@@ -926,7 +926,6 @@ pub const HandleGuard = struct {
             enterWithHeldConnection(entry, access, self.admission_budget_ns)
         else
             enterWithAdmissionBudget(entry, ptr, access, if (access == .read) .read_only else .mutation, false, self.admission_budget_ns) orelse return false;
-        const connection = self.connection.?;
         if (!next.connection_gate_held) connection.gate.mutex.lockUncancelable(handleLockIo());
         // Release before collectRetired can destroy the pin's Store. Keep it
         // through resumed admission so no publication races the handoff.

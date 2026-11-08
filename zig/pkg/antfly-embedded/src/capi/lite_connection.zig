@@ -3516,10 +3516,15 @@ pub const Owner = struct {
             const state = h.db_mod.enrichment_state;
             const target = database.core.nextDerivedSequence();
             if (database.resolution_runtime) |runtime| {
-                if (runtime.stats().catch_up_required) return true;
+                const stats = runtime.stats();
+                // A cold driver can load its applied watermark before any
+                // process-local notification. The durable journal is also a
+                // target; an empty cached notification never proves it clean.
+                if (stats.catch_up_required or stats.applied_sequence < @max(stats.target_sequence, target)) return true;
             } else if (try state.loadAppliedSequence(alloc, database.core.store, "resolution") < target) return true;
             if (database.promotion_runtime) |runtime| {
-                if (runtime.stats().catch_up_required) return true;
+                const stats = runtime.stats();
+                if (stats.catch_up_required or stats.applied_sequence < @max(stats.target_sequence, target)) return true;
             } else if (try state.loadAppliedSequence(alloc, database.core.store, "promotion") < target) return true;
             if (database.resolution_runtime == null and
                 try @import("../storage/db/resolution_runtime.zig").hasDurableReresolveBacklog(database.core.store)) return true;

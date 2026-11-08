@@ -6636,6 +6636,12 @@ fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool, cursor: ?[
             owner.wake.set(shared.handleLockIo());
             owner.worker.?.join();
             owner.worker = null;
+            // Pause every mutable maintenance actor before replacing providers
+            // or resetting cancellation; no pre-pause future may escape here.
+            owner.producer_wake.set(shared.handleLockIo());
+            if (owner.producer_worker) |worker| worker.join();
+            owner.producer_worker = null;
+            owner.collectCompletedProducer();
             owner.stopping.store(false, .release);
             return owner;
         }
@@ -6810,6 +6816,12 @@ test "capi native resolver maintenance retries transient inference and survives 
             owner.wake.set(shared.handleLockIo());
             owner.worker.?.join();
             owner.worker = null;
+            // Pause every mutable maintenance actor before replacing providers
+            // or resetting cancellation; no pre-pause future may escape here.
+            owner.producer_wake.set(shared.handleLockIo());
+            if (owner.producer_worker) |worker| worker.join();
+            owner.producer_worker = null;
+            owner.collectCompletedProducer();
             owner.stopping.store(false, .release);
             return owner;
         }
