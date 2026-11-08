@@ -133,13 +133,15 @@ features or release build-speed/memory improvement. The available build times
 mix warm and cold caches and are unsuitable for that comparison.
 
 After integrating main, both library profiles were rebuilt from identical
-`9c64a7384ffaf2615b2d69f647c3c03b8f5c6baa092e051240a73ac74f2a2ab0`
+`6c82151b5acf6200ad66bc1cd06811803095e1cedc2e2f8dde06534c3f3400a5`
 authored inputs with native image and lake options enabled. The full library was
-200,065,984 bytes and storage was 129,707,344 bytes (35.2% smaller). The full
+200,099,088 bytes and storage was 129,707,344 bytes (35.2% smaller). The full
 product/native-client build passed 156/156 steps; the storage C library and smoke
 suite passed 54/54. Both retained the 141-function public export boundary.
 The cold compiled-owner restore regression and all 32 generation-lifecycle tests
-passed. This remains a CPU-only macOS Debug screen, not Linux release acceptance.
+passed. Main was integrated through `09f6ab2b14`; its extracted GLiNER helper
+now receives the bound model-selection control, and all 58 executor-batching
+tests passed. This remains a CPU-only macOS Debug screen, not Linux release acceptance.
 
 Optimized CPU image transport passed 112 source and 112 native fixtures, including
 four VP8 cases per mode. This alone does not qualify runtime performance, GPU
