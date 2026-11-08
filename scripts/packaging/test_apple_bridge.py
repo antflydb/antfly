@@ -23,6 +23,9 @@ import apple_bridge as bridge
 
 
 class AppleBridgeArtifactTests(unittest.TestCase):
+    def test_committed_bridge_matches_its_source(self):
+        bridge.verify(bridge.SOURCE.parent.parent / "prebuilt/arm64", "arm64")
+
     def fixture(self, root):
         binary = root / bridge.LIBRARY
         binary.write_bytes(
@@ -47,13 +50,11 @@ class AppleBridgeArtifactTests(unittest.TestCase):
             with patch.object(
                 bridge.subprocess, "run", side_effect=AssertionError("execution")
             ):
-                self.assertEqual(
-                    bridge.verify(root, "a" * 40, "arm64"), root / bridge.LIBRARY
-                )
+                self.assertEqual(bridge.verify(root, "arm64"), root / bridge.LIBRARY)
 
     def test_mismatched_source_commit_hash_architecture_abi_or_sdk_is_rejected(self):
         for field, value in [
-            ("source_commit", "b" * 40),
+            ("source_commit", "invalid"),
             ("source_sha256", "0" * 64),
             ("sha256", "0" * 64),
             ("architecture", "x86_64"),
@@ -66,7 +67,7 @@ class AppleBridgeArtifactTests(unittest.TestCase):
                 document[field] = value
                 (root / "apple-bridge.json").write_text(json.dumps(document))
                 with self.assertRaises(ValueError):
-                    bridge.verify(root, "a" * 40, "arm64")
+                    bridge.verify(root, "arm64")
 
     def test_tampered_binary_extra_member_and_symlink_are_rejected(self):
         for damage in ("bytes", "extra", "link"):
@@ -85,7 +86,15 @@ class AppleBridgeArtifactTests(unittest.TestCase):
                     binary.unlink()
                     binary.symlink_to(bridge.SOURCE)
                 with self.assertRaises(ValueError):
-                    bridge.verify(root, "a" * 40, "arm64")
+                    bridge.verify(root, "arm64")
+
+    def test_unrelated_release_commit_does_not_require_a_rebuild(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            document = self.fixture(root)
+            document["source_commit"] = "b" * 40
+            (root / "apple-bridge.json").write_text(json.dumps(document))
+            self.assertEqual(bridge.verify(root, "arm64"), root / bridge.LIBRARY)
 
     def test_macho_architecture_is_checked_independently_of_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -96,4 +105,4 @@ class AppleBridgeArtifactTests(unittest.TestCase):
             document["sha256"] = bridge.digest(binary)
             (root / "apple-bridge.json").write_text(json.dumps(document))
             with self.assertRaisesRegex(ValueError, "Mach-O"):
-                bridge.verify(root, "a" * 40, "arm64")
+                bridge.verify(root, "arm64")

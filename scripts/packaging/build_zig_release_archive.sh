@@ -250,7 +250,7 @@ if [ -n "$apple_bridge_dir" ]; then
   bridge_arch=arm64
   case "$target" in x86_64-*) bridge_arch=x86_64 ;; esac
   python3 "$repo_root/scripts/packaging/apple_bridge.py" verify \
-    --directory "$apple_bridge_dir" --source-commit "$(git -C "$repo_root" rev-parse HEAD)" --architecture "$bridge_arch"
+    --directory "$apple_bridge_dir" --architecture "$bridge_arch"
   zig_build_options+=(-Dapple-bridge-path="$apple_bridge_dir/libantfly-apple.dylib")
 fi
 

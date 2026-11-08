@@ -60,10 +60,13 @@ required. Add the selected prefix's `bin` directory to `PATH`.
 ### Native Apple providers in Mac archives
 
 Source build contract 7 enables Vision OCR, speech transcription, and generation
-as one default macOS capability. A small `xcode-27` job builds the Swift bridge
-from the exact release source; existing Linux cross-build jobs verify its commit,
-source hash, binary hash, architecture and ABI, then include it in both server
-and embedded archives. No complete Antfly build moves to a Mac runner.
+as one default macOS capability. The ARM64 Swift bridge and its metadata are
+committed under `zig/lib/apple_native/prebuilt/arm64`. Existing Linux cross-build
+jobs verify its source hash, binary hash, architecture and ABI, then include it
+in both server and embedded archives. No Mac CI builder is needed. `make generate` rebuilds the
+bridge on Apple Silicon Macs; `make apple-bridge-generate` runs only that step.
+Commit the binary
+and metadata together (commands in the Apple provider guide).
 Older source contracts keep their previous packaging behavior.
 
 The CLI and library retain their macOS 15 deployment target. The bridge is lazy

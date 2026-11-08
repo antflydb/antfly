@@ -121,17 +121,9 @@ jobs:
           matrix="$(python scripts/release/release_platforms.py github-matrix)"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
-  build-apple-bridge:
-    needs: release-plan
-    if: ${{ needs.release-plan.outputs.apple_provider_bundle == 'true' }}
-    uses: ./.github/workflows/build-apple-provider-bridge.yml
-    with:
-      source_commit: ${{ inputs.source_commit }}
-
   build-zig-runtime-archives:
     name: Build Zig archive (${{ matrix.artifact_name }})
-    needs: [release-plan, build-apple-bridge]
-    if: ${{ !cancelled() && needs.release-plan.result == 'success' && (needs.build-apple-bridge.result == 'success' || needs.build-apple-bridge.result == 'skipped') }}
+    needs: release-plan
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -215,11 +207,6 @@ jobs:
         with:
           mirror-only: 'true'
 
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: ${{ matrix.archive_os == 'Darwin' && needs.release-plan.outputs.apple_provider_bundle == 'true' }}
-        with:
-          name: antfly-apple-bridge
-          path: .release-inputs/apple-bridge
       - name: Build source-declared runtime archives
         env:
           RELEASE_TAG: ${{ inputs.tag_name }}
@@ -241,7 +228,7 @@ jobs:
               build_args+=(--jobs "${{ matrix.zig_jobs }}")
             fi
             if [ "${{ matrix.archive_os }}" = Darwin ] && [ "$APPLE_PROVIDER_BUNDLE" = true ]; then
-              build_args+=(--apple-providers true --apple-bridge-dir "$PWD/.release-inputs/apple-bridge")
+              build_args+=(--apple-providers true --apple-bridge-dir "$PWD/zig/lib/apple_native/prebuilt/arm64")
             fi
             prefix=antfly
             if [ "$product" != server ]; then

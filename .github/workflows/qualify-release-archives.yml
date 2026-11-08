@@ -40,18 +40,9 @@ jobs:
             echo 'apple_provider_bundle=false' >> "$GITHUB_OUTPUT"
           fi
 
-  build-apple-bridge:
-    needs: plan
-    if: ${{ needs.plan.outputs.apple_provider_bundle == 'true' }}
-    uses: ./.github/workflows/build-apple-provider-bridge.yml
-    with:
-      source_commit: ${{ inputs.source_commit }}
-      artifact_name: qualification-apple-bridge
-
   archives:
     name: Qualify ${{ matrix.artifact_name }}
-    needs: [plan, build-apple-bridge]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.build-apple-bridge.result == 'success' || needs.build-apple-bridge.result == 'skipped') }}
+    needs: plan
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     strategy:
@@ -109,6 +100,7 @@ jobs:
           python3 -m unittest zig/tools/test_run_bounded_zig_build.py
           python3 -m unittest zig.tools.test_capi_exports.ExportPolicyTests.test_release_metadata_is_linked_once_per_final_image
           python3 -m unittest scripts.packaging.test_release_licenses scripts.packaging.test_fixture_process
+          python3 -m unittest discover -s scripts/packaging -p test_apple_bridge.py
 
       - name: Install pinned macOS cross-compilation SDK
         if: ${{ matrix.macos_sdk == 'true' }}
@@ -148,11 +140,6 @@ jobs:
         with:
           mirror-only: 'true'
 
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: ${{ matrix.archive_os == 'Darwin' && needs.plan.outputs.apple_provider_bundle == 'true' }}
-        with:
-          name: qualification-apple-bridge
-          path: .release-inputs/apple-bridge
       - name: Build source-declared runtime archives
         env:
           RELEASE_TAG: v0.0.0-qualification
@@ -174,7 +161,7 @@ jobs:
               build_args+=(--jobs "${{ matrix.zig_jobs }}")
             fi
             if [ "${{ matrix.archive_os }}" = Darwin ] && [ "$APPLE_PROVIDER_BUNDLE" = true ]; then
-              build_args+=(--apple-providers true --apple-bridge-dir "$PWD/.release-inputs/apple-bridge")
+              build_args+=(--apple-providers true --apple-bridge-dir "$PWD/zig/lib/apple_native/prebuilt/arm64")
             fi
             prefix=antfly
             if [ "$product" != server ]; then

@@ -38,7 +38,7 @@ pub const Modules = struct {
 /// One capability switch for Vision, SpeechAnalyzer and Foundation Models.
 /// Cross builds use the bridge built from the same source on a Mac runner.
 pub fn configure(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, link_libc: bool, modules: Modules) ?*std.Build.Step.InstallFile {
-    const enabled = b.option(bool, "apple-providers", "Enable Apple Vision OCR, transcription and generation (default on macOS; Swift 6/macOS 27 SDK or a prebuilt bridge required)") orelse (target.result.os.tag == .macos and link_libc);
+    const enabled = b.option(bool, "apple-providers", "Enable Apple Vision OCR, transcription and generation (default on macOS; bundled ARM64 bridge)") orelse (target.result.os.tag == .macos and link_libc);
     const prebuilt = b.option([]const u8, "apple-bridge-path", "Path to a matching prebuilt libantfly-apple.dylib for macOS cross compilation");
     if (enabled and (target.result.os.tag != .macos or !link_libc))
         @panic("-Dapple-providers=true requires macOS and libc");
@@ -65,7 +65,18 @@ pub fn configure(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .file = b.path("lib/readers/src/apple_vision.m"),
         .flags = &.{ "-fobjc-arc", "-fblocks" },
     });
-    const bridge: std.Build.LazyPath = if (prebuilt) |path| (if (std.fs.path.isAbsolute(path)) std.Build.LazyPath{ .cwd_relative = path } else b.path(path)) else native: {
+    var verification: ?*std.Build.Step.Run = null;
+    const bundled = prebuilt == null and target.result.cpu.arch == .aarch64;
+    if (bundled) {
+        const check = b.addSystemCommand(&.{"python3"});
+        check.addFileArg(b.path("../scripts/packaging/apple_bridge.py"));
+        check.addArgs(&.{ "verify", "--directory" });
+        check.addDirectoryArg(b.path("lib/apple_native/prebuilt/arm64"));
+        check.addArgs(&.{ "--architecture", "arm64" });
+        check.has_side_effects = true;
+        verification = check;
+    }
+    const bridge: std.Build.LazyPath = if (bundled) b.path("lib/apple_native/prebuilt/arm64/libantfly-apple.dylib") else if (prebuilt) |path| (if (std.fs.path.isAbsolute(path)) std.Build.LazyPath{ .cwd_relative = path } else b.path(path)) else native: {
         if (b.graph.host.result.os.tag != .macos)
             @panic("macOS cross builds require -Dapple-bridge-path, or explicitly -Dapple-providers=false");
         const swift = b.addSystemCommand(&.{ "xcrun", "swiftc", "-parse-as-library", "-swift-version", "6", "-target", if (target.result.cpu.arch == .aarch64) "arm64-apple-macos26.0" else "x86_64-apple-macos26.0", "-module-cache-path" });
@@ -81,6 +92,7 @@ pub fn configure(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         break :native swift.addOutputFileArg("libantfly-apple.dylib");
     };
     const install = b.addInstallFileWithDir(bridge, .lib, "libantfly-apple.dylib");
+    if (verification) |check| install.step.dependOn(&check.step);
     b.getInstallStep().dependOn(&install.step);
     b.step("apple-native-bridge", "Build or install the native Apple provider bridge").dependOn(&install.step);
     return install;

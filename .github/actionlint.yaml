@@ -14,11 +14,6 @@ self-hosted-runner:
 # Keep controller/admission events queued instead of replacing pending events.
 # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency
 paths:
-  .github/workflows/build-apple-provider-bridge.yml:
-    # GitHub's hosted Xcode 27 image is newer than actionlint's built-in labels.
-    # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
-    ignore:
-      - '^label "xcode-27" is unknown\. available labels are'
   .github/workflows/pr-ci-controller.yml:
     ignore:
       - '^unexpected key "queue" for "concurrency" section\.'

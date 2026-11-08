@@ -36,13 +36,13 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def verify(directory, commit, architecture):
-    if not re.fullmatch(r"[0-9a-f]{40}", commit):
-        raise ValueError("Invalid Apple bridge source commit")
+def verify(directory, architecture):
     metadata_path = directory / "apple-bridge.json"
     if metadata_path.is_symlink():
         raise ValueError("Apple bridge metadata must not be a symlink")
     metadata = json.loads(metadata_path.read_bytes())
+    if not re.fullmatch(r"[0-9a-f]{40}", metadata.get("source_commit", "")):
+        raise ValueError("Invalid Apple bridge build provenance")
     library = directory / LIBRARY
     if library.is_symlink() or set(p.name for p in directory.iterdir()) != {
         LIBRARY,
@@ -52,7 +52,6 @@ def verify(directory, commit, architecture):
     expected = {
         "schema_version": 1,
         "abi_version": 2,
-        "source_commit": commit,
         "architecture": architecture,
         "source_sha256": digest(SOURCE),
         "sha256": digest(library),
@@ -116,23 +115,28 @@ def build(directory, commit, architecture):
         ],
         check=True,
     )
-    (directory / "apple-bridge.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "abi_version": 2,
-                "source_commit": commit,
-                "architecture": architecture,
-                "source_sha256": digest(SOURCE),
-                "sha256": digest(library),
-                "sdk_version": sdk,
-            },
-            sort_keys=True,
-            indent=2,
-        )
-        + "\n"
-    )
-    verify(directory, commit, architecture)
+    metadata = {
+        "schema_version": 1,
+        "abi_version": 2,
+        "source_commit": commit,
+        "architecture": architecture,
+        "source_sha256": digest(SOURCE),
+        "sha256": digest(library),
+        "sdk_version": sdk,
+    }
+    metadata_path = directory / "apple-bridge.json"
+    if metadata_path.is_file():
+        previous = json.loads(metadata_path.read_bytes())
+        # An unchanged generated binary keeps its original build provenance;
+        # routine make generate runs should not churn metadata after each commit.
+        if all(
+            previous.get(key) == value
+            for key, value in metadata.items()
+            if key != "source_commit"
+        ):
+            metadata["source_commit"] = previous.get("source_commit", commit)
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True, indent=2) + "\n")
+    verify(directory, architecture)
     subprocess.run(["codesign", "--verify", "--strict", str(library)], check=True)
     if (
         platform.machine() == architecture
@@ -184,13 +188,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["build", "verify"])
     parser.add_argument("--directory", type=Path, required=True)
-    parser.add_argument("--source-commit", required=True)
+    parser.add_argument(
+        "--source-commit", help="Build provenance commit (defaults to HEAD)"
+    )
     parser.add_argument("--architecture", choices=["arm64", "x86_64"], default="arm64")
     args = parser.parse_args()
     if args.command == "build":
-        build(args.directory, args.source_commit, args.architecture)
+        commit = (
+            args.source_commit
+            or subprocess.check_output(
+                ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True
+            ).strip()
+        )
+        build(args.directory, commit, args.architecture)
     else:
-        verify(args.directory, args.source_commit, args.architecture)
+        verify(args.directory, args.architecture)
 
 
 if __name__ == "__main__":

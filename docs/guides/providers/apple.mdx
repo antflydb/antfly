@@ -35,28 +35,30 @@ zig build antfly capi                     # All Apple providers, default on macO
 zig build antfly -Dapple-providers=false  # Disable all three, for example with an older SDK
 ```
 
-Release build contract 7 includes the bridge in both macOS server and embedded
-archives. Existing older releases are unchanged. The release workflow compiles
-only the small Swift bridge on a Mac with the macOS 27 SDK, binds it to the
-release source commit, and verifies its source hash, binary hash, architecture,
-and ABI before the Linux macOS cross-build packages it. CLI and SDK packages
-retain the adjacent bridge; users do not compile or install it separately.
+Release build contract 7 includes the committed ARM64 bridge in both macOS server
+and embedded archives. Existing older releases are unchanged. Linux release jobs
+verify its Swift source hash, binary hash, architecture and ABI before packaging.
+CLI and SDK packages retain the adjacent bridge; users need neither Xcode nor Swift.
+Native and cross-compiled ARM64 builds use and verify the committed bridge by default.
 
-A manual macOS cross-build can supply a bridge built from the same source:
+`make generate` rebuilds the bridge automatically on Apple Silicon Macs.
+Use `make apple-bridge-generate` to rebuild only the bridge. Other platforms
+keep the committed binary. When changing `zig/lib/apple_native/src/bridge.swift`, rebuild on a Mac with
+Swift 6 and the macOS 27 SDK, then commit both the dylib and its metadata:
 
 ```bash
-# On a Mac (this builds only the Swift bridge):
-python3 scripts/packaging/apple_bridge.py build --directory dist/apple-bridge \
-  --source-commit "$(git rev-parse HEAD)" --architecture arm64
-# On the cross-build host, after copying that verified directory:
-python3 scripts/packaging/apple_bridge.py verify --directory dist/apple-bridge \
-  --source-commit "$(git rev-parse HEAD)" --architecture arm64
-cd zig
-zig build antfly -Dtarget=aarch64-macos.15.0 \
-  -Dapple-bridge-path="$PWD/../dist/apple-bridge/libantfly-apple.dylib"
+python3 scripts/packaging/apple_bridge.py build \
+  --directory zig/lib/apple_native/prebuilt/arm64 --architecture arm64
+python3 scripts/packaging/apple_bridge.py verify \
+  --directory zig/lib/apple_native/prebuilt/arm64 --architecture arm64
 ```
 
-The build needs the macOS 27 SDK and the Swift 6 command-line toolchain.
+The metadata records the build's provenance commit and the actual Swift source
+hash. Verification checks source contents rather than requiring the build's commit
+to equal each subsequent release commit. Source edits require a rebuilt bridge;
+unrelated Antfly changes reuse the existing binary. `-Dapple-bridge-path` can
+explicitly select a custom bridge.
+
 Transcription and generation live in `lib/libantfly-apple.dylib`, which the
 `antfly`, `capi`, and independent `libantfly` steps install. Keep it in the `lib/` directory beside
 `libantfly`, or beside the CLI's installation. For a custom Lite layout, set

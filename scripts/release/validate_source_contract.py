@@ -83,6 +83,8 @@ APPLE_PROVIDER_PATHS = REQUIRED_PATHS | {
     "scripts/packaging/verify_native_archives.py",
     "scripts/packaging/apple_bridge.py",
     "zig/lib/apple_native/build_support.zig",
+    "zig/lib/apple_native/prebuilt/arm64/apple-bridge.json",
+    "zig/lib/apple_native/prebuilt/arm64/libantfly-apple.dylib",
     "zig/lib/apple_native/src/bridge.swift",
     "zig/lib/apple_native/src/loader.c",
     "zig/lib/apple_native/src/loader.h",
