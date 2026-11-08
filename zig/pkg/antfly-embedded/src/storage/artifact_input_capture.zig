@@ -167,7 +167,41 @@ pub const Capture = struct {
     /// while this helper stages only the revision sidecars and native clock.
     pub fn stage(self: *Capture, txn: anytype, retained_advanced: bool) !void {
         if (self.poisoned) return error.RetainedEffectsTransactionFailed;
-        if (self.staged or (self.documents.count() == 0 and self.artifacts.count() == 0)) return;
+        if (self.staged) return;
+        if (self.documents.count() == 0 and self.artifacts.count() == 0) {
+            // Nothing for this capture's OWN bookkeeping to do: no document
+            // or artifact revision was touched in this transaction, which
+            // is the ordinary case for every write with no active
+            // online-source replication authority (standalone Lite's
+            // default). That bookkeeping -- below -- genuinely needs a
+            // live `self.selected`/authority to stamp revision keys, so it
+            // must stay skipped here.
+            //
+            // An attached `commit_participant`, however, is not that
+            // bookkeeping: WS4 phase 2's inline text/dense/sparse/graph
+            // publication (`InlineTextPublication.stage` and siblings)
+            // reuses this same attachment slot purely to get "run once,
+            // inside this transaction, before commit" -- it ignores the
+            // position bytes entirely and has nothing to do with
+            // replication. Skipping it here (as this function used to,
+            // unconditionally, whenever no document/artifact was touched)
+            // silently dropped every inline index-catalog/progress mutation
+            // a participant staged: the write still acknowledged
+            // successfully (its in-memory projection was installed
+            // regardless), but nothing durable ever reached the native
+            // transaction, so the effect vanished on the next reopen. A
+            // participant that DOES need authority (e.g.
+            // `artifact_authored_acceptance`'s `Prepared.participant`) is
+            // only ever attached by its own caller when authority is
+            // already known to be active, so it is safe to always invoke
+            // whatever is attached here.
+            self.staged = true;
+            if (self.participant) |participant| {
+                var view_txn = txn;
+                try participant.stage(participant.ptr, @import("commit_participant.zig").View.from(&view_txn), &.{});
+            }
+            return;
+        }
         errdefer self.poisoned = true;
         const expected = self.selected orelse return error.ArtifactCatalogCorrupt;
         const current = (try publication.authority(txn)) orelse return error.RetainedEffectsFenceMismatch;
