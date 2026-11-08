@@ -1144,6 +1144,7 @@ def test_native_catalog_file_commit_read_and_restart(
                         deleted.get("responses", [deleted])[0]["hits"]["hits"] == []
                     ), deleted
                 chunk_requests = []
+                first_chunk_revisions = None
                 for name in ("managed_chunks", "managed_chunks_second"):
                     chunk_query = {
                         "embeddings": {name: [1, 0]},
@@ -1179,6 +1180,38 @@ def test_native_catalog_file_commit_read_and_restart(
                     assert all(
                         hit["_source"]["text"] for hit in members["hits"]["hits"]
                     ), members
+                    revisions = {
+                        hit["_id"]: hit["hierarchy"]["artifact"]["revision"]
+                        for hit in members["hits"]["hits"]
+                    }
+                    assert all(
+                        value.startswith("sha256:") and len(value) == 71
+                        for value in revisions.values()
+                    ), members
+                    if first_chunk_revisions is None:
+                        first_chunk_revisions = revisions
+                    # Both accepted replacements and archived chunks must use
+                    # the pinned lake producer state during revision shaping.
+                    for amount in (1, 3):
+                        selected_members = call(
+                            "POST",
+                            "/tables/hn/query",
+                            dict(
+                                chunk_query,
+                                hierarchy={},
+                                fields=["text"],
+                                filter_query={
+                                    "term": {"path": "/amount", "value": amount}
+                                },
+                            ),
+                        )["responses"][0]
+                        assert selected_members["hits"]["hits"], selected_members
+                        assert all(
+                            hit["_source"]["text"]
+                            and revisions[hit["_id"]]
+                            == hit["hierarchy"]["artifact"]["revision"]
+                            for hit in selected_members["hits"]["hits"]
+                        ), selected_members
                     units = call(
                         "POST",
                         "/tables/hn/query",
@@ -1224,6 +1257,10 @@ def test_native_catalog_file_commit_read_and_restart(
                 assert all(
                     hit["_source"]["text"] for hit in chunk_reopened["hits"]["hits"]
                 ), chunk_reopened
+                assert {
+                    hit["_id"]: hit["hierarchy"]["artifact"]["revision"]
+                    for hit in chunk_reopened["hits"]["hits"]
+                } == first_chunk_revisions, chunk_reopened
                 mixed_restarted = call("POST", "/query", mixed_next)["responses"][0]
                 assert [
                     hit["_source"]["amount"] for hit in mixed_restarted["hits"]["hits"]
