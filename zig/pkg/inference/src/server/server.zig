@@ -8794,6 +8794,8 @@ pub const Node = struct {
         /// Conservative epochs have no vision broker. Encode one page under
         /// the step lock, exactly as generation does without a hook.
         fn encodeSerial(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
+            const phase_timer = readers_api.pipeline_metrics.start(.vision);
+            defer phase_timer.finish();
             const request: *@This() = @ptrCast(@alignCast(raw));
             try request.control.check();
             try request.ctx.lockStep(request.control);
@@ -8803,6 +8805,8 @@ pub const Node = struct {
         }
 
         fn encodeCpuPrepared(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, original_limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
+            const phase_timer = readers_api.pipeline_metrics.start(.vision);
+            defer phase_timer.finish();
             const request: *@This() = @ptrCast(@alignCast(raw));
             try request.control.check();
             const ctx = request.ctx;
@@ -8859,6 +8863,8 @@ pub const Node = struct {
         }
 
         fn encode(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
+            const phase_timer = readers_api.pipeline_metrics.start(.vision);
+            defer phase_timer.finish();
             const request: *@This() = @ptrCast(@alignCast(raw));
             try request.control.check();
             const ctx = request.ctx;

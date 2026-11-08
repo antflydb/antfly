@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Io = std.Io;
+const pipeline_metrics = @import("antfly_readers").pipeline_metrics;
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const inference_request_context = @import("antfly_inference_execution_context");
@@ -4512,7 +4513,7 @@ const AssetInvocationCancellation = struct {
 };
 
 fn scopedAssetProducer(
-    runtime: *EnrichmentRuntime,
+    runtime: anytype,
     producer: asset_producer_mod.Producer,
     cancellation: *AssetInvocationCancellation,
 ) asset_producer_mod.Producer {
@@ -4541,8 +4542,10 @@ fn scopedAssetProducer(
         },
         .max_response_bytes = producer.invocation_context.max_response_bytes,
         .document_checkpoints = producer.invocation_context.document_checkpoints,
-        .progress = producer.invocation_context.progress orelse
-            inference_request_context.ProgressSink{ .ptr = runtime, .update_fn = noteInferenceProgress },
+        .progress = if (comptime @TypeOf(runtime) == *EnrichmentRuntime)
+            producer.invocation_context.progress orelse inference_request_context.ProgressSink{ .ptr = runtime, .update_fn = noteInferenceProgress }
+        else
+            .{},
     });
 }
 
@@ -6968,6 +6971,7 @@ const UnsupportedEnrichmentRuntime = struct {
     /// Invocation-local runtimes borrow the lifecycle owner's cache.
     shared_vector_label_cache: ?*@import("vector_label_cache.zig").Cache = null,
     generated_publication: ?GeneratedPublicationPort = null,
+    document_prefetch: ?*DocumentPreparationPipeline = null,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
     /// before releasing BackendRuntime.
@@ -7485,6 +7489,7 @@ const PlatformEnrichmentRuntime = struct {
     };
 
     alloc: Allocator,
+    document_prefetch: ?*DocumentPreparationPipeline = null,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
     /// before releasing BackendRuntime. Per-operation lane leases protect
@@ -13322,6 +13327,254 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     }
 }
 
+/// Speculation owns no replay cursor, retry ticket, producer identity, or
+/// publication window. At most one future document is running; the second
+/// slot holds the joined current document until its ordered publication ends.
+const DocumentPreparationPipeline = struct {
+    runtime: *EnrichmentRuntime,
+    guard: ForegroundCatchUpGuard,
+    jobs: [2]?*Job = .{ null, null },
+
+    /// A preparation worker receives only immutable lifetime/dispatch inputs,
+    /// never a copy of the enrichment worker's mutexes or mutable retry state.
+    const RenderContext = struct {
+        config: Config,
+        index_manager: @FieldType(EnrichmentRuntime, "index_manager"),
+        backend_runtime: @FieldType(EnrichmentRuntime, "backend_runtime"),
+        active_provider_guard: ForegroundCatchUpGuard,
+        timeout_ms: u64,
+        fn syncWaitTimeoutMs(self: *@This()) u64 {
+            return self.timeout_ms;
+        }
+    };
+    const Job = struct {
+        context: RenderContext,
+        cache: *PreparedDocumentSourceCache,
+        doc_key: []u8,
+        source_url: []u8,
+        raw: []u8,
+        config_json: []u8,
+        config: document_extraction_mod.Config,
+        description: std.heap.ArenaAllocator,
+        policy: GeneratedTextBatchPolicy,
+        producer: asset_producer_mod.Producer,
+        remote_snapshot: ?scraping.RemoteContentConfig.Snapshot = null,
+        remote_config: scraping.RemoteContentConfig = .{},
+        source: ?PreparedDocumentSourceCache.PreparedSourceLease = null,
+        pdf: ?PreparedDocumentSourceCache.PreparedPdfLease = null,
+        fingerprint: ?[]u8 = null,
+        units: std.ArrayListUnmanaged(document_extraction_mod.Unit) = .empty,
+        window: ?RuntimePdfRenderWindow = null,
+        raster: bool = false,
+        future: ?Io.Future(void) = null,
+        cancel: std.atomic.Value(bool) = .init(false),
+        budgeted: ?resource_manager_mod.BudgetedAllocator = null,
+
+        fn allocator(self: *@This()) Allocator {
+            return if (self.budgeted) |*b| b.allocator() else platform.allocator.concurrentFallback();
+        }
+        fn isCancelled(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.context.active_provider_guard.check() catch return true;
+            return self.cancel.load(.acquire) or self.context.config.cancellation.isCancelled();
+        }
+        fn probeCancelled(ptr: ?*const anyopaque) bool {
+            return isCancelled(ptr orelse return true);
+        }
+        fn run(self: *@This()) void {
+            self.prepare() catch {};
+        }
+        fn begin(_: *anyopaque, _: document_extraction_mod.StreamInfo) anyerror!void {}
+        fn end(_: *anyopaque) anyerror!void {}
+        fn collect(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.units.items.len == 8) return error.PrefetchWindowFull;
+            var owned = try cloneDocumentExtractionUnit(self.allocator(), unit.*);
+            errdefer owned.deinit(self.allocator());
+            try self.units.append(self.allocator(), owned);
+        }
+        fn prepare(self: *@This()) !void {
+            const a = self.allocator();
+            if (isCancelled(self)) return error.Canceled;
+            const fetched = try self.cache.fetch(self.source_url, if (self.config.credentials.len > 0) self.config.credentials else null, remoteRenderConfig(self.context.config.secret_store, &self.remote_config, self.context.config.io, CancellationToken{ .ptr = self, .is_cancelled_fn = isCancelled }, null, null));
+            self.source = switch (fetched) {
+                .ok => |lease| lease,
+                .http_error => return,
+            };
+            const entry = self.source.?.entry();
+            try document_extraction_mod.verifyChecksumDigest(self.config, &entry.content_sha256);
+            if (!document_extraction_mod.resolvesToPdf(self.config, self.source_url, entry.content.content_type, entry.content.data)) return;
+            self.pdf = try self.cache.preparePdf(&self.source.?, self.config.pdf_decode_limits, self.context.timeout_ms);
+            self.fingerprint = try document_extraction_mod.metadataFingerprintAlloc(a, self.source_url, self.config_json, self.config) orelse
+                try document_extraction_mod.downloadedMetadataFingerprintAlloc(a, self.source_url, self.config_json, self.config, entry.content.content_type) orelse
+                try documentExtractionFingerprintFromDigestAlloc(a, &entry.source_identity, self.config_json, self.config.native_text, self.config.content_type, self.config.filename, entry.content.content_type, &entry.content_sha256);
+            const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(a, platform.allocator.concurrentFallback(), self.context.config.resource_manager orelse self.context.index_manager.resource_manager, self.context.timeout_ms, self.config, self.pdf.?.session());
+            defer coordinator.destroy();
+            coordinator.session.setCancellationProbe(.{ .context = self, .is_cancelled_fn = probeCancelled });
+            document_extraction_mod.extractPreparedPdfStreaming(a, &coordinator.session, "application/pdf", self.config.native_text, self.config.ocr_mode, .{ .ptr = self, .on_begin = begin, .on_unit = collect, .on_end = end }) catch |err| if (err != error.PrefetchWindowFull) return err;
+            const prototype = asset_producer_mod.Request{ .producer_type = document_extraction_mod.ocrProducerType(self.config), .config_json = document_extraction_mod.effectiveOcrConfigJson(self.config), .source_text = "", .content_type = "image/png", .inline_media_trusted = true };
+            self.raster = try self.producer.borrowedRasterBatchAvailable(a, &.{prototype});
+            if (try self.producer.capabilitiesForRequests(a, &.{prototype})) |cap| {
+                if (!cap.supports(.{ .image = true }) or (!self.raster and !cap.acceptsMimeType("image/png"))) return;
+                self.policy.max_items = @min(self.policy.max_items, cap.batch.max_items);
+                if (!self.raster) if (cap.batch.max_encoded_media_bytes) |limit| {
+                    self.policy.max_bytes = @min(self.policy.max_bytes, limit);
+                };
+                self.policy.max_pixels = @min(self.policy.max_pixels, cap.renderPixelLimit(self.raster));
+                if (cap.image_transform) |transform| {
+                    self.policy.preferred_image_width = transform.target_width;
+                    self.policy.preferred_image_height = transform.target_height;
+                }
+            }
+            // Do not paint born-digital pages or speculate an entire large PDF.
+            if (for (self.units.items) |unit| {
+                if (unit.extraction_status) |status| if (std.mem.eql(u8, status, "pending_ocr")) break false;
+            } else true) return;
+            self.policy.render_items = @min(self.policy.max_items, 8);
+            self.policy.defer_render_pressure = true;
+            self.window = try renderRuntimePdfWindow(&self.context, a, self.producer, &coordinator.session, self.config, try coordinator.availableRenderBytes(), self.policy, document_extraction_mod.ocrProducerType(self.config), document_extraction_mod.effectiveOcrConfigJson(self.config), "pdf", "application/pdf", self.fingerprint.?, self.units.items, 0, self.raster, .{ .context = self, .is_cancelled_fn = probeCancelled });
+            // A deferred render borrows its session. Never let it outlive this
+            // coordinator; the ordinary foreground path retries under pressure.
+            if (self.window.?.deferred_render != null) {
+                self.window.?.deinit();
+                self.window = null;
+            }
+        }
+        fn join(self: *@This()) void {
+            if (self.future) |*future| {
+                const timer = pipeline_metrics.start(.prefetch_wait);
+                defer timer.finish();
+                future.await(self.context.config.io.?);
+                self.future = null;
+            }
+        }
+        fn destroy(self: *@This()) void {
+            self.cancel.store(true, .release);
+            self.join();
+            const a = self.allocator();
+            if (self.window) |*w| w.deinit();
+            for (self.units.items) |*u| u.deinit(a);
+            self.units.deinit(a);
+            if (self.pdf) |*pdf| pdf.deinit();
+            if (self.source) |*source| source.deinit();
+            if (self.fingerprint) |v| a.free(v);
+            self.description.deinit();
+            if (self.remote_snapshot) |*snapshot| snapshot.deinit();
+            if (self.budgeted) |*b| b.deinit();
+            platform.allocator.concurrentFallback().destroy(self);
+        }
+    };
+
+    fn deinit(self: *@This()) void {
+        for (&self.jobs) |*slot| if (slot.*) |job| {
+            job.destroy();
+            slot.* = null;
+        };
+    }
+    fn joinFor(self: *@This(), key: []const u8) void {
+        for (self.jobs) |maybe| if (maybe) |job| if (std.mem.eql(u8, job.doc_key, key)) {
+            job.join();
+        };
+    }
+    fn releaseFor(self: *@This(), key: []const u8) void {
+        for (&self.jobs) |*slot| if (slot.*) |job| if (std.mem.eql(u8, job.doc_key, key)) {
+            job.destroy();
+            slot.* = null;
+        };
+    }
+    fn takeWindow(self: *@This(), fingerprint: []const u8, config_json: []const u8, policy: GeneratedTextBatchPolicy, units: []const document_extraction_mod.Unit, start: usize, raster: bool) ?RuntimePdfRenderWindow {
+        for (self.jobs) |maybe| if (maybe) |job| {
+            if (job.future != null or job.window == null or job.fingerprint == null or job.raster != raster or
+                !std.mem.eql(u8, job.fingerprint.?, fingerprint) or !std.mem.eql(u8, document_extraction_mod.effectiveOcrConfigJson(job.config), config_json) or
+                job.policy.max_items != policy.max_items or job.policy.max_bytes != policy.max_bytes or job.policy.max_pixels != policy.max_pixels or
+                job.policy.preferred_image_width != policy.preferred_image_width or job.policy.preferred_image_height != policy.preferred_image_height) continue;
+            const w = &job.window.?;
+            if (w.unit_indices.len == 0 or w.unit_indices[0] < start) continue;
+            var matches = true;
+            for (w.unit_indices) |i| {
+                if (i >= units.len or i >= job.units.items.len or !std.mem.eql(u8, units[i].unit_id, job.units.items[i].unit_id) or units[i].page_number != job.units.items[i].page_number or
+                    !std.mem.eql(u8, units[i].extraction_status orelse "", "pending_ocr"))
+                {
+                    matches = false;
+                    break;
+                }
+            }
+            if (!matches) continue;
+            const result = w.*;
+            job.window = null;
+            return result;
+        };
+        return null;
+    }
+    fn startNext(self: *@This(), current: enrichment_worker.PendingDocumentGroup, next: enrichment_worker.PendingDocumentGroup, plans: *std.ArrayListUnmanaged(RequestPlanCacheEntry), cache: *PreparedDocumentSourceCache) !void {
+        const io = self.runtime.config.io orelse return;
+        if (!platform.env.getenvBoolDefault("ANTFLY_ENRICHMENT_DOCUMENT_PREFETCH", true)) return;
+        const slot = for (&self.jobs) |*value| {
+            if (value.* == null) break value;
+        } else return;
+        for (self.jobs) |value| if (value) |job| if (job.future != null) return;
+        const requests = try getOrCreatePlannedRequests(self.runtime, next.doc_key, plans);
+        for (requests) |request| {
+            if (request.kind != .asset or request.input_kind != .document or request.upstream_artifact_name.len != 0 or request.source_template.len != 0) continue;
+            var cfg = asset_producer_mod.parseProducerConfig(self.runtime.alloc, request.producer_json) catch continue;
+            defer cfg.deinit(self.runtime.alloc);
+            if (cfg.type != .document_extraction) continue;
+            const key = try internal_keys.artifactNamedPrefixAlloc(self.runtime.alloc, next.doc_key, "asset", requestArtifactName(request));
+            defer self.runtime.alloc.free(key);
+            const manifest = try storeGetOptionalAllocWithRetry(self.runtime, key);
+            defer if (manifest) |v| self.runtime.alloc.free(v);
+            if (manifest != null) continue; // Preserve the zero-fetch replay/repair fast paths.
+            const raw = try storeGetOptionalAllocWithRetry(self.runtime, next.doc_key) orelse continue;
+            defer self.runtime.alloc.free(raw);
+            const url = try extractAssetSourceValue(self.runtime.alloc, self.runtime.config, raw, request) orelse continue;
+            defer self.runtime.alloc.free(@constCast(url));
+            const current_raw = try storeGetOptionalAllocWithRetry(self.runtime, current.doc_key);
+            defer if (current_raw) |v| self.runtime.alloc.free(v);
+            if (current_raw) |v| {
+                const current_url = try extractAssetSourceValue(self.runtime.alloc, self.runtime.config, v, request);
+                defer if (current_url) |u| self.runtime.alloc.free(@constCast(u));
+                if (current_url) |u| if (std.mem.eql(u8, u, url)) continue;
+            }
+            var config = document_extraction_mod.parseConfig(self.runtime.alloc, cfg.config_json) catch continue;
+            defer config.deinit(self.runtime.alloc);
+            if (!config.ocr_enabled) continue;
+            try document_extraction_mod.applySourceMetadataFromJson(self.runtime.alloc, &config, raw);
+            if (!std.ascii.eqlIgnoreCase(config.content_type, "application/pdf")) continue;
+            const producer = self.runtime.config.asset_producer orelse return;
+            const backing = platform.allocator.concurrentFallback();
+            const job = try backing.create(Job);
+            var arena = std.heap.ArenaAllocator.init(backing);
+            var transferred = false;
+            errdefer if (!transferred) {
+                arena.deinit();
+                backing.destroy(job);
+            };
+            const description = arena.allocator();
+            job.* = .{ .context = .{ .config = self.runtime.config, .index_manager = self.runtime.index_manager, .backend_runtime = self.runtime.backend_runtime, .active_provider_guard = self.guard, .timeout_ms = self.runtime.syncWaitTimeoutMs() }, .cache = cache, .doc_key = try description.dupe(u8, next.doc_key), .source_url = try description.dupe(u8, url), .raw = try description.dupe(u8, raw), .config_json = try description.dupe(u8, cfg.config_json), .config = try document_extraction_mod.parseConfig(description, cfg.config_json), .description = undefined, .policy = requestGeneratedTextBatchPolicy(self.runtime.alloc, request), .producer = producer };
+            try document_extraction_mod.applySourceMetadataFromJson(description, &job.config, raw);
+            job.description = arena;
+            transferred = true;
+            errdefer job.destroy();
+            if (self.runtime.config.resource_manager orelse self.runtime.index_manager.resource_manager) |manager|
+                job.budgeted = resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, backing, 1);
+            applyDocumentExtractionRuntimePolicy(&job.config);
+            if (self.runtime.config.remote_content) |remote| job.remote_snapshot = try remote.acquire();
+            if (job.remote_snapshot) |snapshot| job.remote_config = snapshot.config.*;
+            job.remote_config.runtime = null;
+            if (job.remote_config.security == null) job.remote_config.security = .{};
+            job.remote_config.security.?.max_download_size_bytes = @min(job.remote_config.security.?.max_download_size_bytes orelse 16 * 1024 * 1024, 16 * 1024 * 1024);
+            // Policy and credentials were snapshotted, but secret resolution and
+            // cancellation remain the same supported content-fetch path.
+            job.future = io.concurrent(Job.run, .{job}) catch {
+                job.destroy();
+                return;
+            };
+            slot.* = job;
+            return;
+        }
+    }
+};
+
 const PreparedDocumentSourceCache = struct {
     const SourceIdentity = [std.crypto.hash.sha2.Sha256.digest_length]u8;
     const ContentDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
@@ -13738,6 +13991,8 @@ const PreparedDocumentSourceCache = struct {
         }
 
         const alloc = self.allocator();
+        const fetch_timer = pipeline_metrics.start(.source_fetch);
+        defer fetch_timer.finish();
         const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
             alloc,
             config,
@@ -13966,6 +14221,8 @@ const PreparedDocumentSourceCache = struct {
         };
         variant.* = .{ .entry = entry, .decode_limits = decode_limits };
         variant.deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms);
+        const prepare_timer = pipeline_metrics.start(.pdf_prepare);
+        defer prepare_timer.finish();
         const prepared = self.prepare_pdf_session_fn(
             alloc,
             entry.content.data,
@@ -15254,6 +15511,15 @@ fn runGeneratedCatchUpQuanta(
     const max_preparation_items = generatedPreparationWindowItems();
     const max_source_bytes = generatedPreparationSourceBytes();
 
+    var preparation = DocumentPreparationPipeline{ .runtime = runtime, .guard = guard };
+    const previous_prefetch = runtime.document_prefetch;
+    runtime.document_prefetch = &preparation;
+    defer {
+        preparation.deinit();
+        runtime.document_prefetch = previous_prefetch;
+    }
+    var primed_through: usize = 0;
+    var primed_dependencies = false;
     var max_seen = runtime.applied_sequence;
     var last_processed: ?enrichment_worker.PendingDocumentGroup = null;
     for (pending) |group| {
@@ -15265,7 +15531,13 @@ fn runGeneratedCatchUpQuanta(
             owned.* = PreparedDocumentSourceCache.init(runtime);
             prepared_sources = owned;
         }
+        preparation.joinFor(group.doc_key);
+        // One future document is prepared while this document performs external
+        // inference. Durable publication and replay advancement remain serial.
+        if (group_index + 1 < pending.len and !replayCursorsCoverGroup(replay_cursor_assets, replay_cursor_dense, runtime.applied_sequence, pending[group_index + 1]))
+            try preparation.startNext(group, pending[group_index + 1], &request_plan_cache, prepared_sources.?);
         try processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, processed_request_count, guard, prepared_sources.?);
+        preparation.releaseFor(group.doc_key);
         last_processed = group;
         // Synchronous consumers have released their leases. Dense work owns
         // its prepared chunks; only deferred assets can still use source bytes.
@@ -20885,12 +21157,14 @@ test "PDF composite lease admits two future overlap windows atomically" {
 }
 
 fn renderPreparedPdfWindowBatchAlloc(
-    runtime: *EnrichmentRuntime,
+    runtime: anytype,
     session: *document_extraction_mod.PdfRenderSession,
     alloc: Allocator,
     plans: []const document_extraction_mod.PreparedPdfPageRenderPlan,
     initial_options: document_extraction_mod.PdfPageRenderBatchOptions,
 ) !document_extraction_mod.RenderedPdfPageBatch {
+    const render_timer = pipeline_metrics.start(.pdf_render);
+    defer render_timer.finish();
     const backend_runtime = runtime.backend_runtime orelse
         return try session.renderPreparedPagesBatchAlloc(alloc, plans, initial_options);
     var render_lane = backend_runtime.acquirePdfRenderLane() catch |err| switch (err) {
@@ -20913,12 +21187,14 @@ fn renderPreparedPdfWindowBatchAlloc(
 }
 
 fn renderPreparedPdfRasterWindowBatchAlloc(
-    runtime: *EnrichmentRuntime,
+    runtime: anytype,
     session: *document_extraction_mod.PdfRenderSession,
     alloc: Allocator,
     plans: []const document_extraction_mod.PreparedPdfPageRenderPlan,
     initial_options: document_extraction_mod.PdfPageRenderBatchOptions,
 ) !document_extraction_mod.RenderedPdfPageRasterBatch {
+    const render_timer = pipeline_metrics.start(.pdf_render);
+    defer render_timer.finish();
     const backend_runtime = runtime.backend_runtime orelse
         return try session.renderPreparedPagesRasterBatchAlloc(alloc, plans, initial_options);
     var render_lane = backend_runtime.acquirePdfRenderLane() catch |err| switch (err) {
@@ -20937,7 +21213,7 @@ fn renderPreparedPdfRasterWindowBatchAlloc(
 /// path, not an extra user-visible limit. Retry only rendering, once, after all
 /// workers joined; the configured ceiling and resource admission remain hard.
 fn renderAdmittedPdfWindowBatchAlloc(
-    runtime: *EnrichmentRuntime,
+    runtime: anytype,
     session: *document_extraction_mod.PdfRenderSession,
     lease: *PdfWindowCompositeLease,
     plans: []const document_extraction_mod.PreparedPdfPageRenderPlan,
@@ -20959,7 +21235,7 @@ fn renderAdmittedPdfWindowBatchAlloc(
     var admitted_options = options;
     admitted_options.scratch_growth = .{ .context = &growth, .max_bytes = max_scratch_bytes, .grow_fn = Growth.grow };
     const Render = struct {
-        runtime: *EnrichmentRuntime,
+        runtime: @TypeOf(runtime),
         session: *document_extraction_mod.PdfRenderSession,
         plans: []const document_extraction_mod.PreparedPdfPageRenderPlan,
         use_rasters: bool,
@@ -21313,7 +21589,7 @@ test "PDF render wave accepts partial serial grants without changing page plans"
 }
 
 fn renderRuntimePdfWindow(
-    runtime: *EnrichmentRuntime,
+    runtime: anytype,
     alloc: Allocator,
     producer: asset_producer_mod.Producer,
     session: *document_extraction_mod.PdfRenderSession,
@@ -21632,6 +21908,9 @@ const RuntimePdfRenderWindowPreparer = struct {
         if (self.lifecycle.isCancelled() or self.cancel_requested.load(.acquire)) return error.Canceled;
         self.coordinator.beginOperation(self.runtime.syncWaitTimeoutMs());
         self.coordinator.session.setCancellationProbe(self.cancellationProbe());
+        if (!speculative) if (self.runtime.document_prefetch) |pipeline| {
+            if (pipeline.takeWindow(self.source_fingerprint, self.producer_config_json, self.batch_policy, self.units, start_index, self.use_borrowed_rasters)) |window| return window;
+        };
         const available_bytes = try self.coordinator.availableRenderBytes();
         var policy = self.batch_policy;
         policy.defer_render_pressure = speculative;
@@ -29797,6 +30076,8 @@ fn flushGeneratedReplayWindowWithIdentity(
     completed_failure_fingerprint: u64,
 ) !void {
     if (window.isEmpty()) return;
+    const publication_timer = pipeline_metrics.start(.publication);
+    defer publication_timer.finish();
 
     if (!window.hasDerivedItems()) {
         try applyCoverageOutcomeTransitions(runtime, window.coverage_transitions.items);

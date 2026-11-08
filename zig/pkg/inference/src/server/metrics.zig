@@ -259,6 +259,7 @@ pub const Metrics = struct {
         try prometheus.write(self, writer);
         try self.extraction_v2.render(writer);
         try self.embedding_groups.render(writer);
+        try @import("antfly_readers").pipeline_metrics.writePrometheus(writer);
     }
 };
 

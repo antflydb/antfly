@@ -7443,6 +7443,8 @@ pub const NativeGenerationPipeline = struct {
         allow_resident_greedy_token: bool,
         capture_last_hidden: bool,
     ) !PrefillOutput {
+        const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
+        defer if (self.scheduler == null) phase_timer.finish();
         const allocator = self.allocator;
         // Private opt-in qualification only. Preserve admitted chunk shapes,
         // scheduler turns and the original final-logit projection.
@@ -8616,6 +8618,8 @@ pub const NativeGenerationPipeline = struct {
         on_token_ctx: ?*anyopaque,
         emitted_text: ?*StreamingTextState,
     ) !DecodeResult {
+        const phase_timer = @import("antfly_readers").pipeline_metrics.start(.decode);
+        defer if (self.scheduler == null) phase_timer.finish();
         const allocator = self.allocator;
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         var tokens_generated = initial_tokens_generated;
@@ -14111,6 +14115,14 @@ pub const NativeGenerationPipeline = struct {
         self: *NativeGenerationPipeline,
         claimed: []const runtime.scheduler.native_generate.StepItem,
     ) !StepForwardResult {
+        var has_prefill = false;
+        var has_decode = false;
+        for (claimed) |item| {
+            has_prefill = has_prefill or item.phase == .prefill;
+            has_decode = has_decode or item.phase == .decode;
+        }
+        const phase_timer = @import("antfly_readers").pipeline_metrics.start(if (has_prefill and has_decode) .mixed_step else if (has_prefill) .prefill else .decode);
+        defer phase_timer.finish();
         if (comptime build_options.enable_cuda) {
             if (self.lighton_cuda_execution_id != 0) {
                 var pure_decode = claimed.len >= 2 and claimed.len <= (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64);

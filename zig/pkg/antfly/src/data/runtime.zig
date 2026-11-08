@@ -2785,6 +2785,7 @@ pub const HealthSource = struct {
         try writeAsyncIndexingMetrics(writer, async_indexing_stats, replay_not_visible_skipped_by_index);
         try antfly.db.query_metrics.writePrometheus(writer);
         try antfly.db.enrichment_utf8_text.writePrometheus(writer);
+        try @import("antfly_readers").pipeline_metrics.writePrometheus(writer);
     }
 
     fn writeHotStandbyMetrics(self: *HealthSource, writer: *std.Io.Writer) !void {
