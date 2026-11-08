@@ -1552,27 +1552,6 @@ test "WS4-for-dense: a synchronous dense vector write lands in one native commit
     try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"marker\":\"seed\"}" }}, .sync_level = .write });
     try handle.db.runUntilIdle();
 
-    // The very first write ever made into a brand-new dense index has a
-    // pre-existing bootstrap quirk, independent of inline publication
-    // (`denseEmbeddingWriteEligibleForInlinePublication`'s own
-    // `entry.index.generationRepairPending()` check guards the one
-    // version of this this change's own tests could reproduce, but
-    // `lite-write-amplification`'s 128-write "dense" diagnostic -- no
-    // explicit warm-up, every write a fresh key -- never sees that guard
-    // trigger either, so whatever actually causes it is not specific to
-    // skipping the slow path's checkpoint build): an exhaustive-coverage
-    // search (`search_effort: 1.0` below) right after that very first
-    // write can fail closed with `error.IndexRebuilding`
-    // (`error.IncompletePublishedSnapshot` inside HBC), regardless of
-    // whether that first write went through the inline path or the slow
-    // one. This warm-up write (not part of the measurement below) only
-    // needs to not be the index's absolute first write; it is not
-    // special beyond that.
-    try handle.db.batch(.{ .writes = &.{
-        .{ .key = "warmup-doc", .value = "{\"marker\":\"warmup-marker\",\"_embeddings\":{\"dv_idx\":[0.0,0.0]}}" },
-    }, .sync_level = .full_index });
-    try handle.db.runUntilIdle();
-
     const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
     const before_sequence = store.file.activeCheckpoint().commit_sequence;
 
@@ -1665,22 +1644,20 @@ test "WS4-for-dense round 2: an update or a delete falls back and still lands co
     const after_update_sequence = store.file.activeCheckpoint().commit_sequence;
     try std.testing.expect(after_update_sequence - before_update_sequence > 1);
 
-    // Not `search_effort: 1.0` here: that forces HBC's exhaustive-coverage
-    // (`.complete_snapshot`) search policy, which independently validates
-    // tree structure while scoring and has its own pre-existing dense-
-    // replacement issue unrelated to inline publication (both writes
-    // above take the slow path -- the first because a fresh index's
-    // checkpoint has never been built, the second because
-    // `overwritten_doc_keys` excludes it -- so inline publication's own
-    // code never runs in this sequence at all). Default-effort search is
-    // enough to prove the fallback's functional result (old vector gone,
-    // new one findable) without exercising that separate, pre-existing
-    // code path.
+    // An exhaustive search (`search_effort: 1.0`) must prove the fallback's
+    // functional result too (old vector gone, new one findable): HBC's
+    // `CompleteCoverageTracker` used to trip over a stale `native_catalog_
+    // backend` mirror left by a PRIOR inline-published write into this same
+    // fresh index (`HBCIndex.installStagedWrite` never called
+    // `applyExternallyCommittedMutations`, so the mirror never learned about
+    // mutations that only ever landed through the primary write's own
+    // native commit) -- fixed directly in `installStagedWrite`.
     {
         var result = try handle.db.search(allocator, .{
             .index_name = "dv_idx",
             .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 1.0 }, .k = 1 } },
             .limit = 1,
+            .search_effort = 1.0,
         });
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.hits.len);
