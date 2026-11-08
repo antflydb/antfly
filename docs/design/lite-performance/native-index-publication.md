@@ -115,8 +115,14 @@ not inferred from a generic Busy error or an uncertain publication. Cancellation
 returns directly through suspended lifetime cleanup without another writer
 admission; ordinary cancellation/conflict and unknown-outcome handling remains.
 Autocommit reuses normalization's matching row authority rather than projecting
-the same document again. Attempt arenas reuse their retained capacity across
-refusals instead of accumulating allocations in the enclosing SQL arena.
+the same document again. One attempt arena reuses its retained capacity across
+refusals and reclaims through the original request quota, avoiding redundant
+arena growth and accumulation in the enclosing SQL region.
+
+CHECK-only catalogs retain ordinary packed-row validation, including repairs
+while existing coverage is invalid. Every replacement must still satisfy all
+current CHECKs. Active coordinated UNIQUE/FK bindings retain their activation
+fence; explicit coordinated repairs keep their existing guarded authority.
 
 Eligible SQL text updates complete the same owned foreground publication as
 document batches. Artifact staging and replacement assembly run after releasing
@@ -128,8 +134,8 @@ selected its final conflict postimages; merely staged or unused candidates do
 not build text artifacts. The exact postimage witness survives packed-row
 transfer without granting another transfer. Both text metadata and source
 progress join primary/constraint effects in the native atomic group. Detached
-staging debits the same remaining admission budget. A
-lost optional text-source witness permits one canonical asynchronous fallback
+staging debits the same remaining admission budget. A lost optional text-source
+witness permits one canonical asynchronous fallback
 with the same owned SQL postimages and predicates, rather than reevaluating SQL
 or repeatedly preparing against a moving source tip. Native-backed hosted Lite
 handles also use this handoff when their logical identity supports exact checks.
@@ -140,6 +146,11 @@ there is no separate coordinator transaction ID. Confirmed primary success
 remains committed if later visibility or activation work fails. Other
 coordinator-backed paths retain transaction-ID reconciliation. SDK decoders
 already support both optional fields.
+
+The [native SQL publication receipt](sql-native-publication-debug.json) records
+the exact-credit, cancellation, CHECK repair and shared text-publication
+regressions, full Debug and SDK gates, and current-library checkpoint counts.
+It does not establish end-to-end or optimized performance acceptance.
 
 ## Grouped-source publication
 
