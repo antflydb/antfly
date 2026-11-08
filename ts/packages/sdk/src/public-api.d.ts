@@ -17617,6 +17617,12 @@ export interface components {
              * @default 0
              */
             reembed_budget_ms?: number;
+            /**
+             * @description How vectors that cannot be re-embedded from text (images, audio windows, model outputs) are kept once the graph covers them. "full" keeps the stored float32 vector. "int8" replaces it with a stub holding an int8 copy (about a quarter of the size), read back instead of re-embedding. Requires "auto" or "transient" storage.
+             * @default full
+             * @enum {string}
+             */
+            media_vectors?: "full" | "int8";
         };
         /**
          * @description How an HBC dense index with quantization_bits above 1 uses its extended codes (not

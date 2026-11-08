@@ -10904,6 +10904,8 @@ pub const LeannIndexConfig = struct {
     batch_size: ?i64 = null,
     /// Time a query may spend re-embedding candidates whose stored vectors were dropped. Once spent, the remaining candidates are ranked by their code estimates instead, so the query still returns results. 0 means no limit.
     reembed_budget_ms: ?i64 = null,
+    /// How vectors that cannot be re-embedded from text (images, audio windows, model outputs) are kept once the graph covers them. "full" keeps the stored float32 vector. "int8" replaces it with a stub holding an int8 copy (about a quarter of the size), read back instead of re-embedding. Requires "auto" or "transient" storage.
+    media_vectors: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -10914,6 +10916,7 @@ pub const LeannIndexConfig = struct {
         .{ "bound_scale", "bound_scale", true },
         .{ "batch_size", "batch_size", true },
         .{ "reembed_budget_ms", "reembed_budget_ms", true },
+        .{ "media_vectors", "media_vectors", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -10952,6 +10955,10 @@ pub const LeannIndexConfig = struct {
         }
         if (self.reembed_budget_ms) |value| {
             try jw.objectField("reembed_budget_ms");
+            try jw.write(value);
+        }
+        if (self.media_vectors) |value| {
+            try jw.objectField("media_vectors");
             try jw.write(value);
         }
         try jw.endObject();
