@@ -916,7 +916,7 @@ from this change.
 Owned text/ordered-row readiness now selects the retained native cut through the
 same preparation path as queries. It retains credential/store/definition checks,
 reader protection, cut expiry and accepted-WAL visibility while avoiding fresh
-live-source catalog discovery. Readiness does not contribute query-phase metrics.
+live-source catalog discovery. This additional readiness preparation does not contribute query-phase metrics.
 Tables containing vector or materialization definitions retain strict live-source
 qualification. Manifest loading transfers its verified allocation into the decoded
 owner, and source planning transfers its manifest into the serving source instead
