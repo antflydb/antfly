@@ -122,6 +122,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "inference = Path.cwd().name == 'inference'\n"
                 "library = 'lib/libantfly.dylib' if any(arg.startswith('-Dtarget=aarch64-macos') for arg in args) else 'lib/libantfly.so'\n"
                 "names = (() if '--build-file' in args else ('bin/antfly',)) + (library, 'include/antfly.h')\n"
+                "if '-Dapple-providers=true' in args: names += ('lib/libantfly-apple.dylib',)\n"
                 "for name in names:\n"
                 "    path = prefix / name\n"
                 "    path.parent.mkdir(parents=True, exist_ok=True)\n"
@@ -181,16 +182,32 @@ pub fn build(b: *std.Build) void {
                 if entry["archive_os"] == "Darwin"
             )
             compile_failed = False
-            for product, target, steps, license_name in (
-                ("embedded", darwin_target, ["libantfly"], "LICENSES/Apache-2.0.txt"),
-                ("server", darwin_target, ["antfly", "libantfly"], "LICENSE"),
-                ("server", darwin_target, ["antfly", "libantfly"], "LICENSE"),
+            compiled_targets = set()
+            for product, target, steps, license_name, apple_enabled in (
+                (
+                    "embedded",
+                    darwin_target,
+                    ["libantfly"],
+                    "LICENSES/Apache-2.0.txt",
+                    False,
+                ),
+                ("server", darwin_target, ["antfly", "libantfly"], "LICENSE", False),
+                ("server", darwin_target, ["antfly", "libantfly"], "LICENSE", False),
                 (
                     "server",
                     "aarch64-linux-musl",
                     ["antfly", "libantfly"],
                     "LICENSE",
+                    False,
                 ),
+                (
+                    "embedded",
+                    darwin_target,
+                    ["libantfly"],
+                    "LICENSES/Apache-2.0.txt",
+                    True,
+                ),
+                ("server", darwin_target, ["antfly", "libantfly"], "LICENSE", True),
             ):
                 if compile_failed:
                     break  # Later cases require this first provider/cache to exist.
@@ -213,6 +230,7 @@ pub fn build(b: *std.Build) void {
                             product + ".tar.gz",
                             "--out-dir",
                             str(root / "out"),
+                            *([] if apple_enabled else ["--apple-providers", "false"]),
                         ],
                         env={
                             **os.environ,
@@ -233,18 +251,12 @@ pub fn build(b: *std.Build) void {
                         steps,
                         [arg for arg in args if arg in ("libantfly", "antfly", "grep")],
                     )
-                    self.assertEqual(
-                        product == "server", "-Dapple-providers=false" in args
+                    self.assertIn(
+                        "-Dapple-providers=" + str(apple_enabled).lower(), args
                     )
-                    if product == "server":
-                        self.assertIn(
-                            "-Dapple-ocr=" + ("true" if "macos" in target else "false"),
-                            args,
-                        )
-                    else:
-                        self.assertFalse(
-                            any(arg.startswith("-Dapple-ocr=") for arg in args)
-                        )
+                    self.assertFalse(
+                        any(arg.startswith("-Dapple-ocr=") for arg in args)
+                    )
                     self.assertNotIn("--max-rss-cap", args)
                     project_cache = Path(args[args.index("--cache-dir") + 1])
                     self.assertEqual(project_cache, root / ".zig-cache/release")
@@ -259,15 +271,12 @@ pub fn build(b: *std.Build) void {
                     self.assertEqual(args[args.index("--summary") + 1], "all")
                     if probe_zig:
                         summary = (build_dir / "cache-summary.txt").read_text()
-                        expected = (
-                            "success"
-                            if product == "embedded" or target != darwin_target
-                            else "cached"
-                        )
+                        expected = "cached" if target in compiled_targets else "success"
                         self.assertRegex(
                             summary,
                             rf"compile lib release-cache-probe fast \S+ {expected}",
                         )
+                    compiled_targets.add(target)
                     with tarfile.open(root / "out" / (product + ".tar.gz")) as archive:
                         self.assertFalse(
                             any("antfly-grep" in name for name in archive.getnames())
