@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -11,7 +12,64 @@ if TYPE_CHECKING:
     from .client import AntflyClient
 
 
+# Non-GET actions that only read; they never take an Idempotency-Key.
+_READ_ONLY_POSTS = frozenset(
+    {
+        "changes",
+        "supersession_candidates",
+        "evaluation_tasks",
+        "recall",
+        "brief",
+        "consolidate",
+        "explain",
+        "entity_candidates",
+        "entity_view",
+    }
+)
+
+# Fields accepted by POST /recall (MemoryRecallRequest), besides ``query``.
+_RECALL_FIELDS = frozenset(
+    {
+        "graph",
+        "relationship",
+        "target_id",
+        "missing_relationship",
+        "subject",
+        "predicate",
+        "scope",
+        "environment",
+        "task",
+        "kind",
+        "valid_at",
+        "known_at",
+        "include_history",
+        "include_provisional",
+        "limit",
+        "token_budget",
+        "cursor",
+        "embedding",
+        "embedding_model",
+        "utility_weight",
+    }
+)
+
+
+def _new_key() -> str:
+    return uuid.uuid4().hex
+
+
+def _compact(**fields: Any) -> dict[str, Any]:
+    return {name: value for name, value in fields.items() if value is not None}
+
+
 class MemoryOperations:
+    """Native agent memory API.
+
+    The simple path is ``remember`` -> ``brief``/``recall`` -> ``outcome``. Mutations
+    get an auto-generated Idempotency-Key unless one is passed; pass your own when a
+    retry must be deduplicated across process restarts.
+    """
+
     def __init__(self, client: AntflyClient) -> None:
         self._client = client
 
@@ -19,13 +77,13 @@ class MemoryOperations:
         self,
         space: str,
         *,
-        idempotency_key: str,
+        idempotency_key: str | None = None,
         config: dict[str, Any] | None = None,
         database: str = "default",
         namespace: str = "public",
     ) -> Any:
-        if not idempotency_key:
-            raise ValueError("memory mutations require idempotency_key")
+        """Create a memory space; returns the operation receipt."""
+        idempotency_key = idempotency_key or _new_key()
         return self._client._request(
             "POST",
             "/memory/v1/spaces",
@@ -44,12 +102,17 @@ class MemoryOperations:
         *,
         body: dict[str, Any] | None = None,
         id: str = "",
-        idempotency_key: str = "",
+        idempotency_key: str | None = None,
         database: str = "default",
         namespace: str = "public",
         branch: str = "",
     ) -> Any:
-        """Use the same action names as the native embedded memory envelope."""
+        """Run a native action by its embedded envelope name (the Zig ``Action`` enum).
+
+        Mutations send ``idempotency_key`` or, when omitted, a generated one. Reads
+        (GET routes and read-only POSTs such as recall, brief and consolidate) never
+        send one. GET bodies are sent as query parameters.
+        """
         routes = {
             "changes": ("POST", "/changes"),
             "lineage": ("GET", "/lineage"),
@@ -74,6 +137,9 @@ class MemoryOperations:
             "observe": ("POST", "/observations"),
             "assertions": ("POST", "/assertions"),
             "recall": ("POST", "/recall"),
+            "brief": ("POST", "/brief"),
+            "consolidate": ("POST", "/consolidation"),
+            "pin": ("POST", "/pins"),
             "explain": ("POST", "/memories/" + quote(id, safe="") + "/explain" if id else "/explain"),
             "list": ("GET", "/memories"),
             "get": ("GET", "/memories/" + quote(id, safe="")),
@@ -104,24 +170,271 @@ class MemoryOperations:
         if action not in routes:
             raise ValueError("unknown native memory action")
         method, suffix = routes[action]
-        if (
-            method != "GET"
-            and action
-            not in (
-                "changes",
-                "supersession_candidates",
-                "evaluation_tasks",
-                "recall",
-                "explain",
-                "entity_candidates",
-                "entity_view",
-            )
-            and not idempotency_key
-        ):
-            raise ValueError("memory mutations require idempotency_key")
+        if method == "GET" or action in _READ_ONLY_POSTS:
+            idempotency_key = None
+        else:
+            idempotency_key = idempotency_key or _new_key()
         headers = {"X-Antfly-Database": database, "X-Antfly-Namespace": namespace, "X-Antfly-Memory-Branch": branch}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         kwargs: dict[str, Any] = {"headers": headers}
         kwargs["params" if method == "GET" else "json"] = body or {}
         return self._client._request(method, "/memory/v1/spaces/" + quote(space, safe="") + suffix, **kwargs)
+
+    # Convenience wrappers over ``execute``. Each accepts ``database``, ``namespace``
+    # and ``branch`` scope keywords; body fields left as ``None`` are omitted so the
+    # server applies its defaults.
+
+    def brief(
+        self,
+        space: str,
+        *,
+        limit: int | None = None,
+        token_budget: int | None = None,
+        scope: str | None = None,
+        task: str | None = None,
+        environment: str | None = None,
+        include_provisional: bool | None = None,
+        database: str = "default",
+        namespace: str = "public",
+        branch: str = "",
+    ) -> Any:
+        """Load a small, token-bounded context at session start (read-only).
+
+        Returns current, active memories ranked for usefulness (pinned ones always
+        included), the subjects available for deeper ``recall``, and guidance.
+        Server defaults are ``limit=16`` and ``token_budget=1024``.
+        """
+        body = _compact(
+            scope=scope,
+            task=task,
+            environment=environment,
+            include_provisional=include_provisional,
+            limit=limit,
+            token_budget=token_budget,
+        )
+        return self.execute(space, "brief", body=body, database=database, namespace=namespace, branch=branch)
+
+    def recall(
+        self,
+        space: str,
+        *,
+        query: str = "",
+        database: str = "default",
+        namespace: str = "public",
+        branch: str = "",
+        **filters: Any,
+    ) -> Any:
+        """Search memory for ``query`` (read-only).
+
+        ``filters`` are MemoryRecallRequest fields such as ``limit``, ``token_budget``,
+        ``scope``, ``kind``, ``subject``, ``known_at`` or ``utility_weight`` (0..1,
+        how much recorded outcomes boost ranking).
+        """
+        unknown = sorted(set(filters) - _RECALL_FIELDS)
+        if unknown:
+            raise TypeError("unknown recall fields: " + ", ".join(unknown))
+        body = {"query": query, **_compact(**filters)}
+        return self.execute(space, "recall", body=body, database=database, namespace=namespace, branch=branch)
+
+    def remember(
+        self,
+        space: str,
+        text: str,
+        *,
+        evidence_id: str | None = None,
+        source_id: str = "agent",
+        assertions: list[dict[str, Any]] | None = None,
+        thread_id: str | None = None,
+        visibility: str | None = None,
+        idempotency_key: str | None = None,
+        database: str = "default",
+        namespace: str = "public",
+        branch: str = "",
+    ) -> Any:
+        """Record ``text`` as one evidence item (an observation).
+
+        Pass ``assertions`` to store claims that cite it (or let a space configured
+        for model extraction derive them). ``evidence_id`` is generated when omitted;
+        evidence IDs name immutable source versions.
+        """
+        evidence = _compact(
+            id=evidence_id or _new_key(),
+            source_id=source_id,
+            text=text,
+            thread_id=thread_id,
+            visibility=visibility,
+        )
+        body: dict[str, Any] = {"evidence": [evidence]}
+        if assertions is not None:
+            body["assertions"] = assertions
+        return self.execute(
+            space,
+            "observe",
+            body=body,
+            idempotency_key=idempotency_key,
+            database=database,
+            namespace=namespace,
+            branch=branch,
+        )
+
+    def outcome(
+        self,
+        space: str,
+        *,
+        id: str,
+        task_id: str,
+        success: bool,
+        used_memory_ids: list[str],
+        detail: str = "",
+        idempotency_key: str | None = None,
+        database: str = "default",
+        namespace: str = "public",
+        branch: str = "",
+    ) -> Any:
+        """Report whether a task that used ``used_memory_ids`` succeeded.
+
+        Outcomes feed memory utility, which ranks ``brief`` and ``recall``
+        (with ``utility_weight``).
+        """
+        body = {"id": id, "task_id": task_id, "success": success, "used_memory_ids": used_memory_ids}
+        if detail:
+            body["detail"] = detail
+        return self.execute(
+            space,
+            "outcome",
+            body=body,
+            idempotency_key=idempotency_key,
+            database=database,
+            namespace=namespace,
+            branch=branch,
+        )
+
+    def consolidate(
+        self,
+        space: str,
+        *,
+        limit: int | None = None,
+        stale_after_ms: int | None = None,
+        database: str = "default",
+        namespace: str = "public",
+        branch: str = "",
+    ) -> Any:
+        """Review memory health (duplicates, conflicts, stale claims) without changing anything.
+
+        Findings carry a ``suggested_action``; apply them with ``correct``, ``pin``
+        or ``forget``.
+        """
+        body = _compact(limit=limit, stale_after_ms=stale_after_ms)
+        return self.execute(space, "consolidate", body=body, database=database, namespace=namespace, branch=branch)
+
+    def pin(
+        self,
+        space: str,
+        id: str,
+        *,
+        reason: str = "",
+        idempotency_key: str | None = None,
+        database: str = "default",
+        namespace: str = "public",
+        branch: str = "",
+    ) -> Any:
+        """Pin memory ``id`` so ``brief`` always includes it."""
+        return self._set_pin(space, id, True, reason, idempotency_key, database, namespace, branch)
+
+    def unpin(
+        self,
+        space: str,
+        id: str,
+        *,
+        reason: str = "",
+        idempotency_key: str | None = None,
+        database: str = "default",
+        namespace: str = "public",
+        branch: str = "",
+    ) -> Any:
+        """Remove the pin from memory ``id``."""
+        return self._set_pin(space, id, False, reason, idempotency_key, database, namespace, branch)
+
+    def _set_pin(
+        self,
+        space: str,
+        id: str,
+        pinned: bool,
+        reason: str,
+        idempotency_key: str | None,
+        database: str,
+        namespace: str,
+        branch: str,
+    ) -> Any:
+        body: dict[str, Any] = {"id": id, "pinned": pinned}
+        if reason:
+            body["reason"] = reason
+        return self.execute(
+            space,
+            "pin",
+            body=body,
+            idempotency_key=idempotency_key,
+            database=database,
+            namespace=namespace,
+            branch=branch,
+        )
+
+    def correct(
+        self,
+        space: str,
+        id: str,
+        *,
+        expected_revision: int,
+        lifecycle: str,
+        reason: str,
+        stability: str | None = None,
+        evidence: list[dict[str, Any]] | None = None,
+        idempotency_key: str | None = None,
+        database: str = "default",
+        namespace: str = "public",
+        branch: str = "",
+    ) -> Any:
+        """Change a memory's lifecycle (active, disputed, superseded, retracted) or stability."""
+        body = _compact(
+            id=id,
+            expected_revision=expected_revision,
+            lifecycle=lifecycle,
+            stability=stability,
+            reason=reason,
+            evidence=evidence,
+        )
+        return self.execute(
+            space,
+            "correct",
+            body=body,
+            idempotency_key=idempotency_key,
+            database=database,
+            namespace=namespace,
+            branch=branch,
+        )
+
+    def forget(
+        self,
+        space: str,
+        *,
+        evidence_ids: list[str] | None = None,
+        assertion_ids: list[str] | None = None,
+        source_ids: list[str] | None = None,
+        all: bool | None = None,
+        idempotency_key: str | None = None,
+        database: str = "default",
+        namespace: str = "public",
+        branch: str = "",
+    ) -> Any:
+        """Erase evidence, assertions or whole sources (``all=True`` erases the space's memory)."""
+        body = _compact(evidence_ids=evidence_ids, assertion_ids=assertion_ids, source_ids=source_ids, all=all)
+        return self.execute(
+            space,
+            "forget",
+            body=body,
+            idempotency_key=idempotency_key,
+            database=database,
+            namespace=namespace,
+            branch=branch,
+        )

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Memory transport tests cover identity, scope and durable operation keys."""
 
+import json
+
 import httpx
 import pytest
 
@@ -34,12 +36,22 @@ def test_memory_preserves_authenticated_transport_and_catalog_scope() -> None:
     assert seen[2].url.path == "/memory/v1/spaces/team/maintenance"
 
 
-def test_memory_mutations_require_keys_and_unknown_actions_fail_locally() -> None:
+def test_memory_mutations_generate_keys_and_unknown_actions_fail_locally() -> None:
     client = AntflyClient("http://memory.test")
-    with pytest.raises(ValueError, match="idempotency_key"):
+    seen = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={})
+
+    with httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(respond)) as http:
+        client._client.set_httpx_client(http)
         client.memory.create("team", idempotency_key="")
-    with pytest.raises(ValueError, match="idempotency_key"):
         client.memory.execute("team", "forget")
+        client.memory.execute("team", "forget")
+    keys = [request.headers["idempotency-key"] for request in seen]
+    assert all(len(key) == 32 for key in keys)
+    assert len(set(keys)) == 3
     with pytest.raises(ValueError, match="unknown"):
         client.memory.execute("team", "invent")
 
@@ -177,3 +189,151 @@ def test_memory_branch_feed_supersession_and_evaluation_share_authenticated_tran
     assert seen[2].url.raw_path == b"/memory/v1/spaces/team/evaluations/run%2Fa/tasks"
     assert seen[3].url.raw_path == b"/memory/v1/spaces/team/supersession-proposals/pair%2Fa/verdict"
     assert seen[3].headers["idempotency-key"] == "defer"
+
+
+def _recording_client() -> tuple[AntflyClient, list[httpx.Request], httpx.Client]:
+    client = AntflyClient("http://memory.test", token="agent")
+    seen: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={})
+
+    http = httpx.Client(
+        base_url=client.base_url,
+        headers=client._client.get_httpx_client().headers,
+        transport=httpx.MockTransport(respond),
+    )
+    client._client.set_httpx_client(http)
+    return client, seen, http
+
+
+def test_brief_and_consolidate_are_read_only_posts() -> None:
+    client, seen, http = _recording_client()
+    with http:
+        client.memory.execute("team", "brief", body={"limit": 4}, idempotency_key="ignored")
+        client.memory.execute("team", "consolidate")
+        client.memory.brief("team")
+        client.memory.brief("team", limit=8, token_budget=512, scope="repo", include_provisional=False, branch="fork")
+        client.memory.consolidate("team", limit=32, stale_after_ms=2592000000, database="projects")
+    assert [request.method for request in seen] == ["POST"] * 5
+    assert [request.url.path for request in seen] == [
+        "/memory/v1/spaces/team/brief",
+        "/memory/v1/spaces/team/consolidation",
+        "/memory/v1/spaces/team/brief",
+        "/memory/v1/spaces/team/brief",
+        "/memory/v1/spaces/team/consolidation",
+    ]
+    assert all("idempotency-key" not in request.headers for request in seen)
+    assert json.loads(seen[2].content) == {}
+    assert json.loads(seen[3].content) == {
+        "scope": "repo",
+        "include_provisional": False,
+        "limit": 8,
+        "token_budget": 512,
+    }
+    assert seen[3].headers["x-antfly-memory-branch"] == "fork"
+    assert json.loads(seen[4].content) == {"limit": 32, "stale_after_ms": 2592000000}
+    assert seen[4].headers["x-antfly-database"] == "projects"
+    assert seen[4].headers["authorization"] == "Bearer agent"
+
+
+def test_recall_passes_known_fields_and_rejects_unknown() -> None:
+    client, seen, http = _recording_client()
+    with http:
+        client.memory.recall("team", query="deploy", subject="production", utility_weight=0.5, limit=None)
+        client.memory.recall("team", namespace="agents")
+        with pytest.raises(TypeError, match="utilty"):
+            client.memory.recall("team", query="x", utilty=0.5)
+    assert seen[0].url.path == "/memory/v1/spaces/team/recall"
+    assert "idempotency-key" not in seen[0].headers
+    assert json.loads(seen[0].content) == {"query": "deploy", "subject": "production", "utility_weight": 0.5}
+    assert json.loads(seen[1].content) == {"query": ""}
+    assert seen[1].headers["x-antfly-namespace"] == "agents"
+    assert len(seen) == 2
+
+
+def test_simple_path_mutations_generate_or_pass_through_keys() -> None:
+    client, seen, http = _recording_client()
+    with http:
+        client.memory.remember("team", "Production deploys with Terraform.")
+        client.memory.remember(
+            "team",
+            "Runbook v2",
+            evidence_id="runbook-2",
+            source_id="runbook",
+            thread_id="t1",
+            visibility="team",
+            assertions=[{"id": "a"}],
+            idempotency_key="observe-1",
+            database="projects",
+            namespace="agents",
+            branch="fork",
+        )
+        client.memory.outcome("team", id="o1", task_id="task", success=True, used_memory_ids=["a"])
+        client.memory.outcome(
+            "team", id="o2", task_id="task", success=False, used_memory_ids=[], detail="failed", idempotency_key="o2"
+        )
+        client.memory.pin("team", "claim/a", reason="always needed")
+        client.memory.unpin("team", "claim/a", idempotency_key="unpin-a")
+        client.memory.correct("team", "a", expected_revision=3, lifecycle="retracted", reason="wrong")
+        client.memory.forget("team", source_ids=["runbook"])
+    assert [request.url.path.rsplit("/", 1)[1] for request in seen] == [
+        "observations",
+        "observations",
+        "outcomes",
+        "outcomes",
+        "pins",
+        "pins",
+        "corrections",
+        "forget",
+    ]
+    generated = [seen[i].headers["idempotency-key"] for i in (0, 2, 4, 6, 7)]
+    assert all(len(key) == 32 for key in generated)
+    assert len(set(generated)) == len(generated)
+    assert seen[1].headers["idempotency-key"] == "observe-1"
+    assert seen[3].headers["idempotency-key"] == "o2"
+    assert seen[5].headers["idempotency-key"] == "unpin-a"
+
+    first = json.loads(seen[0].content)
+    assert first["evidence"][0]["text"] == "Production deploys with Terraform."
+    assert first["evidence"][0]["source_id"] == "agent"
+    assert len(first["evidence"][0]["id"]) == 32
+    assert set(first) == {"evidence"} and set(first["evidence"][0]) == {"id", "source_id", "text"}
+    assert json.loads(seen[1].content) == {
+        "evidence": [
+            {"id": "runbook-2", "source_id": "runbook", "text": "Runbook v2", "thread_id": "t1", "visibility": "team"}
+        ],
+        "assertions": [{"id": "a"}],
+    }
+    assert seen[1].headers["x-antfly-database"] == "projects"
+    assert seen[1].headers["x-antfly-namespace"] == "agents"
+    assert seen[1].headers["x-antfly-memory-branch"] == "fork"
+    assert json.loads(seen[2].content) == {"id": "o1", "task_id": "task", "success": True, "used_memory_ids": ["a"]}
+    assert json.loads(seen[3].content)["detail"] == "failed"
+    assert json.loads(seen[4].content) == {"id": "claim/a", "pinned": True, "reason": "always needed"}
+    assert json.loads(seen[5].content) == {"id": "claim/a", "pinned": False}
+    assert json.loads(seen[6].content) == {
+        "id": "a",
+        "expected_revision": 3,
+        "lifecycle": "retracted",
+        "reason": "wrong",
+    }
+    assert json.loads(seen[7].content) == {"source_ids": ["runbook"]}
+
+
+def test_generated_client_exposes_brief_consolidation_and_pins() -> None:
+    from antfly.client_generated.api.memory import (
+        brief_memory,
+        consolidate_memory,
+        get_memory_brief,
+        pin_memory,
+        put_memory_space,
+    )
+    from antfly.client_generated.models.memory_brief_request import MemoryBriefRequest
+    from antfly.client_generated.models.memory_pin import MemoryPin
+
+    for module in (brief_memory, consolidate_memory, get_memory_brief, pin_memory, put_memory_space):
+        assert callable(module.sync_detailed)
+    assert MemoryPin(id="a").to_dict()["id"] == "a"
+    assert MemoryBriefRequest(limit=4).to_dict()["limit"] == 4

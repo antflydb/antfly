@@ -20126,6 +20126,146 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     try std.testing.expectEqual(@as(u16, 200), listed.status);
 }
 
+test "native memory brief, consolidation, pins and the agent MCP profile" {
+    const a = std.testing.allocator;
+    const module = @import("memory.zig");
+    const adapters = @import("protocol_adapters.zig");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("native-memory-layers");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const context: module.memory.Context = .{ .principal = "local", .admin = true, .now_ms = 1, .space = "team" };
+    var native: module.engine.Native(db_mod.DB) = .{ .db = &db, .context = context };
+    const created = try (module.memory.Service{ .backend = native.backend(), .context = context }).execute(a, .create, "", "{}", "create");
+    a.free(created);
+    var reads = table_reads.BoundTableReadSource.init("memory_team", 7002, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("memory_team", &db);
+    var status_source = SchemaUpdateStatusSource{ .table_name = "memory_team" };
+    var api = ApiHttpServer.init(a, .{}, status_source.memoryIface(), reads.source(), writes.source());
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.initWithConfig(a, threaded.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+
+    const observe_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/observations", .{base});
+    defer a.free(observe_url);
+    const body =
+        \\{"evidence":[{"id":"e1","source_id":"note","source_version":"1","text":"Deploys require a change ticket"}],"assertions":[{"id":"ticket","subject":"deploys","predicate":"requires","value":"ticket","kind":"constraint","statement":"Deploys require a change ticket","evidence":[{"id":"e1"}]},{"id":"guess","subject":"deploys","predicate":"owner","value":"infra","stability":"provisional","statement":"Infra probably owns deploys","evidence":[{"id":"e1"}]}]}
+    ;
+    var observed = try requestWithRetry(&client, threaded.io(), .POST, observe_url, body, &.{ .{ "content-type", "application/json" }, .{ "idempotency-key", "observe" } }, 20);
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), observed.status.code);
+
+    const brief_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/brief?limit=4&token_budget=2048", .{base});
+    defer a.free(brief_url);
+    var brief = try requestWithRetry(&client, threaded.io(), .GET, brief_url, "", &.{}, 20);
+    defer brief.deinit();
+    try std.testing.expectEqual(@as(u16, 200), brief.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, brief.body.?, "\"id\":\"ticket\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, brief.body.?, "\"id\":\"guess\"") == null);
+
+    const pins_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/pins", .{base});
+    defer a.free(pins_url);
+    var unkeyed = try requestWithRetry(&client, threaded.io(), .POST, pins_url, "{\"id\":\"ticket\"}", &.{.{ "content-type", "application/json" }}, 20);
+    defer unkeyed.deinit();
+    try std.testing.expectEqual(@as(u16, 400), unkeyed.status.code);
+    var pinned = try requestWithRetry(&client, threaded.io(), .POST, pins_url, "{\"id\":\"ticket\"}", &.{ .{ "content-type", "application/json" }, .{ "idempotency-key", "pin" } }, 20);
+    defer pinned.deinit();
+    try std.testing.expectEqual(@as(u16, 200), pinned.status.code);
+
+    const review_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/consolidation", .{base});
+    defer a.free(review_url);
+    var review = try requestWithRetry(&client, threaded.io(), .POST, review_url, "{}", &.{.{ "content-type", "application/json" }}, 20);
+    defer review.deinit();
+    try std.testing.expectEqual(@as(u16, 200), review.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, review.body.?, "\"kind\":\"unverified\",\"memory_ids\":[\"guess\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, review.body.?, "\"pinned\":1") != null);
+
+    var initialized = try adapters.executeMemoryMcpProfileRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp/agent",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"memory-agent-test\",\"version\":\"1\"}}}",
+    }, @as(?AuthenticatedIdentity, null), .agent);
+    defer initialized.deinit(a);
+    const session_id = for (initialized.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) break header.value;
+    } else return error.TestExpectedEqual;
+    var listed = try adapters.executeMemoryMcpProfileRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp/agent",
+        .session_id = session_id,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}",
+    }, @as(?AuthenticatedIdentity, null), .agent);
+    defer listed.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), listed.status);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "memory_brief") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "memory_outcome") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "memory_fork_lineage") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "memory_review_entity") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "Start here each session") != null);
+
+    // Agent writes may omit idempotency_key; an identical retry replays.
+    const outcome_call =
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_outcome","arguments":{"space":"team","body":{"id":"o1","task_id":"deploy","success":true,"used_memory_ids":["ticket"]}}}}
+    ;
+    inline for (0..2) |_| {
+        var recorded = try adapters.executeMemoryMcpProfileRequest(&api, .{ .method = .post, .endpoint_path = "/memory/v1/mcp/agent", .session_id = session_id, .body = outcome_call }, @as(?AuthenticatedIdentity, null), .agent);
+        defer recorded.deinit(a);
+        try std.testing.expectEqual(@as(u16, 200), recorded.status);
+        try std.testing.expect(std.mem.indexOf(u8, recorded.body, "isError\":true") == null);
+        try std.testing.expect(std.mem.indexOf(u8, recorded.body, "succeeded") != null);
+    }
+    var agent_brief = try adapters.executeMemoryMcpProfileRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp/agent",
+        .session_id = session_id,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_brief\",\"arguments\":{\"space\":\"team\"}}}",
+    }, @as(?AuthenticatedIdentity, null), .agent);
+    defer agent_brief.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), agent_brief.status);
+    try std.testing.expect(std.mem.indexOf(u8, agent_brief.body, "successes") != null);
+
+    // The full catalog still requires explicit keys.
+    var full_init = try adapters.executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"memory-full-test\",\"version\":\"1\"}}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer full_init.deinit(a);
+    const full_session = for (full_init.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) break header.value;
+    } else return error.TestExpectedEqual;
+    var full_listed = try adapters.executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .session_id = full_session,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer full_listed.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, full_listed.body, "memory_fork_lineage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_listed.body, "memory_consolidate") != null);
+}
+
+test "native memory agent idempotency keys are content addressed" {
+    const adapters = @import("protocol_adapters.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"id\":\"o1\"}", .{});
+    const other = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"id\":\"o2\"}", .{});
+    const first = try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", body);
+    try std.testing.expectEqualStrings(first, try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", body));
+    try std.testing.expect(!std.mem.eql(u8, first, try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", other)));
+    try std.testing.expect(!std.mem.eql(u8, first, try adapters.memoryAgentIdempotencyKey(a, "outcome", "other", "", "", body)));
+    try std.testing.expect(first.len <= 256 and std.mem.startsWith(u8, first, "agent:"));
+}
+
 test "native memory catalog ownership denies generic and batched data admission" {
     const a = std.testing.allocator;
     var fixture: SchemaUpdateStatusSource = .{ .table_name = "memory_team" };

@@ -935,7 +935,7 @@ const Run = struct {
                 const page = try parse(t.RecallResult, self.a, try self.recall(input.recall));
                 const ranking = try self.a.alloc([]const u8, page.items.len);
                 for (page.items, ranking) |hit, *id| id.* = hit.memory.assertion.id;
-                return .{ .ranking = ranking };
+                return .{ .ranking = ranking, .token_upper_bound = page.token_upper_bound };
             },
         }
     }

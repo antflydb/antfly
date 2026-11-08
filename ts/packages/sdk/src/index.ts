@@ -541,7 +541,18 @@ export type {
 export { ChatGPTConnectionError } from "./client.js";
 export { AntflyHTTPError, AntflyResponseError } from "./errors.js";
 export type { AudioReadMetadata, AudioReadOptions, AudioReadSegment } from "./inference-types.js";
-export type { MemoryNumbers, MemoryPaths, MemorySchemas } from "./memory.js";
+export type {
+  MemoryCallOptions,
+  MemoryEpisodeQuery,
+  MemoryHistoryQuery,
+  MemoryListQuery,
+  MemoryNumbers,
+  MemoryPageQuery,
+  MemoryPaths,
+  MemoryRememberInput,
+  MemorySchemas,
+  MemoryScopeOptions,
+} from "./memory.js";
 export { parseMemoryJSON, stringifyMemoryJSON } from "./memory.js";
 export * from "./models.js";
 export type {

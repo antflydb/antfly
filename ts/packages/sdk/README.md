@@ -447,7 +447,29 @@ HTTP/S3 objects use a version-pinned `ChunkSourceReference`. See the
 [shared contract](../../../docs/plans/model-aware-media-chunking.md) for source
 security, rendering policies, limits and native database integration.
 
-## Native memory integer precision
+## Native memory
+
+```ts
+await client.memory.put("team");
+const { evidenceId } = await client.memory.remember("team", { text: "We deploy on Tuesdays." });
+const { data: brief } = await client.memory.brief("team", { token_budget: 800 });
+const { data: hits } = await client.memory.recall("team", { query: "deploy day" });
+await client.memory.outcome("team", {
+  id: "outcome-1",
+  task_id: "task-1",
+  success: true,
+  used_memory_ids: ["memory-id"],
+});
+```
+
+Mutating helpers (`remember`, `observe`, `outcome`, `pin`, `unpin`, `configure`,
+`maintain`, ...) generate an `Idempotency-Key` UUID unless you pass
+`{ idempotencyKey }`; pass a stable key to retry safely. A string in that position
+is still accepted as the key. Every helper takes `{ database, namespace, branch }`
+to set `X-Antfly-Database`, `X-Antfly-Namespace`, and `X-Antfly-Memory-Branch`.
+`brief`, `consolidate`, and `recall` are reads and send no key.
+
+### Integer precision
 
 Use `client.memory` or the typed `client.memoryApi` for `/memory/v1` endpoints.
 Safe JSON integers remain JavaScript numbers; larger native resource IDs,
