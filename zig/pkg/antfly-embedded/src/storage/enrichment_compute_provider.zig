@@ -270,3 +270,11 @@ pub fn bufferDestroy(buffer: *abi.OwnedBytes) callconv(.c) void {
     if (buffer.ptr) |ptr| std.heap.c_allocator.free(ptr[0..@intCast(buffer.len)]);
     buffer.* = .{};
 }
+
+pub fn pipelineMetricsJson(version: u32, out_json: *abi.OwnedBytes) callconv(.c) abi.Status {
+    out_json.* = .{};
+    if (version != 1) return .invalid_abi;
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, @import("antfly_platform").document_pipeline_metrics.snapshot(), .{}) catch |err| return error_identity.statusFromError(err);
+    out_json.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}

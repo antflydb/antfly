@@ -2423,3 +2423,6 @@ pub extern fn antfly_storage_wal_append_idempotent(
     request: *const WalIdempotentAppendRequest,
     result: *WalIdempotentAppendResult,
 ) Status;
+
+/// Snapshot JSON uses an independent version so cache/budget ABI layouts do not change.
+pub extern fn antfly_storage_context_pipeline_metrics_json(context: ?*anyopaque, version: u32, out_json: *OwnedBytes) callconv(.c) Status;

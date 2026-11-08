@@ -53,6 +53,7 @@ pub fn main(init: std.process.Init) !void {
         read_calls: usize = 0,
         generator_calls: usize = 0,
         embed_calls: usize = 0,
+        revisioned: bool = false,
 
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
@@ -69,12 +70,15 @@ pub fn main(init: std.process.Init) !void {
         }
 
         fn modelCapabilities(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
             task: inference_work.Task,
         ) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
+                .model_revision = if (self.revisioned) @as([32]u8, @splat(1)) else null,
+                .model_revision_pinning = self.revisioned,
                 .task = task,
                 .input_modalities = switch (task) {
                     .read => .{ .image = true },
@@ -371,6 +375,9 @@ pub fn main(init: std.process.Init) !void {
         @import("storage/memory_budget.zig").smartResourceBudgets(0).options,
     );
     if (local.read_calls != 4) return error.IntegrationGroundingReaderWasNotInvoked;
+    local.revisioned = true;
+    try enrichment_runtime.runNativeDocumentPreparationIntegration(alloc, io_impl.io(), fixture.two_page_pdf, runtime.producer());
+    if (local.read_calls != 6) return error.IntegrationPrefetchRepeatedInference;
 }
 
 fn requiredEnv(name: [*:0]const u8) ![]const u8 {

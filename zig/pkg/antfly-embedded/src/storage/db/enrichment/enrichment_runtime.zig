@@ -4569,7 +4569,7 @@ fn scopedAssetProducer(
         .progress = if (comptime @TypeOf(runtime) == *EnrichmentRuntime)
             producer.invocation_context.progress orelse inference_request_context.ProgressSink{ .ptr = runtime, .update_fn = noteInferenceProgress }
         else
-            .{},
+            null,
     });
 }
 
@@ -13389,6 +13389,81 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
 /// Speculation owns no replay cursor, retry ticket, producer identity, or
 /// publication window. At most one future document is running; the second
 /// slot holds the joined current document until its ordered publication ends.
+/// Production-mode PDF probe: fetch and render a future document, consume its
+/// admitted window through the ordinary OCR coordinator, and verify ownership
+/// drains without publishing artifacts or advancing the replay cursor.
+pub fn runNativeDocumentPreparationIntegration(alloc: Allocator, io: Io, pdf_bytes: []const u8, producer: asset_producer_mod.Producer) !void {
+    const backing = platform.allocator.concurrentFallback();
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "document-prefetch-probe" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(alloc, store);
+    defer erased.deinit();
+    var manager = try index_manager_mod.IndexManager.init(alloc, "document-prefetch-probe-unused");
+    defer manager.deinit();
+    var resources = resource_manager_mod.ResourceManager.init(.{});
+    defer resources.deinit(alloc);
+    var runtime: EnrichmentRuntime = .{ .alloc = alloc, .io_impl = .{ .borrowed = io }, .store = erased, .owns_store = false, .change_journal = undefined, .replay_source = undefined, .index_manager = &manager, .write_ctx = undefined, .write_fn = undefined, .notify_ctx = undefined, .notify_fn = undefined, .ownership = undefined, .config = .{ .io = io, .asset_producer = producer, .resource_manager = &resources } };
+    var cache = PreparedDocumentSourceCache.initWithConfig(backing, runtime.config, &resources);
+    defer cache.deinit();
+    const base64 = std.base64.standard.Encoder;
+    const encoded = try alloc.alloc(u8, base64.calcSize(pdf_bytes.len));
+    defer alloc.free(encoded);
+    _ = base64.encode(encoded, pdf_bytes);
+    const url = try std.fmt.allocPrint(alloc, "data:application/pdf;base64,{s}", .{encoded});
+    defer alloc.free(url);
+    const raw = try std.json.Stringify.valueAlloc(alloc, .{ .url = url }, .{});
+    defer alloc.free(raw);
+    const current_key = try internal_keys.documentKeyAlloc(alloc, "current");
+    defer alloc.free(current_key);
+    const next_key = try internal_keys.documentKeyAlloc(alloc, "next");
+    defer alloc.free(next_key);
+    {
+        var batch = try erased.beginBatch();
+        errdefer batch.abort();
+        try batch.put(current_key, "{\"url\":\"https://example.invalid/current.pdf\"}");
+        try batch.put(next_key, raw);
+        try batch.commit();
+    }
+    const producer_json = "{\"type\":\"document_extraction\",\"config\":{\"content_type\":\"application/pdf\",\"ocr\":{\"mode\":\"always\",\"prompt\":\"<OCR>\",\"reader\":{\"provider\":\"antfly\",\"model\":\"multistage-integration\"}}}}";
+    var requests = [_]enrichment_types.GeneratedEnrichmentRequest{.{ .kind = .asset, .index_name = "", .artifact_name = "units", .source_field = "url", .doc_key = "next", .producer_json = producer_json }};
+    var current_requests = requests;
+    current_requests[0].doc_key = "current";
+    var plans: std.ArrayListUnmanaged(RequestPlanCacheEntry) = .empty;
+    defer plans.deinit(alloc);
+    try plans.append(alloc, .{ .doc_key = @constCast("current"), .requests = &current_requests });
+    try plans.append(alloc, .{ .doc_key = @constCast("next"), .requests = &requests });
+    var pipeline = DocumentPreparationPipeline{ .runtime = &runtime, .guard = .{} };
+    defer pipeline.deinit();
+    try pipeline.startNext(.{ .doc_key = "current", .sequence = 1 }, .{ .doc_key = "next", .sequence = 2 }, &plans, &cache);
+    pipeline.joinFor("next");
+    const job = pipeline.jobs[0] orelse return error.DocumentPreparationNotScheduled;
+    if (!job.computed or job.units.items.len == 0) return error.DocumentPreparationNotComputed;
+    if (cache.content_digest_computations != 1 or cache.pdf_preparation_computations != 1) return error.DocumentPreparationRepeatedSourceWork;
+    const source = job.source.?.entry();
+    const completed = try alloc.alloc(document_extraction_mod.Unit, job.units.items.len);
+    defer alloc.free(completed);
+    var initialized: usize = 0;
+    defer for (completed[0..initialized]) |*unit| unit.deinit(alloc);
+    for (job.units.items, completed, 0..) |unit, *owned, i| {
+        owned.* = try cloneDocumentExtractionUnit(alloc, if (i == 0 and job.computed) job.original_first.? else unit);
+        initialized += 1;
+    }
+    var coordinator: ?*RuntimePdfOcrCoordinator = null;
+    defer if (coordinator) |owner| owner.destroy();
+    runtime.document_prefetch = &pipeline;
+    defer runtime.document_prefetch = null;
+    try completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(&runtime, alloc, backing, producer, job.config, job.policy, url, source.content.data, &source.content_fingerprint, "pdf", "application/pdf", completed, .ocr, &coordinator, job.pdf.?.session());
+    if (job.window != null) return error.DocumentPreparationNotReused;
+    for (completed) |unit| if (!unit.ocr_attempted or unit.ocr_failure_stage != null) return error.DocumentPreparationOcrIncomplete;
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "next", "asset", "units");
+    defer alloc.free(manifest_key);
+    const manifest = try storeGetOptionalAllocWithRetry(&runtime, manifest_key);
+    defer if (manifest) |v| alloc.free(v);
+    if (manifest != null or runtime.applied_sequence != 0) return error.SpeculativePreparationPublished;
+}
+
 const DocumentPreparationPipeline = struct {
     runtime: *EnrichmentRuntime,
     guard: ForegroundCatchUpGuard,
@@ -13411,20 +13486,28 @@ const DocumentPreparationPipeline = struct {
         cache: *PreparedDocumentSourceCache,
         doc_key: []u8,
         source_url: []u8,
-        raw: []u8,
         config_json: []u8,
         config: document_extraction_mod.Config,
         description: std.heap.ArenaAllocator,
         policy: GeneratedTextBatchPolicy,
+        requested_policy: GeneratedTextBatchPolicy,
         producer: asset_producer_mod.Producer,
         remote_snapshot: ?scraping.RemoteContentConfig.Snapshot = null,
         remote_config: scraping.RemoteContentConfig = .{},
         source: ?PreparedDocumentSourceCache.PreparedSourceLease = null,
         pdf: ?PreparedDocumentSourceCache.PreparedPdfLease = null,
         fingerprint: ?[]u8 = null,
+        inspected_pages: usize = 0,
+        ready: std.atomic.Value(bool) = .init(false),
+        window_mutex: std.atomic.Mutex = .unlocked,
+        reclaimer_id: u64 = 0,
         units: std.ArrayListUnmanaged(document_extraction_mod.Unit) = .empty,
         window: ?RuntimePdfRenderWindow = null,
         raster: bool = false,
+        capabilities: ?inference_work.InferenceCapabilities = null,
+        computed: bool = false,
+        original_first: ?document_extraction_mod.Unit = null,
+        consumed: bool = false,
         future: ?Io.Future(void) = null,
         cancel: std.atomic.Value(bool) = .init(false),
         budgeted: ?resource_manager_mod.BudgetedAllocator = null,
@@ -13435,24 +13518,38 @@ const DocumentPreparationPipeline = struct {
         fn isCancelled(ptr: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             self.context.active_provider_guard.check() catch return true;
-            return self.cancel.load(.acquire) or self.context.config.cancellation.isCancelled();
+            return self.cancel.load(.acquire) or self.context.config.cancellation.isCancelled() or self.producer.invocation_context.cancellation.isCancelled();
         }
         fn probeCancelled(ptr: ?*const anyopaque) bool {
             return isCancelled(ptr orelse return true);
         }
         fn run(self: *@This()) void {
-            self.prepare() catch {};
+            self.prepare() catch {
+                pipeline_metrics.prefetch(.failed);
+                self.ready.store(true, .release);
+                return;
+            };
+            pipeline_metrics.prefetch(.ready);
+            self.ready.store(true, .release);
         }
         fn begin(_: *anyopaque, _: document_extraction_mod.StreamInfo) anyerror!void {}
         fn end(_: *anyopaque) anyerror!void {}
         fn collect(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.units.items.len == 8) return error.PrefetchWindowFull;
+            if (self.inspected_pages == 8) return error.PrefetchWindowFull;
+            self.inspected_pages += 1;
+            if (!std.mem.eql(u8, unit.extraction_status orelse "", "pending_ocr")) return;
             var owned = try cloneDocumentExtractionUnit(self.allocator(), unit.*);
             errdefer owned.deinit(self.allocator());
             try self.units.append(self.allocator(), owned);
         }
         fn prepare(self: *@This()) !void {
+            if (isCancelled(self)) return error.Canceled;
+            var cancellation: AssetInvocationCancellation = undefined;
+            var context = self.producer.invocation_context;
+            context.cancellation = .{ .ptr = self, .is_cancelled_fn = isCancelled };
+            context.progress = null;
+            const producer = scopedAssetProducer(&self.context, self.producer.withInvocationContext(context), &cancellation);
             const a = self.allocator();
             if (isCancelled(self)) return error.Canceled;
             const fetched = try self.cache.fetch(self.source_url, if (self.config.credentials.len > 0) self.config.credentials else null, remoteRenderConfig(self.context.config.secret_store, &self.remote_config, self.context.config.io, CancellationToken{ .ptr = self, .is_cancelled_fn = isCancelled }, null, null));
@@ -13464,16 +13561,15 @@ const DocumentPreparationPipeline = struct {
             try document_extraction_mod.verifyChecksumDigest(self.config, &entry.content_sha256);
             if (!document_extraction_mod.resolvesToPdf(self.config, self.source_url, entry.content.content_type, entry.content.data)) return;
             self.pdf = try self.cache.preparePdf(&self.source.?, self.config.pdf_decode_limits, self.context.timeout_ms);
-            self.fingerprint = try document_extraction_mod.metadataFingerprintAlloc(a, self.source_url, self.config_json, self.config) orelse
-                try document_extraction_mod.downloadedMetadataFingerprintAlloc(a, self.source_url, self.config_json, self.config, entry.content.content_type) orelse
-                try documentExtractionFingerprintFromDigestAlloc(a, &entry.source_identity, self.config_json, self.config.native_text, self.config.content_type, self.config.filename, entry.content.content_type, &entry.content_sha256);
+            self.fingerprint = try a.dupe(u8, &entry.content_fingerprint);
             const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(a, platform.allocator.concurrentFallback(), self.context.config.resource_manager orelse self.context.index_manager.resource_manager, self.context.timeout_ms, self.config, self.pdf.?.session());
             defer coordinator.destroy();
             coordinator.session.setCancellationProbe(.{ .context = self, .is_cancelled_fn = probeCancelled });
             document_extraction_mod.extractPreparedPdfStreaming(a, &coordinator.session, "application/pdf", self.config.native_text, self.config.ocr_mode, .{ .ptr = self, .on_begin = begin, .on_unit = collect, .on_end = end }) catch |err| if (err != error.PrefetchWindowFull) return err;
             const prototype = asset_producer_mod.Request{ .producer_type = document_extraction_mod.ocrProducerType(self.config), .config_json = document_extraction_mod.effectiveOcrConfigJson(self.config), .source_text = "", .content_type = "image/png", .inline_media_trusted = true };
-            self.raster = try self.producer.borrowedRasterBatchAvailable(a, &.{prototype});
-            if (try self.producer.capabilitiesForRequests(a, &.{prototype})) |cap| {
+            self.raster = try producer.borrowedRasterBatchAvailable(a, &.{prototype});
+            if (try producer.capabilitiesForRequests(a, &.{prototype})) |cap| {
+                self.capabilities = cap;
                 if (!cap.supports(.{ .image = true }) or (!self.raster and !cap.acceptsMimeType("image/png"))) return;
                 self.policy.max_items = @min(self.policy.max_items, cap.batch.max_items);
                 if (!self.raster) if (cap.batch.max_encoded_media_bytes) |limit| {
@@ -13489,15 +13585,106 @@ const DocumentPreparationPipeline = struct {
             if (for (self.units.items) |unit| {
                 if (unit.extraction_status) |status| if (std.mem.eql(u8, status, "pending_ocr")) break false;
             } else true) return;
-            self.policy.render_items = @min(self.policy.max_items, 8);
+            self.policy.render_items = 1;
             self.policy.defer_render_pressure = true;
-            self.window = try renderRuntimePdfWindow(&self.context, a, self.producer, &coordinator.session, self.config, try coordinator.availableRenderBytes(), self.policy, document_extraction_mod.ocrProducerType(self.config), document_extraction_mod.effectiveOcrConfigJson(self.config), "pdf", "application/pdf", self.fingerprint.?, self.units.items, 0, self.raster, .{ .context = self, .is_cancelled_fn = probeCancelled });
+            self.window = try renderRuntimePdfWindow(&self.context, a, producer, &coordinator.session, self.config, try coordinator.availableRenderBytes(), self.policy, document_extraction_mod.ocrProducerType(self.config), document_extraction_mod.effectiveOcrConfigJson(self.config), "pdf", "application/pdf", self.fingerprint.?, self.units.items, 0, self.raster, .{ .context = self, .is_cancelled_fn = probeCancelled });
             // A deferred render borrows its session. Never let it outlive this
             // coordinator; the ordinary foreground path retries under pressure.
             if (self.window.?.deferred_render != null) {
                 self.window.?.deinit();
                 self.window = null;
             }
+            try self.computeFirstPage(producer);
+        }
+        fn pinnedModelConfig(self: *@This()) !bool {
+            const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator(), document_extraction_mod.effectiveOcrConfigJson(self.config), .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return false;
+            const model = parsed.value.object.get("model") orelse return false;
+            if (model != .string) return false;
+            const separator = std.mem.lastIndexOfScalar(u8, model.string, '@') orelse return false;
+            const revision = model.string[separator + 1 ..];
+            if (revision.len != 40 and revision.len != 64) return false;
+            for (revision) |c| if (!std.ascii.isHex(c)) return false;
+            return true;
+        }
+        fn sameSource(self: *const @This(), bytes: []const u8) bool {
+            const source = self.source orelse return false;
+            const cached = source.entry().content.data;
+            // The source lease pins this exact cache allocation through use.
+            // A short diagnostic fingerprint is not a cache correctness proof.
+            return cached.ptr == bytes.ptr and cached.len == bytes.len;
+        }
+        fn computeFirstPage(self: *@This(), producer: asset_producer_mod.Producer) !void {
+            const capabilities = self.capabilities orelse return;
+            // An unversioned provider cannot establish reusable model identity.
+            if (capabilities.model_revision == null or (!capabilities.model_revision_pinning and !try self.pinnedModelConfig())) return;
+            const w = if (self.window) |*window| window else return;
+            if (w.unit_indices.len != 1 or w.planned_parts_json.len != 1) return;
+            const index = w.unit_indices[0];
+            const unit = &self.units.items[index];
+            self.original_first = try cloneDocumentExtractionUnit(self.allocator(), unit.*);
+            var media: [1]asset_producer_mod.EncodedMedia = undefined;
+            var rasters: [1]antfly_image.BorrowedRasterAttachment = undefined;
+            switch (w.batch) {
+                .encoded => |batch| {
+                    if (batch.results.len != 1) return;
+                    const page = batch.results[0].rendered orelse return;
+                    unit.ocr_rendered_width = page.width;
+                    unit.ocr_rendered_height = page.height;
+                    unit.ocr_effective_render_dpi = page.effective_dpi;
+                    unit.ocr_rendered_bytes = page.png.len;
+                    try document_extraction_mod.recordPdfRenderQualityWarningAlloc(self.allocator(), unit, page);
+                    media[0] = .{ .bytes = page.png, .mime_type = "image/png" };
+                },
+                .raster => |batch| {
+                    if (batch.results.len != 1) return;
+                    const page = batch.results[0].rendered orelse return;
+                    unit.ocr_rendered_width = page.width;
+                    unit.ocr_rendered_height = page.height;
+                    unit.ocr_effective_render_dpi = page.effective_dpi;
+                    unit.ocr_rendered_bytes = page.bytes.len;
+                    try document_extraction_mod.recordPdfRenderQualityWarningAlloc(self.allocator(), unit, page);
+                    rasters[0] = .{ .bytes = page.bytes, .width = page.width, .height = page.height, .stride_bytes = page.stride, .format = .rgba8, .mime_type = antfly_image.rgba8_raster_mime_type, .item_id = unit.unit_id, .source_fingerprint = self.fingerprint.?, .page_number = unit.page_number };
+                },
+            }
+            const producer_type = document_extraction_mod.ocrProducerType(self.config);
+            const request = asset_producer_mod.Request{ .producer_type = producer_type, .config_json = document_extraction_mod.effectiveOcrConfigJson(self.config), .source_text = "", .source_parts_json = w.planned_parts_json[0], .content_type = runtimeGeneratedTextContentType(.ocr, producer_type), .inline_media_trusted = true, .source_fingerprint = self.fingerprint.?, .item_id = unit.unit_id, .page_number = unit.page_number, .media = if (self.raster) &.{} else &media };
+            const a = w.allocator();
+            {
+                var produced = if (self.raster) try producer.produceBorrowedRasterBatchReported(a, &.{request}, &rasters) else try producer.produceBatchReported(a, &.{request});
+                defer produced.deinit(a);
+                try produced.validateForRequests(&.{request});
+                const value = switch (produced.items[0].result) {
+                    .value => |v| v,
+                    .item_error => return,
+                };
+                // The selection helper consumes this payload on every outcome.
+                produced.items[0].result = .{ .value = &.{} };
+                try applyRuntimeGeneratedUnitText(self.allocator(), a, unit, value, "ocr_text", "completed", .ocr, runtimeGeneratedTextOutputMode(.ocr, producer_type), self.config.ocr_quality, document_extraction_mod.effectiveOcrPrompt(self.config));
+            }
+            self.computed = true;
+            // Retain only the bounded selected text/provenance, not the PNG,
+            // renderer or invocation allowance while awaiting ordered publish.
+            w.deinit();
+            self.window = null;
+        }
+        fn samePolicy(a: document_extraction_mod.Config, b: document_extraction_mod.Config) bool {
+            return a.ocr_render_dpi == b.ocr_render_dpi and a.ocr_render_resolution == b.ocr_render_resolution and
+                a.ocr_max_rendered_pixels == b.ocr_max_rendered_pixels and a.ocr_max_rendered_dimension == b.ocr_max_rendered_dimension and
+                std.meta.eql(a.native_text, b.native_text) and std.meta.eql(a.ocr_quality, b.ocr_quality) and std.meta.eql(a.pdf_decode_limits, b.pdf_decode_limits) and
+                a.ocr_mode == b.ocr_mode and std.mem.eql(u8, document_extraction_mod.effectiveOcrPrompt(a), document_extraction_mod.effectiveOcrPrompt(b));
+        }
+        fn reclaim(ptr: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.ready.load(.acquire) or !self.window_mutex.tryLock()) return 0;
+            defer self.window_mutex.unlock();
+            const w = if (self.window) |*window| window else return 0;
+            const released = w.lease.reservedBytes();
+            w.deinit();
+            self.window = null;
+            pipeline_metrics.prefetch(.reclaimed);
+            return @intCast(released);
         }
         fn join(self: *@This()) void {
             if (self.future) |*future| {
@@ -13510,10 +13697,12 @@ const DocumentPreparationPipeline = struct {
         fn destroy(self: *@This()) void {
             self.cancel.store(true, .release);
             self.join();
+            if (self.budgeted) |*b| b.reservation.manager.unregisterReclaimer(self.reclaimer_id);
             const a = self.allocator();
             if (self.window) |*w| w.deinit();
             for (self.units.items) |*u| u.deinit(a);
             self.units.deinit(a);
+            if (self.original_first) |*unit| unit.deinit(a);
             if (self.pdf) |*pdf| pdf.deinit();
             if (self.source) |*source| source.deinit();
             if (self.fingerprint) |v| a.free(v);
@@ -13541,12 +13730,40 @@ const DocumentPreparationPipeline = struct {
             slot.* = null;
         };
     }
-    fn takeWindow(self: *@This(), fingerprint: []const u8, config_json: []const u8, policy: GeneratedTextBatchPolicy, units: []const document_extraction_mod.Unit, start: usize, raster: bool) ?RuntimePdfRenderWindow {
+    fn restoreComputed(self: *@This(), alloc: Allocator, producer: asset_producer_mod.Producer, config: document_extraction_mod.Config, policy: GeneratedTextBatchPolicy, fingerprint: []const u8, source_bytes: []const u8, units: []document_extraction_mod.Unit) !bool {
+        if (units.len == 0) return false;
         for (self.jobs) |maybe| if (maybe) |job| {
-            if (job.future != null or job.window == null or job.fingerprint == null or job.raster != raster or
+            if (job.future != null or !job.sameSource(source_bytes) or !job.computed or job.consumed or job.fingerprint == null or !std.mem.eql(u8, job.fingerprint.?, fingerprint) or
+                !std.mem.eql(u8, document_extraction_mod.effectiveOcrConfigJson(job.config), document_extraction_mod.effectiveOcrConfigJson(config)) or !Job.samePolicy(job.config, config) or
+                !std.meta.eql(job.requested_policy, policy) or
+                job.original_first == null or !std.mem.eql(u8, job.original_first.?.text, units[0].text) or
+                job.units.items.len == 0 or !std.mem.eql(u8, job.units.items[0].unit_id, units[0].unit_id) or job.units.items[0].page_number != units[0].page_number) continue;
+            var cancellation: AssetInvocationCancellation = undefined;
+            const scoped = scopedAssetProducer(self.runtime, producer, &cancellation);
+            const prototype = asset_producer_mod.Request{ .producer_type = document_extraction_mod.ocrProducerType(config), .config_json = document_extraction_mod.effectiveOcrConfigJson(config), .source_text = "", .content_type = "image/png", .inline_media_trusted = true };
+            const current = try scoped.capabilitiesForRequests(alloc, &.{prototype}) orelse continue;
+            if (job.capabilities == null or !std.meta.eql(job.capabilities.?, current)) continue;
+            // Allocate before replacing the owner's unit. No partial metadata
+            // transfer can authorize a source, retry or publication transition.
+            const replacement = try cloneDocumentExtractionUnit(alloc, job.units.items[0]);
+            units[0].deinit(alloc);
+            units[0] = replacement;
+            job.consumed = true;
+            pipeline_metrics.prefetch(.consumed);
+            return units.len == 1;
+        };
+        return false;
+    }
+    fn takeWindow(self: *@This(), fingerprint: []const u8, config_json: []const u8, policy: GeneratedTextBatchPolicy, config: document_extraction_mod.Config, source_bytes: []const u8, units: []const document_extraction_mod.Unit, start: usize, raster: bool) ?RuntimePdfRenderWindow {
+        for (self.jobs) |maybe| if (maybe) |job| {
+            if (job.future != null) continue;
+            while (!job.window_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer job.window_mutex.unlock();
+            if (job.window == null or !job.sameSource(source_bytes) or job.fingerprint == null or job.raster != raster or
                 !std.mem.eql(u8, job.fingerprint.?, fingerprint) or !std.mem.eql(u8, document_extraction_mod.effectiveOcrConfigJson(job.config), config_json) or
                 job.policy.max_items != policy.max_items or job.policy.max_bytes != policy.max_bytes or job.policy.max_pixels != policy.max_pixels or
-                job.policy.preferred_image_width != policy.preferred_image_width or job.policy.preferred_image_height != policy.preferred_image_height) continue;
+                job.policy.preferred_image_width != policy.preferred_image_width or job.policy.preferred_image_height != policy.preferred_image_height or
+                !Job.samePolicy(job.config, config)) continue;
             const w = &job.window.?;
             if (w.unit_indices.len == 0 or w.unit_indices[0] < start) continue;
             var matches = true;
@@ -13561,9 +13778,20 @@ const DocumentPreparationPipeline = struct {
             if (!matches) continue;
             const result = w.*;
             job.window = null;
+            pipeline_metrics.prefetch(.consumed);
             return result;
         };
         return null;
+    }
+    fn eligible(request: enrichment_types.GeneratedEnrichmentRequest) bool {
+        const privacy = @import("../../../privacy/document.zig");
+        return request.kind == .asset and request.input_kind == .document and
+            request.upstream_artifact_name.len == 0 and request.source_template.len == 0 and
+            request.neighbor_context_json.len == 0 and request.group_source_json.len == 0 and
+            request.prior_context_json.len == 0 and !request.requires_committed_graph and
+            !privacy.isManagedArtifactName(requestArtifactName(request)) and
+            privacy.consumerPolicyVersion(requestArtifactName(request)) == null and
+            !std.mem.eql(u8, request.source_field, privacy.source_field);
     }
     fn startNext(self: *@This(), current: enrichment_worker.PendingDocumentGroup, next: enrichment_worker.PendingDocumentGroup, plans: *std.ArrayListUnmanaged(RequestPlanCacheEntry), cache: *PreparedDocumentSourceCache) !void {
         const io = self.runtime.config.io orelse return;
@@ -13574,7 +13802,7 @@ const DocumentPreparationPipeline = struct {
         for (self.jobs) |value| if (value) |job| if (job.future != null) return;
         const requests = try getOrCreatePlannedRequests(self.runtime, next.doc_key, plans);
         for (requests) |request| {
-            if (request.kind != .asset or request.input_kind != .document or request.upstream_artifact_name.len != 0 or request.source_template.len != 0) continue;
+            if (!eligible(request)) continue;
             var cfg = asset_producer_mod.parseProducerConfig(self.runtime.alloc, request.producer_json) catch continue;
             defer cfg.deinit(self.runtime.alloc);
             if (cfg.type != .document_extraction) continue;
@@ -13583,12 +13811,27 @@ const DocumentPreparationPipeline = struct {
             const manifest = try storeGetOptionalAllocWithRetry(self.runtime, key);
             defer if (manifest) |v| self.runtime.alloc.free(v);
             if (manifest != null) continue; // Preserve the zero-fetch replay/repair fast paths.
-            const raw = try storeGetOptionalAllocWithRetry(self.runtime, next.doc_key) orelse continue;
+            const source_key = try documentSourceStoreKeyAlloc(self.runtime, next.doc_key);
+            defer self.runtime.alloc.free(source_key);
+            const raw = try storeGetOptionalDocumentAllocWithRetry(self.runtime, source_key) orelse continue;
             defer self.runtime.alloc.free(raw);
             const url = try extractAssetSourceValue(self.runtime.alloc, self.runtime.config, raw, request) orelse continue;
             defer self.runtime.alloc.free(@constCast(url));
-            const current_raw = try storeGetOptionalAllocWithRetry(self.runtime, current.doc_key);
+            const current_key = try documentSourceStoreKeyAlloc(self.runtime, current.doc_key);
+            defer self.runtime.alloc.free(current_key);
+            const current_raw = try storeGetOptionalDocumentAllocWithRetry(self.runtime, current_key);
             defer if (current_raw) |v| self.runtime.alloc.free(v);
+            const current_requests = try getOrCreatePlannedRequests(self.runtime, current.doc_key, plans);
+            var compatible = true;
+            for (current_requests) |current_request| {
+                if (current_request.kind == .asset and current_request.upstream_artifact_name.len == 0 and
+                    (current_request.source_template.len != 0 or !std.mem.eql(u8, current_request.source_field, request.source_field)))
+                {
+                    compatible = false;
+                    break;
+                }
+            }
+            if (!compatible) continue;
             if (current_raw) |v| {
                 const current_url = try extractAssetSourceValue(self.runtime.alloc, self.runtime.config, v, request);
                 defer if (current_url) |u| self.runtime.alloc.free(@constCast(u));
@@ -13609,13 +13852,15 @@ const DocumentPreparationPipeline = struct {
                 backing.destroy(job);
             };
             const description = arena.allocator();
-            job.* = .{ .context = .{ .config = self.runtime.config, .index_manager = self.runtime.index_manager, .backend_runtime = self.runtime.backend_runtime, .active_provider_guard = self.guard, .timeout_ms = self.runtime.syncWaitTimeoutMs() }, .cache = cache, .doc_key = try description.dupe(u8, next.doc_key), .source_url = try description.dupe(u8, url), .raw = try description.dupe(u8, raw), .config_json = try description.dupe(u8, cfg.config_json), .config = try document_extraction_mod.parseConfig(description, cfg.config_json), .description = undefined, .policy = requestGeneratedTextBatchPolicy(self.runtime.alloc, request), .producer = producer };
+            job.* = .{ .context = .{ .config = self.runtime.config, .index_manager = self.runtime.index_manager, .backend_runtime = self.runtime.backend_runtime, .active_provider_guard = self.guard, .timeout_ms = self.runtime.syncWaitTimeoutMs() }, .cache = cache, .doc_key = try description.dupe(u8, next.doc_key), .source_url = try description.dupe(u8, url), .config_json = try description.dupe(u8, cfg.config_json), .config = try document_extraction_mod.parseConfig(description, cfg.config_json), .description = undefined, .policy = requestGeneratedTextBatchPolicy(self.runtime.alloc, request), .requested_policy = requestGeneratedTextBatchPolicy(self.runtime.alloc, request), .producer = producer };
             try document_extraction_mod.applySourceMetadataFromJson(description, &job.config, raw);
             job.description = arena;
             transferred = true;
             errdefer job.destroy();
             if (self.runtime.config.resource_manager orelse self.runtime.index_manager.resource_manager) |manager|
                 job.budgeted = resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, backing, 1);
+            if (job.budgeted) |*budgeted|
+                job.reclaimer_id = try budgeted.reservation.manager.registerReclaimer(.document_extraction_working_set, job, Job.reclaim);
             applyDocumentExtractionRuntimePolicy(&job.config);
             if (self.runtime.config.remote_content) |remote| job.remote_snapshot = try remote.acquire();
             if (job.remote_snapshot) |snapshot| job.remote_config = snapshot.config.*;
@@ -13629,6 +13874,7 @@ const DocumentPreparationPipeline = struct {
                 return;
             };
             slot.* = job;
+            pipeline_metrics.prefetch(.started);
             return;
         }
     }
@@ -15667,7 +15913,10 @@ fn runGeneratedCatchUpQuanta(
     for (pending, 0..) |group, group_index| {
         try guard.check();
         max_seen = @max(max_seen, group.sequence);
-        if (replayCursorsCoverGroup(replay_cursor_assets, replay_cursor_dense, runtime.applied_sequence, group)) continue;
+        if (replayCursorsCoverGroup(replay_cursor_assets, replay_cursor_dense, runtime.applied_sequence, group)) {
+            preparation.releaseFor(group.doc_key);
+            continue;
+        }
         if (group_index >= primed_through) {
             // Prime only the next physical detector cohort. Acknowledged
             // earlier cohorts can checkpoint even when a later root waits
@@ -15677,14 +15926,14 @@ fn runGeneratedCatchUpQuanta(
         }
         if (prepared_sources == null) {
             const owned = try runtime.alloc.create(PreparedDocumentSourceCache);
-            owned.* = PreparedDocumentSourceCache.init(runtime);
+            owned.* = PreparedDocumentSourceCache.initWithConfig(platform.allocator.concurrentFallback(), runtime.config, runtime.index_manager.resource_manager);
             prepared_sources = owned;
         }
         preparation.joinFor(group.doc_key);
         // One future document is prepared while this document performs external
         // inference. Durable publication and replay advancement remain serial.
         if (group_index + 1 < pending.len and !replayCursorsCoverGroup(replay_cursor_assets, replay_cursor_dense, runtime.applied_sequence, pending[group_index + 1]))
-            try preparation.startNext(group, pending[group_index + 1], &request_plan_cache, prepared_sources.?);
+            preparation.startNext(group, pending[group_index + 1], &request_plan_cache, prepared_sources.?) catch {};
         try processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, processed_request_count, guard, prepared_sources.?);
         preparation.releaseFor(group.doc_key);
         last_processed = group;
@@ -15703,6 +15952,7 @@ fn runGeneratedCatchUpQuanta(
         ) or (primed_dependencies and group_index + 1 == primed_through)) {
             // Cursor checkpoints are saved per-lane inside dispatch as each
             // stream durably publishes.
+            preparation.deinit();
             try dispatchDeferredGeneratedWork(pipeline, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, runtime.applied_sequence, group, &prepared_sources);
         } else if (window.itemCount() >= max_window_items) {
             try flushGeneratedReplayWindow(runtime, &window);
@@ -15710,6 +15960,7 @@ fn runGeneratedCatchUpQuanta(
         }
     }
     try guard.check();
+    preparation.deinit();
     try dispatchDeferredGeneratedWork(pipeline, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, runtime.applied_sequence, last_processed, &prepared_sources);
     return max_seen;
 }
@@ -19842,6 +20093,8 @@ const SharedPdfPngPage = struct {
     /// Pure worker phase. Lease acquisition, shrinking and release belong to
     /// the coordinator; this worker owns only its independent allocator/data.
     fn encodeAdmitted(self: *@This(), runtime: *EnrichmentRuntime, raster: document_extraction_mod.RenderedPdfPageRasterBatch) !void {
+        const encode_timer = pipeline_metrics.start(.media_encode);
+        defer encode_timer.finish();
         const Page = std.meta.Child(@FieldType(document_extraction_mod.RenderedPdfPageBatch, "results"));
         const alloc = self.lease.?.allocator();
         const results = try alloc.alloc(Page, raster.results.len);
@@ -20274,6 +20527,9 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
     prepared_pdf_session: ?*document_extraction_mod.PdfRenderSession,
 ) !void {
     const uses_pdf_decoder_reservation = kind == .ocr and std.mem.eql(u8, route_type, "pdf");
+    if (uses_pdf_decoder_reservation) if (runtime.document_prefetch) |pipeline| {
+        if (try pipeline.restoreComputed(alloc, producer, config, batch_policy, source_fingerprint, source_bytes, units)) return;
+    };
     if (uses_pdf_decoder_reservation and pdf_coordinator_slot.* == null) {
         pdf_coordinator_slot.* = if (prepared_pdf_session) |prepared|
             try RuntimePdfOcrCoordinator.createFromPrepared(
@@ -22171,6 +22427,7 @@ const RuntimePdfRenderWindowPreparer = struct {
     route_type: []const u8,
     source_content_type: []const u8,
     source_fingerprint: []const u8,
+    source_bytes: []const u8,
     units: []const document_extraction_mod.Unit,
     use_borrowed_rasters: bool,
     cancel_requested: *const std.atomic.Value(bool),
@@ -22196,7 +22453,7 @@ const RuntimePdfRenderWindowPreparer = struct {
         self.coordinator.beginOperation(self.runtime.syncWaitTimeoutMs());
         self.coordinator.session.setCancellationProbe(self.cancellationProbe());
         if (!speculative) if (self.runtime.document_prefetch) |pipeline| {
-            if (pipeline.takeWindow(self.source_fingerprint, self.producer_config_json, self.batch_policy, self.units, start_index, self.use_borrowed_rasters)) |window| return window;
+            if (pipeline.takeWindow(self.source_fingerprint, self.producer_config_json, self.batch_policy, self.config, self.source_bytes, self.units, start_index, self.use_borrowed_rasters)) |window| return window;
         };
         const available_bytes = try self.coordinator.availableRenderBytes();
         var policy = self.batch_policy;
@@ -22480,6 +22737,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             .route_type = route_type,
             .source_content_type = source_content_type,
             .source_fingerprint = source_fingerprint,
+            .source_bytes = source_bytes,
             .units = units,
             .use_borrowed_rasters = use_pdf_borrowed_rasters,
             .cancel_requested = &pdf_prefetch_cancel_requested,
@@ -45469,4 +45727,206 @@ test "document extraction OCR selection keeps independent native quality" {
     var image_quality = try std.json.parseFromSlice(std.json.Value, alloc, image.ocr_output_quality.?, .{});
     defer image_quality.deinit();
     try std.testing.expect(image_quality.value.object.get("too_short").?.bool);
+}
+
+test "document preparation rejects canceled work before touching source or provider" {
+    var job: DocumentPreparationPipeline.Job = undefined;
+    job.context = .{ .config = .{}, .index_manager = undefined, .backend_runtime = null, .active_provider_guard = .{}, .timeout_ms = 1000 };
+    job.cancel = .init(true);
+    job.budgeted = null;
+    try std.testing.expectError(error.Canceled, job.prepare());
+}
+
+test "document preparation overlaps owner work and joins before releasing descriptions" {
+    var threaded = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Probe = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        completed: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) platform_time.yieldNow();
+            self.completed.store(true, .release);
+        }
+    };
+    var probe: Probe = .{};
+    var job: DocumentPreparationPipeline.Job = undefined;
+    job.doc_key = @constCast("next");
+    job.context.config = .{ .io = io };
+    job.future = try io.concurrent(Probe.run, .{&probe});
+    while (!probe.entered.load(.acquire)) platform_time.yieldNow();
+    defer {
+        probe.release.store(true, .release);
+        job.join();
+    }
+    var pipeline = DocumentPreparationPipeline{ .runtime = undefined, .guard = .{}, .jobs = .{ &job, null } };
+    // Finishing current work must not join the future document accidentally.
+    pipeline.joinFor("current");
+    try std.testing.expect(!probe.completed.load(.acquire));
+    probe.release.store(true, .release);
+    pipeline.joinFor("next");
+    try std.testing.expect(probe.completed.load(.acquire));
+    try std.testing.expect(job.future == null);
+}
+
+test "document preparation full queue does not plan or fetch another source" {
+    var runtime: EnrichmentRuntime = undefined;
+    runtime.config = .{ .io = std.testing.io };
+    var first: DocumentPreparationPipeline.Job = undefined;
+    var second: DocumentPreparationPipeline.Job = undefined;
+    var pipeline = DocumentPreparationPipeline{ .runtime = &runtime, .guard = .{}, .jobs = .{ &first, &second } };
+    var plans: std.ArrayListUnmanaged(RequestPlanCacheEntry) = .empty;
+    var cache: PreparedDocumentSourceCache = undefined;
+    try pipeline.startNext(.{ .doc_key = "current", .sequence = 1 }, .{ .doc_key = "next", .sequence = 2 }, &plans, &cache);
+    try std.testing.expectEqual(@as(usize, 0), plans.items.len);
+}
+
+const DocumentPreparationTestWindow = struct {
+    fn create(alloc: Allocator, manager: *resource_manager_mod.ResourceManager) !RuntimePdfRenderWindow {
+        const lease = try PdfWindowCompositeLease.create(alloc, alloc, manager, 16, 64, 1);
+        errdefer lease.destroy();
+        const indices = try alloc.dupe(usize, &.{0});
+        errdefer alloc.free(indices);
+        const parts = try alloc.alloc([]u8, 0);
+        errdefer alloc.free(parts);
+        const results = try lease.allocator().alloc(std.meta.Child(@FieldType(document_extraction_mod.RenderedPdfPageBatch, "results")), 0);
+        lease.finishRendering();
+        return .{ .metadata_alloc = alloc, .unit_indices = indices, .planned_parts_json = parts, .batch = .{ .encoded = .{ .results = results, .requested_parallelism = 1, .peak_launched_workers = 1, .peak_parallelism = 1, .peak_admitted_pixels = 1, .peak_admitted_bytes = 1, .thread_spawn_fallbacks = 0 } }, .lease = lease, .page_output_bytes_cap = 64 };
+    }
+};
+
+test "document preparation releases speculative output for foreground memory admission" {
+    const a = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 100, .soft_limit_bytes = 0 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    var job: DocumentPreparationPipeline.Job = undefined;
+    job.ready = .init(true);
+    job.window_mutex = .unlocked;
+    job.window = try DocumentPreparationTestWindow.create(a, &manager);
+    defer if (job.window) |*window| window.deinit();
+    const registration = try manager.registerReclaimer(.document_extraction_working_set, &job, DocumentPreparationPipeline.Job.reclaim);
+    defer manager.unregisterReclaimer(registration);
+    // Completed speculative output may be discarded; it must never deny
+    // a foreground request which fits by itself in the same hard envelope.
+    var foreground = try manager.reserve(.document_extraction_working_set, 80);
+    defer foreground.release();
+    try std.testing.expect(job.window == null);
+    try std.testing.expectEqual(@as(u64, 80), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
+test "document preparation only consumes joined windows with matching source render and page policy" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var job: DocumentPreparationPipeline.Job = undefined;
+    job.future = null;
+    job.window_mutex = .unlocked;
+    job.window = try DocumentPreparationTestWindow.create(a, &manager);
+    defer if (job.window) |*window| window.deinit();
+    job.fingerprint = @constCast("source-fingerprint");
+    job.config = .{ .ocr_config_json = "{}" };
+    job.policy = .{ .max_items = 2, .max_bytes = 1024 };
+    job.raster = false;
+    var cache = PreparedDocumentSourceCache.initWithConfig(a, .{}, null);
+    defer cache.deinit();
+    var source = try cache.adoptOwned("https://example.test/input.pdf", null, .{ .data = try a.dupe(u8, "source bytes"), .content_type = try a.dupe(u8, "application/pdf") });
+    defer source.deinit();
+    job.source = source;
+    const bytes = source.entry().content.data;
+    const units = [_]document_extraction_mod.Unit{.{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_ocr_pending"), .page_number = 1, .extraction_status = @constCast("pending_ocr") }};
+    job.units = .empty;
+    job.units.items = @constCast(&units);
+    job.units.capacity = 1;
+    var pipeline = DocumentPreparationPipeline{ .runtime = undefined, .guard = .{}, .jobs = .{ &job, null } };
+    try std.testing.expect(pipeline.takeWindow("different-source", "{}", job.policy, job.config, bytes, &units, 0, false) == null);
+    var changed = job.config;
+    changed.ocr_render_dpi += 1;
+    try std.testing.expect(pipeline.takeWindow("source-fingerprint", "{}", job.policy, changed, bytes, &units, 0, false) == null);
+    try std.testing.expect(pipeline.takeWindow("source-fingerprint", "{}", job.policy, job.config, bytes, &units, 0, true) == null);
+    var consumed = pipeline.takeWindow("source-fingerprint", "{}", job.policy, job.config, bytes, &units, 0, false) orelse return error.TestUnexpectedResult;
+    defer consumed.deinit();
+    try std.testing.expect(job.window == null);
+    try std.testing.expect(pipeline.takeWindow("source-fingerprint", "{}", job.policy, job.config, bytes, &units, 0, false) == null);
+}
+
+test "document preparation excludes inputs with privacy or causal prerequisites" {
+    var request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .index_name = "", .artifact_name = "units", .doc_key = "next", .source_field = "url" };
+    try std.testing.expect(DocumentPreparationPipeline.eligible(request));
+    request.prior_context_json = "{}";
+    try std.testing.expect(!DocumentPreparationPipeline.eligible(request));
+    request.prior_context_json = "";
+    request.requires_committed_graph = true;
+    try std.testing.expect(!DocumentPreparationPipeline.eligible(request));
+    request.requires_committed_graph = false;
+    request.source_field = @import("../../../privacy/document.zig").source_field;
+    try std.testing.expect(!DocumentPreparationPipeline.eligible(request));
+    request.source_field = "url";
+    request.upstream_artifact_name = "redacted";
+    try std.testing.expect(!DocumentPreparationPipeline.eligible(request));
+}
+
+test "document preparation computed reuse requires exact source policy and live model revision" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        revision: [32]u8 = @splat(1),
+        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.UnexpectedProviderExecution;
+        }
+        fn caps(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !?inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .model_revision = self.revision, .model_revision_pinning = true, .task = .read, .input_modalities = .{ .image = true }, .input_granularity = .page, .output = .read_result };
+        }
+    };
+    var fake: Fake = .{};
+    const producer: asset_producer_mod.Producer = .{ .ptr = &fake, .vtable = &.{ .produce = Fake.produce, .capabilities_for_requests = Fake.caps } };
+    var cache = PreparedDocumentSourceCache.initWithConfig(a, .{}, null);
+    defer cache.deinit();
+    var source = try cache.adoptOwned("https://example.test/input.pdf", null, .{ .data = try a.dupe(u8, "source bytes"), .content_type = try a.dupe(u8, "application/pdf") });
+    defer source.deinit();
+    var runtime: EnrichmentRuntime = undefined;
+    runtime.config = .{};
+    runtime.active_provider_guard = .{};
+    var job: DocumentPreparationPipeline.Job = undefined;
+    job.future = null;
+    job.source = source;
+    job.computed = true;
+    job.consumed = false;
+    job.fingerprint = @constCast("fingerprint");
+    job.config = .{ .ocr_config_json = "{}" };
+    job.requested_policy = .{ .max_items = 2, .max_bytes = 1024 };
+    job.original_first = .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast("native heading"), .method = @constCast("pdf_ocr_pending"), .page_number = 1, .extraction_status = @constCast("pending_ocr") };
+    var result = [_]document_extraction_mod.Unit{job.original_first.?};
+    result[0].text = @constCast("selected OCR text");
+    result[0].extraction_status = @constCast("completed");
+    result[0].ocr_attempted = true;
+    job.units = .empty;
+    job.units.items = &result;
+    job.units.capacity = 1;
+    job.capabilities = try producer.capabilitiesForRequests(a, &.{});
+    var units = [_]document_extraction_mod.Unit{try cloneDocumentExtractionUnit(a, job.original_first.?)};
+    defer units[0].deinit(a);
+    var pipeline = DocumentPreparationPipeline{ .runtime = &runtime, .guard = .{}, .jobs = .{ &job, null } };
+    const bytes = source.entry().content.data;
+    const other_source = try a.dupe(u8, bytes);
+    defer a.free(other_source);
+    try std.testing.expect(!try pipeline.restoreComputed(a, producer, job.config, job.requested_policy, "fingerprint", other_source, &units));
+    var changed = job.requested_policy;
+    changed.max_pixels = 1;
+    try std.testing.expect(!try pipeline.restoreComputed(a, producer, job.config, changed, "fingerprint", bytes, &units));
+    fake.revision = @splat(2);
+    try std.testing.expect(!try pipeline.restoreComputed(a, producer, job.config, job.requested_policy, "fingerprint", bytes, &units));
+    try std.testing.expectEqualStrings("native heading", units[0].text);
+    try std.testing.expect(!job.consumed);
+    fake.revision = @splat(1);
+    job.computed = false;
+    try std.testing.expect(!try pipeline.restoreComputed(a, producer, job.config, job.requested_policy, "fingerprint", bytes, &units));
+    job.computed = true;
+    try std.testing.expect(try pipeline.restoreComputed(a, producer, job.config, job.requested_policy, "fingerprint", bytes, &units));
+    try std.testing.expectEqualStrings("selected OCR text", units[0].text);
+    try std.testing.expect(units[0].ocr_attempted and job.consumed);
+    try std.testing.expect(!try pipeline.restoreComputed(a, producer, job.config, job.requested_policy, "fingerprint", bytes, &units));
 }

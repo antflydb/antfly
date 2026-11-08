@@ -14,7 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
-pub const pipeline_metrics = @import("pipeline_metrics.zig");
+pub const pipeline_metrics = @import("antfly_platform").document_pipeline_metrics;
 pub const document_runs = @import("antfly_document_runs");
 pub const document_failure = @import("document_failure.zig");
 const httpx = @import("httpx");
@@ -2000,4 +2000,8 @@ test "audio source URL schemes ignore case while signed paths and queries stay b
     try std.testing.expectEqualStrings("data:application/octet-stream;base64,AA==", wrapped);
     try std.testing.expectError(error.InvalidDocumentSource, audioSourceUrl(bounded.allocator(), ""));
     try std.testing.expectError(error.InvalidBase64, audioSourceUrl(bounded.allocator(), "not audio"));
+}
+
+test {
+    _ = pipeline_metrics;
 }

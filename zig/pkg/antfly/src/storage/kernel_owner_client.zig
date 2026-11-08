@@ -136,6 +136,13 @@ pub const Context = struct {
         return result;
     }
 
+    pub fn pipelineMetricsJson(self: *Context) !Response {
+        try self.ensure();
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_context_pipeline_metrics_json(self.handle, 1, &response.buffer));
+        return response;
+    }
+
     pub fn invalidateCaches(self: *Context) !void {
         try self.ensure();
         try statusToError(abi.antfly_storage_context_invalidate_caches(self.handle));

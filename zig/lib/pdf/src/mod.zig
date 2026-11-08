@@ -443,6 +443,8 @@ fn renderParsedPagePngNativeWithAllocators(
     const raw = try renderParsedPageRgbaNativeWithAllocators(scratch_alloc, scratch_alloc, parsed, page_number, dpi, max_pixels, rotation, profile);
     defer scratch_alloc.free(raw.rgba);
     try parsed.checkCancellation();
+    const encode_timer = @import("antfly_platform").document_pipeline_metrics.start(.media_encode);
+    defer encode_timer.finish();
     return try image.png.encodeRgbaWithCancellation(
         scratch_alloc,
         output_alloc,

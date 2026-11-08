@@ -9000,8 +9000,6 @@ pub const Node = struct {
         /// Conservative epochs have no vision broker. Encode one page under
         /// the step lock, exactly as generation does without a hook.
         fn encodeSerial(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
-            const phase_timer = readers_api.pipeline_metrics.start(.vision);
-            defer phase_timer.finish();
             const request: *@This() = @ptrCast(@alignCast(raw));
             try request.control.check();
             try request.ctx.lockStep(request.control);
@@ -9011,8 +9009,6 @@ pub const Node = struct {
         }
 
         fn encodeCpuPrepared(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, original_limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
-            const phase_timer = readers_api.pipeline_metrics.start(.vision);
-            defer phase_timer.finish();
             const request: *@This() = @ptrCast(@alignCast(raw));
             try request.control.check();
             const ctx = request.ctx;
@@ -9069,8 +9065,6 @@ pub const Node = struct {
         }
 
         fn encode(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
-            const phase_timer = readers_api.pipeline_metrics.start(.vision);
-            defer phase_timer.finish();
             const request: *@This() = @ptrCast(@alignCast(raw));
             try request.control.check();
             const ctx = request.ctx;
@@ -12344,14 +12338,14 @@ pub const Node = struct {
             break :bytes planned;
         } else null;
         const execution_mutex = loaded.targetInferenceExecutionMutex();
-        const effective = model_path_selection_control orelse InferenceExecutionControl{};
+        const effective = control orelse InferenceExecutionControl{};
         // A waiting GPU boundary request cannot use the session workspace
         // yet. Admit its device ceiling only when it reaches the front of the
         // model queue; otherwise concurrent waiters reserve duplicate device
         // capacity and fail before the already-serialized execution can drain.
         // This is distinct from the execution/provider lock: admission may
         // evict other models and must remain outside those locks.
-        const gliner_turn = if (backend == .cuda or backend == .metal) try loaded.gliner_execution_lane.acquire(model_path_selection_control orelse .{}) else null;
+        const gliner_turn = if (backend == .cuda or backend == .metal) try loaded.gliner_execution_lane.acquire(control orelse .{}) else null;
         defer if (gliner_turn) |turn| turn.release();
         const admission_mutex = if (backend == .cuda or backend == .metal) &loaded.gliner_boundary_admission_lock else null;
         if (admission_mutex) |mutex| try effective.lock(mutex);
@@ -12419,12 +12413,12 @@ pub const Node = struct {
             if (execution_mutex) |mutex| try effective.lock(mutex);
             defer if (execution_mutex) |mutex| mutex.unlock();
             var managed = if (workspace_plan) |plan|
-                session_factory.getManagedGlinerBoundaryComputeBackend(loaded.session, scratch, budget, model_path_selection_control, plan, if (workspace_permit) |*permit| permit else null) catch |err| {
+                session_factory.getManagedGlinerBoundaryComputeBackend(loaded.session, scratch, budget, control, plan, if (workspace_permit) |*permit| permit else null) catch |err| {
                     if (err == error.GlinerBoundaryWorkspacePlanChanged) continue;
                     return err;
                 }
             else
-                try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, model_path_selection_control);
+                try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, control);
             defer managed.deinit();
             const json = if (test_qualification)
                 try boundary_executor.execute(&managed.backend, scratch, &config, loaded.getTokenizer(), request, request_options)

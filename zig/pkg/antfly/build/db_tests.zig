@@ -287,6 +287,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "PDF scratch growth distinguishes",
         "PDF partial scratch grants yield contention",
         "PDF composite lease admits two future overlap windows atomically",
+        "document preparation",
         "prepared document source cache isolates credentials and reuses bytes",
         "prepared document source cache accounts retained bytes through eviction",
         "prepared document cache single-flights concurrent PDF variants and drains leases",

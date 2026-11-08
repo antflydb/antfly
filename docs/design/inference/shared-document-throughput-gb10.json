@@ -1,0 +1,93 @@
+{
+  "hardware": "NVIDIA DGX Spark / GB10",
+  "backend": "CUDA (required; no CPU fallback)",
+  "scope": "inference HTTP only; synthetic smoke corpus; not an A100 qualification",
+  "foundation_pr": 1517,
+  "foundation_head": "c354a4237aa168561278a97b7e49069f5ecbf127",
+  "source_archive_head": "9e11d8d366",
+  "source_archive_sha256": "3942db75e0470a3dfa1b37e815f65ba4dd4bc44933fc0078ee9b9a5e14747439",
+  "source_overlay_sha256": "6cac89a6ab0431a3256ab9f820c919e69b73b96e587be429a376639fd1be59a0",
+  "binary_sha256": "c5d5a0a48e8fa28b630daf3feedcbdfa4c23bd6836f0f429163b134c629f7ee4",
+  "model_files": [
+    {
+      "file": "config.json",
+      "bytes": 2897,
+      "sha256": "99b4c363a998c2d8c5ed5b3f3a40ec5cb97a156034df5002d0d789c74324f5f0"
+    },
+    {
+      "file": "model.safetensors",
+      "bytes": 9078620536,
+      "sha256": "6b0dab74a2dab02d5b10ca56322255024ed8dca35c02746b42e9f296aaeb4e67"
+    }
+  ],
+  "requests": 48,
+  "warmup_requests": 4,
+  "physical_batch_evidence": "LIGHTONOCR3 diagnostics include nonzero batched_steps; physical_rows_limit=2. cohort_items counts completed requests, not physical width.",
+  "measurement": {
+    "scope": "inference HTTP only; synthetic smoke corpus; not an A100 qualification",
+    "model": "LightOnOCR-3-4B",
+    "transport": "AFATT001",
+    "rounds": [
+      {
+        "round": 0,
+        "concurrency": 1,
+        "completed": 8,
+        "seconds": 29.031723231000797,
+        "pages_per_second": 0.27556063194545066,
+        "median_request_seconds": 2.6390074800019647
+      },
+      {
+        "round": 0,
+        "concurrency": 2,
+        "completed": 8,
+        "seconds": 17.720039784999244,
+        "pages_per_second": 0.45146625498958165,
+        "median_request_seconds": 2.885484484499102
+      },
+      {
+        "round": 1,
+        "concurrency": 2,
+        "completed": 8,
+        "seconds": 17.68419970999821,
+        "pages_per_second": 0.45238122907405287,
+        "median_request_seconds": 2.9204226060010114
+      },
+      {
+        "round": 1,
+        "concurrency": 1,
+        "completed": 8,
+        "seconds": 29.121828726001695,
+        "pages_per_second": 0.2747080231557411,
+        "median_request_seconds": 2.6460805209990212
+      },
+      {
+        "round": 2,
+        "concurrency": 1,
+        "completed": 8,
+        "seconds": 29.12240462799673,
+        "pages_per_second": 0.2747025907438023,
+        "median_request_seconds": 2.65008049700009
+      },
+      {
+        "round": 2,
+        "concurrency": 2,
+        "completed": 8,
+        "seconds": 17.668961014998786,
+        "pages_per_second": 0.4527713878144266,
+        "median_request_seconds": 2.8817207270003564
+      }
+    ],
+    "singleton_pages_per_second": 0.2747080231557411,
+    "concurrent_pages_per_second": 0.45238122907405287,
+    "throughput_ratio": 1.6467710839940881,
+    "normalized_output_parity": true
+  },
+  "limitations": [
+    "Inference-only candidate snapshot precedes final database speculative-OCR implementation; this does not measure its end-to-end speedup.",
+    "Four synthetic smoke pages; not production corpus or accuracy qualification.",
+    "Only the 4B model loaded; not a six-model residency or A100 memory qualification.",
+    "No vLLM comparison in this campaign.",
+    "No sustained GPU-utilization samples captured; utilization must not be inferred from throughput.",
+    "Initial bench-server compile succeeded but exceeded its default 12 GiB declared compiler memory bound (22.49 GiB peak). Use an explicit sufficient compile-memory bound for reproduction."
+  ]
+}

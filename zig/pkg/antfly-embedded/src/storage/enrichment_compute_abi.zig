@@ -116,3 +116,6 @@ pub extern fn antfly_enrichment_render_pdf_page_png(
 ) callconv(.c) Status;
 
 pub extern fn antfly_enrichment_buffer_destroy(buffer: *OwnedBytes) callconv(.c) void;
+
+/// Independent, versioned observability payload; never exposes allocator or runtime state.
+pub extern fn antfly_enrichment_pipeline_metrics_json(version: u32, out_json: *OwnedBytes) callconv(.c) Status;

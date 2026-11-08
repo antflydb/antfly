@@ -23,4 +23,5 @@ comptime {
     @export(&provider.extractStream, .{ .name = "antfly_enrichment_extract_stream", .visibility = .hidden });
     @export(&provider.renderPdfPagePng, .{ .name = "antfly_enrichment_render_pdf_page_png", .visibility = .hidden });
     @export(&provider.bufferDestroy, .{ .name = "antfly_enrichment_buffer_destroy", .visibility = .hidden });
+    @export(&provider.pipelineMetricsJson, .{ .name = "antfly_enrichment_pipeline_metrics_json", .visibility = .hidden });
 }
