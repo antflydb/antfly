@@ -200,7 +200,8 @@ clipboard; a user copy takes ownership immediately. Snapshotting runs off the UI
 thread and rejects more than 16 items, 64 representations, or 8 MiB of retained
 data, offering manual copy instead. macOS can materialize a large promised
 representation before its size is known; the app never retains it beyond the limit.
-Focus is checked again immediately before sending the paste. The OS does not acknowledge
+Focus is checked again immediately before sending the paste. Normal Quit waits for
+an owned restoration; a concurrent user copy still prevents restoration. The OS does not acknowledge
 whether a recipient actually inserted the text; “paste sent” records that limit.
 Secure or custom text controls may need manual copy/paste.
 
@@ -245,8 +246,8 @@ History and audio retention are off by default:
   work, and limits local history to 500 entries and a conservative 16 MiB JSON byte
   budget. An entry too large for that budget remains available to copy/export.
   Persistence errors appear in History sync status. Normal Quit drains local writes,
-  including explicit local clears and completed audio archives; active recording
-  work is canceled. Remote uploads remain durable in the outbox for restart.
+  including explicit local clears and completed audio archives, and finishes any
+  owned clipboard restoration; active recording work is canceled. Remote uploads remain durable in the outbox for restart.
 - The table's full-text index searches final transcript text. Search results are
   shown as the server's JSON response, including document IDs and sources.
 - Clear local history removes the local cache. Delete local history and matching
@@ -256,6 +257,9 @@ History and audio retention are off by default:
   A remote deletion failure keeps local entries available for retry, but canceled
   uploads cannot restart automatically. A separate bounded deletion journal stores
   document IDs, original destinations, and acknowledgments before jobs are removed.
+  Final local cleanup runs through the same ordered writer as ordinary snapshots.
+  The journal is removed only after an actual archive commit; a newer requested
+  snapshot that fails cannot suppress a pending deletion.
   It survives restarts, local clears, and retention changes without retaining text
   or credentials. Retry pending deletions completes the remaining targets without deleting newer transcripts,
   even when the local history list is empty. Startup cancels matching queued uploads
@@ -272,8 +276,9 @@ History and audio retention are off by default:
   records beyond the local count/byte retention window need normal Antfly table management.
 - Audio retention keeps only `last-recording.wav` locally, never in Antfly. Archival
   runs independently of recognition and insertion; a disk failure produces a separate
-  warning. Completed archives have their own ownership, so a new recording or normal
-  Quit cannot invalidate them. Canceling active processing and retention changes
+  warning. One writer stages audio, with only the newest pending clip retained while
+  disk I/O is busy. Starting another recording does not invalidate an older completed
+  archive; a newer finished clip can supersede it. Normal Quit drains the writer. Canceling active processing and retention changes
   still fence its pending archive writes. Saving
   settings with retention disabled deletes retained local data; remote transcripts
   require explicit deletion. Inference providers have their own retention policy.

@@ -401,6 +401,9 @@ final class CaptureConverter: @unchecked Sendable {
         "Focused text field changed. Copy the transcript to insert it manually.")
     }
   }
+  static func finishPendingPaste() async {
+    await DesktopClipboard.shared.finishRestoration()
+  }
   func paste(_ text: String, validate: @MainActor () throws -> Void = {}) async throws {
     try validate()
     try validatePasteTarget()
