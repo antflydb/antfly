@@ -34,6 +34,7 @@ UNITS = (
     "cli",
     "distributed",
     "storage_kernel",
+    "local_query",
     "enrichment_compute",
     "serverless",
     "inference",
@@ -453,7 +454,7 @@ class RuntimeCacheTest(unittest.TestCase):
             ("zig/lib/a2a/src/root.zig", ("api_kernel",)),
             (
                 "zig/lib/raft/src/root.zig",
-                ("distributed", "storage_kernel", "api_kernel"),
+                ("distributed", "storage_kernel", "local_query", "api_kernel"),
             ),
         )
         for relative, _ in owners:
@@ -502,7 +503,9 @@ class RuntimeCacheTest(unittest.TestCase):
         baseline = self.build("cache-probe", settings=enabled)
         self.assert_archives(self.build("cache-probe", settings=enabled))
         changed = self.build("cache-probe", settings=disabled)
-        self.assert_archives(changed, rebuilt=("distributed", "storage_kernel"))
+        self.assert_archives(
+            changed, rebuilt=("distributed", "storage_kernel", "local_query")
+        )
         # The actual capability implementation must still report the new value.
         self.assertNotEqual(self.probe(baseline), self.probe(changed))
         self.assert_archives(self.build("cache-probe", settings=disabled))

@@ -126,6 +126,10 @@ class SearchGatewayTest(unittest.TestCase):
                 if query.get("full_text_search", {}).get("match") == "fail":
                     self.send_response(500)
                     self.send_header("Server-Timing", "private;desc=server-only")
+                    self.send_header(
+                        "X-Request-ID", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                    )
+                    self.send_header("CF-Ray", "0123456789abcdef-SJC")
                     self.end_headers()
                     self.wfile.write(b"server-only")
                     return
@@ -202,6 +206,12 @@ class SearchGatewayTest(unittest.TestCase):
             self.assertIsNone(result)
             self.assertEqual(evidence["status"], 503)
             self.assertGreaterEqual(evidence["backend_seconds"], 0)
+            self.assertEqual(
+                evidence["upstream_request_id"], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            )
+            self.assertEqual(evidence["upstream_cf_ray"], "0123456789abcdef-SJC")
+            self.assertGreater(evidence["started_at"], 0)
+            self.assertGreaterEqual(evidence["headers_seconds"], 0)
             self.assertNotIn("server-only", json.dumps(evidence))
         finally:
             for server in (gateway, backend):
