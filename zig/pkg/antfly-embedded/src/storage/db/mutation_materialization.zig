@@ -5740,7 +5740,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             completion.failed_sequence = published_sequence;
             var encoded: [artifact_repair_completion_state_len]u8 = undefined;
             encodeArtifactRepairCompletionState(&encoded, completion);
-            try ctx.store.put(key, &encoded);
+            // Status-like bookkeeping (lite-single-commit-write-path.md §3.2a):
+            // `failed_sequence` is derived from the publication sequence and
+            // is recomputed identically if this write is lost on crash (the
+            // next failed publication at or past this sequence sets it
+            // again). Ride along instead of paying a dedicated fsync.
+            try ctx.store.putBatchWithReplayWithOptions(null, &.{.{ .key = key, .value = &encoded }}, &.{}, null, .{ .durability = .ride_along });
         }
 
         pub fn clearPublishedEmbeddingArtifactRepairIssuesContext(
