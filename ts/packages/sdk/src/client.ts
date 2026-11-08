@@ -576,6 +576,40 @@ function parseJSON<T>(text: string): T {
   return JSON.parse(text) as T;
 }
 
+/** Join ordinary work, but let cancellation release a caller waiting on user
+ * code. Both handlers stay attached so a late rejection is always observed. */
+function waitForSeriesStep<T>(
+  step: () => T | PromiseLike<T>,
+  signal: AbortSignal | undefined,
+  aborted: () => void
+): Promise<T> {
+  if (!signal) return Promise.resolve().then(step);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (complete: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      complete();
+    };
+    const onAbort = () =>
+      finish(() => {
+        aborted();
+        reject(signal.reason);
+      });
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) return onAbort();
+    try {
+      Promise.resolve(step()).then(
+        (value) => finish(() => resolve(value)),
+        (cause) => finish(() => reject(cause))
+      );
+    } catch (cause) {
+      finish(() => reject(cause));
+    }
+  });
+}
+
 /** Resolves after `ms`, or rejects immediately/on abort when `signal` fires. */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) {
@@ -1431,6 +1465,12 @@ export class AntflyClient {
       phase: "source",
     };
     let pendingIds: string[] = [];
+    type Reading = { id: string; document: Record<string, unknown> };
+    let iterator: AsyncIterator<Reading> | Iterator<Reading> | undefined;
+    let sourceDone = false;
+    const aborted = () => {
+      state.phase = "aborted";
+    };
     const checkAbort = () => {
       if (options?.signal?.aborted) {
         state.phase = "aborted";
@@ -1452,19 +1492,39 @@ export class AntflyClient {
       batch = [];
       pendingIds = [];
       state.phase = "callback";
-      await options?.onBatch?.(outcome, submitted);
+      if (options?.onBatch)
+        await waitForSeriesStep(
+          () => options.onBatch!(outcome, submitted),
+          options.signal,
+          aborted
+        );
       state.phase = "source";
     };
     try {
       checkAbort();
-      for await (const reading of readings) {
+      const asyncIterator = (readings as AsyncIterable<Reading>)[Symbol.asyncIterator];
+      const synchronous = asyncIterator == null;
+      iterator = synchronous
+        ? (readings as Iterable<Reading>)[Symbol.iterator]()
+        : asyncIterator.call(readings);
+      while (true) {
+        checkAbort();
+        const next = await waitForSeriesStep(() => iterator!.next(), options?.signal, aborted);
+        if (next.done) {
+          sourceDone = true;
+          break;
+        }
+        // Match for-await's AsyncFromSyncIterator value unwrapping.
+        const reading = synchronous
+          ? await waitForSeriesStep(() => next.value, options?.signal, aborted)
+          : next.value;
         batch.push(reading);
         checkAbort();
         if (batch.length === batchSize) await flush();
       }
       await flush();
     } catch (cause) {
-      throw new SeriesImportError(submitted, pendingIds, cause, {
+      const failure = new SeriesImportError(submitted, pendingIds, cause, {
         phase: state.phase,
         bufferedIds:
           state.phase === "submission"
@@ -1482,6 +1542,23 @@ export class AntflyClient {
         repairRequiredBatches,
         lastOutcome,
       });
+      if (iterator && !sourceDone) {
+        try {
+          // Invoke return even when next is still pending. An uncooperative
+          // source may never finish closing; abort must still release the caller.
+          const closing = Promise.resolve(iterator.return?.());
+          if (options?.signal?.aborted) void closing.catch(() => {});
+          else
+            await waitForSeriesStep(
+              () => closing,
+              options?.signal,
+              () => {}
+            );
+        } catch {
+          // Iterator cleanup must not replace the original import failure.
+        }
+      }
+      throw failure;
     }
     return { submitted, committedPendingBatches, repairRequiredBatches, lastOutcome };
   }

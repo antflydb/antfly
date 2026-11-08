@@ -69,6 +69,12 @@ earlier batches remain committed. The result reports pending and repair-required
 batch counts, and an optional `onBatch` callback receives each full commit outcome.
 A `SeriesImportError` exposes acknowledged progress and pending IDs; reconcile
 that batch before retrying it.
+Pass an `AbortSignal` to stop ingestion while waiting for the next reading or
+an `onBatch` callback. Cancellation closes the source and reports acknowledged
+and buffered progress without submitting another batch. User-provided sources
+and callbacks can continue settling after cancellation if they do not cooperate;
+their late rejections are observed, and source cleanup cannot replace the original
+failure or keep an aborted import pending.
 
 ## Query bucketed measurements
 
@@ -263,7 +269,9 @@ path. Authorization and snapshot coverage still gate reuse.
 
 The document-table preset accepts pre-1970 observations with retention enabled.
 Retention uses the signed event instant, independently of the unsigned write
-version. Old observations are accepted normally and immediately hidden when
+version. New document writes use the admitted mutation timestamp as their version,
+so correcting a reading does not reuse its event timestamp as a mutation fence.
+Replay and restoration retain the original version. Old observations are accepted normally and immediately hidden when
 expired; sufficiently long retention can keep a pre-1970 observation visible.
 Existing timestamp metadata remains readable without rewriting retained data.
 

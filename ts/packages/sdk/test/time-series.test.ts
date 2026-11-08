@@ -311,9 +311,173 @@ describe("time-series review regressions", () => {
     ).rejects.toMatchObject({
       committedReadings: 1,
       pendingIds: [],
-      details: { phase: "aborted", bufferedIds: ["b"], mayHaveCommitted: false },
+      details: { phase: "aborted", bufferedIds: [], mayHaveCommitted: false },
     });
   });
+});
+
+it("aborts a pending source read, closes once, and observes late source and cleanup failures", async () => {
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  const controller = new AbortController();
+  const reason = new Error("stop source");
+  const batch = vi
+    .spyOn(client.tables, "batchWithOptions")
+    .mockResolvedValue({ status: "committed" });
+  let rejectRead!: (cause: unknown) => void;
+  let rejectClose!: (cause: unknown) => void;
+  let calls = 0;
+  const close = vi.fn(
+    () =>
+      new Promise<IteratorResult<{ id: string; document: Record<string, unknown> }>>(
+        (_resolve, reject) => {
+          rejectClose = reject;
+        }
+      )
+  );
+  const source = {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          calls++;
+          if (calls <= 3)
+            return Promise.resolve({
+              done: false as const,
+              value: { id: String(calls), document: { observed_at: options.start } },
+            });
+          return new Promise<IteratorResult<{ id: string; document: Record<string, unknown> }>>(
+            (_resolve, reject) => {
+              rejectRead = reject;
+            }
+          );
+        },
+        return: close,
+      };
+    },
+  };
+  const result = client.writeSeries("r", "observed_at", source, {
+    batchSize: 2,
+    signal: controller.signal,
+  });
+  const rejected = expect(result).rejects.toMatchObject({
+    cause: reason,
+    committedReadings: 2,
+    pendingIds: [],
+    details: { phase: "aborted", bufferedIds: ["3"], mayHaveCommitted: false },
+  });
+  await vi.waitFor(() => expect(calls).toBe(4));
+  controller.abort(reason);
+  await rejected;
+  expect(close).toHaveBeenCalledTimes(1);
+  expect(batch).toHaveBeenCalledTimes(1);
+  rejectRead(new Error("late read"));
+  rejectClose(new Error("late cleanup"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(calls).toBe(4);
+});
+
+it("aborts an uncooperative callback after acknowledging its batch", async () => {
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  const controller = new AbortController();
+  const reason = new Error("stop callback");
+  const source = (function* () {
+    try {
+      yield { id: "a", document: { observed_at: options.start } };
+      yield { id: "b", document: { observed_at: options.start } };
+    } finally {
+      closed();
+    }
+  })();
+  const closed = vi.fn();
+  const batch = vi
+    .spyOn(client.tables, "batchWithOptions")
+    .mockResolvedValue({ status: "committed_pending" });
+  let rejectCallback!: (cause: unknown) => void;
+  const callback = vi.fn(
+    () =>
+      new Promise<void>((_resolve, reject) => {
+        rejectCallback = reject;
+      })
+  );
+  const result = client.writeSeries("r", "observed_at", source, {
+    batchSize: 1,
+    signal: controller.signal,
+    onBatch: callback,
+  });
+  const rejected = expect(result).rejects.toMatchObject({
+    cause: reason,
+    committedReadings: 1,
+    pendingIds: [],
+    details: {
+      phase: "aborted",
+      bufferedIds: [],
+      mayHaveCommitted: false,
+      committedPendingBatches: 1,
+    },
+  });
+  await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(1));
+  controller.abort(reason);
+  await rejected;
+  expect(closed).toHaveBeenCalledTimes(1);
+  expect(batch).toHaveBeenCalledTimes(1);
+  rejectCallback(new Error("late callback"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});
+
+it("preserves an ambiguous write failure when iterator cleanup is later aborted", async () => {
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  const controller = new AbortController();
+  const failure = new Error("response lost");
+  vi.spyOn(client.tables, "batchWithOptions").mockRejectedValue(failure);
+  const close = vi.fn(
+    () => new Promise<IteratorResult<{ id: string; document: Record<string, unknown> }>>(() => {})
+  );
+  const source = {
+    [Symbol.asyncIterator]: () => ({
+      next: async () => ({
+        done: false as const,
+        value: { id: "a", document: { observed_at: options.start } },
+      }),
+      return: close,
+    }),
+  };
+  const result = client.writeSeries("r", "observed_at", source, {
+    batchSize: 1,
+    signal: controller.signal,
+  });
+  const rejected = expect(result).rejects.toMatchObject({
+    cause: failure,
+    committedReadings: 0,
+    pendingIds: ["a"],
+    details: { phase: "submission", bufferedIds: [], mayHaveCommitted: true },
+  });
+  await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+  controller.abort(new Error("stop cleanup"));
+  await rejected;
+});
+
+it("removes source wait listeners and closes once after a validation failure", async () => {
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  const controller = new AbortController();
+  const added = vi.spyOn(controller.signal, "addEventListener");
+  const removed = vi.spyOn(controller.signal, "removeEventListener");
+  const close = vi.fn(async () => ({ done: true as const, value: undefined }));
+  const source = {
+    [Symbol.asyncIterator]: () => ({
+      next: async () => ({ done: false as const, value: { id: "bad", document: {} } }),
+      return: close,
+    }),
+  };
+  await expect(
+    client.writeSeries("r", "observed_at", source, { batchSize: 1, signal: controller.signal })
+  ).rejects.toMatchObject({
+    committedReadings: 0,
+    details: { phase: "validation", bufferedIds: ["bad"], mayHaveCommitted: false },
+  });
+  expect(close).toHaveBeenCalledTimes(1);
+  expect(added.mock.calls.length).toBeGreaterThan(0);
+  expect(removed.mock.calls.map((call) => call[1])).toEqual(
+    added.mock.calls.map((call) => call[1])
+  );
 });
 
 describe("shared SDK/server fixture", () => {

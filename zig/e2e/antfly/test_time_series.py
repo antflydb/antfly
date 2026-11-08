@@ -1019,6 +1019,23 @@ def test_sdk_retention_preset_lifecycle(stateful_api, shards):
     ]["buckets"][0]
     assert point["doc_count"] == 2
     assert point["sub_aggregations"]["total"]["value"] == 30
+    # Event time stays fixed across a correction, but its mutation fence must
+    # change. Retention and maintained aggregates still follow the event time.
+    _, original_version = api.lookup_key_with_version(name, "a")
+    original_event_time = documents["a"]["observed_at"]
+    documents["a"]["temperature"] = 15
+    api.batch_write(name, inserts={"a": documents["a"]}, sync_level="full_index")
+    corrected, corrected_version = api.lookup_key_with_version(name, "a")
+    assert corrected["observed_at"] == original_event_time
+    assert (
+        original_version and corrected_version and original_version != corrected_version
+    )
+    result = wait_until(indexed_response, timeout_s=30, interval_s=0.25)
+    assert result, last_index_attempt.get("profile", {}).get("aggregation_execution")
+    point = result["aggregations"]["series"]["buckets"][0]["sub_aggregations"][
+        "points"
+    ]["buckets"][0]
+    assert point["sub_aggregations"]["total"]["value"] == 35
     assert not response({"full_text_search": {"ids": ["expired"]}, "limit": 1})["hits"][
         "hits"
     ]
