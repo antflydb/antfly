@@ -1069,15 +1069,22 @@ const recovery_agenda = @import("recovery_agenda.zig");
 // v8: both formats moved their two recovery slots out of the header page
 // into dedicated pages and gained a per-commit manifest (see
 // `slotPhysicalPage`, `CheckpointSlot`, `recoverActiveCheckpoint`).
-// Antfly is unreleased, so the old embedded-slot layout (format_version 3 /
-// indexed_format_version 7) is not preserved: a v7 or v3 file is refused by
-// `decodeHeader`'s version check (surfaced as
-// `error.UnsupportedNativeFormatVersion`), not migrated.
-pub const magic = "AFLITE\x04P";
-const unpacked_v4_magic = "AFLITE\x04N";
-const indexed_magic = "AFLITE\x08P";
-pub const format_version: u32 = 4;
-pub const indexed_format_version: u32 = 8;
+// v9 (lite-single-commit-write-path.md §3.2a "Manifest coverage"): the
+// manifest payload encodes one or more appended page-id runs instead of
+// exactly one (see `encodeManifestPayloadAlloc`/`verifyManifest`), so a
+// commit whose appended pages span more than one contiguous range (several
+// `commit_participant`s each triggering their own intermediate
+// `flushTransactionWrites`/`persistAllocator` cycle, in particular) still
+// gets the one-sync manifest path instead of always falling back to the
+// two-sync presynced one.
+// Antfly is unreleased, so no old layout is preserved: a v3/v7 (pre-v8) or
+// v4/v8 (single-run manifest) file is refused by `decodeHeader`'s version
+// check (surfaced as `error.UnsupportedNativeFormatVersion`), not migrated.
+pub const magic = "AFLITE\x05P";
+const unpacked_v4_magic = "AFLITE\x05N";
+const indexed_magic = "AFLITE\x09P";
+pub const format_version: u32 = 5;
+pub const indexed_format_version: u32 = 9;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -13166,15 +13173,11 @@ pub const NativeFile = struct {
             entries[i] = .{ .page_id = kv.key_ptr.*, .crc = kv.value_ptr.* };
             i += 1;
         }
-        const payload = encodeManifestPayloadAlloc(self.allocator, entries, &builder.reused_pages, manifest_page_id) catch |err| switch (err) {
-            // Not actually one contiguous appended run: fall back exactly
-            // like "too big to fit one page", never a hard error.
-            error.InvalidNativeManifestRange => {
-                if (debugManifestFallbackTraceEnabled()) std.debug.print("manifest fallback: non-contiguous range (count={d})\n", .{count});
-                return false;
-            },
-            else => return err,
-        };
+        // v9: the multi-run encoding (see `encodeManifestPayloadAlloc`) has
+        // no discontiguity failure mode left to catch here -- a window
+        // with scattered appended pages just costs more runs, caught below
+        // by the ordinary "too big to fit one page" check, same as always.
+        const payload = try encodeManifestPayloadAlloc(self.allocator, entries, &builder.reused_pages, manifest_page_id);
         defer self.allocator.free(payload);
         if (payload.len > self.maxPagePayloadBytes()) {
             if (debugManifestFallbackTraceEnabled()) std.debug.print("manifest fallback: payload too big ({d} > {d})\n", .{ payload.len, self.maxPagePayloadBytes() });
@@ -14317,69 +14320,112 @@ const ManifestBuilder = struct {
     }
 };
 
-/// Fixed header before the appended CRC array and the reused (page_id, crc)
-/// pairs: range_start (u64), appended_count (u32), reused_count (u32).
-const manifest_header_size: usize = 16;
+/// Fixed header before the run table and the reused (page_id, crc) pairs:
+/// run_count (u32), reused_count (u32). v9 (design doc §3.2a "Manifest
+/// coverage"): a single since-last-durable-checkpoint window commonly spans
+/// more than one contiguous appended range -- several `commit_participant`s
+/// each triggering their own intermediate `flushTransactionWrites`/
+/// `persistAllocator` cycle (each with its own free-map/ledger pages), or
+/// several ride-along transactions sharing the window -- so the payload
+/// names zero or more runs instead of exactly one.
+const manifest_header_size: usize = 8;
+
+/// Fixed header per run, immediately followed by that run's own flat CRC
+/// array: range_start (u64), count (u32).
+const manifest_run_header_size: usize = 12;
 
 /// A fresh page id the allocator hands out only ever increases
 /// (`PageAllocator.allocate`'s non-reuse branch), so every entry this
 /// window noted that is not a reuse (see `ManifestBuilder.reused_pages`)
-/// is expected to form one contiguous run -- except for exactly one gap at
-/// `manifest_page_id` itself, reserved from that very same sequence before
-/// `flushTransactionWrites` calls `persistAllocator` (whose own ledger/
-/// metadata pages continue the sequence past it), but never an entry since
-/// nothing writes to it until this function runs. `manifest_page_id` is
-/// never re-stored in the payload: it is already `slot.manifest_page` on
-/// the decode side, so `verifyManifest` reconstructs the same gap from
-/// that alone. Naming the run with a start id, a count, and a flat CRC
-/// array costs 4 bytes per page instead of 12, which is what lets
-/// `max_single_sync_pages` be in the thousands instead of the low
-/// hundreds. Reused pages (explicit, from the free list, never contiguous
-/// with anything in particular) still cost a full (page_id, crc) pair
-/// each. `error.InvalidNativeManifestRange` means the appended set was not
-/// actually one contiguous run plus that one known gap -- a sign some
-/// page escaped the allocator's own next_page_id sequencing -- and the
-/// caller must treat that exactly like "too big to fit": fall back to the
-/// presynced two-sync path, never propagate it as a hard error.
+/// forms one or more contiguous runs, with exactly one gap total (not one
+/// per run) at `manifest_page_id` -- reserved from that very same sequence
+/// before `flushTransactionWrites` calls `persistAllocator` (whose own
+/// ledger/metadata pages continue the sequence past it), but never an
+/// entry since nothing writes to it until this function runs. Falling
+/// inside a run bridges it exactly like the v8 single-run encoding did;
+/// falling between two runs (or before the first/after the last) needs no
+/// special handling at all. `manifest_page_id` is never re-stored in the
+/// payload: it is already `slot.manifest_page` on the decode side, so
+/// `verifyManifest` reconstructs the same gap from that alone. Naming a run
+/// with a start id, a count, and a flat CRC array costs 4 bytes per page
+/// instead of 12 (what a reused page -- explicit, from the free list,
+/// never assumed contiguous with anything -- still costs, as a full
+/// (page_id, crc) pair), so a window with few, long runs stays cheap; the
+/// degenerate case (every appended page its own one-entry run) costs the
+/// same 16 bytes/page as encoding every page as if it were reused, still
+/// bounded by `max_single_sync_pages` and caught by the caller's own
+/// payload-too-big-for-one-page check, so this never needs to fail for
+/// discontiguity the way the v8 encoder did.
 fn encodeManifestPayloadAlloc(allocator: Allocator, entries: []const ManifestEntry, reused_pages: *const std.AutoHashMapUnmanaged(u64, void), manifest_page_id: u64) ![]u8 {
-    var appended_min: ?u64 = null;
-    var appended_max: ?u64 = null;
+    var appended = try std.ArrayListUnmanaged(ManifestEntry).initCapacity(allocator, entries.len);
+    defer appended.deinit(allocator);
     var reused_count: usize = 0;
     for (entries) |entry| {
         if (reused_pages.contains(entry.page_id)) {
             reused_count += 1;
         } else {
-            if (appended_min == null or entry.page_id < appended_min.?) appended_min = entry.page_id;
-            if (appended_max == null or entry.page_id > appended_max.?) appended_max = entry.page_id;
+            appended.appendAssumeCapacity(entry);
         }
     }
-    const appended_count = entries.len - reused_count;
-    const range_start = appended_min orelse 0;
-    const gap_in_span = appended_count > 0 and manifest_page_id >= range_start and manifest_page_id <= appended_max.?;
-    if (appended_count > 0) {
-        const span = appended_max.? - range_start + 1;
-        const expected = appended_count + @as(usize, if (gap_in_span) 1 else 0);
-        if (span != expected) return error.InvalidNativeManifestRange;
+    std.mem.sort(ManifestEntry, appended.items, {}, manifestEntryLessThan);
+
+    // Greedily merge adjacent (or gap-bridged) appended ids into the fewest
+    // runs: this both minimizes payload size and is the only pass needed,
+    // since every page id is visited exactly once in sorted order.
+    var runs = std.ArrayListUnmanaged(struct { range_start: u64, crcs: std.ArrayListUnmanaged(u32) }).empty;
+    defer {
+        for (runs.items) |*run| run.crcs.deinit(allocator);
+        runs.deinit(allocator);
     }
-    const out = try allocator.alloc(u8, manifest_header_size + appended_count * 4 + reused_count * manifest_entry_size);
+    var i: usize = 0;
+    while (i < appended.items.len) {
+        var crcs = std.ArrayListUnmanaged(u32).empty;
+        try crcs.append(allocator, appended.items[i].crc);
+        const range_start = appended.items[i].page_id;
+        var last_id = range_start;
+        var j = i + 1;
+        while (j < appended.items.len) {
+            const next_id = appended.items[j].page_id;
+            const bridges_gap = next_id == last_id + 2 and last_id + 1 == manifest_page_id;
+            if (next_id != last_id + 1 and !bridges_gap) break;
+            try crcs.append(allocator, appended.items[j].crc);
+            last_id = next_id;
+            j += 1;
+        }
+        try runs.append(allocator, .{ .range_start = range_start, .crcs = crcs });
+        i = j;
+    }
+
+    var payload_len: usize = manifest_header_size;
+    for (runs.items) |run| payload_len += manifest_run_header_size + run.crcs.items.len * 4;
+    payload_len += reused_count * manifest_entry_size;
+
+    const out = try allocator.alloc(u8, payload_len);
     errdefer allocator.free(out);
-    std.mem.writeInt(u64, out[0..8], range_start, .little);
-    std.mem.writeInt(u32, out[8..12], @intCast(appended_count), .little);
-    std.mem.writeInt(u32, out[12..16], @intCast(reused_count), .little);
-    const appended_crcs = out[manifest_header_size..][0 .. appended_count * 4];
-    var reused_offset: usize = manifest_header_size + appended_count * 4;
-    for (entries) |entry| {
-        if (reused_pages.contains(entry.page_id)) {
-            std.mem.writeInt(u64, out[reused_offset..][0..8], entry.page_id, .little);
-            std.mem.writeInt(u32, out[reused_offset + 8 ..][0..4], entry.crc, .little);
-            reused_offset += manifest_entry_size;
-        } else {
-            var idx = entry.page_id - range_start;
-            if (gap_in_span and entry.page_id > manifest_page_id) idx -= 1;
-            std.mem.writeInt(u32, appended_crcs[idx * 4 ..][0..4], entry.crc, .little);
+    std.mem.writeInt(u32, out[0..4], @intCast(runs.items.len), .little);
+    std.mem.writeInt(u32, out[4..8], @intCast(reused_count), .little);
+    var offset: usize = manifest_header_size;
+    for (runs.items) |run| {
+        std.mem.writeInt(u64, out[offset..][0..8], run.range_start, .little);
+        std.mem.writeInt(u32, out[offset + 8 ..][0..4], @intCast(run.crcs.items.len), .little);
+        offset += manifest_run_header_size;
+        for (run.crcs.items) |crc| {
+            std.mem.writeInt(u32, out[offset..][0..4], crc, .little);
+            offset += 4;
         }
     }
+    for (entries) |entry| {
+        if (!reused_pages.contains(entry.page_id)) continue;
+        std.mem.writeInt(u64, out[offset..][0..8], entry.page_id, .little);
+        std.mem.writeInt(u32, out[offset + 8 ..][0..4], entry.crc, .little);
+        offset += manifest_entry_size;
+    }
+    std.debug.assert(offset == out.len);
     return out;
+}
+
+fn manifestEntryLessThan(_: void, lhs: ManifestEntry, rhs: ManifestEntry) bool {
+    return lhs.page_id < rhs.page_id;
 }
 
 /// `out` must be exactly one physical page (`header.page_size` bytes): the
@@ -14513,32 +14559,41 @@ fn verifyManifest(file: std.Io.File, io: std.Io, slot: CheckpointSlot, page_size
     const payload = decodePagePayload(buf[0..page_size], .commit_manifest) catch return false;
     if (computePageCrc(.commit_manifest, payload) != slot.manifest_crc) return false;
     if (payload.len < manifest_header_size) return false;
-    const range_start = std.mem.readInt(u64, payload[0..8], .little);
-    const appended_count = std.mem.readInt(u32, payload[8..12], .little);
-    const reused_count = std.mem.readInt(u32, payload[12..16], .little);
-    const total = @as(u64, appended_count) + reused_count;
-    if (total != slot.manifest_page_count) return false;
-    if (payload.len != manifest_header_size + @as(usize, appended_count) * 4 + @as(usize, reused_count) * manifest_entry_size) return false;
-    // Walks the same implicit gap encodeManifestPayloadAlloc skipped: a
-    // candidate id equal to this slot's own manifest page is never an
-    // entry (nothing writes to it until the manifest page itself is
-    // built), so it is passed over without consuming one of the
-    // appended_count CRC array slots -- reconstructed purely from
-    // slot.manifest_page, never stored in the payload itself.
-    var i: u32 = 0;
-    var page_id = range_start;
-    while (i < appended_count) : (i += 1) {
-        if (page_id == slot.manifest_page) page_id += 1;
-        const expected_crc = std.mem.readInt(u32, payload[manifest_header_size + @as(usize, i) * 4 ..][0..4], .little);
-        if (page_id < reserved_header_pages or page_id >= slot.page_count) return false;
-        var crc_buf: [4]u8 = undefined;
-        const got = file.readPositionalAll(io, &crc_buf, page_id * @as(u64, page_size) + page_crc_offset) catch return false;
-        if (got != 4) return false;
-        if (std.mem.readInt(u32, &crc_buf, .little) != expected_crc) return false;
-        page_id += 1;
+    const run_count = std.mem.readInt(u32, payload[0..4], .little);
+    const reused_count = std.mem.readInt(u32, payload[4..8], .little);
+    var offset: usize = manifest_header_size;
+    var total_appended: u64 = 0;
+    for (0..run_count) |_| {
+        if (offset + manifest_run_header_size > payload.len) return false;
+        const range_start = std.mem.readInt(u64, payload[offset..][0..8], .little);
+        const count = std.mem.readInt(u32, payload[offset + 8 ..][0..4], .little);
+        offset += manifest_run_header_size;
+        if (offset + @as(usize, count) * 4 > payload.len) return false;
+        // Walks the same implicit gap encodeManifestPayloadAlloc skipped: a
+        // candidate id equal to this slot's own manifest page is never an
+        // entry (nothing writes to it until the manifest page itself is
+        // built), so it is passed over without consuming one of this run's
+        // own CRC array slots -- reconstructed purely from
+        // slot.manifest_page, never stored in the payload itself. At most
+        // one run ever actually bridges the gap; every other run's walk
+        // below never matches it, so this check is a no-op there.
+        var i: u32 = 0;
+        var page_id = range_start;
+        while (i < count) : (i += 1) {
+            if (page_id == slot.manifest_page) page_id += 1;
+            const expected_crc = std.mem.readInt(u32, payload[offset..][0..4], .little);
+            offset += 4;
+            if (page_id < reserved_header_pages or page_id >= slot.page_count) return false;
+            var crc_buf: [4]u8 = undefined;
+            const got = file.readPositionalAll(io, &crc_buf, page_id * @as(u64, page_size) + page_crc_offset) catch return false;
+            if (got != 4) return false;
+            if (std.mem.readInt(u32, &crc_buf, .little) != expected_crc) return false;
+            page_id += 1;
+        }
+        total_appended += count;
     }
-    var offset: usize = manifest_header_size + @as(usize, appended_count) * 4;
     for (0..reused_count) |_| {
+        if (offset + manifest_entry_size > payload.len) return false;
         const reused_page_id = std.mem.readInt(u64, payload[offset..][0..8], .little);
         const expected_crc = std.mem.readInt(u32, payload[offset + 8 ..][0..4], .little);
         offset += manifest_entry_size;
@@ -14548,6 +14603,9 @@ fn verifyManifest(file: std.Io.File, io: std.Io, slot: CheckpointSlot, page_size
         if (got != 4) return false;
         if (std.mem.readInt(u32, &crc_buf, .little) != expected_crc) return false;
     }
+    if (offset != payload.len) return false;
+    const total = total_appended + reused_count;
+    if (total != slot.manifest_page_count) return false;
     return true;
 }
 
