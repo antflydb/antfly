@@ -1,5 +1,5 @@
-import { encodeGraphParameter } from "./graph-wire.js";
 import { AntflyHTTPError, AntflyResponseError } from "./errors.js";
+import { encodeGraphParameter } from "./graph-wire.js";
 import {
   SeriesImportError,
   type SeriesQueryOptions,
