@@ -3466,6 +3466,16 @@ const TestDescriptorFactory = struct {
                     .pre_vote = false,
                     .check_quorum = true,
                     .step_down_on_removal = true,
+                    // Deterministic per-node jitter, derived the same way as
+                    // the production metadata/data Raft runtimes
+                    // (metadata/runtime.zig, data/runtime.zig). Without it
+                    // every simulated node shares the same election_tick
+                    // countdown and, once in lockstep, candidates campaign
+                    // and collide on every tick under resource pressure
+                    // (split vote that never resolves). Seeding from the
+                    // sim's own (group_id, local_node_id) keeps exact replay
+                    // reproducible -- it must never come from host entropy.
+                    .random_seed = raft_host.stableRandomSeed(record.group_id, record.local_node_id),
                     .trace_logger = if (self.trace_group_id == record.group_id) self.trace_logger else null,
                 },
                 .storage = store.storage(),
@@ -6981,6 +6991,7 @@ pub const MetadataAdminVoprSource = struct {
             .list_tables => |request| try store.listSystemCatalogTables(alloc, group_id, request),
             .table_status => |request| try store.listSystemCatalogTables(alloc, group_id, request.listing()),
             .resolver_catalog_read => |request| try store.resolverCatalogRead(alloc, group_id, request),
+            .graph_authority => |request| try std.json.Stringify.valueAlloc(alloc, try store.graphAuthority(alloc, group_id, request), .{}),
             .mutate => unreachable,
         };
         errdefer alloc.free(result);
