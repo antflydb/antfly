@@ -725,9 +725,9 @@ test('PR result maps expanded suites to their single execution job', () => {
   const workflow = fs.readFileSync(path.resolve(__dirname, '../workflows/pr-ci.yml'), 'utf8');
   const script = workflow.split('const needs = JSON.parse(process.env.RESULTS);')[1].split('\n  publish:')[0];
   const check = new Function('process', `const needs = JSON.parse(process.env.RESULTS);${script}`);
-  const results = {approve: {result: 'success', outputs: {suites: JSON.stringify(['zig', 'full', 'vopr', 'soak'])}}, zig: {result: 'success'}, vopr: {result: 'success'}};
+  const results = {approve: {result: 'success', outputs: {suites: JSON.stringify(['zig', 'full', 'vopr', 'soak'])}}, zig: {result: 'success'}, vopr: {result: 'success'}, 'operation-owners': {result: 'success'}};
   check({env: {RESULTS: JSON.stringify(results)}});
-  for (const job of ['zig', 'vopr']) {
+  for (const job of ['zig', 'vopr', 'operation-owners']) {
     for (const result of ['failure', 'skipped', 'cancelled']) {
       assert.throws(() => check({env: {RESULTS: JSON.stringify({...results, [job]: {result}})}}), /did not pass/);
     }

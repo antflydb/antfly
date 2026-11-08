@@ -61,7 +61,7 @@ pub fn capture(db: anytype, a: A, fence: anytype, definition: cypher.catalog.Gra
     return captureSelected(db, a, fence, names.items, @import("antfly_platform").time.realtimeNs());
 }
 pub fn captureSelected(db: anytype, a: A, fence: anytype, names: []const []const u8, now: u64) !Snapshot {
-    if (fence.source != db or !fence.primary.active or !fence.replay.active) return error.CypherSnapshotRequired;
+    if (fence.owner != @as(*const anyopaque, db) or !fence.primary.active or !fence.replay.active) return error.CypherSnapshotRequired;
     db.core.lockApplyShared();
     var locked = true;
     defer if (locked) db.core.unlockApplyShared();
@@ -131,7 +131,7 @@ pub fn visit(db: anytype, a: A, cut: *Snapshot, from: []const u8, to: []const u8
     page_opts.limit = @min(opts.limit, 4096);
     const session = try facade.openRelationalReadSession(a, from, to, page_opts);
     defer session.deinit();
-    try @import("relational_rows.zig").visitCypherRows(&session.reader, a, db.backend_runtime.io(), opts.limit, visitor);
+    try @import("read_session_backend").RelationalRows.visitCypherRows(&session.reader, a, db.backend_runtime.io(), opts.limit, visitor);
     try session.checkpoint();
 }
 pub fn scan(db: anytype, a: A, cut: *Snapshot, from: []const u8, to: []const u8, input: types.ScanOptions) !types.ScanResult {
@@ -222,7 +222,7 @@ pub fn getMany(db: anytype, a: A, cut: *Snapshot, keys: []const []const u8, inpu
             while (next < count) {
                 _ = row_scratch.reset(.free_all);
                 try session.checkpoint();
-                const batch = try @import("relational_rows.zig").lookupCypherBatch(&session.reader, row_scratch.allocator(), selected[next..count], 16 << 20);
+                const batch = try @import("read_session_backend").RelationalRows.lookupCypherBatch(&session.reader, row_scratch.allocator(), selected[next..count], 16 << 20);
                 if (batch.consumed == 0 or batch.consumed > count - next or batch.rows.len != batch.consumed) return error.InvalidResponse;
                 for (batch.rows, positions[next..][0..batch.consumed]) |row, position| {
                     try session.checkpoint();
@@ -341,11 +341,9 @@ pub fn Database(comptime DB: type) type {
             return if (self.cut.indexes) |pinned| .{ .head = pinned.head, .plan = pinned.plan.clone() } else null;
         }
         pub fn openDocumentReadSession(self: *@This(), a: A, from: []const u8, to: []const u8, opts: types.ScanOptions) !*DB.DocumentReadSession {
-            var schema = self.core.acquireSchemaView();
-            defer if (schema) |*view| view.release();
-            if ((if (schema) |view| view.version() else 0) != self.cut.schema_version) return error.SchemaVersionChanged;
-            return DB.DocumentReadSession.openSnapshot(a, self.core.store, try self.cut.primary.forkRead(), schema, self.cut.byte_range, from, to, opts, self.cut.now);
+            return self.source.openCypherPinnedDocumentSession(a, &self.cut, from, to, opts);
         }
+
         // Physical managed-search generations retain the durable cut path.
         // A forged search operation cannot read live state through this facade.
         pub fn searchCypherCut(_: *@This(), _: A, _: types.SearchRequest, _: []const u8, _: []const u8) !types.SearchResult {
@@ -405,17 +403,9 @@ pub fn Database(comptime DB: type) type {
             return self.source.cypherDocumentScanOptions(a, opts);
         }
         pub fn openRelationalReadSession(self: *@This(), a: A, from: []const u8, to: []const u8, opts: types.ScanOptions) !*DB.RelationalReadSession {
-            var statement: DB.RelationalStatementSnapshot = cut: {
-                var read = try self.cut.primary.forkRead();
-                errdefer read.abort();
-                const lease = try self.source.acquireCypherReadAuthority(a, opts.row_policy_principal_proof, opts.row_policy_database);
-                break :cut .{ .index_catalog_captured = true, .indexes = if (self.cut.indexes) |indexes| .{ .head = indexes.head, .plan = indexes.plan.clone() } else null, .read = read, .schema_version = self.cut.schema_version, .row_policy_lease = lease, .row_policy_phase = self.cut.row_policy_phase, .row_policy_generation = self.cut.row_policy_generation, .row_policy_catalog_epoch = self.cut.row_policy_catalog_epoch };
-            };
-            defer statement.deinit();
-            const session = try self.source.openRelationalReadSessionAtSnapshot(a, from, to, opts, &statement);
-            session.reader.now_ns = self.cut.now;
-            return session;
+            return self.source.openCypherPinnedRelationalSession(a, &self.cut, from, to, opts);
         }
+
         pub fn getCypherDocuments(self: *@This(), a: A, keys: []const []const u8, opts: types.ScanOptions, _: u64) ![]?types.LookupResult {
             return self.source.getCypherPinnedDocuments(a, &self.cut, keys, opts);
         }

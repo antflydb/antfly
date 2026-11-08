@@ -14,7 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const reader = @import("reader.zig");
+const reader = @import("pdf_values").reader;
 
 /// A reading-order block of compatible text on one geometric line. Spans are
 /// page-local UTF-8 byte offsets into the emitted text, not glyph indices.

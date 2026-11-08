@@ -223,58 +223,9 @@ const platform_time = @import("antfly_platform").time;
 const distributed_stats_mod = @import("antfly_local_sources").search_distributed_stats;
 const fusion_mod = @import("antfly_local_sources").search_fusion;
 
-/// Normalize known read-transport failures before they cross a compiled
-/// boundary. Reads have no ambiguous mutation outcome; unavailable peers must
-/// not become an unknown runtime defect or a successful empty/partial result.
-fn normalizeDistributedReadTransportError(err: anyerror) anyerror {
-    return switch (err) {
-        // Local request/watchdog admission is also an availability outcome.
-        // No read result exists; never turn saturation into a missing row or
-        // retry it here outside the caller's request budget.
-        error.ConcurrencyUnavailable,
-        error.ResourceTemporarilyUnavailable,
-        error.RemoteUnavailable,
-        error.ConnectionFailed,
-        error.AddressUnavailable,
-        error.ConnectionReset,
-        error.ConnectionRefused,
-        error.ConnectionResetByPeer,
-        error.ConnectionClosed,
-        error.ConnectionAborted,
-        error.ConnectionTimeout,
-        error.ConnectionTimedOut,
-        error.BrokenPipe,
-        error.NotConnected,
-        error.NetworkUnreachable,
-        error.NetworkDown,
-        error.HostUnreachable,
-        error.DnsResolutionFailed,
-        error.TemporaryNameServerFailure,
-        error.NameServerFailure,
-        error.RecvFailed,
-        error.SendFailed,
-        => error.StorageReadTemporarilyUnavailable,
-        else => err,
-    };
-}
-
-pub fn normalizeDistributedQueryOperationalError(err: anyerror) anyerror {
-    return switch (normalizeDistributedReadTransportError(err)) {
-        error.StorageReadTemporarilyUnavailable,
-        // A topology retry that loses its race twice is an availability
-        // outcome, not an internal server failure. The coordinator still
-        // owns all intermediate results and the caller can safely retry the
-        // complete request against a fresh plan.
-        error.TopologyChanged,
-        error.UnknownGroup,
-        error.NotLeader,
-        error.GroupLeaderUnavailable,
-        error.LeaderUnavailable,
-        error.ReadIndexTimeout,
-        => error.DistributedQueryUnavailable,
-        else => err,
-    };
-}
+const read_operational_errors = @import("read_operational_errors.zig");
+const normalizeDistributedReadTransportError = read_operational_errors.normalizeDistributedReadTransportError;
+pub const normalizeDistributedQueryOperationalError = read_operational_errors.normalizeDistributedQueryOperationalError;
 
 const regex_mod = @import("antfly_local_sources").search_regex;
 const httpx = @import("httpx");
@@ -2766,7 +2717,7 @@ pub const BoundTableReadSource = struct {
         const opts: db_mod.types.ScanOptions = .{ .cancellation = cancellation, .execution_deadline_ns = deadline_ns };
         try self.reads.reads.prepareScanWithConsistency(self.reads.group_id, "", "", opts, consistency);
         var fence = (try self.db.tryStatementReadFence()) orelse return error.Backpressured;
-        const snapshot = self.db.captureRelationalStatementSnapshot() catch |err| {
+        const snapshot = self.db.captureRelationalStatementSnapshotAtFence(&fence) catch |err| {
             fence.release();
             return err;
         };
@@ -2835,17 +2786,8 @@ pub const BoundTableReadSource = struct {
     }
 
     fn nextRelationalPage(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("antfly_local_sources").api_table_read_source.RelationalReadView.Page {
-        const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
-        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
-        errdefer page.deinit();
-        const owned = page.arena.allocator();
-        const rows = try owned.alloc(View.Row, page.rows.len);
-        for (page.rows, rows) |row, *output| output.* = .{ .id = row.key, .version = row.version, .schema_version = session.reader.active.version(), .value = row.typed orelse .null, .typed_cells = row.typed_cells, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest };
-        // Reader.after is an opaque physical continuation. It advances even
-        // when a bounded page contains only filtered or expired records.
-        const after = if (page.more) try owned.dupe(u8, session.reader.after.items) else null;
-        return .{ .arena = page.arena, .rows = rows, .after = after };
+        return session.nextViewPage(alloc, limit);
     }
 
     fn closeRelationalRead(ptr: *anyopaque) void {
@@ -21964,251 +21906,6 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(?u64, 17), result.identity_read_generation);
         }
 
-        const aggregation_domain_test_dense = [_]db_mod.types.NamedDenseQuery{
-            .{ .name = "first", .index_name = "va", .query = .{ .vector = &.{ 1, 0 }, .k = 30 } },
-            .{ .name = "second", .index_name = "vb", .query = .{ .vector = &.{ 0, 1 }, .k = 30 } },
-        };
-
-        fn aggregationDomainTestHybrid() db_mod.types.SearchRequest {
-            return .{
-                .full_text = .{ .match = .{ .field = "body", .text = "needle" } },
-                .dense_queries = &aggregation_domain_test_dense,
-                .merge_config = .{ .strategy = .rrf, .rank_constant = 60 },
-                .limit = 30,
-                .search_effort = 0.25,
-                .filter_query_json = "{\"term\":\"alpha\",\"field\":\"role\"}",
-                .aggregations_json = "{\"kinds\":{\"type\":\"terms\",\"field\":\"kind\"}}",
-            };
-        }
-
-        fn aggregationDomainTestPlan(original: db_mod.types.SearchRequest) !aggregation_plan.AggregationDomainPlan {
-            const collection = aggregationCollectionRequest(original, default_aggregation_full_result_budget, 7);
-            return switch (try aggregation_plan.aggregationDomainPlan(original, collection, default_aggregation_full_result_budget)) {
-                .decomposed => |plan| plan,
-                .unchanged => error.TestUnexpectedResult,
-            };
-        }
-
-        test "aggregation domain leaves requests without vector components unchanged" {
-            const text_only: db_mod.types.SearchRequest = .{
-                .full_text = .{ .match = .{ .field = "body", .text = "needle" } },
-                .limit = 30,
-            };
-            const collection = aggregationCollectionRequest(text_only, default_aggregation_full_result_budget, 7);
-            try std.testing.expect((try aggregation_plan.aggregationDomainPlan(text_only, collection, default_aggregation_full_result_budget)) == .unchanged);
-            try std.testing.expectEqual(@as(usize, 0), aggregation_plan.requestVectorComponentCount(text_only));
-        }
-
-        test "aggregation domain windows vector components by the original composed window" {
-            // The collection request's limit is the budget. The window must come
-            // from the caller's request, or every component becomes the whole index.
-            var plan = try aggregationDomainTestPlan(aggregationDomainTestHybrid());
-            try std.testing.expectEqual(default_aggregation_full_result_budget, plan.aggregation_req.limit);
-            try std.testing.expectEqual(@as(u32, 30), plan.vector_window);
-            try std.testing.expectEqual(@as(u32, 30), plan.vectorComponentRequest(0).limit);
-
-            var wide = aggregationDomainTestHybrid();
-            wide.merge_config = .{ .strategy = .rrf, .window_size = 50 };
-            plan = try aggregationDomainTestPlan(wide);
-            try std.testing.expectEqual(@as(u32, 50), plan.vector_window);
-
-            var reranked = aggregationDomainTestHybrid();
-            reranked.reranker = .{ .provider = .antfly, .field = "body", .candidate_count = 80 };
-            plan = try aggregationDomainTestPlan(reranked);
-            try std.testing.expectEqual(@as(u32, 80), plan.vector_window);
-
-            // A larger internal k is preserved on the component; the executor
-            // still searches max(k, window) and pages the same prefix.
-            const big_k = [_]db_mod.types.NamedDenseQuery{
-                .{ .name = "first", .index_name = "va", .query = .{ .vector = &.{ 1, 0 }, .k = 100 } },
-            };
-            var internal = aggregationDomainTestHybrid();
-            internal.dense_queries = &big_k;
-            plan = try aggregationDomainTestPlan(internal);
-            try std.testing.expectEqual(@as(u32, 30), plan.vector_window);
-            try std.testing.expectEqual(@as(u32, 100), plan.vectorComponentRequest(0).dense_queries[0].query.k);
-        }
-
-        test "aggregation domain distinguishes explicit match_all from filter carriers" {
-            var semantic = aggregationDomainTestHybrid();
-            semantic.full_text = .{ .match_all = {} };
-            var plan = try aggregationDomainTestPlan(semantic);
-            try std.testing.expect(plan.text_req == null);
-            try std.testing.expectEqual(@as(usize, 2), plan.vectorComponentCount());
-
-            const explicit = [_]db_mod.types.TextQuery{.{ .match_all = {} }};
-            semantic.full_text = .{ .bool_query = .{ .must = &explicit } };
-            plan = try aggregationDomainTestPlan(semantic);
-            try std.testing.expect(plan.text_req != null);
-
-            semantic.full_text = null;
-            plan = try aggregationDomainTestPlan(semantic);
-            try std.testing.expect(plan.text_req == null);
-
-            plan = try aggregationDomainTestPlan(aggregationDomainTestHybrid());
-            const text_req = plan.text_req orelse return error.TestUnexpectedResult;
-            try std.testing.expectEqual(@as(usize, 0), aggregation_plan.requestVectorComponentCount(text_req));
-            try std.testing.expect(text_req.merge_config == null);
-            try std.testing.expectEqual(default_aggregation_full_result_budget, text_req.limit);
-            try std.testing.expectEqualStrings(aggregationDomainTestHybrid().filter_query_json, text_req.filter_query_json);
-        }
-
-        test "aggregation domain isolates one retrieval source per vector sub-request" {
-            var original = aggregationDomainTestHybrid();
-            original.reranker = .{ .provider = .antfly, .field = "body", .candidate_count = 40 };
-            original.reranker_query_text = "needle";
-            original.pruner = .{ .min_score_ratio = 0.5 };
-            const plan = try aggregationDomainTestPlan(original);
-            try std.testing.expectEqual(@as(usize, 2), plan.vectorComponentCount());
-            for (0..2) |index| {
-                const sub = plan.vectorComponentRequest(index);
-                try std.testing.expect(sub.full_text == null);
-                try std.testing.expectEqual(@as(usize, 0), sub.full_text_queries.len);
-                try std.testing.expect(sub.merge_config == null);
-                try std.testing.expect(sub.reranker == null);
-                try std.testing.expectEqualStrings("", sub.reranker_query_text);
-                try std.testing.expect(sub.pruner == null);
-                try std.testing.expectEqual(@as(u32, 0), sub.offset);
-                try std.testing.expectEqual(@as(u32, 40), sub.limit);
-                // The caller's effort, filters, and read generation are kept.
-                try std.testing.expectEqual(@as(?f32, 0.25), sub.search_effort);
-                try std.testing.expectEqualStrings(original.filter_query_json, sub.filter_query_json);
-                try std.testing.expectEqual(@as(?u64, 7), sub.identity_read_generation);
-                try std.testing.expectEqual(@as(usize, 1), sub.dense_queries.len);
-                try std.testing.expect(sub.dense_queries.ptr == aggregation_domain_test_dense[index..].ptr);
-                try std.testing.expectEqual(@as(usize, 0), sub.sparse_queries.len);
-                try std.testing.expect(sub.dense == null and sub.sparse == null);
-                try std.testing.expect(sub.query == .match_all);
-            }
-
-            // Singleton legacy fields are components too, dense before sparse.
-            const singleton: db_mod.types.SearchRequest = .{
-                .full_text = .{ .match = .{ .field = "body", .text = "needle" } },
-                .dense = .{ .vector = &.{ 1, 0 }, .k = 10 },
-                .sparse = .{ .indices = &.{3}, .values = &.{1}, .k = 10 },
-                .limit = 10,
-            };
-            const singleton_plan = try aggregationDomainTestPlan(singleton);
-            try std.testing.expectEqual(@as(usize, 2), singleton_plan.vectorComponentCount());
-            const dense_sub = singleton_plan.vectorComponentRequest(0);
-            try std.testing.expect(dense_sub.dense != null and dense_sub.sparse == null);
-            const sparse_sub = singleton_plan.vectorComponentRequest(1);
-            try std.testing.expect(sparse_sub.sparse != null and sparse_sub.dense == null);
-            try std.testing.expectEqual(@as(u32, 10), sparse_sub.limit);
-        }
-
-        test "aggregation domain declines expansion, unit modes, and legacy knn" {
-            var expand = aggregationDomainTestHybrid();
-            expand.expand_strategy = .@"union";
-            try std.testing.expect((try aggregation_plan.aggregationDomainPlan(expand, expand, default_aggregation_full_result_budget)) == .unchanged);
-
-            var unit = aggregationDomainTestHybrid();
-            unit.return_mode = .unit;
-            try std.testing.expect((try aggregation_plan.aggregationDomainPlan(unit, unit, default_aggregation_full_result_budget)) == .unchanged);
-
-            var knn = aggregationDomainTestHybrid();
-            knn.query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 5 } };
-            try std.testing.expect((try aggregation_plan.aggregationDomainPlan(knn, knn, default_aggregation_full_result_budget)) == .unchanged);
-        }
-
-        test "aggregation domain rejects vector windows above the budget" {
-            var original = aggregationDomainTestHybrid();
-            original.merge_config = .{ .strategy = .rrf, .window_size = 500 };
-            try std.testing.expectError(error.QueryCandidateBudgetExceeded, aggregation_plan.aggregationDomainPlan(original, original, 100));
-        }
-
-        test "aggregation domain keeps algebraic shortcuts disabled for vector requests" {
-            // Aggregation context uses the collection request, which still carries
-            // the vector components. A vector-only fragment would qualify for the
-            // algebraic path and aggregate the whole index.
-            var semantic = aggregationDomainTestHybrid();
-            semantic.full_text = null;
-            semantic.filter_query_json = "";
-            const plan = try aggregationDomainTestPlan(semantic);
-            try std.testing.expect(!canConsiderAlgebraicAggregations(plan.aggregation_req));
-        }
-
-        fn aggregationDomainTestResult(alloc: std.mem.Allocator, ids: []const []const u8, relation: db_mod.types.TotalHitsRelation) !db_mod.types.SearchResult {
-            const hits = try alloc.alloc(db_mod.types.SearchHit, ids.len);
-            var initialized: usize = 0;
-            errdefer {
-                for (hits[0..initialized]) |*hit| hit.deinit(alloc);
-                alloc.free(hits);
-            }
-            for (ids, 0..) |id, index| {
-                hits[index] = .{ .id = try alloc.dupe(u8, id) };
-                initialized += 1;
-                hits[index].stored_data = try alloc.dupe(u8, "{}");
-            }
-            return .{
-                .alloc = alloc,
-                .hits = hits,
-                .total_hits = @intCast(ids.len),
-                .total_hits_relation = relation,
-            };
-        }
-
-        test "aggregation domain merge deduplicates, moves hits, and enforces the budget" {
-            const alloc = std.testing.allocator;
-            var parts = [_]db_mod.types.SearchResult{
-                try aggregationDomainTestResult(alloc, &.{ "doc:a", "doc:b" }, .exact),
-                try aggregationDomainTestResult(alloc, &.{ "doc:b", "doc:c" }, .gte),
-                try aggregationDomainTestResult(alloc, &.{ "doc:d", "doc:a" }, .gte),
-            };
-            defer for (&parts) |*part| part.deinit();
-            var merged = try aggregation_plan.mergeAggregationDomainResults(alloc, &parts, 100, "test");
-            defer merged.deinit();
-            try std.testing.expectEqual(db_mod.types.TotalHitsRelation.exact, merged.total_hits_relation);
-            try std.testing.expectEqual(@as(u32, 4), merged.total_hits);
-            const want = [_][]const u8{ "doc:a", "doc:b", "doc:c", "doc:d" };
-            for (want, merged.hits) |id, hit| {
-                try std.testing.expectEqualStrings(id, hit.id);
-                try std.testing.expect(hit.stored_data != null);
-            }
-            try std.testing.expect(aggregationCanUseCurrentResult(.{}, merged));
-
-            var over = [_]db_mod.types.SearchResult{
-                try aggregationDomainTestResult(alloc, &.{ "doc:a", "doc:b" }, .exact),
-                try aggregationDomainTestResult(alloc, &.{"doc:c"}, .gte),
-            };
-            defer for (&over) |*part| part.deinit();
-            try std.testing.expectError(error.QueryCandidateBudgetExceeded, aggregation_plan.mergeAggregationDomainResults(alloc, &over, 2, "test"));
-        }
-
-        test "aggregation domain collection runs text first and requires only text completeness" {
-            const alloc = std.testing.allocator;
-            const Searcher = struct {
-                calls: *std.ArrayListUnmanaged(db_mod.types.SearchRequest),
-                text_relation: db_mod.types.TotalHitsRelation,
-
-                pub fn search(self: @This(), a: std.mem.Allocator, req: db_mod.types.SearchRequest) !db_mod.types.SearchResult {
-                    try self.calls.append(a, req);
-                    if (req.dense_queries.len == 0) return try aggregationDomainTestResult(a, &.{ "doc:t1", "doc:shared" }, self.text_relation);
-                    // Vector windows report `gte` against the whole index; that is
-                    // their defined matching set, not an incomplete input.
-                    if (std.mem.eql(u8, req.dense_queries[0].index_name, "va")) return try aggregationDomainTestResult(a, &.{ "doc:shared", "doc:a1" }, .gte);
-                    return try aggregationDomainTestResult(a, &.{"doc:b1"}, .gte);
-                }
-            };
-            var calls = std.ArrayListUnmanaged(db_mod.types.SearchRequest).empty;
-            defer calls.deinit(alloc);
-            const original = aggregationDomainTestHybrid();
-            const collection = aggregationCollectionRequest(original, default_aggregation_full_result_budget, 7);
-            var collected = try aggregation_plan.collectAggregationFullResult(alloc, original, collection, Searcher{ .calls = &calls, .text_relation = .exact }, "test");
-            defer collected.deinit();
-            try std.testing.expectEqual(@as(usize, 3), calls.items.len);
-            try std.testing.expectEqual(@as(usize, 0), calls.items[0].dense_queries.len);
-            try std.testing.expectEqual(default_aggregation_full_result_budget, calls.items[0].limit);
-            try std.testing.expectEqual(@as(u32, 30), calls.items[1].limit);
-            try std.testing.expectEqual(@as(u32, 30), calls.items[2].limit);
-            try std.testing.expectEqual(@as(u32, 4), collected.total_hits);
-            try std.testing.expectEqual(db_mod.types.TotalHitsRelation.exact, collected.total_hits_relation);
-
-            // An incomplete text matching set is still refused.
-            calls.clearRetainingCapacity();
-            try std.testing.expectError(error.QueryCandidateBudgetExceeded, aggregation_plan.collectAggregationFullResult(alloc, original, collection, Searcher{ .calls = &calls, .text_relation = .gte }, "test"));
-        }
-
         test "aggregation completeness requires exact total relation" {
             const req = db_mod.types.SearchRequest{};
             try std.testing.expect(aggregationCanUseCurrentResult(req, .{
@@ -31650,12 +31347,13 @@ fn implementationTests() type {
                     defer alloc.free(body);
                     var response: abi.QueryOwnedResponse = .{};
                     var failure: abi.FailureIdentity = .{};
-                    const status = provider.execute(&.{
-                        .db = @ptrCast(&db),
+                    const request: abi.LocalQueryRequest = .{
+                        .execution = provider.issueForDb(&db),
                         .table_name = .fromSlice("docs"),
                         .request_json = .fromSlice(body),
                         .execution_options = .{ .enabled = 1, .raw_search_result = @intFromBool(raw) },
-                    }, &response, &failure);
+                    };
+                    const status = request.execution.execute_fn.?(request.execution.context, &request, &response, &failure);
                     defer if (response.buffer.ptr) |ptr| std.heap.c_allocator.free(ptr[0..@intCast(response.buffer.len)]);
                     try std.testing.expectEqual(abi.Status.ok, status);
                     var parsed = try std.json.parseFromSlice(Response, alloc, response.buffer.slice(), .{ .ignore_unknown_fields = true });

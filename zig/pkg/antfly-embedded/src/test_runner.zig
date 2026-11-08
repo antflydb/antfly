@@ -183,7 +183,9 @@ pub fn main(init: std.process.Init.Minimal) void {
         // boundary instead of reporting an anonymous signal.
         std.debug.print("{d}/{d} {s}...", .{ current_count, total_count, test_fn.name });
         const setup_start = timingNow(trace_timings, clock_io);
-        testing.allocator_instance = .init(std.heap.page_allocator, .{});
+        var allocator_options: std.heap.SafeAllocator.Options = .{};
+        if (getenvBool("ANTFLY_TEST_DEEP_ALLOC_TRACES")) allocator_options.stack_trace_frames = 32;
+        testing.allocator_instance = .init(std.heap.page_allocator, allocator_options);
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
             .environ = init.environ,
