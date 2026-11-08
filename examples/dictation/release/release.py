@@ -26,7 +26,7 @@ import os
 import plistlib
 import re
 import subprocess
-import tempfile
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
@@ -240,7 +240,9 @@ def verify_unsigned_zip(archive):
 
 class GitHubError(RuntimeError):
     def __init__(self, path, stderr):
-        self.status = 404 if "(HTTP 404)" in stderr else None
+        status = re.search(r"\bHTTP\s*(\d{3})\b", stderr, re.IGNORECASE)
+        self.status = int(status[1]) if status else None
+        self.stderr = stderr
         super().__init__(f"GitHub API failed at {path}: {stderr.strip()}")
 
 
@@ -256,7 +258,7 @@ def gh_api(path, method="GET", payload=None):
     )
     if response.returncode:
         raise GitHubError(path, response.stderr)
-    return json.loads(response.stdout)
+    return json.loads(response.stdout) if response.stdout.strip() else None
 
 
 def verify_source(identity):
@@ -478,6 +480,117 @@ def publish_feed(identity, feed):
         )
 
 
+def inspect_release_assets(release, identity, expected, sizes):
+    """Validate the whole remote snapshot before deleting even a placeholder."""
+    if (
+        release.get("tag_name") != identity["tag"]
+        or release.get("target_commitish") != identity["source_commit"]
+        or release.get("prerelease") is not (identity["channel"] == "beta")
+        or type(release.get("draft")) is not bool
+        or type(release.get("id")) is not int
+        or release["id"] <= 0
+    ):
+        raise ValueError("Existing release source/version identity mismatch")
+    present = set()
+    unfinished = []
+    seen = set()
+    for asset in release["assets"]:
+        name = asset["name"]
+        if name in seen or name not in expected:
+            raise ValueError("Duplicate or unexpected release asset")
+        seen.add(name)
+        if type(asset.get("id")) is not int or asset["id"] <= 0:
+            raise ValueError("Invalid release asset identity")
+        if (
+            release["draft"]
+            and asset.get("state") == "starter"
+            and type(asset.get("size")) is int
+            and asset["size"] == 0
+            and asset.get("digest")
+            in (None, "sha256:" + hashlib.sha256(b"").hexdigest())
+        ):
+            unfinished.append(asset["id"])
+        elif (
+            asset.get("state") == "uploaded"
+            and type(asset.get("size")) is int
+            and asset["size"] == sizes[name]
+            and asset.get("digest") == "sha256:" + expected[name]
+        ):
+            present.add(name)
+        else:
+            raise ValueError(
+                "Existing release asset differs or is incomplete; never overwrite released bytes: "
+                + name
+            )
+    return present, unfinished
+
+
+def retryable_upload_error(error):
+    detail = error.stderr or ""
+    status = re.search(r"\bHTTP\s*(\d{3})\b", detail, re.IGNORECASE)
+    if status:
+        return int(status[1]) in {408, 429} or 500 <= int(status[1]) < 600
+    return (
+        re.search(
+            r"timed? out|timeout|context deadline exceeded|connection (?:reset|closed|refused|aborted)|\bEOF\b|broken pipe|temporary failure",
+            detail,
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
+
+def upload_release_assets(identity, directory, release, expected):
+    repo = POLICY["repository"]
+    sizes = {name: (directory / name).stat().st_size for name in expected}
+    attempts = 3
+    for attempt in range(attempts):
+        present, unfinished = inspect_release_assets(release, identity, expected, sizes)
+        if present == set(expected):
+            return release
+        if not release["draft"]:
+            raise ValueError(
+                "Published release is incomplete; never modify published assets"
+            )
+        error = None
+        try:
+            for asset_id in unfinished:
+                try:
+                    gh_api(f"repos/{repo}/releases/assets/{asset_id}", "DELETE")
+                except GitHubError as deletion_error:
+                    if deletion_error.status != 404:
+                        raise
+            missing = sorted(set(expected) - present)
+            run(
+                "gh",
+                "release",
+                "upload",
+                identity["tag"],
+                "--repo",
+                repo,
+                *[str(directory / name) for name in missing],
+                stderr=subprocess.PIPE,
+            )
+        except (subprocess.CalledProcessError, GitHubError) as mutation_error:
+            error = mutation_error
+        # A failed response can still mean GitHub accepted some/all bytes.
+        # Always reconcile before retrying; complete uploads are never repeated.
+        release = gh_api(f"repos/{repo}/releases/tags/{identity['tag']}")
+        present, _ = inspect_release_assets(release, identity, expected, sizes)
+        if present == set(expected):
+            return release
+        if error is not None and (
+            not retryable_upload_error(error) or attempt + 1 == attempts
+        ):
+            raise error
+        if attempt + 1 == attempts:
+            raise ValueError(
+                "Release upload remains incomplete after three attempts; re-run failed publication jobs"
+            )
+        time.sleep(attempt + 1)
+    raise AssertionError("Unreachable upload retry state")
+
+
 def publish(identity, directory):
     verify_source(identity)
     manifest = json.loads((directory / "release.json").read_text())
@@ -512,6 +625,8 @@ def publish(identity, directory):
             "--repo",
             repo,
             "--verify-tag",
+            "--target",
+            identity["source_commit"],
             "--draft",
             "--latest=false",
             "--title",
@@ -522,47 +637,22 @@ def publish(identity, directory):
         if identity["channel"] == "beta":
             args.append("--prerelease")
         run(*args)
-    # Immutable archives: retries reuse existing verified bytes, never --clobber.
-    with tempfile.TemporaryDirectory() as temp:
-        assets = gh_api(f"repos/{repo}/releases/tags/{identity['tag']}")["assets"]
-        existing = {a["name"] for a in assets}
-        for name in sorted(expected | {"release.json"}):
-            if name in existing:
-                run(
-                    "gh",
-                    "release",
-                    "download",
-                    identity["tag"],
-                    "--repo",
-                    repo,
-                    "--pattern",
-                    name,
-                    "--dir",
-                    temp,
-                )
-                if digest(Path(temp) / name) != digest(directory / name):
-                    raise ValueError("Existing release asset differs: " + name)
-            else:
-                run(
-                    "gh",
-                    "release",
-                    "upload",
-                    identity["tag"],
-                    str(directory / name),
-                    "--repo",
-                    repo,
-                )
+        release = gh_api(f"repos/{repo}/releases/tags/{identity['tag']}")
+    expected_digests = dict(manifest["sha256"])
+    expected_digests["release.json"] = digest(directory / "release.json")
+    release = upload_release_assets(identity, directory, release, expected_digests)
     verify_source(identity)
-    run(
-        "gh",
-        "release",
-        "edit",
-        identity["tag"],
-        "--repo",
-        repo,
-        "--draft=false",
-        "--latest=false",
-    )
+    if release["draft"]:
+        run(
+            "gh",
+            "release",
+            "edit",
+            identity["tag"],
+            "--repo",
+            repo,
+            "--draft=false",
+            "--latest=false",
+        )
     # The feed moves only after every immutable download is available.
     publish_feed(identity, feed)
 

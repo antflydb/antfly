@@ -60,10 +60,17 @@ is available only once; retain a secure backup. Back up the Sparkle signing key
 securely as well. Losing that key can require manual installation or a deliberate
 key rotation; do not generate a new key for every release.
 
-The setup helper prompts for the `.p12` password, generates or reuses the
-`antflydb-dictation` Sparkle key in your login Keychain, and streams credentials
-directly into GitHub Actions secrets. It prints only the public Sparkle key.
-The temporary private-key export has restrictive permissions and is removed.
+The setup helper prompts for the `.p12` password and streams credentials directly
+into GitHub Actions secrets. It checks the existing repository public key before
+changing signing credentials. Routine setup requires this Mac's Keychain key to
+match that identity; a new Mac must restore the original private key. It never
+replaces an existing repository public key. First setup generates or reuses the
+`antflydb-dictation` Keychain key and reserves the public identity with a
+create-only API before uploading credentials. If a feed or any dictation release
+already exists but the public-key variable is missing, setup stops for recovery.
+It prints only the public Sparkle key. The temporary private-key export has
+restrictive permissions, is checked against the deployed public key immediately
+before upload, and is removed afterward.
 Run from a checkout containing this change, authenticated with `gh` as a repo
 administrator:
 
@@ -76,6 +83,20 @@ python3 examples/dictation/release/setup-github.py \
   --team-id TEAMID1234 \
   --identity 'Developer ID Application: Your Organization (TEAMID1234)'
 ```
+
+On a replacement Mac, add `--sparkle-key /secure/path/original-sparkle-seed` to
+the command above. The helper verifies that backup against the deployed public
+key before importing it. Repeating setup with the same key is safe. If this Mac
+has a conflicting `antflydb-dictation` Keychain entry, back it up and remove that
+specific conflicting entry before restoring the original; the helper does not
+overwrite it. Never delete the organization's only copy of a signing key.
+
+A lost repository public-key variable must be restored from a trusted existing
+signed release before rerunning setup. An API permission failure does not count
+as first-time initialization. A genuine key rotation needs a separately reviewed
+transition and compatibility plan; the helper has no force-rotation flag. With
+verification before extraction enabled, Sparkle requires a Developer ID signed
+DMG to rotate the EdDSA key. These ZIP updates cannot silently rotate it.
 
 To configure only the GitHub approval boundary, without any credentials:
 
@@ -138,8 +159,12 @@ The Sparkle release tools are downloaded by exact version and SHA-256 from
 
 A separate publication job consumes the exact signed artifact, rechecks the tag
 and current controller policy, verifies payload digests, and creates/verifies
-immutable GitHub Release assets. It never overwrites an existing asset with
-different bytes and never takes the repository-wide Latest marker from Antfly.
+immutable GitHub Release assets. Existing uploads are verified by their reported
+SHA-256 digests and exact byte lengths, avoiding repeated full archive downloads.
+The release tag, recorded source commit, and stable/prerelease classification
+must match. It never overwrites a completed asset or takes the repository-wide
+Latest marker from Antfly. A published release must already have its complete
+verified asset set; recovery does not add or remove its downloads.
 Only after the downloads are published does it atomically fast-forward the
 `dictation-updates` feed branch. Feed publication refuses version regression,
 conflicting bytes at the same version, or concurrent lost updates.
@@ -152,8 +177,19 @@ Feed URLs:
 These URLs become available after the first corresponding release. No release
 or feed is created just by running the setup helper.
 
-If publication fails after signing, use **Re-run failed jobs** on that run, so
-publication reuses the signed artifact. Do not re-run signing to replace an
+Transient upload and placeholder-deletion failures have at most three attempts
+with bounded backoff. After every mutation response, including failures, the
+publisher re-reads remote state: bytes already accepted by GitHub are not uploaded
+again. Only verified zero-byte `starter` placeholders on a matching draft can be
+removed. The complete snapshot is checked before any deletion, so conflicting
+bytes, unexpected assets, malformed placeholders, or release-identity mismatches
+stop publication without removing data. Permission and validation errors stop
+without automatic retry. A feed advances only after every asset is verified and
+the draft has been published; retrying a feed failure can reuse a complete
+published release without modifying its downloads.
+
+If publication still fails after signing, use **Re-run failed jobs** on that run,
+so publication reuses the signed artifact. Do not re-run signing to replace an
 already-published version: notarization timestamps can produce different bytes.
 Do not move release tags. A correction is a new version. If the controller policy
 changes while a release is queued, release from a new tag containing the reviewed
