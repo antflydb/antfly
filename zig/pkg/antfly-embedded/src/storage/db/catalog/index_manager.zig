@@ -1392,6 +1392,8 @@ pub const IndexManager = struct {
     /// absent (for example without an enrichment runtime), reads of elided
     /// vectors fail with `error.ReembedUnavailable`.
     dense_reembedder: ?DenseReembedder = null,
+    /// Recently re-embedded vectors of transient LEANN indexes (32 MiB).
+    leann_reembed_cache: leann_store_mod.ReembedCache = .{ .limit_bytes = 32 << 20 },
     text_main_backend: persistent_mod.MainBackend,
     text_lsm_storage: ?lsm_backend_mod.Storage,
     text_main_lsm_options: lsm_backend_mod.Options,
@@ -7199,6 +7201,7 @@ pub const IndexManager = struct {
 
     fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
         self.waitForGraphMetricSchedulePins();
+        self.leann_reembed_cache.deinit(self.alloc);
         if (self.write_plan_cache) |cached| {
             self.write_plan_cache = null;
             cached.release();
@@ -23568,6 +23571,7 @@ pub const IndexManager = struct {
                         .search_ef = leann_opts.search_ef,
                         .bound_scale = leann_opts.bound_scale,
                         .batch_size = leann_opts.batch_size,
+                        .reembed_budget_ms = leann_opts.reembed_budget_ms,
                         .replicated = self.leann_replication,
                         .transient = leann_opts.vector_storage.elides(),
                     });
@@ -32847,6 +32851,9 @@ pub const IndexManager = struct {
         defer elided_slots.deinit(alloc);
         var elided_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer elided_keys.deinit(alloc);
+        var elided_digests = std.ArrayListUnmanaged(?u64).empty;
+        defer elided_digests.deinit(alloc);
+        const incarnation = leannIncarnation(entry.config);
         for (vector_ids, metadata, 0..) |vector_id, meta, i| {
             found[i] = false;
             if (meta.len == 0) continue;
@@ -32854,8 +32861,16 @@ pub const IndexManager = struct {
                 if (entry.leann_transient) if (entry.embedding_name) |embedding_name| {
                     break :blk manager.loadDenseVectorArtifactForHbc(alloc, store, meta, embedding_name, null) catch |err| switch (err) {
                         error.VectorElided => {
+                            // A hot candidate re-embedded by an earlier query
+                            // for this exact stub is served from the cache.
+                            const digest = try leannStubDigest(alloc, store, meta, embedding_name);
+                            if (digest) |dg| if (manager.leann_reembed_cache.get(incarnation, meta, dg, out[i * d ..][0..d])) {
+                                found[i] = true;
+                                continue;
+                            };
                             try elided_slots.append(alloc, i);
                             try elided_keys.append(alloc, meta);
+                            try elided_digests.append(alloc, digest);
                             continue;
                         },
                         error.NotFound => continue,
@@ -32881,9 +32896,28 @@ pub const IndexManager = struct {
         try manager.reembedDenseDocuments(alloc, entry, elided_keys.items, vectors, ok);
         for (elided_slots.items, 0..) |slot, j| {
             if (!ok[j]) continue;
-            @memcpy(out[slot * d ..][0..d], vectors[j * d ..][0..d]);
+            const vector = vectors[j * d ..][0..d];
+            @memcpy(out[slot * d ..][0..d], vector);
             found[slot] = true;
+            if (elided_digests.items[j]) |dg| manager.leann_reembed_cache.put(manager.alloc, incarnation, elided_keys.items[j], dg, vector) catch {};
         }
+    }
+
+    /// Digest of the vector an elided stub replaced, or null when the stored
+    /// artifact is not a stub (or is gone).
+    fn leannStubDigest(alloc: Allocator, store: *docstore_mod.DocStore, doc_key: []const u8, embedding_name: []const u8) !?u64 {
+        const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
+            try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, doc_key, embedding_name)
+        else
+            try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, embedding_name);
+        defer alloc.free(artifact_key);
+        const raw = store.get(alloc, artifact_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        const stub = (enrichment_artifact_codec.elidedDenseEmbedding(raw) catch return null) orelse return null;
+        return stub.vector_digest;
     }
 
     /// Embeds documents' source text the way the index's dense producer
@@ -35202,6 +35236,7 @@ const LeannDenseOptions = struct {
     search_ef: u32 = 0,
     bound_scale: f32 = 1.0,
     batch_size: u32 = 0,
+    reembed_budget_ms: u32 = 0,
 };
 
 /// Reads the internal `algorithm` / `leann` fields written by the managed
@@ -35224,6 +35259,7 @@ fn parseLeannDenseOptions(root: std.json.ObjectMap) !?LeannDenseOptions {
     if (try Int.get(value.object, "max_degree", 4, 128)) |v| out.max_degree = v;
     if (try Int.get(value.object, "search_ef", 0, 4096)) |v| out.search_ef = v;
     if (try Int.get(value.object, "batch_size", 0, 1024)) |v| out.batch_size = v;
+    if (try Int.get(value.object, "reembed_budget_ms", 0, 600_000)) |v| out.reembed_budget_ms = v;
     if (try Int.get(value.object, "quantization_bits", 0, 8)) |v| out.rabitq_bits = @intCast(v);
     if (value.object.get("quantizer")) |v| {
         if (v != .string) return error.InvalidIndexConfig;
@@ -52097,6 +52133,13 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
             try std.testing.expect(embedder.documents - before < 64);
         }
         try std.testing.expect(embedder.calls < embedder.documents);
+        // Repeating a query serves its candidates from the re-embed cache.
+        {
+            const before = embedder.documents;
+            try expectTop(&manager, &store, entry, &vectors[177], keys[177]);
+            try std.testing.expectEqual(before, embedder.documents);
+            try std.testing.expect(manager.leann_reembed_cache.hits > 0);
+        }
 
         // Deleting a quarter rebuilds from codes on sync: nothing re-embedded.
         var deleted: [n / 4][]const u8 = undefined;
@@ -52122,8 +52165,10 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         try expectTop(&manager, &store, entry, &vectors[200], keys[200]);
         try std.testing.expect(embedder.documents > before);
 
-        // Without an embedder, reads of elided vectors fail cleanly.
+        // Without an embedder (and nothing cached), reads of elided vectors
+        // fail cleanly.
         manager.dense_reembedder = null;
+        manager.leann_reembed_cache.deinit(alloc);
         try std.testing.expectError(error.ReembedUnavailable, entry.index.searchWithRequest(.{ .query = &vectors[200], .k = 5 }));
     }
 }

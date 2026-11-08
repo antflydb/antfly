@@ -3316,6 +3316,7 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     var search_ef: i64 = 0;
     var bound_scale: f64 = 1.0;
     var batch_size: i64 = 0;
+    var reembed_budget_ms: i64 = 0;
     var quantization_bits: i64 = 0;
     var vector_storage: ?[]const u8 = null;
     if (root.get("leann")) |leann| {
@@ -3341,6 +3342,8 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
                 if (!(bound_scale >= 0 and bound_scale <= 8)) return error.InvalidCreateTableRequest;
             } else if (std.mem.eql(u8, key, "batch_size")) {
                 batch_size = try jsonIntegerInRange(value, 0, 1024);
+            } else if (std.mem.eql(u8, key, "reembed_budget_ms")) {
+                reembed_budget_ms = try jsonIntegerInRange(value, 0, 600_000);
             } else if (std.mem.eql(u8, key, "vector_storage")) {
                 if (value != .string) return error.InvalidCreateTableRequest;
                 if (!std.mem.eql(u8, value.string, "auto") and !std.mem.eql(u8, value.string, "transient") and !std.mem.eql(u8, value.string, "persistent")) return error.InvalidCreateTableRequest;
@@ -3366,8 +3369,8 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     const resolved_storage = vector_storage orelse if (auto_allowed) "auto" else "persistent";
     const json = try std.fmt.allocPrint(
         alloc,
-        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"quantization_bits\":{d},\"vector_storage\":\"{s}\",\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d}}}",
-        .{ max_degree, quantizer, quantization_bits, resolved_storage, search_ef, bound_scale, batch_size },
+        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"quantization_bits\":{d},\"vector_storage\":\"{s}\",\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d},\"reembed_budget_ms\":{d}}}",
+        .{ max_degree, quantizer, quantization_bits, resolved_storage, search_ef, bound_scale, batch_size, reembed_budget_ms },
     );
     defer alloc.free(json);
     try out.appendSlice(alloc, json);
@@ -3404,6 +3407,11 @@ test "managed embedder translates leann algorithm into dense config" {
             \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"persistent"}}
             ,
             "\"vector_storage\":\"persistent\"",
+        },
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"reembed_budget_ms":250}}
+            ,
+            "\"reembed_budget_ms\":250",
         },
         // PQ graphs rebuild from vectors, so they keep them.
         .{

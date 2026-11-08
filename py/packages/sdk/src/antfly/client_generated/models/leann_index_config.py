@@ -35,6 +35,9 @@ class LeannIndexConfig:
         bound_scale (float | Unset): Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates
             and loses fewer true neighbors. Default: 1.0.
         batch_size (int | Unset): Candidates recomputed per batch. 0 uses k. Default: 0.
+        reembed_budget_ms (int | Unset): Time a query may spend re-embedding candidates whose stored vectors were
+            dropped. Once spent, the remaining candidates are ranked by their code estimates instead, so the query still
+            returns results. 0 means no limit. Default: 0.
     """
 
     max_degree: int | Unset = 30
@@ -43,6 +46,7 @@ class LeannIndexConfig:
     search_ef: int | Unset = 0
     bound_scale: float | Unset = 1.0
     batch_size: int | Unset = 0
+    reembed_budget_ms: int | Unset = 0
 
     def to_dict(self) -> dict[str, Any]:
         max_degree = self.max_degree
@@ -61,6 +65,8 @@ class LeannIndexConfig:
 
         batch_size = self.batch_size
 
+        reembed_budget_ms = self.reembed_budget_ms
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
@@ -76,6 +82,8 @@ class LeannIndexConfig:
             field_dict["bound_scale"] = bound_scale
         if batch_size is not UNSET:
             field_dict["batch_size"] = batch_size
+        if reembed_budget_ms is not UNSET:
+            field_dict["reembed_budget_ms"] = reembed_budget_ms
 
         return field_dict
 
@@ -104,6 +112,8 @@ class LeannIndexConfig:
 
         batch_size = d.pop("batch_size", UNSET)
 
+        reembed_budget_ms = d.pop("reembed_budget_ms", UNSET)
+
         leann_index_config = cls(
             max_degree=max_degree,
             quantizer=quantizer,
@@ -111,6 +121,7 @@ class LeannIndexConfig:
             search_ef=search_ef,
             bound_scale=bound_scale,
             batch_size=batch_size,
+            reembed_budget_ms=reembed_budget_ms,
         )
 
         return leann_index_config

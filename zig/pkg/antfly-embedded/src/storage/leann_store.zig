@@ -38,6 +38,7 @@ const Allocator = std.mem.Allocator;
 const leann = @import("antfly_vectorindex").leann;
 const search_results = @import("antfly_vectorindex").search_results;
 const search_types = @import("antfly_vectorindex").search_types;
+const platform_time = @import("antfly_platform").time;
 const vec = @import("antfly_vector").vector;
 const replicated_mod = @import("leann_replicated.zig");
 const replica_mod = @import("leann_replica.zig");
@@ -58,6 +59,9 @@ pub const Options = struct {
     search_ef: u32 = 0,
     bound_scale: f32 = 1.0,
     batch_size: u32 = 0,
+    /// Re-embedding time per query before the remaining candidates are
+    /// ranked by estimate; 0 disables the budget.
+    reembed_budget_ms: u32 = 0,
     /// Vectors served by exact search before the first graph build.
     build_threshold: u32 = 256,
     /// Rebuild on sync once this fraction of graph nodes is deleted.
@@ -191,6 +195,7 @@ pub const LeannStore = struct {
             .search_ef = opts.search_ef,
             .bound_scale = opts.bound_scale,
             .batch_size = opts.batch_size,
+            .reembed_budget_ms = opts.reembed_budget_ms,
             .transient = opts.transient,
         };
     }
@@ -656,6 +661,7 @@ pub const LeannStore = struct {
         // k results pass or the whole graph has been considered.
         var want: usize = if (filter.active()) @max(req.k * 4, req.k + 64) else req.k;
         var ctx = SourceCtx{ .store = self, .far_from = req.query };
+        const gate = SearchGate.init(req, self.opts.reembed_budget_ms);
         while (true) {
             want = @min(want, live);
             var resp = try index.search(alloc, ctx.source(), req.query, .{
@@ -663,6 +669,7 @@ pub const LeannStore = struct {
                 .ef = if (self.opts.search_ef > 0) @max(self.opts.search_ef, @as(u32, @intCast(want))) else 0,
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
+                .gate = gate.recomputeGate(),
             });
             defer resp.deinit(alloc);
             var passed: usize = 0;
@@ -880,6 +887,127 @@ pub const LeannStore = struct {
 };
 
 /// HBC request filters, applied to graph and buffer candidates.
+/// Bounded cache of vectors re-embedded for transient LEANN indexes, so hot
+/// candidates are not re-embedded on every query. Keyed by the index
+/// incarnation, the document key and the digest of the dropped vector: an
+/// edited document (new digest) or a recreated index never sees a stale
+/// vector. Evicts the least recently used entries. Thread-safe.
+pub const ReembedCache = struct {
+    const Entry = struct { vector: []f32, stamp: u64 };
+
+    limit_bytes: usize,
+    mutex: std.atomic.Mutex = .unlocked,
+    map: std.StringHashMapUnmanaged(Entry) = .empty,
+    bytes: usize = 0,
+    clock: u64 = 0,
+    hits: u64 = 0,
+    misses: u64 = 0,
+
+    pub fn deinit(self: *ReembedCache, alloc: Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            alloc.free(e.key_ptr.*);
+            alloc.free(e.value_ptr.vector);
+        }
+        self.map.deinit(alloc);
+        self.* = .{ .limit_bytes = self.limit_bytes };
+    }
+
+    fn lock(self: *ReembedCache) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn keyInto(buf: []u8, incarnation: u64, doc_key: []const u8, digest: u64) ?[]const u8 {
+        if (doc_key.len + 16 > buf.len) return null;
+        std.mem.writeInt(u64, buf[0..8], incarnation, .little);
+        std.mem.writeInt(u64, buf[8..16], digest, .little);
+        @memcpy(buf[16..][0..doc_key.len], doc_key);
+        return buf[0 .. 16 + doc_key.len];
+    }
+
+    /// Copies the cached vector into `out` and returns true on a hit.
+    pub fn get(self: *ReembedCache, incarnation: u64, doc_key: []const u8, digest: u64, out: []f32) bool {
+        if (self.limit_bytes == 0) return false;
+        var buf: [1024]u8 = undefined;
+        const key = keyInto(&buf, incarnation, doc_key, digest) orelse return false;
+        self.lock();
+        defer self.mutex.unlock();
+        const entry = self.map.getPtr(key) orelse {
+            self.misses += 1;
+            return false;
+        };
+        if (entry.vector.len != out.len) return false;
+        @memcpy(out, entry.vector);
+        self.clock += 1;
+        entry.stamp = self.clock;
+        self.hits += 1;
+        return true;
+    }
+
+    pub fn put(self: *ReembedCache, alloc: Allocator, incarnation: u64, doc_key: []const u8, digest: u64, vector: []const f32) !void {
+        var buf: [1024]u8 = undefined;
+        const key = keyInto(&buf, incarnation, doc_key, digest) orelse return;
+        const size = key.len + vector.len * @sizeOf(f32);
+        if (size > self.limit_bytes) return;
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.map.contains(key)) return;
+        while (self.bytes + size > self.limit_bytes) self.evictOldest(alloc);
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        const owned_vector = try alloc.dupe(f32, vector);
+        errdefer alloc.free(owned_vector);
+        self.clock += 1;
+        try self.map.put(alloc, owned_key, .{ .vector = owned_vector, .stamp = self.clock });
+        self.bytes += size;
+    }
+
+    fn evictOldest(self: *ReembedCache, alloc: Allocator) void {
+        var oldest: ?[]const u8 = null;
+        var oldest_stamp: u64 = std.math.maxInt(u64);
+        var it = self.map.iterator();
+        while (it.next()) |e| if (e.value_ptr.stamp < oldest_stamp) {
+            oldest_stamp = e.value_ptr.stamp;
+            oldest = e.key_ptr.*;
+        };
+        const victim = oldest orelse {
+            self.bytes = 0;
+            return;
+        };
+        const kv = self.map.fetchRemove(victim).?;
+        self.bytes -= kv.key.len + kv.value.vector.len * @sizeOf(f32);
+        alloc.free(kv.key);
+        alloc.free(kv.value.vector);
+    }
+};
+
+/// Per-query gate for re-embedding: the request's cancellation aborts the
+/// search; once the time budget is spent, LEANN stops re-embedding and ranks
+/// the remaining candidates by estimate.
+pub const SearchGate = struct {
+    cancellation: ?search_types.CancellationToken,
+    deadline_ns: ?u64,
+
+    pub fn init(req: search_types.SearchRequest, budget_ms: u32) SearchGate {
+        return .{
+            .cancellation = req.cancellation,
+            .deadline_ns = if (budget_ms > 0) platform_time.monotonicNs() + @as(u64, budget_ms) * std.time.ns_per_ms else null,
+        };
+    }
+
+    pub fn recomputeGate(self: *const SearchGate) ?leann.RecomputeGate {
+        if (self.cancellation == null and self.deadline_ns == null) return null;
+        return .{ .ctx = self, .check_fn = check };
+    }
+
+    fn check(raw: *const anyopaque) anyerror!bool {
+        const self: *const SearchGate = @ptrCast(@alignCast(raw));
+        if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        if (self.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return false;
+        return true;
+    }
+};
+
 const Filter = struct {
     allowed: std.AutoHashMapUnmanaged(u64, void) = .empty,
     excluded: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -1009,6 +1137,29 @@ fn addAll(alloc: Allocator, store: *LeannStore, data: []const f32, dims: usize, 
         });
     }
     try store.apply(items.items, &.{});
+}
+
+test "leann reembed cache: hits by digest, misses on a new digest, evicts least recent" {
+    const alloc = testing.allocator;
+    const v1 = [_]f32{ 1, 2, 3, 4 };
+    const v2 = [_]f32{ 5, 6, 7, 8 };
+    // Room for two entries of a 7-byte key plus 16 vector bytes.
+    var cache = ReembedCache{ .limit_bytes = 2 * (16 + 7 + 16) };
+    defer cache.deinit(alloc);
+    var out: [4]f32 = undefined;
+    try testing.expect(!cache.get(1, "doc:aa", 10, &out));
+    try cache.put(alloc, 1, "doc:aa", 10, &v1);
+    try testing.expect(cache.get(1, "doc:aa", 10, &out));
+    try testing.expectEqualSlices(f32, &v1, &out);
+    // An edited document (new digest) or another incarnation misses.
+    try testing.expect(!cache.get(1, "doc:aa", 11, &out));
+    try testing.expect(!cache.get(2, "doc:aa", 10, &out));
+    try cache.put(alloc, 1, "doc:bb", 10, &v2);
+    _ = cache.get(1, "doc:aa", 10, &out); // doc:aa is now most recent
+    try cache.put(alloc, 1, "doc:cc", 10, &v2); // evicts doc:bb
+    try testing.expect(cache.get(1, "doc:aa", 10, &out));
+    try testing.expect(!cache.get(1, "doc:bb", 10, &out));
+    try testing.expect(cache.get(1, "doc:cc", 10, &out));
 }
 
 fn expectAscending(items: []const search_results.SearchResult) !void {

@@ -550,9 +550,12 @@ Three modes:
 
 ## Remaining work
 
-1. **Transient storage follow-ups.** A per-query deadline and
-   cancellation inside re-embedding, a bounded hot-embedding cache, and
-   include `leann.store` in backups so restores need not re-embed. For
+1. **Transient storage follow-ups.** Include `leann.store` in backups so
+   restores need not re-embed. (Done: the request's cancellation is checked
+   before every re-embed batch; `leann.reembed_budget_ms` bounds the time a
+   query spends re-embedding, after which `bounds` mode ranks the remaining
+   candidates by estimate; a 32 MiB `IndexManager.leann_reembed_cache`
+   keyed by index incarnation, key and stub digest serves hot candidates.) For
    media-derived vectors, which `auto` keeps at full precision, an int8
    stored copy would cut them about 4x without query-time embedding.
 2. **Splits.** Rebuild both children from the parent's stored vectors (or

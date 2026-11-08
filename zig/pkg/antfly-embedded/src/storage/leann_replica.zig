@@ -659,6 +659,8 @@ pub const Replica = struct {
         ef: u32 = 0,
         bound_scale: f32 = 1.0,
         batch_size: u32 = 0,
+        /// Cancellation and re-embedding budget (see `leann.RecomputeGate`).
+        gate: ?leann.RecomputeGate = null,
     };
 
     pub fn search(self: *const Replica, alloc: Allocator, query: []const f32, k: u32, tuning: SearchTuning, loader: VectorLoader) ![]Hit {
@@ -682,6 +684,7 @@ pub const Replica = struct {
                 .ef = if (tuning.ef > 0) @max(tuning.ef, k) else 0,
                 .bound_scale = tuning.bound_scale,
                 .batch_size = tuning.batch_size,
+                .gate = tuning.gate,
             });
             defer resp.deinit(alloc);
             for (resp.results) |r| try hits.append(alloc, .{ .key = self.keys.items[r.id], .distance = r.distance });

@@ -3589,6 +3589,17 @@ components:
           maximum: 1024
           default: 0
           description: "Candidates recomputed per batch. 0 uses k."
+        reembed_budget_ms:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          maximum: 600000
+          default: 0
+          description: >-
+            Time a query may spend re-embedding candidates whose stored vectors
+            were dropped. Once spent, the remaining candidates are ranked by
+            their code estimates instead, so the query still returns results.
+            0 means no limit.
     DistanceMetric:
       x-go-type-skip-optional-pointer: true
       type: string

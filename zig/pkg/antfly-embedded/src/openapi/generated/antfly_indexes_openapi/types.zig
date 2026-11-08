@@ -10902,6 +10902,8 @@ pub const LeannIndexConfig = struct {
     bound_scale: ?f32 = null,
     /// Candidates recomputed per batch. 0 uses k.
     batch_size: ?i64 = null,
+    /// Time a query may spend re-embedding candidates whose stored vectors were dropped. Once spent, the remaining candidates are ranked by their code estimates instead, so the query still returns results. 0 means no limit.
+    reembed_budget_ms: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -10911,6 +10913,7 @@ pub const LeannIndexConfig = struct {
         .{ "search_ef", "search_ef", true },
         .{ "bound_scale", "bound_scale", true },
         .{ "batch_size", "batch_size", true },
+        .{ "reembed_budget_ms", "reembed_budget_ms", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -10945,6 +10948,10 @@ pub const LeannIndexConfig = struct {
         }
         if (self.batch_size) |value| {
             try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.reembed_budget_ms) |value| {
+            try jw.objectField("reembed_budget_ms");
             try jw.write(value);
         }
         try jw.endObject();
