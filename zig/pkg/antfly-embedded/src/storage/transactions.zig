@@ -377,6 +377,20 @@ pub const ResolutionOutcome = struct {
     replay_sequence: u64,
 };
 
+/// `resolveIntentsWithExtraBatchStaged`'s result: the same `ResolutionOutcome`
+/// plus the durability ticket (if any) for whatever this resolution staged.
+/// `ticket` is `null` only when resolution wrote nothing (the no-op terminal-
+/// retry branch with no completion writes/deletes). See
+/// `docs/design/lite-performance/lite-single-commit-write-path.md` §3.2:
+/// callers release locks scoped to "a transaction is open" between getting
+/// this ticket and calling `wait()` on it, so this resolution's commit can
+/// share a group-commit fsync with concurrent writers instead of blocking
+/// them behind it.
+pub const StagedResolutionOutcome = struct {
+    outcome: ResolutionOutcome,
+    ticket: ?backend_erased.Ticket = null,
+};
+
 pub const IntentSnapshotValidation = struct {
     status: TxnStatus,
     has_intents: bool,
@@ -941,6 +955,12 @@ pub const TxnManager = struct {
         _ = try self.resolveIntentsWithExtraBatch(txn_id, status, timestamp, .{});
     }
 
+    /// Blocking convenience wrapper over `resolveIntentsWithExtraBatchStaged`:
+    /// identical behavior to before that split existed (every caller here
+    /// still gets a fully durable outcome before this returns). Callers on
+    /// the synchronous write ack path that need to release locks between
+    /// staging and durability (lite-single-commit-write-path.md §3.2/§3.2a)
+    /// should call the staged form directly instead.
     pub fn resolveIntentsWithExtraBatch(
         self: *TxnManager,
         txn_id: TxnId,
@@ -948,6 +968,25 @@ pub const TxnManager = struct {
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
     ) !ResolutionOutcome {
+        const staged = try self.resolveIntentsWithExtraBatchStaged(txn_id, status, timestamp, extra_batch);
+        if (staged.ticket) |ticket| try ticket.wait();
+        return staged.outcome;
+    }
+
+    /// Staged counterpart: stages every durable effect of this resolution
+    /// attempt (the transaction record transition, applied intents, and any
+    /// completion writes) and returns a ticket instead of blocking for the
+    /// fsync, mirroring `docstore.zig`'s `Batch.commitStaged`/`StagedBatch`
+    /// split. `ticket` is `null` only when this call wrote nothing at all
+    /// (the no-op terminal-retry branch below with no completion writes or
+    /// deletes) -- there is then nothing to wait for.
+    pub fn resolveIntentsWithExtraBatchStaged(
+        self: *TxnManager,
+        txn_id: TxnId,
+        status: TxnStatus,
+        timestamp: u64,
+        extra_batch: ResolutionExtraBatch,
+    ) !StagedResolutionOutcome {
         const rec_key = makeRecordKey(txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var record = try self.loadTransactionRecord(txn_id);
@@ -1009,13 +1048,14 @@ pub const TxnManager = struct {
             if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
             }
-            if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0) {
-                try self.applyBatch(completion_writes.items, extra_batch.completion_deletes, null);
-            }
-            return .{
+            const ticket: ?backend_erased.Ticket = if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0)
+                try self.applyBatchStaged(completion_writes.items, extra_batch.completion_deletes, null, null, null)
+            else
+                null;
+            return .{ .outcome = .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
-            };
+            }, .ticket = ticket };
         }
 
         // Scan all intents for this txn
@@ -1068,11 +1108,11 @@ pub const TxnManager = struct {
             try completion_deletes.append(self.alloc, &schema_lease_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            try self.applyBatchWithReservation(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
-            return .{
+            const ticket = try self.applyBatchStaged(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null);
+            return .{ .outcome = .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
-            };
+            }, .ticket = ticket };
         }
 
         if (extra_batch.skip_all_intent_application and extra_batch.skip_intent_keys.len != 0) {
@@ -1194,7 +1234,7 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyBatchWithParticipant(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null);
+        const ticket = try self.applyBatchStaged(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -1210,10 +1250,10 @@ pub const TxnManager = struct {
                 .reason = if (status == .committed) "committed" else "aborted",
             });
         }
-        return .{
+        return .{ .outcome = .{
             .applied = true,
             .replay_sequence = record.replay_sequence,
-        };
+        }, .ticket = ticket };
     }
 
     pub fn collectIntentBatch(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !IntentBatch {
@@ -2631,6 +2671,17 @@ pub const TxnManager = struct {
     }
 
     fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant) !void {
+        var ticket = try self.applyBatchStaged(writes, deletes, replay, reservation, participant);
+        try ticket.wait();
+    }
+
+    /// Staged counterpart of `applyBatchWithParticipant`: stages the batch
+    /// and returns a durability ticket instead of blocking for the fsync.
+    /// `backend_erased.Batch.commitStaged` is already backend-agnostic (see
+    /// its own doc comment): a backend without a staged commit path, e.g.
+    /// the hosted LSM backend, returns an already-durable ticket from the
+    /// ordinary blocking commit, so this never changes behavior there.
+    fn applyBatchStaged(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant) !backend_erased.Ticket {
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
         if (participant) |observer| try batch.setCommitParticipant(observer);
@@ -2645,7 +2696,7 @@ pub const TxnManager = struct {
             try batch.put(kv.key, kv.value);
         }
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
-        try batch.commit();
+        return try batch.commitStaged();
     }
 
     fn traceWriteIntentSuccess(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, predicates: []const VersionPredicate) void {
