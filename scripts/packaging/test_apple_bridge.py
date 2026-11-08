@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,6 +25,50 @@ import apple_bridge as bridge
 
 
 class AppleBridgeArtifactTests(unittest.TestCase):
+    def test_parallel_generate_checks_only_after_bridge_build(self):
+        makefile = (bridge.ROOT / "Makefile").read_text()
+        generate = next(
+            line for line in makefile.splitlines() if line.startswith("generate:")
+        )
+        targets = makefile[
+            makefile.index("apple-bridge-check:") : makefile.index(
+                "graph-identifier-generate:"
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = root / "runner.py"
+            runner.write_text(
+                "import pathlib,sys,time\n"
+                "done=pathlib.Path(__file__).with_name('built')\n"
+                "if 'build' in sys.argv:\n"
+                " time.sleep(0.2);done.touch()\n"
+                "else:\n"
+                " assert done.exists(), 'verification raced regeneration'\n"
+            )
+            uname = root / "uname"
+            uname.write_text(
+                '#!/bin/sh\nif [ "$1" = -s ]; then echo Darwin; else echo arm64; fi\n'
+            )
+            uname.chmod(0o755)
+            fixture = root / "Makefile"
+            fixture.write_text(
+                "SCRIPTS_PY := python3 "
+                + str(runner)
+                + "\n"
+                + generate
+                + "\n\t@:\n"
+                + "graph-identifier-generate provider-matrix-generate:\n\t@:\n"
+                + targets
+            )
+            subprocess.run(
+                ["make", "-f", str(fixture), "-j4", "generate"],
+                env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
     def test_committed_bridge_matches_its_source(self):
         bridge.verify(bridge.SOURCE.parent.parent / "prebuilt/arm64", "arm64")
 

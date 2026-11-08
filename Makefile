@@ -39,7 +39,7 @@ build: ## Build the Zig antfly binary and copy it to ./antfly.
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
 	cp zig/zig-out/bin/antfly ./antfly
 
-generate: graph-identifier-generate provider-matrix-generate apple-bridge-generate apple-bridge-check ## Regenerate openapi.yaml, Zig modules, SDKs, and the antfarm build.
+generate: graph-identifier-generate provider-matrix-generate apple-bridge-generate ## Regenerate openapi.yaml, Zig modules, SDKs, and the antfarm build.
 	$(SCRIPTS_PY) scripts/generate_sources_clients.py
 	$(SCRIPTS_PY) scripts/generate_memory_openapi.py --zig $(ZIG)
 	$(SCRIPTS_PY) scripts/join_public_openapi.py openapi.yaml
@@ -67,6 +67,7 @@ apple-bridge-generate: ## Refresh the committed ARM64 Apple bridge on Apple Sili
 	else \
 		echo "Using committed ARM64 Apple bridge (rebuild requires an Apple Silicon Mac)."; \
 	fi
+	$(SCRIPTS_PY) scripts/packaging/apple_bridge.py verify --directory zig/lib/apple_native/prebuilt/arm64 --architecture arm64
 
 graph-identifier-generate:
 	$(SCRIPTS_PY) scripts/generate_graph_identifier_policy.py
