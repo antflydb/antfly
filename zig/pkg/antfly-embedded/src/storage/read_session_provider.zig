@@ -48,6 +48,11 @@ pub fn tryFence(db: anytype, allow_unresolved: bool) !?contract.Handle {
     owner.* = .{ .alloc = db.alloc, .value = value, .db = db, .capture = Capture.run };
     return issue(.statement_fence, owner);
 }
+pub fn resolveFence(handle: contract.Handle, db: *const anyopaque) !*const Backend.StatementReadFence {
+    const owner = try handle.resolve(.statement_fence, FenceOwner);
+    if (owner.db != db) return error.InvalidArgument;
+    return &owner.value;
+}
 pub fn closeFence(handle: contract.Handle) !void {
     const owner = try handle.resolve(.statement_fence, FenceOwner);
     const alloc = owner.alloc;
@@ -210,11 +215,26 @@ fn issue(comptime kind: contract.Kind, value: anytype) contract.Handle {
 }
 const Outcome = @import("read_session_types").types.contract.NativeOutcome;
 const statement_ops: contract.Operations = .{ .close = Adapters.closeStatement };
-const relational_ops: contract.Operations = .{ .close = Adapters.closeRelational, .checkpoint = Adapters.checkpoint, .range_proofs = Adapters.relationalProofs, .normalize = Adapters.normalizeRelational, .next_typed = Adapters.nextTyped, .next_view = Adapters.nextView };
-const reader_ops: contract.Operations = .{ .close = Adapters.closeReader, .next_page = Adapters.readerNextPage, .next_typed = Adapters.readerNextTyped, .lookup_batch = Adapters.readerLookupBatch, .lookup_one = Adapters.readerLookupOne };
+const relational_ops: contract.Operations = .{ .seek_prefix = Adapters.seekPrefix, .visit_cypher = Adapters.visitCypher, .close = Adapters.closeRelational, .checkpoint = Adapters.checkpoint, .range_proofs = Adapters.relationalProofs, .normalize = Adapters.normalizeRelational, .next_typed = Adapters.nextTyped, .next_view = Adapters.nextView };
+const reader_ops: contract.Operations = .{ .reader_seek_prefix = Adapters.readerSeekPrefix, .close = Adapters.closeReader, .next_page = Adapters.readerNextPage, .next_typed = Adapters.readerNextTyped, .lookup_batch = Adapters.readerLookupBatch, .lookup_one = Adapters.readerLookupOne };
 const document_ops: contract.Operations = .{ .close = Adapters.closeDocument, .range_proofs = Adapters.documentProofs, .normalize = Adapters.normalizeDocument, .next_view = Adapters.nextDocument };
 const provider = @This();
 const Adapters = struct {
+    fn seekPrefix(h: contract.Handle, values: []const std.json.Value, after: ?[]const u8) Outcome(void) {
+        const session = h.resolve(.relational, Relational) catch |err| return failure(void, err);
+        session.seekPrefix(values, after) catch |err| return failure(void, err);
+        return .{ .value = {} };
+    }
+    fn readerSeekPrefix(h: contract.Handle, values: []const ReaderValues.Value, after: ?[]const u8) Outcome(void) {
+        const owner = h.resolve(.reader, ReaderOwner) catch |err| return failure(void, err);
+        owner.value.seekPrefix(values, after) catch |err| return failure(void, err);
+        return .{ .value = {} };
+    }
+    fn visitCypher(h: contract.Handle, alloc: A, limit: usize, visitor: types.ScanVisitor) Outcome(void) {
+        const session = h.resolve(.relational, Relational) catch |err| return failure(void, err);
+        session.visitCypherRows(alloc, limit, visitor) catch |err| return failure(void, err);
+        return .{ .value = {} };
+    }
     fn closeReader(h: contract.Handle) Outcome(void) {
         return .{ .value = provider.closeReader(h) catch |err| return failure(void, err) };
     }

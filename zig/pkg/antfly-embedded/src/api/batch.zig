@@ -122,6 +122,7 @@ const private_fields = [_][]const u8{
     "_merge_proof_adoption",
     "_merge_replication",
     "_merge_source_transition",
+    "_normalized_graph_rows",
     "_online_source",
     "_predicates",
     "_range_guards",

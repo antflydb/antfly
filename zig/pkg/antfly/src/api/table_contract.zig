@@ -2563,6 +2563,7 @@ test "external lake public compatibility normalization preserves exact schema li
         }
     };
     try Check.run(std.testing.allocator);
+    // Remapping may avoid allocations depending on the backing heap's layout.
     var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Check.run, .{});
     try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(std.testing.allocator,

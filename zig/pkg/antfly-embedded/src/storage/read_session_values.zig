@@ -55,6 +55,8 @@ pub const Page = struct {
     rows: []const Row,
     more: bool,
     records_examined: usize,
+    /// Continuation after the last examined record, including rejected rows.
+    next_cursor: ?[]const u8 = null,
     output_bytes: usize,
     /// Work counters distinguish covering scans from primary-row fallbacks.
     primary_lookups: usize = 0,

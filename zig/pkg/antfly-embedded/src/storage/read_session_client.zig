@@ -63,6 +63,12 @@ pub const Relational = struct {
         contract.call("close", .relational, self.handle, .{self.handle}) catch @panic("incompatible read session owner");
         self.alloc.destroy(self);
     }
+    pub fn seekPrefix(self: *Relational, values: []const std.json.Value, after: ?[]const u8) !void {
+        return contract.call("seek_prefix", .relational, self.handle, .{ self.handle, values, after });
+    }
+    pub fn visitCypherRows(self: *Relational, alloc: A, limit: usize, visitor: Types.types.ScanVisitor) !void {
+        return contract.call("visit_cypher", .relational, self.handle, .{ self.handle, alloc, limit, visitor });
+    }
     pub fn checkpoint(self: *const Relational) !void {
         return contract.call("checkpoint", .relational, self.handle, .{self.handle});
     }
@@ -127,6 +133,9 @@ pub const RelationalRows = struct {
         pub fn deinit(self: *Reader) void {
             contract.call("close", .reader, self.handle, .{self.handle}) catch @panic("incompatible read owner");
             self.* = undefined;
+        }
+        pub fn seekPrefix(self: *Reader, values: []const Types.reader_values.Value, after: ?[]const u8) !void {
+            return contract.call("reader_seek_prefix", .reader, self.handle, .{ self.handle, values, after });
         }
         pub fn nextPage(self: *Reader, alloc: A, io: ?std.Io, budget: Budget) !Page {
             var retained_io = io;

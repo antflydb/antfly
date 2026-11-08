@@ -54,6 +54,122 @@ fn close(self: *DB) engine.Outcome(void) {
     return .{ .value = self.close() };
 }
 
+const graph_mod = @import("../graph/graph.zig");
+fn captureQueryCutAtStatementFence(self: *DB, request: @import("db/native_query_cut_contract.zig").Request, handle: session_contract.Handle, cancellation: types.CancellationToken) engine.Outcome(void) {
+    const fence = @import("read_session_provider.zig").resolveFence(handle, self) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = self.captureQueryCutAtStatementFence(request, fence, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn releaseStatementQueryCut(self: *DB, request: @import("db/native_query_cut_contract.zig").Request) engine.Outcome(void) {
+    return .{ .value = self.releaseStatementQueryCut(request) };
+}
+
+fn graphEdgesForCypherPageAt(
+    self: *DB,
+    alloc: Allocator,
+    index_name: []const u8,
+    key: []const u8,
+    edge_types: []const []const u8,
+    direction: graph_mod.EdgeDirection,
+    cursor: ?graph_mod.CypherEdgeScanCursor,
+    limits: graph_mod.EdgePageLimits,
+    ttl_now_ns: u64,
+) engine.Outcome(graph_mod.CypherEdgePage) {
+    return .{ .value = self.graphEdgesForCypherPageAt(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn graphEdgesForCypherPageAuthorizedAt(
+    self: *DB,
+    alloc: Allocator,
+    index_name: []const u8,
+    key: []const u8,
+    edge_types: []const []const u8,
+    direction: graph_mod.EdgeDirection,
+    cursor: ?graph_mod.CypherEdgeScanCursor,
+    limits: graph_mod.EdgePageLimits,
+    ttl_now_ns: u64,
+    principal_proof: []const u8,
+    database: []const u8,
+) engine.Outcome(graph_mod.CypherEdgePage) {
+    return .{ .value = self.graphEdgesForCypherPageAuthorizedAt(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn graphEdgesForCypherCapturePageAuthorizedAt(self: *DB, handle: session_contract.Handle, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8) engine.Outcome(graph_mod.CypherEdgePage) {
+    const fence = @import("read_session_provider.zig").resolveFence(handle, self) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = self.graphEdgesForCypherCapturePageAuthorizedAt(fence, alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn cypherDocumentScanOptions(self: *DB, alloc: Allocator, input: types.ScanOptions) engine.Outcome(types.ScanOptions) {
+    return .{ .value = self.cypherDocumentScanOptions(alloc, input) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn acquireCypherReadAuthority(self: *DB, alloc: Allocator, proof: []const u8, database: []const u8) engine.Outcome(DB.CypherReadLease) {
+    return .{ .value = self.acquireCypherReadAuthority(alloc, proof, database) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn permitsCypherDocument(self: *DB, alloc: Allocator, document: std.json.Value, json_null_fields: []const []const u8, proof: []const u8, database: []const u8) engine.Outcome(bool) {
+    return .{ .value = self.permitsCypherDocument(alloc, document, json_null_fields, proof, database) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn cypherFieldDerivedEdgeType(self: *const DB, index_name: []const u8, edge_type: []const u8) engine.Outcome(bool) {
+    return .{ .value = self.cypherFieldDerivedEdgeType(index_name, edge_type) };
+}
+
+fn getCypherPinnedDocument(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, key: []const u8, opts: types.LookupOptions) engine.Outcome(?types.LookupResult) {
+    return .{ .value = self.getCypherPinnedDocument(alloc, cut, key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn getCypherDocuments(self: *DB, alloc: Allocator, keys: []const []const u8, opts: types.ScanOptions, now: u64) engine.Outcome([]?types.LookupResult) {
+    return .{ .value = self.getCypherDocuments(alloc, keys, opts, now) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn getCypherPinnedDocuments(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, keys: []const []const u8, opts: types.ScanOptions) engine.Outcome([]?types.LookupResult) {
+    return .{ .value = self.getCypherPinnedDocuments(alloc, cut, keys, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn captureCypherSelectedSnapshot(self: *DB, alloc: Allocator, handle: session_contract.Handle, names: []const []const u8, now: u64, cancellation: types.CancellationToken) engine.Outcome(DB.CypherPinnedSnapshot) {
+    const fence = @import("read_session_provider.zig").resolveFence(handle, self) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = self.captureCypherSelectedSnapshot(alloc, fence, names, now, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn captureCypherPinnedSnapshot(self: *DB, alloc: Allocator, handle: session_contract.Handle, graph: @import("cypher").catalog.Graph, table: []const u8) engine.Outcome(DB.CypherPinnedSnapshot) {
+    const fence = @import("read_session_provider.zig").resolveFence(handle, self) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = self.captureCypherPinnedSnapshot(alloc, fence, graph, table) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn visitCypherDocuments(self: *DB, alloc: Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) engine.Outcome(void) {
+    return .{ .value = self.visitCypherDocuments(alloc, from, to, opts, visitor) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn visitCypherPinnedDocuments(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) engine.Outcome(void) {
+    return .{ .value = self.visitCypherPinnedDocuments(alloc, cut, from, to, opts, visitor) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn scanCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) engine.Outcome(types.ScanResult) {
+    return .{ .value = self.scanCypherPinnedSnapshot(alloc, cut, from, to, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn cypherAdjacencyRoutes(self: *DB, alloc: Allocator) engine.Outcome([]const @import("cypher").backend.AdjacencyRoute) {
+    return .{ .value = self.cypherAdjacencyRoutes(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn cypherPinnedAdjacencyRoutes(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot) engine.Outcome([]const @import("cypher").backend.AdjacencyRoute) {
+    return .{ .value = self.cypherPinnedAdjacencyRoutes(alloc, cut) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn graphEdgesForCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, index: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits) engine.Outcome(graph_mod.CypherEdgePage) {
+    return .{ .value = self.graphEdgesForCypherPinnedSnapshot(alloc, cut, index, key, edge_types, direction, cursor, limits) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn cypherPinnedSnapshotDeinit(cut: *DB.CypherPinnedSnapshot) engine.Outcome(void) {
+    cut.deinit();
+    return .{ .value = {} };
+}
+fn cypherGraphIndexIdentity(self: *const DB, alloc: Allocator, index_name: []const u8) engine.Outcome(?@import("cypher").catalog.IndexIdentity) {
+    return .{ .value = self.cypherGraphIndexIdentity(alloc, index_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn hasRetainedQueryCut(self: *const DB) engine.Outcome(bool) {
+    return .{ .value = self.hasRetainedQueryCut() };
+}
+
+fn searchCypherCut(self: *DB, alloc: Allocator, req: types.SearchRequest, proof: []const u8, database: []const u8) engine.Outcome(types.SearchResult) {
+    return .{ .value = self.searchCypherCut(alloc, req, proof, database) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn enqueueGeneratedArtifactCatalog(self: *DB) engine.Outcome(void) {
+    return .{ .value = self.enqueueGeneratedArtifactCatalog() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn closeOwned(self: *DB) engine.Outcome(void) {
     return .{ .value = self.closeOwned() };
 }
@@ -323,7 +439,7 @@ fn trySnapshotDenseSearch(self: *DB, alloc: std.mem.Allocator, req: types.Search
     return .{ .value = value };
 }
 
-fn snapshotInternal(self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken, maintenance_deadline_ns: ?u64, expected_topology_fence: ?@import("db/relational_integrity_topology.zig").Fence, backup_seal_only: bool, query_cut: ?@import("db/native_query_cut.zig").Request) engine.Outcome(u64) {
+fn snapshotInternal(self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken, maintenance_deadline_ns: ?u64, expected_topology_fence: ?@import("db/relational_integrity_topology.zig").Fence, backup_seal_only: bool, query_cut: ?@import("db/native_query_cut_contract.zig").Request) engine.Outcome(u64) {
     return .{ .value = self.snapshotInternal(id, include_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -383,11 +499,11 @@ fn batchNativeInitialChildApply(self: *DB, req: types.BatchRequest, receipt: db.
     return .{ .value = self.batchNativeInitialChildApply(req, receipt) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn captureQueryCut(self: *DB, request: @import("db/native_query_cut.zig").Request, cancellation: types.CancellationToken) engine.Outcome(void) {
+fn captureQueryCut(self: *DB, request: @import("db/native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) engine.Outcome(void) {
     return .{ .value = self.captureQueryCut(request, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn openQueryCut(self: *DB, request: @import("db/native_query_cut.zig").Request, cancellation: types.CancellationToken) engine.Outcome(DB) {
+fn openQueryCut(self: *DB, request: @import("db/native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) engine.Outcome(DB) {
     return .{ .value = self.openQueryCut(request, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -1764,7 +1880,7 @@ fn writeConfigureStorageKernelOwnerDb(alloc: std.mem.Allocator, database: *@impo
     return .{ .value = @import("write.zig").configureStorageKernelOwnerDb(alloc, database, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn writeConfigureStorageKernelOwnerDbAtOpen(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig, historical_ordered_apply: bool) engine.Outcome(bool) {
+fn writeConfigureStorageKernelOwnerDbAtOpen(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig, historical_ordered_apply: u8) engine.Outcome(bool) {
     return .{ .value = @import("write.zig").configureStorageKernelOwnerDbAtOpen(alloc, database, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed, historical_ordered_apply) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 

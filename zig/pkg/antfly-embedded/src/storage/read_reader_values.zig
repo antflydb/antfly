@@ -42,6 +42,9 @@ pub const RowFilter = struct {
     }
 };
 pub const Request = struct {
+    reverse: bool = false,
+    cypher_projection_json: []const u8 = "",
+    cypher_presence_fields: []const []const u8 = &.{},
     include_primary_digest: bool = false,
     /// Stateful internal readers already retain a cursor; public stateless
     /// pages opt in to owned external continuation tokens.

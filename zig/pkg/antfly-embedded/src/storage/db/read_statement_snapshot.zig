@@ -16,6 +16,8 @@
 //! Owner-local retained visibility cut. It never crosses the native boundary.
 const Source = @import("read_session_source_types").types;
 pub const Implementation = struct {
+    index_catalog_captured: bool = false,
+    indexes: ?Source.index_catalog.WriteSnapshot = null,
     row_policy_lease: ?Source.row_policy_gate.Gate.Lease = null,
     row_policy_phase: Source.table_catalog.RowPolicyPhase = .disabled,
     row_policy_generation: u64 = 0,
@@ -23,6 +25,7 @@ pub const Implementation = struct {
     read: Source.store.DocStore.Txn,
     schema_version: u32,
     pub fn deinit(self: *@This()) void {
+        if (self.indexes) |*indexes| indexes.deinit();
         self.read.abort();
         if (self.row_policy_lease) |*lease| lease.release();
         self.* = undefined;

@@ -156,7 +156,7 @@ pub const Record = struct {
     with_check: ?Predicate = null,
 
     pub fn validateShape(self: @This()) !void {
-        if (self.id == 0 or self.generation == 0 or self.table_id == 0 or self.schema_version == 0 or
+        if (self.id == 0 or self.generation == 0 or self.table_id == 0 or
             self.name.len == 0 or self.name.len > 128 or !self.commands.any() or self.roles.len == 0 or self.roles.len > 256)
             return error.InvalidRowPolicyRecord;
         for (self.name) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '_') return error.InvalidRowPolicyRecord;
@@ -237,7 +237,6 @@ pub const OwnerDescriptor = struct {
 
     pub fn digest(self: @This()) ![32]u8 {
         if (self.table_id == 0 or self.group_id == 0 or self.range_id == 0 or
-            self.schema_version == 0 or
             self.range_start.len > std.math.maxInt(u32) or self.range_end.len > std.math.maxInt(u32))
             return error.InvalidRowPolicyPublication;
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -297,7 +296,7 @@ pub const InstallSnapshot = struct {
     settings: []const @import("settings.zig").Record,
 
     pub fn validateShape(self: @This()) !void {
-        if (self.table_id == 0 or self.schema_version == 0 or self.policy_generation == 0 or
+        if (self.table_id == 0 or self.policy_generation == 0 or
             self.catalog_epoch == 0 or self.records.len > 1024 or self.settings.len > 1024)
             return error.InvalidRowPolicyRecord;
         if (self.phase != .disabled and self.records.len == 0) return error.InvalidRowPolicyRecord;
@@ -360,7 +359,7 @@ pub const Publication = struct {
     disabled_acknowledged_owners: []const OwnerAck = &.{},
 
     pub fn validateShape(self: @This()) !void {
-        if (self.table_id == 0 or self.schema_version == 0 or self.generation == 0 or
+        if (self.table_id == 0 or self.generation == 0 or
             self.catalog_epoch == 0 or self.required_owners.len == 0 or self.required_owners.len > 4096 or
             self.acknowledged_owners.len > self.required_owners.len or
             self.serving_acknowledged_owners.len > self.required_owners.len or
@@ -440,7 +439,7 @@ pub const PublicationStamp = struct {
     }
 
     pub fn validateShape(self: @This()) !void {
-        if (self.table_id == 0 or self.schema_version == 0 or self.generation == 0 or self.catalog_epoch == 0) return error.InvalidRowPolicyPublication;
+        if (self.table_id == 0 or self.generation == 0 or self.catalog_epoch == 0) return error.InvalidRowPolicyPublication;
         if (self.serving_generation) |serving| {
             if (serving == 0 or serving >= self.generation or self.serving_catalog_epoch == null or self.serving_catalog_epoch.? == 0 or self.serving_catalog_epoch.? >= self.catalog_epoch or
                 (self.phase != .pending_install and self.phase != .pending_disable and self.phase != .serving_install and self.phase != .serving_disable)) return error.InvalidRowPolicyPublication;
@@ -479,6 +478,21 @@ test "row-policy publication stamp retains prior serving authority only during c
     candidate.serving_generation = null;
     candidate.serving_catalog_epoch = null;
     try std.testing.expect((try candidate.servingAuthority()) == null);
+}
+
+test "row-policy identities accept initial schema version zero with an exact digest" {
+    const predicate: Predicate = .{ .instructions = &.{.{ .type = .{ .kind = .boolean, .nullable = false }, .operation = .{ .literal = .{ .bool = true } } }}, .root = 0 };
+    const record: Record = .{ .id = 9, .generation = 1, .table_id = 3, .schema_version = 0, .schema_digest = @splat(8), .name = "visible", .commands = .{ .select = true }, .roles = &.{"PUBLIC"}, .using = predicate };
+    try record.validateShape();
+    const snapshot: InstallSnapshot = .{ .table_id = 3, .schema_version = 0, .schema_digest = @splat(8), .policy_generation = 1, .catalog_epoch = 7, .phase = .active, .records = &.{record}, .settings = &.{} };
+    try snapshot.validateShape();
+    const stamp: PublicationStamp = .{ .table_id = 3, .schema_version = 0, .generation = 1, .catalog_epoch = 7, .topology_generation = 1, .schema_record_digest = @splat(8), .phase = .active };
+    try std.testing.expectEqual(@as(u64, 1), (try stamp.servingAuthority()).?.generation);
+    var descriptor: OwnerDescriptor = .{ .table_id = 3, .group_id = 11, .shard_id = 13, .range_id = 17, .schema_version = 0, .schema_digest = @splat(8), .range_start = "", .range_end = "" };
+    const initial = try descriptor.digest();
+    descriptor.schema_version = 1;
+    const next = try descriptor.digest();
+    try std.testing.expect(!std.mem.eql(u8, &initial, &next));
 }
 
 test "row-policy publication requires canonical owner and acknowledgement order" {

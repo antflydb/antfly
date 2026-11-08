@@ -256,6 +256,7 @@ pub const BatchRequest = struct {
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    normalized_graph_rows: bool = false,
     /// Exact metadata read-index snapshot fetched and validated by the owner
     /// leader before proposal. Followers consume these committed bytes locally;
     /// they must never perform metadata IO from deterministic Raft apply.
@@ -1351,6 +1352,12 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Private compiler-certified nullness projection; authorization uses original rows.
+    cypher_presence_fields: []const []const u8 = &.{},
+    cypher_projection_json: []const u8 = "",
+    /// Private read-index preparation for a later fenced graph snapshot.
+    /// Public lookup decoders never populate this maintenance-only flag.
+    cypher_prepare: bool = false,
     /// Private authoritative metadata assertion. Zero means no active masking;
     /// a nonzero value must match the installed policy before reading data.
     privacy_policy_version: ?[64]u8 = null,
@@ -1471,6 +1478,9 @@ pub const RelationalRowQuery = struct {
     };
     /// Retained typed readers bound bytes as well as rows. Transported with
     /// the query so every owner uses the same requested page envelope.
+    /// Private compiler-certified nullness projection; authorization uses original rows.
+    cypher_presence_fields: []const []const u8 = &.{},
+    cypher_projection_json: []const u8 = "",
     page_bytes: usize = 16 * 1024 * 1024,
     fields: []const []const u8,
     index: ?[]const u8 = null,
@@ -1478,6 +1488,7 @@ pub const RelationalRowQuery = struct {
     /// pinned catalog snapshot. This is deliberately a hint: no usable index
     /// is a correct primary-key fallback.
     auto_index: bool = false,
+    reverse: bool = false,
     after: ?[]const u8 = null,
     lower: ?Bound = null,
     upper: ?Bound = null,
@@ -1486,6 +1497,9 @@ pub const RelationalRowQuery = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Private compiler-certified nullness projection; authorization uses original rows.
+    cypher_presence_fields: []const []const u8 = &.{},
+    cypher_projection_json: []const u8 = "",
     /// Private authoritative metadata assertion. Zero means no active masking;
     /// a nonzero value must match the installed policy before reading data.
     privacy_policy_version: ?[64]u8 = null,
@@ -1520,6 +1534,9 @@ pub const ScanOptions = struct {
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     filter_query_json: []const u8 = "",
+    /// Internal Cypher visitation only. Reserved document identities consume
+    /// progress but must not be decoded by a user row filter. Never serialized.
+    cypher_node_keys_only: bool = false,
     /// Internal-only response mode used by linear merge. Public scans leave
     /// this false and retain their existing NDJSON shape.
     include_content_hashes: bool = false,
@@ -1587,11 +1604,21 @@ pub const ScanVisitor = struct {
     borrow_documents: bool = false,
     context: ?*anyopaque,
     visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
+    /// Optional physical-candidate accounting, before visibility/predicate work.
+    /// Owner count readers report rejected candidates as well as emitted rows.
+    progress: ?*const fn (context: ?*anyopaque, examined: usize) anyerror!void = null,
     callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
 
-    const NativeCallbacks = struct { visit: @FieldType(ScanVisitor, "visit") };
+    const NativeCallbacks = struct {
+        visit: @FieldType(ScanVisitor, "visit"),
+        progress: @typeInfo(@FieldType(ScanVisitor, "progress")).optional.child,
+    };
     const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
 
+    pub fn reportProgress(self: ScanVisitor, examined: usize) anyerror!void {
+        const callback = self.progress orelse return;
+        return NativeBoundary.call("progress", self.callback_dispatch, callback, .{ self.context, examined });
+    }
     pub fn visitEntry(self: ScanVisitor, entry: ScanVisitEntry) anyerror!void {
         return NativeBoundary.call("visit", self.callback_dispatch, self.visit, .{ self.context, entry });
     }
@@ -1721,6 +1748,7 @@ pub const TransactionIntentRequest = struct {
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    normalized_graph_rows: bool = false,
     range_guards: []const @import("../range_protection.zig").Proof = &.{},
     schema_version: ?u32 = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
@@ -1734,6 +1762,8 @@ pub const TransactionIntentRequest = struct {
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
+    graph_writes: []const GraphEdgeWrite = &.{},
+    graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
     integrity: []const TransactionIntegrityOperation = &.{},
     integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},

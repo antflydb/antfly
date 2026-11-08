@@ -51,3 +51,9 @@ pub const value_ranges = @import("value_ranges.zig");
 pub const snapshot_admission = @import("db/snapshot_admission.zig");
 
 pub const privacy_read = @import("db/privacy_read.zig");
+
+pub const cypher_projection = @import("db/query/cypher_projection.zig");
+pub const streamed_projection = @import("db/query/streamed_projection.zig");
+pub const relational_checks = @import("../schema/relational_checks.zig");
+
+pub const cypher = @import("cypher");

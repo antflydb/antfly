@@ -38,6 +38,8 @@ test {
     _ = internal_group_operations;
     _ = restore_catalog;
     _ = transactions;
+    _ = @import("api/graph_execution.zig");
+    _ = @import("api/http_server.zig");
 }
 
 /// Implementation source choices for this compilation root.

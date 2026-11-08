@@ -90,6 +90,8 @@ SOURCE_MODULES = {
     "engine_errors": ("zig/pkg/inference/src/host/engine_errors.zig",),
     "engine_memory": ("zig/lib/runtime/src/runtime_memory_abi.zig",),
     "sql_parser": ("zig/lib/sql/root.zig",),
+    "cypher": ("zig/lib/cypher/root.zig",),
+    "cypher_regex_capture": ("zig/lib/regex/src/captures.zig",),
     "antfly_public_server_openapi": (
         "zig/pkg/antfly-server-api/src/openapi/generated/antfly_public_server_openapi/root.zig",
     ),
