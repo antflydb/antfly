@@ -109,6 +109,11 @@ pub fn storageSuffixAlloc(alloc: Allocator, id: []const u8) ![]u8 {
 }
 
 pub const ScopedUploadVisitor = struct {
+    pub const Maintenance = enum { inspect, remove };
+    /// Admit provider-owned migration work and physical cleanup before I/O.
+    /// remove consumes both one work unit and one deletion unit. Payload
+    /// deletion remains admitted by visit, including on remote providers.
+    maintenance: ?*const fn (*anyopaque, Maintenance) anyerror!void = null,
     /// Backend-owned durable continuation. Callers persist it only after all
     /// delivered entries have been processed. Lexical providers may ignore it.
     continuation: ?[]const u8 = null,

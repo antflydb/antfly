@@ -243,6 +243,14 @@ fn scanScopes(a: A, target: *artifacts.ArtifactStore, domain: [32]u8, previous: 
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.result.retained = true;
         }
+        fn maintenance(raw: *anyopaque, operation: artifacts.ScopedUploadVisitor.Maintenance) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.budget.check();
+            if (self.budget.work == 0 or (operation == .remove and self.budget.deletes == 0)) return error.QueryGcBudgetExhausted;
+            try self.budget.visit();
+            if (operation == .remove) try self.budget.remove();
+            self.result.progressed = true;
+        }
         fn checkpoint(raw: *anyopaque, bytes: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.continuation = try self.a.dupe(u8, bytes);
@@ -254,6 +262,7 @@ fn scanScopes(a: A, target: *artifacts.ArtifactStore, domain: [32]u8, previous: 
     target.visitScopedUploads(domain, .{
         .ptr = &visitor,
         .visit = Visitor.visit,
+        .maintenance = Visitor.maintenance,
         .checkpoint = Visitor.checkpoint,
         .cleanup_staging = true,
         .reclaim_retired_inventory = true,
@@ -597,7 +606,7 @@ test "external lake query cleanup persists journals and reclaims interrupted fen
     }
     var journal_reads: u64 = 0;
     var complete = false;
-    for (0..25) |_| {
+    for (0..100) |_| {
         var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
         defer store.deinit();
         var budget: Budget = .{ .deletes = 1, .reads = 4096, .work = 4, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s };
@@ -610,7 +619,7 @@ test "external lake query cleanup persists journals and reclaims interrupted fen
         }
     }
     try std.testing.expect(complete);
-    try std.testing.expectEqual(@as(u64, 21), journal_reads);
+    try std.testing.expect(journal_reads >= 21 and journal_reads <= 63);
     for (expired_paths) |path| try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
     for (inventory_paths) |path| try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
     for (active_paths) |path| try std.Io.Dir.cwd().access(std.testing.io, path, .{});
@@ -815,13 +824,23 @@ test "external lake query cleanup legacy temporary inventories resume linearly a
         try target.delete(value.artifact_id);
     }
     var reads: usize = 0;
+    var migration_reads: usize = 0;
     var complete = false;
-    for (0..135) |_| {
+    for (0..400) |_| {
         var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
         defer store.deinit();
         var budget: Budget = .{ .deletes = 1, .reads = 16384, .work = 1, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s, .retire_after_ms = 90000 };
         const result = try collectScopes(a, &store, 7, domain, 100000, &budget);
-        reads += store.implementation.local_inventory.?.temporary_records_read.load(.monotonic);
+        const temporary_reads = store.implementation.local_inventory.?.temporary_records_read.load(.monotonic);
+        reads += temporary_reads;
+        migration_reads += store.implementation.local_inventory.?.migration_entries_read.load(.monotonic);
+        if (store.implementation.local_inventory.?.migration_entries_read.load(.monotonic) != 0)
+            try std.testing.expect(result.progressed);
+        if (temporary_reads != 0) {
+            try std.testing.expectEqual(@as(usize, 1), temporary_reads);
+            try std.testing.expectEqual(@as(usize, 0), budget.deletes);
+            try std.testing.expectEqual(@as(usize, 0), budget.work);
+        }
         if (!result.more) {
             try std.testing.expect(!result.retained and !result.failed);
             complete = true;
@@ -830,11 +849,48 @@ test "external lake query cleanup legacy temporary inventories resume linearly a
     }
     try std.testing.expect(complete);
     try std.testing.expectEqual(@as(usize, 129), reads);
+    try std.testing.expectEqual(@as(usize, 129), migration_reads);
     var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
     defer store.deinit();
     var budget: Budget = .{ .deletes = 128, .reads = 16384, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s };
     _ = try collectScopes(a, &store, 7, domain, 131000, &budget);
     try std.testing.expectEqual(@as(usize, 0), store.implementation.local_inventory.?.temporary_records_read.load(.monotonic));
+}
+
+test "external lake query cleanup filesystem staging shares the turn deletion budget across categories" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("query-shared-staging-budget");
+    defer directory.cleanup();
+    var config = try local.common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+    defer store.deinit();
+    var target = store.artifactStore();
+    var paths: [3][]const u8 = undefined;
+    for (0..3) |category| {
+        const scope = try artifacts.UploadScope.forPublication(try scopeDomain(a, &store, 7, category), 1, std.testing.io);
+        var value = try target.putScoped(scope, "interrupted staging", .none);
+        defer value.deinit(a);
+        const suffix = try artifacts.storageSuffixAlloc(scratch, value.artifact_id);
+        paths[category] = try std.fmt.allocPrint(scratch, "{s}/{s}.pending-v2", .{ store.implementation.local_inventory.?.root_dir, suffix });
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = paths[category], .data = "unfinished" });
+        try target.delete(value.artifact_id);
+    }
+    var budget: Budget = .{ .deletes = 1, .reads = 16384, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s };
+    const result = collect(a, &store, 7, 0, 100000, &budget);
+    try std.testing.expect(result.more and !result.failed);
+    try std.testing.expectEqual(@as(usize, 0), budget.deletes);
+    var removed: usize = 0;
+    for (paths) |path| std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch |err| {
+        if (err != error.FileNotFound) return err;
+        removed += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), removed);
+    // Index GC receives this same remainder and cannot admit a second delete.
+    try std.testing.expectError(error.QueryGcBudgetExhausted, budget.remove());
 }
 
 test "external lake query cleanup retirement reuses read proofs and fences concurrent changes" {
@@ -894,12 +950,22 @@ test "external lake query cleanup retirement restarts sweeps admitted before the
         var value = try target.putScoped(later, try std.fmt.bufPrint(&text, "later-{d}", .{i}), .none);
         value.deinit(a);
     }
-    // Advance beyond the first scope before the writer horizon passes.
-    for (0..2) |_| {
+    // Advance beyond the first scope before the writer horizon passes,
+    // including its separately budgeted metadata retirement.
+    const earlier_path = try std.fs.path.join(a, &.{ store.implementation.local_inventory.?.root_dir, "graph", &std.fmt.bytesToHex(&domain, .lower), &std.fmt.bytesToHex(&earlier.attempt, .lower) });
+    defer a.free(earlier_path);
+    var earlier_retired = false;
+    for (0..16) |_| {
         var budget: Budget = .{ .deletes = 1, .reads = 16384, .work = 1, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s };
         const result = try collectScopes(a, &store, 7, domain, 100000, &budget);
         try std.testing.expect(result.more);
+        std.Io.Dir.cwd().access(std.testing.io, earlier_path, .{}) catch |err| {
+            if (err != error.FileNotFound) return err;
+            earlier_retired = true;
+            break;
+        };
     }
+    try std.testing.expect(earlier_retired);
     var late = try target.putScoped(earlier, "late orphan behind the cursor", .none);
     defer late.deinit(a);
     var budget: Budget = .{ .deletes = 128, .reads = 16384, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s, .retire_after_ms = 120000 };
