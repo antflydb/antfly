@@ -43,8 +43,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         const cut = owner.current orelse return &.{};
         if (!cut.canIssue(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(server.cfg.node_config))) return &.{};
     };
-    @import("lake_index_navigation_warming.zig").warmNavigationWithin(a, server, table, request) catch |err| {
-        _ = err;
+    @import("lake_index_navigation_warming.zig").warmNavigationWithin(a, server, table, request) catch {
         try request.ensureActive();
     };
     const normalized = try request.platformDeadline();
