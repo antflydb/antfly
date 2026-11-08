@@ -845,3 +845,47 @@ refreshing credentials beyond one token lifetime and the managed Cloud route
 remain separate deployment qualifications. These results neither deploy the
 candidate nor establish DuckDB cold-performance parity. Upgrade and release
 coordination still precede enabling durable native ownership in production.
+
+## Reviewed candidate qualification (November 8)
+
+The reviewed implementation is `737f1385065ecd6616e215d1a88b1422541fb984`, with
+qualification-fixture refinements in `3375bcbe52`. The matching ReleaseSafe
+server/Lite build passed all 85 steps and the 141-function export boundary:
+
+- Server SHA-256: `a72f167b8065275fe9da8da527b161df7b4cf6cd1c3985733d5ca5ee6942848d`
+- Lite SHA-256: `c3f6e16e4c7e0a11ee87dbf2cc3b84b49738d1f26149acd05e9425352a074b46`
+
+The same 10,000-comment corpus above was queried through fully remote GCS,
+with highlights and seven hits. Warm values are medians of five single-attempt
+requests. Query memory is sampled during restart, warm and cache-cleared reads.
+
+| Source delivery | Warm median | First query after restart | Verified-cache-cleared query | Peak sampled RSS / footprint |
+| --- | ---: | ---: | ---: | ---: |
+| Stored source | 8.90 ms | 2345.33 ms | 6206.82 ms | 189.20 / 163.16 MiB |
+| Parquet hydration | 7.51 ms | 831.89 ms | 8206.94 ms | 250.19 / 220.89 MiB |
+
+Full restart, including shutdown, startup and the first query, took 2797.91 ms
+and 1290.58 ms respectively. Cache-cleared startup plus query, excluding
+shutdown, took 6526.45 ms and 8535.66 ms. OS/provider caches were retained.
+Five other Zig compilers were active at stored-source profiling admission and
+three at hydration admission; one-minute host loads were 14.57 and 11.28.
+These current-load samples show seconds-scale cold latency and do not establish
+an order-of-magnitude cold improvement or isolate GCS wait from host scheduling.
+
+Both profiling requests recorded two preparations across three leaf calls.
+The GCS stored-source case kept readers active through three acknowledged
+batches and published visibility: 476 searches succeeded during that interval,
+with zero rebuilding responses. Its fresh composed search included all three
+new IDs, while retained cursors preserved their earlier cut. The independent
+local stress case recorded 68 successful searches, zero rebuilding responses
+and one retried published-snapshot binding conflict, using the original
+incarnation-fenced receipt. Accepted readers remain strict about conflicts.
+
+Validation passed: 188 focused native tests, 49 runtime-ABI tests, 237 HN tests
+and 52 subtests, two additional real-GCS native-cursor modes, four local
+composed cases, the native gateway case, eight GCS correctness cases and both
+real-corpus profiling cases. The unchanged optional DuckDB comparison test was
+not run. Initial construction encountered one provider timeout; retrying the
+existing fixture completed publication. Initial 10k readiness now has a bounded
+600-second setup allowance, separate from unchanged single-attempt query
+timings. The deployment qualifications described above still apply.
