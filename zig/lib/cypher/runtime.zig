@@ -2385,7 +2385,7 @@ const Engine = struct {
             const n: i128 = @intCast(sequence.length);
             const Prefix = struct {
                 fn at(r: @import("range.zig").Range, k: i128) i128 {
-                    return @intCast(@divTrunc(@as(i256, k) * (2 * @as(i256, r.start) + (k - 1) * @as(i256, r.step)), 2));
+                    return @intCast(@import("arithmetic_series.zig").sum(@intCast(k), r.start, r.step));
                 }
             };
             const total = Prefix.at(sequence, n);
