@@ -125,6 +125,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_typed_json;
     _ = @import("antfly_local_sources").storage_db_relational_constraint_jobs;
     _ = @import("antfly_local_sources").storage_db_relational_integrity;
+    _ = @import("antfly_local_sources").storage_db_relational_integrity_json;
     _ = @import("antfly_local_sources").storage_db_relational_integrity_contract;
     _ = @import("antfly_local_sources").storage_db_relational_transition_contract;
     _ = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
@@ -239,6 +240,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_enrichment_document_checkpoints;
     _ = @import("antfly_local_sources").storage_db_enrichment_vector_label_cache;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_extraction;
+    _ = @import("antfly_local_sources").storage_db_enrichment_document_extraction_client;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_extraction_completion;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_unit_fingerprint;
     _ = @import("antfly_local_sources").storage_db_enrichment_embedder;
@@ -250,6 +252,8 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_enrichment_vector_labels;
     _ = @import("antfly_local_sources").storage_db_enrichment_neighbor_context;
     _ = @import("antfly_local_sources").storage_db_enrichment_utf8_text;
+    _ = @import("antfly_local_sources").storage_db_enrichment_scoped_retries;
+    _ = @import("antfly_local_sources").storage_db_enrichment_scoped_retry_source;
     _ = @import("antfly_local_sources").storage_db_generation_lifecycle;
     _ = @import("antfly_local_sources").storage_db_graph_runtime;
     _ = @import("antfly_local_sources").storage_db_graph_asset_state;
@@ -510,6 +514,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_artifact_graph_publication;
     _ = @import("antfly_local_sources").storage_db_artifact_inventory;
     _ = @import("antfly_local_sources").storage_db_artifact_native_stream;
+    _ = @import("antfly_local_sources").storage_db_artifact_producer_context;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_dispatch;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_input;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_obligations;

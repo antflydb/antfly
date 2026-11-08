@@ -1256,6 +1256,7 @@ pub const Adapter = struct {
             _ = try pin.acquireFor(a, self.source.inventory.snapshot_id, now * std.time.ns_per_ms, (expires - now) * std.time.ns_per_ms);
             var store = try @import("lake_index_store.zig").Store.openNative(a, adapter.server.cfg.node_config, adapter.server.cfg.secret_store, false, adapter.server.cfg.deployment_mode, adapter.server.cfg.native_lake_artifact_base_dir);
             defer store.deinit();
+            try adapter.server.retainLakeQueryStore(a, &store, self.table.id, adapter.context);
             var artifacts = store.artifactStore();
             const token = try @import("lake_sql_retained_cut.zig").saveDistributed(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), adapter.server.embedding_provider_runtime.io, .{ .table_id = self.table.id, .schema_version = self.table.schema_version, .object_generation = options.catalog_generation, .expires_ms = expires, .metadata_location = metadata.metadata_location, .metadata_json = metadata.metadata_json, .table_uuid = try lake.metadata.str(try lake.metadata.get(root, "table-uuid")), .snapshot_id = self.source.inventory.snapshot_id, .pending = pending, .authorization = if (adapter.server.cfg.distributed_sql_scope_seed) |seed| .{ .scope = @import("../serverless/sql/bridge.zig").principalScope(seed, adapter.context), .table = @import("lake_sql_retained_cut.zig").ReadTable.from(self.table) } else null }, adapter.context.cancellation);
             return .{ .token = token.token, .min_splits = token.minimumSplits(), .schema = try @import("../serverless/sql/lake_source.zig").Host.fingerprint(a, self.table), .snapshot = try a.dupe(u8, self.source.inventory.snapshot_id), .wal_cut = pending.lsn, .expires_ms = expires, .estimated_bytes = estimates.bytes +| token.bytes, .estimated_rows = estimates.rows +| token.rows, .bucket = if (token.paged) null else try @import("../serverless/sql/lake_source.zig").Host.bucketLayout(a, self.source, pin.context) };
@@ -1340,6 +1341,7 @@ pub const Adapter = struct {
         _ = try pin.acquireFor(a, cut.snapshot_id, now, (cut.expires_ms - now / std.time.ns_per_ms) * std.time.ns_per_ms);
         var store = try @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
         defer store.deinit();
+        try self.server.retainLakeQueryStore(a, &store, table.id, self.context);
         var artifacts = store.artifactStore();
         const token = try @import("lake_sql_retained_cut.zig").save(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), self.server.embedding_provider_runtime.io, cut, self.context.cancellation);
         try self.server.txn_sessions.bindLakeCut(self.server.alloc, id, table.physical_name, table.id, try std.json.Stringify.valueAlloc(a, token, .{}));

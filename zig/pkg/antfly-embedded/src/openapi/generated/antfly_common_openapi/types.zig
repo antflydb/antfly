@@ -727,6 +727,8 @@ pub const DeciderCascadeStage = struct {
     decider: DeciderConfig,
     /// Required on every stage except the first, which must omit it. Inclusive band on the previous stage's answer.
     when: ?std.json.Value = null,
+    /// Require this stage to agree with the preceding stage on the band question, or every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and abstains; a keep_previous failure leaves agreement unverified and also abstains.
+    require_agreement: ?bool = null,
     /// Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
     on_failure: ?[]const u8 = null,
 
@@ -735,6 +737,7 @@ pub const DeciderCascadeStage = struct {
         .{ "name", "name", false },
         .{ "decider", "decider", false },
         .{ "when", "when", true },
+        .{ "require_agreement", "require_agreement", true },
         .{ "on_failure", "on_failure", true },
     };
 
@@ -756,6 +759,10 @@ pub const DeciderCascadeStage = struct {
             try jw.objectField("when");
             try jw.write(value);
         }
+        if (self.require_agreement) |value| {
+            try jw.objectField("require_agreement");
+            try jw.write(value);
+        }
         if (self.on_failure) |value| {
             try jw.objectField("on_failure");
             try jw.write(value);
@@ -766,7 +773,7 @@ pub const DeciderCascadeStage = struct {
 
 pub const DeciderConfig = struct {
     provider: ?[]const u8 = null,
-    /// Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate questions only.
+    /// Execution contract. With provider antfly, typed invokes the Decisions endpoint; remote named deciders may return validated typed or generated answers, including upstream cascade outcomes. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate questions only.
     decision_method: ?[]const u8 = null,
     cascade: ?DeciderCascade = null,
     /// Required with decision_method=generated. Provider configuration belongs here rather than in the outer typed-decider fields.

@@ -1466,7 +1466,14 @@ pub const Runtime = struct {
                 break :blk try self.readerCapabilities(alloc, cfg.value);
             },
             .decision => blk: {
-                var parsed = try @import("functions/materialization.zig").parse(alloc, requests[0].config_json);
+                const raw = requests[0].config_json;
+                if (std.mem.indexOf(u8, raw, "decision_revision_probe") != null or std.mem.indexOfScalar(u8, raw, '\\') != null) {
+                    const envelope = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+                    defer envelope.deinit();
+                    if (envelope.value == .object) if (envelope.value.object.get("decision_revision_probe")) |probe|
+                        break :blk try self.proxyDecisionRevisionCapabilities(alloc, probe);
+                }
+                var parsed = try @import("functions/materialization.zig").parse(alloc, raw);
                 defer parsed.deinit();
                 if (parsed.value.decider.decision_method != .generated) break :blk null;
                 try self.routeGeneratorConfig(alloc, &parsed.value.decider.generator.?);
@@ -3220,13 +3227,36 @@ pub const Runtime = struct {
         return try asset_producer.producedBatchFromOutputs(alloc, requests, out, reader_execution);
     }
 
+    fn proxyDecisionRevisionCapabilities(self: *Runtime, a: Allocator, raw: std.json.Value) !?inference_work.InferenceCapabilities {
+        const probe = try @import("antfly_resolver").adjudication.Config.parseRevisionRequest(a, raw);
+        // This native route exposes a single leaf revision. Composite routes
+        // require an authoritative host verifier of the complete dependency set.
+        if (probe.version != 1) return error.CapabilityDiscoveryUnavailable;
+        const original = try @import("functions/materialization.zig").parse(a, probe.specification);
+        defer original.deinit();
+        const cfg = original.value.decider;
+        if (cfg.provider != .antfly or cfg.decision_method != .typed or !std.mem.eql(u8, cfg.model, probe.model)) return error.CapabilityDiscoveryUnavailable;
+        // Match the Decisions executor's route, not generation availability.
+        // A local generator callback is not proof that Decisions ran locally.
+        if (cfg.url.len == 0) if (self.antfly_provider) |local| if (local.decide_json != null)
+            return self.linkedModelCapabilities(a, local, probe.model, .generate);
+        // Public gateway aliases and HTTP task routes do not expose an
+        // authoritative execution-revision contract here. A /generate lookup
+        // on the old leaf is not proof of the current Decisions route, even
+        // when unqualified alias and leaf names happen to be equal.
+        return error.CapabilityDiscoveryUnavailable;
+    }
+
     fn constrainedProducerCapabilities(self: *Runtime, a: Allocator, generator: *generating_runtime.GeneratorConfig, output: constrained.Output, probabilities: ?constrained.Probabilities, batch: constrained.Batch, task: inference_work.Task) !inference_work.InferenceCapabilities {
         var engine = self.constrainedRuntime();
         const resolved = try engine.capabilities(a, generator);
         _ = try resolved.select(output, probabilities);
         const revision: ?[32]u8 = if (resolved.model_revision) |value| blk: {
             var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+            // Execution reports this same 32-byte identity as lowercase hex.
+            // Decode it; hashing the hex would invalidate every unchanged receipt.
+            if (value.len != 64) return error.InvalidInferenceCapabilities;
+            _ = std.fmt.hexToBytes(&digest, value) catch return error.InvalidInferenceCapabilities;
             break :blk digest;
         } else null;
         return .{ .model_revision = revision, .task = task, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = if (task == .extract) .extraction else .generated_text, .batch = .{ .mode = if (batch.max_items_per_call > 1) .native else .serial_compatibility, .preferred_items = batch.max_items_per_call, .max_items = batch.max_items_per_call, .per_item_failures = true } };
@@ -9797,4 +9827,61 @@ test "privacy structurally wide sources fit planning and execution budgets indep
     }
     const escaped = try std.json.Stringify.valueAlloc(scratch, .{ .body = "\\\"{[:,\\\"" }, .{});
     try std.testing.expectEqual(try privacy.jsonStructureBytes("{\"body\":\"short\"}"), try privacy.jsonStructureBytes(escaped));
+}
+
+test "decision provider revision discovery matches execution bytes and verifies only exact proxy routes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fixture = struct {
+        probes: usize = 0,
+        missing: bool = false,
+        logprobs: bool = true,
+        fn generate(_: *anyopaque, _: Allocator, _: []const u8, _: ?RequestContext) ![]u8 {
+            return error.UnexpectedInferenceDuringDiscovery;
+        }
+        fn capabilities(ptr: *anyopaque, _: Allocator, model: []const u8, task: inference_work.Task) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.probes += 1;
+            try std.testing.expectEqualStrings("native", model);
+            try std.testing.expectEqual(inference_work.Task.generate, task);
+            return .{ .model_revision = if (self.missing) null else @splat(0xaa), .task = .generate, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true, .generation_token_logprobs_v1 = self.logprobs };
+        }
+    };
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var fixture = Fixture{};
+    var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = &fixture, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fixture.generate, .decide_json = Fixture.generate, .model_capabilities = Fixture.capabilities } });
+    defer runtime.deinit();
+    const resolve = @import("functions/resolver_adjudication.zig").modelRevision;
+    const generated =
+        \\{"version":"v1","decider":{"decision_method":"generated","generator":{"provider":"antfly","model":"native"}},"questions":[{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]}]}
+    ;
+    const expected: [32]u8 = @splat(0xaa);
+    try std.testing.expectEqualSlices(u8, &expected, &(try resolve(scratch, runtime.producer(), .{ .io = std.testing.io }, generated, 10000)).?);
+    // Revision discovery must also work for verdict-only native generators.
+    fixture.logprobs = false;
+    const proxy =
+        \\{"version":"v1","decider":{"model":"native"},"questions":[{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]}]}
+    ;
+    const probe = try std.json.Stringify.valueAlloc(scratch, .{ .decision_revision_probe = .{ .version = 1, .specification = proxy, .model = "native" } }, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &(try resolve(scratch, runtime.producer(), .{ .io = std.testing.io }, probe, 10000)).?);
+    try std.testing.expectEqual(@as(usize, 2), fixture.probes);
+    fixture.missing = true;
+    try std.testing.expectError(error.CapabilityDiscoveryUnavailable, resolve(scratch, runtime.producer(), .{ .io = std.testing.io }, probe, 10000));
+    fixture.missing = false;
+    // A previously resolved leaf is not proof of an opaque alias's current
+    // execution identity. Do not query the old leaf and silently reuse it.
+    const alias = try std.mem.replaceOwned(u8, scratch, proxy, "\"model\":\"native\"", "\"model\":\"deciders/alias\"");
+    const alias_probe = try std.json.Stringify.valueAlloc(scratch, .{ .decision_revision_probe = .{ .version = 1, .specification = alias, .model = "native" } }, .{});
+    const probes = fixture.probes;
+    try std.testing.expectError(error.CapabilityDiscoveryUnavailable, resolve(scratch, runtime.producer(), .{ .io = std.testing.io }, alias_probe, 10000));
+    try std.testing.expectEqual(probes, fixture.probes);
+    // Generator availability must not change the route used to verify a
+    // Decisions response. Without decide_json, this route is HTTP, not linked.
+    var remote_only = Runtime.initWithOptions(a, &client, .{ .inference_api_url = "invalid-default-endpoint", .antfly_provider = .{ .ptr = &fixture, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fixture.generate, .model_capabilities = Fixture.capabilities } });
+    defer remote_only.deinit();
+    try std.testing.expectError(error.CapabilityDiscoveryUnavailable, resolve(scratch, remote_only.producer(), .{ .io = std.testing.io }, probe, 10000));
+    try std.testing.expectEqual(probes, fixture.probes);
 }

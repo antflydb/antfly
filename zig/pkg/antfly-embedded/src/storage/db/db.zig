@@ -21282,6 +21282,19 @@ pub const DB = struct {
         std.crypto.hash.Blake3.hash(bytes, &digest, .{});
         return digest;
     }
+    fn nativeQueryReuseDigest(self: *DB, cancellation: types.CancellationToken) !?[32]u8 {
+        var capture = self.core.snapshot_admission.tryAcquireCapture() orelse return null;
+        defer capture.release();
+        var replay = self.core.snapshot_replay_admission.tryAcquireCapture() orelse return null;
+        defer replay.release();
+        if (!self.core.tryLockApplyExclusive()) return null;
+        defer self.core.unlockApply();
+        try cancellation.check();
+        try self.requireQueryCutStorage();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        return self.nativeQueryReuseDigestLocked(arena.allocator());
+    }
     /// Query-pin guard is held. Validate unchanged state at a short read point,
     /// release mutation fences before repository I/O, then rebind exact extents.
     fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !bool {
@@ -21289,19 +21302,7 @@ pub const DB = struct {
         if (repository.vtable.reuse == null) return false;
         const basis = self.local_execution.native_query_reuse orelse return false;
         if (std.mem.eql(u8, &basis.id, request.id)) return false;
-        const digest = checked: {
-            var capture = self.core.snapshot_admission.tryAcquireCapture() orelse return false;
-            defer capture.release();
-            var replay = self.core.snapshot_replay_admission.tryAcquireCapture() orelse return false;
-            defer replay.release();
-            if (!self.core.tryLockApplyExclusive()) return false;
-            defer self.core.unlockApply();
-            try cancellation.check();
-            try self.requireQueryCutStorage();
-            var arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena.deinit();
-            break :checked (try self.nativeQueryReuseDigestLocked(arena.allocator())) orelse return false;
-        };
+        const digest = (try self.nativeQueryReuseDigest(cancellation)) orelse return false;
         if (!basis.matches(digest, @import("native_query_cut.zig").nowMs())) return false;
         const proof = (try repository.reuse(io, basis.asRequest(), request, self.core.identity_namespace, basis.proof(), cancellation)) orelse return false;
         // Rotate the logical authority, so expiry of the original manifest does
@@ -21337,7 +21338,7 @@ pub const DB = struct {
         // usable cursors. The parent guard excludes readers of this new root.
         errdefer if (!existed) std.Io.Dir.cwd().deleteTree(io, root) catch {};
         profile.next("snapshot");
-        _ = self.snapshotInternal(request.id, true, token, deadline, null, false, request) catch |err| {
+        _ = self.snapshotInternal(request.id, true, token, self.snapshotMaintenanceDeadline(deadline), null, false, request) catch |err| {
             try token.check();
             return switch (err) {
                 error.NativeBackupStorageBackendUnsupported, error.NativeBackupProjectionBackendUnsupported, error.BackupSealBackendUnsupported => error.UnsupportedQueryRequest,
@@ -21371,7 +21372,33 @@ pub const DB = struct {
         if (state) |value| if (value.request.table_id != self.core.identity_namespace.table_id or (!value.complete and !try snapshotPathExists(io, try cut.pathAlloc(a, self.core.path, value.request.id)))) {
             state = null;
         };
-        if (state) |value| if (value.complete and value.next_ms > now and value.sequence == sequence) return true;
+        if (state) |value| if (value.complete and value.sequence == sequence) {
+            if (value.source_digest) |previous| {
+                // The query-pin guard also owns initialization of the local
+                // digest epoch; foreground captures use the same guard.
+                const renewal: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 2 * std.time.ns_per_s };
+                var guard = try cut.lock(self.alloc, io, self.core.path, renewal.token());
+                defer guard.deinit();
+                const current = (try self.nativeQueryReuseDigest(renewal.token())) orelse return false;
+                if (std.mem.eql(u8, &previous, &current)) {
+                    if (value.request.expires_ms > now +| 120_000) return true;
+                    var nonce: [32]u8 = undefined;
+                    try io.randomSecure(&nonce);
+                    const id = std.fmt.bytesToHex(nonce, .lower);
+                    const request: cut.Request = .{ .id = &id, .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| @import("native_query_cut_contract.zig").max_ttl_ms, .create = true, .timeout_ms = 2000 };
+                    if (try self.tryReuseNativeQueryCut(io, request, renewal.token())) {
+                        state.?.request = request;
+                        state.?.next_ms = now +| 60_000;
+                        try warming.writeState(a, io, state_path, state.?);
+                        return true;
+                    }
+                    // Never recapture an unchanged corpus on an expired
+                    // optional hint alone. Foreground capture can re-establish
+                    // a missing proof; a later tick can renew that live basis.
+                    return true;
+                }
+            } else if (value.next_ms > now) return true;
+        };
         if (state == null or state.?.complete or state.?.request.expires_ms <= now +| 15000) {
             // Keep one private warm cut; it never consumes all foreground cut
             // capacity. Completed cuts are discarded after publishing hints.
@@ -21394,6 +21421,9 @@ pub const DB = struct {
         const warmed = try repository.warmReusable(io, root, state.?.request, self.core.identity_namespace, control.token(), 8 * 1024 * 1024);
         const completed = warmed.complete;
         if (completed) {
+            // Preserve the digest of the captured cut, not a later live read:
+            // writes may have resumed while publication was in progress.
+            state.?.source_digest = try cut.validateWithSourceProof(a, io, root, state.?.request, self.core.identity_namespace, control.token());
             state.?.complete = true;
             state.?.next_ms = now +| 60000;
             try warming.writeState(a, io, state_path, state.?);
@@ -21542,6 +21572,17 @@ pub const DB = struct {
         try self.ensureSnapshotStorageLocked(include_generated);
     }
 
+    // Query/backup controls use the platform monotonic clock. Visibility
+    // waiters use BackendRuntime's awake clock, whose epoch may differ (on
+    // macOS or a borrowed/simulated executor). Transfer the remaining budget,
+    // never compare an absolute deadline from one clock against the other.
+    fn snapshotMaintenanceDeadline(self: *DB, deadline_ns: u64) u64 {
+        const remaining_ns = deadline_ns -| monotonicTimeNs();
+        return self.backend_runtime.monotonicClock().nowRealtimeNs() +| remaining_ns;
+    }
+
+    /// maintenance_deadline_ns is always in BackendRuntime.monotonicClock's
+    /// domain. Query controls translate their platform deadline at admission.
     pub fn snapshotInternal(
         self: *DB,
         id: []const u8,
@@ -27582,7 +27623,7 @@ pub const DB = struct {
         if (ordered_value.value.command.binding.epoch != command.authority_epoch or
             !std.mem.eql(u8, &ordered_value.value.command.binding.digest, &command.catalog_digest) or
             !std.mem.eql(u8, &ordered_value.value.command.namespace, &namespace)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
-        if (command.execution_identity != null and ordered_value.value.command.binding.effect_protocol < 17) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .invalid_output, &apply_held);
+        if (command.execution_identity != null and ordered_value.value.command.binding.effect_protocol < @as(u16, if (command.producer_scope_key.len == 0) 17 else 18)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .invalid_output, &apply_held);
         if (command.mode != .publish) {
             var txn = try self.core.store.beginWriteTxn();
             var txn_open = true;
@@ -75000,6 +75041,199 @@ test "db sparse hits resolve doc ordinals through identity not sparse doc nums" 
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), result.hits[0].doc_ordinal);
 }
 
+test "db native checkpoint warming transfers snapshot budgets to a different runtime clock" {
+    const a = std.testing.allocator;
+    const offset = monotonicTimeNs() + 365 * std.time.ns_per_day;
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = @intCast(offset) });
+    defer clock.deinit();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = clock.io() },
+    });
+    defer runtime.deinit();
+    // This boundary uses only the owning runtime; no physical DB is needed.
+    var db: DB = undefined;
+    db.backend_runtime = runtime.ptr();
+    const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    const wait: derived_executor_mod.VisibilityWait = .{
+        .deadline_ns = db.snapshotMaintenanceDeadline(deadline),
+        .clock = runtime.ptr().monotonicClock(),
+    };
+    try wait.check();
+    clock.monotonic_ns += 6 * std.time.ns_per_s;
+    try std.testing.expectError(error.EnrichmentWaitTimeout, wait.check());
+    const expired: derived_executor_mod.VisibilityWait = .{
+        .deadline_ns = db.snapshotMaintenanceDeadline(monotonicTimeNs() -| 1),
+        .clock = runtime.ptr().monotonicClock(),
+    };
+    try std.testing.expectError(error.EnrichmentWaitTimeout, expired.check());
+}
+
+test "db native checkpoint warming preserves public snapshot runtime deadlines" {
+    const a = std.testing.allocator;
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = @intCast(monotonicTimeNs() + 365 * std.time.ns_per_day) });
+    defer clock.deinit();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = clock.io() },
+        .filesystem_io = std.testing.io,
+    });
+    defer runtime.deinit();
+    var directory = try TestDirectory.init("snapshot-runtime-deadline");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .backend_runtime = runtime.ptr(),
+        .no_sync = true,
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+        .start_independent_maintenance = false,
+    });
+    defer db.close();
+    const now = runtime.ptr().monotonicClock().nowRealtimeNs();
+    try db.drainSnapshotMaintenance(now + std.time.ns_per_s);
+    _ = try db.snapshotWithMaintenanceDeadline("valid-runtime-budget", now + std.time.ns_per_s);
+    try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"pending text\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentWaitTimeout, db.snapshotWithMaintenanceDeadline("expired-runtime-budget", now -| 1));
+    _ = try db.snapshotWithMaintenanceDeadline("drained-runtime-budget", now + 5 * std.time.ns_per_s);
+}
+
+test "db idle dense query captures retain the same immutable runs" {
+    const a = std.testing.allocator;
+    const cut = @import("native_query_cut.zig");
+    var directory = try TestDirectory.init("idle-dense-capture");
+    defer directory.cleanup();
+    const path = directory.path();
+    defer cleanupTempDir(path.ptr);
+    const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{path});
+    defer a.free(pins);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+    const Gate = struct {
+        fn permitted(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var gate: u8 = 0;
+    var db = try DB.open(a, path, .{
+        .no_sync = true,
+        .index_backends = .{ .dense_native_migration_policy_source = .{ .ptr = &gate, .authority_permitted = Gate.permitted } },
+        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+        .start_index_workers = false,
+        .start_independent_maintenance = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"embedding\":[1,0]}" }}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    _ = try db.runLsmMaintenanceUntilIdle();
+    const first_id: [64]u8 = @splat('a');
+    const second_id: [64]u8 = @splat('b');
+    var request: cut.Request = .{ .id = &first_id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+    try db.captureQueryCutInternal(request, .none, false);
+    const dense = db.core.index_manager.denseIndex("dense").?;
+    // Initial capture can leave finite LSM compaction debt. Let the next
+    // capture retire it before checking subsequent unchanged generations.
+    const sequence = db.core.nextDerivedSequence();
+    request.id = &second_id;
+    try db.captureQueryCutInternal(request, .none, false);
+    var second = try dense.index.pinNativeCheckpoint();
+    defer second.deinit();
+    for ([_]u8{ 'c', 'd', 'e' }) |letter| {
+        const id: [64]u8 = @splat(letter);
+        request.id = &id;
+        try db.captureQueryCutInternal(request, .none, false);
+        var next = try dense.index.pinNativeCheckpoint();
+        defer next.deinit();
+        try std.testing.expectEqual(sequence, db.core.nextDerivedSequence());
+        try std.testing.expectEqualSlices(u64, second.run_ids, next.run_ids);
+    }
+}
+
+test "db native checkpoint warming skips unchanged expired cuts and resumes on content changes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const cut = @import("native_query_cut.zig");
+    const warming = @import("native_query_warming.zig");
+    const port = @import("native_query_cut_repository.zig");
+    const Namespace = @import("doc_identity_namespace.zig").Namespace;
+    const Fixture = struct {
+        calls: usize = 0,
+        fn unexpected(_: *anyopaque, _: port.Executor, _: []const u8, _: cut.Request, _: Namespace, _: types.CancellationToken) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn warm(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: types.CancellationToken, _: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var receiver = try executor.receive();
+            try cut.validate(std.testing.allocator, receiver.io(), root, request, namespace, cancellation);
+            self.calls += 1;
+            return true;
+        }
+    };
+    var fixture: Fixture = .{};
+    var directory = try TestDirectory.init("idle-native-warming");
+    defer directory.cleanup();
+    const path = directory.path();
+    defer cleanupTempDir(path.ptr);
+    const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{path});
+    defer a.free(pins);
+    defer std.Io.Dir.cwd().deleteTree(io, pins) catch {};
+    const state_path = try std.fs.path.join(a, &.{ pins, ".warming.json" });
+    defer a.free(state_path);
+    const Gate = struct {
+        fn permitted(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var gate: u8 = 0;
+    var db = try DB.open(a, path, .{
+        .no_sync = true,
+        .index_backends = .{ .dense_native_migration_policy_source = .{ .ptr = &gate, .authority_permitted = Gate.permitted } },
+        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+        .start_index_workers = false,
+        .start_independent_maintenance = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const previous_repository = db.backend_runtime.query_cut_repository;
+    defer db.backend_runtime.query_cut_repository = previous_repository;
+    db.backend_runtime.query_cut_repository = .{ .ptr = &fixture, .vtable = &.{ .publish = Fixture.unexpected, .recover = Fixture.unexpected, .warm = Fixture.warm } };
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\",\"embedding\":[1,0]}" }}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var state = (try warming.readState(arena.allocator(), io, state_path)).?;
+    try std.testing.expect(state.source_digest != null);
+    const sequence = db.core.nextDerivedSequence();
+    // Simulate many elapsed ticks and expiry without wall-clock sleeps. A cut
+    // is optional warming, so expiry alone must never force a new snapshot.
+    state.next_ms = 0;
+    state.request.expires_ms = 1;
+    try warming.writeState(a, io, state_path, state);
+    for (0..8) |_| try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expectEqual(sequence, db.core.nextDerivedSequence());
+    // Same-watermark changes must invalidate warming as they invalidate query
+    // reuse. Checking only the source sequence would miss this revision.
+    _ = db.core.store.query_generation_revision.fetchAdd(1, .acq_rel);
+    try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"updated\",\"embedding\":[0,1]}" }}, .sync_level = .full_index });
+    try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+    // A different owner epoch also invalidates a persisted completed hint.
+    db.local_execution.native_query_reuse_epoch_ready = false;
+    try std.testing.expect(try DB.warmNativeCheckpoint(&db, .none));
+    try std.testing.expectEqual(@as(usize, 4), fixture.calls);
+}
+
 test "db index catalog barrier disables published dense fast path" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -95129,6 +95363,39 @@ test "db dense repair reprocesses corrupt managed source before rebuilding" {
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 2), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db dense enrichment skips unchanged multimodal parts" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedSingleCall;
+        }
+        fn parts(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const template_mod.ContentPart, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return a.dupe(f32, &.{ 1, 0, 0 });
+        }
+    };
+    var probe = Probe{};
+    var directory = try TestDirectory.init("parts-source-hash");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_parts_fn = Probe.parts } } });
+    defer db.close();
+    try db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{body}}\"}}" });
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"same source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"same source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"new source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
 }
 
 test "db dense enrichment skips unchanged source hash" {

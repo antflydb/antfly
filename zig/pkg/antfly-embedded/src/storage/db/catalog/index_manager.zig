@@ -35702,6 +35702,17 @@ pub fn onlineBaseGeneratedVectorConfig(alloc: Allocator, cfg: types.IndexConfig,
 /// Match a chunk vector's semantic source against immutable catalog bytes.
 /// Physical generation numbers and matching dimensions alone never authorize
 /// consuming an identically named embedding from a different chunk producer.
+/// Execution-aware refresh of generated chunk vectors needs scoped identities.
+pub fn onlineGeneratedChunkVectorConfig(alloc: Allocator, cfg: types.IndexConfig, producers: []const enrichment_catalog.EnrichmentConfig) !bool {
+    if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return false;
+    if (try configUsesExternalCoverage(alloc, cfg)) return false;
+    const generator = if (cfg.kind == .dense_vector) try parseDenseGeneratorConfig(alloc, cfg.config_json) else try parseSparseGeneratorConfig(alloc, cfg.config_json);
+    defer if (generator) |value| value.deinit(alloc);
+    if (generator) |value| return value.embedding_input == .text and generatorHasChunking(value);
+    for (producers) |entry| if (entry.kind == .embedding and try consumesGeneratedChunkVector(alloc, cfg, producers, entry.source_artifact_name, entry.name)) return true;
+    return false;
+}
+
 pub fn consumesGeneratedChunkVector(alloc: Allocator, cfg: types.IndexConfig, producers: []const enrichment_catalog.EnrichmentConfig, chunk_name: []const u8, embedding_name: []const u8) !bool {
     if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return false;
     if (try configUsesExternalCoverage(alloc, cfg)) return false;

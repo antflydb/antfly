@@ -253,6 +253,9 @@ pub const Repository = struct {
         return .{ .io = io, .file = file };
     }
     fn linkGeneration(a: A, io: std.Io, source: []const u8, target: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+        return linkGenerationAs(a, io, source, target, request, request, namespace, cancellation);
+    }
+    fn linkGenerationAs(a: A, io: std.Io, source: []const u8, target: []const u8, request: cut.Request, replacement: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
         try cut.validate(a, io, source, request, namespace, cancellation);
         const manifest_path = try std.fs.path.join(a, &.{ source, "query-cut.json" });
         defer a.free(manifest_path);
@@ -279,8 +282,10 @@ pub const Repository = struct {
         const to_manifest = try std.fs.path.join(a, &.{ staging, "query-cut.json" });
         defer a.free(to_manifest);
         try cut.validate(a, io, source, request, namespace, cancellation);
-        _ = try local.storage_db_native_backup.writeFileDurable(io, to_manifest, bytes);
-        try cut.validate(a, io, staging, request, namespace, cancellation);
+        const rebound = if (request.expires_ms == replacement.expires_ms and std.mem.eql(u8, request.id, replacement.id)) bytes else try std.json.Stringify.valueAlloc(a, cut.Manifest{ .request = replacement, .namespace = namespace, .sequence = parsed.value.sequence, .files = parsed.value.files, .reuse_digest = parsed.value.reuse_digest }, .{});
+        defer if (rebound.ptr != bytes.ptr) a.free(rebound);
+        _ = try local.storage_db_native_backup.writeFileDurable(io, to_manifest, rebound);
+        try cut.validate(a, io, staging, replacement, namespace, cancellation);
         // Sync nested link directories before publishing their parent.
         var inventory_arena = std.heap.ArenaAllocator.init(a);
         defer inventory_arena.deinit();
@@ -338,6 +343,7 @@ pub const Repository = struct {
                     },
                     else => return link_err,
                 };
+                if (proof) |out| out.* = try linkedProof(a, io, target, request, namespace, cancellation);
                 return true;
             },
             else => return err,
@@ -345,7 +351,46 @@ pub const Repository = struct {
         const source_manifest = try local.storage_db_native_backup.readFileAlloc(a, io, try std.fs.path.join(a, &.{ root, "query-cut.json" }), max_manifest_bytes);
         const retained_manifest = try local.storage_db_native_backup.readFileAlloc(a, io, try std.fs.path.join(a, &.{ target, "query-cut.json" }), max_manifest_bytes);
         if (!std.mem.eql(u8, source_manifest, retained_manifest)) return error.CatalogGenerationChanged;
+        if (proof) |out| out.* = try linkedProof(a, io, target, request, namespace, cancellation);
         return true;
+    }
+    fn linkedProof(a: A, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.ReuseProof {
+        const digest = (try cut.validateWithSourceProof(a, io, root, request, namespace, cancellation)) orelse return null;
+        const path = try std.fs.path.join(a, &.{ root, "query-cut.json" });
+        defer a.free(path);
+        const bytes = try local.storage_db_native_backup.readFileAlloc(a, io, path, max_manifest_bytes);
+        defer a.free(bytes);
+        var manifest = try std.json.parseFromSlice(cut.Manifest, a, bytes, .{});
+        defer manifest.deinit();
+        return .{ .sequence = manifest.value.sequence, .digest = digest, .manifest_checksum = manifestChecksum(bytes) };
+    }
+    fn reuseLinked(self: *Repository, a: A, io: std.Io, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
+        var guard = try linkedLock(a, io, try self.linkedNamespace(a, namespace), cancellation);
+        defer guard.deinit();
+        const source = self.linkedRoot(a, previous, namespace) catch |err| switch (err) {
+            error.CatalogGenerationChanged => return null,
+            else => return err,
+        };
+        const held = linkedProof(a, io, source, previous, namespace, cancellation) catch |err| switch (err) {
+            error.CatalogGenerationChanged, error.FileNotFound => return null,
+            else => return err,
+        };
+        const current = held orelse return null;
+        if (!std.meta.eql(current, proof)) return null;
+        const target = try self.linkedRoot(a, request, namespace);
+        try fs.createDirPathPortable(io, std.fs.path.dirname(target).?);
+        cut.validate(a, io, target, request, namespace, cancellation) catch |err| switch (err) {
+            error.CatalogGenerationChanged => linkGenerationAs(a, io, source, target, previous, request, namespace, cancellation) catch |link_err| {
+                try cancellation.check();
+                // A source may expire during the bounded link operation. Its
+                // optional proof cannot revoke the caller's fresh request.
+                if (previous.expires_ms <= cut.nowMs()) return null;
+                return link_err;
+            },
+            else => return err,
+        };
+        try self.register(a, namespace, cancellation);
+        return linkedProof(a, io, target, request, namespace, cancellation);
     }
     // Missing caches read retained files in place, even across filesystems.
     // A shared expiry lease protects lazy reads and any escaped page sources.
@@ -1049,10 +1094,10 @@ pub const Repository = struct {
     }
     /// Rebind a proved unchanged physical generation to a new logical cursor.
     /// Extent horizons must cover the new cursor; never extend them by assertion.
-    fn reuse(raw: *anyopaque, _: port.Executor, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
-        return reuseImpl(raw, previous, request, namespace, proof, cancellation) catch |err| return repositoryFailure("reuse", err, cancellation);
+    fn reuse(raw: *anyopaque, executor: port.Executor, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
+        return reuseImpl(raw, executor, previous, request, namespace, proof, cancellation) catch |err| return repositoryFailure("reuse", err, cancellation);
     }
-    fn reuseImpl(raw: *anyopaque, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
+    fn reuseImpl(raw: *anyopaque, executor: port.Executor, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
         const self = from(raw);
         try cancellation.check();
         try request.validate(cut.nowMs());
@@ -1060,6 +1105,10 @@ pub const Repository = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
+        if (self.store.opened.fs_client != null) {
+            var receiver = try executor.receive();
+            if (try self.reuseLinked(a, receiver.io(), previous, request, namespace, proof, cancellation)) |renewed| return renewed;
+        }
         const bytes = self.readManifest(a, previous, namespace, cancellation) catch |err| switch (err) {
             error.CatalogGenerationChanged => return null,
             else => return err,
@@ -1395,6 +1444,46 @@ test "external lake native reuse avoids capture and invalidates writes metadata 
     const old_bytes = (try prior.get(a, "doc")).?;
     defer a.free(old_bytes);
     try std.testing.expect(std.mem.indexOf(u8, old_bytes, "\"amount\":1") != null);
+}
+
+test "external lake native linked renewal reuses immutable files without snapshot capture" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-linked-renewal");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .filesystem_io = io });
+    defer runtime.deinit();
+    runtime.ptr().query_cut_repository = repository.capability();
+    const root = try std.fs.path.join(a, &.{ directory.path(), "db" });
+    defer a.free(root);
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    var db = try local.storage_db_db.DB.open(a, root, .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .start_optional_runtimes = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":1}" }} });
+    const first: cut.Request = .{ .id = &@as([64]u8, @splat('a')), .table_id = 7, .expires_ms = cut.nowMs() + 240000, .create = true };
+    try db.captureQueryCut(first, .none);
+    const proof = db.local_execution.native_query_reuse.?.proof();
+    const second: cut.Request = .{ .id = &@as([64]u8, @splat('b')), .table_id = 7, .expires_ms = first.expires_ms + 30000, .create = true };
+    try std.testing.expect(db.snapshot_publication_mutex.tryLock());
+    defer db.snapshot_publication_mutex.unlock();
+    try db.captureQueryCut(second, .none);
+    try std.testing.expectEqual(proof.digest, db.local_execution.native_query_reuse.?.proof().digest);
+    const path = try cut.pathAlloc(a, root, second.id);
+    defer a.free(path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, path, .{}));
+    const retained = try repository.linkedRoot(a, second, namespace);
+    defer a.free(retained);
+    try cut.validate(a, io, retained, second, namespace, .none);
+    var wrong = proof;
+    wrong.digest = @splat(0);
+    try std.testing.expect(try repository.capability().reuse(io, first, second, namespace, wrong, .none) == null);
+    var reader = try db.openQueryCut(.{ .id = first.id, .table_id = 7, .expires_ms = first.expires_ms }, .none);
+    defer reader.close();
+    const value = (try reader.get(a, "doc")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("{\"amount\":1}", value);
 }
 
 test "external lake native reuse validates physical retention before extending cursors" {
@@ -2389,4 +2478,69 @@ test "external lake native transient hints cannot fail a sealed publication and 
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, repository.chunkedCapability().publishReusable(io, next_root, next_request, namespace, .none));
     try std.testing.expectEqual(error.AccessDenied, repositoryFailure("read", error.AccessDenied, .none));
     try std.testing.expectEqual(error.TlsBadRecordMac, repositoryFailure("read", error.TlsBadRecordMac, .none));
+}
+
+test "external lake native reuse falls back when its basis expires behind collection lock" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-expired-reuse-basis");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const parent = try repository.linkedNamespace(a, namespace);
+    defer a.free(parent);
+    var guard = try Repository.linkedLock(a, io, parent, .none);
+    var guarded = true;
+    defer if (guarded) guard.deinit();
+    const Worker = struct {
+        repository: *Repository,
+        previous: cut.Request,
+        request: cut.Request,
+        started: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        proof: ?port.ReuseProof = null,
+        fn run(self: *@This(), executor_io: std.Io, ns: Namespace) void {
+            self.previous.expires_ms = cut.nowMs() + 100;
+            self.previous.validate(cut.nowMs()) catch |err| {
+                self.failure = err;
+                self.started.set(executor_io);
+                return;
+            };
+            self.started.set(executor_io);
+            self.proof = self.repository.capability().reuse(executor_io, self.previous, self.request, ns, .{ .sequence = 1, .digest = @splat(1), .manifest_checksum = @splat(1) }, .none) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var worker: Worker = .{
+        .repository = &repository,
+        .previous = .{ .id = &@as([64]u8, @splat('a')), .table_id = 7, .expires_ms = cut.nowMs() + 500, .create = true },
+        .request = .{ .id = &@as([64]u8, @splat('b')), .table_id = 7, .expires_ms = cut.nowMs() + 300000, .create = true },
+    };
+    var task = try io.concurrent(Worker.run, .{ &worker, io, namespace });
+    var awaited = false;
+    defer if (!awaited) {
+        if (guarded) {
+            guard.deinit();
+            guarded = false;
+        }
+        task.await(io);
+    };
+    worker.started.wait(io) catch |err| {
+        guard.deinit();
+        guarded = false;
+        task.await(io);
+        awaited = true;
+        return err;
+    };
+    try io.sleep(.fromMilliseconds(@intCast(worker.previous.expires_ms -| cut.nowMs() + 10)), .awake);
+    guard.deinit();
+    guarded = false;
+    task.await(io);
+    awaited = true;
+    try std.testing.expect(worker.failure == null);
+    try std.testing.expect(worker.proof == null);
+    try worker.request.validate(cut.nowMs());
 }
