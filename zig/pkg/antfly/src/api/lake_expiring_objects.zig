@@ -20,7 +20,7 @@ const std = @import("std");
 const Store = @import("lake_index_store.zig").Store;
 const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const A = std.mem.Allocator;
-const Progress = struct { version: u16 = 2, cursor: ?[]const u8 = null, after_key: ?[]const u8 = null, retained: bool = false };
+const Progress = @import("lake_query_gc.zig").RecordProgress;
 pub fn collect(a: A, store: *Store, table: u64, kind: []const u8, context: Context) !void {
     try context.ensureActive();
     const gc = @import("lake_query_gc.zig");
