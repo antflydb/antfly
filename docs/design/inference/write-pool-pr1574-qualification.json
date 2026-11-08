@@ -1,472 +1,445 @@
 {
   "status": "passed",
-  "date_utc": "2026-11-08",
-  "host": "glowworm (spark-beb5)",
-  "code_commit": "c845eded3c8f6a86552d57bc321ea27c61859203",
-  "merged_main": "3e8975a1da80d692466cf847ef56175b53b26929",
+  "qualification_kind": "serving-envelope",
+  "acceptance": {
+    "embedding_cosine_min": 0.9999,
+    "embedding_max_abs": 0.005,
+    "confidence_absolute_tolerance": 0.0005,
+    "corpus_wer_max": 0.12,
+    "long_audio_wer_max": 0.15,
+    "batch_throughput_ratio_min": 0.9,
+    "batch_promotion_ratio_min": 1.1,
+    "native_batches_per_model_min": 3,
+    "burst_tail_serial_work_ratio_max": 1.25,
+    "mixed_tail_serial_work_ratio_max": 2.0,
+    "mixed_p95_ms_max": {
+      "embed": 1500,
+      "extract": 2000,
+      "whisper": 5000,
+      "ocr": 15000
+    },
+    "recovery_seconds_max": 30,
+    "managed_limit_gib": 38
+  },
   "scope": "Qualify bounded write serving, observed HTTP batching, and accuracy evidence.\n\nUses the pinned, locally cached LibriSpeech dummy dev-clean shard (73 clips,\none speaker), frozen GLiNER oracles and synthetic OCR pages. Passing this\nenvelope does not establish general ASR/OCR accuracy or A100 performance.\nRequires numpy, av and pyarrow for the independent speech fixtures.\n",
-  "binary_sha256": "850cbe958ea8f29d65a5edf017d95d21a9f177d6159b8956cf11a4d8fc0deb22",
-  "gpu": {
-    "name": "NVIDIA GB10",
-    "uuid": "GPU-3bd71415-6064-a1a7-5d0e-4e12158b383a"
-  },
-  "harness_sha256": "b2370f53d10914790dbdd36a2fe1e5ee926f67b25ed733da0a8a51ae18eefb32",
-  "runtime_environment": {
-    "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "0",
-    "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": null,
-    "ANTFLY_INFERENCE_CUDA_GREEDY_DEVICE_TOKEN_HANDOFF": null,
-    "ANTFLY_INFERENCE_REQUIRED_BACKEND": "cuda",
-    "ANTFLY_SERVER_DECODE_GRAPH_REPLAY": "0"
-  },
-  "config_sha256": "c7a1bbfb43a8a45bd04f0c8a91bdf0f947f33cadf14f20eca2c4597b394e4cf6",
-  "raw_evidence_bundle_sha256": "c2290036db7fd61d4cc1a5c6ed98897fd79a1b19535bba0dd680d24e80261d26",
-  "evidence_directory": ".benchmark-results/pr1574",
-  "configuration": {
-    "resources": {
-      "memory": {
-        "max_bytes": 77309411328
+  "rounds": 5,
+  "soak_rounds_min": 100,
+  "soak_seconds_min": 300,
+  "harness_sha256": "f3546b60a208c605216b3d80c705eca0cf8a1f867c30a06e83a75afea36185a7",
+  "identity": {
+    "binary_sha256": "49aada553645db8aebacbb7855fd8628d892a06c429d3d611f030866136ef8ab",
+    "configuration": {
+      "resources": {
+        "memory": {
+          "max_bytes": 77309411328
+        },
+        "inference": {
+          "memory": {
+            "max_host_bytes": 34359738368,
+            "max_device_bytes": 40802189312,
+            "max_combined_bytes": 75161927680,
+            "max_kv_bytes": 21474836480,
+            "max_scratch_bytes": 12884901888
+          },
+          "admission": {
+            "max_concurrent_requests": 16,
+            "max_work_units": 1024
+          },
+          "request_limits": {
+            "max_items_per_request": 8,
+            "max_input_tokens_per_item": 32768,
+            "max_output_tokens_per_item": 1024,
+            "max_decoded_pixels_per_batch": 4000000
+          }
+        }
       },
       "inference": {
-        "memory": {
-          "max_host_bytes": 34359738368,
-          "max_device_bytes": 40802189312,
-          "max_combined_bytes": 75161927680,
-          "max_kv_bytes": 21474836480,
-          "max_scratch_bytes": 12884901888
+        "models_dir": "/home/ajroetker/antfly/.worktrees/qualification-pr-1574/.benchmark-results/pr1574/models",
+        "ml_dir": "/home/ajroetker/antfly/.worktrees/qualification-pr-1574/.benchmark-results/pr1574/ml",
+        "max_loaded_models": 4,
+        "keep_alive": "0",
+        "preload": [
+          {
+            "kind": "embedder",
+            "name": "google/embeddinggemma-2",
+            "backend": "cuda"
+          },
+          {
+            "kind": "transcriber",
+            "name": "openai/whisper-small",
+            "backend": "cuda"
+          },
+          {
+            "kind": "extractor",
+            "name": "antflydb/GLiNER2.5",
+            "backend": "cuda"
+          },
+          {
+            "kind": "reader",
+            "name": "lightonai/LightOnOCR-3-0.8B",
+            "backend": "cuda"
+          }
+        ],
+        "kernel_jit": {
+          "mode": "off"
         },
-        "admission": {
-          "max_concurrent_requests": 16,
-          "max_work_units": 1024
+        "prompt_cache": {
+          "enabled": false
         },
-        "request_limits": {
-          "max_items_per_request": 8,
-          "max_input_tokens_per_item": 32768,
-          "max_output_tokens_per_item": 1024,
-          "max_decoded_pixels_per_batch": 4000000
+        "generation_batching": {
+          "mode": "on",
+          "max_step_items": 2,
+          "max_step_query_tokens": 512,
+          "max_decode_wait_us": 1000,
+          "max_idle_prefill_chunk_size": 512
         }
       }
     },
-    "inference": {
-      "models_dir": "/home/ajroetker/antfly/.worktrees/qualification-pr-1574/.benchmark-results/pr1574/models",
-      "ml_dir": "/home/ajroetker/antfly/.worktrees/qualification-pr-1574/.benchmark-results/pr1574/ml",
-      "max_loaded_models": 4,
-      "keep_alive": "0",
-      "preload": [
+    "gpu": {
+      "name": "NVIDIA GB10",
+      "uuid": "GPU-3bd71415-6064-a1a7-5d0e-4e12158b383a"
+    },
+    "runtime_environment": {
+      "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "0",
+      "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": null,
+      "ANTFLY_INFERENCE_CUDA_GREEDY_DEVICE_TOKEN_HANDOFF": null,
+      "ANTFLY_INFERENCE_REQUIRED_BACKEND": "cuda",
+      "ANTFLY_SERVER_DECODE_GRAPH_REPLAY": "0"
+    },
+    "owned_pids": [
+      3701656,
+      3701660
+    ],
+    "working_directory": "/home/ajroetker/antfly/.worktrees/qualification-pr-1574",
+    "model_artifacts": {
+      "version": 1,
+      "models": [
         {
-          "kind": "embedder",
-          "name": "google/embeddinggemma-2",
-          "backend": "cuda"
+          "model": "antflydb/GLiNER2.5",
+          "backend": "cuda",
+          "tasks": [
+            "extractor"
+          ],
+          "files": [
+            {
+              "path": "config.json",
+              "size": 4103,
+              "sha256": "d6b515c21ae2100c12267fb42a3f02c1e99ad87580366aebedb161efd74441c7"
+            },
+            {
+              "path": "encoder_config/config.json",
+              "size": 857,
+              "sha256": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4"
+            },
+            {
+              "path": "model.safetensors",
+              "size": 774366564,
+              "sha256": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a"
+            },
+            {
+              "path": "tokenizer.json",
+              "size": 8341713,
+              "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3"
+            },
+            {
+              "path": "tokenizer_config.json",
+              "size": 645,
+              "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+            },
+            {
+              "path": "write-pool-acquisition.json",
+              "size": 1568,
+              "sha256": "9220c294cd3df0fd6eb978d1f14c9d947b44e0238edbe5ef725f3fcbeb149775"
+            }
+          ]
         },
         {
-          "kind": "transcriber",
-          "name": "openai/whisper-small",
-          "backend": "cuda"
+          "model": "google/embeddinggemma-2",
+          "backend": "cuda",
+          "tasks": [
+            "classifier",
+            "embedder"
+          ],
+          "files": [
+            {
+              "path": "1_Pooling/config.json",
+              "size": 90,
+              "sha256": "8759bdf7c77efc7df7723f64856a593c8943b71ee38baf2a88771fbaf78438f9"
+            },
+            {
+              "path": "2_Normalize/config.json",
+              "size": 97,
+              "sha256": "cdb09dfca347a56aa2d691744e38d5ad3c7cbc2834e7181272b9a15328b82524"
+            },
+            {
+              "path": "chat_template.jinja",
+              "size": 1016,
+              "sha256": "4b852efc0b9960283e735363331e6f325b33bc74bdbaa076f595bc4e9b94d85e"
+            },
+            {
+              "path": "config.json",
+              "size": 4455,
+              "sha256": "b8f1e9931b57fbc054acdb445c41765d55b0074c58d145fa82839941ad1b5bb3"
+            },
+            {
+              "path": "config_sentence_transformers.json",
+              "size": 1565,
+              "sha256": "031e56a498d33c349ab489a21885bcfe25b4fcba841149dc99e1e90d4a7c28f5"
+            },
+            {
+              "path": "model.safetensors",
+              "size": 1488915288,
+              "sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79"
+            },
+            {
+              "path": "modules.json",
+              "size": 413,
+              "sha256": "3d02572a0455b832de67fb8e63a54981bc7e8b46e337c95e917bd8122a533bfd"
+            },
+            {
+              "path": "preprocessor_config.json",
+              "size": 511,
+              "sha256": "ea2ae257e901064abdd98dceb19f2b0da06af600bed15e0f99f5c85c37ee9d78"
+            },
+            {
+              "path": "processor_config.json",
+              "size": 1788,
+              "sha256": "168f6a08522f3ce5dea596d94d003af2fd691742d4f41fe1f9d8cce76bfbf69c"
+            },
+            {
+              "path": "sentence_bert_config.json",
+              "size": 747,
+              "sha256": "b1bcd9f2dce3ae863b359e87d0710b5dbc3314a59ecb4e2f97c7778fc8e4b228"
+            },
+            {
+              "path": "tokenizer.json",
+              "size": 32170510,
+              "sha256": "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4"
+            },
+            {
+              "path": "tokenizer.model",
+              "size": 4689013,
+              "sha256": "e594c8a90eb08d8bda498ff4747977dc827ae0c3c56b5c0d41a605a22d02ef03"
+            },
+            {
+              "path": "tokenizer_config.json",
+              "size": 1599,
+              "sha256": "17bd5d6e9364ca49a534e1502076593317c298d4a663623091ed45388f004874"
+            },
+            {
+              "path": "write-pool-acquisition.json",
+              "size": 3867,
+              "sha256": "cee0c38ccf5294b0ab9a1648d5259fe444db86a38362138899ddea08aed49cc5"
+            }
+          ]
         },
         {
-          "kind": "extractor",
-          "name": "antflydb/GLiNER2.5",
-          "backend": "cuda"
+          "model": "lightonai/LightOnOCR-3-0.8B",
+          "backend": "cuda",
+          "tasks": [
+            "generator",
+            "reader"
+          ],
+          "files": [
+            {
+              "path": "chat_template.jinja",
+              "size": 435,
+              "sha256": "2178c43e4543160bd8293bf9bf1c4305543b33ea21c368e3123b251d0ea9b961"
+            },
+            {
+              "path": "config.json",
+              "size": 2692,
+              "sha256": "842fafd8f06807269960515fa6f0e4b5dd27f9e645b67a2b3e84f1699ee8d60c"
+            },
+            {
+              "path": "generation_config.json",
+              "size": 205,
+              "sha256": "b1cfebea5837fc69aa89c3e2210dbe6494bb29a04e1e88beb227ddad53b9dfc1"
+            },
+            {
+              "path": "merges.txt",
+              "size": 3353259,
+              "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+            },
+            {
+              "path": "model.safetensors",
+              "size": 1706030528,
+              "sha256": "ae46aa6fd7136d57297ac006ed9ec345b7a2083feb2e99501bedcb014ca3efdf"
+            },
+            {
+              "path": "model_manifest.json",
+              "size": 111,
+              "sha256": "7b7ad22ff1cd5d468344db57acfaa435deac5f8c697e118ea5a8c1c74af6673c"
+            },
+            {
+              "path": "preprocessor_config.json",
+              "size": 390,
+              "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+            },
+            {
+              "path": "processor_config.json",
+              "size": 1191,
+              "sha256": "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1"
+            },
+            {
+              "path": "tokenizer.json",
+              "size": 19989325,
+              "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+            },
+            {
+              "path": "tokenizer_config.json",
+              "size": 1168,
+              "sha256": "c908cd42c5e6eac721445fb70841e45845a6a269c6ef2c595e97a578a9724671"
+            },
+            {
+              "path": "vocab.json",
+              "size": 6722759,
+              "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+            },
+            {
+              "path": "write-pool-acquisition.json",
+              "size": 3028,
+              "sha256": "dd4a88c184869b66f2de162fc590479cf6429f6811fdf29ff3cdbf885fdd1365"
+            }
+          ]
         },
         {
-          "kind": "reader",
-          "name": "lightonai/LightOnOCR-3-0.8B",
-          "backend": "cuda"
+          "model": "openai/whisper-small",
+          "backend": "cuda",
+          "tasks": [
+            "transcriber"
+          ],
+          "files": [
+            {
+              "path": "acquisition-receipt.json",
+              "size": 4266,
+              "sha256": "ab5fcc0826bdc69f33697978bebc4d221a1de587504fd32976df76d1d5b91599"
+            },
+            {
+              "path": "added_tokens.json",
+              "size": 34604,
+              "sha256": "9715fd2243b6f06a5858b5e32950d2853f73dd5bc201aafcf76f5082a2d8acd1"
+            },
+            {
+              "path": "config.json",
+              "size": 1967,
+              "sha256": "e6a2b489da1b5aed65a8eb8d1e7466fa867ad5643a8bc138ba708bd56b2875c4"
+            },
+            {
+              "path": "generation_config.json",
+              "size": 3868,
+              "sha256": "71565b8ef50d0bf7a1193ed4bbed195b94e70c18894d81bba2f1233dcec3ab53"
+            },
+            {
+              "path": "merges.txt",
+              "size": 493869,
+              "sha256": "2df2990a395e35e8dfbc7511e08c12d56018d8d04691e0133e5d63b21e154dc6"
+            },
+            {
+              "path": "model.safetensors",
+              "size": 966995080,
+              "sha256": "1d7734884874f1a1513ed9aa760a4f8e97aaa02fd6d93a3a85d27b2ae9ca596b"
+            },
+            {
+              "path": "normalizer.json",
+              "size": 52666,
+              "sha256": "bf1c507dc8724ca9cf9903640dacfb69dae2f00edee4f21ceba106a7392f26dd"
+            },
+            {
+              "path": "preprocessor_config.json",
+              "size": 184990,
+              "sha256": "9b5cd03a36fbb8a627c64d98a5b5b126ead95a77720723944487311f0110b666"
+            },
+            {
+              "path": "special_tokens_map.json",
+              "size": 2194,
+              "sha256": "e67ae3a0aaa99abcd9f187138e12db1f65c16a14761c50ef10eef2c174a7a691"
+            },
+            {
+              "path": "tokenizer.json",
+              "size": 2480466,
+              "sha256": "27fc476bfe7f17299480be2273fc0608e4d5a99aba2ab5dec5374b4482d1a566"
+            },
+            {
+              "path": "tokenizer_config.json",
+              "size": 282683,
+              "sha256": "2a4c4281cf9f51ac6ccc406fdc711a087afe6530f671fa7b80953edc498275ce"
+            },
+            {
+              "path": "vocab.json",
+              "size": 835550,
+              "sha256": "8f680bba319e01a653d2e8a5dbc17a9157179e0576e6ce74ce0c06356c6e24f9"
+            }
+          ]
         }
-      ],
-      "kernel_jit": {
-        "mode": "off"
-      },
-      "prompt_cache": {
-        "enabled": false
-      },
-      "generation_batching": {
-        "mode": "on",
-        "max_step_items": 2,
-        "max_step_query_tokens": 512,
-        "max_decode_wait_us": 1000,
-        "max_idle_prefill_chunk_size": 512
-      }
+      ]
     }
   },
-  "model_artifacts": {
-    "version": 1,
-    "models": [
-      {
-        "model": "antflydb/GLiNER2.5",
-        "backend": "cuda",
-        "tasks": [
-          "extractor"
-        ],
-        "files": [
-          {
-            "path": "config.json",
-            "size": 4103,
-            "sha256": "d6b515c21ae2100c12267fb42a3f02c1e99ad87580366aebedb161efd74441c7"
-          },
-          {
-            "path": "encoder_config/config.json",
-            "size": 857,
-            "sha256": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4"
-          },
-          {
-            "path": "model.safetensors",
-            "size": 774366564,
-            "sha256": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a"
-          },
-          {
-            "path": "tokenizer.json",
-            "size": 8341713,
-            "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3"
-          },
-          {
-            "path": "tokenizer_config.json",
-            "size": 645,
-            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
-          },
-          {
-            "path": "write-pool-acquisition.json",
-            "size": 1568,
-            "sha256": "9220c294cd3df0fd6eb978d1f14c9d947b44e0238edbe5ef725f3fcbeb149775"
-          }
-        ]
-      },
-      {
-        "model": "google/embeddinggemma-2",
-        "backend": "cuda",
-        "tasks": [
-          "classifier",
-          "embedder"
-        ],
-        "files": [
-          {
-            "path": "1_Pooling/config.json",
-            "size": 90,
-            "sha256": "8759bdf7c77efc7df7723f64856a593c8943b71ee38baf2a88771fbaf78438f9"
-          },
-          {
-            "path": "2_Normalize/config.json",
-            "size": 97,
-            "sha256": "cdb09dfca347a56aa2d691744e38d5ad3c7cbc2834e7181272b9a15328b82524"
-          },
-          {
-            "path": "chat_template.jinja",
-            "size": 1016,
-            "sha256": "4b852efc0b9960283e735363331e6f325b33bc74bdbaa076f595bc4e9b94d85e"
-          },
-          {
-            "path": "config.json",
-            "size": 4455,
-            "sha256": "b8f1e9931b57fbc054acdb445c41765d55b0074c58d145fa82839941ad1b5bb3"
-          },
-          {
-            "path": "config_sentence_transformers.json",
-            "size": 1565,
-            "sha256": "031e56a498d33c349ab489a21885bcfe25b4fcba841149dc99e1e90d4a7c28f5"
-          },
-          {
-            "path": "model.safetensors",
-            "size": 1488915288,
-            "sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79"
-          },
-          {
-            "path": "modules.json",
-            "size": 413,
-            "sha256": "3d02572a0455b832de67fb8e63a54981bc7e8b46e337c95e917bd8122a533bfd"
-          },
-          {
-            "path": "preprocessor_config.json",
-            "size": 511,
-            "sha256": "ea2ae257e901064abdd98dceb19f2b0da06af600bed15e0f99f5c85c37ee9d78"
-          },
-          {
-            "path": "processor_config.json",
-            "size": 1788,
-            "sha256": "168f6a08522f3ce5dea596d94d003af2fd691742d4f41fe1f9d8cce76bfbf69c"
-          },
-          {
-            "path": "sentence_bert_config.json",
-            "size": 747,
-            "sha256": "b1bcd9f2dce3ae863b359e87d0710b5dbc3314a59ecb4e2f97c7778fc8e4b228"
-          },
-          {
-            "path": "tokenizer.json",
-            "size": 32170510,
-            "sha256": "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4"
-          },
-          {
-            "path": "tokenizer.model",
-            "size": 4689013,
-            "sha256": "e594c8a90eb08d8bda498ff4747977dc827ae0c3c56b5c0d41a605a22d02ef03"
-          },
-          {
-            "path": "tokenizer_config.json",
-            "size": 1599,
-            "sha256": "17bd5d6e9364ca49a534e1502076593317c298d4a663623091ed45388f004874"
-          },
-          {
-            "path": "write-pool-acquisition.json",
-            "size": 3867,
-            "sha256": "cee0c38ccf5294b0ab9a1648d5259fe444db86a38362138899ddea08aed49cc5"
-          }
-        ]
-      },
-      {
-        "model": "lightonai/LightOnOCR-3-0.8B",
-        "backend": "cuda",
-        "tasks": [
-          "generator",
-          "reader"
-        ],
-        "files": [
-          {
-            "path": "chat_template.jinja",
-            "size": 435,
-            "sha256": "2178c43e4543160bd8293bf9bf1c4305543b33ea21c368e3123b251d0ea9b961"
-          },
-          {
-            "path": "config.json",
-            "size": 2692,
-            "sha256": "842fafd8f06807269960515fa6f0e4b5dd27f9e645b67a2b3e84f1699ee8d60c"
-          },
-          {
-            "path": "generation_config.json",
-            "size": 205,
-            "sha256": "b1cfebea5837fc69aa89c3e2210dbe6494bb29a04e1e88beb227ddad53b9dfc1"
-          },
-          {
-            "path": "merges.txt",
-            "size": 3353259,
-            "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
-          },
-          {
-            "path": "model.safetensors",
-            "size": 1706030528,
-            "sha256": "ae46aa6fd7136d57297ac006ed9ec345b7a2083feb2e99501bedcb014ca3efdf"
-          },
-          {
-            "path": "model_manifest.json",
-            "size": 111,
-            "sha256": "7b7ad22ff1cd5d468344db57acfaa435deac5f8c697e118ea5a8c1c74af6673c"
-          },
-          {
-            "path": "preprocessor_config.json",
-            "size": 390,
-            "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
-          },
-          {
-            "path": "processor_config.json",
-            "size": 1191,
-            "sha256": "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1"
-          },
-          {
-            "path": "tokenizer.json",
-            "size": 19989325,
-            "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
-          },
-          {
-            "path": "tokenizer_config.json",
-            "size": 1168,
-            "sha256": "c908cd42c5e6eac721445fb70841e45845a6a269c6ef2c595e97a578a9724671"
-          },
-          {
-            "path": "vocab.json",
-            "size": 6722759,
-            "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
-          },
-          {
-            "path": "write-pool-acquisition.json",
-            "size": 3028,
-            "sha256": "dd4a88c184869b66f2de162fc590479cf6429f6811fdf29ff3cdbf885fdd1365"
-          }
-        ]
-      },
-      {
-        "model": "openai/whisper-small",
-        "backend": "cuda",
-        "tasks": [
-          "transcriber"
-        ],
-        "files": [
-          {
-            "path": "acquisition-receipt.json",
-            "size": 4266,
-            "sha256": "ab5fcc0826bdc69f33697978bebc4d221a1de587504fd32976df76d1d5b91599"
-          },
-          {
-            "path": "added_tokens.json",
-            "size": 34604,
-            "sha256": "9715fd2243b6f06a5858b5e32950d2853f73dd5bc201aafcf76f5082a2d8acd1"
-          },
-          {
-            "path": "config.json",
-            "size": 1967,
-            "sha256": "e6a2b489da1b5aed65a8eb8d1e7466fa867ad5643a8bc138ba708bd56b2875c4"
-          },
-          {
-            "path": "generation_config.json",
-            "size": 3868,
-            "sha256": "71565b8ef50d0bf7a1193ed4bbed195b94e70c18894d81bba2f1233dcec3ab53"
-          },
-          {
-            "path": "merges.txt",
-            "size": 493869,
-            "sha256": "2df2990a395e35e8dfbc7511e08c12d56018d8d04691e0133e5d63b21e154dc6"
-          },
-          {
-            "path": "model.safetensors",
-            "size": 966995080,
-            "sha256": "1d7734884874f1a1513ed9aa760a4f8e97aaa02fd6d93a3a85d27b2ae9ca596b"
-          },
-          {
-            "path": "normalizer.json",
-            "size": 52666,
-            "sha256": "bf1c507dc8724ca9cf9903640dacfb69dae2f00edee4f21ceba106a7392f26dd"
-          },
-          {
-            "path": "preprocessor_config.json",
-            "size": 184990,
-            "sha256": "9b5cd03a36fbb8a627c64d98a5b5b126ead95a77720723944487311f0110b666"
-          },
-          {
-            "path": "special_tokens_map.json",
-            "size": 2194,
-            "sha256": "e67ae3a0aaa99abcd9f187138e12db1f65c16a14761c50ef10eef2c174a7a691"
-          },
-          {
-            "path": "tokenizer.json",
-            "size": 2480466,
-            "sha256": "27fc476bfe7f17299480be2273fc0608e4d5a99aba2ab5dec5374b4482d1a566"
-          },
-          {
-            "path": "tokenizer_config.json",
-            "size": 282683,
-            "sha256": "2a4c4281cf9f51ac6ccc406fdc711a087afe6530f671fa7b80953edc498275ce"
-          },
-          {
-            "path": "vocab.json",
-            "size": 835550,
-            "sha256": "8f680bba319e01a653d2e8a5dbc17a9157179e0576e6ce74ce0c06356c6e24f9"
-          }
-        ]
-      }
-    ]
-  },
-  "controlled_rounds": 5,
   "batching": {
     "embed": {
       "serialized_seconds": [
-        0.12154477900185157,
-        0.12297768999997061,
-        0.12110356400080491,
-        0.12390156000037678,
-        0.12677398899541004
+        0.22805302300548647,
+        0.23296819099778077,
+        0.2293693390020053,
+        0.23234717000013916,
+        0.22771343900240026
       ],
       "concurrent_seconds": [
-        0.07674997900176095,
-        0.0763178359993617,
-        0.06163231700338656,
-        0.07755212299525738,
-        0.07116062600107398
+        0.1572072209964972,
+        0.1567508860025555,
+        0.14903956500347704,
+        0.15810091399907833,
+        0.0864786979946075
       ],
       "observed": [
         {
-          "native_batches": 1.0,
-          "native_items": 2.0,
-          "decoder_widths": []
-        },
-        {
-          "native_batches": 1.0,
-          "native_items": 2.0,
-          "decoder_widths": []
-        },
-        {
-          "native_batches": 3.0,
-          "native_items": 6.0,
-          "decoder_widths": []
-        },
-        {
-          "native_batches": 1.0,
-          "native_items": 2.0,
+          "native_batches": 2.0,
+          "native_items": 4.0,
           "decoder_widths": []
         },
         {
           "native_batches": 2.0,
           "native_items": 4.0,
           "decoder_widths": []
+        },
+        {
+          "native_batches": 2.0,
+          "native_items": 4.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 1.0,
+          "native_items": 2.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 0.0,
+          "native_items": 0.0,
+          "decoder_widths": []
         }
       ],
       "physical_evidence": {
-        "native_batches": 8.0,
-        "native_items": 16.0,
+        "native_batches": 7.0,
+        "native_items": 14.0,
         "stage": "model forward"
       },
-      "throughput_ratio": 1.611388588127671,
+      "throughput_ratio": 1.4632729986500101,
       "promotion_10_percent_pass": true
     },
     "extract": {
       "serialized_seconds": [
-        0.1425243080011569,
-        0.14356541000597645,
-        0.14297726599761518,
-        0.14978385099675506,
-        0.13528589899942745
+        0.36755672900471836,
+        0.39806418800435495,
+        0.40466639299847884,
+        0.3951618610008154,
+        0.3988832100003492
       ],
       "concurrent_seconds": [
-        0.048392570002761204,
-        0.058613952001906,
-        0.048274027001752984,
-        0.04641818800155306,
-        0.07160657700296724
-      ],
-      "observed": [
-        {
-          "native_batches": 3.0,
-          "native_items": 8.0,
-          "decoder_widths": []
-        },
-        {
-          "native_batches": 2.0,
-          "native_items": 6.0,
-          "decoder_widths": []
-        },
-        {
-          "native_batches": 3.0,
-          "native_items": 8.0,
-          "decoder_widths": []
-        },
-        {
-          "native_batches": 3.0,
-          "native_items": 8.0,
-          "decoder_widths": []
-        },
-        {
-          "native_batches": 2.0,
-          "native_items": 5.0,
-          "decoder_widths": []
-        }
-      ],
-      "physical_evidence": {
-        "native_batches": 13.0,
-        "native_items": 35.0,
-        "stage": "model forward"
-      },
-      "throughput_ratio": 2.9545293004578412,
-      "promotion_10_percent_pass": true
-    },
-    "whisper": {
-      "serialized_seconds": [
-        1.425737735000439,
-        1.4307687079999596,
-        1.4133499960007612,
-        1.4167219170049066,
-        1.428757041998324
-      ],
-      "concurrent_seconds": [
-        1.0223038390031434,
-        1.0298920480054221,
-        1.0287115309984074,
-        1.0264698960017995,
-        1.0401898569980403
+        0.17321418099891162,
+        0.1958470710014808,
+        0.23532207200332778,
+        0.18964277100167237,
+        0.2337610059985309
       ],
       "observed": [
         {
@@ -476,47 +449,97 @@
         },
         {
           "native_batches": 2.0,
-          "native_items": 5.0,
+          "native_items": 6.0,
           "decoder_widths": []
         },
         {
           "native_batches": 2.0,
           "native_items": 5.0,
-          "decoder_widths": []
-        },
-        {
-          "native_batches": 3.0,
-          "native_items": 6.0,
           "decoder_widths": []
         },
         {
           "native_batches": 3.0,
           "native_items": 7.0,
           "decoder_widths": []
+        },
+        {
+          "native_batches": 1.0,
+          "native_items": 4.0,
+          "decoder_widths": []
         }
       ],
       "physical_evidence": {
-        "native_batches": 12.0,
-        "native_items": 29.0,
+        "native_batches": 10.0,
+        "native_items": 28.0,
+        "stage": "model forward"
+      },
+      "throughput_ratio": 2.0325256128101357,
+      "promotion_10_percent_pass": true
+    },
+    "whisper": {
+      "serialized_seconds": [
+        3.1012869750047685,
+        3.063364672998432,
+        3.0713725200039335,
+        3.067484532002709,
+        2.7729957409974304
+      ],
+      "concurrent_seconds": [
+        2.7305309259973,
+        2.723541777995706,
+        2.703131760004908,
+        2.710142169999017,
+        2.709428730995569
+      ],
+      "observed": [
+        {
+          "native_batches": 2.0,
+          "native_items": 7.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 2.0,
+          "native_items": 7.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 2.0,
+          "native_items": 5.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 2.0,
+          "native_items": 6.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 2.0,
+          "native_items": 5.0,
+          "decoder_widths": []
+        }
+      ],
+      "physical_evidence": {
+        "native_batches": 10.0,
+        "native_items": 30.0,
         "stage": "encoder"
       },
-      "throughput_ratio": 1.3859451284819382,
+      "throughput_ratio": 1.1318537329736549,
       "promotion_10_percent_pass": true
     },
     "ocr": {
       "serialized_seconds": [
-        8.546958501996414,
-        8.587101777004136,
-        8.568991483996797,
-        8.627218339999672,
-        8.613351367006544
+        20.157044309999037,
+        17.955886426003417,
+        18.089423555000394,
+        18.716359812999144,
+        18.570669580003596
       ],
       "concurrent_seconds": [
-        4.695079686993267,
-        4.4206395740038715,
-        4.252640147002239,
-        4.499648770004569,
-        4.514879936999932
+        9.680474585999036,
+        10.202467174000049,
+        9.661837544001173,
+        9.879302752000513,
+        10.332967018999625
       ],
       "observed": [
         {
@@ -594,57 +617,57 @@
         "max_observed_rows": 2,
         "batched_requests": 40
       },
-      "throughput_ratio": 1.908393791588186,
+      "throughput_ratio": 1.8797550845623312,
       "promotion_10_percent_pass": true
     }
   },
   "soak": {
-    "rounds": 172,
-    "requests": 1376,
-    "seconds": 300.9448702160007
+    "rounds": 100,
+    "requests": 800,
+    "seconds": 377.6868120459985
   },
   "mixed_latency": {
     "embed": {
-      "requests": 344,
-      "successful": 344,
+      "requests": 200,
+      "successful": 200,
       "statuses": {
-        "200": 344
+        "200": 200
       },
-      "p50_ms": 14.686709004308796,
-      "p95_ms": 21.650518996466417,
+      "p50_ms": 23.12100200288114,
+      "p95_ms": 38.53026700380724,
       "first_content_p50_ms": null,
       "first_content_p95_ms": null
     },
     "extract": {
-      "requests": 344,
-      "successful": 344,
+      "requests": 200,
+      "successful": 200,
       "statuses": {
-        "200": 344
+        "200": 200
       },
-      "p50_ms": 22.19693249935517,
-      "p95_ms": 50.75714099803008,
+      "p50_ms": 55.38978350159596,
+      "p95_ms": 276.8617030014866,
       "first_content_p50_ms": null,
       "first_content_p95_ms": null
     },
     "whisper": {
-      "requests": 344,
-      "successful": 344,
+      "requests": 200,
+      "successful": 200,
       "statuses": {
-        "200": 344
+        "200": 200
       },
-      "p50_ms": 296.50781899908907,
-      "p95_ms": 445.82268499652855,
+      "p50_ms": 672.0624534973467,
+      "p95_ms": 870.9226530045271,
       "first_content_p50_ms": null,
       "first_content_p95_ms": null
     },
     "ocr": {
-      "requests": 344,
-      "successful": 344,
+      "requests": 200,
+      "successful": 200,
       "statuses": {
-        "200": 344
+        "200": 200
       },
-      "p50_ms": 1006.742094999936,
-      "p95_ms": 2458.8630759972148,
+      "p50_ms": 2164.0106529994227,
+      "p95_ms": 5431.967953998537,
       "first_content_p50_ms": null,
       "first_content_p95_ms": null
     }
@@ -664,7 +687,7 @@
       ],
       "observed": {
         "native_batches": 3.0,
-        "native_items": 8.0,
+        "native_items": 6.0,
         "stage": "model forward"
       },
       "singleton_reference_parity": true
@@ -683,7 +706,7 @@
       ],
       "observed": {
         "native_batches": 1.0,
-        "native_items": 4.0,
+        "native_items": 2.0,
         "stage": "model forward"
       },
       "singleton_reference_parity": true
@@ -721,7 +744,7 @@
       ],
       "observed": {
         "native_batches": 2.0,
-        "native_items": 8.0,
+        "native_items": 5.0,
         "stage": "model forward"
       },
       "singleton_reference_parity": true
@@ -752,7 +775,7 @@
       },
       "requests": 9,
       "frozen_oracle_and_singleton_parity": true,
-      "native_batches": 3.0
+      "native_batches": 2.0
     },
     {
       "case": "unicode_offsets",
@@ -763,7 +786,7 @@
       },
       "requests": 9,
       "frozen_oracle_and_singleton_parity": true,
-      "native_batches": 2.0
+      "native_batches": 3.0
     },
     {
       "case": "entity_attributes",
@@ -785,7 +808,7 @@
       },
       "requests": 9,
       "frozen_oracle_and_singleton_parity": true,
-      "native_batches": 3.0
+      "native_batches": 2.0
     },
     {
       "case": "record_natural",
@@ -818,7 +841,7 @@
       },
       "requests": 9,
       "frozen_oracle_and_singleton_parity": true,
-      "native_batches": 2.0
+      "native_batches": 3.0
     },
     {
       "case": "enum_field",
@@ -829,7 +852,7 @@
       },
       "requests": 9,
       "frozen_oracle_and_singleton_parity": true,
-      "native_batches": 2.0
+      "native_batches": 1.0
     },
     {
       "case": "constrained_classification",
@@ -844,7 +867,7 @@
       },
       "requests": 9,
       "frozen_oracle_and_singleton_parity": true,
-      "native_batches": 3.0
+      "native_batches": 2.0
     }
   ],
   "speech": {
@@ -855,36 +878,1032 @@
     ],
     "wer": 0.07565217391304348,
     "errors": 87,
-    "reference_words": 1150
+    "reference_words": 1150,
+    "clips_scored": [
+      {
+        "id": "1272-128104-0000",
+        "input_sha256": "4e25e22555cd16e90edb0a3b49fdcf1fe652b2a1250ab643634db33895c75b41",
+        "reference": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+        "text": "Mr. Quilter is the apostle of the Middle Classes, and we are glad to welcome his Gospel.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 17,
+          "wer": 0.058823529411764705
+        }
+      },
+      {
+        "id": "1272-128104-0001",
+        "input_sha256": "46a9d58622b4675b29564da2d9ba73e702241c5fa969f12c387cad4aa984276a",
+        "reference": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+        "text": "Nor is Mr. Quilter's manner less interesting than his matter.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.1
+        }
+      },
+      {
+        "id": "1272-128104-0002",
+        "input_sha256": "59bf7bb1129c11734a8dd362ad52b4e10ae31c03f0879fc92f7107ecd513513f",
+        "reference": "HE TELLS US THAT AT THIS FESTIVE SEASON OF THE YEAR WITH CHRISTMAS AND ROAST BEEF LOOMING BEFORE US SIMILES DRAWN FROM EATING AND ITS RESULTS OCCUR MOST READILY TO THE MIND",
+        "text": "He tells us that at this festive season of the year, with Christmas and roast beef looming before us, symbolies drawn from eating and its results occur most readily to the mind.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 32,
+          "wer": 0.03125
+        }
+      },
+      {
+        "id": "1272-128104-0003",
+        "input_sha256": "60d72657439cd3092fc2313efe0fabd31f0cd2f28f8ca46a21380c290b2e031d",
+        "reference": "HE HAS GRAVE DOUBTS WHETHER SIR FREDERICK LEIGHTON'S WORK IS REALLY GREEK AFTER ALL AND CAN DISCOVER IN IT BUT LITTLE OF ROCKY ITHACA",
+        "text": "He has grave doubts whether Sir Frederick Layton's work is really Greek after all and can discover in it but little of rocky Ithaca.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 24,
+          "wer": 0.041666666666666664
+        }
+      },
+      {
+        "id": "1272-128104-0004",
+        "input_sha256": "07244790e9a8300bfcbf12c28ac5230792e75238d03b2ac167a72bf3943c5404",
+        "reference": "LINNELL'S PICTURES ARE A SORT OF UP GUARDS AND AT EM PAINTINGS AND MASON'S EXQUISITE IDYLLS ARE AS NATIONAL AS A JINGO POEM MISTER BIRKET FOSTER'S LANDSCAPES SMILE AT ONE MUCH IN THE SAME WAY THAT MISTER CARKER USED TO FLASH HIS TEETH AND MISTER JOHN COLLIER GIVES HIS SITTER A CHEERFUL SLAP ON THE BACK BEFORE HE SAYS LIKE A SHAMPOOER IN A TURKISH BATH NEXT MAN",
+        "text": "Linnell's pictures are a sort of up-guards-and-atom paintings, and Mason's exquisite idylls are as national as a jingle poem. Mr. Birkut Foster's landscapes smile at one much in the same way that Mr. Carker used to flash his teeth. And Mr. John Collier gives his sitter a cheerful slap on the back, before he says, like a shampoo",
+        "score": {
+          "errors": 14,
+          "substitutions": 7,
+          "deletions": 7,
+          "insertions": 0,
+          "reference_words": 68,
+          "wer": 0.20588235294117646
+        }
+      },
+      {
+        "id": "1272-128104-0005",
+        "input_sha256": "870faa0669d19ca8416b9923cdf722ba9fd6ccce766a50583fa9c0f808b39eba",
+        "reference": "IT IS OBVIOUSLY UNNECESSARY FOR US TO POINT OUT HOW LUMINOUS THESE CRITICISMS ARE HOW DELICATE IN EXPRESSION",
+        "text": "It is obviously unnecessary for us to point out how luminous these criticisms are, how delicate an expression.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.05555555555555555
+        }
+      },
+      {
+        "id": "1272-128104-0006",
+        "input_sha256": "12475ade3c01c9f750bfc95e1c5a5dd05afcfe30141a0f5464da59f0c01d26e4",
+        "reference": "ON THE GENERAL PRINCIPLES OF ART MISTER QUILTER WRITES WITH EQUAL LUCIDITY",
+        "text": "Under general principles of art, Mr. Quilter writes with equal lucidity.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 12,
+          "wer": 0.25
+        }
+      },
+      {
+        "id": "1272-128104-0007",
+        "input_sha256": "84998a43cb534e09801f5522b9ed0aa58e88035c9727bc8e4d362a7bc158d0b6",
+        "reference": "PAINTING HE TELLS US IS OF A DIFFERENT QUALITY TO MATHEMATICS AND FINISH IN ART IS ADDING MORE FACT",
+        "text": "Painting, he tells us, is of a different quality to mathematics, and finish in art is adding more factor.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 19,
+          "wer": 0.05263157894736842
+        }
+      },
+      {
+        "id": "1272-128104-0008",
+        "input_sha256": "08a3f099d544fac5df1b6105bfd4952d911995f271b494c9a689c083c39ab855",
+        "reference": "AS FOR ETCHINGS THEY ARE OF TWO KINDS BRITISH AND FOREIGN",
+        "text": "As for etchings, they are of two kinds, British and foreign.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 11,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-128104-0009",
+        "input_sha256": "2bfbcdfab6024ccd3bfeb4e883cc7f9cc613235e504bfc068fd34069056513b7",
+        "reference": "HE LAMENTS MOST BITTERLY THE DIVORCE THAT HAS BEEN MADE BETWEEN DECORATIVE ART AND WHAT WE USUALLY CALL PICTURES MAKES THE CUSTOMARY APPEAL TO THE LAST JUDGMENT AND REMINDS US THAT IN THE GREAT DAYS OF ART MICHAEL ANGELO WAS THE FURNISHING UPHOLSTERER",
+        "text": "He laments most bitterly the divorce that has been made between decorative art and what we usually call pictures, makes a customary appeal to the last judgment and reminds us that in the great days of art Michelangelo was the furnishing upholsterer.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 43,
+          "wer": 0.06976744186046512
+        }
+      },
+      {
+        "id": "1272-128104-0010",
+        "input_sha256": "2ebbcaa44f14c15fd8afd0e4a71cae494377d30812a0ba05d6be07c55d00bbea",
+        "reference": "NEAR THE FIRE AND THE ORNAMENTS FRED BROUGHT HOME FROM INDIA ON THE MANTEL BOARD",
+        "text": "near the fire, and the ornaments Fred brought home from India on the mental board.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 15,
+          "wer": 0.06666666666666667
+        }
+      },
+      {
+        "id": "1272-128104-0011",
+        "input_sha256": "d481b97c34ef7c5087dcd53f93d311e050834ba5e4b0f9165f6a8e9e8c7fb245",
+        "reference": "IN FACT HE IS QUITE SEVERE ON MISTER RUSKIN FOR NOT RECOGNISING THAT A PICTURE SHOULD DENOTE THE FRAILTY OF MAN AND REMARKS WITH PLEASING COURTESY AND FELICITOUS GRACE THAT MANY PHASES OF FEELING",
+        "text": "In fact, he is quite severe on Mr. Ruskin for not recognizing that a picture should denote the frailty of man, and remarks with pleasing courtesy and felicitous grace that, many phases of feeling,",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 34,
+          "wer": 0.058823529411764705
+        }
+      },
+      {
+        "id": "1272-128104-0012",
+        "input_sha256": "222cd90cd9edf086096fb0abba901b772f8ca4e763d5becb803b0a7f9b16ace9",
+        "reference": "ONLY UNFORTUNATELY HIS OWN WORK NEVER DOES GET GOOD",
+        "text": "Only, unfortunately, his own work never does get good.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-128104-0013",
+        "input_sha256": "4e090445122aee10fe3045cf79fb234f5059e6b911c0ffcbedb91e04c20473ae",
+        "reference": "MISTER QUILTER HAS MISSED HIS CHANCE FOR HE HAS FAILED EVEN TO MAKE HIMSELF THE TUPPER OF PAINTING",
+        "text": "Mr. Quilter has missed his chance, for he has failed even to make himself the tupper of painting.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.05555555555555555
+        }
+      },
+      {
+        "id": "1272-128104-0014",
+        "input_sha256": "5e7e3b96d975c74c952209a4d3a0731ec57019689685e1cf5f3c73a76f6f8a36",
+        "reference": "BY HARRY QUILTER M A",
+        "text": "by Harry Quilter, M.A.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 5,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0000",
+        "input_sha256": "26cbebbdd8954104c936dc38fbb8a80958f2169ada0fa6fe46a89cfa9e3d824c",
+        "reference": "BECAUSE YOU WERE SLEEPING INSTEAD OF CONQUERING THE LOVELY ROSE PRINCESS HAS BECOME A FIDDLE WITHOUT A BOW WHILE POOR SHAGGY SITS THERE A COOING DOVE",
+        "text": "Because you were sleeping instead of conquering, the lovely rose princess has become a fiddle without a bow. All poor shaggy sits there, accuing dove.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 26,
+          "wer": 0.11538461538461539
+        }
+      },
+      {
+        "id": "1272-135031-0001",
+        "input_sha256": "7565c448f1e4cab4eebce19116ad20b22b24a5c38a82a2f98ae19bb068a3aecb",
+        "reference": "HE HAS GONE AND GONE FOR GOOD ANSWERED POLYCHROME WHO HAD MANAGED TO SQUEEZE INTO THE ROOM BESIDE THE DRAGON AND HAD WITNESSED THE OCCURRENCES WITH MUCH INTEREST",
+        "text": "He has gone, and gone for good,\" answered Polychrome, who had managed to squeeze into the room beside the dragon, and had witnessed the occurrences with much interest.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 28,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0002",
+        "input_sha256": "6fbbe1b5e143f2ac7baa9c62bbf3575d34ab79a79f9fcbaa0cac60c2e08e1703",
+        "reference": "I HAVE REMAINED A PRISONER ONLY BECAUSE I WISHED TO BE ONE AND WITH THIS HE STEPPED FORWARD AND BURST THE STOUT CHAINS AS EASILY AS IF THEY HAD BEEN THREADS",
+        "text": "I have remained a prisoner only because I wished to be one.\" And with this he stepped forward and burst the stout chains as easily as if they had been threads.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 31,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0003",
+        "input_sha256": "80f47603018506ec4a646b68d9f7716b132d8d5ee740dc503ed4f9122cd76243",
+        "reference": "THE LITTLE GIRL HAD BEEN ASLEEP BUT SHE HEARD THE RAPS AND OPENED THE DOOR",
+        "text": "The little girl had been asleep, but she heard the wraps and opened the door.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 15,
+          "wer": 0.06666666666666667
+        }
+      },
+      {
+        "id": "1272-135031-0004",
+        "input_sha256": "919d80690bed932be273b0e6e3512b18a6166ed974400ca7e03903760ef24420",
+        "reference": "THE KING HAS FLED IN DISGRACE AND YOUR FRIENDS ARE ASKING FOR YOU",
+        "text": "The king has fled to disgrace and your friends are asking for you.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.07692307692307693
+        }
+      },
+      {
+        "id": "1272-135031-0005",
+        "input_sha256": "d3da297f1f6a0f933ce6d778b8dc8fecff4cc7c21616dbd536146e76ebb98fbe",
+        "reference": "I BEGGED RUGGEDO LONG AGO TO SEND HIM AWAY BUT HE WOULD NOT DO SO",
+        "text": "I begged Ruggedo a long ago to send him away, but he would not do so.",
+        "score": {
+          "errors": 1,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 15,
+          "wer": 0.06666666666666667
+        }
+      },
+      {
+        "id": "1272-135031-0006",
+        "input_sha256": "65ae3678b861333fb9ba2e5d7db9a0f77fe58ad89d4480872eeb62d22e894dd3",
+        "reference": "I ALSO OFFERED TO HELP YOUR BROTHER TO ESCAPE BUT HE WOULD NOT GO",
+        "text": "I also offered to help your brother to escape, but he would not go.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 14,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0007",
+        "input_sha256": "1d1b4106711196bcf15091b2df60096dfa234132df32f5d7a57ef4931dfc5d83",
+        "reference": "HE EATS AND SLEEPS VERY STEADILY REPLIED THE NEW KING",
+        "text": "He eats and sleeps very steadily, replied the new king.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0008",
+        "input_sha256": "bc3c6a74fccbe7a7c86f9f59ed4589d8be65dc84d00a3d413b58d4722a341570",
+        "reference": "I HOPE HE DOESN'T WORK TOO HARD SAID SHAGGY",
+        "text": "I hope it doesn't work too hard, since shaggy.",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.2222222222222222
+        }
+      },
+      {
+        "id": "1272-135031-0009",
+        "input_sha256": "d23fc0e9c9ccb35f6ec9223954c921e1c9daa0cc9d8e8ad10b3b9cb4b14b6617",
+        "reference": "HE DOESN'T WORK AT ALL",
+        "text": "he doesn't work at all.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 5,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0010",
+        "input_sha256": "cec411cc16334eae88f793cf4cc0c2c6f83087c06b4e11a451c329a33b26b884",
+        "reference": "IN FACT THERE IS NOTHING HE CAN DO IN THESE DOMINIONS AS WELL AS OUR NOMES WHOSE NUMBERS ARE SO GREAT THAT IT WORRIES US TO KEEP THEM ALL BUSY",
+        "text": "In fact, there is nothing he can do in these dominions as well as our gnomes, whose numbers are so great that it worries us to keep them all busy.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 30,
+          "wer": 0.03333333333333333
+        }
+      },
+      {
+        "id": "1272-135031-0011",
+        "input_sha256": "765c97d18eb1aa76ab4223359dd403ab8e606d9dc195c0b82f4b6b40b5b91a14",
+        "reference": "NOT EXACTLY RETURNED KALIKO",
+        "text": "Not exactly, we've turned calico.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 4,
+          "wer": 0.75
+        }
+      },
+      {
+        "id": "1272-135031-0012",
+        "input_sha256": "2da8a3d5a915be58a29cae9520c94e96395619f1dd3a0968486c9d5154b77b12",
+        "reference": "WHERE IS MY BROTHER NOW",
+        "text": "Where is my brother now?",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 5,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0013",
+        "input_sha256": "52e72bda6f458ffea420adc0044fd93392d16d3f0393f03c71888b773e9ad02c",
+        "reference": "INQUIRED SHAGGY IN THE METAL FOREST",
+        "text": "inquired Shaggy in the metal forest.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 6,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0014",
+        "input_sha256": "659d4e11b195fa5e15dcb1fa860d703cbb9e1a57fa307d4ac6a6093435cf49cb",
+        "reference": "WHERE IS THAT",
+        "text": "Where is that?",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 3,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0015",
+        "input_sha256": "95eb0d408f2f4275bd44995e2202b1b1377ac00538662d5cae509de32e9d353f",
+        "reference": "THE METAL FOREST IS IN THE GREAT DOMED CAVERN THE LARGEST IN ALL OUR DOMINIONS REPLIED KALIKO",
+        "text": "The middle forest is in the great domed cavern, the largest in all our dominions,\" replied Calico.",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 17,
+          "wer": 0.11764705882352941
+        }
+      },
+      {
+        "id": "1272-135031-0016",
+        "input_sha256": "e4ef839a12f5e01279f449fbec8decd9917a2a01516a8a67635c4cde526caee5",
+        "reference": "KALIKO HESITATED",
+        "text": "Calico hesitated.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 2,
+          "wer": 0.5
+        }
+      },
+      {
+        "id": "1272-135031-0017",
+        "input_sha256": "18bf640efb70a8735f674c4289ab2cc9ee42a529e097dca376d0f69a3907e56f",
+        "reference": "HOWEVER IF WE LOOK SHARP WE MAY BE ABLE TO DISCOVER ONE OF THESE SECRET WAYS",
+        "text": "However, if we look sharp, we may be able to discover one of these secret ways.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 16,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0018",
+        "input_sha256": "db055fdf17b99b4e68f2e2bdbd01a5a8388321df44e0fcb1600e6b4387466fc3",
+        "reference": "OH NO I'M QUITE SURE HE DIDN'T",
+        "text": "Oh no, I'm quite sure he didn't.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 7,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0019",
+        "input_sha256": "c19e0c3de6100627ffbca103dc5d8502dc6d74a3e1f06e00d5e6dc6ffbb25d94",
+        "reference": "THAT'S FUNNY REMARKED BETSY THOUGHTFULLY",
+        "text": "That's funny, remarked Betsy thoughtfully.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 5,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0020",
+        "input_sha256": "293af6add35a8f87e03f4ec59ef6e23538293c6fc8be45346dd17f6a69cc7f1f",
+        "reference": "I DON'T BELIEVE ANN KNEW ANY MAGIC OR SHE'D HAVE WORKED IT BEFORE",
+        "text": "I don't believe Ann knew any magic or she'd have worked it before.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0021",
+        "input_sha256": "cce5a7959d35cd34310e6868853d7d755b5aa13caa9579ddbaf0e5b28ffd29fd",
+        "reference": "I DO NOT KNOW CONFESSED SHAGGY",
+        "text": "I do not know, confessed Shaggy.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 6,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-135031-0022",
+        "input_sha256": "0d3573eac7e74ab8c05a5743b050bd6bda2e6f73629bc7ec338394206a29e7f2",
+        "reference": "TRUE AGREED KALIKO",
+        "text": "True, agreed Calico.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 3,
+          "wer": 0.3333333333333333
+        }
+      },
+      {
+        "id": "1272-135031-0023",
+        "input_sha256": "9d37ebdf780a28eaeebaada1f12bc2b2a2fca2278c09a2652f5e5b7e9420aa04",
+        "reference": "KALIKO WENT TO THE BIG GONG AND POUNDED ON IT JUST AS RUGGEDO USED TO DO BUT NO ONE ANSWERED THE SUMMONS",
+        "text": "Calico went to the big gong and pounded on it just as Virgato used to do, but no one answered the summons.",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 22,
+          "wer": 0.09090909090909091
+        }
+      },
+      {
+        "id": "1272-135031-0024",
+        "input_sha256": "f1359484fb8e3647248cc1f6fd978d331f83fbfe20e173e287110c087c45d967",
+        "reference": "HAVING RETURNED TO THE ROYAL CAVERN KALIKO FIRST POUNDED THE GONG AND THEN SAT IN THE THRONE WEARING RUGGEDO'S DISCARDED RUBY CROWN AND HOLDING IN HIS HAND THE SCEPTRE WHICH RUGGEDO HAD SO OFTEN THROWN AT HIS HEAD",
+        "text": "Having returned to the Royal Cavern, Calico first pounded the gong and then sat into the throne, wearing Regato's discarded ruby crown and holding in his hand the scepter which Regato had so often thrown at his head.",
+        "score": {
+          "errors": 5,
+          "substitutions": 5,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 38,
+          "wer": 0.13157894736842105
+        }
+      },
+      {
+        "id": "1272-141231-0000",
+        "input_sha256": "adb240047a1e0732c96b029b7dbd7c81a17c853cbd30aec0ee0d9c4e59fe720a",
+        "reference": "A MAN SAID TO THE UNIVERSE SIR I EXIST",
+        "text": "A man said to the universe, Sir, I exist.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0001",
+        "input_sha256": "5ec33d1ae2a06430ddd4faa6090673f7dbb09f71405ce401a08301eedb313275",
+        "reference": "SWEAT COVERED BRION'S BODY TRICKLING INTO THE TIGHT LOINCLOTH THAT WAS THE ONLY GARMENT HE WORE",
+        "text": "Sweat covered Brion's body, trickling into the tight-loin cloth that was the only garment he wore.",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 16,
+          "wer": 0.125
+        }
+      },
+      {
+        "id": "1272-141231-0002",
+        "input_sha256": "9a490059a63cd2f92fbc8c447135ed87f97ed36ee53714987b01c8ac7c33dec4",
+        "reference": "THE CUT ON HIS CHEST STILL DRIPPING BLOOD THE ACHE OF HIS OVERSTRAINED EYES EVEN THE SOARING ARENA AROUND HIM WITH THE THOUSANDS OF SPECTATORS WERE TRIVIALITIES NOT WORTH THINKING ABOUT",
+        "text": "The cut on his chest still dripping blood. The ache of his overstrained eyes. Even the soaring arena around him with the thousands of spectators, retrievalities not worth thinking about.",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 31,
+          "wer": 0.06451612903225806
+        }
+      },
+      {
+        "id": "1272-141231-0003",
+        "input_sha256": "da658227a61fdfefa7a54ad9bb4614a7da33e335358e5b3620ddcf7c93c3e77f",
+        "reference": "HIS INSTANT OF PANIC WAS FOLLOWED BY A SMALL SHARP BLOW HIGH ON HIS CHEST",
+        "text": "His instant panic was followed by a small sharp blow high on his chest.",
+        "score": {
+          "errors": 1,
+          "substitutions": 0,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 15,
+          "wer": 0.06666666666666667
+        }
+      },
+      {
+        "id": "1272-141231-0004",
+        "input_sha256": "34c4339d921ca363faa292996ea12864c9bbdb5a69fa40178e41629f069a36e0",
+        "reference": "ONE MINUTE A VOICE SAID AND THE TIME BUZZER SOUNDED",
+        "text": "One minute, a voice said, and a time buzzer sounded.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.1
+        }
+      },
+      {
+        "id": "1272-141231-0005",
+        "input_sha256": "65265556f1956c0f20f5234b6aa2166dfdcde396ffc3cd1287d9e9e64489afbb",
+        "reference": "A MINUTE IS NOT A VERY LARGE MEASURE OF TIME AND HIS BODY NEEDED EVERY FRACTION OF IT",
+        "text": "A minute is not a very large measure of time, and his body needed every fraction of it.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0006",
+        "input_sha256": "c3e32102b9faeb6dc3ec5203440d4e2a365cc0ea44fa6aeaefe5e3668a9a8585",
+        "reference": "THE BUZZER'S WHIRR TRIGGERED HIS MUSCLES INTO COMPLETE RELAXATION",
+        "text": "The buzzers were triggered his muscles into complete relaxation.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.1111111111111111
+        }
+      },
+      {
+        "id": "1272-141231-0007",
+        "input_sha256": "1cc95ce7c6be4352b94c10d77a4b0475ccc5ad543b0d3a5f791459963ce4efb1",
+        "reference": "ONLY HIS HEART AND LUNGS WORKED ON AT A STRONG MEASURED RATE",
+        "text": "Only his heart and lungs worked on at a strong, measured rate.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 12,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0008",
+        "input_sha256": "1d5eb4bf16f57e21ac034f012f37c9b97a61f8e2552a441352b9d0eab58c48e7",
+        "reference": "HE WAS IN REVERIE SLIDING ALONG THE BORDERS OF CONSCIOUSNESS",
+        "text": "He was in the river, sliding along the borders of consciousness.",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 10,
+          "wer": 0.2
+        }
+      },
+      {
+        "id": "1272-141231-0009",
+        "input_sha256": "42cf54411f05e2cd4397d9e7cbfb566c204954e1d6dc3f892b57499433c8e7fd",
+        "reference": "THE CONTESTANTS IN THE TWENTIES NEEDED UNDISTURBED REST THEREFORE NIGHTS IN THE DORMITORIES WERE AS QUIET AS DEATH",
+        "text": "The contestants in the 20s needed undisturbed rest. Therefore, knights in the dormitories were as quiet as death.",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.1111111111111111
+        }
+      },
+      {
+        "id": "1272-141231-0010",
+        "input_sha256": "b0316adbccaff2af04f6d397c03905f157a6b2418a9b54e88a16d5859b000211",
+        "reference": "PARTICULARLY SO ON THIS LAST NIGHT WHEN ONLY TWO OF THE LITTLE CUBICLES WERE OCCUPIED THE THOUSANDS OF OTHERS STANDING WITH DARK EMPTY DOORS",
+        "text": "Particularly so, on this last night, when only two of the little cubicles were occupied, the thousands of others standing with dark, empty doors.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 24,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0011",
+        "input_sha256": "49975adce742d343d7755ad7e52f75f93bf28ee6f9f038b4dab9a217336b78f7",
+        "reference": "THE OTHER VOICE SNAPPED WITH A HARSH URGENCY CLEARLY USED TO COMMAND",
+        "text": "The other voice snapped with a harsh urgency, clearly used to command.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 12,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0012",
+        "input_sha256": "3559a8ddb75104a20769c00b17226fb86de0e4329bfca313833eb83c0561efef",
+        "reference": "I'M HERE BECAUSE THE MATTER IS OF UTMOST IMPORTANCE AND BRANDD IS THE ONE I MUST SEE NOW STAND ASIDE",
+        "text": "I'm here because the matter is of utmost importance, and brand is the one I must see. Now stand aside.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 20,
+          "wer": 0.05
+        }
+      },
+      {
+        "id": "1272-141231-0013",
+        "input_sha256": "ff87e7b407cf5355d492e618dbc87e9800a688ccb950ab1ac693d64a1bcfb80f",
+        "reference": "THE TWENTIES",
+        "text": "The 20s.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 2,
+          "wer": 0.5
+        }
+      },
+      {
+        "id": "1272-141231-0014",
+        "input_sha256": "9a2410edf224fc38005243625b49e18fba5b297867171177906f9ed1f808b714",
+        "reference": "HE MUST HAVE DRAWN HIS GUN BECAUSE THE INTRUDER SAID QUICKLY PUT THAT AWAY YOU'RE BEING A FOOL OUT",
+        "text": "He must have drawn his gun because the intruder said quickly, But that away you're being a fool. Out.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 19,
+          "wer": 0.05263157894736842
+        }
+      },
+      {
+        "id": "1272-141231-0015",
+        "input_sha256": "24727264f148b3bbe587338e1456281298e6cbd7a29eff07ab06ea096cbdd174",
+        "reference": "THERE WAS SILENCE THEN AND STILL WONDERING BRION WAS ONCE MORE ASLEEP",
+        "text": "There was silence then, and, still wondering, Brienne was once more asleep.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 12,
+          "wer": 0.08333333333333333
+        }
+      },
+      {
+        "id": "1272-141231-0016",
+        "input_sha256": "2de6e800e9a973de275a2c57ef2a8ccf0e25655f0158a0a551bdc0e944607ebc",
+        "reference": "TEN SECONDS",
+        "text": "10 seconds.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 2,
+          "wer": 0.5
+        }
+      },
+      {
+        "id": "1272-141231-0017",
+        "input_sha256": "54aac47c491c01ca59b3be862b9f53cf4fd93862e1363b02471d910f76e3b4ac",
+        "reference": "HE ASKED THE HANDLER WHO WAS KNEADING HIS ACHING MUSCLES",
+        "text": "He asked the handler who was kneading his aching muscles.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0018",
+        "input_sha256": "dcc9cc41630ec440e639cf8349899f6e76000d728659ca42ef7ac0ef003ca201",
+        "reference": "A RED HAIRED MOUNTAIN OF A MAN WITH AN APPARENTLY INEXHAUSTIBLE STORE OF ENERGY",
+        "text": "A red-haired mountain of a man with an apparently inexhaustible store of energy.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 14,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0019",
+        "input_sha256": "42735cf9485cd4c93d766d01cddebabed5a21f49e26a9c6dd15f8e5db2f6b5a6",
+        "reference": "THERE COULD BE LITTLE ART IN THIS LAST AND FINAL ROUND OF FENCING",
+        "text": "There could be little art in this last and final round of fencing.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0020",
+        "input_sha256": "3998b463548c90f6686faf96432cc237c96f0bd784d8124a1a3c851fd4451acf",
+        "reference": "JUST THRUST AND PARRY AND VICTORY TO THE STRONGER",
+        "text": "Just thrust and parry and victory to the stronger.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0021",
+        "input_sha256": "f40d906923ec180a258635ec7bf5bfdaeac2c1ee3bef24c32ef6361b420d6ea8",
+        "reference": "EVERY MAN WHO ENTERED THE TWENTIES HAD HIS OWN TRAINING TRICKS",
+        "text": "Every man who entered the 20s had his own training tricks.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 11,
+          "wer": 0.09090909090909091
+        }
+      },
+      {
+        "id": "1272-141231-0022",
+        "input_sha256": "6fca2f211411ffd83f84ccfe38ac1434a83ba02497c68cd1819cb63da57fb3a4",
+        "reference": "THERE APPEARED TO BE AN IMMEDIATE ASSOCIATION WITH THE DEATH TRAUMA AS IF THE TWO WERE INEXTRICABLY LINKED INTO ONE",
+        "text": "There appeared to be an immediate association with the death trauma, as if the two were inextricably linked into one.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 20,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0023",
+        "input_sha256": "e4eee59ba1119187a240da9e67bc4f60af77b023b2aac7b33ffe2a6258e8a7f8",
+        "reference": "THE STRENGTH THAT ENABLES SOMEONE IN A TRANCE TO HOLD HIS BODY STIFF AND UNSUPPORTED EXCEPT AT TWO POINTS THE HEAD AND HEELS",
+        "text": "The strength that enables someone in a trance to hold his body stiff and unsupported except at two points, the head and heels.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 23,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0024",
+        "input_sha256": "84bd6220942701e8973dc0e8a2c8a7ac5f794a15d1a884994e95c5e3b8efa96e",
+        "reference": "THIS IS PHYSICALLY IMPOSSIBLE WHEN CONSCIOUS",
+        "text": "This is physically impossible when conscious.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 6,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0025",
+        "input_sha256": "b3819f4ebe697500f8fdb302dcf832e73e08c8d8e3abc69e04328f1cdce5dceb",
+        "reference": "OTHERS HAD DIED BEFORE DURING THE TWENTIES AND DEATH DURING THE LAST ROUND WAS IN SOME WAYS EASIER THAN DEFEAT",
+        "text": "Others had died before during the 20s, and death during the last round was in some ways easier than defeat.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 20,
+          "wer": 0.05
+        }
+      },
+      {
+        "id": "1272-141231-0026",
+        "input_sha256": "78bbbfada3676e97548fe946e252cfffc5fba916542d2c6e39d5ecbb8be76710",
+        "reference": "BREATHING DEEPLY BRION SOFTLY SPOKE THE AUTO HYPNOTIC PHRASES THAT TRIGGERED THE PROCESS",
+        "text": "Breathing deeply, Breon softly spoke the auto-hypnotic phrases that triggered the process.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.07692307692307693
+        }
+      },
+      {
+        "id": "1272-141231-0027",
+        "input_sha256": "b676f024fec3c98d3e7783e5bf3846739b47807aa30c1ed0c9066e3988b2dfeb",
+        "reference": "WHEN THE BUZZER SOUNDED HE PULLED HIS FOIL FROM HIS SECOND'S STARTLED GRASP AND RAN FORWARD",
+        "text": "When the buzzer sounded, he pulled his foil from his second startled grasp and ran forward.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 16,
+          "wer": 0.0625
+        }
+      },
+      {
+        "id": "1272-141231-0028",
+        "input_sha256": "a6833433f5c62c5ffae8a368811c507dde2401d3ff7e9669a492c150f6afe8d4",
+        "reference": "IROLG LOOKED AMAZED AT THE SUDDEN FURY OF THE ATTACK THEN SMILED",
+        "text": "I rolled, clicked the maze at the sudden fury of the attack, then smiled.",
+        "score": {
+          "errors": 5,
+          "substitutions": 3,
+          "deletions": 0,
+          "insertions": 2,
+          "reference_words": 12,
+          "wer": 0.4166666666666667
+        }
+      },
+      {
+        "id": "1272-141231-0029",
+        "input_sha256": "8b76b5e12d811444604a97633f4cfeb6e4228273f734d3c14ee0f8aa9c8df860",
+        "reference": "HE THOUGHT IT WAS A LAST BURST OF ENERGY HE KNEW HOW CLOSE THEY BOTH WERE TO EXHAUSTION",
+        "text": "He thought it was the last burst of energy. He knew how close they both were to exhaustion.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.05555555555555555
+        }
+      },
+      {
+        "id": "1272-141231-0030",
+        "input_sha256": "f65aeae1485f33072d636c36ad06ae205627f59619b2113a0c91d91126afed3e",
+        "reference": "BRION SAW SOMETHING CLOSE TO PANIC ON HIS OPPONENT'S FACE WHEN THE MAN FINALLY RECOGNIZED HIS ERROR",
+        "text": "Brion saw something close to panic on his opponent's face when the man finally recognized his error.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 17,
+          "wer": 0.0
+        }
+      },
+      {
+        "id": "1272-141231-0031",
+        "input_sha256": "8b2218bd45e5df4d097c0f6a7ca9ac44e3b3f5add0a4d035d3da2f4e3f1e31c6",
+        "reference": "A WAVE OF DESPAIR ROLLED OUT FROM IROLG BRION SENSED IT AND KNEW THE FIFTH POINT WAS HIS",
+        "text": "A wave of despair rolled out from Irogg, re-insensed it, and knew the fifth point was his.",
+        "score": {
+          "errors": 3,
+          "substitutions": 3,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.16666666666666666
+        }
+      },
+      {
+        "id": "1272-141231-0032",
+        "input_sha256": "57a830871a87def230b541a41898aca9ef444b2ae420cdc776a4e6debf74d50c",
+        "reference": "THEN THE POWERFUL TWIST THAT THRUST IT ASIDE IN AND UNDER THE GUARD",
+        "text": "Then the powerful twist that's rest of the side, in and under the guard.",
+        "score": {
+          "errors": 5,
+          "substitutions": 4,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 13,
+          "wer": 0.38461538461538464
+        }
+      }
+    ]
   },
-  "long_speech": [
-    {
-      "seconds": 86.345,
-      "clips": 8,
-      "score": {
-        "errors": 24,
-        "substitutions": 17,
-        "deletions": 7,
-        "insertions": 0,
-        "reference_words": 200,
-        "wer": 0.12
-      },
-      "input_sha256": "9ef20b32bc7a18ef36f9e199637beed29726d3ddb580438f010da7bb84280d9a"
-    },
-    {
-      "seconds": 156.08,
-      "clips": 16,
-      "score": {
-        "errors": 45,
-        "substitutions": 25,
-        "deletions": 19,
-        "insertions": 1,
-        "reference_words": 361,
-        "wer": 0.12465373961218837
-      },
-      "input_sha256": "3a9b86f62f3f8199bd601afd0a11802e611ac1b0198d9df76d089522977ecb58"
-    }
-  ],
   "known_accuracy_limits": [
     {
       "case": "identical sentence repeated 24 times",
@@ -908,77 +1927,67 @@
       "antfly_admission_inference_in_flight_requests": 0.0
     }
   },
-  "memory_evidence": {
-    "complete": true,
-    "errors": [],
-    "samples_per_phase": {
-      "boundary-context-sweep": 16,
-      "boundary-schema-sweep": 4,
-      "deadlines-and-disconnects": 10,
-      "dense-varied-long-speech": 14,
-      "embed-automatic-batching": 3,
-      "embed-serialized": 5,
-      "extract-automatic-batching": 3,
-      "extract-serialized": 6,
-      "known-checkpoint-accuracy-limit": 3,
-      "mixed-sustained-turnover": 1185,
-      "ocr-automatic-batching": 90,
-      "ocr-serialized": 205,
-      "recovery": 26,
-      "request-limits-and-isolation": 4,
-      "speech-corpus": 44,
-      "warmup": 30,
-      "whisper-automatic-batching": 22,
-      "whisper-serialized": 36
+  "error": null,
+  "date_utc": "2026-11-08",
+  "host": "glowworm (spark-beb5), shared GPU",
+  "qualified_source": "ade11524f1467dc786db623ea962ce98acdf3c67",
+  "merged_commit": "a3009dbd46b707b57f435a6e7f191115154ca30a",
+  "post_merge_review": {
+    "qualified_source": "ade11524f1467dc786db623ea962ce98acdf3c67",
+    "merged_commit": "a3009dbd46b707b57f435a6e7f191115154ca30a",
+    "critical_inputs_byte_identical": {
+      "configs/inference-write-pool-40g.json": "0f475957744e9c79450d11f336038b282bf47ab0602b46d09aaef207ec73cc73",
+      "zig/pkg/inference/build.zig": "71b5a9f5078c336d54fe90b5fd920027edd17b1d4e0d5d64cb14af6b625cce08",
+      "zig/pkg/inference/build/runtime.zig": "01bdbb817a84a13ef62b00a098892cde31af3adbc488dd65936aaae89788617d",
+      "zig/pkg/inference/src/server/server.zig": "cf6918e18737b54b01f0ad9e7b423fc76dd0db47213aa51a6dacf229be0e41f0",
+      "zig/pkg/inference/src/server/gliner_microbatch.zig": "3c39de76f12e9c7ca50cfd9c9205d844dd495e1c640a0c963db7c77c7876f837",
+      "zig/pkg/inference/src/extractors/gliner_boundary_executor.zig": "21edadaa3e0c4f395b7bfdc934dd713442128c8c26873d0a873bc99a077aa0cd",
+      "zig/pkg/inference/src/pipelines/gliner_boundary_pipeline.zig": "f03c8b0211d32342ca5d35bae72c0fe3d1dbfb3410c641a699fb627469405c95",
+      "zig/pkg/inference/src/pipelines/gliner_boundary_scoring.zig": "52c8493132115d232684d6282342177cd9087fe353853fc7959730959562870c",
+      "zig/pkg/inference/src/architectures/gliner/boundary_request_device.zig": "6e2971fcf2351b106e923ad19dbb07c127030148a390a45f42b61d158995d1f3",
+      "zig/pkg/inference/src/architectures/gliner/boundary_scorer_device.zig": "737b79748c10272ede1d34599e52055837855119349f490a4aa1b2aad38e0871",
+      "zig/pkg/inference/src/runtime/tier/memory.zig": "4bcb3b66cab502ed061666f00b84ce42820f390f81d222eea53059d74c6f741a",
+      "zig/pkg/inference/scripts/qualify_write_pool_production.py": "f3546b60a208c605216b3d80c705eca0cf8a1f867c30a06e83a75afea36185a7"
     },
-    "service_nvml_requested": true
+    "transcription_provider_move_verbatim": true,
+    "other_inference_differences_reviewed": [
+      "CUDA-disabled Florence guard (unchanged enabled-CUDA branch; Florence outside this profile)",
+      "GLiNER fixture-reader extraction and test-only imports"
+    ],
+    "post_merge_harness_change": "mixed OCR and Whisper parity verified against prior identical-request references"
   },
-  "memory_peaks": {
-    "service_nvml_bytes_max": 6833618944,
-    "memory.current_max": 2277928960,
-    "memory.peak_max": 3987664896
-  },
-  "cuda_managed_live_bytes_max": 6307409404.0,
-  "legacy_write": {
+  "supplementary_mixed_recognition_parity": {
     "status": "passed",
-    "memory_evidence": {
-      "complete": true,
-      "errors": [],
-      "samples_per_phase": {
-        "baseline": 13,
-        "limits-and-silence": 3,
-        "mixed-burst-and-batches": 55,
-        "mixed-steady": 54,
-        "ocr-deadline": 3,
-        "recovery": 6,
-        "warmup": 4,
-        "windowed-audio-and-eight-pages": 9
-      },
-      "service_nvml_requested": true
-    }
+    "verified": {
+      "whisper": 200,
+      "ocr": 200
+    },
+    "requests_sha256": "815b0b3dec0eef5e5133e85801c7b6aa92391291621da97eb3ef4a8db3f877f2",
+    "helper_commit": "1c6a702ec4c369e55c20af2825c59c5ba9221bd3",
+    "helper_sha256": "4605c356b3e2b73eded4aa56f47c3d4388212f6d814e1e87914a255a85330d2a"
   },
   "physical_recovery": {
     "status": "passed",
-    "binary_sha256": "3200ca966fad96ced447ab5f826b7978f14035f8f7421590e2a343860f357921",
-    "elapsed_seconds": 5.554218483004661,
+    "binary_sha256": "9029dadc0b2cbe75ea1a0d669a966251e4d8777990a52e417e659f998952fb59",
+    "elapsed_seconds": 5.4823715679958696,
     "stable_samples_by_phase": {
       "guard-rejected": 7,
       "failed-free": 7,
       "quarantined": 7,
       "reloaded": 17
     },
-    "raw_samples": 50,
+    "raw_samples": 49,
     "excluded_allowance_bytes": 2147483648,
     "managed_limit_bytes": 67108864
   },
-  "receipts_sha256": {
-    "acquisition/embedders/google/embeddinggemma-2.json": "cee0c38ccf5294b0ab9a1648d5259fe444db86a38362138899ddea08aed49cc5",
-    "acquisition/extractors/antflydb/GLiNER2.5.json": "9220c294cd3df0fd6eb978d1f14c9d947b44e0238edbe5ef725f3fcbeb149775",
-    "acquisition/readers/lightonai/LightOnOCR-3-0.8B.json": "dd4a88c184869b66f2de162fc590479cf6429f6811fdf29ff3cdbf885fdd1365",
-    "acquisition/transcribers/openai/whisper-small.json": "79e35f59ed20842b4002cc1dd6c5e0fcb983061cb31120377b5613ed3f0f1867",
-    "final/qualification.json": "493ba78a7634db56078886a1a54ddb789f5f8bd8c8281be585cf7b911f791c3f",
-    "final/report.json": "2784ad245f6252dcc515267251e4e886be08960328f4f98cba0ff14269fd2a24",
-    "legacy-write/report.json": "c3e3629e3cacfa445ade09405672103f9f2df838600d340a688a776def6a5f96",
-    "physical-recovery/summary.json": "9f87d514f5a7c7ff3614a1c652eea273e593681a505f2951ec5239d344328e86"
-  }
+  "legacy_write_status": "passed",
+  "raw_evidence_bundle_sha256": "b5a53c26586c9ab3da9fe71d27219c4577c1b977b1d2f5a1c1d21c193ff227a8",
+  "evidence_directory": "/home/ajroetker/antfly/.benchmark-results/pr1574-final-reviewed",
+  "host_context": "Sun Nov  8 20:44:57 UTC 2026\n 20:44:57 up 12:14, 11 users,  load average: 2.56, 2.87, 2.76\n    PID COMMAND           RSS     TIME\n3701038, 31783 MiB\n3701660, 6398 MiB\n",
+  "local_validation": {
+    "focused_zig_tests": 69,
+    "python_tests": 51,
+    "production_check_steps": 17
+  },
+  "provenance_note": "GPU campaign used the archived harness identified above. The stronger mixed recognition helper was applied offline to preserved identical-request responses; no new runtime binary was required. CUDA serving differences between qualified head and squash merge were reviewed; critical inputs are byte-identical."
 }
