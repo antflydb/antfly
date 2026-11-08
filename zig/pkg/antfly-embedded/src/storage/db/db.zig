@@ -3465,6 +3465,11 @@ pub const DB = struct {
         try txn.commit();
         self.local_execution.relational_index_maintenance_sweep.request();
         self.local_execution.relational_index_retry_after_ns.store(0, .release);
+        // Wake the owner-only sweep now instead of waiting for its next
+        // poll (task 3: relational demand should wake maintenance, not
+        // only arm a flag for `independent_maintenance.zig`'s own cadence
+        // to notice up to 5s later).
+        self.independent_maintenance.notify();
         return true;
     }
 
@@ -3561,6 +3566,7 @@ pub const DB = struct {
         try txn.commit();
         self.local_execution.relational_index_maintenance_sweep.request();
         self.local_execution.relational_index_retry_after_ns.store(0, .release);
+        self.independent_maintenance.notify();
         return true;
     }
 
@@ -38545,6 +38551,7 @@ pub const DB = struct {
         // unchanged. Wake an idle worker after the new identity commits.
         self.local_execution.relational_index_maintenance_sweep.request();
         self.local_execution.relational_index_retry_after_ns.store(0, .release);
+        self.independent_maintenance.notify();
         if (self.transaction_recovery_identity_context) |ctx| ctx.updateIdentityNamespace(namespace);
     }
 

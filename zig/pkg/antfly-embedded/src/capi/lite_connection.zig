@@ -971,7 +971,16 @@ pub const Demand = packed struct(u8) {
     group_source: bool = false,
     ttl: bool = false,
     resolver: bool = false,
-    _reserved: u3 = 0,
+    /// Relational maintenance sweep (index build/repair, index GC, CHECK
+    /// validation; `independent_maintenance.zig`'s `.index` Work) has a
+    /// bounded page it could run right now. Lite-relational-one §3.3c/task 3:
+    /// without this bit, a no-other-consumer table whose only backlog is
+    /// relational maintenance never satisfies `registeredDemand().any()`,
+    /// so `maintenanceTurn`'s no-consumer gating (see its "changed_matters"
+    /// comment) could starve that backlog instead of just this owner's
+    /// own separately-scheduled `independent_maintenance.Owner` noticing it.
+    relational: bool = false,
+    _reserved: u2 = 0,
 
     pub const none: Demand = .{};
 
@@ -1785,6 +1794,7 @@ pub const Owner = struct {
             .group_source = database.core.index_manager.hasGroupSources(),
             .ttl = database.ttl_runtime != null,
             .resolver = database.core.index_manager.resolvers.items.len != 0,
+            .relational = database.local_execution.relational_index_maintenance_sweep.isPending(),
         };
     }
 
