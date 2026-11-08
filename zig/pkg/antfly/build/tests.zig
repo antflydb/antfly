@@ -4090,8 +4090,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("transaction-runtime-regression-test", "Check transaction identity, recovery clocks, and safe stateless retries").dependOn(&addCuratedTestRunArtifact(b, transaction_runtime_regressions, transaction_runtime_filters).step);
+    // This whole "full cluster"/"production cluster" VOPR family boots the
+    // real metadata and data-plane harness, which reaches the production
+    // storage owner through storage.kernel_owner_client the same way the
+    // server does; VoprIo only swaps the simulated transport underneath it.
+    // Give the family its own clone of antfly_test_mod (not the shared
+    // module every other unit test compiles against) so only these compiles
+    // pull in the storage-kernel/enrichment-compute/inference provider
+    // archives as a link prerequisite. The clone must be recursive (not just
+    // the top-level module): antfly_test_mod reaches usermgr_storage_test_mod,
+    // which imports antfly_test_mod back as "antfly_root", so a shallow clone
+    // would make pkg/antfly/src/root.zig the root of two live modules at once.
+    var full_cluster_vopr_consumer_mod_copies: std.AutoHashMap(*std.Build.Module, *std.Build.Module) = .init(b.allocator);
+    const full_cluster_vopr_consumer_mod = @import("../../../build_support/antfly/test_partitions.zig").cloneModule(b, antfly_test_mod, &full_cluster_vopr_consumer_mod_copies);
+    @import("../../../build_support/embedded/source_owner.zig").adopt(full_cluster_vopr_consumer_mod);
     const vopr_runtime_regression_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{
             "metadata VOPR distributed data survives split partition node restart and modeled storage crash",
             "metadata VOPR split runtime preserves source identity namespace",
@@ -4129,7 +4143,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("vopr-runtime-regression-test", "Run VOPR runtime ownership, clock, snapshot, and replay regressions").dependOn(&run_vopr_runtime_regressions.step);
 
     const standby_production_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"production standby owners"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4137,7 +4151,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("standby-production-vopr-test", "Exercise production standby public writes, standby reads, and promotion on VoprIo").dependOn(&run_standby_production_vopr_tests.step);
 
     const standby_scaling_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"production standby scaling VOPR exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4146,7 +4160,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("standby-scaling-vopr-test", "Replay production standby promotion with automatic split/merge and replica scale-out/drain").dependOn(&run_standby_scaling_vopr_tests.step);
 
     const full_cluster_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{
             "full cluster VOPR exact replays",
             "full cluster graph inflight restart cutoff drains parked hooks",
@@ -4165,21 +4179,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     full_cluster_vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
 
     const full_cluster_graph_replay_soak_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster VOPR graph inflight restart repeated exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     b.step("full-cluster-graph-replay-soak-test", "Repeat the graph restart recorded history and exact replay")
         .dependOn(&b.addRunArtifact(full_cluster_graph_replay_soak_tests).step);
     const full_cluster_graph_cutoff_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster graph inflight restart cutoff drains parked hooks"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     b.step("full-cluster-graph-cutoff-test", "Verify graph restart hooks drain at a bounded replay cutoff")
         .dependOn(&b.addRunArtifact(full_cluster_graph_cutoff_tests).step);
     const full_cluster_node_replacement_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{
             "failed node replacement leaves a drainable empty slot",
             "metadata wrapper rejects empty node startup and restores external ownership after retry",
@@ -4190,7 +4204,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&b.addRunArtifact(full_cluster_node_replacement_tests).step);
 
     const extension_lifecycle_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{ "extension lifecycle", "wasmtime v45" },
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4198,7 +4212,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&b.addRunArtifact(extension_lifecycle_tests).step);
 
     const resource_pressure_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster VOPR exact replays resource pressure recovery"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4206,7 +4220,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&b.addRunArtifact(resource_pressure_vopr_tests).step);
 
     const production_cluster_service_rate_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production service rates compose heal and exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4218,7 +4232,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_service_rate_vopr_test_step.dependOn(&run_production_cluster_service_rate_vopr_tests.step);
 
     const production_cluster_query_cache_service_rate_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production query embedding cache deadline owner restart and exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4230,7 +4244,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_query_cache_service_rate_vopr_test_step.dependOn(&run_production_cluster_query_cache_service_rate_vopr_tests.step);
 
     const production_cluster_serverless_fencing_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production generation progress conflict exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4242,7 +4256,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_serverless_fencing_vopr_test_step.dependOn(&run_production_cluster_serverless_fencing_vopr_tests.step);
 
     const production_cluster_authenticated_tenant_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production authenticated tenant isolation exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4254,7 +4268,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_authenticated_tenant_vopr_test_step.dependOn(&run_production_cluster_authenticated_tenant_vopr_tests.step);
 
     const production_cluster_disk_capacity_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production disk capacity pressure exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4266,7 +4280,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_disk_capacity_vopr_test_step.dependOn(&run_production_cluster_disk_capacity_vopr_tests.step);
 
     const production_cluster_managed_index_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production managed index publication bounded lifecycle exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4278,7 +4292,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_managed_index_vopr_test_step.dependOn(&run_production_cluster_managed_index_vopr_tests.step);
 
     const production_cluster_replication_backfill_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication backfill crosses public data raft and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4290,7 +4304,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_backfill_vopr_test_step.dependOn(&run_production_cluster_replication_backfill_vopr_tests.step);
 
     const production_cluster_replication_schema_change_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication schema change resumes through public data raft and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4302,7 +4316,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_schema_change_vopr_test_step.dependOn(&run_production_cluster_replication_schema_change_vopr_tests.step);
 
     const production_cluster_replication_owner_restart_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication target owner restarts resumes and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4314,7 +4328,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_owner_restart_vopr_test_step.dependOn(&run_production_cluster_replication_owner_restart_vopr_tests.step);
 
     const production_cluster_replication_source_crash_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication source session crashes resumes and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4326,7 +4340,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_source_crash_vopr_test_step.dependOn(&run_production_cluster_replication_source_crash_vopr_tests.step);
 
     const production_cluster_replication_cancellation_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication durable cancellation resumes and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4338,7 +4352,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_cancellation_vopr_test_step.dependOn(&run_production_cluster_replication_cancellation_vopr_tests.step);
 
     const production_cluster_replication_stale_owner_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication stale owner replays undurable batch and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4350,7 +4364,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_stale_owner_vopr_test_step.dependOn(&run_production_cluster_replication_stale_owner_vopr_tests.step);
 
     const production_cluster_replication_topology_change_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication metadata topology rotates cutover authority and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4362,7 +4376,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_topology_change_vopr_test_step.dependOn(&run_production_cluster_replication_topology_change_vopr_tests.step);
 
     const production_cluster_graph_hydration_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public graph hydration exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4374,7 +4388,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_graph_hydration_vopr_test_step.dependOn(&run_production_cluster_graph_hydration_vopr_tests.step);
 
     const production_cluster_graph_cancellation_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public graph cancellation exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4386,7 +4400,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_graph_cancellation_vopr_test_step.dependOn(&run_production_cluster_graph_cancellation_vopr_tests.step);
 
     const production_cluster_graph_cancellation_transport_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public graph cancellation under transport fault exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4398,7 +4412,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_graph_cancellation_transport_vopr_test_step.dependOn(&run_production_cluster_graph_cancellation_transport_vopr_tests.step);
 
     const production_cluster_graph_inflight_authorization_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public graph inflight authorization revocation exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4410,7 +4424,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_graph_inflight_authorization_vopr_test_step.dependOn(&run_production_cluster_graph_inflight_authorization_vopr_tests.step);
 
     const production_cluster_graph_stale_snapshot_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public graph stale snapshot retry exhaustion exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4422,7 +4436,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_graph_stale_snapshot_vopr_test_step.dependOn(&run_production_cluster_graph_stale_snapshot_vopr_tests.step);
 
     const production_cluster_global_query_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public global query exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4434,7 +4448,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_global_query_vopr_test_step.dependOn(&run_production_cluster_global_query_vopr_tests.step);
 
     const production_cluster_global_query_cancellation_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public global query cancellation exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4446,7 +4460,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_global_query_cancellation_vopr_test_step.dependOn(&run_production_cluster_global_query_cancellation_vopr_tests.step);
 
     const production_cluster_global_query_authorization_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public global query inflight authorization revocation exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4458,7 +4472,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_global_query_authorization_vopr_test_step.dependOn(&run_production_cluster_global_query_authorization_vopr_tests.step);
 
     const production_cluster_global_query_transport_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public global query transport failure exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4470,7 +4484,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_global_query_transport_vopr_test_step.dependOn(&run_production_cluster_global_query_transport_vopr_tests.step);
 
     const production_cluster_global_query_owner_restart_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public global query owner restart exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4482,14 +4496,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_global_query_owner_restart_vopr_test_step.dependOn(&run_production_cluster_global_query_owner_restart_vopr_tests.step);
 
     const production_cluster_baseline_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane baseline exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_baseline_vopr_tests = b.addRunArtifact(production_cluster_baseline_vopr_tests);
     b.step("production-cluster-baseline-vopr-test", "Exact-replay the production DataServer baseline").dependOn(&run_production_cluster_baseline_vopr_tests.step);
     const production_cluster_bounded_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane VOPR bounded cutoff exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4499,49 +4513,49 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // running the two fresh-world replay processes serially.
     run_production_cluster_bounded_vopr_tests.step.dependOn(&run_production_cluster_baseline_vopr_tests.step);
     const production_cluster_deep_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane VOPR active split exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_deep_vopr_tests = b.addRunArtifact(production_cluster_deep_vopr_tests);
     const production_cluster_graph_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_vopr_tests = b.addRunArtifact(production_cluster_graph_vopr_tests);
     const production_cluster_graph_split_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_vopr_tests = b.addRunArtifact(production_cluster_graph_split_vopr_tests);
     const production_cluster_graph_split_transport_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split transport failure exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_transport_vopr_tests = b.addRunArtifact(production_cluster_graph_split_transport_vopr_tests);
     const production_cluster_graph_split_owner_restart_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split owner restart exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_owner_restart_vopr_tests = b.addRunArtifact(production_cluster_graph_split_owner_restart_vopr_tests);
     const production_cluster_graph_split_partial_write_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split partial write exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_partial_write_vopr_tests = b.addRunArtifact(production_cluster_graph_split_partial_write_vopr_tests);
     const production_cluster_graph_split_resource_pressure_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split resource pressure exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_resource_pressure_vopr_tests = b.addRunArtifact(production_cluster_graph_split_resource_pressure_vopr_tests);
     const production_cluster_join_split_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{
             "full cluster production data plane distributed join active split exact replay",
             "production distributed join oracle accepts broadcast without a shuffle ledger",
@@ -4550,55 +4564,55 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_production_cluster_join_split_vopr_tests = b.addRunArtifact(production_cluster_join_split_vopr_tests);
     const production_cluster_durable_join_takeover_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane durable shuffle join finalizer takeover exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_takeover_vopr_tests = b.addRunArtifact(production_cluster_durable_join_takeover_vopr_tests);
     const production_cluster_durable_join_cancellation_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production durable shuffle join cancellation exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_cancellation_vopr_tests = b.addRunArtifact(production_cluster_durable_join_cancellation_vopr_tests);
     const production_cluster_durable_join_worker_retry_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production durable shuffle partition worker failover exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_worker_retry_vopr_tests = b.addRunArtifact(production_cluster_durable_join_worker_retry_vopr_tests);
     const production_cluster_durable_join_owner_restart_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production durable shuffle partition owner reconstruction exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_owner_restart_vopr_tests = b.addRunArtifact(production_cluster_durable_join_owner_restart_vopr_tests);
     const production_cluster_durable_join_retry_exhaustion_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production durable shuffle overlapping fault retry exhaustion exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_retry_exhaustion_vopr_tests = b.addRunArtifact(production_cluster_durable_join_retry_exhaustion_vopr_tests);
     const production_cluster_durable_join_cancellation_overlap_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production durable shuffle cancellation under overlapping faults exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_cancellation_overlap_vopr_tests = b.addRunArtifact(production_cluster_durable_join_cancellation_overlap_vopr_tests);
     const production_cluster_durable_join_cancellation_owner_restart_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production durable shuffle cancellation with owner reconstruction exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_cancellation_owner_restart_vopr_tests = b.addRunArtifact(production_cluster_durable_join_cancellation_owner_restart_vopr_tests);
     const production_cluster_graph_split_overlapping_faults_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split overlapping link resource faults exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_overlapping_faults_vopr_tests = b.addRunArtifact(production_cluster_graph_split_overlapping_faults_vopr_tests);
     const production_cluster_graph_split_socket_pressure_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split socket pressure exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -8180,7 +8194,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .storage_test_step = lib_storage_test_step,
         // Runtime/restore and VOPR CLI/meta/registry slices each share a root.
         // Register both roots once to link their production ABI providers.
-        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ lite_cmd_tests, provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, standalone_restore_tests, system_catalog_standalone_tests, vopr_cli } }) catch @panic("OOM"),
+        // The full-cluster/production-cluster VOPR family (vopr_runtime_regression_tests
+        // onward) shares one clone of antfly_test_mod, full_cluster_vopr_consumer_mod;
+        // registering any one of its compiles here links the storage-kernel,
+        // enrichment-compute, and inference provider archives onto that whole family.
+        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ lite_cmd_tests, provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, standalone_restore_tests, system_catalog_standalone_tests, vopr_cli, vopr_runtime_regression_tests } }) catch @panic("OOM"),
     };
 }
 
