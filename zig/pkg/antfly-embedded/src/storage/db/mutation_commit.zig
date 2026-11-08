@@ -3850,8 +3850,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         durable_outbox_deletes[durable_outbox_delete_count] = key;
                         durable_outbox_delete_count += 1;
                     }
+                    // The remote wait above already proved durability and
+                    // authority; this clear is bookkeeping that is safe to
+                    // lose on crash (the row is re-read and re-published,
+                    // tolerated by the at-least-once replication adapter),
+                    // so it rides along instead of forcing its own fsync
+                    // (lite-single-commit-write-path.md §3.2a).
                     if (durable_outbox_delete_count != 0)
-                        try S.ownerField(self, "core").*.store.putBatch(&.{}, durable_outbox_deletes[0..durable_outbox_delete_count]);
+                        try S.ownerField(self, "core").*.store.putBatchWithReplayWithOptions(null, &.{}, durable_outbox_deletes[0..durable_outbox_delete_count], null, .{ .durability = .ride_along });
                 }
             }
             if (opts.document_child_range_dispatcher) |dispatcher| {
