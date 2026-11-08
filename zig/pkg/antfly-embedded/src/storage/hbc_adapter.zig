@@ -15352,6 +15352,26 @@ pub const HBCIndex = struct {
             try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
         }
 
+        // An EXHAUSTIVE search (`search_effort: 1.0`) must see it too. This
+        // is the regression check for the bug `installStagedWrite` used to
+        // have: it published `self.metadata`/`published_active_count` but
+        // never called `applyExternallyCommittedMutations` to bring
+        // `self.store`'s own in-memory mirror in sync with the mutations
+        // that were only ever committed through the EXTERNAL `commitStaged`
+        // call above (standing in for a real primary write's native
+        // transaction). An ordinary search is cache-shielded (the node cache
+        // is warmed during the staged insert itself, before its throwaway
+        // transaction aborts) and so could never catch this, but
+        // `CompleteCoverageTracker.flushAssignments`'s `.vecs`-namespace
+        // consistency check bypasses every cache and reads `self.store`
+        // directly -- it used to find nothing there and fail closed with
+        // `error.IncompletePublishedSnapshot`.
+        {
+            var results = try idx.searchWithRequest(.{ .query = &.{ 1.0, 0.0 }, .k = 1, .search_effort = 1.0 });
+            defer results.deinit();
+            try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+        }
+
         // --- Delete, staged ---
         const submits_before_delete = test_sink.submit_calls;
         var del_staged = try idx.deleteStaged(1);
@@ -19661,7 +19681,33 @@ pub const HBCIndex = struct {
     /// externally-owned commit (folded in via `commit_participant.View.
     /// putIndexCatalog(nativeCatalogScope(), staged.mutations)`). Publishes
     /// this index's in-memory metadata and releases `published_snapshot_mu`.
+    ///
+    /// `staged.mutations` landed durably through the host transaction's OWN
+    /// native commit, never through this index's `self.store`
+    /// (`native_catalog_backend.Backend`) -- `insertWithMetadataStaged`/
+    /// `deleteStaged` only ever harvest pending mutations from a throwaway
+    /// transaction they abort. `self.store`'s in-memory read mirror (the
+    /// tree `NamespaceTxn.commit` would otherwise update) never learns about
+    /// them unless told explicitly. Every reader of `.nodes`/`.vecs` through
+    /// the node/quantized caches stays correct regardless (those caches are
+    /// populated eagerly during the staged insert itself, before the
+    /// throwaway transaction aborts), but a cache-bypassing read -- notably
+    /// `CompleteCoverageTracker.flushAssignments`'s own `.vecs` consistency
+    /// check during an exhaustive (`search_effort: 1.0`) search -- reads
+    /// straight through to the stale mirror and fails closed with
+    /// `error.IncompletePublishedSnapshot`. Mirror this index's sibling
+    /// inline-publication install step, `installInlineProjectionCheckpoint
+    /// Publication`, which calls the same `applyExternallyCommittedMutations`
+    /// for exactly this reason.
     pub fn installStagedWrite(self: *HBCIndex, staged: *vectorindex_hbc_index.StagedWrite) !void {
+        if (self.env_owner == .native_catalog and staged.mutations.len != 0) {
+            const converted = try self.alloc.alloc(native_catalog_backend.Mutation, staged.mutations.len);
+            defer self.alloc.free(converted);
+            for (staged.mutations, converted) |pending, *out| {
+                out.* = .{ .namespace = pending.namespace, .key = pending.key, .value = pending.value, .is_delete = pending.is_delete };
+            }
+            try self.env_owner.native_catalog.applyExternallyCommittedMutations(converted);
+        }
         try vectorindex_hbc_index.installStagedWrite(self, staged);
     }
 

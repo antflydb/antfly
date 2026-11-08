@@ -8143,11 +8143,21 @@ pub const GraphIndex = struct {
     /// batch-apply entry points) in that case.
     pub fn prepareInlineEdgePublication(self: *GraphIndex, write: BatchWrite) !InlineEdgePublication {
         if (std.meta.activeTag(self.outgoing_owner) != .native_catalog or std.meta.activeTag(self.reverse_owner) != .native_catalog) {
+            wal_trace.recordOp(.graph_inline_prepare_backend_mismatch);
             return error.InlineEdgePublicationUnsupported;
         }
-        if (write.owner.len != 0 or write.owner_document.len != 0) return error.InlineEdgePublicationUnsupported;
-        if (self.ttl_duration_ns != 0) return error.InlineEdgePublicationUnsupported;
-        if (self.metric_configs.len != 0) return error.InlineEdgePublicationUnsupported;
+        if (write.owner.len != 0 or write.owner_document.len != 0) {
+            wal_trace.recordOp(.graph_inline_prepare_owner);
+            return error.InlineEdgePublicationUnsupported;
+        }
+        if (self.ttl_duration_ns != 0) {
+            wal_trace.recordOp(.graph_inline_prepare_ttl);
+            return error.InlineEdgePublicationUnsupported;
+        }
+        if (self.metric_configs.len != 0) {
+            wal_trace.recordOp(.graph_inline_prepare_metrics);
+            return error.InlineEdgePublicationUnsupported;
+        }
 
         try @import("mutation_identity.zig").validate(write.edge_id, write.owner_document, write.owner);
         try edge_type_mod.validateStored(write.edge_type);

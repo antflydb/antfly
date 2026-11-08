@@ -139,6 +139,10 @@ pub fn loadReplayCursor(alloc: Allocator, store: anytype, scope: []const u8) !?R
     return try decodeReplayCursor(alloc, raw);
 }
 
+// §3.2a's "Catch-up progress" ride-along entry: replay restarts from
+// durable progress and redoing the skipped preparation window is
+// idempotent, so a lost cursor write just means a slightly larger replay
+// window next time, not incorrect results.
 pub fn saveReplayCursor(store: anytype, scope: []const u8, cursor: ReplayCursor) !void {
     const key = try replayCursorKey(std.heap.page_allocator, scope);
     defer std.heap.page_allocator.free(key);
@@ -146,7 +150,7 @@ pub fn saveReplayCursor(store: anytype, scope: []const u8, cursor: ReplayCursor)
     defer std.heap.page_allocator.free(raw);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
+    var txn = try runtime.store.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     try txn.put(key, raw);
     try txn.commit();
@@ -157,7 +161,7 @@ pub fn clearReplayCursor(store: anytype, scope: []const u8) !void {
     defer std.heap.page_allocator.free(key);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
+    var txn = try runtime.store.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     txn.delete(key) catch |err| switch (err) {
         error.NotFound => {},
@@ -229,13 +233,19 @@ pub fn saveAppliedSequence(store: anytype, scope: []const u8, sequence: u64) !vo
     return try saveProjectionCheckpoint(store, scope, .{ .applied_sequence = sequence });
 }
 
+// §3.2a's "Catch-up progress" ride-along entry: replay restarts from
+// durable progress, and re-applying the backlog between the durable
+// watermark and the in-memory one is idempotent. Not yet a
+// commit_participant in the producer's own plan transaction (future
+// work -- see saveRuntimeStatus above for the same caveat); ride-along
+// already removes this call's own fsync.
 pub fn saveProjectionCheckpoint(store: anytype, scope: []const u8, checkpoint: ProjectionCheckpoint) !void {
     const key = try appliedSequenceKey(std.heap.page_allocator, scope);
     defer std.heap.page_allocator.free(key);
     var buf = encodeProjectionCheckpoint(checkpoint);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
+    var txn = try runtime.store.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     try txn.put(key, &buf);
     try txn.commit();
@@ -473,7 +483,17 @@ pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatu
     var retry_count_buf = encodeRuntimeAuxSidecar(&buf, status);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
+    // §3.4: these are durable retry/terminal-failure fields, written only
+    // on change (see durableRuntimeStatusFieldsUnchanged above -- the common
+    // case commits nothing at all). The underlying failure/retry condition
+    // that caused the change persists until resolved, so a value lost here
+    // in a crash is re-observed and re-written identically by the producer's
+    // next attempt -- safe to lose, per §3.2a. Ride along instead of paying
+    // a dedicated fsync on the indexing hot path; ideally this would be a
+    // commit_participant inside the producer's own plan transaction, but
+    // that needs threading a View through every saveRuntimeStatus call site
+    // (future work) -- ride-along already removes its own fsync today.
+    var txn = try runtime.store.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     try txn.put(key, &buf);
     try txn.put(retry_count_key, &retry_count_buf);

@@ -1097,6 +1097,112 @@ test "lite write amplification ceilings" {
     try expectAtMost(graph_concurrent.perUpdate(.calling_thread), 6.0 * slack, "graph 8-writer calling-thread syncs/update");
 }
 
+// ---------------------------------------------------------------------------
+// "Other write-path surfaces" harness modes: TTL'd document writes and an
+// enrichment-backed index driven by a deterministic non-inference producer
+// (lite-single-commit-write-path.md §3.2a/§3.4). Deliberately separate from
+// the report/ceilings tests above (own JSON markers, no ceiling gate yet):
+// these exist to show the TTL-schedule write and the enrichment status/
+// progress writes this change touched cost no *extra* durable commit beyond
+// an ordinary write, not to gate the unrelated primary/indexed/graph modes.
+//
+// No new harness mode exists yet for "a table with a replication/CDC source
+// configured so outbox rows are written": every durable-outbox write path
+// (`mutation_commit.zig`'s replication_async_batch_mirror/
+// replication_async_effect_mirror) is configured through internal `DB`
+// fields with no public capi entry point, unlike schema/index/enrichment
+// configuration -- this harness only opens through the public embedding
+// seam (`capi.openLiteHandleWithRuntime`), by design (see this file's top
+// comment), so it cannot reach that configuration without adding new capi
+// surface. The TTL/outbox ride-along conversions are instead covered
+// directly by `storage/lite/crash_consistency_test.zig`'s "TTL/outbox
+// ride-along bookkeeping..." test.
+const ttl_doc_count: usize = 24;
+
+fn measureSingleWriterTtl(alloc: std.mem.Allocator, comptime name: []const u8, updates: usize) !ModeReport {
+    var fixture = try Fixture.open(alloc, name, .primary_only);
+    defer fixture.close();
+
+    // A short TTL so the schema-level write-path cost (the per-write
+    // timestamp key, already folded into the primary commit -- see
+    // mutation_commit.zig's shouldWriteTimestamp/timestamp_writes) is
+    // exercised on every insert, matching a document TTL configuration.
+    try std.testing.expectEqual(capi_types.ErrorCode.ok, api.antfly_db_set_schema_json(fixture.handle, .fromSlice("{\"ttl_duration_ns\":3600000000000}")));
+
+    var buffer: [text_bytes]u8 = undefined;
+    var key_buffer: [32]u8 = undefined;
+    wal_trace.reset();
+    wal_trace.registerCallingThread();
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    for (0..updates) |i| {
+        const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i % ttl_doc_count});
+        const text = payload(&buffer, 0, i);
+        try insertOne(alloc, fixture.handle, key, text, "write");
+    }
+    const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    return .{ .updates = updates, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
+}
+
+/// Public-capi JSON shape for `types.EnrichmentConfig` (see
+/// `capi/db.zig`'s `antfly_db_add_enrichment_json`): an empty/omitted
+/// `producer_json` on an `asset` enrichment resolves to the deterministic
+/// field-copy producer (no embedder, no generator, no inference -- see
+/// `config_validation.zig`'s `.copy` producer kind), matching this
+/// harness's "no inference on the write path" measurement goal.
+fn addCopyEnrichment(handle: *anyopaque) !void {
+    try std.testing.expectEqual(capi_types.ErrorCode.ok, api.antfly_db_add_enrichment_json(handle, .fromSlice(
+        "{\"name\":\"wal_copy\",\"kind\":\"asset\",\"field\":\"body\",\"content_type\":\"text/plain\"}",
+    )));
+}
+
+/// Enrichment-backed mode: single writer, `updates` single-doc writes each
+/// with a `body` field a deterministic `.copy` producer (no inference)
+/// materializes into its own asset artifact. Writes ack at `sync_level:
+/// "write"` (generated artifacts are asynchronous by design -- §3.3a:
+/// "Inference never runs inside a commit"); `db.runUntilIdle()` once after
+/// the whole batch deterministically drains the enrichment worker under
+/// this harness's `.manual` BackendRuntime, so the worker's own durable
+/// commits (artifact publication, `enrichment_state.saveRuntimeStatus`/
+/// `saveProjectionCheckpoint` progress -- this change's ride-along
+/// conversions) are fully captured in one snapshot.
+fn measureSingleWriterEnrichment(alloc: std.mem.Allocator, comptime name: []const u8, updates: usize) !ModeReport {
+    var fixture = try Fixture.open(alloc, name, .primary_only);
+    defer fixture.close();
+    try addCopyEnrichment(fixture.handle);
+
+    var buffer: [text_bytes]u8 = undefined;
+    var key_buffer: [32]u8 = undefined;
+    wal_trace.reset();
+    wal_trace.registerCallingThread();
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    for (0..updates) |i| {
+        const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i});
+        const text = payload(&buffer, 0, i);
+        try insertOne(alloc, fixture.handle, key, text, "write");
+    }
+    try std.testing.expectEqual(capi_types.ErrorCode.ok, api.antfly_db_run_until_idle(fixture.handle));
+    const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    return .{ .updates = updates, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
+}
+
+test "lite write amplification: TTL-scheduled document writes" {
+    const alloc = std.testing.allocator;
+    const ttl = try measureSingleWriterTtl(alloc, "lite-write-amp-ttl", default_updates);
+    printStageTable("TTL-scheduled (sync_level write)", ttl);
+    const json_text = try std.json.Stringify.valueAlloc(alloc, modeJson(ttl), .{ .whitespace = .indent_2 });
+    defer alloc.free(json_text);
+    std.debug.print("lite_write_amplification_ttl_json_begin\n{s}\nlite_write_amplification_ttl_json_end\n", .{json_text});
+}
+
+test "lite write amplification: enrichment-backed index with a deterministic copy producer" {
+    const alloc = std.testing.allocator;
+    const enrichment = try measureSingleWriterEnrichment(alloc, "lite-write-amp-enrichment", default_updates);
+    printStageTable("enrichment-backed (deterministic copy producer, drained via runUntilIdle)", enrichment);
+    const json_text = try std.json.Stringify.valueAlloc(alloc, modeJson(enrichment), .{ .whitespace = .indent_2 });
+    defer alloc.free(json_text);
+    std.debug.print("lite_write_amplification_enrichment_json_begin\n{s}\nlite_write_amplification_enrichment_json_end\n", .{json_text});
+}
+
 // WS4 phase 2 round 2: measures the inline text publication fast path
 // directly, through `sync_level: "full_text"` (not `"full_index"`; see
 // `measureSingleWriterWithSyncLevel`'s comment). Runs with the default
