@@ -651,17 +651,24 @@ test "shared computed containers compare and hash without expanding their DAG" {
     try check("WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a UNWIND [a,a] AS x RETURN count(*) ORDER BY collect(x)", "[[2]]");
 }
 
-test "nonidentical shared values reserve bounded work before equality ordering or output" {
+test "independent shared values meter visited comparisons and reserve expanded output" {
     for ([_][]const u8{
         "WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a, reduce(b=[1],x IN range(1,40)|[b,b]) AS b RETURN a=b",
         "WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a, reduce(b=[1],x IN range(1,40)|[b,b]) AS b RETURN a<b",
         "WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a RETURN a",
-    }) |query| {
+    }, 0..) |query, index| {
         var diagnostic: c.Diagnostic = .{};
         var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
         defer compiled.deinit();
         var fixture: Fixture = .{ .cancel_after = 20_000 };
-        try std.testing.expectError(error.CypherStateBudgetExceeded, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+        // Comparisons now checkpoint actual members. Make the work ceiling
+        // deliberately precede cancellation, rather than relying on a bulk
+        // expanded reservation to win that race before the first member.
+        try std.testing.expectError(error.CypherStateBudgetExceeded, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 10_000 }));
+        if (index < 2) {
+            var canceled: Fixture = .{ .cancel_after = 1_000 };
+            try std.testing.expectError(error.Canceled, runtime.execute(std.testing.allocator, canceled.backend(), graph, &compiled, &.{}, .{}));
+        }
     }
 }
 

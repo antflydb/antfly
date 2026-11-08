@@ -3300,3 +3300,101 @@ def test_authenticated_cypher_identity_membership_and_edge_domains(
     finally:
         session.close()
         server.stop()
+
+
+def test_authenticated_cypher_immutable_metadata_and_visited_comparison_work(
+    monkeypatch,
+):
+    """Immutable inputs outlive row scratch; skipped fanout is not traversal."""
+    write_config = conftest._write_remote_content_e2e_config
+
+    def with_graph_work_budget(*args, **kwargs):
+        path = write_config(*args, **kwargs)
+        config = json.loads(path.read_text())
+        config.setdefault("resources", {}).setdefault("query", {}).setdefault(
+            "request_limits", {}
+        )["graph"] = {"max_intermediate_states": 1000000}
+        path.write_text(json.dumps(config))
+        return path
+
+    monkeypatch.setattr(
+        conftest, "_write_remote_content_e2e_config", with_graph_work_budget
+    )
+    binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port())
+    session = requests.Session()
+    session.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+    base = server.api_url.rstrip("/")
+    name = "cypher_metadata_" + uuid.uuid4().hex
+
+    def call(path, body):
+        response = session.post(base + path, json=body, timeout=60)
+        assert response.status_code in (200, 201, 202), (
+            response.status_code,
+            response.text,
+            server.log_path.read_text()[-4000:],
+        )
+        return response.json()
+
+    def query(statement, parameters=None, *, budget=300000):
+        result = call(
+            f"/graphs/{name}/query",
+            {
+                "query": statement,
+                "parameters": parameters or {},
+                "limits": {"intermediate_states": budget, "memory_bytes": 1 << 20},
+            },
+        )
+        assert result["complete"] is True, result
+        assert result["stats"]["intermediate_states"] < budget, result
+        print(json.dumps({"metadata_query": statement, "stats": result["stats"]}))
+        return result
+
+    try:
+        call(f"/tables/{name}", {"num_shards": 1})
+        call(
+            f"/graphs/{name}",
+            {"labels": [{"name": "D", "table": name}], "relationships": []},
+        )
+        left = {f"k{i:04}": i for i in range(2048)}
+        right = dict(reversed(list(left.items())))
+        right["k0000"] = -1
+        lookup = query(
+            "UNWIND range(0,31) AS i RETURN sum($m['k000'+toString(i%2)])",
+            {"m": left},
+            budget=10000,
+        )
+        assert lookup["rows"] == [[{"type": "integer", "value": "16"}]], lookup
+        ordered = query(
+            "UNWIND range(0,31) AS i "
+            "RETURN sum(CASE WHEN [$a,i] < [$b,i] THEN 1 ELSE 0 END)",
+            {"a": left, "b": right},
+        )
+        assert ordered["rows"] == [[{"type": "integer", "value": "0"}]], ordered
+        wide = list(range(16384))
+        other = list(wide)
+        other[0] = -1
+        equal = query(
+            "UNWIND range(0,31) AS i "
+            "RETURN sum(CASE WHEN [$a,i] = [$b,i] THEN 1 ELSE 0 END)",
+            {"a": wide, "b": other},
+            budget=100000,
+        )
+        assert equal["rows"] == [[{"type": "integer", "value": "0"}]], equal
+        for comparison, expected in (
+            ("[0,x]=[1,x]", False),
+            ("[0,x]=[0,x]", True),
+            ("[0,x]<[1,x]", True),
+            ("[0,x]<=[0,x]", True),
+        ):
+            dag = query(
+                "WITH reduce(a=[1], i IN range(1,30) | [a,a]) AS x "
+                f"RETURN {comparison}",
+                budget=10000,
+            )
+            assert dag["rows"] == [[{"type": "boolean", "value": expected}]], dag
+    finally:
+        session.close()
+        server.stop()

@@ -5800,3 +5800,41 @@ native count, projection, adjacency, callback and metadata gates pass. The
 ordered producer gate passes all nine private and fifteen server cases,
 including protocol-15 activation, newer atomic activation, renewal, retirement
 and compound-commit readiness invalidation.
+
+### Immutable comparison metadata across evaluation epochs
+
+Auxiliary field indexes and sorted map views now live with the nearest ancestor
+that already certifies the immutable allocation. Each observing evaluation still
+supplies its own cancellation and work admission. Uncertified row allocations
+keep their indexes in row scratch, so recycled addresses cannot populate a
+statement cache. Tiny maps retain their bounded linear lookup. Total ordering
+uses the same structural depth certificates as nullable comparisons instead of
+building a second depth cache in every row.
+
+Equality, nullable ordering and grouping collision checks meter the members and
+byte prefixes they actually visit. They no longer reserve the expanded size of
+an unvisited suffix. Identical nested allocations use structural certificates to
+preserve NULL semantics without expanding shared DAGs. Entity and path equality
+also meter visited identities. Full structural depth validation remains required,
+and output still reserves expanded serialization work before traversing it.
+
+Regression coverage exercises repeated child epochs, transient-address reuse,
+observer cancellation, first-member-decisive wide comparisons, shared DAGs,
+nullable members, depth violations and work exhaustion on equal independent
+containers. Authenticated HTTP coverage runs the original 32-row map and list
+workloads with strict work ceilings, including a 30-layer shared DAG.
+
+On the `3259eb8558` main merge, authenticated HTTP measurements for 32 rows are:
+
+| Observation | Before work units | After work units |
+| --- | ---: | ---: |
+| Dynamic lookup into a fixed 2,048-field map | 67,990 | 4,502 |
+| Ordering two fixed 2,048-field maps inside changing lists | 2,364,391 | 138,023 |
+| Equality of 16,384-member lists differing at their first member | 1,082,439 | 33,543 |
+
+The new campaign enforces a 1 MiB query-memory ceiling throughout. Map ordering
+uses 919,808 reported query-memory bytes: cached sorted views remain owned until
+their immutable inputs expire. The 30-layer shared-DAG comparisons use 360–363
+work units, including equal outer lists that share the large subtree. Independent
+equal containers still consume actual traversal work and stop at their work or
+cancellation boundary; full DAG output still requires expanded admission.
