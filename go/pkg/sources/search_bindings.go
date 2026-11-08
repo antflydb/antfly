@@ -103,6 +103,9 @@ func ValidateSearchBindings(version int, streams []SearchStream, artifacts []Art
 				}
 				inputs[input] = true
 			}
+			if inputs["text"] && semantic.VectorSpace.QueryModality != "text" && semantic.VectorSpace.QueryModality != "multimodal" {
+				return fmt.Errorf("text query input is incompatible with the declared query modality")
+			}
 			if len(inputs) == 0 || semantic.External && inputs["text"] {
 				return fmt.Errorf("external vectors accept supplied query vectors; managed bindings require supported query inputs")
 			}

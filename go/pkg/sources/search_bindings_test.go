@@ -46,6 +46,10 @@ func TestSearchStreamContracts(t *testing.T) {
 			s.Retrieval.Semantic.QueryInputs = []management.SemanticRetrievalQueryInputs{"vector", "vector"}
 		},
 		func(s *SearchStream) { s.Retrieval.Semantic.VectorSpace.Revision = "" },
+		func(s *SearchStream) {
+			s.Retrieval.Semantic.QueryInputs = []management.SemanticRetrievalQueryInputs{"text"}
+			s.Retrieval.Semantic.VectorSpace.QueryModality = "image"
+		},
 	} {
 		stream := testMediaStream()
 		mutate(&stream)
@@ -81,6 +85,9 @@ func TestSearchQueryCompatibilityAndBudgets(t *testing.T) {
 	_, err = BuildSearchQuery(binding, request)
 	require.Error(t, err)
 	request.VectorSpace = &space
+	request.Text = string([]byte{0xff})
+	_, err = BuildSearchQuery(binding, request)
+	require.ErrorContains(t, err, "UTF-8")
 	request.Text = "not advertised"
 	_, err = BuildSearchQuery(binding, request)
 	require.Error(t, err)
@@ -301,6 +308,10 @@ func TestScalarTextBindingRequiresDeclaredNativeAssetType(t *testing.T) {
 	index, err := decodeSearchIndex(raw)
 	require.NoError(t, err)
 	require.NoError(t, checkNativeStream(stream, index, false))
+	originalSources := index.Config["sources"].([]any)
+	index.Config["sources"] = append(append([]any{}, originalSources...), map[string]any{"artifact": stream.Artifact, "field": "other"})
+	require.Error(t, checkNativeStream(stream, index, false), "an index covering another field must not masquerade as this stream")
+	index.Config["sources"] = originalSources
 	nativeEnrichments(index.Config)[stream.Artifact]["content_type"] = "application/json"
 	require.Error(t, checkNativeStream(stream, index, false), "an object field must not be treated as a scalar text slot")
 }

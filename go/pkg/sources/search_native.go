@@ -141,6 +141,9 @@ func nativeLineage(enrichments map[string]map[string]any, member string, stream 
 func checkNativeStream(stream SearchStream, index nativeSearchIndex, semantic bool) error {
 	cfg := index.Config
 	sources := nativeSources(cfg)
+	if raw, ok := cfg["sources"].([]any); ok && len(raw) != len(sources) {
+		return fmt.Errorf("native index has ambiguous repeated artifact sources")
+	}
 	if !semantic {
 		if cfg["type"] != "full_text" {
 			return fmt.Errorf("text binding does not name a full-text index")

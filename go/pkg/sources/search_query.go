@@ -23,6 +23,7 @@ import (
 	"math"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // SearchRequest intentionally has no arbitrary native query/template override.
@@ -85,6 +86,9 @@ func BuildSearchQuery(binding Binding, request SearchRequest) ([]byte, error) {
 	}
 	if request.Limit < 1 || request.Limit > 100 || request.Matches < 1 || request.Matches > 10 || request.Limit*request.Matches > 1000 {
 		return nil, fmt.Errorf("search response exceeds group/member budget")
+	}
+	if !utf8.ValidString(request.Text) {
+		return nil, fmt.Errorf("query text is not valid UTF-8")
 	}
 	if len(request.Text) > 65536 {
 		return nil, fmt.Errorf("query text exceeds budget")
