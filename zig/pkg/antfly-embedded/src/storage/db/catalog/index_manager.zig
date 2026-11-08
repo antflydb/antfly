@@ -4605,9 +4605,9 @@ pub const IndexManager = struct {
 
     /// Status-only opens consume durable catalog and lifecycle records from the
     /// primary store, but never serve vectors or own native-file maintenance.
-    /// Keep that observational binding separate from the runtime binding:
-    /// loading a vector generation here would also reclaim unreferenced files,
-    /// turning a public status read into synchronous, mutating disk work.
+    /// Keep status binding separate from runtime construction: it needs no
+    /// serving vector mappings. Generation observation never grants physical
+    /// collection authority; recovery requires exclusion from active builders.
     fn bindPrimaryStoreForStatus(self: *IndexManager, store: anytype) void {
         const Store = @TypeOf(store);
         if (comptime Store == *docstore_mod.DocStore) self.primary_store = store;

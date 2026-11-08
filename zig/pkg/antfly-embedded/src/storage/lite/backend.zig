@@ -1740,7 +1740,7 @@ test "lite backend native open requires an existing file" {
     }));
 }
 
-test "lite backend recovers vector crash orphans only on writer reopen" {
+test "lite backend cold vector opens preserve construction until exclusive recovery" {
     const alloc = std.testing.allocator;
     const Connection = @import("connection.zig").Connection;
     const VectorStore = @import("../vector_block_store.zig").Store;
@@ -1794,7 +1794,10 @@ test "lite backend recovers vector crash orphans only on writer reopen" {
                 try std.testing.expectEqual(@as(u64, 6), try storage.fileSize(orphan));
                 if (!published) try std.testing.expectError(error.FileNotFound, storage.fileSize(root ++ "/wal-1.afvw"));
             } else {
-                try std.testing.expectError(error.FileNotFound, storage.fileSize(orphan));
+                // A writer runtime is still an observer at open: another
+                // detached actor can be preparing this generation.
+                try std.testing.expectEqual(@as(u64, 6), try storage.fileSize(orphan));
+                if (!published) try std.testing.expectError(error.FileNotFound, storage.fileSize(root ++ "/wal-1.afvw"));
             }
             try std.testing.expectEqual(@as(u64, 4), try storage.fileSize(unrelated));
             try std.testing.expectEqual(@as(u64, 4), try storage.fileSize(root ++ "/unmanaged"));
@@ -1804,6 +1807,27 @@ test "lite backend recovers vector crash orphans only on writer reopen" {
                 var scratch: [1]f32 = undefined;
                 try std.testing.expectEqualSlices(f32, &.{1.0}, try (try blocks.get("artifact", 0, 1)).vector.decodeInto(&scratch));
             }
+        }
+        // Every DB above is closed and its workers joined. This controlled
+        // fixture has no foreign actors/builders; explicit recovery now owns
+        // the exclusion required by reclaimUnreferencedFiles, unlike a generic
+        // cold runtime open in a multi-owner process.
+        var recovered = try Handle.open(alloc, fixture.path(), .{});
+        defer recovered.deinit();
+        var opts = db_mod.OpenOptions{};
+        try recovered.configureDbOpenOptions(&opts);
+        const storage = opts.index_backends.vector_block_storage.?;
+        var blocks = try VectorStore.open(alloc, storage, root);
+        defer blocks.deinit();
+        _ = try blocks.reclaimUnreferencedFiles();
+        try std.testing.expectError(error.FileNotFound, storage.fileSize(orphan));
+        try std.testing.expectEqual(@as(u64, 4), try storage.fileSize(unrelated));
+        try std.testing.expectEqual(@as(u64, 4), try storage.fileSize(root ++ "/unmanaged"));
+        if (published) {
+            var current = try VectorStore.openReadOnlyWithBlocks(alloc, storage, root);
+            defer current.deinit();
+            var scratch: [1]f32 = undefined;
+            try std.testing.expectEqualSlices(f32, &.{1.0}, try (try current.get("artifact", 0, 1)).vector.decodeInto(&scratch));
         }
     }
 }

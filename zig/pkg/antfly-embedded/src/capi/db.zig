@@ -5671,7 +5671,7 @@ pub fn antfly_db_batch_json(
     var response: ?[]u8 = batch_api.encodeBatchResponse(response_allocator, owned.result()) catch |err|
         return capi.mapErrorContext(err, "batch response allocation failed before mutation; no write applied");
     defer if (response) |buffer| response_allocator.free(buffer);
-    const code = executeOwnedDocumentBatch(handle_ptr, owned.req);
+    const code = executeOwnedDocumentBatch(handle_ptr, db_mod.types.fromPublicMutation(owned.req));
     if (code != .ok) return code;
     out_buf.* = .{ .ptr = response.?.ptr, .len = response.?.len };
     response = null;

@@ -12110,7 +12110,7 @@ test "capi native replay admission excludes slow refused preparation from busy w
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.attempts += 1;
             if (self.attempts == 1) try h.handleLockIo().sleep(.fromMilliseconds(750), .awake);
-            try handle.database().*.batchTracked(self.batch.req, primary_committed);
+            try handle.database().*.batchTracked(h.db_mod.types.fromPublicMutation(self.batch.req), primary_committed);
         }
     };
     const Consumer = struct {
