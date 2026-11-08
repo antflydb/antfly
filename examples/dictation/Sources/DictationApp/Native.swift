@@ -380,7 +380,7 @@ final class CaptureConverter: @unchecked Sendable {
     return InsertionTarget(
       pid: app.processIdentifier, bundleID: app.bundleIdentifier ?? "", element: element)
   }
-  func paste(_ text: String) async throws {
+  private func validatePasteTarget() throws {
     guard AXIsProcessTrusted() else {
       throw DictationError.invalid(
         "Enable Accessibility for Antfly Dictation to paste. The transcript is ready to copy.")
@@ -400,31 +400,18 @@ final class CaptureConverter: @unchecked Sendable {
       throw DictationError.invalid(
         "Focused text field changed. Copy the transcript to insert it manually.")
     }
-    let clipboard = NSPasteboard.general
-    let saved =
-      clipboard.pasteboardItems?.map { item in
-        item.types.compactMap { type in item.data(forType: type).map { (type, $0) } }
-      } ?? []
-    clipboard.clearContents()
-    clipboard.setString(text, forType: .string)
-    let count = clipboard.changeCount
-    guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
-      let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false)
-    else { throw DictationError.invalid("Cannot generate paste event.") }
-    down.flags = .maskCommand
-    up.flags = .maskCommand
-    down.post(tap: .cghidEventTap)
-    up.post(tap: .cghidEventTap)
-    // Let the recipient read the clipboard; do not overwrite a concurrent copy.
-    try? await Task.sleep(for: .milliseconds(750))
-    if clipboard.changeCount == count {
-      clipboard.clearContents()
-      let items = saved.map { entries in
-        let item = NSPasteboardItem()
-        for (type, data) in entries { item.setData(data, forType: type) }
-        return item
-      }
-      clipboard.writeObjects(items)
+  }
+  func paste(_ text: String) async throws {
+    try validatePasteTarget()
+    try await DesktopClipboard.shared.paste(text) {
+      try validatePasteTarget()
+      guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
+        let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false)
+      else { throw DictationError.invalid("Cannot generate paste event.") }
+      down.flags = .maskCommand
+      up.flags = .maskCommand
+      down.post(tap: .cghidEventTap)
+      up.post(tap: .cghidEventTap)
     }
   }
 }
@@ -436,4 +423,60 @@ final class CaptureConverter: @unchecked Sendable {
     }
     _ = NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app"))
   }
+}
+
+@MainActor private enum DesktopClipboard {
+  static let shared = ClipboardCoordinator(
+    read: {
+      try await Task.detached(priority: .userInitiated) {
+        let board = NSPasteboard.general
+        let count = board.changeCount
+        let items = board.pasteboardItems ?? []
+        guard items.count <= 16 else {
+          throw DictationError.invalid(
+            "Clipboard is too large to preserve. Copy the transcript manually.")
+        }
+        var bytes = 0
+        var representations = 0
+        var saved: [[ClipboardCoordinator.Representation]] = []
+        for item in items {
+          var entries: [ClipboardCoordinator.Representation] = []
+          for type in item.types {
+            representations += 1
+            guard representations <= 64 else {
+              throw DictationError.invalid(
+                "Clipboard has too many formats to preserve. Copy the transcript manually.")
+            }
+            guard let data = item.data(forType: type) else {
+              throw DictationError.invalid(
+                "Clipboard cannot be preserved. Copy the transcript manually.")
+            }
+            bytes += data.count
+            guard bytes <= 8 * 1024 * 1024 else {
+              throw DictationError.invalid(
+                "Clipboard is too large to preserve. Copy the transcript manually.")
+            }
+            entries.append(.init(type: type.rawValue, data: data))
+          }
+          saved.append(entries)
+        }
+        return ClipboardCoordinator.Snapshot(count: count, items: saved)
+      }.value
+    }, count: { NSPasteboard.general.changeCount },
+    writeText: { text in
+      let board = NSPasteboard.general
+      board.clearContents()
+      board.setString(text, forType: .string)
+      return board.changeCount
+    },
+    restore: { saved in
+      let board = NSPasteboard.general
+      board.clearContents()
+      let items = saved.map { entries in
+        let item = NSPasteboardItem()
+        for entry in entries { item.setData(entry.data, forType: .init(entry.type)) }
+        return item
+      }
+      board.writeObjects(items)
+    })
 }

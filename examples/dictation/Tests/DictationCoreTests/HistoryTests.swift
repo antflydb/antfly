@@ -198,7 +198,8 @@ final class StoreProtocol: URLProtocol, @unchecked Sendable {
     let store = Store(
       directory: directory, registerHotkey: false,
       historyUpload: { _, _ in Issue.record("Deleted history uploaded") },
-      clientFactory: { try AntflyClient(configuration: $0, session: session) })
+      clientFactory: { try AntflyClient(configuration: $0, session: session) },
+      credentialReader: { _ in "" }, credentialWriter: { _, _ in })
     store.config.retainHistory = true
     store.config.server = "https://original.example"
     await store.recordHistory(historyEntry(), snapshot: store.config)
@@ -233,7 +234,8 @@ final class StoreProtocol: URLProtocol, @unchecked Sendable {
     let store = Store(
       directory: directory, registerHotkey: false,
       historyUpload: { _, _ in Issue.record("Deletion failure resumed an upload") },
-      clientFactory: { try AntflyClient(configuration: $0, session: session) })
+      clientFactory: { try AntflyClient(configuration: $0, session: session) },
+      credentialReader: { _ in "" }, credentialWriter: { _, _ in })
     store.config.retainHistory = true
     await store.recordHistory(historyEntry(), snapshot: store.config)
     do {
@@ -245,11 +247,20 @@ final class StoreProtocol: URLProtocol, @unchecked Sendable {
     await store.outbox?.resume()
     await store.outbox?.waitUntilIdle()
   }
-  @Test @MainActor func damagedOutboxDoesNotPreventLocalRetentionOrDeletion() async throws {
+  @Test @MainActor func damagedOutboxRetainsLocalHistoryAndFailsRemoteDeletionClosed() async throws
+  {
     let directory = try testDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     let queueDirectory = directory.appendingPathComponent("outbox")
-    try FileManager.default.createDirectory(at: queueDirectory, withIntermediateDirectories: true)
+    var configuration = Configuration()
+    configuration.retainHistory = true
+    try JSONEncoder().encode(configuration).write(
+      to: directory.appendingPathComponent("settings.json"))
+    let pending = try HistoryOutbox(
+      directory: queueDirectory, paused: true,
+      upload: { _, _ in Issue.record("Paused queue dispatched") })
+    try await pending.enqueue(
+      historyEntry(), destination: .init(server: "https://original.example", table: "dictation"))
     try Data(count: 8 * 1024 * 1024 + 1).write(
       to: queueDirectory.appendingPathComponent("oversized.json"))
     HistoryDeleteProtocol.failure = false
@@ -258,14 +269,24 @@ final class StoreProtocol: URLProtocol, @unchecked Sendable {
     let session = URLSession(configuration: options)
     let store = Store(
       directory: directory, registerHotkey: false,
-      clientFactory: { try AntflyClient(configuration: $0, session: session) })
+      clientFactory: { try AntflyClient(configuration: $0, session: session) },
+      credentialReader: { _ in "" }, credentialWriter: { _, _ in })
     #expect(store.outbox == nil)
     store.config.retainHistory = true
     await store.recordHistory(historyEntry(), snapshot: store.config)
     let file = directory.appendingPathComponent("history.json")
     #expect(try JSONDecoder().decode([HistoryEntry].self, from: Data(contentsOf: file)).count == 1)
-    try await store.deleteRetainedHistory()
-    #expect(try JSONDecoder().decode([HistoryEntry].self, from: Data(contentsOf: file)).isEmpty)
+    do {
+      try await store.deleteRetainedHistory()
+      Issue.record("Deletion must not report success while pending jobs cannot be canceled")
+    } catch {}
+    #expect(try JSONDecoder().decode([HistoryEntry].self, from: Data(contentsOf: file)).count == 1)
+    store.config.retainHistory = false
+    store.save()
+    await store.historySettingsTask?.value
+    #expect(!FileManager.default.fileExists(atPath: queueDirectory.path))
+    let restarted = Store(directory: directory, registerHotkey: false)
+    #expect(await restarted.outbox?.status().pending == 0)
   }
 
 }
@@ -356,4 +377,28 @@ func manualHistoryRetryDoesNotRetargetOldTranscriptsAfterConnectionChanges() asy
     await probe.destinations == [
       HistoryDestination(server: "https://original.example", table: "original")
     ])
+}
+
+@Test func disablingRetentionCannotCancelADispatchedWriteDuringDeletion() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let probe = HistoryProbe()
+  let queue = try HistoryOutbox(
+    directory: directory.appendingPathComponent("outbox"),
+    upload: { await probe.upload($0, to: $1) })
+  let entry = historyEntry()
+  try await queue.enqueue(
+    entry, destination: .init(server: "https://example.com", table: "dictation"))
+  while await probe.uploads.isEmpty { await Task.yield() }
+  let deletion = Task { await queue.pause() }
+  while !(await queue.status()).paused { await Task.yield() }
+  let disable = Task { await queue.setEnabled(false) }
+  await Task.yield()
+  await probe.release()
+  let hold = await deletion.value
+  await disable.value
+  #expect(await probe.wasCanceled == false)
+  try await queue.discard(ids: [entry.id])
+  await queue.resume(hold)
+  #expect((await queue.status()).paused)
 }

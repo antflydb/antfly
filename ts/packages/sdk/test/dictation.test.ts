@@ -16,6 +16,8 @@ describe("dictation", () => {
       expect(input.url).toBe("http://localhost:8080/ai/v1/dictate");
       expect(await input.json()).toEqual({ ...request, stream: false });
       expect(input.signal.aborted).toBe(false);
+      expect(input.headers.get("Authorization")).toBe("Bearer override");
+      expect(input.headers.get("Accept")).toBe("application/json");
       return Response.json({
         object: "dictation",
         text: "Antfly",
@@ -23,8 +25,18 @@ describe("dictation", () => {
       });
     });
     vi.stubGlobal("fetch", fetch);
-    const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
-    expect((await client.dictate(request, { signal: abort.signal })).text).toBe("Antfly");
+    const client = new InferenceClient({
+      baseUrl: "http://localhost:8080",
+      headers: { Authorization: "Bearer original" },
+    });
+    expect(
+      (
+        await client.dictate(request, {
+          signal: abort.signal,
+          headers: { authorization: "Bearer override", Accept: "ignored" },
+        })
+      ).text
+    ).toBe("Antfly");
     expect(fetch).toHaveBeenCalledOnce();
   });
 
@@ -36,17 +48,25 @@ describe("dictation", () => {
     ];
     vi.stubGlobal(
       "fetch",
-      vi.fn(
-        async () =>
-          new Response(
-            `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
-            { headers: { "Content-Type": "text/event-stream" } }
-          )
-      )
+      vi.fn(async (_url, init) => {
+        const headers = new Headers(init?.headers);
+        expect(headers.get("Authorization")).toBe("Bearer override");
+        expect(headers.get("Accept")).toBe("text/event-stream");
+        return new Response(
+          `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
+          { headers: { "Content-Type": "text/event-stream" } }
+        );
+      })
     );
-    const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+    const client = new InferenceClient({
+      baseUrl: "http://localhost:8080",
+      headers: { Authorization: "Bearer original" },
+    });
     const received = [];
-    for await (const event of client.dictateStream(request)) received.push(event);
+    for await (const event of client.dictateStream(request, {
+      headers: { authorization: "Bearer override", Accept: "ignored" },
+    }))
+      received.push(event);
     expect(received).toEqual(events);
   });
 

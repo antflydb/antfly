@@ -686,3 +686,128 @@ def test_real_whisper_final_segments_clean_before_release_and_flush_tail(tmp_pat
                 server.url + f"/ai/v1/transcription/sessions/{session_id}", timeout=40
             )
         server.stop()
+
+
+@pytest.mark.e2e_resource("antfly_process")
+@pytest.mark.skipif(
+    os.environ.get("ANTFLY_TEST_WHISPER_SESSIONS") != "1",
+    reason="Requires an installed Whisper model; never downloads models",
+)
+@pytest.mark.parametrize("capacity", [1, 2])
+def test_recorded_whisper_cleanup_uses_one_slot_per_stage(tmp_path, capacity):
+    """A fresh composite request must work with one shared inference slot."""
+    models_dir = Path.home() / ".antfly/inference/models"
+    model = os.environ.get("ANTFLY_TEST_WHISPER_MODEL", "openai/whisper-tiny")
+    if not (models_dir / model / "model_manifest.json").exists():
+        pytest.skip("Whisper model is not installed")
+
+    class Cleanup(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "Clean."},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    fixture = ThreadingHTTPServer(("127.0.0.1", 0), Cleanup)
+    thread = threading.Thread(target=fixture.serve_forever, daemon=True)
+    thread.start()
+    config = tmp_path / "recorded-config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "public_inference": {"enabled": True, "default_timeout_ms": 60000},
+                "resources": {
+                    "inference": {"admission": {"max_concurrent_requests": capacity}}
+                },
+                "inference": {"models_dir": str(models_dir)},
+                "transcribers": {"speech": {"provider": "antfly", "model": model}},
+                "generators": {
+                    "cleanup": {
+                        "provider": "openai",
+                        "model": "fixture",
+                        "url": f"http://127.0.0.1:{fixture.server_port}/v1",
+                        "api_key": "fixture",
+                        "max_tokens": 256,
+                    }
+                },
+            }
+        )
+    )
+    binary = harness.resolve_binary_path(
+        os.environ.get("ANTFLY_BIN", str(harness.DEFAULT_ANTFLY_BIN))
+    )
+    server = None
+    try:
+        server = harness.StandaloneAntflyServer(
+            binary, "127.0.0.1", 0, config_path=config
+        )
+        audio = (
+            Path(__file__).resolve().parents[2]
+            / "lib/transcribing/src/testdata/apple-speech.wav"
+        ).read_bytes()
+        for stream in [False, True]:
+            metadata = json.dumps(
+                {
+                    "model": "transcribers/speech",
+                    "audio": "attachment:0",
+                    "language": "en",
+                    "cleanup_model": "generators/cleanup",
+                    "stream": stream,
+                }
+            ).encode()
+            mime = b"audio/wav"
+            body = (
+                b"AFATT001"
+                + struct.pack("<QII", len(metadata), 1, 0)
+                + struct.pack("<IIQ", len(mime), 0, len(audio))
+                + metadata
+                + mime
+                + audio
+            )
+            response = requests.post(
+                server.url + "/ai/v1/dictate",
+                data=body,
+                headers={"Content-Type": "application/vnd.antfly.attachments.v1"},
+                timeout=90,
+            )
+            assert response.status_code == 200, response.text
+            if stream:
+                assert '"type":"dictation.transcript"' in response.text
+                assert '"type":"dictation.completed"' in response.text
+                assert "[DONE]" in response.text
+                assert '"type":"error"' not in response.text
+            else:
+                assert response.json()["text"] == "Clean."
+                assert response.json()["transcript"]["text"].strip()
+        response = requests.post(
+            server.url + "/ai/v1/dictate",
+            json={
+                "model": "transcribers/speech",
+                "audio": base64.b64encode(audio).decode(),
+                "language": "en",
+                "style": "verbatim",
+            },
+            timeout=90,
+        )
+        assert response.status_code == 200, response.text
+    finally:
+        if server is not None:
+            server.stop()
+        fixture.shutdown()
+        fixture.server_close()
+        thread.join(timeout=5)

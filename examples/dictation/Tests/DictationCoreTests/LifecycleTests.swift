@@ -147,3 +147,87 @@ private final class DiscoveryProtocol: URLProtocol, @unchecked Sendable {
   }
   override func stopLoading() {}
 }
+
+@Test @MainActor func savingBeforeDiscoveryPreservesUnloadedCredentialAndHonorsExplicitClear()
+  async throws
+{
+  let directory = try lifecycleDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  var credentials = ["https://saved.example": "secret"]
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    credentialReader: { credentials[$0] ?? "" },
+    credentialWriter: { credentials[$1] = $0 })
+  store.config.server = "https://saved.example"
+  store.connectionChanged()
+  store.save()
+  #expect(credentials["https://saved.example"] == "secret")
+  store.token = ""
+  store.save()
+  #expect(credentials["https://saved.example"] == "")
+  store.discoveryTask?.cancel()
+}
+
+@Test @MainActor func retentionDisableFencesAnArchiveAlreadyWriting() async throws {
+  let directory = try lifecycleDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let began = LifecycleSignal()
+  let release = LifecycleSignal()
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    audioArchiveStage: { data, directory in
+      await began.send()
+      await release.wait()
+      // Deliberately ignore cancellation to model a completed kernel write.
+      let file = directory.appendingPathComponent(".recording-" + UUID().uuidString + ".wav")
+      try data.write(to: file)
+      return file
+    }, credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  store.config.retainAudio = true
+  store.archiveAudio(Task { Data([1, 2, 3]) }, run: store.generation)
+  let archive = store.audioArchiveTask
+  await began.wait()
+  #expect(store.state == .idle)
+  store.config.retainAudio = false
+  store.save()
+  await release.send()
+  await archive?.value
+  #expect(
+    !FileManager.default.fileExists(
+      atPath: directory.appendingPathComponent("last-recording.wav").path))
+  #expect(
+    try FileManager.default.contentsOfDirectory(atPath: directory.path).allSatisfy {
+      !$0.hasPrefix(".recording-")
+    })
+  await store.historySettingsTask?.value
+}
+
+@Test @MainActor func slowFailingAudioArchiveDoesNotDelayOrFailDictation() async throws {
+  let directory = try lifecycleDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let began = LifecycleSignal()
+  let release = LifecycleSignal()
+  let options = URLSessionConfiguration.ephemeral
+  options.protocolClasses = [StoreProtocol.self]
+  let client = try AntflyClient(
+    server: "https://fixture.example", session: URLSession(configuration: options))
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    audioArchiveStage: { _, _ in
+      await began.send()
+      await release.wait()
+      throw DictationError.invalid("Disk unavailable")
+    }, clientFactory: { _ in client }, credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  store.config.retainAudio = true
+  store.config.autoPaste = false
+  store.archiveAudio(Task { Data([1]) }, run: store.generation)
+  await began.wait()
+  store.submit(
+    audio: Data([1]), preset: store.config.presets[0], snapshot: store.config, destination: nil)
+  await store.requestTask?.value
+  #expect(store.state == .idle && store.result == "Clean.")
+  await release.send()
+  await store.audioArchiveTask?.value
+  #expect(store.state == .idle && store.result == "Clean.")
+  #expect(store.processingWarning.contains("Audio archive unavailable"))
+}

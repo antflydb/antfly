@@ -289,3 +289,25 @@ private actor PreviewProbe {
   #expect(await preview.raw == "one tail provisional")
   #expect(try await pipeline.finish(Data()).text == "ONE TAIL")
 }
+
+@Test func completedLiveResultDoesNotWaitForSessionDisposal() async throws {
+  let began = Signal()
+  let release = Signal()
+  let disposed = Signal()
+  let pipeline = LiveDictation(
+    incremental: false, needsCleanup: false,
+    recognize: { _, _ in [final(1, "ready", 0)] },
+    clean: { DictationResult(raw: $0, text: $0) },
+    close: {
+      await began.send()
+      await release.wait()
+      await disposed.send()
+    })
+  let result = try await pipeline.finish(Data())
+  #expect(result.text == "ready")
+  await began.wait()
+  #expect(await disposed.ready == false)
+  await release.send()
+  await pipeline.cancel()
+  #expect(await disposed.ready)
+}

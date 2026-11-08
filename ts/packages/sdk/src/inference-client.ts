@@ -907,9 +907,10 @@ export class InferenceClient {
   ): Promise<components["schemas"]["InferenceDictateResponse"]> {
     const { data, error, response } = await this.client.POST("/ai/v1/dictate", {
       body: { ...request, stream: false },
+      headers: this.requestHeaders(options?.headers, "application/json"),
       signal: options?.signal,
     });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("Dictation returned an empty response");
     return data;
   }
@@ -921,7 +922,7 @@ export class InferenceClient {
   ): AsyncGenerator<components["schemas"]["InferenceDictationEvent"], void, void> {
     const response = await fetch(`${this.baseUrl}/ai/v1/dictate`, {
       method: "POST",
-      headers: { ...this.headers, Accept: "text/event-stream" },
+      headers: this.requestHeaders(options?.headers, "text/event-stream"),
       body: JSON.stringify({ ...request, stream: true }),
       signal: options?.signal,
     });

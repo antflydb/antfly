@@ -29,6 +29,13 @@ public actor LiveDictation {
   private var stopped = false
   private var appending = false
   private var worker: Task<Void, Never>?
+  // Separately owned disposal never gates transcript delivery or a new recording.
+  private var disposal: Task<Void, Never>?
+  private func dispose() {
+    guard disposal == nil else { return }
+    let close = self.close
+    disposal = Task(priority: .utility) { await close() }
+  }
   private var failure: String?
   private var started = ProcessInfo.processInfo.systemUptime
   private var recognitionSeconds: TimeInterval = 0
@@ -189,7 +196,7 @@ public actor LiveDictation {
       try Task.checkCancellation()
       guard !stopped else { throw CancellationError() }
       stopped = true
-      await close()
+      dispose()
       return DictationResult(
         raw: original, text: final,
         timing: DictationTiming(
@@ -199,7 +206,7 @@ public actor LiveDictation {
       stopped = true
       worker?.cancel()
       if let worker { await worker.value }
-      await close()
+      dispose()
       throw error
     }
   }
@@ -207,6 +214,7 @@ public actor LiveDictation {
     stopped = true
     worker?.cancel()
     if let worker { await worker.value }
-    await close()
+    dispose()
+    await disposal?.value
   }
 }

@@ -143,7 +143,7 @@ public actor HistoryOutbox {
       start()
     } else {
       let active = worker
-      active?.cancel()
+      if !uploading { active?.cancel() }
       await active?.value
     }
     await notify()

@@ -239,7 +239,22 @@ public actor AntflyClient {
     return try JSONDecoder().decode(Response.self, from: data).data
   }
   public func closeSession(_ id: String) async {
-    _ = try? await json("ai/v1/transcription/sessions/\(id)", method: "DELETE")
+    var disposal = request("ai/v1/transcription/sessions/\(id)", method: "DELETE")
+    // The server TTL is the fallback if disposal cannot reach the server.
+    disposal.timeoutInterval = 3
+    let request = disposal
+    let session = self.session
+    let operation = Task { try await session.data(for: request) }
+    let deadline = Task {
+      do { try await Task.sleep(for: .seconds(3)) } catch { return }
+      operation.cancel()
+    }
+    defer { deadline.cancel() }
+    _ = try? await withTaskCancellationHandler {
+      try await operation.value
+    } onCancel: {
+      operation.cancel()
+    }
   }
   public func setup(table: String) async throws {
     // GET distinguishes an existing table from a genuine create failure.

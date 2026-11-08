@@ -629,7 +629,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
     if (task != .transcribe) {
         if (execution_options.attachments) |attachments| request = try inlineTaskAttachments(a, task, request, attachments);
     }
-    const caller_owns_admission = if (generator_override) |cfg| !(cfg.provider == .antfly and cfg.url.len == 0 and server.antfly_provider != null and server.antfly_provider.?.owns_invocation_admission) else !try ownsLocalAdmission(server, named, target.configured.task, target.configured.name);
+    const caller_owns_admission = task != .transcribe and (if (generator_override) |cfg| !(cfg.provider == .antfly and cfg.url.len == 0 and server.antfly_provider != null and server.antfly_provider.?.owns_invocation_admission) else !try ownsLocalAdmission(server, named, target.configured.task, target.configured.name));
     if (caller_owns_admission and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
     defer if (caller_owns_admission) server.releaseInference();
     var client = httpx.Client.initWithConfig(a, server.inferenceIo(), .{ .keep_alive = false });
@@ -901,6 +901,8 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                     },
                 }
             } else blk: {
+                if (!server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
+                defer server.releaseInference();
                 var result = try executor.transcribeWithAudio(a, name, .{
                     .url = if (attachment != null) value.audio else try std.fmt.allocPrint(a, "data:audio/wav;base64,{s}", .{value.audio}),
                     .language = value.language,
@@ -929,7 +931,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                     .{ .role = .system, .content = .{ .text = try cleanup.buildSystemPrompt(a, options) } },
                     .{ .role = .user, .content = .{ .text = try cleanup.buildUserPrompt(a, raw) } },
                 };
-                var generated = generateDictationCleanup(a, executor, cleanup_name, &messages, value.max_tokens orelse cleanup.suggestedMaxTokens(raw.len)) catch |err| {
+                var generated = admittedDictationCleanup(server, named, a, executor, cleanup_name, &messages, value.max_tokens orelse cleanup.suggestedMaxTokens(raw.len)) catch |err| {
                     if (writer) |*stream| {
                         try dictationEvent(a, stream, .{ .type = "error", .id = id, .@"error" = @errorName(err), .message = "Dictation cleanup failed; raw transcript is available." });
                         try stream.writeEvent(null, "[DONE]");
@@ -2336,7 +2338,7 @@ fn nativeDictationTranscript(server: anytype, ctx: *httpx.Context, a: std.mem.Al
     }.cancelled };
     var buffered = options;
     buffered.response_delivery = .buffered;
-    buffered.admission_held = true;
+    buffered.admission_held = false;
     // Keep recognition audio borrowed in its original binary envelope.
     // The forwarding transport accounts for media separately from metadata.
     buffered.attachments = options.attachments;
@@ -2359,6 +2361,15 @@ fn dictationAttachment(audio: []const u8, attachments: ?[]const httpx.attachment
     }
     if (index != null) return error.InvalidInferenceRequest;
     return null;
+}
+
+/// Composite stages run sequentially and must never reserve a gateway slot
+/// while an embedded invocation reserves that same resource again.
+fn admittedDictationCleanup(server: anytype, named: gateway.View, a: std.mem.Allocator, executor: tasks.Executor, name: []const u8, messages: []const generating.ChatMessage, max_tokens: i64) !generating.GenerateResult {
+    const acquire = !try ownsLocalAdmission(server, named, .generate, name);
+    if (acquire and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
+    defer if (acquire) server.releaseInference();
+    return generateDictationCleanup(a, executor, name, messages, max_tokens);
 }
 
 fn generateDictationCleanup(a: std.mem.Allocator, executor: tasks.Executor, name: []const u8, messages: []const generating.ChatMessage, max_tokens: i64) !generating.GenerateResult {

@@ -23,7 +23,17 @@ import SwiftUI
   @Published var models: [DiscoveredModel] = []
   @Published var searchText = ""
   @Published var searchResult = ""
-  @Published var token = ""
+  @Published var token = "" { didSet { if !loadingCredential { credentialEdited = true } } }
+  private var loadingCredential = false
+  private var credentialOrigin: String?
+  private var credentialEdited = false
+  private func loadCredential(for origin: String) {
+    loadingCredential = true
+    token = credentialReader(origin)
+    loadingCredential = false
+    credentialOrigin = origin
+    credentialEdited = false
+  }
   @Published var working = false
   @Published var historySyncStatus = "History sync idle."
   @Published var historyWorking = false
@@ -36,6 +46,7 @@ import SwiftUI
   private var overlayTask: Task<Void, Never>?
   private(set) var outbox: HistoryOutbox?
   private var historyRevision: UInt64 = 0
+  private(set) var historySettingsTask: Task<Void, Never>?
   private var microphone: Microphone?
   private var target: InsertionTarget?
   private var selected: Preset?
@@ -56,6 +67,9 @@ import SwiftUI
   private let settingsOpener: @MainActor (String) -> Void
   private let credentialReader: @MainActor (String) -> String
   private let credentialWriter: @MainActor (String, String) throws -> Void
+  private(set) var audioArchiveTask: Task<Void, Never>?
+  private let audioArchiveStage: @Sendable (Data, URL) async throws -> URL
+  private var audioRetentionEpoch = UUID()
   private var retryRecording: PCMRecording?
   private var retryPreset: Preset?
   private let clientFactory: (@Sendable (Configuration) throws -> AntflyClient)?
@@ -66,6 +80,9 @@ import SwiftUI
   init(
     directory storageDirectory: URL? = nil, registerHotkey: Bool = true,
     historyUpload: HistoryOutbox.Upload? = nil,
+    audioArchiveStage: @escaping @Sendable (Data, URL) async throws -> URL = {
+      try await RecordingArchive.stage($0, in: $1)
+    },
     clientFactory: (@Sendable (Configuration) throws -> AntflyClient)? = nil,
     shortcutManager: (any ShortcutManaging)? = nil,
     credentialReader: @escaping @MainActor (String) -> String = { Credentials.read(server: $0) },
@@ -80,6 +97,7 @@ import SwiftUI
     },
     settingsOpener: @escaping @MainActor (String) -> Void = { DesktopSettings.open($0) }
   ) {
+    self.audioArchiveStage = audioArchiveStage
     self.keyboardAccess = keyboardAccess
     self.keyboardAccessRequest = keyboardAccessRequest
     self.settingsOpener = settingsOpener
@@ -100,6 +118,10 @@ import SwiftUI
       if FileManager.default.fileExists(atPath: settingsFile.path) {
         config = try Configuration.decode(Data(contentsOf: settingsFile))
       }
+      if !config.retainHistory, FileManager.default.fileExists(atPath: historyFile.path) {
+        try FileManager.default.removeItem(at: historyFile)
+      }
+      if !config.retainAudio { try removeAudio() }
     } catch { message = error.localizedDescription }
     if config.retainHistory, let data = try? Data(contentsOf: historyFile) {
       do { history = try JSONDecoder().decode([HistoryEntry].self, from: data) } catch {
@@ -115,6 +137,13 @@ import SwiftUI
       message = error.localizedDescription
     }
     do {
+      // Disabled retention is authoritative after a crash, before any queue resumes.
+      if !config.retainHistory {
+        let queue = directory.appendingPathComponent("outbox")
+        if FileManager.default.fileExists(atPath: queue.path) {
+          try FileManager.default.removeItem(at: queue)
+        }
+      }
       outbox = try HistoryOutbox(
         directory: self.directory.appendingPathComponent("outbox"), paused: true, archive: archive,
         upload: historyUpload ?? { entry, destination in
@@ -127,7 +156,7 @@ import SwiftUI
       let legacyDestination = HistoryDestination(server: config.server, table: config.table)
       Task { await restoreHistoryDestinations(legacyDestination: legacyDestination) }
     }
-    token = registerHotkey ? credentialReader(config.server) : ""
+    if registerHotkey { loadCredential(for: config.server) }
     hotkey?.changed = { [weak self] down in self?.shortcut(down: down) }
     hotkey?.interrupted = { [weak self] in if self?.state != .idle { self?.cancel() } }
     if registerHotkey {
@@ -244,30 +273,46 @@ import SwiftUI
   }
   private func persistSettings() throws -> String? {
     config = try config.validated()
+    // Unloaded credentials are different from a token explicitly cleared by the user.
+    if credentialOrigin != config.server && !credentialEdited { loadCredential(for: config.server) }
     try credentialWriter(token, config.server)
+    credentialOrigin = config.server
+    credentialEdited = false
     try write(JSONEncoder().encode(config), to: settingsFile)
     var shortcutIssue: String?
     do { try registerShortcut() } catch {
       shortcutIssue = error.localizedDescription
       shortcutStatus = error.localizedDescription
     }
+    let previousHistorySettings = historySettingsTask
     if !config.retainHistory {
       history = []
       historyRevision += 1
       let revision = historyRevision
-      Task {
+      historySettingsTask = Task {
+        await previousHistorySettings?.value
         await outbox?.setEnabled(false)
-        guard !config.retainHistory else {
-          await outbox?.setEnabled(true)
-          return
-        }
         do {
-          try await outbox?.discardAll()
+          if let outbox {
+            try await outbox.discardAll()
+          } else {
+            // No worker exists when initialization failed. Atomically retire the
+            // whole queue, including malformed jobs, before removing its files.
+            let queue = directory.appendingPathComponent("outbox")
+            if FileManager.default.fileExists(atPath: queue.path) {
+              let retired = directory.appendingPathComponent("retired-outbox-" + UUID().uuidString)
+              try FileManager.default.moveItem(at: queue, to: retired)
+              try FileManager.default.removeItem(at: retired)
+            }
+          }
           try await archive.store([], revision: revision)
         } catch { historySyncStatus = error.localizedDescription }
       }
     } else {
-      Task { await outbox?.resume() }
+      historySettingsTask = Task {
+        await previousHistorySettings?.value
+        await outbox?.resume()
+      }
     }
     if !config.retainAudio { try removeAudio() }
     return shortcutIssue
@@ -460,25 +505,13 @@ import SwiftUI
       let pump = plan?.session == true ? previewTask : nil
       let usesSession = plan?.session == true
       let run = generation
+      // Share one conversion between archival and a recorded-upload fallback.
+      let retainedEncoding = snapshot.retainAudio ? Task { try await recording.encoded() } : nil
+      if let retainedEncoding { archiveAudio(retainedEncoding, run: run) }
       runSubmission(preset: preset, snapshot: snapshot, destination: target, releasedAt: releasedAt)
       { [self] in
         // Successful sessions need only the final PCM tail, never a full WAV copy.
         var audio: Data?
-        if snapshot.retainAudio {
-          audio = try await recording.encoded()
-          try Task.checkCancellation()
-          guard generation == run else { throw CancellationError() }
-          let file = directory.appendingPathComponent("last-recording.wav")
-          let candidate = try await RecordingArchive.stage(audio!, in: directory)
-          defer { try? FileManager.default.removeItem(at: candidate) }
-          try Task.checkCancellation()
-          guard generation == run else { throw CancellationError() }
-          if FileManager.default.fileExists(atPath: file.path) {
-            _ = try FileManager.default.replaceItemAt(file, withItemAt: candidate)
-          } else {
-            try FileManager.default.moveItem(at: candidate, to: file)
-          }
-        }
         await pump?.value
         try Task.checkCancellation()
         guard generation == run else { throw CancellationError() }
@@ -486,7 +519,11 @@ import SwiftUI
         if usesSession && preset.processingStrategy == .incremental {
           throw DictationError.invalid(liveFailure ?? "Incremental processing failed.")
         }
-        if audio == nil { audio = try await recording.encoded() }
+        if let retainedEncoding {
+          audio = try await retainedEncoding.value
+        } else {
+          audio = try await recording.encoded()
+        }
         try Task.checkCancellation()
         guard generation == run else { throw CancellationError() }
         return try await client(snapshot).dictate(
@@ -683,7 +720,9 @@ import SwiftUI
         try Task.checkCancellation()
         guard let self, discoveryGeneration == revision else { return }
         _ = try snapshot.validated()
-        if loadCredentials && token.isEmpty { token = credentialReader(snapshot.server) }
+        if loadCredentials && credentialOrigin != snapshot.server && !credentialEdited {
+          loadCredential(for: snapshot.server)
+        }
         let data = try await client(snapshot, token: token).models()
         try Task.checkCancellation()
         let catalog = try JSONDecoder().decode(ModelCatalog.self, from: Data(data.utf8))
@@ -694,7 +733,11 @@ import SwiftUI
   }
   func connectionChanged() {
     models = []
+    loadingCredential = true
     token = ""
+    loadingCredential = false
+    credentialOrigin = nil
+    credentialEdited = false
     scheduleDiscovery(debounce: true, loadCredentials: true)
   }
   func processingDescription(_ preset: Preset) -> String {
@@ -806,7 +849,7 @@ import SwiftUI
       incoming.table = current.table
       incoming.profile = current.profile
       self.config = incoming
-      self.token = self.credentialReader(incoming.server)
+      self.loadCredential(for: incoming.server)
       _ = try self.persistSettings()
       self.message = "Settings replaced from Antfly."
     }
@@ -879,9 +922,14 @@ import SwiftUI
     let entries = history
     let ids = Set(entries.map(\.id))
     guard !ids.isEmpty else { return }
-    let pauseToken = await outbox?.pause()
+    guard let outbox else {
+      throw DictationError.invalid(
+        "History sync is unavailable. Repair the outbox before deleting remote history; no deletion has been reported as complete."
+      )
+    }
+    let pauseToken = await outbox.pause()
     do {
-      let pending = await outbox?.destinations(for: ids) ?? [:]
+      let pending = await outbox.destinations(for: ids) ?? [:]
       var groups: [HistoryDestination: Set<String>] = [:]
       for entry in entries {
         var destinations = pending[entry.id] ?? []
@@ -893,7 +941,7 @@ import SwiftUI
         }
         for destination in destinations { groups[destination, default: []].insert(entry.id) }
       }
-      try await outbox?.discard(ids: ids)
+      try await outbox.discard(ids: ids)
       for (destination, matching) in groups {
         var connection = snapshot
         connection.server = destination.server
@@ -904,10 +952,10 @@ import SwiftUI
       history.removeAll { ids.contains($0.id) }
       historyRevision += 1
       try await archive.store(history, revision: historyRevision)
-      if let pauseToken { await outbox?.resume(pauseToken) }
+      await outbox.resume(pauseToken)
       historySyncStatus = "Matching history deleted from its original destinations."
     } catch {
-      if let pauseToken { await outbox?.resume(pauseToken) }
+      await outbox.resume(pauseToken)
       throw error
     }
   }
@@ -941,7 +989,39 @@ import SwiftUI
       }
     }
   }
+  func archiveAudio(_ encoding: Task<Data, Error>, run: UUID) {
+    audioArchiveTask?.cancel()
+    let epoch = audioRetentionEpoch
+    let stage = audioArchiveStage
+    audioArchiveTask = Task { [weak self, directory] in
+      do {
+        let data = try await encoding.value
+        try Task.checkCancellation()
+        let candidate = try await stage(data, directory)
+        defer { try? FileManager.default.removeItem(at: candidate) }
+        try Task.checkCancellation()
+        guard let self, generation == run, audioRetentionEpoch == epoch, config.retainAudio else {
+          return
+        }
+        let file = directory.appendingPathComponent("last-recording.wav")
+        if FileManager.default.fileExists(atPath: file.path) {
+          _ = try FileManager.default.replaceItemAt(file, withItemAt: candidate)
+        } else {
+          try FileManager.default.moveItem(at: candidate, to: file)
+        }
+      } catch is CancellationError {
+      } catch {
+        guard let self, generation == run, audioRetentionEpoch == epoch, config.retainAudio else {
+          return
+        }
+        processingWarning = "Audio archive unavailable: " + error.localizedDescription
+      }
+    }
+  }
   private func removeAudio() throws {
+    audioRetentionEpoch = UUID()
+    audioArchiveTask?.cancel()
+    audioArchiveTask = nil
     try RecordingArchive.removeStaleCandidates(in: directory)
     let file = directory.appendingPathComponent("last-recording.wav")
     if FileManager.default.fileExists(atPath: file.path) {
@@ -963,7 +1043,7 @@ import SwiftUI
       perform {
         let imported = try Configuration.decode(Data(contentsOf: url))
         self.config = imported
-        self.token = self.credentialReader(imported.server)
+        self.loadCredential(for: imported.server)
         _ = try self.persistSettings()
         self.message = "Settings imported."
       }

@@ -165,7 +165,9 @@ Apple currently recognizes recorded files, so Automatic explains that transcript
 and cleanup run after release. Unknown capability metadata also uses recorded clips.
 Legacy live preview on older Whisper servers remains provisional and requires the
 final full clip pass. Sessions are deleted on completion/failure/cancel; idle expiry
-bounds sessions whose creation response was interrupted. Live chunks also use binary
+bounds sessions whose creation response was interrupted. Session disposal runs separately
+from completed result delivery, uses a three-second HTTP timeout, and falls back
+to the server TTL when unavailable. Live chunks also use binary
 attachments. Cleanup may return one complete-text delta per batch; pipeline overlap
 does not imply token-streaming generation. No provider is changed automatically.
 
@@ -190,7 +192,13 @@ The app pastes once after successful completion, rather than revising text in an
 Silence produces no insertion. Expand Processing details for timings and fallback explanations.
 
 Paste temporarily places the text on the clipboard, sends Command-V, then restores
-the previous clipboard if no other app changed it. The OS does not acknowledge
+the previous clipboard if no other app changed it. Restoration runs separately after
+750 ms and does not delay the next recording. Overlapping pastes preserve the original
+clipboard; a user copy takes ownership immediately. Snapshotting runs off the UI
+thread and rejects more than 16 items, 64 representations, or 8 MiB of retained
+data, offering manual copy instead. macOS can materialize a large promised
+representation before its size is known; the app never retains it beyond the limit.
+Focus is checked again immediately before sending the paste. The OS does not acknowledge
 whether a recipient actually inserted the text; “paste sent” records that limit.
 Secure or custom text controls may need manual copy/paste.
 
@@ -237,13 +245,18 @@ History and audio retention are off by default:
   all matching pending jobs, and deletes
   the cached entries at their original server/table destinations before resuming.
   A remote deletion failure keeps local entries available for retry, but canceled
-  uploads cannot restart automatically. Manual uploads also preserve destinations.
+  uploads cannot restart automatically. If the queue cannot be loaded, remote deletion
+  fails closed and retains local history; it never reports success while unknown jobs
+  remain. Turning retention off retires the unavailable queue so it cannot upload on
+  restart. Manual uploads also preserve destinations.
   Legacy archives recover destinations from pending jobs; already uploaded legacy
   entries without destination metadata bind once to the configuration that loads
   them, since their earlier destination cannot be reconstructed. Turning history retention off removes
   pending uploads and the local archive. Older remote
   records beyond the local 500-entry window need normal Antfly table management.
-- Audio retention keeps only `last-recording.wav` locally, never in Antfly. Saving
+- Audio retention keeps only `last-recording.wav` locally, never in Antfly. Archival
+  runs independently of recognition and insertion; a disk failure produces a separate
+  warning. Canceled recordings and retention changes fence pending archive writes. Saving
   settings with retention disabled deletes retained local data; remote transcripts
   require explicit deletion. Inference providers have their own retention policy.
 
