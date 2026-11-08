@@ -484,9 +484,31 @@ pub const Socket = struct {
         };
         select.cancelDiscard();
         return switch (outcome) {
-            .operation => operation_result,
+            // `operation_result` is the *read sub-task's own* outcome, not
+            // the calling fiber's. See the comment on the `.timer` arm below:
+            // a blunt teardown sweep can cancel this sub-task directly, and
+            // that independent cancellation must not be mistaken for the
+            // calling fiber's own acknowledged cancellation.
+            .operation => operation_result catch |err| switch (err) {
+                error.Canceled => error.Timeout,
+                else => err,
+            },
             .timer => |result| blk: {
-                try result;
+                // `result` is the *timer sub-task's own* outcome, not the
+                // calling fiber's. `error.Canceled` here means something
+                // canceled this timer task directly (for example a harness
+                // teardown sweep that cancels every live task, not just the
+                // ones a caller is actually awaiting) rather than that this
+                // fiber's own cancellation was observed and acknowledged. A
+                // genuine cancellation of the calling fiber is already
+                // delivered above through `select.await()` returning
+                // `error.Canceled` directly. Forwarding the sub-task's
+                // independent cancellation here instead would make the
+                // caller believe its own cancellation was acknowledged
+                // (recancel() expects exactly that), when it was not,
+                // which is a race only a blunt cancel-everything sweep can
+                // trigger. Fall back to the ordinary elapsed-timeout outcome.
+                result catch {};
                 break :blk error.Timeout;
             },
         };
@@ -516,9 +538,19 @@ pub const Socket = struct {
         };
         select.cancelDiscard();
         return switch (outcome) {
-            .operation => operation_result,
+            // See the matching comment in `netReadWithTimeout`: this is the
+            // write sub-task's own cancellation, not the calling fiber's, so
+            // it must not be forwarded as this fiber's `error.Canceled`.
+            .operation => operation_result catch |err| switch (err) {
+                error.Canceled => error.Timeout,
+                else => err,
+            },
             .timer => |result| blk: {
-                try result;
+                // See the matching comment in `netReadWithTimeout`: this is
+                // the timer sub-task's own cancellation, not the calling
+                // fiber's, so it must not be forwarded as this fiber's
+                // `error.Canceled`.
+                result catch {};
                 break :blk error.Timeout;
             },
         };
