@@ -30,6 +30,7 @@ from conftest import (
 )
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_privacy_default_cors_supports_conditional_browser_saves(tmp_path):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).is_file():

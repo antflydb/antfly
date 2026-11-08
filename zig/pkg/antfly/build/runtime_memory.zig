@@ -117,6 +117,14 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
         profile.optimize == .debug and !profile.strip and profile.cpu_inference and !profile.sanitize_thread)
     {
+        if (unit == .api_kernel) {
+            // Main run 42491033320, native GNU LLVM Debug: 18,744,197,120
+            // bytes. Add 10% and round to 128 MiB (19.25 GiB), rather than
+            // rounding to a whole GiB and consuming the entire 20 GiB lane.
+            const peak: usize = 18_744_197_120;
+            const quantum: usize = 128 * 1024 * 1024;
+            return (std.math.divCeil(usize, peak + peak / 10, quantum) catch unreachable) * quantum;
+        }
         // Native LLVM Debug, run 38693574492: API peaked at 12,089,720,832
         // bytes, exceeding the old 10 GiB claim and forcing a retry. 15 GiB
         // retains >=25% headroom. Distributed/CLI summaries rounded to 8G/2G;
@@ -562,16 +570,18 @@ test "native Linux LLVM Debug claims cover measured peaks and account for overla
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
     const profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .debug, .strip = false, .cpu_inference = true };
     const gib = 1024 * 1024 * 1024;
-    const api_peak: usize = 12_089_720_832;
+    const api_peak: usize = 18_744_197_120;
     const api = runtimeCompileMaxRss(.api_kernel, profile);
-    try std.testing.expect(api >= api_peak + api_peak / 4);
+    try std.testing.expect(api >= api_peak + api_peak / 10);
     try std.testing.expect(runtimeCompileMaxRss(.distributed, profile) >= 9 * gib + 9 * gib / 4);
     try std.testing.expect(runtimeCompileMaxRss(.cli, profile) >= 3 * gib + 3 * gib / 4);
-    // CI's 22 GiB aggregate cannot safely overlap API with distributed or the
-    // storage adapter. Smaller CLI work can still run alongside the API.
+    // The measured API no longer safely overlaps a 3 GiB CLI in 22 GiB.
+    // Retain bounded tool overlap in the actual 20 GiB lane, without pretending
+    // two large compilations fit by understating either reservation.
     try std.testing.expect(api + runtimeCompileMaxRss(.distributed, profile) > 22 * gib);
     try std.testing.expect(api + runtimeCompileMaxRss(.storage_kernel, profile) > 22 * gib);
-    try std.testing.expect(api + runtimeCompileMaxRss(.cli, profile) <= 22 * gib);
+    try std.testing.expect(api + 512 * 1024 * 1024 <= 20 * gib);
+    try std.testing.expect(api <= api_peak + api_peak / 10 + 128 * 1024 * 1024);
     var fallback = profile;
     fallback.host = macos;
     try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));

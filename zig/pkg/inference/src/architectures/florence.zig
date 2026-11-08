@@ -2641,8 +2641,8 @@ fn residualDepthwiseConv(
     const bias_name = try fmtAlloc(allocator, "vision_tower.blocks.{d}.{d}.{s}.fn.dw.bias", .{ stage, layer, block_prefix });
     defer allocator.free(bias_name);
 
-    if (cb.kind() == .cuda) {
-        if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceDepthwiseResidual(cb, input, try cb.getWeight(weight_name), try cb.getWeight(bias_name), batch, height, width, channels)) |result| return result;
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda) if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceDepthwiseResidual(cb, input, try cb.getWeight(weight_name), try cb.getWeight(bias_name), batch, height, width, channels)) |result| return result;
     }
     const updates_ct = try cb.tokenGridConv2d(
         input,
@@ -2776,8 +2776,8 @@ fn residualMlp(
     const fc2_b_name = try fmtAlloc(allocator, "vision_tower.blocks.{d}.{d}.{s}.fn.net.fc2.bias", .{ stage, layer, block_prefix });
     defer allocator.free(fc2_b_name);
 
-    if (cb.kind() == .cuda) {
-        if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceMlp(cb, input, .{
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda) if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceMlp(cb, input, .{
             try cb.getWeight(norm_w_name), try cb.getWeight(norm_b_name),
             try cb.getWeight(fc1_w_name),  try cb.getWeight(fc1_b_name),
             try cb.getWeight(fc2_w_name),  try cb.getWeight(fc2_b_name),
@@ -3045,7 +3045,9 @@ fn applyEncoderImagePromptEmbeddingsTensor(
     const merged = if (prompt_seq_len > 0) blk: {
         const prompt_embeddings = try cb.embeddingLookup(try promptEmbedWeight(cb), prompt_input_ids, batch * prompt_seq_len, d_model);
         defer cb.free(prompt_embeddings);
-        if (batch > 1) break :blk try @import("../ops/cuda/cuda_compute.zig").CudaCompute.concatFlorenceImagePrompt(cb, image.features, prompt_embeddings, batch, image.seq_len, prompt_seq_len, d_model);
+        if (comptime build_options.enable_cuda) {
+            if (batch > 1) break :blk try @import("../ops/cuda/cuda_compute.zig").CudaCompute.concatFlorenceImagePrompt(cb, image.features, prompt_embeddings, batch, image.seq_len, prompt_seq_len, d_model);
+        } else if (batch > 1) return error.UnsupportedShape;
         break :blk try cb.concatRows2D(allocator, image.features, prompt_embeddings, image.seq_len, prompt_seq_len, d_model);
     } else try cb.sliceRows2D(allocator, image.features, 0, batch * image.seq_len, d_model);
 
@@ -3708,6 +3710,7 @@ fn compactSelfCacheRows(
 // Slice all active page prefixes in one device operation. Repeated pairwise
 // concatenation otherwise copies the growing prefix once for every page.
 fn compactSelfCacheRowsDevice(cb: *const ComputeBackend, slab: CT, batch: usize, capacity: usize, active_len: usize, d_model: usize) !CT {
+    if (comptime !build_options.enable_cuda) return error.UnsupportedBackend;
     if (batch == 0 or batch > 64 or capacity == 0 or active_len == 0 or active_len > capacity or d_model == 0)
         return error.InvalidInputShape;
     return @import("../ops/cuda/cuda_compute.zig").CudaCompute.compactFlorenceSelfCache(cb, slab, batch, capacity, active_len, d_model);

@@ -201,6 +201,20 @@ static int run_signal_lifetime_smoke(void) {
                 snprintf(identity_path, sizeof(identity_path), "%s/identity", namespace_path);
                 remove(identity_path);
                 rmdir(namespace_path);
+            } else if (strcmp(entry->d_name, "first.aflite.lock.q") == 0 ||
+                       strcmp(entry->d_name, "second.aflite.lock.q") == 0) {
+                /* A closed writer queue retains its tail counter so future
+                 * owners share the same ticket sequence. Remove only that
+                 * persistent metadata in this private fixture. Outstanding
+                 * tickets remain errors instead of being hidden by rm -rf. */
+                char queue_path[1400], tail_path[1500];
+                snprintf(queue_path, sizeof(queue_path), "%s/%s", directory, entry->d_name);
+                snprintf(tail_path, sizeof(tail_path), "%s/tail", queue_path);
+                remove(tail_path);
+                if (rmdir(queue_path) != 0) {
+                    fprintf(stderr, "signal smoke writer queue cleanup failed: %s: %s\n", queue_path, strerror(errno));
+                    failed = 1;
+                }
             } else if (strncmp(entry->d_name, ".aflite-maintenance-", 20) == 0) {
                 snprintf(first_path, sizeof(first_path), "%s/%s", directory, entry->d_name);
                 remove(first_path);
