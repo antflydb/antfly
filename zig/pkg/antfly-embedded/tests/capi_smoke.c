@@ -86,6 +86,13 @@ static int run_inference_smoke(void) {
     }
     antfly_inference *inference = NULL;
     antfly_error_code code = antfly_inference_open(&options, &inference);
+#ifdef ANTFLY_STORAGE_PROFILE
+    if (code != ANTFLY_UNSUPPORTED || inference != NULL) {
+        fprintf(stderr, "storage profile must reject local inference without publishing a handle\n");
+        return 1;
+    }
+    return 0;
+#endif
     if (code == ANTFLY_UNSUPPORTED) {
         fprintf(stderr, "inference smoke skipped: %s\n", antfly_error_code_name(code));
         return 0;
@@ -550,6 +557,11 @@ int main(void) {
         (void)remove(bad_path);
         return fail_with_buffer("status json did not expose expected Lite inference modes", &status);
     }
+#ifdef ANTFLY_STORAGE_PROFILE
+    if (!buffer_contains(status, "\"local_inference_runtime\":false")) {
+        return fail_with_buffer("storage profile advertised local model execution", &status);
+    }
+#endif
     antfly_buffer_free_zero(&status);
 
     antfly_db_close(handle);

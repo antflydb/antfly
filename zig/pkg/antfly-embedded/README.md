@@ -46,6 +46,18 @@ coordination. Zig 0.17.0 or later is required. Native builds retain the
 existing supported Linux and macOS targets; optional accelerator runtimes
 must be supplied by the consumer.
 
+Native C library builds can select `-Dcapi-profile=storage` to omit local model
+execution. The default is `full`. The storage profile keeps the public C API
+symbols and database operations; `antfly_inference_open` returns
+`ANTFLY_UNSUPPORTED` without publishing a handle, and status reports
+`local_inference_runtime: false`. Media decoding remains available. This option
+selects the native C library composition; the Zig source modules, server, and
+browser products retain their own profiles.
+
+From this package directory, build and check it with
+`zig build capi capi-smoke -Dcapi-profile=storage`. In a monorepo checkout, run
+the same command from `zig/`.
+
 The source archive includes the complete first-party Apache composition and
 shared runtime sources, generated contracts, pinned dependency manifests,
 source provenance, and third-party notices. It contains no server implementations or server test sources. Repository-wide corpora, benchmarks and CI tooling are
