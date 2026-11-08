@@ -204,10 +204,14 @@ const Work = struct {
     output_values: usize = 0,
     output_string_bytes: usize = 0,
     enum_steps: usize = 0,
+    independent_index: ?usize = null,
 
     fn check(self: *const Work) !void {
         try self.scorer.check();
         if (self.options.control) |control| try control.check();
+        if (self.options.independent_rows) |rows| if (self.independent_index) |index| {
+            if (rows.check_fn) |check_row| try check_row(rows.context, index);
+        };
     }
     fn copy(self: *Work, text: []const u8) ![]const u8 {
         self.output_string_bytes = try std.math.add(usize, self.output_string_bytes, text.len);
@@ -1215,6 +1219,7 @@ fn runScoredInternal(allocator: Allocator, config: *const model.Config, prepared
         defer scratch.deinit();
         work.allocator = scratch.allocator();
         work.options = if (per_sample.len == 0) options else optionsForSample(options, per_sample[b]);
+        work.independent_index = b;
         if (window_candidates) work.options.overlap = .allow;
         var offsets = try boundary.OffsetMap.init(allocator, prepared.samples[b].original_text, prepared.samples[b].original_text.len);
         defer offsets.deinit();
@@ -1230,7 +1235,13 @@ fn runScoredInternal(allocator: Allocator, config: *const model.Config, prepared
         }
         const decoded = decodeSample(&work, b, offsets, classification_scores, joint_sets) catch |err| {
             if (options.independent_rows) |rows| {
-                if (independentRowRejection(err)) {
+                var row_local = independentRowRejection(err);
+                if (!row_local and (err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded or err == error.Timeout)) {
+                    if (rows.check_fn) |check_row| check_row(rows.context, b) catch {
+                        row_local = true;
+                    };
+                }
+                if (row_local) {
                     rows.errors[b] = err;
                     sample.* = .{};
                     continue;
@@ -1240,6 +1251,7 @@ fn runScoredInternal(allocator: Allocator, config: *const model.Config, prepared
         };
         sample.* = try cloneOwned(Sample, arena.allocator(), decoded);
     }
+    work.independent_index = null;
     try work.check();
     return .{ .allocator = allocator, .outputs = .{ .arena = arena, .samples = samples }, .classification_scores = classification_scores, .joint_candidates = joint_sets };
 }
@@ -2420,6 +2432,14 @@ test "gliner microbatch decoding isolates row budgets cancellation and preserves
         fn cancelFirst(_: ?*anyopaque, index: usize) !void {
             if (index == 0) return error.Canceled;
         }
+        fn cancelLast(_: ?*anyopaque, index: usize) !void {
+            if (index == 1) return error.DeadlineExceeded;
+        }
+        fn cancelDuringDecode(raw: ?*anyopaque, index: usize) !void {
+            const calls: *[2]usize = @ptrCast(@alignCast(raw.?));
+            calls[index] += 1;
+            if (index == 0 and calls[0] > 1) return error.Canceled;
+        }
     };
     var stub = Stub{};
     try std.testing.expectError(error.ExtractionOutputLimitExceeded, runScored(a, &config, &prepared, &schemas, null, stub.scorer(), .{ .max_output_values = 2 }));
@@ -2446,6 +2466,18 @@ test "gliner microbatch decoding isolates row budgets cancellation and preserves
     defer cancelled.deinit();
     try std.testing.expectEqual(error.Canceled, errors[0].?);
     try std.testing.expect(errors[1] == null);
+    var checkpoints = [_]usize{ 0, 0 };
+    var interrupted = try runScored(a, &config, &prepared, &schemas, null, stub.scorer(), .{ .independent_rows = .{ .errors = &errors, .context = &checkpoints, .check_fn = Stub.cancelDuringDecode } });
+    defer interrupted.deinit();
+    try std.testing.expect(checkpoints[0] > 1);
+    try std.testing.expectEqual(error.Canceled, errors[0].?);
+    try std.testing.expect(errors[1] == null);
+    try std.testing.expectEqual(@as(usize, 1), interrupted.samples[1].classifications[0].labels.len);
+    var last_cancelled = try runScored(a, &config, &prepared, &schemas, null, stub.scorer(), .{ .independent_rows = .{ .errors = &errors, .check_fn = Stub.cancelLast } });
+    defer last_cancelled.deinit();
+    try std.testing.expect(errors[0] == null);
+    try std.testing.expectEqual(error.DeadlineExceeded, errors[1].?);
+    try std.testing.expectEqual(@as(usize, 3), last_cancelled.samples[0].classifications[0].labels.len);
     for ([_]anyerror{ error.OutOfMemory, error.ResourceLimitExceeded, error.NonFiniteBoundaryScore }) |err| {
         stub.failure = err;
         try std.testing.expectError(err, runScored(a, &config, &prepared, &schemas, null, stub.scorer(), .{ .independent_rows = .{ .errors = &errors } }));
