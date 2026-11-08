@@ -105,9 +105,9 @@ test "time series merge tail streams source-preserving oversized row with bounde
     const first = try chunks.requestAt(0);
     try std.testing.expectEqual(@as(u64, 333), first.merge_page.?.chunk.?.timestamp);
     try std.testing.expectEqual(@as(i128, -1), std.mem.readInt(i128, &first.merge_page.?.chunk.?.ttl_source.?, .little));
-    const wire = try @import("../../api/batch.zig").encodeBatchRequest(alloc, first);
+    const wire = try @import("../../api/batch_internal.zig").encodeBatchRequest(alloc, first);
     defer alloc.free(wire);
-    var decoded = try @import("../../api/batch.zig").parseInternalBatchRequest(alloc, wire);
+    var decoded = try @import("../../api/batch_internal.zig").parseInternalBatchRequest(alloc, wire);
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(first.merge_page.?.chunk.?.ttl_source, decoded.req.merge_page.?.chunk.?.ttl_source);
     try std.testing.expectEqual(@as(u64, value.len), first.merge_page.?.chunk.?.total_bytes);
