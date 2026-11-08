@@ -2579,6 +2579,18 @@ pub const Owner = struct {
         try enterMaintenanceWriter(ptr, .index);
     }
 
+    fn enterMaintenanceIndexRead(ptr: *anyopaque, path: []const u8) !void {
+        const root: *h.Handle = @ptrCast(@alignCast(ptr));
+        if (root.maintenance_publication) |publication| {
+            for (publication.index_scopes) |scope| {
+                if (std.mem.eql(u8, path, scope.domain) or
+                    (std.mem.startsWith(u8, path, scope.domain) and path.len > scope.domain.len and path[scope.domain.len] == '/'))
+                    return enterMaintenanceWriterForIndex(ptr, .index_read, scope.name);
+            }
+        }
+        return enterMaintenanceWriter(ptr, .index_read);
+    }
+
     fn enterMaintenanceWriter(ptr: *anyopaque, scope: PublicationScope) !void {
         return enterMaintenanceWriterForIndex(ptr, scope, null);
     }
@@ -3407,7 +3419,7 @@ pub const Owner = struct {
         try (try run.sealedView()).source.readInto(offset, bytes[0..count]);
         const store = pending.root.owned_lite_backend.?.native_docstore.?;
         pending.root.maintenance_owner = self;
-        store.writer_admission = .{ .ptr = pending.root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
+        store.writer_admission = .{ .ptr = pending.root, .enter = enterMaintenanceWriter, .enter_index_read = enterMaintenanceIndexRead, .leave = leaveMaintenanceWriter };
         defer {
             store.writer_admission = null;
             pending.root.maintenance_owner = null;
@@ -4255,7 +4267,7 @@ pub const Owner = struct {
         if (run_source) database.async_context.replay_index_publication = .{ .ptr = root, .enter = enterReplayIndexPublication, .leave = leaveMaintenanceWriter };
         if (run_source) database.async_context.replay_metadata_publication = .{ .ptr = root, .enter = enterReplayMetadataPublication, .leave = leaveMaintenanceWriter };
         if (run_source) database.async_context.replay_publication = .{ .ptr = &publication, .publish = PreparedPublication.publishReplay };
-        store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
+        store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .enter_index_read = enterMaintenanceIndexRead, .leave = leaveMaintenanceWriter };
         const publication_overhead_before = group_state.publication_overhead_ns.load(.monotonic);
         clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.setup_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.setup_ns);
         if (publish_ready_merge and split_index_work and !run_source) {
@@ -4752,7 +4764,7 @@ pub const Owner = struct {
         self.maintenance_activity.begin();
         root.maintenance_owner = self;
         root.maintenance_publication = null;
-        store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
+        store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .enter_index_read = enterMaintenanceIndexRead, .leave = leaveMaintenanceWriter };
         lease.close();
         MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.storage_turn, turn_held_from);
         lease_held = false;
@@ -11513,6 +11525,7 @@ test "capi native staged text replay distinguishes foreign index changes from it
             changed_index: []const u8,
             publications: usize = 0,
             broad_refusals: usize = 0,
+            scoped_reads: usize = 0,
             failure: ?anyerror = null,
             fn notify(raw: *anyopaque, detached: *h.Handle) void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
@@ -11530,12 +11543,51 @@ test "capi native staged text replay distinguishes foreign index changes from it
                 }
                 // Exercise the former broad admission on this exact captured
                 // runtime as a control, without building another library.
-                Owner.enterMaintenanceWriter(detached, .index) catch |err| {
-                    if (err == error.EnrichmentWaitCanceled) self.broad_refusals += 1 else self.failure = err;
+                if (Owner.enterMaintenanceWriter(detached, .index)) |_| {
+                    Owner.leaveMaintenanceWriter(detached);
+                    self.failure = error.TestExpectedBroadIndexRefusal;
                     return;
+                } else |err| {
+                    if (err == error.EnrichmentWaitCanceled) self.broad_refusals += 1 else {
+                        self.failure = err;
+                        return;
+                    }
+                }
+                self.checkScopedReads(detached) catch |err| {
+                    self.failure = err;
                 };
-                Owner.leaveMaintenanceWriter(detached);
-                self.failure = error.TestExpectedBroadIndexRefusal;
+            }
+            fn checkScopedReads(self: *@This(), detached: *h.Handle) !void {
+                const store = detached.owned_lite_backend.?.native_docstore.?;
+                // Exercise the artifact phase's short-read admission policy.
+                // This hook still retains a source epoch, so retain it as an
+                // additional fence while testing the stricter policy.
+                const previous = store.index_reads_require_admission;
+                store.index_reads_require_admission = true;
+                defer store.index_reads_require_admission = previous;
+                const domain = try std.fmt.allocPrint(alloc, "{s}/indexes/text", .{detached.db.core.index_manager.base_path});
+                defer alloc.free(domain);
+                var namespaces = try @import("../storage/lite/namespace_store.zig").Backend.open(alloc, store, domain, true);
+                defer namespaces.deinit();
+                var adapter = @import("../storage/lite/index_storage.zig").Store.initWithNamespace(alloc, store, domain);
+                const missing = try std.mem.concat(alloc, u8, &.{ domain, "/missing-reader-canary" });
+                defer alloc.free(missing);
+                if (std.mem.eql(u8, self.changed_index, "text")) {
+                    try std.testing.expectError(error.EnrichmentWaitCanceled, namespaces.beginRead());
+                    try std.testing.expectError(error.EnrichmentWaitCanceled, adapter.storage().fileSize(missing));
+                    try std.testing.expectError(error.EnrichmentWaitCanceled, store.beginIndexReadForPath(domain));
+                } else {
+                    try std.testing.expectError(error.FileNotFound, adapter.storage().fileSize(missing));
+                    var read = try namespaces.beginRead();
+                    defer read.abort();
+                    var catalog = try store.beginIndexReadForPath(domain);
+                    defer catalog.abort();
+                    // A lexical sibling must not inherit this index's witness.
+                    const sibling = try std.mem.concat(alloc, u8, &.{ domain, "-unrelated/record" });
+                    defer alloc.free(sibling);
+                    try std.testing.expectError(error.EnrichmentWaitCanceled, store.beginIndexReadForPath(sibling));
+                    self.scoped_reads += 1;
+                }
             }
             fn changeOtherIndex(self: *@This()) !void {
                 var lease = try self.connection.acquire();
@@ -11579,6 +11631,7 @@ test "capi native staged text replay distinguishes foreign index changes from it
         try std.testing.expect(probe.publications != 0);
         if (!std.mem.eql(u8, changed_index, "catalog")) try std.testing.expectEqual(probe.publications, probe.broad_refusals);
         try std.testing.expectEqual(std.mem.eql(u8, changed_index, "graph"), caught_up);
+        if (std.mem.eql(u8, changed_index, "graph")) try std.testing.expectEqual(probe.publications, probe.scoped_reads);
         owner.test_before_replay_index_publication = null;
         try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(fixture.id));
         var lease = try fixture.connection.acquire();

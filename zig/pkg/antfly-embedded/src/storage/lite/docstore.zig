@@ -1608,6 +1608,9 @@ pub const PublicationScope = enum { primary, index, reclamation, artifact_lease,
 pub const WriterAdmission = struct {
     ptr: *anyopaque,
     enter: *const fn (*anyopaque, PublicationScope) anyerror!void,
+    /// Exact catalog path being read. Owners may validate its index domain;
+    /// absent or unrecognized paths retain conservative catalog admission.
+    enter_index_read: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     leave: *const fn (*anyopaque) void,
 };
 
@@ -1963,15 +1966,15 @@ pub const Store = struct {
     /// Initialize after the returned Store has its stable address. Sources
     /// independently own their runtime and descriptor.
     pub fn openArtifactSource(self: *Store, key: []const u8) !@import("../../segment_source.zig").Source {
-        // The optional pool lookup reads the catalog before lease publication.
-        // Refresh first; a late lease cannot protect an already reused root.
-        const admission = try self.acquireIndexReadAdmission();
+        // Refresh before looking up an immutable source: a late lease cannot
+        // protect catalog pages which a peer already reused.
+        const admission = try self.acquireIndexReadAdmission(key);
         defer if (admission) |held| held.leave(held.ptr);
         return (try self.artifactRegistry()).open(key);
     }
 
     pub fn beginArtifactConstruction(self: *Store) !artifact_source.Construction {
-        const admission = try self.acquireIndexReadAdmission();
+        const admission = try self.acquireIndexReadAdmission(null);
         defer if (admission) |held| held.leave(held.ptr);
         return (try self.artifactRegistry()).beginConstruction();
     }
@@ -3490,17 +3493,23 @@ pub const Store = struct {
         return try Txn.openRead(self);
     }
 
-    fn acquireIndexReadAdmission(self: *Store) !?WriterAdmission {
+    fn acquireIndexReadAdmission(self: *Store, path: ?[]const u8) !?WriterAdmission {
         if (!self.index_reads_require_admission) return null;
         const admission = self.writer_admission orelse return error.EnrichmentWaitCanceled;
-        try admission.enter(admission.ptr, .index_read);
+        if (path != null and admission.enter_index_read != null) {
+            try admission.enter_index_read.?(admission.ptr, path.?);
+        } else try admission.enter(admission.ptr, .index_read);
         return admission;
     }
 
     /// Register a current read pin while detached artifact admission excludes
     /// peer publication. The old captured catalog need not remain retained.
     pub fn beginIndexRead(self: *Store) !Txn {
-        const admission = try self.acquireIndexReadAdmission();
+        return self.beginIndexReadForPath(null);
+    }
+
+    pub fn beginIndexReadForPath(self: *Store, path: ?[]const u8) !Txn {
+        const admission = try self.acquireIndexReadAdmission(path);
         defer if (admission) |held| held.leave(held.ptr);
         return self.beginRead();
     }

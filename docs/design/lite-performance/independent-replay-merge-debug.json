@@ -2,7 +2,7 @@
   "status": "qualification_pending",
   "qualified": false,
   "scope": "Independent replay service and bounded normalized-delta merge construction",
-  "main_included": "9256338b2eda89acfd051e217eb7c20b9efa6691",
+  "main_included": "7db8b07aee4ac18dedef2112b3b7d9b340a41fd0",
   "prior_optimized_candidate": {
     "source": "017b0513e1a81f44290e55968d63dfb2d4750e7d",
     "original_importer_successful_inputs": 10,
@@ -104,5 +104,46 @@
     "Final optimized qualification on wolfspider using retained references.",
     "Human repository CI and Beads-owned full factory qualification."
   ],
-  "data_retention": "Reuse one local working fixture; no database archive per candidate or run. Private logs and inputs remain uncommitted."
+  "data_retention": "Reuse one local working fixture; no database archive per candidate or run. Private logs and inputs remain uncommitted.",
+  "current_requalification": {
+    "tested_source": "fd32917c65bb409b284e9e05f8754b47f8fea6c3",
+    "optimization": "Debug",
+    "native_passed": 851,
+    "native_skipped": 5,
+    "capi_embedded_passed": 401,
+    "capi_embedded_skipped": 3,
+    "capi_public_owner_passed": 89,
+    "producer_maintenance_passed": 113,
+    "vector_passed": 53,
+    "installed_model_tests_passed": 5,
+    "sdk_passed": 307,
+    "sdk_skipped": 1,
+    "native_page_failures": 0,
+    "fresh_original_importer": {
+      "complete": false,
+      "successful_inputs": 7,
+      "failed_input_ordinal": 7,
+      "failed_input_seconds": 1403.3543,
+      "failure": "LiteReplayBacklogExceeded and retryable Busy",
+      "failed_file_bytes": 3496558592,
+      "no_database_archive": true
+    },
+    "idle_diagnostic": {
+      "application_writes": 0,
+      "seconds": 53.45,
+      "full_text_fragment_next": 743,
+      "full_text_fragment_total": 1024,
+      "interpretation": "Replay progresses after application writes stop. This does not qualify live-write throughput."
+    },
+    "live_refusal_contexts": {
+      "total": 44,
+      "clean_catalog_with_captured_scopes_and_no_resolver_or_shadow_dependency": 43,
+      "interpretation": "Index reads used unnamed admission despite available per-index witnesses. Contribution to end-to-end failure still requires verification."
+    },
+    "latest_main_merge": {
+      "commit": "ea0138e2d2b239fb08a8fc7cdb3c468fac221b82",
+      "validation": "pending after merge"
+    },
+    "wrapper_correction": "Local profiling wrapper now propagates the importer exit code; earlier successful wrapper exit codes did not establish importer success."
+  }
 }

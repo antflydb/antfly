@@ -148,8 +148,8 @@ fn lockStore(store: *docstore.Store) void {
     store.mutex.lock();
 }
 
-fn pinSnapshot(store: *docstore.Store) !docstore.Txn {
-    return store.beginIndexRead();
+fn pinSnapshot(store: *docstore.Store, path: []const u8) !docstore.Txn {
+    return store.beginIndexReadForPath(path);
 }
 
 const CatalogRead = struct {
@@ -164,9 +164,9 @@ const CatalogRead = struct {
     }
 };
 
-fn pinCatalogSnapshot(self: *Store) !CatalogRead {
+fn pinCatalogSnapshot(self: *Store, path: []const u8) !CatalogRead {
     if (self.read_snapshot) |snapshot| return .{ .borrowed = snapshot, .checkpoint = snapshot.checkpoint };
-    const snapshot = try self.docs.beginIndexRead();
+    const snapshot = try self.docs.beginIndexReadForPath(path);
     return .{ .owned = snapshot, .checkpoint = snapshot.checkpoint };
 }
 
@@ -233,7 +233,7 @@ fn validateIndexPath(self: *const Store, path: []const u8) !void {
 fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinCatalogSnapshot(self);
+    var snapshot = try pinCatalogSnapshot(self, path);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -244,7 +244,7 @@ fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_by
 fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinCatalogSnapshot(self);
+    var snapshot = try pinCatalogSnapshot(self, path);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -287,7 +287,7 @@ fn openImmutableSource(ptr: *anyopaque, allocator: Allocator, path: []const u8) 
     };
     const state = try allocator.create(State);
     errdefer allocator.destroy(state);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinSnapshot(self.docs, path);
     errdefer snapshot.abort();
     const value = try snapshot.openIndexValue(allocator, path);
     state.* = .{ .allocator = allocator, .snapshot = snapshot, .value = value };
@@ -336,7 +336,7 @@ fn mapArtifact(file: std.Io.File, length: usize) ![]align(std.heap.page_size_min
 fn mapImmutableArtifact(ptr: *anyopaque, allocator: Allocator, path: []const u8) !MappedArtifact {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinSnapshot(self.docs, path);
     defer snapshot.abort();
     var value = try snapshot.openIndexValue(allocator, path);
     defer value.deinit(allocator);
@@ -355,7 +355,7 @@ fn mapImmutableArtifact(ptr: *anyopaque, allocator: Allocator, path: []const u8)
 fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinCatalogSnapshot(self);
+    var snapshot = try pinCatalogSnapshot(self, path);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -367,7 +367,7 @@ fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
 fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinCatalogSnapshot(self);
+    var snapshot = try pinCatalogSnapshot(self, path);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -1137,7 +1137,7 @@ fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const 
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    var snapshot = try pinCatalogSnapshot(self);
+    var snapshot = try pinCatalogSnapshot(self, path);
     defer snapshot.abort();
     const file = try snapshot.readFile();
     const prefix = if (std.mem.eql(u8, directory, "/"))
@@ -1182,7 +1182,7 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    var snapshot = try pinCatalogSnapshot(self);
+    var snapshot = try pinCatalogSnapshot(self, path);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();

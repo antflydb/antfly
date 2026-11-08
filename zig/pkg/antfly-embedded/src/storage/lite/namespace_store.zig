@@ -88,6 +88,7 @@ pub const Backend = struct {
     registry: *artifacts.Registry,
     prefix: []u8,
     generation_key: []u8,
+    domain: []const u8,
     refs: std.atomic.Value(usize) = .init(1),
     read_only: bool,
 
@@ -100,7 +101,7 @@ pub const Backend = struct {
         errdefer a.free(generation_key);
         const registry = try store.artifactRegistry();
         registry.retainOwner();
-        self.* = .{ .alloc = a, .registry = registry, .prefix = prefix, .generation_key = generation_key, .read_only = read_only or store.read_only };
+        self.* = .{ .alloc = a, .registry = registry, .prefix = prefix, .generation_key = generation_key, .domain = prefix[0..root.len], .read_only = read_only or store.read_only };
         return .{ .allocator = a, .ptr = self, .vtable = &.{ .deinit = close, .capabilities = capabilities, .begin_read = beginRead, .begin_write = beginWrite, .begin_batch = beginBatch } };
     }
     fn cast(raw: *anyopaque) *Backend {
@@ -245,7 +246,9 @@ const Txn = struct {
         const owner = backend.registry.beginCallback() orelse return error.ReadOnly;
         defer backend.registry.endCallback();
         const admission = owner.writer_admission;
-        if (admission) |port| try port.enter(port.ptr, .index_read);
+        if (admission) |port| {
+            if (port.enter_index_read) |enter| try enter(port.ptr, backend.domain) else try port.enter(port.ptr, .index_read);
+        }
         defer if (admission) |port| port.leave(port.ptr);
         const io = owner.file.runtime();
         owner.generation_lock.lockSharedUncancelable(io);
