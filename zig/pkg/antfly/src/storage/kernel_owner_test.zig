@@ -30,6 +30,14 @@ test "borrowed document batches cross compiled owner without payload ownership t
     defer tmp.cleanup();
     const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(path);
+    // The shared control header keeps its own version when owner layouts
+    // advance. Reject a stale nested header before opening the physical DB.
+    try std.testing.expectError(error.InvalidAbiVersion, client.Owner.open(.{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 1,
+        .initial_range_control = .{ .version = abi.query_abi_version - 1 },
+    }));
     var owner = try client.Owner.open(.{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 1 });
     defer owner.deinit();
     const document = try alloc.dupe(u8, "{\"id\":9007199254740993,\"text\":\"borrowed\"}");
@@ -425,7 +433,7 @@ test "local query identity relay preserves origin and attributes protocol defect
     const failure = error_identity.failureFromError(
         error.InvalidQueryRequest,
         .local_query,
-        abi.abi_version,
+        abi.query_abi_version,
         @backingInt(abi.LocalQueryOperation.parse_internal_request),
     );
     var forwarded: abi.FailureIdentity = .{};
@@ -452,7 +460,7 @@ test "local query identity relay preserves origin and attributes protocol defect
     );
     try std.testing.expectEqual(abi.Status.invalid_boundary_failure_identity, replacement.status);
     try std.testing.expectEqual(abi.FailureBoundary.storage_owner, replacement.boundary);
-    try std.testing.expectEqual(abi.abi_version, replacement.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, replacement.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.validate_provider_response),
         replacement.operation,
@@ -2112,7 +2120,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.Status.invalid_query, invalid_query_status);
     try std.testing.expectEqual(invalid_query_status, invalid_query_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, invalid_query_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, invalid_query_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, invalid_query_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.parse_internal_request),
         invalid_query_failure.operation,
@@ -2124,7 +2132,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     var invalid_abi_response: abi.QueryOwnedResponse = .{};
     var invalid_abi_failure: abi.FailureIdentity = .{};
     var invalid_abi_request = abi.LocalQueryRequest{};
-    invalid_abi_request.version = abi.abi_version - 1;
+    invalid_abi_request.version = abi.query_abi_version - 1;
     const invalid_abi_status = abi.antfly_local_query_execute(
         &invalid_abi_request,
         &invalid_abi_response,
@@ -2161,7 +2169,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_algebraic_status != .ok);
     try std.testing.expectEqual(invalid_algebraic_status, operation_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.algebraic_partials),
         operation_failure.operation,
@@ -2177,7 +2185,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_text_stats_status != .ok);
     try std.testing.expectEqual(invalid_text_stats_status, operation_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.text_stats),
         operation_failure.operation,
@@ -2193,7 +2201,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_preflight_status != .ok);
     try std.testing.expectEqual(invalid_preflight_status, operation_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.preflight),
         operation_failure.operation,
@@ -2209,7 +2217,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_graph_status != .ok);
     try std.testing.expectEqual(invalid_graph_status, operation_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.parse_graph_expand),
         operation_failure.operation,
@@ -2679,7 +2687,7 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.antfly_storage_owner_algebraic_partials_json(null, &invalid_operation, &response, &query_failure),
     );
     try std.testing.expectEqual(@as(u64, 0), response.len);
-    const invalid_controlled = abi.ControlledJsonOperationRequest{ .version = abi.abi_version + 1 };
+    const invalid_controlled = abi.ControlledJsonOperationRequest{ .version = abi.query_abi_version + 1 };
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_expand_json(null, &invalid_controlled, &response, &query_failure));
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_hydrate_json(null, &invalid_controlled, &response, &query_failure));
@@ -4128,7 +4136,7 @@ test "storage kernel status registry is unique and lossless" {
         const failure = error_identity.failureFromError(
             expected,
             .local_query,
-            abi.abi_version,
+            abi.query_abi_version,
             @backingInt(abi.LocalQueryOperation.execute_internal_query),
         );
         var forwarded: abi.FailureIdentity = .{};

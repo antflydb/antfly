@@ -1218,7 +1218,8 @@ fn acceptStorageOwnerFailure(
     failure: abi.FailureIdentity,
     label: []const u8,
 ) !void {
-    error_identity.validateFailureEnvelope(status, &failure, abi.abi_version) catch |err| {
+    const version = if (failure.boundary == .local_query) abi.query_abi_version else abi.abi_version;
+    error_identity.validateFailureEnvelope(status, &failure, version) catch |err| {
         std.log.err(
             "{s} returned inconsistent failure identity status={s} identity_status={s} boundary={s} version={d} operation={d} error={s} hash={x}",
             .{
