@@ -32,6 +32,7 @@ const backend_scan = @import("backend_scan.zig");
 const backend_types = @import("backend_types.zig");
 const change_journal_mod = @import("db/derived/change_journal.zig");
 const replay_chunks = @import("db/derived/replay_chunks.zig");
+const apply_state = @import("db/derived/apply_state.zig");
 const replay_reference = @import("db/derived/replay_reference.zig");
 const internal_keys = @import("internal_keys.zig");
 const retained_effects = @import("retained_effects.zig");
@@ -576,6 +577,23 @@ pub const DocStore = struct {
     active_consumer_hint_mask: std.atomic.Value(u8) = .init(replay_reference.all_hints_mask),
     journal_credit_capacity_bytes: u64 = std.math.maxInt(u64),
     journal_credit_progress_reserve_bytes: u64 = 0,
+    // WS5: the DB layer's last computed "every registered consumer has
+    // applied at least this sequence" watermark (`mutation_commit.zig`'s
+    // `truncateReplayJournalIfSafeContext`, the same catalog-derived walk
+    // that drives `active_consumer_hint_mask` above). `requestRetirement`
+    // only ever raises a *requested* ceiling -- a foreground caller's own
+    // just-applied sequence, not a cross-consumer minimum -- so nothing
+    // before `serviceRetirement` validates that ceiling against what every
+    // consumer has actually, durably applied. Default
+    // `maxInt(u64)` ("no constraint observed yet") preserves prior
+    // behavior for callers with no DB-layer consumer registry (native-only
+    // tests, backends with no managed indexes).
+    // WS5 (a): diagnostic only now -- `serviceRetirement` clamps against
+    // `apply_state.minAppliedSequenceAcrossAllConsumers` (a fresh scan of
+    // every progress-v2 record, done at drain time), not this field. Kept
+    // for `noteSafeRetirementWatermark` callers/tests that want to assert
+    // on the last value the DB layer's catalog walk computed.
+    known_safe_retirement_watermark: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
 
     const replay_index_unknown: u8 = 0;
     const replay_index_missing: u8 = 1;
@@ -3257,6 +3275,15 @@ pub const DocStore = struct {
         self.active_consumer_hint_mask.store(mask, .release);
     }
 
+    /// WS5: the DB layer calls this every time it recomputes
+    /// `min_applied` (alongside `setActiveConsumerHintMask`, same call
+    /// site), so `serviceRetirement` below always clamps against a
+    /// reasonably fresh cross-consumer minimum instead of trusting
+    /// whatever ceiling a `requestRetirement` caller happened to pass.
+    pub fn noteSafeRetirementWatermark(self: *DocStore, min_consumer_progress: u64) void {
+        self.known_safe_retirement_watermark.store(min_consumer_progress, .release);
+    }
+
     pub fn setJournalCreditPolicy(self: *DocStore, capacity_bytes: u64, progress_reserve_bytes: u64) void {
         self.journal_credit_capacity_bytes = capacity_bytes;
         self.journal_credit_progress_reserve_bytes = progress_reserve_bytes;
@@ -3268,9 +3295,21 @@ pub const DocStore = struct {
     /// path-lease holder or the Raft leader) -- `is_owner` is not derived
     /// here, it is asserted, so a caller cannot mistake a skipped turn for a
     /// completed one.
+    ///
+    /// `requestRetirement` callers (foreground acks, replay catch-up, a
+    /// caller's own just-applied sequence) raise a *requested* ceiling; they
+    /// are never required to prove it is safe. Per `clampRetireTarget`'s doc
+    /// comment, the owner must independently clamp to whatever every
+    /// registered consumer has actually applied before physically deleting
+    /// anything: `apply_state.minAppliedSequenceAcrossAllConsumers` is that
+    /// clamp, read fresh every call. Its default (`maxInt(u64)`, "no
+    /// constraint observed") preserves the historical unclamped behavior
+    /// for a store with no managed consumers.
     pub fn serviceRetirement(self: *DocStore, alloc: Allocator, is_owner: bool, budget: replay_chunks.RetirementBudget) !replay_chunks.RetirementStats {
         if (!is_owner) return error.RetirementRequiresOwner;
-        return try self.retireReplaySlice(alloc, self.retirement_queue.requested(), budget);
+        const requested = self.retirement_queue.requested();
+        const safe_ceiling = try apply_state.minAppliedSequenceAcrossAllConsumers(alloc, self);
+        return try self.retireReplaySlice(alloc, replay_chunks.clampRetireTarget(requested, safe_ceiling), budget);
     }
 
     /// WS5: one bounded, single-transaction retirement chunk across every

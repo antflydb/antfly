@@ -23,6 +23,7 @@ const backend_erased = @import("../backend_erased.zig");
 const backend_types = @import("../backend_types.zig");
 const change_journal_mod = @import("../db/derived/change_journal.zig");
 const replay_chunks = @import("../db/derived/replay_chunks.zig");
+const apply_state = @import("../db/derived/apply_state.zig");
 const replay_reference = @import("../db/derived/replay_reference.zig");
 const internal_keys = @import("../internal_keys.zig");
 const native = @import("native.zig");
@@ -1726,6 +1727,12 @@ pub const Store = struct {
     active_consumer_hint_mask: std.atomic.Value(u8) = .init(replay_reference.all_hints_mask),
     journal_credit_capacity_bytes: u64 = std.math.maxInt(u64),
     journal_credit_progress_reserve_bytes: u64 = 0,
+    // WS5 (a): diagnostic only now -- `serviceRetirement` clamps against
+    // `apply_state.minAppliedSequenceAcrossAllConsumers` (a fresh scan of
+    // every progress-v2 record, done at drain time), not this field. Kept
+    // for `noteSafeRetirementWatermark` callers/tests that want to assert
+    // on the last value the DB layer's catalog walk computed.
+    known_safe_retirement_watermark: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
 
     pub const MaintenancePhase = enum { assessment, copy, verification };
     pub const MaintenanceTestHook = struct {
@@ -3869,6 +3876,15 @@ pub const Store = struct {
         self.active_consumer_hint_mask.store(mask, .release);
     }
 
+    /// WS5: the DB layer calls this every time it recomputes
+    /// `min_applied` (alongside `setActiveConsumerHintMask`, same call
+    /// site), so `serviceRetirement` below always clamps against a
+    /// reasonably fresh cross-consumer minimum instead of trusting
+    /// whatever ceiling a `requestRetirement` caller happened to pass.
+    pub fn noteSafeRetirementWatermark(self: *Store, min_consumer_progress: u64) void {
+        self.known_safe_retirement_watermark.store(min_consumer_progress, .release);
+    }
+
     pub fn setJournalCreditPolicy(self: *Store, capacity_bytes: u64, progress_reserve_bytes: u64) void {
         self.journal_credit_capacity_bytes = capacity_bytes;
         self.journal_credit_progress_reserve_bytes = progress_reserve_bytes;
@@ -3886,9 +3902,28 @@ pub const Store = struct {
     /// it must never force its own fsync. It becomes durable for free on
     /// the next foreground group, or at this owner's own idle-flush/close
     /// barrier.
+    ///
+    /// `requestRetirement` callers raise a *requested* ceiling; they are
+    /// never required to prove it is safe (a foreground ack's own
+    /// just-applied sequence, in particular, says nothing about whether
+    /// every *other* registered consumer -- or even this write's own
+    /// consumer's durably persisted progress-v2 record, which can lag a
+    /// coalesced in-memory advance -- has actually reached it). Per
+    /// `clampRetireTarget`'s doc comment, the owner must independently
+    /// clamp to whatever every registered consumer has actually applied
+    /// before physically deleting anything: `apply_state.
+    /// minAppliedSequenceAcrossAllConsumers` is that clamp, read fresh
+    /// (a scan of every progress-v2 record in this same store, right now)
+    /// every single call -- never a value some earlier, possibly-stale
+    /// push left behind. `maxInt(u64)` ("no constraint observed") when no
+    /// progress-v2 record exists yet preserves the historical unclamped
+    /// behavior for a store with no managed consumers.
     pub fn serviceRetirement(self: *Store, is_owner: bool, budget: replay_chunks.RetirementBudget) !replay_chunks.RetirementStats {
         if (!is_owner) return error.RetirementRequiresOwner;
-        return try retireReplaySlice(self, "", false, self.retirement_queue.requested(), budget, false);
+        const requested = self.retirement_queue.requested();
+        const safe_ceiling = try apply_state.minAppliedSequenceAcrossAllConsumers(self.allocator, self);
+        const target = replay_chunks.clampRetireTarget(requested, safe_ceiling);
+        return try retireReplaySlice(self, "", false, target, budget, false);
     }
 };
 
@@ -3957,6 +3992,45 @@ const RuntimeStore = struct {
     pub fn truncateReplayUpTo(self: *RuntimeStore, alloc: Allocator, up_to_sequence: u64) !void {
         _ = alloc;
         try drainRetireReplaySlice(self.store, self.prefix, true, up_to_sequence);
+    }
+
+    /// Without this, `backend_erased.Store.sync`'s generic thunk
+    /// (`@hasDecl(Handle, "sync")`) silently no-ops for every caller that
+    /// reaches a native Lite store through this erasure -- `DocStore.sync`/
+    /// `DBCore.syncStore`, and so `DB.sync`, close (`deinitWrapperState`'s
+    /// `self.core.syncStore(true)`), and every restore/migration/merge-
+    /// import barrier that calls `core.syncStore(true)` expecting a real
+    /// durability barrier before proceeding. `capi/lite_connection.zig`'s
+    /// `Owner.deinit()` worked around exactly this by reaching the concrete
+    /// `Store.sync()` directly instead of going through `DocStore`/
+    /// `backend_erased`; that bypass is correct for Owner's own generation
+    /// teardown, but it is not the only path that needs this barrier -- a
+    /// `DB` opened and closed without an `Owner` (every embedded caller
+    /// that talks to `storage/db/db.zig` directly, including this engine's
+    /// own `DB.close()`) had no durability barrier at all for ride-along
+    /// work (WS5 retirement, deferred progress-v2, background segment
+    /// merges) still pending at close. `Store.sync()` already does the
+    /// right thing -- `forceDrainDurable()` then `syncIndexContents()` --
+    /// for exactly this reason; `force` is accepted only to match the
+    /// generic signature, since `Store.sync()` always forces every
+    /// ride-along commit through regardless.
+    ///
+    /// Deliberately NOT mirrored by a `syncReplayState` override: that
+    /// thunk falls back to `sync(false)` only when `Handle` declares no
+    /// `syncReplayState` of its own, and the old LSM-WAL-era meaning of
+    /// "sync replay state" (flush a separate WAL) has no native-Lite
+    /// counterpart -- the replay journal is just another native B-tree,
+    /// covered by the same commit as everything else. Picking up this
+    /// `sync` method would silently turn every existing `syncReplayState()`
+    /// call site (several in index/merge hot paths) into a full durability
+    /// barrier, a much bigger behavior change than this fix's scope.
+    pub fn sync(self: *RuntimeStore, force: bool) !void {
+        _ = force;
+        try self.store.sync();
+    }
+
+    pub fn syncReplayState(self: *RuntimeStore) !void {
+        _ = self;
     }
 };
 

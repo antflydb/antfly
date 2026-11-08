@@ -5832,6 +5832,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             min_applied = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, min_applied);
             min_applied = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, min_applied);
 
+            // WS5 (a): diagnostic push only -- `DocStore.serviceRetirement`/
+            // `Store.serviceRetirement`'s actual safety clamp is
+            // `apply_state.minAppliedSequenceAcrossAllConsumers`, a fresh
+            // scan of every progress-v2 record read at drain time, not
+            // this pushed value. Kept so `known_safe_retirement_watermark`
+            // reflects the latest consumer walk for diagnostics/tests.
+            ctx.store.noteSafeRetirementWatermark(min_applied);
+
             // WS5: this same consumer walk is a minimal, catalog-derived
             // consumer registry for the hinted replay lanes. A durable,
             // explicitly-registered registry is WS7's job; until it lands,
