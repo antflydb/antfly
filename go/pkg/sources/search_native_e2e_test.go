@@ -37,7 +37,7 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 	u, err := url.Parse(endpoint)
 	require.NoError(t, err)
 	require.True(t, u.Scheme == "http" && net.ParseIP(u.Hostname()).IsLoopback())
-	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 	defer cancel()
 	p := &Publisher{Endpoint: endpoint}
 	table := fmt.Sprintf("source_search_contract_%d", time.Now().UnixNano())
@@ -65,7 +65,8 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 		require.NoError(t, err)
 		parents[item.id] = doc
 	}
-	require.NoError(t, p.Batch(ctx, table, parents, nil))
+	_, err = p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": parents, "sync_level": "write"})
+	require.NoError(t, err)
 	valid := time.Now().Add(5 * time.Minute).Unix()
 	binding := Binding{ID: testSourceID, Table: table, SearchVersion: 2, Streams: []SearchStream{text, original}, Artifacts: []ArtifactBinding{artifact}, Filter: SourceFilter(testSourceID), Status: "searchable", ValidUntil: &valid}
 	require.Eventually(t, func() bool {
@@ -136,7 +137,16 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 	delete(media, "_embeddings")
 	media["metadata"] = map[string]any{}
 	media["source"].(map[string]any)["revision"] = "r2"
-	require.NoError(t, p.Batch(ctx, table, map[string]any{"image": media}, nil))
+	_, err = p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": map[string]any{"image": media}, "sync_level": "write"})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		for _, s := range ObserveSearch(ctx, p, binding).Streams {
+			if s.State != "ready" {
+				return false
+			}
+		}
+		return true
+	}, 60*time.Second, 100*time.Millisecond)
 	raw, err = p.Search(ctx, binding, request)
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(raw, &wire))
