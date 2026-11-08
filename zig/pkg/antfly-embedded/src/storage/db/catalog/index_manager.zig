@@ -8693,6 +8693,31 @@ pub const IndexManager = struct {
     pub fn updateRange(self: *IndexManager, byte_range: docstore_mod.ByteRange) void {
         self.byte_range = byte_range;
         for (self.graph_indexes.items) |*entry| entry.index.reconcileOwnershipRange(byte_range.start, byte_range.end);
+        self.dropLeannKeysOutOfRange() catch |err| {
+            std.log.warn("leann range drop deferred err={s}", .{@errorName(err)});
+        };
+    }
+
+    /// LEANN graphs are not partitioned by key range: after a split narrows
+    /// this shard, keys that moved away would stay in the graph (taking
+    /// result slots and failing to re-embed). Drop them. Replicated stores
+    /// only mark them; the leader deletes them through the log, so every
+    /// replica, which runs this at the same apply position, agrees.
+    /// Idempotent, so reopening with the same range is harmless. Takes only
+    /// the LEANN records mutex (callers may hold the catalog lock).
+    fn dropLeannKeysOutOfRange(self: *IndexManager) !void {
+        var any = false;
+        for (self.dense_indexes.items) |*entry| if (entry.index.leann != null) {
+            any = true;
+        };
+        if (!any) return;
+        self.lockAtomicWithBackoff(&self.leann_records_mutex);
+        defer self.leann_records_mutex.unlock();
+        for (self.dense_indexes.items) |*entry| {
+            const store = entry.index.leann orelse continue;
+            const dropped = try store.dropKeysWhere(@as(*const IndexManager, self), IndexManager.keyInRange);
+            if (dropped > 0) std.log.info("leann range drop index={s} keys={d}", .{ entry.config.name, dropped });
+        }
     }
 
     pub fn validateRangeTransition(self: *IndexManager, byte_range: docstore_mod.ByteRange) !void {
@@ -17249,16 +17274,22 @@ pub const IndexManager = struct {
         }
     };
 
-    /// LEANN indexes cannot be split yet: their graph is not partitioned by
-    /// key range. Fail the split before any state moves.
-    fn rejectLeannSplit(self: *IndexManager) !void {
-        for (self.dense_indexes.items) |*entry| {
-            if (entry.index.leann != null) return error.UnsupportedLeannSplit;
+    /// Keeps a LEANN key on the left (parent) side of a local split.
+    const LeannSplitLeft = struct {
+        split_key: []const u8,
+
+        fn keep(self: *const LeannSplitLeft, key: []const u8) bool {
+            var buf: [512]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&buf);
+            const raw = if (internal_keys.isInternalUserKey(key))
+                (internal_keys.decodeDocumentComponentAlloc(fba.allocator(), key) catch return true) orelse return true
+            else
+                key;
+            return std.mem.order(u8, raw, self.split_key) == .lt;
         }
-    }
+    };
 
     pub fn handoffDenseFrom(self: *IndexManager, src: *IndexManager, dest_store: *docstore_mod.DocStore, split_key: []const u8, collect_skip_doc_keys: bool) ![]DenseSplitHandoff {
-        try src.rejectLeannSplit();
         const dense_split_batch_size = 1024;
         var handoffs = try self.alloc.alloc(DenseSplitHandoff, self.dense_indexes.items.len);
         errdefer {
@@ -17277,6 +17308,11 @@ pub const IndexManager = struct {
 
         for (self.dense_indexes.items, 0..) |*dest_entry, i| {
             const src_entry = src.denseIndex(dest_entry.config.name) orelse continue;
+            // LEANN graphs are not partitioned by key range. With no handoff
+            // the child indexes its documents itself (residual indexing),
+            // building its own graph; the parent drops them in
+            // pruneDenseSplitRange.
+            if (src_entry.index.leann != null) continue;
             const split_work = src_entry.index.estimateSplitRebuildWork(split_key) catch |err| switch (err) {
                 error.MissingSplitRange => continue,
                 else => return err,
@@ -17866,8 +17902,12 @@ pub const IndexManager = struct {
     }
 
     pub fn pruneDenseSplitRange(self: *IndexManager, store: *docstore_mod.DocStore, split_key: []const u8) !void {
-        try self.rejectLeannSplit();
         for (self.dense_indexes.items) |*entry| {
+            if (entry.index.leann) |leann_store| {
+                const left = LeannSplitLeft{ .split_key = split_key };
+                _ = try leann_store.dropKeysWhere(&left, LeannSplitLeft.keep);
+                continue;
+            }
             var members = try entry.index.collectSplitMembers(split_key);
             defer members.deinit(self.alloc);
 
@@ -51842,7 +51882,6 @@ test "leann dense index applies writes, searches, deletes, and reopens" {
             }
         }
 
-        try std.testing.expectError(error.UnsupportedLeannSplit, manager.pruneDenseSplitRange(&store, "doc:0150"));
         try std.testing.expect(!manager.nativeBackupSupportsImmutableCheckpoint("leann_idx", .dense_vector));
         try manager.syncAll(true);
     }
@@ -51865,6 +51904,19 @@ test "leann dense index applies writes, searches, deletes, and reopens" {
         const doc = try manager.lookupDenseDocKey(&store, "leann_idx", best.vector_id);
         defer if (doc) |d| alloc.free(d);
         try std.testing.expectEqualStrings(keys[7], doc.?);
+
+        // A local split keeps only the parent's side (doc:0000..doc:0149,
+        // less the deleted doc:0123) and still finds what remains.
+        try manager.pruneDenseSplitRange(&store, "doc:0150");
+        try std.testing.expectEqual(@as(u64, 149), entry.index.stats().active_count);
+        var after = try entry.index.searchWithRequest(.{ .query = &vectors[220], .k = 10 });
+        defer after.deinit();
+        try std.testing.expect(after.items.items.len > 0);
+        for (after.items.items) |item| {
+            const kept = try manager.lookupDenseDocKey(&store, "leann_idx", item.vector_id);
+            defer if (kept) |d| alloc.free(d);
+            if (kept) |d| try std.testing.expect(std.mem.order(u8, d, "doc:0150") == .lt);
+        }
     }
 }
 
@@ -52447,6 +52499,52 @@ test "replicated leann indexes converge from leader-planned records" {
     const leader_state = try leader.denseIndex("leann_idx").?.index.leann.?.replicated.?.replica.encodeState(alloc);
     defer alloc.free(leader_state);
     try std.testing.expectEqualSlices(u8, leader_state, caught_up);
+
+    // A split narrows this shard to keys before doc:0150 on every replica at
+    // the same log position. Moved keys leave each graph through
+    // leader-planned deletes, and the replicas still agree byte for byte.
+    leader.updateRange(.{ .start = "", .end = "doc:0150" });
+    follower.updateRange(.{ .start = "", .end = "doc:0150" });
+    while (true) {
+        const proposals = try leader.planLeannRecords(alloc);
+        defer IndexManager.freeLeannProposals(alloc, proposals);
+        if (proposals.len == 0) break;
+        for (proposals) |p| for (p.records) |record| {
+            raft_index += 1;
+            const key = try internal_keys.leannRecordKeyAlloc(alloc, p.index_name, raft_index);
+            defer alloc.free(key);
+            try store_a.put(key, record);
+            try store_b.put(key, record);
+        };
+        try leader.drainLeannRecords(&store_a);
+        try follower.drainLeannRecords(&store_b);
+    }
+    const split_a = leader.denseIndex("leann_idx").?;
+    const split_b = follower.denseIndex("leann_idx").?;
+    const narrowed_a = try split_a.index.leann.?.replicated.?.replica.encodeState(alloc);
+    defer alloc.free(narrowed_a);
+    const narrowed_b = try split_b.index.leann.?.replicated.?.replica.encodeState(alloc);
+    defer alloc.free(narrowed_b);
+    try std.testing.expectEqualSlices(u8, narrowed_a, narrowed_b);
+    // doc:0000..doc:0149 minus the deleted doc:0005.
+    try std.testing.expectEqual(@as(u64, 149), split_b.index.stats().active_count);
+    {
+        var results = try split_b.index.searchWithRequest(.{ .query = &vectors[220], .k = 10 });
+        defer results.deinit();
+        try std.testing.expect(results.items.items.len > 0);
+        for (results.items.items) |item| {
+            const doc = try follower.lookupDenseDocKey(&store_b, "leann_idx", item.vector_id);
+            defer if (doc) |d| alloc.free(d);
+            if (doc) |d| try std.testing.expect(std.mem.order(u8, d, "doc:0150") == .lt);
+        }
+    }
+    // Reopening with the same range drops nothing more.
+    leader.updateRange(.{ .start = "", .end = "doc:0150" });
+    {
+        const proposals = try leader.planLeannRecords(alloc);
+        defer IndexManager.freeLeannProposals(alloc, proposals);
+        try std.testing.expectEqual(@as(usize, 0), proposals.len);
+    }
 }
 
 test "recreated replicated leann index skips its previous incarnation's records" {

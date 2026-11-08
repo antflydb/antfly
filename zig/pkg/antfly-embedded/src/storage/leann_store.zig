@@ -685,6 +685,32 @@ pub const LeannStore = struct {
         }
     }
 
+    /// Drops every key `keep` rejects (after a shard split or range change).
+    /// Local mode deletes them now; replicated mode marks them for the
+    /// leader to delete through the log. Returns how many keys it dropped.
+    pub fn dropKeysWhere(self: *LeannStore, ctx: anytype, comptime keep: fn (@TypeOf(ctx), []const u8) bool) !usize {
+        if (self.replicated) |state| {
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
+            return state.dropKeysWhere(ctx, keep);
+        }
+        var ids = std.ArrayListUnmanaged(u64).empty;
+        defer ids.deinit(self.alloc);
+        {
+            self.lock.lockSharedUncancelable(self.io);
+            defer self.lock.unlockShared(self.io);
+            var nodes = self.node_of.iterator();
+            while (nodes.next()) |e| {
+                if (!keep(ctx, self.nodes.items[e.value_ptr.*].metadata)) try ids.append(self.alloc, e.key_ptr.*);
+            }
+            for (self.pending.items) |p| if (!keep(ctx, p.metadata)) try ids.append(self.alloc, p.vector_id);
+        }
+        if (ids.items.len == 0) return 0;
+        const no_writes: []const struct { vector_id: u64, vector: []const f32, metadata: []const u8 } = &.{};
+        try self.apply(no_writes, ids.items);
+        return ids.items.len;
+    }
+
     /// Metadata for a live vector id, owned by `alloc`.
     pub fn getMetadata(self: *LeannStore, alloc: Allocator, vector_id: u64) !?[]u8 {
         self.lock.lockSharedUncancelable(self.io);

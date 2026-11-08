@@ -324,6 +324,44 @@ pub const ReplicatedState = struct {
         }
     }
 
+    /// Shard range change (a split narrowed this shard, or a child opened
+    /// over its range): every key `keep` rejects is unbound and marked for
+    /// deletion, whether it is in the graph, the exact buffer, or only bound.
+    /// The leader plans the deletes like any other (graph deletes, buffer
+    /// deletes, or `forget` for keys the graph never saw), so every replica
+    /// drops them at the same log position. Idempotent.
+    pub fn dropKeysWhere(self: *ReplicatedState, ctx: anytype, comptime keep: fn (@TypeOf(ctx), []const u8) bool) !usize {
+        var doomed = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (doomed.items) |k| self.alloc.free(k);
+            doomed.deinit(self.alloc);
+        }
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+        const Collect = struct {
+            fn add(state: *ReplicatedState, list: *std.ArrayListUnmanaged([]u8), set: *std.StringHashMapUnmanaged(void), key: []const u8) !void {
+                if (set.contains(key)) return;
+                const owned = try state.alloc.dupe(u8, key);
+                errdefer state.alloc.free(owned);
+                try list.append(state.alloc, owned);
+                try set.put(state.alloc, owned, {});
+            }
+        };
+        var bound = self.bindings.keyIterator();
+        while (bound.next()) |k| if (!keep(ctx, k.*)) try Collect.add(self, &doomed, &seen, k.*);
+        var live = self.replica.node_of.keyIterator();
+        while (live.next()) |k| if (!keep(ctx, k.*)) try Collect.add(self, &doomed, &seen, k.*);
+        for (self.replica.buffer_keys.items) |k| if (!keep(ctx, k)) try Collect.add(self, &doomed, &seen, k);
+        for (doomed.items) |key| {
+            if (self.bindings.fetchRemove(key)) |kv| {
+                _ = self.key_of.remove(kv.value);
+                self.alloc.free(kv.key);
+            }
+            try self.markDirty(key, delete_digest);
+        }
+        return doomed.items.len;
+    }
+
     /// Replay of a key whose stored vector is an elided stub with `digest`
     /// (see `LeannStore.noteElided`).
     pub fn noteElided(self: *ReplicatedState, key: []const u8, vector_id: u64, digest: u64) !void {

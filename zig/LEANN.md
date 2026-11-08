@@ -10,8 +10,8 @@ indexes keep only a small stub per document once the graph covers it and
 re-embed query candidates ([Transient vector storage](#transient-vector-storage)). The algorithm is in
 `lib/vectorindex/src/leann.zig`; the table integration is described in
 [Table integration](#table-integration). Not yet supported for LEANN indexes:
-shard splits, remote dense storage, and native index backups (backups use
-the logical path) ([Remaining work](#remaining-work)).
+remote dense storage and native index backups (backups use the logical
+path) ([Remaining work](#remaining-work)).
 
 ## Overview
 
@@ -555,8 +555,14 @@ Three modes:
    include `leann.store` in backups so restores need not re-embed. For
    media-derived vectors, which `auto` keeps at full precision, an int8
    stored copy would cut them about 4x without query-time embedding.
-2. **Splits.** Rebuild both children from the parent's stored vectors (or
-   re-embedded text) during handoff.
+2. **Splits.** Supported: when a split narrows a shard, every LEANN key
+   outside the new range is dropped (`IndexManager.updateRange` →
+   `LeannStore.dropKeysWhere`; replicated stores mark them and the leader
+   deletes them through the log), and the child indexes its documents
+   itself. Follow-ups: a bulk first build for large children (today the
+   child buffers to `build_threshold`, then plans per-key deltas) and a
+   production-cluster VOPR that checks replica graph equality across a
+   split.
 3. **Remote storage and native backups.** Store `leann.store` through the
    dense storage abstraction and include it in native checkpoints.
 4. **Filter-aware traversal.** Filters are applied after an over-fetched

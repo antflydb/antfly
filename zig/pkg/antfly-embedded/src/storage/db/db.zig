@@ -58412,6 +58412,10 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     defer dest_indexes.deinit();
     dest_indexes.setIo(self.core.index_manager.io);
     dest_indexes.setRelaxedSplitDurability(true);
+    // LEANN children index their documents themselves (no dense handoff);
+    // stubbed vectors re-embed from the parent's documents, still present
+    // until finalize.
+    dest_indexes.dense_reembedder = self.core.index_manager.dense_reembedder;
     const dest_applied_sequence_checkpoint_path = try apply_state.checkpointPathAlloc(self.alloc, dest_dir);
     defer self.alloc.free(dest_applied_sequence_checkpoint_path);
     dest_indexes.setAppliedSequenceCheckpointPath(dest_applied_sequence_checkpoint_path);
