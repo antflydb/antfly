@@ -360,6 +360,7 @@ pub fn referenceEncoderDeviceBytes(backend: compute.BackendKind, allocator: Allo
             var pipeline_options = items[0].options.native(self.options.pipeline);
             pipeline_options.control = self.options.control;
             _ = try device_request.plan(self.config, prepared, schemas[0..items.len], .{
+                .independent_requests = self.options.brokered_request,
                 .precision = self.precision,
                 .execution_policy = .reference_v1,
                 .limits = device_limits,
@@ -597,6 +598,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
                 var device_limits = options.device;
                 device_limits.encoder = engine_options.limits;
                 break :device (try device_request.run(cb, allocator, config, &prepared, schemas, .{
+                    .independent_requests = options.brokered_request,
                     .precision = options.identity.?.precision,
                     .execution_policy = options.metal_execution_policy,
                     .limits = device_limits,
@@ -2167,4 +2169,28 @@ test "boundary qualification native full-context groups fit head budgets before 
     request.items[0].text = text[0 .. 4095 * 4];
     try std.testing.expectError(error.ResourceLimitExceeded, prepareGroup(.native, a, &config, tok.tokenizer(), request.items, .{ .identity = identity, .pipeline = options.pipeline }));
     std.debug.print("native-head admission: windows={} words={} admitted_batch={} planned_bytes={}\n", .{ usage.window_count, receiver.words, receiver.batch, planned.intermediate_bytes });
+}
+
+test "gliner microbatch preflight includes record callback downloads" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"structures":{"record":{"mode":"latent","fields":{"name":"str"}}}},"inputs":[{"content":"Ada"},{"content":"Bob"}]}
+    , .{});
+    defer request.deinit();
+    var config = QualificationGeometryTest.config();
+    config.head.pool_size = 1;
+    config.head.min_pool_per_query = 1;
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var options = Options{ .identity = .{ .backbone = config.backbone, .precision = .fp32, .weight = artifact.Digest.of("review"), .sidecars = @splat(artifact.Digest.of("review")) } };
+    var prepared = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, options);
+    defer prepared.deinit();
+    const schemas = [_]*const @TypeOf(request.items[0].compiled){ &request.items[0].compiled, &request.items[1].compiled };
+    const combined = try device_request.plan(&config, &prepared, &schemas, .{ .limits = options.device });
+    // One candidate, one field => one object + two assignment logits per row.
+    // A singleton fits, but two callbacks require 24 bytes, not 12.
+    options.brokered_request = true;
+    options.device.head.max_result_download_bytes = combined.minimum_result_download_bytes + 12;
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options));
+    options.engine.limits.max_batch = 1;
+    try std.testing.expect(try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options) > 0);
 }

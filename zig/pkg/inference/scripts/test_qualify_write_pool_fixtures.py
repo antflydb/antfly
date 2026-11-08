@@ -19,6 +19,8 @@ import json
 import re
 from pathlib import Path
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from unittest.mock import patch
 
@@ -119,6 +121,68 @@ class FixtureAcquisitionTests(unittest.TestCase):
                 )
             self.assertEqual(receipt, again)
             self.assertEqual(request.call_count, 1)
+
+    def test_concurrent_corpus_acquisition_publishes_once(self):
+        data = b"verified corpus"
+        started = threading.Event()
+        release = threading.Event()
+
+        class Source(io.BytesIO):
+            def read(self, size=-1):
+                started.set()
+                if not release.wait(5):
+                    raise TimeoutError("test download was not released")
+                return super().read(size)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "corpus.parquet"
+            with (
+                patch.object(
+                    fixtures.urllib.request,
+                    "urlopen",
+                    side_effect=lambda *args, **kwargs: Source(data),
+                ) as request,
+                ThreadPoolExecutor(2) as pool,
+            ):
+                first = pool.submit(
+                    fixtures.acquire,
+                    "url",
+                    path,
+                    sha256=hashlib.sha256(data).hexdigest(),
+                )
+                self.assertTrue(started.wait(5))
+                second = pool.submit(
+                    fixtures.acquire,
+                    "url",
+                    path,
+                    sha256=hashlib.sha256(data).hexdigest(),
+                )
+                release.set()
+                self.assertEqual(first.result(timeout=5), second.result(timeout=5))
+                self.assertEqual(request.call_count, 1)
+                self.assertEqual(path.read_bytes(), data)
+                self.assertFalse(path.with_name(path.name + ".part").exists())
+
+    def test_published_immutable_fixture_needs_no_lock_or_network(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "corpus.parquet"
+            path.write_bytes(b"verified")
+            with (
+                patch.object(
+                    fixtures.fcntl,
+                    "flock",
+                    side_effect=AssertionError("cached reads must not lock"),
+                ),
+                patch.object(
+                    fixtures.urllib.request,
+                    "urlopen",
+                    side_effect=AssertionError("cached reads must not download"),
+                ),
+            ):
+                receipt = fixtures.acquire(
+                    "url", path, sha256=hashlib.sha256(b"verified").hexdigest()
+                )
+            self.assertEqual(receipt["size_bytes"], 8)
 
     def test_corrupt_download_is_not_published(self):
         with tempfile.TemporaryDirectory() as temporary:

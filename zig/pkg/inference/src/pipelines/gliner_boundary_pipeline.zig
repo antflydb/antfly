@@ -2804,3 +2804,80 @@ test "gliner boundary pipeline attribute labels consume the shared value budget"
 test "gliner boundary pipeline Python parity Transformers base wrapper all inference tasks" {
     try publishedCheckpointParity("base", "ANTFLY_GLINER25_BASE_MODEL_DIR", "pipeline_cases_base.json", true);
 }
+
+test "gliner microbatch record row shape rejection preserves healthy peer" {
+    const a = std.testing.allocator;
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const config_bytes = try fixtures.fixtureBytes(a, "models/base/config.json");
+    defer a.free(config_bytes);
+    const encoder_bytes = try fixtures.fixtureBytes(a, "models/base/encoder_config.json");
+    defer a.free(encoder_bytes);
+    const config = try model.parseConfig(a, config_bytes, encoder_bytes);
+    const Stub = struct {
+        explicit_calls: usize = 0,
+        record_calls: usize = 0,
+        backend_failure: ?anyerror = null,
+        fn check(_: *anyopaque) !void {}
+        fn classify(_: *anyopaque, _: Allocator, _: tasks.Limits, _: ?Control) !scoring.ClassificationScores {
+            return error.UnexpectedScorerCall;
+        }
+        fn relations(_: *anyopaque, _: Allocator, _: scoring.RelationRequest, _: tasks.Limits, _: ?Control) !scoring.RelationScores {
+            return error.UnexpectedScorerCall;
+        }
+        fn explicit(raw: *anyopaque, allocator: Allocator, request: scoring.ExplicitRequest, _: head.Limits, _: ?Control) !scoring.ExplicitScores {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.explicit_calls += 1;
+            try std.testing.expectEqual(@as(usize, 2), request.indices.len);
+            var storage = try scoring.Storage.init(allocator);
+            errdefer storage.deinit();
+            return .{ .storage = storage, .logits = try storage.alloc().dupe(f32, &.{ 10, 5 }), .valid = try storage.alloc().dupe(bool, &.{ true, true }) };
+        }
+        fn record(raw: *anyopaque, allocator: Allocator, request: scoring.RecordRequest, limits: tasks.Limits, _: ?Control) !scoring.RecordScores {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.record_calls += 1;
+            try request.validate(32, limits);
+            if (self.backend_failure) |err| return err;
+            var storage = try scoring.Storage.init(allocator);
+            errdefer storage.deinit();
+            const fields = try storage.alloc().alloc(tasks.RecordFieldResult, 1);
+            fields[0] = .{ .candidate_spans = try storage.alloc().dupe(ops.Span, &.{.{ .start = 0, .end = 1 }}), .candidate_logits = try storage.alloc().dupe(f32, &.{4}), .assign_logits = &.{} };
+            return .{ .storage = storage, .object_logits = &.{}, .instance_seeds = &.{}, .fields = fields };
+        }
+        fn scorer(self: *@This()) scoring.Scorer {
+            return .{ .context = self, .check_fn = check, .classify_fn = classify, .explicit_fn = explicit, .relations_fn = relations, .record_fn = record };
+        }
+    };
+    var compiled = try schema_mod.compile(a,
+        \\{"structures":{"event":{"mode":"natural","anchor":"kind","fields":{"kind":{"type":"str"}}}}}
+    , .{});
+    defer compiled.deinit();
+    const schemas = [_]*const schema_mod.CompiledSchema{ &compiled, &compiled };
+    var prepared = try classificationTestBatch(a, &schemas);
+    defer prepared.deinit();
+    prepared.query_width = 1;
+    prepared.classification_width = 0;
+    var mask = [_]bool{ true, true };
+    prepared.query_marker_mask = &mask;
+    for (@constCast(prepared.samples)) |*sample| {
+        sample.original_text = "Z";
+        sample.words = &.{.{ .text = "z", .source = .{ .start = 0, .end = 1 }, .input_start = 0, .input_end = 1 }};
+        sample.queries = &.{.{ .kind = .field, .group_index = 0, .schema_index = 0, .role_index = 0, .label_index = 0, .name = "kind", .marker_index = 0 }};
+    }
+    var indices = [_]ops.Span{ .{ .start = 0, .end = 1 }, .{ .start = 0, .end = 1 }, .{ .start = 0, .end = 1 }, .{ .start = 0, .end = 1 } };
+    var valid = [_]bool{ true, true, true, false };
+    const pool = ops.SharedPool{ .allocator = a, .batch = 2, .capacity = 2, .indices = &indices, .valid = &valid, .proposal_logits = &.{}, .compat_logits = &.{} };
+    const scores = scoring.CandidateScoreView{ .batch = 2, .text_length = 1, .queries = 1, .pool = &pool, .pair_logits = &.{ 4, 4, 4, 4 }, .null_logits = null, .count_log_rates = null };
+    var stub = Stub{};
+    var errors: [2]?anyerror = undefined;
+    var result = try runScored(a, &config, &prepared, &schemas, scores, stub.scorer(), .{ .task_limits = .{ .max_record_instances = 1 }, .independent_rows = .{ .errors = &errors } });
+    defer result.deinit();
+    try std.testing.expectEqual(error.ExtractionRecordLimitExceeded, errors[0].?);
+    try std.testing.expect(errors[1] == null);
+    try std.testing.expectEqual(@as(usize, 2), stub.record_calls);
+    // An untyped failure after successful row admission is still shared. It
+    // must never be mistaken for a semantic capacity rejection or replayed.
+    for ([_]anyerror{ error.ResourceLimitExceeded, error.OutOfMemory, error.NonFiniteBoundaryScore }) |err| {
+        var failing = Stub{ .backend_failure = err };
+        try std.testing.expectError(err, runScored(a, &config, &prepared, &schemas, scores, failing.scorer(), .{ .independent_rows = .{ .errors = &errors } }));
+    }
+}

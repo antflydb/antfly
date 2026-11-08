@@ -77,6 +77,18 @@ def verify(path, *, sha256=None, blob_id=None, size=None):
 
 
 def acquire(url, path, **identity):
+    # Published fixtures are immutable and can be verified without write
+    # access. Writers lock publication as well as transfer, then recheck the
+    # final file under lock before opening the shared temporary path.
+    if path.exists():
+        return verify(path, **identity)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name(path.name + ".acquisition.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _acquire_locked(url, path, **identity)
+
+
+def _acquire_locked(url, path, **identity):
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         return verify(path, **identity)
@@ -117,7 +129,7 @@ def snapshot(cache, model):
             identity = (
                 {"sha256": lfs["sha256"]} if lfs else {"blob_id": entry["blobId"]}
             )
-            receipt = acquire(
+            receipt = _acquire_locked(
                 f"https://huggingface.co/{repository}/resolve/{revision}/{name}",
                 directory / str(name),
                 size=entry["size"],

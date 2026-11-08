@@ -43,6 +43,8 @@ pub const Limits = struct {
 };
 
 pub const Options = struct {
+    /// Independent HTTP callers must fit aggregate callback transfers before dispatch.
+    independent_requests: bool = false,
     /// Obtain from the validated opened model artifact's immutable identity.
     precision: artifact.Precision = .fp32,
     execution_policy: ExecutionPolicy = .reference_v1,
@@ -61,6 +63,7 @@ pub const Plan = struct {
     /// host model mappings, tokenizer/processor storage, and decoded outputs.
     combined_device_upper_bound_bytes: usize,
     minimum_result_download_bytes: usize,
+    callback_result_download_upper_bound_bytes: usize,
 };
 
 pub const Result = struct {
@@ -99,6 +102,49 @@ pub fn requiredHeadOutputs(schemas: []const *const schema.CompiledSchema) head.R
         if (structure.mode != null) return .{ .record_candidates = true };
     };
     return .{ .record_candidates = false };
+}
+
+/// Scalar callback transfers are data dependent, but their shape is bounded by
+/// the shared pool, schema and existing row/task limits. This allocation-free
+/// bound admits independent cohorts without borrowing a peer's transfer budget.
+/// Singleton execution keeps its existing exact, incremental checks.
+fn callbackDownloadUpperBound(config: *const model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema.CompiledSchema, options: Options) !usize {
+    var elements: usize = 0;
+    for (prepared.samples, schemas) |sample, compiled| {
+        // Per-sample semantic overrides can only narrow these common ceilings.
+        const semantic = options.pipeline;
+        const limits = options.limits.scorer.tasks;
+        const pool = @min(config.head.pool_size, try mul(sample.words.len, try add(sample.words.len, 1)) / 2);
+        const value = compiled.schema;
+        if (value.joint_ie) |joint| {
+            const pair_cap = @min(config.head.relation_pair_cap, semantic.joint_candidates.relation_pair_cap);
+            const pairs = @min(try mul(joint.relations.len, pair_cap), semantic.joint_candidates.proposal_limits.max_output_pairs, semantic.task_limits.max_relation_pairs, limits.max_relation_pairs);
+            elements = try add(elements, pairs);
+            const spans = @min(try mul(pairs, 2), semantic.head_limits.max_explicit_candidates);
+            elements = try add(elements, @min(try mul(joint.entities.len, spans), semantic.joint_candidates.max_explicit_elements));
+            continue;
+        }
+        var attribute_queries: usize = 0;
+        for (value.entity_attributes) |attribute| attribute_queries = try add(attribute_queries, attribute.labels.len);
+        elements = try add(elements, try mul(attribute_queries, @min(pool, semantic.head_limits.max_explicit_candidates)));
+        const pairs = @min(try mul(value.relations.len, @min(config.head.relation_pair_cap, semantic.relation_limits.pair_cap)), semantic.relation_limits.max_output_pairs, semantic.task_limits.max_relation_pairs, limits.max_relation_pairs);
+        elements = try add(elements, pairs);
+        for (value.structures) |structure| {
+            for (structure.fields) |field| elements = try add(elements, field.choices.len);
+            const mode = structure.mode orelse continue;
+            const fields = structure.fields.len;
+            const candidates = @min(pool, limits.max_candidates_per_field, semantic.task_limits.max_candidates_per_field);
+            const total = @min(try mul(fields, candidates), limits.max_record_candidates);
+            const instances = @min(switch (mode) {
+                .natural => candidates,
+                .latent => total,
+                .anchorless => config.head.record_instance_queries,
+            }, limits.max_record_instances, semantic.task_limits.max_record_instances);
+            const assignments = @min(try mul(instances, try add(total, fields)), limits.max_record_assignment_elements, semantic.task_limits.math.max_intermediate_bytes / 4);
+            elements = try add(elements, try add(instances, assignments));
+        }
+    }
+    return mul(elements, @sizeOf(f32));
 }
 
 /// No allocator, model tensor read, backend dispatch, or upload is performed.
@@ -141,10 +187,13 @@ pub fn plan(config: *const model.Config, prepared: *const processor.PreparedBatc
     const minimum_download = try add(head_download_bytes, try mul(classification_elements, 4));
     if (head_download_bytes > options.limits.head.max_result_download_bytes or minimum_download > options.limits.scorer.max_result_download_bytes)
         return error.ResourceLimitExceeded;
+    const callback_download = if (options.independent_requests and batch > 1) try callbackDownloadUpperBound(config, prepared, schemas, options) else 0;
+    if (try add(head_download_bytes, callback_download) > options.limits.head.max_result_download_bytes or
+        try add(minimum_download, callback_download) > options.limits.scorer.max_result_download_bytes) return error.ResourceLimitExceeded;
     const head_budget = if (headed != null) options.limits.head.max_device_bytes else 0;
     const combined = try add(options.limits.max_encoder_device_bytes, head_budget);
     if (combined > options.limits.max_combined_device_bytes) return error.ResourceLimitExceeded;
-    return .{ .encoder = encoded, .head = headed, .encoder_budget_bytes = options.limits.max_encoder_device_bytes, .head_budget_bytes = head_budget, .combined_device_upper_bound_bytes = combined, .minimum_result_download_bytes = minimum_download };
+    return .{ .encoder = encoded, .head = headed, .encoder_budget_bytes = options.limits.max_encoder_device_bytes, .head_budget_bytes = head_budget, .combined_device_upper_bound_bytes = combined, .minimum_result_download_bytes = minimum_download, .callback_result_download_upper_bound_bytes = callback_download };
 }
 
 fn checkBackend(cb: *const ops.ComputeBackend) !void {

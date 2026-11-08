@@ -112,6 +112,44 @@ class QualificationTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 assert_equivalent("extract", reference, observed)
 
+    def test_recognition_parity_preserves_usage_and_identity(self):
+        for kind in ("ocr", "whisper"):
+            reference = {
+                "model": "m",
+                "object": "list",
+                "data": [
+                    {
+                        "id": "a",
+                        "index": 0,
+                        "text": "hello",
+                        "status": "complete",
+                        "audio": {"duration_ms": 20},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 17,
+                    "completion_tokens": 3,
+                    "total_tokens": 20,
+                },
+                "execution": {"native_items": 1},
+            }
+            candidate = copy.deepcopy(reference)
+            candidate["execution"] = {"native_items": 8}
+            assert_equivalent(kind, reference, candidate)
+            for field in ("model", "object", "usage", "id", "index", "audio"):
+                changed = copy.deepcopy(candidate)
+                if field in ("model", "object"):
+                    changed[field] = "other"
+                elif field == "usage":
+                    changed[field]["prompt_tokens"] = 999
+                else:
+                    changed["data"][0][field] = "other"
+                with (
+                    self.subTest(kind=kind, field=field),
+                    self.assertRaises(AssertionError),
+                ):
+                    assert_equivalent(kind, reference, changed)
+
     def test_regression_and_promotion_are_separate_gates(self):
         self.assertFalse(latency_gate(1, 1, [0.9])["promotion_10_percent_pass"])
         self.assertTrue(latency_gate(1, 0.8, [0.7])["promotion_10_percent_pass"])

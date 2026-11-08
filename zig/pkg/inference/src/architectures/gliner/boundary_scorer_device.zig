@@ -151,7 +151,7 @@ pub const Context = struct {
     fn explicit(raw: *anyopaque, allocator: Allocator, request: scoring.ExplicitRequest, limits: cpu_head.Limits, control: ?scoring.Control) !scoring.ExplicitScores {
         const self = get(raw);
         try self.sample(request.sample_index, control);
-        if (request.query_ids.len > limits.max_queries or request.capacity > limits.max_explicit_candidates or try mul(request.indices.len, 4) > limits.max_intermediate_bytes) return error.ResourceLimitExceeded;
+        if (request.query_ids.len > limits.max_queries or request.capacity > limits.max_explicit_candidates or try mul(request.indices.len, 4) > limits.max_intermediate_bytes) return error.ExtractionCandidateLimitExceeded;
         const headed = self.head_result orelse return error.MissingBoundaryScores;
         var result = try headed.scoreExplicitSubset(request.sample_index, request.query_ids, .{ .capacity = request.capacity, .indices = request.indices, .valid_mask = request.valid_mask });
         defer result.deinit();
@@ -175,7 +175,7 @@ pub const Context = struct {
         try self.sample(request.sample_index, control);
         try self.validateMath(limits.math);
         if (!self.config.head.directional_relation_states) return error.UnsupportedGlinerBoundaryConfiguration;
-        if (request.query_pairs.len > limits.math.max_queries or request.pairs.len > limits.max_relation_pairs) return error.ResourceLimitExceeded;
+        if (request.query_pairs.len > limits.math.max_queries or request.pairs.len > self.taskLimits(limits).max_relation_pairs) return error.RelationProposalLimitExceeded;
         var storage = try scoring.Storage.init(allocator);
         errdefer storage.deinit();
         if (request.pairs.len == 0) return .{ .storage = storage, .logits = &.{}, .valid = &.{} };
@@ -212,6 +212,7 @@ pub const Context = struct {
     fn record(raw: *anyopaque, allocator: Allocator, request: scoring.RecordRequest, limits: cpu_tasks.Limits, control: ?scoring.Control) !scoring.RecordScores {
         const self = get(raw);
         try self.sample(request.sample_index, control);
+        try request.validate(self.config.head.record_instance_queries, self.taskLimits(limits));
         try self.validateMath(limits.math);
         if (request.fields.len == 0 or request.fields.len > limits.max_record_fields) return error.InvalidBoundaryScorerRouting;
         const headed = self.head_result orelse return error.MissingBoundaryScores;

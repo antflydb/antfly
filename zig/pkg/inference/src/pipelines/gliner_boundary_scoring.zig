@@ -113,6 +113,38 @@ pub const RecordRequest = struct {
     mode: tasks.RecordMode,
     anchor_field: ?usize = null,
     fields: []const RecordFieldRoute,
+
+    /// Pure row admission. Keep these typed rejections distinct from a
+    /// ResourceLimitExceeded raised later by shared device/workspace owners.
+    pub fn validate(self: RecordRequest, instance_queries: usize, limits: anytype) !void {
+        if (self.fields.len == 0) return error.InvalidBoundaryScorerRouting;
+        if (self.fields.len > limits.max_record_fields) return error.ExtractionRecordLimitExceeded;
+        var total: usize = 0;
+        for (self.fields) |field| {
+            if (field.pool_indices.len > limits.max_candidates_per_field) return error.ExtractionCandidateLimitExceeded;
+            total = std.math.add(usize, total, field.pool_indices.len) catch return error.ExtractionCandidateLimitExceeded;
+        }
+        if (comptime @hasField(@TypeOf(limits), "max_record_candidates")) {
+            if (total > limits.max_record_candidates) return error.ExtractionCandidateLimitExceeded;
+        }
+        const instances = switch (self.mode) {
+            .natural => blk: {
+                const anchor = self.anchor_field orelse return error.InvalidBoundaryScorerRouting;
+                if (anchor >= self.fields.len) return error.InvalidBoundaryScorerRouting;
+                break :blk self.fields[anchor].pool_indices.len;
+            },
+            .latent => total,
+            .anchorless => instance_queries,
+        };
+        if (instances > limits.max_record_instances) return error.ExtractionRecordLimitExceeded;
+        const columns = std.math.add(usize, total, self.fields.len) catch return error.ExtractionAssignmentLimitExceeded;
+        const assignments = std.math.mul(usize, instances, columns) catch return error.ExtractionAssignmentLimitExceeded;
+        const assignment_limit = if (comptime @hasField(@TypeOf(limits), "max_record_assignment_elements")) limits.max_record_assignment_elements else limits.math.max_intermediate_bytes / @sizeOf(f32);
+        if (assignments > assignment_limit) return error.ExtractionAssignmentLimitExceeded;
+        if (comptime @hasField(@TypeOf(limits), "max_record_attention_work")) {
+            if (self.mode == .anchorless and (std.math.mul(usize, instances, total) catch return error.ExtractionAssignmentLimitExceeded) > limits.max_record_attention_work) return error.ExtractionAssignmentLimitExceeded;
+        }
+    }
 };
 pub const RecordScores = struct {
     storage: Storage,
@@ -139,9 +171,12 @@ pub const Scorer = struct {
         return self.classify_fn(self.context, allocator, limits, control);
     }
     pub fn explicit(self: Scorer, allocator: Allocator, request: ExplicitRequest, limits: head.Limits, control: ?Control) !ExplicitScores {
+        if (request.query_ids.len > limits.max_queries or request.capacity > limits.max_explicit_candidates or
+            (std.math.mul(usize, request.indices.len, @sizeOf(head.SignedSpan)) catch return error.ExtractionCandidateLimitExceeded) > limits.max_intermediate_bytes) return error.ExtractionCandidateLimitExceeded;
         return self.explicit_fn(self.context, allocator, request, limits, control);
     }
     pub fn relations(self: Scorer, allocator: Allocator, request: RelationRequest, limits: tasks.Limits, control: ?Control) !RelationScores {
+        if (request.query_pairs.len > limits.math.max_queries or request.pairs.len > limits.max_relation_pairs) return error.RelationProposalLimitExceeded;
         return self.relations_fn(self.context, allocator, request, limits, control);
     }
     pub fn record(self: Scorer, allocator: Allocator, request: RecordRequest, limits: tasks.Limits, control: ?Control) !RecordScores {
@@ -234,6 +269,7 @@ pub const NativeContext = struct {
     fn recordScores(raw: *anyopaque, allocator: Allocator, request: RecordRequest, limits: tasks.Limits, control: ?Control) !RecordScores {
         const self = get(raw);
         try self.checkSample(request.sample_index, control);
+        try request.validate(self.config.head.record_instance_queries, limits);
         const b = request.sample_index;
         const h: usize = self.config.encoder.hidden_size;
         const q = self.prepared.query_width;
@@ -263,3 +299,22 @@ pub const NativeContext = struct {
         return .{ .storage = .{ .allocator = result.storage.allocator, .arena = result.storage.arena }, .object_logits = result.object_logits, .instance_seeds = result.instance_seeds, .fields = result.fields };
     }
 };
+
+test "gliner microbatch record admission distinguishes row ceilings before scorer execution" {
+    const DeviceLimits = @import("../architectures/gliner/boundary_tasks_device.zig").Limits;
+    const fields = [_]RecordFieldRoute{.{ .query_id = 0, .pool_indices = &.{ 0, 1 } }};
+    var request = RecordRequest{ .sample_index = 0, .mode = .latent, .fields = &fields };
+    try request.validate(2, DeviceLimits{});
+    try std.testing.expectError(error.ExtractionRecordLimitExceeded, request.validate(2, DeviceLimits{ .max_record_instances = 1 }));
+    try std.testing.expectError(error.ExtractionRecordLimitExceeded, request.validate(2, DeviceLimits{ .max_record_fields = 0 }));
+    try std.testing.expectError(error.ExtractionCandidateLimitExceeded, request.validate(2, DeviceLimits{ .max_candidates_per_field = 1 }));
+    try std.testing.expectError(error.ExtractionCandidateLimitExceeded, request.validate(2, DeviceLimits{ .max_record_candidates = 1 }));
+    try std.testing.expectError(error.ExtractionAssignmentLimitExceeded, request.validate(2, DeviceLimits{ .max_record_assignment_elements = 5 }));
+    try std.testing.expectError(error.ExtractionAssignmentLimitExceeded, request.validate(2, tasks.Limits{ .math = .{ .max_intermediate_bytes = 20 } }));
+    request.mode = .anchorless;
+    try std.testing.expectError(error.ExtractionAssignmentLimitExceeded, request.validate(2, DeviceLimits{ .max_record_attention_work = 3 }));
+    request.mode = .natural;
+    try std.testing.expectError(error.InvalidBoundaryScorerRouting, request.validate(2, DeviceLimits{}));
+    request.anchor_field = 0;
+    try request.validate(2, DeviceLimits{});
+}

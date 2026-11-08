@@ -73,13 +73,19 @@ def assert_equivalent(kind, reference, candidate):
     if kind == "extract":
         equivalent(reference, candidate, tolerance=0.0005)
     else:
-        left, right = reference["data"], candidate["data"]
-        assert len(left) == len(right)
-        for a, b in zip(left, right, strict=True):
-            assert a["text"] == b["text"], "recognized text changed under concurrency"
-            assert b.get("status") == "complete", "incomplete recognition"
-            if kind == "whisper":
-                equivalent(a["audio"], b["audio"], tolerance=0.0005)
+        # Physical batching attribution may legitimately differ. Everything
+        # else is the caller's public response contract, including usage/IDs.
+        left, right = copy.deepcopy(reference), copy.deepcopy(candidate)
+        left.pop("execution", None)
+        right.pop("execution", None)
+        try:
+            equivalent(left["usage"], right["usage"], tolerance=0)
+            equivalent(left, right, tolerance=0.0005)
+        except (AttributeError, TypeError, KeyError) as error:
+            raise AssertionError("recognition response contract changed") from error
+        assert all(item.get("status") == "complete" for item in candidate["data"]), (
+            "incomplete recognition"
+        )
     return {"equivalent": True}
 
 
