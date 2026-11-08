@@ -1829,6 +1829,116 @@ test "crash sweep: full text with retirement turn" {
     try reportFailures(&report);
 }
 
+// Regression coverage for the actual mechanism behind "retirement makes
+// full-text documents unsearchable after reopen": a minimal, non-crash
+// reproduction of `runFullTextWithRetirement` above, outside the sweep
+// harness, so a failure here points straight at the bug instead of a
+// crash-barrier index.
+//
+// Root cause (confirmed by deleting pieces of this scenario one at a time
+// until the failure flipped): nothing to do with retirement at all.
+// `ArtifactInputCapture.stage` (storage/artifact_input_capture.zig) used
+// to skip its attached `commit_participant` whenever this transaction
+// touched no replicated document/artifact ("documents.count() == 0 and
+// artifacts.count() == 0" -- the ordinary case for every write on a
+// standalone Lite store with no online-source replication authority).
+// WS4 phase 2's inline text/dense/sparse/graph publication
+// (`InlineTextPublication.stage` in mutation_materialization.zig) attaches
+// itself through that exact same slot purely to run once inside the host
+// transaction before commit -- it ignores the replication-position bytes
+// entirely and has nothing to do with document/artifact revision
+// tracking. Skipping it silently dropped every inline segment/seal/
+// progress mutation a write staged: the write still acknowledged and
+// stayed searchable in-session (the in-memory projection is installed
+// regardless of whether the durable catalog write happened), but nothing
+// durable ever reached the native transaction, so the effect vanished on
+// the next reopen.
+//
+// A fresh index's very first write still happens to survive: index
+// activation's own cold-start catch-up commits through the older,
+// several-commits-per-write path, which never goes through this capture
+// at all. Every write after that takes the broken inline fast path, which
+// is why `runFullTextWithRetirement`'s *second* and *third* writes were
+// the ones that came back unsearchable -- the retirement turn in between
+// them never touched the lost data; it was already gone the moment the
+// write it belonged to committed.
+test "regression: a second synchronous full_text write survives close+reopen without any retirement call" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    {
+        var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+        defer handle.close();
+        inline for (retirement_docs[0..2]) |doc| {
+            const json = try std.fmt.allocPrint(allocator, "{{\"body\":\"{s}\"}}", .{doc.body});
+            defer allocator.free(json);
+            try handle.db.batch(.{ .writes = &.{.{ .key = doc.key, .value = json }}, .sync_level = .full_text });
+        }
+    }
+    {
+        var handle = try openDbWithIo(allocator, path, std.testing.io, false);
+        defer handle.close();
+        var result = try handle.db.search(allocator, .{
+            .index_name = "body_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "retirement" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    }
+}
+
+// The exact scenario `runFullTextWithRetirement`'s crash sweep drives
+// (three small full-text writes, one owner retirement turn, close,
+// reopen), run once without any crash injection. Kept alongside the
+// simpler regression above because this is the shape the bug was first
+// reported in, and because it exercises `runRetirementTurn` itself (which
+// the simpler test above never calls) staying a true no-op end to end.
+test "regression: full-text writes with an intervening retirement turn survive close+reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    {
+        var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+        defer handle.close();
+        inline for (retirement_docs) |doc| {
+            const json = try std.fmt.allocPrint(allocator, "{{\"body\":\"{s}\"}}", .{doc.body});
+            defer allocator.free(json);
+            try handle.db.batch(.{ .writes = &.{.{ .key = doc.key, .value = json }}, .sync_level = .full_text });
+        }
+        try runRetirementTurn(allocator, &handle);
+    }
+
+    {
+        var handle = try openDbWithIo(allocator, path, std.testing.io, false);
+        defer handle.close();
+        var result = try handle.db.search(allocator, .{
+            .index_name = "body_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "retirement" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        var seen: [retirement_docs.len]bool = @splat(false);
+        for (result.hits) |hit| {
+            inline for (retirement_docs, 0..) |doc, i| {
+                if (std.mem.eql(u8, hit.id, doc.key)) seen[i] = true;
+            }
+        }
+        inline for (retirement_docs, 0..) |doc, i| {
+            if (!seen[i]) {
+                std.debug.print("regression: acknowledged document not searchable after reopen key={s}\n", .{doc.key});
+                return error.CrashConsistencyFullTextNotRebuilt;
+            }
+        }
+    }
+}
+
 test "crash sweep: full text with non-durable commit" {
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "full-text-with-non-durable-commit",
