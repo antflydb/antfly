@@ -28,7 +28,6 @@ pub fn build(b: *std.Build) void {
         .@"blas-root" = b.option([]const u8, "blas-root", "Path to the consumer's system BLAS installation"),
         .blas = b.option([]const u8, "blas", "CPU BLAS policy: auto, linked, or off") orelse "auto",
         .@"cuda-artifacts" = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: fatbin, portable, or sm89") orelse "fatbin",
-        .@"capi-profile" = b.option([]const u8, "capi-profile", "Native C library composition: full or storage") orelse "full",
         .strip = b.option(bool, "strip", "Strip native debug information") orelse false,
         .cuda = b.option(bool, "cuda", "Enable CUDA") orelse false,
         .@"wasm-memory-model" = b.option([]const u8, "wasm-memory-model", "Inference browser memory model: wasm32 or wasm64") orelse "wasm32",

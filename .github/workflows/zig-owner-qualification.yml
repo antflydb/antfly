@@ -218,15 +218,12 @@ jobs:
           python3 tools/run_bounded_zig_build.py -- build compiled-image-native-test compiled-pdf-native-test lake-execution-abi-integration-test mutation-resource-frame-test runtime-io-abi-test -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1 2>&1 | tee ../.benchmark-results/owner-qualification/equivalence.log
           python3 tools/check_image_owner_transport.py --build-log ../.benchmark-results/owner-qualification/equivalence.log --report ../.benchmark-results/owner-qualification/image-equivalence.json
           python3 tools/run_bounded_zig_build.py -- build lake-integration-test '-Dtest-filter=external lake execution' -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1 2>&1 | tee ../.benchmark-results/owner-qualification/lake-source.log
-      - name: Qualify full and storage C library compositions
+      - name: Qualify the C library with inference
         working-directory: zig
         run: |
           set -euo pipefail
-          : > ../.benchmark-results/owner-qualification/libantfly-debug-stripped-sizes.tsv
-          for profile in full storage; do
-            python3 tools/run_bounded_zig_build.py -- build capi capi-smoke "-Dcapi-profile=$profile" -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1
-            printf '%s\t%s\n' "$profile" "$(stat -c '%s' zig-out/lib/libantfly.so)" >> ../.benchmark-results/owner-qualification/libantfly-debug-stripped-sizes.tsv
-          done
+          python3 tools/run_bounded_zig_build.py -- build capi capi-smoke -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1
+          stat -c '%s' zig-out/lib/libantfly.so > ../.benchmark-results/owner-qualification/libantfly-debug-stripped-bytes.txt
       - name: Whole lake operation runtime and allocation probe
         working-directory: zig
         run: python3 tools/check_lake_execution_runtime.py --report ../.benchmark-results/owner-qualification/lake-runtime.json --rows 1024 --rounds 4

@@ -17,7 +17,6 @@ and pinned detailed records are in the [qualification summary](history/productio
 | Lake execution | `-Dshared-lake-execution=true` moves complete index attempts to the serverless owner. Coordinator publication/lease authority stays in the caller. Default remains off. |
 | Query execution | Parsing, execution and encoding live beside private DB state. The dispatcher consumes a checked operation capability. |
 | Read/restore ownership | Owner-issued relational/document readers, statement handles, statement capture fences and boxed query leases preserve typed values and explicit page release. Cypher uses bounded session operations and immutable metadata; pinned session construction stays in the owner. Retained local query-cut locks and publication readers expose release capabilities rather than file/executor/manager state. Disposable restore materialization stays inside its owner. |
-| Embedded C library composition | `-Dcapi-profile=storage` omits local model execution while preserving the C ABI and storage operations. The default remains `full`; media remains included. |
 | Commit disposition | Retry-shaped errors can retry preparation only before primary commit, preventing duplicate non-idempotent application. |
 | Disabled CUDA | Compile-time capability checks prevent CPU-only owners from instantiating concrete CUDA cleanup/execution paths. |
 
@@ -119,25 +118,22 @@ rebuild and must never be used in a warm-cache isolation check.
 - `profile-zig-products-paired.yml`: frozen paired product costs and artifacts.
 - `zig-owner-qualification.yml`: hosted policy checks, heavy native ownership
   tests and full/scheduled cache matrices. Focused behavior checks use stripped
-  Debug; production archive attribution retains unstripped Debug symbols. Both
-  C library profiles run the C consumer smoke suite.
+  Debug; production archive attribution retains unstripped Debug symbols. The
+  complete C library, including inference, runs the C consumer smoke suite.
 
 ## November 8 local screen
 
-The optional C library profile was compared on frozen `ba8493237e` sources with
-Zig 0.17.0, macOS arm64, baseline CPU, stripped Debug, Metal/CUDA/system BLAS off.
-The installed full library was 199,828,784 bytes and the storage profile was
-124,558,272 bytes (37.7% smaller). Both export/linkage and C smoke checks passed.
-This measures the cost of omitting a capability; it does not claim equivalent
-features or release build-speed/memory improvement. The available build times
-mix warm and cold caches and are unsuitable for that comparison.
+Both `antfly` and `libantfly` must preserve inference functionality. A smaller
+storage-only composition was screened and rejected as outside that acceptance
+target; its size reductions do not count as improvements and the build option
+and unavailable inference provider have been removed.
 
-After integrating main, both library profiles were rebuilt from identical
-`6c82151b5acf6200ad66bc1cd06811803095e1cedc2e2f8dde06534c3f3400a5`
-authored inputs with native image and lake options enabled. The full library was
-200,099,088 bytes and storage was 129,707,344 bytes (35.2% smaller). The full
-product/native-client build passed 156/156 steps; the storage C library and smoke
-suite passed 54/54. Both retained the 141-function public export boundary.
+With native image and lake options enabled, the complete library was
+200,099,088 bytes in stripped Debug. The full product/native-client build passed
+156/156 steps and enforced the 141-function public C export boundary. Final-head
+release size, build-time and peak-memory improvements remain unqualified.
+After removing the storage-only build path, all 55 complete C library/export/
+linkage/smoke steps passed, with native inference exercised rather than skipped.
 The cold compiled-owner restore regression and all 32 generation-lifecycle tests
 passed. Main was integrated through `09f6ab2b14`; its extracted GLiNER helper
 now receives the bound model-selection control, and all 58 executor-batching

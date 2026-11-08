@@ -124,13 +124,10 @@ pub const AddEmbeddedResult = struct {
     run_capi_tests: *std.Build.Step.Run,
 };
 
-const CapiProfile = enum { full, storage };
-
 pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult {
     const target = options.antfly_imports.platform_target;
     const optimize = options.optimize;
     const strip = options.strip;
-    const capi_profile = b.option(CapiProfile, "capi-profile", "Embedded library composition: full (default) or storage without local model execution") orelse .full;
     const link_libc = options.antfly_imports.platform_link_libc;
     const httpx_mod = options.antfly_imports.httpx;
     const structlog_mod = options.antfly_imports.structlog;
@@ -240,7 +237,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_mod.addImport("antfly_platform", platform_mod);
     const capi_options = b.addOptions();
     capi_options.addOption(bool, "linked_storage", false);
-    // The default native libantfly includes the local inference provider archive.
+    // Every native libantfly includes the local inference provider archive.
     // Unit tests exercise the same host directly.
     capi_options.addOption(bool, "inference_enabled", true);
     capi_mod.addOptions("capi_build_options", capi_options);
@@ -328,40 +325,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // and before any consumer can cache this module's dependency graph.
     antfly_imports.build_info.link(libantfly_link_mod);
     addMacosSdkPaths(b, libantfly_link_mod, target);
-    var selected_storage = native_storage;
-    var selected_inference = native_inference;
-    if (capi_profile == .storage) {
-        if (native_storage == null) @panic("capi-profile=storage requires a native storage owner");
-        const storage_options = b.addOptions();
-        storage_options.addOption(bool, "linked_storage", false);
-        storage_options.addOption(bool, "inference_enabled", false);
-        const no_local_models = @import("storage.zig").createLiteOptions(b, false);
-        const old_capi_options = capi_mod.import_table.get("capi_build_options").?;
-        var rewrite: @import("../module_rewrite.zig").Rewriter = .{
-            .b = b,
-            .replacements = &.{
-                .{ .source = old_capi_options, .target = storage_options.createModule() },
-                .{ .source = antfly_imports.lite_options, .target = no_local_models },
-            },
-            .on_copy = @import("source_owner.zig").trackModuleCopy,
-        };
-        const storage_root = rewrite.rewrite(capi_mod);
-        const disabled = b.createModule(.{
-            .root_source_file = b.path("pkg/inference/src/host/native_disabled_exports.zig"),
-            .target = target,
-            .optimize = optimize,
-            .pic = true,
-            .link_libc = true,
-        });
-        disabled.addImport("antfly_inference_bridge", antfly_imports.inference_bridge);
-        disabled.addImport("antfly_inference_engine", antfly_imports.inference_engine);
-        @import("source_owner.zig").registerStorageIndependent(disabled);
-        selected_inference = @import("shared_library.zig").addProviderArchive(b, disabled, "antfly-embedded-disabled-inference", 4 * 1024 * 1024 * 1024);
-        selected_storage = @import("shared_library.zig").addProviderArchive(b, storage_root, "antfly-embedded-storage-profile", 14 * 1024 * 1024 * 1024);
-        selected_storage.?.link_function_sections = true;
-        selected_storage.?.link_data_sections = true;
-    }
-    const libantfly = @import("shared_library.zig").addWithStorageOwner(b, libantfly_link_mod, &.{ selected_inference, native_enrichment }, selected_storage);
+    const libantfly = @import("shared_library.zig").addWithStorageOwner(b, libantfly_link_mod, &.{ native_inference, native_enrichment }, native_storage);
     const install_libantfly = libantfly.install;
     b.addNamedLazyPath("libantfly", libantfly.binary);
     if (native_storage) |owner| {
@@ -423,7 +387,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_smoke_mod.addIncludePath(b.path("pkg/antfly-embedded/include"));
     capi_smoke_mod.addCSourceFile(.{
         .file = b.path("pkg/antfly-embedded/tests/capi_smoke.c"),
-        .flags = if (capi_profile == .storage) &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-DANTFLY_STORAGE_PROFILE=1" } else &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     const capi_smoke = b.addExecutable(.{
         .name = "antfly-c-smoke",

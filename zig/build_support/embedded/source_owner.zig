@@ -388,11 +388,6 @@ fn trackSessionCopy(original: *std.Build.Module, copy: *std.Build.Module) void {
     adopt(copy);
 }
 
-/// Preserve source-provider policy when a product composition forks modules.
-pub fn trackModuleCopy(original: *std.Build.Module, copy: *std.Build.Module) void {
-    trackSessionCopy(original, copy);
-}
-
 fn bindSessionCompile(b: *std.Build, artifact: *std.Build.Step.Compile) void {
     if (isStorageIndependent(artifact.root_module)) return;
     const root = artifact.root_module;
