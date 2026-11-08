@@ -7970,3 +7970,191 @@ test "memory dimension admission pins durable geometry and receipt replay cannot
     external.models.embedder.?.dimensions = 65537;
     try std.testing.expectError(error.InvalidMemoryConfig, external.validate());
 }
+
+const layered_claims = "{\"assertions\":[" ++
+    "{\"id\":\"a-language\",\"subject\":\"service\",\"predicate\":\"language\",\"value\":\"Zig\",\"statement\":\"The service is written in Zig\",\"evidence\":[{\"id\":\"e1\"}]}," ++
+    "{\"id\":\"z-ticket\",\"subject\":\"deploys\",\"predicate\":\"requires\",\"value\":\"ticket\",\"kind\":\"constraint\",\"statement\":\"Deploys require a change ticket\",\"evidence\":[{\"id\":\"e1\"}]}," ++
+    "{\"id\":\"m-guess\",\"subject\":\"service\",\"predicate\":\"owner\",\"value\":\"infra\",\"stability\":\"provisional\",\"role\":\"inferred\",\"statement\":\"Infra probably owns the service\",\"evidence\":[{\"id\":\"e1\"}]}," ++
+    "{\"id\":\"b-language-copy\",\"subject\":\"service\",\"predicate\":\"language\",\"value\":\"Zig\",\"statement\":\"Service code is Zig\",\"evidence\":[{\"id\":\"e1\"}]}" ++
+    "]}";
+fn briefIndex(brief: []const u8, id: []const u8) ?usize {
+    var needle_buffer: [128]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buffer, "\"id\":\"{s}\"", .{id}) catch return null;
+    return std.mem.indexOf(u8, brief, needle);
+}
+test "memory brief is small, ranks durable settled claims first and honors branch-local pins" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    try discard(&store, .assertions, "", layered_claims, "claims", 3);
+    const initial = try store.run(.brief, "", "{}", "", 10);
+    defer std.testing.allocator.free(initial);
+    // The constraint outranks plain semantic facts; provisional claims stay
+    // out of injected context; restated duplicates collapse to one item.
+    try std.testing.expect(briefIndex(initial, "z-ticket").? < briefIndex(initial, "a-language").?);
+    try std.testing.expect(briefIndex(initial, "m-guess") == null);
+    try std.testing.expect(briefIndex(initial, "b-language-copy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, initial, "\"guidance\":\"These are the memories") != null);
+    try std.testing.expect(std.mem.indexOf(u8, initial, "\"subject\":\"service\",\"memories\":") != null);
+    const parsed = try std.json.parseFromSlice(m.types.Brief, std.testing.allocator, initial, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.token_upper_bound == initial.len and initial.len <= 1024);
+
+    try discard(&store, .pin, "", "{\"id\":\"a-language\",\"reason\":\"core fact\"}", "pin", 11);
+    const pinned = try store.run(.brief, "", "{}", "", 12);
+    defer std.testing.allocator.free(pinned);
+    try std.testing.expect(briefIndex(pinned, "a-language").? < briefIndex(pinned, "z-ticket").?);
+    try std.testing.expect(std.mem.indexOf(u8, pinned, "\"pinned\":true") != null);
+
+    const limited = try store.run(.brief, "", "{\"limit\":1}", "", 13);
+    defer std.testing.allocator.free(limited);
+    const limited_value = try std.json.parseFromSlice(m.types.Brief, std.testing.allocator, limited, .{});
+    defer limited_value.deinit();
+    try std.testing.expectEqual(@as(usize, 1), limited_value.value.items.len);
+    try std.testing.expect(!limited_value.value.complete and limited_value.value.omitted > 0);
+
+    const tight = try store.run(.brief, "", "{\"token_budget\":400}", "", 14);
+    defer std.testing.allocator.free(tight);
+    try std.testing.expect(tight.len <= 400);
+    try std.testing.expectError(error.InvalidMemoryRequest, store.run(.brief, "", "{\"limit\":0}", "", 14));
+
+    // Private memory never reaches another principal's brief or pin.
+    const bob = store.service("bob", false, 15);
+    const bob_brief = try bob.execute(std.testing.allocator, .brief, "", "{}", "");
+    defer std.testing.allocator.free(bob_brief);
+    try std.testing.expect(briefIndex(bob_brief, "z-ticket") == null);
+    try std.testing.expectError(error.Forbidden, bob.execute(std.testing.allocator, .pin, "", "{\"id\":\"z-ticket\"}", "bob-pin"));
+
+    try discard(&store, .pin, "", "{\"id\":\"a-language\",\"pinned\":false}", "unpin", 16);
+    const unpinned = try store.run(.brief, "", "{}", "", 17);
+    defer std.testing.allocator.free(unpinned);
+    try std.testing.expect(std.mem.indexOf(u8, unpinned, "\"pinned\":true") == null);
+    try std.testing.expectError(error.MemoryNotFound, store.run(.pin, "", "{\"id\":\"missing\"}", "pin-missing", 18));
+}
+test "memory pins on team memory are curator decisions" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"team-e\",\"source_id\":\"handbook\",\"source_version\":\"v1\",\"visibility\":\"team\",\"text\":\"Deploys require review\"}]}", "team-source", 3);
+    try discard(&store, .assertions, "", "{\"assertions\":[{\"id\":\"team-rule\",\"subject\":\"deploys\",\"predicate\":\"requires\",\"value\":\"review\",\"kind\":\"constraint\",\"visibility\":\"team\",\"statement\":\"Deploys require review\",\"evidence\":[{\"id\":\"team-e\"}]}]}", "team", 3);
+    try std.testing.expectError(error.Forbidden, store.service("bob", false, 4).execute(std.testing.allocator, .pin, "", "{\"id\":\"team-rule\"}", "writer"));
+    var curator = store.service("carol", false, 5);
+    curator.context.curator = true;
+    const receipt = try curator.execute(std.testing.allocator, .pin, "", "{\"id\":\"team-rule\"}", "curator");
+    std.testing.allocator.free(receipt);
+    const brief = try store.service("bob", false, 6).execute(std.testing.allocator, .brief, "", "{}", "");
+    defer std.testing.allocator.free(brief);
+    try std.testing.expect(std.mem.indexOf(u8, brief, "\"id\":\"team-rule\"") != null and std.mem.indexOf(u8, brief, "\"pinned\":true") != null);
+}
+test "memory outcome utility is opt-in for recall and surfaces harmful claims in consolidation" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    try discard(&store, .assertions, "", layered_claims, "claims", 3);
+    try discard(&store, .outcome, "", "{\"id\":\"o1\",\"task_id\":\"t1\",\"success\":false,\"used_memory_ids\":[\"a-language\"]}", "o1", 4);
+    try discard(&store, .outcome, "", "{\"id\":\"o2\",\"task_id\":\"t2\",\"success\":false,\"used_memory_ids\":[\"a-language\"]}", "o2", 5);
+    try discard(&store, .outcome, "", "{\"id\":\"o3\",\"task_id\":\"t3\",\"success\":true,\"used_memory_ids\":[\"z-ticket\"]}", "o3", 6);
+
+    // Default ranking ignores outcomes: equal lexical-free scores fall back to id order.
+    const plain = try store.run(.recall, "", "{\"token_budget\":8192}", "", 10);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "\"id\":\"a-language\"").? < std.mem.indexOf(u8, plain, "\"id\":\"z-ticket\"").?);
+    const boosted = try store.run(.recall, "", "{\"token_budget\":8192,\"utility_weight\":1}", "", 10);
+    defer std.testing.allocator.free(boosted);
+    // The failing claim drops below its restated copy and the useful constraint.
+    try std.testing.expect(std.mem.indexOf(u8, boosted, "\"id\":\"z-ticket\"").? < std.mem.indexOf(u8, boosted, "\"id\":\"b-language-copy\"").?);
+    try std.testing.expect(std.mem.indexOf(u8, boosted, "\"id\":\"a-language\"") == null);
+    try std.testing.expectError(error.InvalidMemoryRequest, store.run(.recall, "", "{\"utility_weight\":2}", "", 10));
+
+    const brief = try store.run(.brief, "", "{}", "", 11);
+    defer std.testing.allocator.free(brief);
+    try std.testing.expect(std.mem.indexOf(u8, brief, "\"successes\":1,\"failures\":0") != null);
+
+    const review = try store.run(.consolidate, "", "{}", "", 12);
+    defer std.testing.allocator.free(review);
+    const parsed = try std.json.parseFromSlice(m.types.Consolidation, std.testing.allocator, review, .{});
+    defer parsed.deinit();
+    var harmful = false;
+    var duplicate = false;
+    var unverified = false;
+    var promote = false;
+    for (parsed.value.findings) |finding| switch (finding.kind) {
+        .harmful => harmful = harmful or std.mem.eql(u8, finding.memory_ids[0], "a-language"),
+        .duplicate => duplicate = duplicate or (finding.memory_ids.len == 2 and std.mem.eql(u8, finding.memory_ids[0], "a-language") and std.mem.eql(u8, finding.memory_ids[1], "b-language-copy")),
+        .unverified => unverified = unverified or std.mem.eql(u8, finding.memory_ids[0], "m-guess"),
+        .promote => promote = promote or std.mem.eql(u8, finding.memory_ids[0], "z-ticket"),
+        else => {},
+    };
+    try std.testing.expect(harmful and duplicate and unverified and promote);
+    try std.testing.expectEqual(@as(u32, 4), parsed.value.stats.memories);
+    try std.testing.expect(parsed.value.complete);
+
+    // Consolidation is read-only: the space revision does not move.
+    const again = try store.run(.consolidate, "", "{}", "", 13);
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqualStrings(review, again);
+
+    // Another principal cannot read alice's outcomes through utility.
+    const bob = store.service("bob", false, 14);
+    const bob_recall = try bob.execute(std.testing.allocator, .recall, "", "{\"token_budget\":8192,\"utility_weight\":1}", "");
+    defer std.testing.allocator.free(bob_recall);
+    try std.testing.expect(std.mem.indexOf(u8, bob_recall, "\"successes\"") == null);
+}
+test "memory consolidation reports unordered single-valued claims and is bounded" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    try discard(&store, .assertions, "", "{\"assertions\":[{\"id\":\"undated\",\"subject\":\"staging\",\"predicate\":\"deploys_with\",\"value\":\"Helm\",\"statement\":\"Staging uses Helm\",\"evidence\":[{\"id\":\"e1\"}]}]}", "undated", 3);
+    const review = try store.run(.consolidate, "", "{\"limit\":1,\"stale_after_ms\":1}", "", 1000);
+    defer std.testing.allocator.free(review);
+    const parsed = try std.json.parseFromSlice(m.types.Consolidation, std.testing.allocator, review, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.findings.len);
+    try std.testing.expect(parsed.value.omitted > 0 and !parsed.value.complete);
+    const full = try store.run(.consolidate, "", "{\"stale_after_ms\":1}", "", 1000);
+    defer std.testing.allocator.free(full);
+    try std.testing.expect(std.mem.indexOf(u8, full, "\"kind\":\"unordered\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full, "\"kind\":\"stale\"") != null);
+    try std.testing.expectError(error.InvalidMemoryRequest, store.run(.consolidate, "", "{\"limit\":0}", "", 1000));
+}
+test "memory maintenance reclaims outcome bindings and pins after global forget" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    try discard(&store, .assertions, "", layered_claims, "claims", 3);
+    try discard(&store, .outcome, "", "{\"id\":\"o1\",\"task_id\":\"t1\",\"success\":true,\"used_memory_ids\":[\"z-ticket\"]}", "o1", 4);
+    try discard(&store, .pin, "", "{\"id\":\"z-ticket\"}", "pin", 5);
+    var bindings: usize = 0;
+    var it = store.values.iterator();
+    while (it.next()) |entry| if (std.mem.startsWith(u8, entry.key_ptr.*, "outcome-use/") or std.mem.startsWith(u8, entry.key_ptr.*, "brief-pin/")) {
+        bindings += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), bindings);
+    try discard(&store, .forget, "", "{\"all\":true}", "forget", 6);
+    const brief = try store.run(.brief, "", "{}", "", 7);
+    defer std.testing.allocator.free(brief);
+    try std.testing.expect(briefIndex(brief, "z-ticket") == null);
+    var turns: usize = 0;
+    while (turns < 64) : (turns += 1) try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(store.arena.allocator(), "maintenance-{d}", .{turns}), 8 + @as(i64, @intCast(turns)));
+    it = store.values.iterator();
+    while (it.next()) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.key_ptr.*, "outcome-use/"));
+        try std.testing.expect(!std.mem.startsWith(u8, entry.key_ptr.*, "brief-pin/"));
+    }
+}
+test "memory consolidation reports links whose target was retired" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    try discard(&store, .assertions, "", "{\"assertions\":[{\"id\":\"choice\",\"subject\":\"db\",\"predicate\":\"engine\",\"value\":\"lmdb\",\"kind\":\"decision\",\"statement\":\"We chose LMDB\",\"evidence\":[{\"id\":\"e1\"}]}]}", "choice", 3);
+    try discard(&store, .assertions, "", "{\"assertions\":[{\"id\":\"why\",\"subject\":\"db\",\"predicate\":\"reason\",\"value\":\"mmap\",\"kind\":\"rationale\",\"statement\":\"Memory-mapped reads are fast\",\"motivates\":[\"choice\"],\"evidence\":[{\"id\":\"e1\"}]}]}", "why", 4);
+    const clean = try store.run(.consolidate, "", "{}", "", 5);
+    defer std.testing.allocator.free(clean);
+    try std.testing.expect(std.mem.indexOf(u8, clean, "\"kind\":\"dangling_link\"") == null);
+    try discard(&store, .forget, "", "{\"assertion_ids\":[\"choice\"]}", "forget", 6);
+    var turns: usize = 0;
+    while (turns < 32) : (turns += 1) try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(store.arena.allocator(), "maintenance-{d}", .{turns}), 7 + @as(i64, @intCast(turns)));
+    const review = try store.run(.consolidate, "", "{}", "", 100);
+    defer std.testing.allocator.free(review);
+    try std.testing.expect(std.mem.indexOf(u8, review, "\"kind\":\"dangling_link\",\"memory_ids\":[\"why\"],\"entity_id\":null,\"target_id\":\"choice\"") != null);
+}

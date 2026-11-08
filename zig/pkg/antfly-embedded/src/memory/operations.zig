@@ -18,14 +18,14 @@ const std = @import("std");
 const t = @import("types.zig");
 const schema = @import("schema.zig");
 
-pub const Action = enum { evaluation_results, put_evaluation_dataset, evaluation_dataset, evaluation_cases, start_evaluation, evaluation_run, evaluation_tasks, evaluation_verdict, lineage, fork_lineage, checkpoint_lineage, revert_lineage, supersession_candidates, propose_supersession, supersession_proposals, supersession_proposal, review_supersession, changes, create, inspect, configure, observe, assertions, recall, get, history, correct, forget, outcome, operation, advance, list, entities, curate_entity, resolve_entity, evidence, stage_embeddings, configuration, explain, entity_candidates, propose_entity, entity_proposals, entity_proposal, review_entity, entity_view, episodes, episode, propose_relationship, relationship_proposal, review_relationship };
+pub const Action = enum { evaluation_results, put_evaluation_dataset, evaluation_dataset, evaluation_cases, start_evaluation, evaluation_run, evaluation_tasks, evaluation_verdict, lineage, fork_lineage, checkpoint_lineage, revert_lineage, supersession_candidates, propose_supersession, supersession_proposals, supersession_proposal, review_supersession, changes, create, inspect, configure, observe, assertions, recall, get, history, correct, forget, outcome, operation, advance, list, entities, curate_entity, resolve_entity, evidence, stage_embeddings, configuration, explain, entity_candidates, propose_entity, entity_proposals, entity_proposal, review_entity, entity_view, episodes, episode, propose_relationship, relationship_proposal, review_relationship, brief, consolidate, pin };
 pub const Configure = struct { expected_revision: u64, config: t.Config };
 pub const Page = struct { cursor: ?[]const u8 = null, limit: u16 = 64 };
 pub const EvaluationResultRequest = struct { cursor: ?[]const u8 = null, limit: u16 = 8 };
 
 pub fn mutates(action: Action) bool {
     return switch (action) {
-        .evaluation_results, .evaluation_dataset, .evaluation_cases, .evaluation_run, .evaluation_tasks, .lineage, .supersession_candidates, .supersession_proposals, .supersession_proposal, .changes, .inspect, .recall, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal => false,
+        .evaluation_results, .evaluation_dataset, .evaluation_cases, .evaluation_run, .evaluation_tasks, .lineage, .supersession_candidates, .supersession_proposals, .supersession_proposal, .changes, .inspect, .recall, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal, .brief, .consolidate => false,
         else => true,
     };
 }
@@ -35,8 +35,8 @@ pub fn mutates(action: Action) bool {
 /// small ingestion budget never locks out inspection, erasure or recovery.
 pub fn usesInputBudget(action: Action) bool {
     return switch (action) {
-        .put_evaluation_dataset, .evaluation_verdict, .propose_supersession, .review_supersession, .observe, .assertions, .correct, .outcome, .curate_entity, .stage_embeddings, .recall, .propose_entity, .review_entity, .propose_relationship, .review_relationship => true,
-        .evaluation_results, .evaluation_dataset, .evaluation_cases, .start_evaluation, .evaluation_run, .evaluation_tasks, .lineage, .fork_lineage, .checkpoint_lineage, .revert_lineage, .supersession_candidates, .supersession_proposals, .supersession_proposal, .changes, .create, .configure, .forget, .advance, .inspect, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal => false,
+        .put_evaluation_dataset, .evaluation_verdict, .propose_supersession, .review_supersession, .observe, .assertions, .correct, .outcome, .curate_entity, .stage_embeddings, .recall, .propose_entity, .review_entity, .propose_relationship, .review_relationship, .pin => true,
+        .evaluation_results, .evaluation_dataset, .evaluation_cases, .start_evaluation, .evaluation_run, .evaluation_tasks, .lineage, .fork_lineage, .checkpoint_lineage, .revert_lineage, .supersession_candidates, .supersession_proposals, .supersession_proposal, .changes, .create, .configure, .forget, .advance, .inspect, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal, .brief, .consolidate => false,
     };
 }
 
@@ -75,6 +75,9 @@ pub fn Body(comptime action: Action) type {
         .propose_entity => t.EntityProposalRequest,
         .review_entity => t.EntityVerdict,
         .entity_proposals => Page,
+        .brief => t.BriefRequest,
+        .consolidate => t.ConsolidationRequest,
+        .pin => t.Pin,
         else => struct {},
     };
 }
@@ -138,6 +141,34 @@ pub fn description(action: Action) []const u8 {
         .stage_embeddings => "Stage externally produced vectors for a pending embedding generation.",
         .configuration => "Get an immutable historical configuration by generation id.",
         .explain => "Explain a memory id or body.resource through a bounded provenance graph with authorization, retention and known_at applied.",
+        .brief => "Load the small session-start brief: pinned and highest-signal current memories within a token budget, with ids for deeper recall.",
+        .consolidate => "Review memory health without changing it: duplicates, disputes, unordered or unverified claims, outcome-harmful claims, dangling links, orphan entities and pin candidates, each with a suggested reviewed action.",
+        .pin => "Pin or unpin a memory in the session-start brief of the selected branch. Pinning team-visible memory requires curator access.",
+    };
+}
+
+/// The agent profile is a small purpose-oriented toolset for models working
+/// inside a task. The full catalog remains available to operators and curators.
+pub fn agentProfile(action: Action) bool {
+    return switch (action) {
+        .brief, .recall, .observe, .correct, .forget, .outcome, .get, .explain => true,
+        else => false,
+    };
+}
+
+/// Agent-facing descriptions say what memory is for rather than prescribing
+/// rules; stronger models use that freedom better than fixed procedures.
+pub fn agentDescription(action: Action) []const u8 {
+    return switch (action) {
+        .brief => "Start here each session. Returns the few memories most worth knowing up front (pinned and high-signal), each with an id you can recall, get or explain for detail.",
+        .recall => "Search memory when the brief is not enough: query text plus optional subject, kind, scope, task or time filters. Results cite their evidence.",
+        .observe => "Remember something worth keeping for future sessions: store the source text as evidence and, optionally, the specific claims it supports. Prefer facts likely to matter again, quote critical details verbatim, and skip transient state that will soon be stale.",
+        .correct => "Fix a memory that turned out to be wrong or uncertain: retract or dispute it, or mark it settled once verified. Requires the memory's current revision.",
+        .forget => "Forget evidence or memories that should no longer be kept.",
+        .outcome => "Report whether a task succeeded and which memory ids you used. Memories that keep helping rank higher; ones linked to failures are flagged for review.",
+        .get => "Read one memory by id, including its lifecycle, validity and evidence citations.",
+        .explain => "Show why a memory exists: its evidence, the decisions that changed it and what depends on it.",
+        else => description(action),
     };
 }
 
@@ -181,6 +212,12 @@ pub fn mcpTools(a: std.mem.Allocator) !std.json.Value {
         try tool.put(a, "name", .{ .string = "memory_" ++ name });
         try tool.put(a, "description", .{ .string = description(action) });
         try tool.put(a, "input_schema_json", .{ .string = try std.json.Stringify.valueAlloc(a, input, .{}) });
+        // Agent tools derive a content-addressed idempotency key when omitted,
+        // so an identical retry replays the first receipt.
+        if (comptime mutates(action)) _ = required.pop();
+        try tool.put(a, "agent", .{ .bool = agentProfile(action) });
+        try tool.put(a, "agent_description", .{ .string = agentDescription(action) });
+        try tool.put(a, "agent_input_schema_json", .{ .string = try std.json.Stringify.valueAlloc(a, input, .{}) });
         try tools.append(a, .{ .object = tool });
     }
     return .{ .array = std.array_list.Managed(std.json.Value).fromOwnedSlice(a, try tools.toOwnedSlice(a)) };
@@ -211,4 +248,21 @@ test "memory MCP contracts cover every native action with exact payload domains"
         }
     }
     try std.testing.expect(configured and recalled);
+}
+
+test "memory agent MCP profile is small and derives idempotency keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const tools = (try mcpTools(arena.allocator())).array.items;
+    var agent_tools: usize = 0;
+    for (tools) |tool| {
+        if (!tool.object.get("agent").?.bool) continue;
+        agent_tools += 1;
+        const action = std.meta.stringToEnum(Action, tool.object.get("action").?.string).?;
+        const input = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), tool.object.get("agent_input_schema_json").?.string, .{ .parse_numbers = false });
+        for (input.object.get("required").?.array.items) |name| try std.testing.expect(!std.mem.eql(u8, name.string, "idempotency_key"));
+        try std.testing.expectEqual(mutates(action), input.object.get("properties").?.object.contains("idempotency_key"));
+        try std.testing.expect(tool.object.get("agent_description").?.string.len > 0);
+    }
+    try std.testing.expect(agent_tools >= 5 and agent_tools <= 8);
 }

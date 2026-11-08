@@ -1528,7 +1528,7 @@ pub const AntflyApiHandler = struct {
             try self.registerProbes(server);
         }
 
-        const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*", routes.memory_mcp_v1 };
+        const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*", routes.memory_mcp_v1, routes.memory_mcp_v1_agent };
         const mcp_handler = httpx.Handler.bind(self, mcpRoute);
         inline for (mcp_paths) |path| {
             try server.get(path, mcp_handler);
@@ -1958,7 +1958,7 @@ pub const AntflyApiHandler = struct {
             inline for (.{ "cursor", "start", "subject", "predicate", "scope", "task", "environment", "kind", "relationship", "target_id", "missing_relationship" }) |field| if (try ctx.queryDecoded(field)) |decoded| {
                 try query_body.put(a, field, .{ .string = decoded });
             };
-            inline for (.{ "limit", "valid_at", "known_at" }) |field| if (ctx.query(field)) |v| {
+            inline for (.{ "limit", "valid_at", "known_at", "token_budget" }) |field| if (ctx.query(field)) |v| {
                 const number = std.fmt.parseInt(i64, v, 10) catch return memoryFailure(ctx, error.InvalidMemoryRequest);
                 try query_body.put(a, field, .{ .integer = number });
             };
@@ -2170,8 +2170,9 @@ pub const AntflyApiHandler = struct {
         };
         const path = ctx.request.uri.path;
         var extension_name: ?[]const u8 = null;
-        const is_memory = std.mem.eql(u8, path, routes.memory_mcp_v1);
-        var endpoint_path: []const u8 = if (is_memory) routes.memory_mcp_v1 else routes.mcp_v1;
+        const is_memory_agent = std.mem.eql(u8, path, routes.memory_mcp_v1_agent);
+        const is_memory = is_memory_agent or std.mem.eql(u8, path, routes.memory_mcp_v1);
+        var endpoint_path: []const u8 = if (is_memory_agent) routes.memory_mcp_v1_agent else if (is_memory) routes.memory_mcp_v1 else routes.mcp_v1;
         if (std.mem.startsWith(u8, path, routes.mcp_v1_extension_profiles_prefix)) {
             const profile = path[routes.mcp_v1_extension_profiles_prefix.len..];
             if (!std.mem.eql(u8, profile, "copilot"))
@@ -2192,7 +2193,7 @@ pub const AntflyApiHandler = struct {
             .body = body,
         };
         var response = if (is_memory)
-            try protocol_adapters.executeMemoryMcpRequest(self.api_server, request, authenticated_identity)
+            try protocol_adapters.executeMemoryMcpProfileRequest(self.api_server, request, authenticated_identity, if (is_memory_agent) .agent else .full)
         else if (extension_name) |name|
             try protocol_adapters.executeExtensionMcpRequest(self.api_server, request, authenticated_identity, name)
         else

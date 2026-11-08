@@ -55,6 +55,7 @@ const GenerationProvenance = struct {
 const JudgmentArtifact = struct { input_version: u8 = 0, operation: prov.Resource, inputs: GenerationProvenance, reason: []const u8, output_assertion_id: ?[]const u8 = null };
 const ExplainedRecord = struct { resource: prov.Resource, record: std.json.Value, links: []const prov.Link };
 const StoredOutcome = struct { outcome: t.Outcome, owner: []const u8, recorded_at: i64, revision: u64 = 0 };
+const OutcomeUse = struct { outcome_id: []const u8, memory_id: []const u8 };
 const DependencyWork = struct { kind: []const u8, id: []const u8, revision: u64, cursor: ?[]const u8 = null };
 const EntityPolicy = struct { state: curation.State = .{}, redirects: []const curation.Redirect = &.{} };
 // Free-text audit content has its own retention lifecycle. Identity origins
@@ -415,6 +416,9 @@ pub const Service = struct {
             .review_entity => try run.reviewEntity(id, try parse(t.EntityVerdict, a, admitted_body), &op),
             .resolve_entity => output = try run.resolveEntity(id),
             .entities => output = try run.entityList(try parse(operations.Page, a, admitted_body)),
+            .brief => output = try run.brief(try parse(t.BriefRequest, a, admitted_body)),
+            .consolidate => output = try run.consolidate(try parse(t.ConsolidationRequest, a, admitted_body)),
+            .pin => try run.pinMemory(try parse(t.Pin, a, admitted_body)),
         }
         if (mutates(action)) {
             op.intake_screening = run.intake_report;
@@ -1600,6 +1604,13 @@ const Run = struct {
         if (action == .forget) {
             const request = try parse(t.Forget, self.a, body);
             if (request.all or request.source_ids.len > 0) return .admin;
+        }
+        if (action == .pin) {
+            // Team briefs are shared injected context; curating them is a
+            // curator decision. Private pins only shape the owner's brief.
+            const request = try parse(t.Pin, self.a, body);
+            try t.validateId(request.id);
+            if (try self.assertion(request.id)) |record| if (record.assertion.visibility == .team) return .curator;
         }
         return actionGrant(action);
     }
@@ -5195,7 +5206,7 @@ const Run = struct {
         const record = (try self.read(t.EntityRecord, try key(self.a, "entity", selected))) orelse return error.MemoryNotFound;
         try self.authorize(record.owner, record.entity.visibility);
         if (!try self.entityVisible(record)) return error.MemoryNotFound;
-        return self.encode(.{ .entity = record.entity, .resource_ref = try self.resourceRef(.entity, record.entity.id, record.revision), .canonical_id = selected, .requested_id = id, .revision = self.state.revision, .identity = "explicit", .uncertainty = "Names and aliases alone do not prove entity identity" });
+        return self.encode(t.ResolvedEntity{ .entity = record.entity, .resource_ref = try self.resourceRef(.entity, record.entity.id, record.revision), .canonical_id = selected, .requested_id = id, .revision = self.state.revision, .identity = "explicit", .uncertainty = "Names and aliases alone do not prove entity identity" });
     }
     fn entity(self: *Run, value: t.Entity) !void {
         try t.validateId(value.id);
@@ -5488,6 +5499,9 @@ const Run = struct {
             if (!try self.evidenceVisible(record)) return error.MemoryNotFound;
         }
         try self.put(path, StoredOutcome{ .outcome = request, .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision });
+        // Reverse bindings let reads derive per-memory utility without
+        // scanning every outcome. Reads recheck the outcome itself.
+        for (request.used_memory_ids) |id| try self.put(try outcomeUseKey(self.a, id, request.id), OutcomeUse{ .outcome_id = request.id, .memory_id = id });
     }
     fn advance(self: *Run, id: []const u8, receipt: *t.Operation) !void {
         if (id.len == 0) return self.maintenance();
@@ -6315,6 +6329,12 @@ const Run = struct {
             const serving = self.state.config.features.semantic_recall and projection.generation == self.state.config.embedding_generation;
             const staging = if (self.state.pending_config) |pending| projection.generation == pending.embedding_generation else false;
             if ((!serving and !staging) or record == null or !try self.retained(record.?, 0)) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "outcome-use/")) {
+            const binding = try parse(OutcomeUse, self.a, row.json);
+            if (try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-outcome", binding.outcome_id)) != null or try self.read(StoredOutcome, try key(self.a, "outcome", binding.outcome_id)) == null) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "brief-pin/")) {
+            const stored = try parse(t.StoredPin, self.a, row.json);
+            if (try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-assertion", stored.id)) != null) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "outcome/")) {
             const stored = try parse(StoredOutcome, self.a, row.json);
             if (!try self.outcomeRetained(stored)) {
@@ -7166,6 +7186,7 @@ const Run = struct {
             score += try cosine(query_vector, embedding);
         };
         if (require_match and request.query.len > 0 and score <= 0) return null;
+        if (request.utility_weight > 0) score += request.utility_weight * (try self.utility(claim.id)).score;
         if (claim.stability == .provisional) score *= 0.5;
         const support = try self.visibleSupport(claim, request.known_at, valid);
         record.assertion.evidence = support.evidence;
@@ -7221,6 +7242,7 @@ const Run = struct {
     fn recall(self: *Run, request: t.Recall) ![]const u8 {
         self.historical_resource_reads = request.known_at != null;
         if (request.limit == 0 or request.limit > t.max_items or request.token_budget == 0 or request.token_budget > self.state.config.max_recall_tokens) return error.InvalidMemoryRequest;
+        if (!std.math.isFinite(request.utility_weight) or request.utility_weight < 0 or request.utility_weight > 1) return error.InvalidMemoryRequest;
         const Hit = t.RecallHit;
         var hits: std.ArrayList(Hit) = .empty;
         var after: ?[]const u8 = null;
@@ -7364,6 +7386,301 @@ const Run = struct {
             result.token_upper_bound = rendered.len;
         }
     }
+
+    /// Outcome-derived utility, counted only from retained outcomes the caller
+    /// may read. Bounded by max_utility_outcomes reverse bindings per memory.
+    fn utility(self: *Run, id: []const u8) !t.Utility {
+        var result: t.Utility = .{};
+        if (try self.read(bool, "forgotten-all") != null) return result;
+        const prefix = try std.fmt.allocPrint(self.a, "outcome-use/{s}/", .{try hash(self.a, id)});
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, null, t.max_utility_outcomes);
+        for (page.rows) |row| {
+            const binding = parse(OutcomeUse, self.a, row.json) catch return error.MemoryCorruptState;
+            if (try self.read(bool, try key(self.a, "forgotten-outcome", binding.outcome_id)) != null) continue;
+            const stored = (try self.read(StoredOutcome, try key(self.a, "outcome", binding.outcome_id))) orelse continue;
+            if (!eql(u8, stored.owner, self.service.context.principal) and !self.service.context.admin) continue;
+            if (stored.outcome.success) result.successes += 1 else result.failures += 1;
+        }
+        result.complete = page.next == null;
+        const successes: f64 = @floatFromInt(result.successes);
+        const failures: f64 = @floatFromInt(result.failures);
+        result.score = (successes - failures) / (successes + failures + 2);
+        return result;
+    }
+    fn anyOutcomeUse(self: *Run) !bool {
+        return (try self.service.backend.scan(self.service.backend.ptr, self.a, "outcome-use/", null, 1)).rows.len > 0;
+    }
+    fn pinKey(self: *Run, id: []const u8) ![]const u8 {
+        try t.validateId(id);
+        return std.fmt.allocPrint(self.a, "brief-pin/{s}", .{try hash(self.a, .{ self.service.context.branch, id })});
+    }
+    /// Pins of the selected branch. Pins are branch-local and are not
+    /// inherited by forks; retention and authorization are rechecked on read.
+    fn pinnedIds(self: *Run) !std.StringArrayHashMapUnmanaged(void) {
+        var pinned: std.StringArrayHashMapUnmanaged(void) = .empty;
+        if (try self.read(bool, "forgotten-all") != null) return pinned;
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "brief-pin/", null, t.max_brief_pins);
+        for (page.rows) |row| {
+            const stored = parse(t.StoredPin, self.a, row.json) catch return error.MemoryCorruptState;
+            if (eql(u8, stored.branch, self.service.context.branch)) try pinned.put(self.a, stored.id, {});
+        }
+        return pinned;
+    }
+    fn pinMemory(self: *Run, request: t.Pin) !void {
+        if (try self.read(bool, "forgotten-all") != null) return error.MemoryForgotten;
+        try t.validateId(request.id);
+        if (request.reason.len > t.max_text_bytes or !std.unicode.utf8ValidateSlice(request.reason)) return error.InvalidMemoryRequest;
+        const record = (try self.assertion(request.id)) orelse return error.MemoryNotFound;
+        try self.authorize(record.owner, record.assertion.visibility);
+        if (!try self.evidenceVisible(record)) return error.MemoryNotFound;
+        const path = try self.pinKey(request.id);
+        if (!request.pinned) return self.remove(path);
+        if (try self.read(t.StoredPin, path) == null) {
+            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "brief-pin/", null, t.max_brief_pins);
+            if (page.rows.len >= t.max_brief_pins) return error.MemoryWorkLimit;
+        }
+        try self.put(path, t.StoredPin{ .id = request.id, .branch = self.service.context.branch, .principal = self.service.context.principal, .reason = request.reason, .recorded_at = self.service.context.now_ms, .revision = self.state.revision });
+    }
+    const CurrentScan = struct { hits: []const t.RecallHit, scanned: usize, more: bool };
+    /// Bounded scan of authorized current memory, shared by brief and
+    /// consolidation. Pinned ids are read directly so a large space cannot
+    /// push them out of the scan window.
+    fn currentMemories(self: *Run, request: t.Recall, first: []const []const u8) !CurrentScan {
+        var hits: std.ArrayList(t.RecallHit) = .empty;
+        var seen: ResourceSet = .empty;
+        // An explicit pin outranks the provisional filter.
+        var pinned_request = request;
+        pinned_request.include_provisional = true;
+        for (first) |id| {
+            const record = (try self.assertion(id)) orelse continue;
+            if (try self.recallHit(record, pinned_request, null, false)) |hit| {
+                try seen.put(self.a, hit.memory.assertion.id, {});
+                try hits.append(self.a, hit);
+            }
+        }
+        var after: ?[]const u8 = null;
+        var scanned: usize = 0;
+        var more = false;
+        while (true) {
+            try self.service.context.check();
+            const page = try self.recordPage("assertion/", after, 128);
+            for (page.rows) |row| {
+                scanned += 1;
+                const record = try parse(t.StoredAssertion, self.a, row.json);
+                if (seen.contains(record.assertion.id)) continue;
+                if (try self.recallHit(record, request, null, false)) |hit| {
+                    try seen.put(self.a, hit.memory.assertion.id, {});
+                    try hits.append(self.a, hit);
+                }
+            }
+            after = page.next;
+            if (after == null) break;
+            if (scanned >= 4096) {
+                more = true;
+                break;
+            }
+        }
+        return .{ .hits = hits.items, .scanned = scanned, .more = more };
+    }
+    fn brief(self: *Run, request: t.BriefRequest) ![]const u8 {
+        if (request.limit == 0 or request.limit > t.max_brief_items or request.token_budget == 0 or request.token_budget > self.state.config.max_recall_tokens) return error.InvalidMemoryRequest;
+        const pinned = try self.pinnedIds();
+        const scan = try self.currentMemories(.{ .scope = request.scope, .task = request.task, .environment = request.environment, .include_provisional = request.include_provisional }, pinned.keys());
+        const outcomes = try self.anyOutcomeUse();
+        const Candidate = struct { item: t.BriefItem, hit: t.RecallHit };
+        var ranked_candidates: std.ArrayList(Candidate) = .empty;
+        var subjects: std.StringArrayHashMapUnmanaged(u32) = .empty;
+        for (scan.hits) |hit| {
+            const claim = hit.memory.assertion;
+            const is_pinned = pinned.contains(claim.id);
+            const subject = (try self.canonical(claim.subject)) orelse claim.subject;
+            const entry = try subjects.getOrPut(self.a, subject);
+            entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+            // Disputed claims would spread uncertainty into every session.
+            if (hit.memory.lifecycle != .active and !is_pinned) continue;
+            const used = if (outcomes) try self.utility(claim.id) else t.Utility{};
+            var score = briefKindWeight(claim.kind) + 2 * used.score;
+            if (claim.stability == .settled) score += 1;
+            switch (claim.role) {
+                .observed => score += 0.25,
+                .hypothesized => score -= 1,
+                else => {},
+            }
+            if (is_pinned) score += 100;
+            try ranked_candidates.append(self.a, .{ .hit = hit, .item = .{ .id = claim.id, .statement = claim.statement, .kind = claim.kind, .subject = claim.subject, .predicate = claim.predicate, .scope = claim.scope, .stability = claim.stability, .valid_from = claim.valid_from, .pinned = is_pinned, .score = score, .utility = used } });
+        }
+        std.mem.sort(Candidate, ranked_candidates.items, {}, struct {
+            fn less(_: void, left: Candidate, right: Candidate) bool {
+                return if (left.item.score == right.item.score) std.mem.lessThan(u8, left.item.id, right.item.id) else left.item.score > right.item.score;
+            }
+        }.less);
+        var selected: std.ArrayList(t.BriefItem) = .empty;
+        var kept: std.ArrayList(t.RecallHit) = .empty;
+        var omitted: usize = 0;
+        var bytes: usize = 0;
+        for (ranked_candidates.items) |candidate| {
+            var duplicate = false;
+            for (kept.items) |present| {
+                const left = candidate.hit.memory.assertion;
+                const right = present.memory.assertion;
+                if (try self.sameCanonicalGroup(left, right) and try self.sameCanonicalValue(left, right) and (left.visibility == .team or eql(u8, candidate.hit.memory.owner, present.memory.owner))) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            const size = (try self.encode(candidate.item)).len;
+            if (duplicate or selected.items.len >= request.limit or bytes + size > request.token_budget) {
+                omitted += 1;
+                continue;
+            }
+            bytes += size;
+            try selected.append(self.a, candidate.item);
+            try kept.append(self.a, candidate.hit);
+        }
+        const SubjectEntry = t.SubjectCount;
+        var ranked: std.ArrayList(SubjectEntry) = .empty;
+        var iterator = subjects.iterator();
+        while (iterator.next()) |entry| try ranked.append(self.a, .{ .subject = entry.key_ptr.*, .memories = entry.value_ptr.* });
+        std.mem.sort(SubjectEntry, ranked.items, {}, struct {
+            fn less(_: void, left: SubjectEntry, right: SubjectEntry) bool {
+                return if (left.memories == right.memories) std.mem.lessThan(u8, left.subject, right.subject) else left.memories > right.memories;
+            }
+        }.less);
+        var result: t.Brief = .{ .items = selected.items, .subjects = ranked.items[0..@min(ranked.items.len, 8)], .guidance = brief_guidance, .scanned = scan.scanned, .omitted = omitted, .complete = !scan.more and omitted == 0, .token_upper_bound = 0, .revision = self.state.revision, .config_generation = self.state.config.generation };
+        while (true) {
+            const rendered = try self.encode(result);
+            if (rendered.len == result.token_upper_bound) {
+                if (rendered.len <= request.token_budget) return rendered;
+                if (result.subjects.len > 0) {
+                    result.subjects = result.subjects[0 .. result.subjects.len - 1];
+                } else if (selected.items.len > 0) {
+                    _ = selected.pop();
+                    result.items = selected.items;
+                    result.omitted += 1;
+                } else if (result.guidance.len > 0) {
+                    result.guidance = "";
+                } else return error.InvalidMemoryRequest;
+                result.complete = false;
+            }
+            result.token_upper_bound = rendered.len;
+        }
+    }
+    fn consolidate(self: *Run, request: t.ConsolidationRequest) ![]const u8 {
+        if (request.limit == 0 or request.limit > t.max_consolidation_findings) return error.InvalidMemoryRequest;
+        const now = self.service.context.now_ms;
+        const pinned = try self.pinnedIds();
+        const scan = try self.currentMemories(.{}, &.{});
+        const outcomes = try self.anyOutcomeUse();
+        var findings: std.ArrayList(t.Finding) = .empty;
+        var visible: ResourceSet = .empty;
+        var referenced: ResourceSet = .empty;
+        var duplicates: std.StringArrayHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
+        var by_kind: std.StringArrayHashMapUnmanaged(u32) = .empty;
+        var by_lifecycle: std.StringArrayHashMapUnmanaged(u32) = .empty;
+        var by_stability: std.StringArrayHashMapUnmanaged(u32) = .empty;
+        var by_producer: std.StringArrayHashMapUnmanaged(u32) = .empty;
+        var stats: t.SpaceStats = .{};
+        for (scan.hits) |hit| try visible.put(self.a, hit.memory.assertion.id, {});
+        for (scan.hits) |hit| {
+            const record = hit.memory;
+            const claim = record.assertion;
+            stats.memories += 1;
+            if (pinned.contains(claim.id)) stats.pinned += 1;
+            inline for (.{ .{ &by_kind, @tagName(claim.kind) }, .{ &by_lifecycle, @tagName(record.lifecycle) }, .{ &by_stability, @tagName(claim.stability) }, .{ &by_producer, claim.producer } }) |counter| {
+                const entry = try counter[0].getOrPut(self.a, counter[1]);
+                entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+            }
+            const subject = (try self.canonical(claim.subject)) orelse claim.subject;
+            try referenced.put(self.a, subject, {});
+            const value = if (self.objectTyped(claim.predicate)) (try self.canonical(claim.value)) orelse claim.value else claim.value;
+            if (self.objectTyped(claim.predicate)) try referenced.put(self.a, value, {});
+            if (record.lifecycle == .active) {
+                const bucket = try hash(self.a, .{ subject, claim.predicate, claim.scope, claim.environment, claim.task, claim.visibility, if (claim.visibility == .private) record.owner else "", value, claim.modality });
+                const entry = try duplicates.getOrPut(self.a, bucket);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(self.a, claim.id);
+            }
+            if (record.lifecycle == .disputed) {
+                var ids: std.ArrayList([]const u8) = .empty;
+                try ids.append(self.a, claim.id);
+                for (record.conflicts_with) |other| if (visible.contains(other)) try ids.append(self.a, other);
+                try findings.append(self.a, .{ .kind = .dispute, .memory_ids = ids.items, .reason = record.reason orelse "conflicting current claims need a supersession verdict", .suggested_action = .review_supersession });
+            }
+            const single = self.singlePredicate(claim.predicate);
+            if (single and claim.valid_from == null and record.lifecycle == .active) try findings.append(self.a, .{ .kind = .unordered, .memory_ids = try self.a.dupe([]const u8, &.{claim.id}), .reason = "single-valued predicate without valid_from cannot be ordered against later values", .suggested_action = .add_valid_from });
+            if (record.lifecycle == .active and (claim.stability == .provisional or claim.role == .inferred or claim.role == .hypothesized)) try findings.append(self.a, .{ .kind = .unverified, .memory_ids = try self.a.dupe([]const u8, &.{claim.id}), .reason = "provisional or inferred claim; check it against its evidence and settle or retract it", .suggested_action = .verify });
+            if (request.stale_after_ms) |window| if ((single or claim.stability == .provisional) and record.recorded_from +| @as(i64, @intCast(@min(window, std.math.maxInt(i64)))) <= now) {
+                try findings.append(self.a, .{ .kind = .stale, .memory_ids = try self.a.dupe([]const u8, &.{claim.id}), .reason = "volatile claim has not changed within stale_after_ms; reconfirm it", .suggested_action = .verify });
+            };
+            const used = if (outcomes) try self.utility(claim.id) else t.Utility{};
+            if (used.failures >= 2 and used.failures > used.successes) try findings.append(self.a, .{ .kind = .harmful, .memory_ids = try self.a.dupe([]const u8, &.{claim.id}), .reason = "used mostly in failed tasks; it may be wrong or misapplied", .suggested_action = .correct });
+            // Public views drop links to retired targets; inspect stored links.
+            const stored_claim = if (try self.assertion(claim.id)) |raw| raw.assertion else claim;
+            inline for (.{ stored_claim.depends_on, stored_claim.supersedes, stored_claim.motivates, stored_claim.rejected_in_favor_of }) |targets| for (targets) |target| {
+                const linked = try self.assertion(target);
+                if (linked == null or !try self.retained(linked.?, 0)) try findings.append(self.a, .{ .kind = .dangling_link, .memory_ids = try self.a.dupe([]const u8, &.{claim.id}), .target_id = target, .reason = "links to a memory that does not exist or was retired", .suggested_action = .fix_link });
+            };
+            const durable_kind = switch (claim.kind) {
+                .constraint, .preference, .procedural, .lesson => true,
+                else => false,
+            };
+            if (!pinned.contains(claim.id) and record.lifecycle == .active and claim.stability == .settled and ((durable_kind and used.failures == 0) or (used.successes >= 2 and used.score > 0))) try findings.append(self.a, .{ .kind = .promote, .memory_ids = try self.a.dupe([]const u8, &.{claim.id}), .reason = "settled durable or repeatedly useful memory; consider pinning it to the brief", .suggested_action = .pin });
+        }
+        var buckets = duplicates.iterator();
+        while (buckets.next()) |entry| if (entry.value_ptr.items.len > 1) {
+            std.mem.sort([]const u8, entry.value_ptr.items, {}, stringLess);
+            try findings.append(self.a, .{ .kind = .duplicate, .memory_ids = entry.value_ptr.items, .reason = "same subject, predicate, applicability and value; review as restates", .suggested_action = .propose_supersession });
+        };
+        // Orphans are only reported when the claim scan was complete;
+        // otherwise a reference may sit outside the bounded window.
+        var after: ?[]const u8 = null;
+        var entities_scanned: usize = 0;
+        while (true) {
+            try self.service.context.check();
+            const page = try self.recordPage("entity/", after, 128);
+            for (page.rows) |row| {
+                entities_scanned += 1;
+                const stored = (try self.read(t.EntityRecord, row.key)) orelse continue;
+                self.authorize(stored.owner, stored.entity.visibility) catch continue;
+                if (try self.read(bool, "forgotten-all") != null or !try self.entityVisible(stored)) continue;
+                stats.entities += 1;
+                const canonical_id = (try self.canonical(stored.entity.id)) orelse continue;
+                if (!scan.more and !eql(u8, canonical_id, stored.entity.id)) continue;
+                if (!scan.more and !referenced.contains(canonical_id)) try findings.append(self.a, .{ .kind = .orphan_entity, .entity_id = stored.entity.id, .reason = "no current claim mentions this entity as subject or object", .suggested_action = .curate_entity });
+            }
+            after = page.next;
+            if (after == null or entities_scanned >= 1024) break;
+        }
+        std.mem.sort(t.Finding, findings.items, {}, struct {
+            fn less(_: void, left: t.Finding, right: t.Finding) bool {
+                if (left.kind != right.kind) return @intFromEnum(left.kind) < @intFromEnum(right.kind);
+                const lhs = if (left.memory_ids.len > 0) left.memory_ids[0] else left.entity_id orelse "";
+                const rhs = if (right.memory_ids.len > 0) right.memory_ids[0] else right.entity_id orelse "";
+                if (!eql(u8, lhs, rhs)) return std.mem.lessThan(u8, lhs, rhs);
+                return std.mem.lessThan(u8, left.target_id orelse "", right.target_id orelse "");
+            }
+        }.less);
+        const counts = struct {
+            fn sorted(a: A, map: std.StringArrayHashMapUnmanaged(u32)) ![]const t.Count {
+                var out: std.ArrayList(t.Count) = .empty;
+                var it = map.iterator();
+                while (it.next()) |entry| try out.append(a, .{ .name = entry.key_ptr.*, .memories = entry.value_ptr.* });
+                std.mem.sort(t.Count, out.items, {}, struct {
+                    fn less(_: void, left: t.Count, right: t.Count) bool {
+                        return std.mem.lessThan(u8, left.name, right.name);
+                    }
+                }.less);
+                return out.items;
+            }
+        };
+        stats.by_kind = try counts.sorted(self.a, by_kind);
+        stats.by_lifecycle = try counts.sorted(self.a, by_lifecycle);
+        stats.by_stability = try counts.sorted(self.a, by_stability);
+        stats.by_producer = try counts.sorted(self.a, by_producer);
+        const shown = findings.items[0..@min(findings.items.len, request.limit)];
+        const omitted = findings.items.len - shown.len;
+        return self.encode(t.Consolidation{ .findings = shown, .stats = stats, .scanned = scan.scanned, .omitted = omitted, .complete = !scan.more and omitted == 0 and after == null, .revision = self.state.revision, .config_generation = self.state.config.generation });
+    }
     fn entityList(self: *Run, request: anytype) ![]const u8 {
         if (request.limit == 0 or request.limit > t.max_items) return error.InvalidMemoryRequest;
         const page = try self.recordPage("entity/", try self.decodeCursor("entity/", request.cursor), request.limit);
@@ -7450,6 +7767,21 @@ fn key(a: A, prefix: []const u8, id: []const u8) ![]const u8 {
 fn dependencyKey(a: A, kind: []const u8, parent: []const u8, child: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "dependency/{s}/{s}/{s}", .{ kind, try hash(a, parent), try hash(a, child) });
 }
+fn outcomeUseKey(a: A, memory_id: []const u8, outcome_id: []const u8) ![]const u8 {
+    try t.validateId(memory_id);
+    return std.fmt.allocPrint(a, "outcome-use/{s}/{s}", .{ try hash(a, memory_id), try hash(a, outcome_id) });
+}
+fn briefKindWeight(kind: t.Kind) f64 {
+    return switch (kind) {
+        .constraint, .preference => 3,
+        .procedural, .lesson => 2.5,
+        .decision => 2,
+        .summary => 1.5,
+        .semantic, .rationale => 1,
+        .episodic, .open_question, .alternative => 0.5,
+    };
+}
+const brief_guidance = "These are the memories most worth knowing at the start of a session. Use recall with a query or subject for anything else, explain or get an id before relying on a detail, and report outcomes with the ids you used.";
 fn configKey(a: A, generation: u64) ![]const u8 {
     return std.fmt.allocPrint(a, "configuration/{d:0>20}", .{generation});
 }

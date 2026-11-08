@@ -132,8 +132,9 @@ pub fn route(method: []const u8, path: []const u8) !Route {
     if (id != null) return error.MemoryRouteNotFound;
     if (std.mem.eql(u8, resource, "entity-corrections") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .action = .curate_entity };
     if (std.mem.eql(u8, resource, "entities") and std.mem.eql(u8, method, "GET")) return .{ .space = space, .action = .entities };
+    if (std.mem.eql(u8, resource, "brief")) return .{ .space = space, .action = if (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "POST")) .brief else return error.MethodNotAllowed };
     if (!std.mem.eql(u8, method, "POST")) return error.MethodNotAllowed;
-    inline for (.{ .{ "explain", memory.Action.explain }, .{ "embeddings", memory.Action.stage_embeddings }, .{ "observations", memory.Action.observe }, .{ "assertions", memory.Action.assertions }, .{ "recall", memory.Action.recall }, .{ "corrections", memory.Action.correct }, .{ "forget", memory.Action.forget }, .{ "outcomes", memory.Action.outcome }, .{ "maintenance", memory.Action.advance } }) |entry| {
+    inline for (.{ .{ "explain", memory.Action.explain }, .{ "embeddings", memory.Action.stage_embeddings }, .{ "observations", memory.Action.observe }, .{ "assertions", memory.Action.assertions }, .{ "recall", memory.Action.recall }, .{ "corrections", memory.Action.correct }, .{ "forget", memory.Action.forget }, .{ "outcomes", memory.Action.outcome }, .{ "maintenance", memory.Action.advance }, .{ "consolidation", memory.Action.consolidate }, .{ "pins", memory.Action.pin } }) |entry| {
         if (std.mem.eql(u8, resource, entry[0])) return .{ .space = space, .action = entry[1] };
     }
     return error.MemoryRouteNotFound;
@@ -183,6 +184,16 @@ pub fn status(err: anyerror) u16 {
         error.OutOfMemory, error.MemoryCorruptState => 500,
         else => 400,
     };
+}
+
+test "memory route exposes brief, consolidation and pins" {
+    try std.testing.expectEqual(memory.Action.brief, (try route("GET", "/memory/v1/spaces/team/brief")).action);
+    try std.testing.expectEqual(memory.Action.brief, (try route("POST", "/memory/v1/spaces/team/brief")).action);
+    try std.testing.expectError(error.MethodNotAllowed, route("DELETE", "/memory/v1/spaces/team/brief"));
+    try std.testing.expectEqual(memory.Action.consolidate, (try route("POST", "/memory/v1/spaces/team/consolidation")).action);
+    try std.testing.expectEqual(memory.Action.pin, (try route("POST", "/memory/v1/spaces/team/pins")).action);
+    try std.testing.expectError(error.MethodNotAllowed, route("GET", "/memory/v1/spaces/team/pins"));
+    try std.testing.expectEqual(memory.Action.create, (try route("PUT", "/memory/v1/spaces/team")).action);
 }
 
 test "memory route separates native operations and rejects unknown paths" {

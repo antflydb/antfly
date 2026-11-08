@@ -1322,17 +1322,25 @@ from .memory_assertion_support_sets_item_evidence_item_span_type_0 import (
     MemoryAssertionSupportSetsItemEvidenceItemSpanType0,
 )
 from .memory_assertion_visibility import MemoryAssertionVisibility
+from .memory_brief import MemoryBrief
+from .memory_brief_item import MemoryBriefItem
+from .memory_brief_item_kind import MemoryBriefItemKind
+from .memory_brief_item_stability import MemoryBriefItemStability
+from .memory_brief_request import MemoryBriefRequest
 from .memory_change_page import MemoryChangePage
 from .memory_change_request import MemoryChangeRequest
 from .memory_change_request_start import MemoryChangeRequestStart
 from .memory_claim_pin import MemoryClaimPin
 from .memory_claim_view import MemoryClaimView
 from .memory_configure_request import MemoryConfigureRequest
+from .memory_consolidation import MemoryConsolidation
+from .memory_consolidation_request import MemoryConsolidationRequest
 from .memory_correction import MemoryCorrection
 from .memory_correction_evidence_item import MemoryCorrectionEvidenceItem
 from .memory_correction_evidence_item_span_type_0 import MemoryCorrectionEvidenceItemSpanType0
 from .memory_correction_lifecycle import MemoryCorrectionLifecycle
 from .memory_correction_stability import MemoryCorrectionStability
+from .memory_count import MemoryCount
 from .memory_create_space_request import MemoryCreateSpaceRequest
 from .memory_embedding_batch import MemoryEmbeddingBatch
 from .memory_embedding_batch_items_item import MemoryEmbeddingBatchItemsItem
@@ -1537,6 +1545,9 @@ from .memory_explanation_nodes_item_links_item_target_type_0_kind import (
 )
 from .memory_explanation_nodes_item_resource import MemoryExplanationNodesItemResource
 from .memory_explanation_nodes_item_resource_kind import MemoryExplanationNodesItemResourceKind
+from .memory_finding import MemoryFinding
+from .memory_finding_kind import MemoryFindingKind
+from .memory_finding_suggested_action import MemoryFindingSuggestedAction
 from .memory_forget_request import MemoryForgetRequest
 from .memory_inspection import MemoryInspection
 from .memory_inspection_capabilities import MemoryInspectionCapabilities
@@ -1661,6 +1672,7 @@ from .memory_observation_request_origin_type_0_trace_type_0_kind import (
 from .memory_operation import MemoryOperation
 from .memory_operation_phase import MemoryOperationPhase
 from .memory_outcome import MemoryOutcome
+from .memory_pin import MemoryPin
 from .memory_recall_request import MemoryRecallRequest
 from .memory_recall_request_embedding_model_type_0 import MemoryRecallRequestEmbeddingModelType0
 from .memory_recall_request_graph_type_0 import MemoryRecallRequestGraphType0
@@ -1905,6 +1917,7 @@ from .memory_relationship_proposal_views_type_0_item_dependencies_item_resource 
 from .memory_relationship_proposal_views_type_0_item_dependencies_item_resource_kind import (
     MemoryRelationshipProposalViewsType0ItemDependenciesItemResourceKind,
 )
+from .memory_resolved_entity import MemoryResolvedEntity
 from .memory_result import MemoryResult
 from .memory_space_change import MemorySpaceChange
 from .memory_space_change_kind import MemorySpaceChangeKind
@@ -1924,6 +1937,9 @@ from .memory_space_config_predicates_item_cardinality import MemorySpaceConfigPr
 from .memory_space_config_processing import MemorySpaceConfigProcessing
 from .memory_space_config_semantic_discovery import MemorySpaceConfigSemanticDiscovery
 from .memory_space_config_source_rules_item import MemorySpaceConfigSourceRulesItem
+from .memory_space_stats import MemorySpaceStats
+from .memory_stored_evidence import MemoryStoredEvidence
+from .memory_subject_count import MemorySubjectCount
 from .memory_supersession_candidate import MemorySupersessionCandidate
 from .memory_supersession_candidate_page import MemorySupersessionCandidatePage
 from .memory_supersession_candidate_page_retrieval import MemorySupersessionCandidatePageRetrieval
@@ -1943,6 +1959,7 @@ from .memory_supersession_verdict_evidence_item import MemorySupersessionVerdict
 from .memory_supersession_verdict_evidence_item_span_type_0 import MemorySupersessionVerdictEvidenceItemSpanType0
 from .memory_supersession_verdict_model_type_0 import MemorySupersessionVerdictModelType0
 from .memory_supersession_verdict_verdict import MemorySupersessionVerdictVerdict
+from .memory_utility import MemoryUtility
 from .merge_config import MergeConfig
 from .merge_config_weights import MergeConfigWeights
 from .merge_profile import MergeProfile
@@ -3958,17 +3975,25 @@ __all__ = (
     "MemoryAssertionSupportSetsItemEvidenceItem",
     "MemoryAssertionSupportSetsItemEvidenceItemSpanType0",
     "MemoryAssertionVisibility",
+    "MemoryBrief",
+    "MemoryBriefItem",
+    "MemoryBriefItemKind",
+    "MemoryBriefItemStability",
+    "MemoryBriefRequest",
     "MemoryChangePage",
     "MemoryChangeRequest",
     "MemoryChangeRequestStart",
     "MemoryClaimPin",
     "MemoryClaimView",
     "MemoryConfigureRequest",
+    "MemoryConsolidation",
+    "MemoryConsolidationRequest",
     "MemoryCorrection",
     "MemoryCorrectionEvidenceItem",
     "MemoryCorrectionEvidenceItemSpanType0",
     "MemoryCorrectionLifecycle",
     "MemoryCorrectionStability",
+    "MemoryCount",
     "MemoryCreateSpaceRequest",
     "MemoryEmbeddingBatch",
     "MemoryEmbeddingBatchItemsItem",
@@ -4129,6 +4154,9 @@ __all__ = (
     "MemoryExplanationNodesItemLinksItemTargetType0Kind",
     "MemoryExplanationNodesItemResource",
     "MemoryExplanationNodesItemResourceKind",
+    "MemoryFinding",
+    "MemoryFindingKind",
+    "MemoryFindingSuggestedAction",
     "MemoryForgetRequest",
     "MemoryInspection",
     "MemoryInspectionCapabilities",
@@ -4205,6 +4233,7 @@ __all__ = (
     "MemoryOperation",
     "MemoryOperationPhase",
     "MemoryOutcome",
+    "MemoryPin",
     "MemoryRecallRequest",
     "MemoryRecallRequestEmbeddingModelType0",
     "MemoryRecallRequestGraphType0",
@@ -4333,6 +4362,7 @@ __all__ = (
     "MemoryRelationshipProposalViewsType0ItemDependenciesItemEvidenceItemSpanType0",
     "MemoryRelationshipProposalViewsType0ItemDependenciesItemResource",
     "MemoryRelationshipProposalViewsType0ItemDependenciesItemResourceKind",
+    "MemoryResolvedEntity",
     "MemoryResult",
     "MemorySpaceChange",
     "MemorySpaceChangeKind",
@@ -4352,6 +4382,9 @@ __all__ = (
     "MemorySpaceConfigProcessing",
     "MemorySpaceConfigSemanticDiscovery",
     "MemorySpaceConfigSourceRulesItem",
+    "MemorySpaceStats",
+    "MemoryStoredEvidence",
+    "MemorySubjectCount",
     "MemorySupersessionCandidate",
     "MemorySupersessionCandidatePage",
     "MemorySupersessionCandidatePageRetrieval",
@@ -4371,6 +4404,7 @@ __all__ = (
     "MemorySupersessionVerdictEvidenceItemSpanType0",
     "MemorySupersessionVerdictModelType0",
     "MemorySupersessionVerdictVerdict",
+    "MemoryUtility",
     "MergeConfig",
     "MergeConfigWeights",
     "MergeProfile",
