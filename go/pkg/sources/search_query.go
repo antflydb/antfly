@@ -251,6 +251,20 @@ func (p *Publisher) Search(ctx context.Context, binding Binding, request SearchR
 	if err := json.Unmarshal(response, &envelope); err != nil {
 		return nil, err
 	}
+	result := envelope
+	if responses, ok := envelope["responses"].([]any); ok {
+		if len(responses) != 1 {
+			return nil, fmt.Errorf("unexpected search response count")
+		}
+		var valid bool
+		result, valid = responses[0].(map[string]any)
+		if !valid {
+			return nil, fmt.Errorf("invalid native search response")
+		}
+	}
+	if _, ok := result["hits"].(map[string]any); !ok {
+		return nil, fmt.Errorf("native search hits unavailable")
+	}
 	// Preserve native hits and scores while identifying the selected binding and
 	// its actual consistency. Unretained relevance results cannot be continued
 	// as a snapshot and cannot prove authoritative absence.
@@ -263,22 +277,27 @@ func (p *Publisher) Search(ctx context.Context, binding Binding, request SearchR
 func SearchConsistency(raw []byte) (string, error) {
 	var response struct {
 		Responses []struct {
-			Status         int    `json:"status"`
-			RemoteSnapshot string `json:"remote_snapshot"`
-			LiveRead       bool   `json:"live_read"`
+			Error          json.RawMessage `json:"error"`
+			Status         int             `json:"status"`
+			RemoteSnapshot string          `json:"remote_snapshot"`
+			LiveRead       bool            `json:"live_read"`
 		} `json:"responses"`
-		RemoteSnapshot string `json:"remote_snapshot"`
-		LiveRead       bool   `json:"live_read"`
+		RemoteSnapshot string          `json:"remote_snapshot"`
+		LiveRead       bool            `json:"live_read"`
+		Error          json.RawMessage `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &response); err != nil {
 		return "unknown", err
+	}
+	if len(response.Error) > 0 && string(response.Error) != "null" {
+		return "unknown", fmt.Errorf("native query failed")
 	}
 	if len(response.Responses) > 0 {
 		if len(response.Responses) != 1 {
 			return "unknown", fmt.Errorf("unexpected search response count")
 		}
 		r := response.Responses[0]
-		if r.Status >= 400 {
+		if r.Status >= 400 || len(r.Error) > 0 && string(r.Error) != "null" {
 			return "unknown", fmt.Errorf("native query failed")
 		}
 		response.RemoteSnapshot = r.RemoteSnapshot

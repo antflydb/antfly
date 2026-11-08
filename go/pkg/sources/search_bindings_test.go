@@ -180,6 +180,10 @@ func TestSearchConsistencyIsPerOperation(t *testing.T) {
 	value, err = SearchConsistency([]byte(`{"responses":[{"status":200}]}`))
 	require.NoError(t, err)
 	require.Equal(t, "unretained", value)
+	for _, raw := range []string{`{"error":"query failed"}`, `{"responses":[{"error":{"code":"incomplete"}}]}`} {
+		_, err = SearchConsistency([]byte(raw))
+		require.Error(t, err, "native errors must never become successful empty results")
+	}
 }
 
 func TestProcessingChangesDoNotInvalidateAcquisition(t *testing.T) {
