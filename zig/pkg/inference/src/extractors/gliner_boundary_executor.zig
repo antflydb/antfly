@@ -46,6 +46,13 @@ pub const ItemExecution = struct {
 };
 
 pub const Options = struct {
+    /// Synchronous row consumer for independent broker callers. It owns
+    /// serialization failures locally; the executor never builds a combined
+    /// response when this sink is installed.
+    row_sink: ?RowSink = null,
+    /// Immutable rows prepared under this request's tokenizer and options.
+    /// Owners remain borrowed through synchronous planning and execution.
+    prepared_samples: ?[]const processor.Sample = null,
     item_executions: ?[]ItemExecution = null,
     brokered_request: bool = false,
     preparations: ?*PreparationStore = null,
@@ -65,6 +72,73 @@ pub const Options = struct {
     observer: ?observation.Observer = null,
 };
 
+pub const RowSink = struct {
+    context: *anyopaque,
+    emit_fn: *const fn (*anyopaque, usize, wire.Item, pipeline.Sample, usize) void,
+    fail_fn: *const fn (*anyopaque, usize, anyerror) void,
+    check_fn: *const fn (?*anyopaque, usize) anyerror!void,
+};
+
+const RowCheck = struct {
+    sink: RowSink,
+    first: usize,
+    fn check(raw: ?*anyopaque, index: usize) !void {
+        const self: *const @This() = @ptrCast(@alignCast(raw.?));
+        try self.sink.check_fn(self.sink.context, self.first + index);
+    }
+};
+
+test "gliner microbatch complete device planning rejects oversized heads before dispatch" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"entities":["person"]},"inputs":[{"content":"Ada"},{"content":"Bob"}]}
+    , .{});
+    defer request.deinit();
+    const config = QualificationGeometryTest.config();
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var options = Options{ .identity = .{ .backbone = config.backbone, .precision = .fp32, .weight = artifact.Digest.of("head plan test"), .sidecars = @splat(artifact.Digest.of("head plan test")) } };
+    var prepared = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, options);
+    defer prepared.deinit();
+    const schemas = [_]*const @TypeOf(request.items[0].compiled){ &request.items[0].compiled, &request.items[1].compiled };
+    const combined = try device_request.plan(&config, &prepared, &schemas, .{ .limits = options.device });
+    options.device.head.max_result_download_bytes = combined.minimum_result_download_bytes / 2;
+    // The encoder fits both rows; only the combined head download rejects it.
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options));
+    options.engine.limits.max_batch = 1;
+    try std.testing.expect(try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options) > 0);
+}
+
+test "gliner microbatch reuses prepared short rows through cohort planning and serial fallback" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"entities":["person"]},"inputs":[{"content":"Ada met Bob"},{"content":"Bob"}]}
+    , .{});
+    defer request.deinit();
+    const config = QualificationGeometryTest.config();
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var left = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items[0..1], .{});
+    defer left.deinit();
+    var right = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items[1..], .{});
+    defer right.deinit();
+    const calls = tokenizer.calls;
+    const samples = [_]processor.Sample{ left.samples[0], right.samples[0] };
+    const identity = artifact.Identity{ .backbone = config.backbone, .precision = .fp32, .weight = artifact.Digest.of("prepared row test"), .sidecars = @splat(artifact.Digest.of("prepared row test")) };
+    var options = Options{ .prepared_samples = &samples, .identity = identity };
+    var cohort = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, options);
+    defer cohort.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cohort.samples.len);
+    try std.testing.expectEqual(left.sequence_length, cohort.sequence_length);
+    _ = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options);
+    _ = try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, options);
+    options.prepared_samples = samples[1..];
+    var serial = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items[1..], options);
+    defer serial.deinit();
+    try std.testing.expectEqualSlices(i64, right.input_ids, serial.input_ids);
+    try std.testing.expectEqual(calls, tokenizer.calls);
+    options.prepared_samples = samples[0..1];
+    try std.testing.expectError(error.InvalidBoundaryPipelineRouting, prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items[1..], options));
+}
+
 /// Both device owners enforce these caps independently before allocating.
 /// Serial inputs/windows reuse this reservation; simultaneous encoder/head
 /// ownership requires their sum, including protected weights and upload
@@ -82,7 +156,7 @@ fn progress(options: Options, index: ?usize, stage: []const u8) !void {
     if (observation.Stage.fromFailure(stage)) |phase| observation.emit(options.observer, .{ .phase = phase });
 }
 
-fn observeSample(observer: ?observation.Observer, sample: pipeline.Sample, tokens: usize, values: usize) void {
+pub fn observeSample(observer: ?observation.Observer, sample: pipeline.Sample, tokens: usize, values: usize) void {
     const active = observer orelse return;
     var summary = observation.Sample{ .prompt_tokens = tokens, .output_values = values };
     for ([_]?pipeline.Diagnostics{ sample.classification_solver, sample.joint_solver, sample.record_solver }, &summary.solvers) |value, *out| if (value) |diagnostic| {
@@ -100,6 +174,7 @@ pub fn preflight(request: *const wire.Request, options: Options) !void {
     try progress(options, null, "preflight");
     if (request.items.len == 0 or options.max_response_bytes == 0) return error.InvalidExtractionRequest;
     for (request.items, 0..) |item, index| {
+        if (options.row_sink != null and item.options.long_document.mode == .window) return error.InvalidExtractionRequest;
         try progress(options, index, "preflight");
         try item.options.validateNativeLimits(options.pipeline);
         try pipeline.validateOptions(item.options.native(options.pipeline));
@@ -177,9 +252,10 @@ pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator,
     return executeChecked(cb, allocator, config, tokenizer, request, prepared_options, &gate);
 }
 
-/// Independent broker enrollment must reject an unsupported row before it can
-/// join healthy callers. This quiet pass executes no learned operations.
-pub fn validateQualifiedGeometry(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !void {
+/// Prepare and qualify a single short row once, before broker enrollment.
+/// The returned owner must outlive every repacked planning/execution view.
+pub fn prepareQualifiedShortRow(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !processor.PreparedBatch {
+    if (request.items.len != 1 or request.items[0].options.long_document.mode == .window) return error.InvalidExtractionRequest;
     const identity = options.identity orelse return error.UnsupportedGlinerBoundaryRuntime;
     if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
     var gate = try qualification.Admission.initResolved(identity, switch (backend) {
@@ -188,7 +264,12 @@ pub fn validateQualifiedGeometry(backend: compute.BackendKind, allocator: Alloca
         .native => .native,
         else => return error.UnsupportedGlinerBoundaryBackend,
     }, request, options.pipeline, options.control);
-    try planRequestGeometry(backend, allocator, config, tokenizer, request, options, &gate);
+    try preflight(request, options);
+    try progress(options, 0, "tokenizing");
+    var prepared = try prepareGroup(backend, allocator, config, tokenizer, request.items, options);
+    errdefer prepared.deinit();
+    try observeGroup(allocator, config, request.items, &prepared, options, &gate);
+    return prepared;
 }
 
 /// The receiver is a compile-time parameter for the quiet scalar observation
@@ -265,9 +346,26 @@ pub fn referenceEncoderDeviceBytes(backend: compute.BackendKind, allocator: Allo
         // qualification views retain its tensors but slice samples to one row,
         // so they are not complete batches accepted by the device planner.
         pub fn observeSingle(_: *@This(), _: Allocator, _: []const u8, _: *const processor.PreparedBatch, _: processor.Options) !void {}
-        pub fn observeGroupBatch(self: *@This(), prepared: *const processor.PreparedBatch) !void {
+        pub fn observeGroupBatch(self: *@This(), _: Allocator, items: []const wire.Item, prepared: *const processor.PreparedBatch) !void {
             self.note(prepared);
             if (self.failure) |err| return err;
+            // Encoder bytes alone do not establish that the complete cohort
+            // fits: head routes and result-download ceilings scale with rows
+            // too. Validate them before the broker can enter learned work.
+            if (items.len > device_request.max_admission_batch) return error.ResourceLimitExceeded;
+            var schemas: [device_request.max_admission_batch]*const @TypeOf(items[0].compiled) = undefined;
+            for (items, schemas[0..items.len]) |*item, *compiled| compiled.* = &item.compiled;
+            var device_limits = self.options.device;
+            device_limits.encoder = self.options.engine.limits;
+            var pipeline_options = items[0].options.native(self.options.pipeline);
+            pipeline_options.control = self.options.control;
+            _ = try device_request.plan(self.config, prepared, schemas[0..items.len], .{
+                .independent_requests = self.options.row_sink != null or self.options.brokered_request,
+                .precision = self.precision,
+                .execution_policy = .reference_v1,
+                .limits = device_limits,
+                .pipeline = pipeline_options,
+            });
         }
         pub fn observeWindowGroup(self: *@This(), prepared: *const processor.PreparedBatch) void {
             self.note(prepared);
@@ -296,7 +394,14 @@ fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *con
         const inputs = try allocator.alloc(processor.Item, count);
         defer allocator.free(inputs);
         for (inputs, items[0..count]) |*input, *item| input.* = .{ .text = item.text, .schema = &item.compiled };
-        var prepared = processor.prepare(allocator, tokenizer, inputs, process_options) catch |err| {
+        const preparation = if (options.prepared_samples) |samples| repacked: {
+            if (samples.len < count) return error.InvalidBoundaryPipelineRouting;
+            for (samples[0..count], items[0..count]) |sample, item| {
+                if (!std.mem.eql(u8, sample.original_text, item.text) or !std.mem.eql(u8, &sample.schema_fingerprint, &item.compiled.fingerprint)) return error.InvalidBoundaryPipelineRouting;
+            }
+            break :repacked processor.packSamples(allocator, samples[0..count], process_options);
+        } else processor.prepare(allocator, tokenizer, inputs, process_options);
+        var prepared = preparation catch |err| {
             if (err == error.BoundaryBatchLimitExceeded and count > 1) {
                 count = (count + 1) / 2;
                 continue;
@@ -322,7 +427,7 @@ fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *con
 
 fn observeGroup(allocator: Allocator, config: *const model.Config, items: []const wire.Item, prepared: *const processor.PreparedBatch, options: Options, gate: anytype) !void {
     // Planners that size device work see the batch exactly as it executes.
-    if (comptime @hasDecl(@TypeOf(gate.*), "observeGroupBatch")) try gate.observeGroupBatch(prepared);
+    if (comptime @hasDecl(@TypeOf(gate.*), "observeGroupBatch")) try gate.observeGroupBatch(allocator, items[0..prepared.samples.len], prepared);
     for (items[0..prepared.samples.len], 0..) |*item, index| {
         // Preserve the physical padded length in every item's policy check.
         var view = prepared.*;
@@ -336,6 +441,7 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
     var quiet = options;
     quiet.observer = null;
     try preflight(request, quiet);
+    if (options.prepared_samples) |samples| if (samples.len != request.items.len) return error.InvalidBoundaryPipelineRouting;
     var remaining_tokens = options.long_document.max_total_encoded_tokens;
     var remaining_attention = try options.long_document.attentionWorkLimit(config, options.engine.limits);
     var remaining_windows = options.long_document.max_request_windows;
@@ -372,7 +478,9 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
             index += 1;
             continue;
         }
-        var prepared = try prepareGroup(backend, allocator, config, tokenizer, request.items[index..], quiet);
+        var group_options = quiet;
+        if (options.prepared_samples) |samples| group_options.prepared_samples = samples[index..];
+        var prepared = try prepareGroup(backend, allocator, config, tokenizer, request.items[index..], group_options);
         defer prepared.deinit();
         try observeGroup(allocator, config, request.items[index..], &prepared, quiet, gate);
         index += prepared.samples.len;
@@ -385,13 +493,14 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
     if (cb.kind() != .native and options.identity == null) return error.MissingGlinerBoundaryIdentity;
     if (options.identity) |identity| if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
     try preflight(request, options);
+    if (options.prepared_samples) |samples| if (samples.len != request.items.len) return error.InvalidBoundaryPipelineRouting;
     if (options.item_executions) |evidence| {
         if (evidence.len != request.items.len) return error.InvalidExtractionRequest;
         @memset(evidence, .{});
     }
     var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
     defer writer.deinit();
-    try writer.begin(request.model);
+    if (options.row_sink == null) try writer.begin(request.model);
     var prompt_tokens: usize = 0;
     var remaining_values = options.pipeline.max_output_values;
     var remaining_window_tokens = options.long_document.max_total_encoded_tokens;
@@ -444,13 +553,15 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             prompt_tokens = try std.math.add(usize, prompt_tokens, result.prompt_tokens);
             if (options.item_executions) |evidence| evidence[index] = .{ .prompt_tokens = result.prompt_tokens, .output_values = used, .rows = 1, .group = index };
             try progress(options, index, "serializing");
-            try writer.append(item, result.sample);
+            if (options.row_sink) |sink| sink.emit_fn(sink.context, index, item, result.sample, result.prompt_tokens) else try writer.append(item, result.sample);
             observeSample(options.observer, result.sample, result.prompt_tokens, used);
             index += 1;
             continue;
         }
         try progress(options, index, "tokenizing");
-        var prepared = try prepareGroup(cb.kind(), allocator, config, tokenizer, request.items[index..], options);
+        var group_options = options;
+        if (options.prepared_samples) |samples| group_options.prepared_samples = samples[index..];
+        var prepared = try prepareGroup(cb.kind(), allocator, config, tokenizer, request.items[index..], group_options);
         defer prepared.deinit();
         if (gate) |active| try observeGroup(allocator, config, request.items[index..], &prepared, options, active);
         const schemas = try allocator.alloc(*const @TypeOf(item.compiled), prepared.samples.len);
@@ -463,6 +574,14 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
         var pipeline_options = item.options.native(options.pipeline);
         pipeline_options.control = options.control;
         pipeline_options.max_output_values = remaining_values;
+        var row_errors: [device_request.max_admission_batch]?anyerror = undefined;
+        var row_check: RowCheck = undefined;
+        if (options.row_sink) |sink| {
+            if (prepared.samples.len > row_errors.len) return error.ResourceLimitExceeded;
+            pipeline_options.max_output_values = options.pipeline.max_output_values;
+            row_check = .{ .sink = sink, .first = index };
+            pipeline_options.independent_rows = .{ .errors = row_errors[0..prepared.samples.len], .context = &row_check, .check_fn = RowCheck.check };
+        }
         var result = switch (cb.kind()) {
             .native, .wasm => native: {
                 var encoded = try engine.encodeNative(cb, allocator, config, &prepared, engine_options);
@@ -490,17 +609,26 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
         defer result.deinit();
         if (result.samples.len != prepared.samples.len) return error.InvalidExtractionOutput;
         for (result.samples, prepared.samples, request.items[index..][0..result.samples.len], 0..) |sample, input, source, row| {
+            if (options.row_sink) |sink| {
+                if (row_errors[row]) |err| {
+                    sink.fail_fn(sink.context, index + row, err);
+                    continue;
+                }
+            }
             const used = try outputValues(sample);
             if (options.item_executions) |evidence| evidence[index + row] = .{ .prompt_tokens = input.input_ids.len, .output_values = used, .rows = prepared.samples.len, .group = index };
-            if (used > remaining_values) return error.ExtractionOutputLimitExceeded;
-            remaining_values -= used;
+            if (options.row_sink == null) {
+                if (used > remaining_values) return error.ExtractionOutputLimitExceeded;
+                remaining_values -= used;
+            }
             try progress(options, index + row, "serializing");
-            try writer.append(source, sample);
+            if (options.row_sink) |sink| sink.emit_fn(sink.context, index + row, source, sample, input.input_ids.len) else try writer.append(source, sample);
             observeSample(options.observer, sample, input.input_ids.len, used);
         }
         index += prepared.samples.len;
     }
     try progress(options, null, "serializing");
+    if (options.row_sink != null) return allocator.alloc(u8, 0);
     return writer.finish(prompt_tokens);
 }
 
@@ -2040,4 +2168,76 @@ test "boundary qualification native full-context groups fit head budgets before 
     request.items[0].text = text[0 .. 4095 * 4];
     try std.testing.expectError(error.ResourceLimitExceeded, prepareGroup(.native, a, &config, tok.tokenizer(), request.items, .{ .identity = identity, .pipeline = options.pipeline }));
     std.debug.print("native-head admission: windows={} words={} admitted_batch={} planned_bytes={}\n", .{ usage.window_count, receiver.words, receiver.batch, planned.intermediate_bytes });
+}
+
+test "gliner microbatch preflight includes record callback downloads" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"structures":{"record":{"mode":"latent","fields":{"name":"str"}}}},"inputs":[{"content":"Ada"},{"content":"Bob"}]}
+    , .{});
+    defer request.deinit();
+    var config = QualificationGeometryTest.config();
+    config.head.pool_size = 1;
+    config.head.min_pool_per_query = 1;
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var options = Options{ .identity = .{ .backbone = config.backbone, .precision = .fp32, .weight = artifact.Digest.of("review"), .sidecars = @splat(artifact.Digest.of("review")) } };
+    var prepared = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, options);
+    defer prepared.deinit();
+    const schemas = [_]*const @TypeOf(request.items[0].compiled){ &request.items[0].compiled, &request.items[1].compiled };
+    const combined = try device_request.plan(&config, &prepared, &schemas, .{ .limits = options.device });
+    // One candidate, one field => one object + two assignment logits per row.
+    // A singleton fits, but two callbacks require 24 bytes, not 12.
+    options.brokered_request = true;
+    options.device.head.max_result_download_bytes = combined.minimum_result_download_bytes + 12;
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options));
+    const Sink = struct {
+        fn emit(_: *anyopaque, _: usize, _: wire.Item, _: pipeline.Sample, _: usize) void {}
+        fn fail(_: *anyopaque, _: usize, _: anyerror) void {}
+        fn check(_: ?*anyopaque, _: usize) !void {}
+    };
+    options.brokered_request = false;
+    options.row_sink = .{ .context = &tokenizer, .emit_fn = Sink.emit, .fail_fn = Sink.fail, .check_fn = Sink.check };
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options));
+    options.engine.limits.max_batch = 1;
+    try std.testing.expect(try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options) > 0);
+}
+
+test "gliner microbatch callback planning covers every frozen schema route" {
+    const a = std.testing.allocator;
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const bytes = try fixtures.fixtureBytes(a, "pipeline_cases_base.json");
+    defer a.free(bytes);
+    const Cases = struct { cases: []const struct { id: []const u8, schema: std.json.Value } };
+    const cases = try std.json.parseFromSlice(Cases, a, bytes, .{ .ignore_unknown_fields = true });
+    defer cases.deinit();
+    const config = QualificationGeometryTest.config();
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var checked: usize = 0;
+    for (cases.value.cases) |case| {
+        const json = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "m", .schema = case.schema, .inputs = .{ .{ .content = "Ada met Bob." }, .{ .content = "Bob met Ada." } } }, .{});
+        defer a.free(json);
+        var request = try wire.parseJson(a, json, .{});
+        defer request.deinit();
+        var prepared = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, .{});
+        defer prepared.deinit();
+        const schemas = [_]*const @TypeOf(request.items[0].compiled){ &request.items[0].compiled, &request.items[1].compiled };
+        var options = device_request.Options{ .independent_requests = true };
+        const plan = try device_request.plan(&config, &prepared, &schemas, options);
+        if (plan.callback_result_download_upper_bound_bytes == 0) continue;
+        checked += 1;
+        options.limits.scorer.max_result_download_bytes = plan.minimum_result_download_bytes + plan.callback_result_download_upper_bound_bytes - 1;
+        try std.testing.expectError(error.ResourceLimitExceeded, device_request.plan(&config, &prepared, &schemas, options));
+        // The exact same initial transfers fit without independent-caller
+        // admission. Only callback headroom is responsible for subdivision.
+        options.independent_requests = false;
+        var errors: [2]?anyerror = @splat(null);
+        options.pipeline.independent_rows = .{ .errors = errors[0..1] };
+        try std.testing.expectError(error.InvalidBoundaryPipelineOptions, device_request.plan(&config, &prepared, &schemas, options));
+        options.pipeline.independent_rows = .{ .errors = &errors };
+        try std.testing.expectError(error.ResourceLimitExceeded, device_request.plan(&config, &prepared, &schemas, options));
+        options.pipeline.independent_rows = null;
+        const atomic = try device_request.plan(&config, &prepared, &schemas, options);
+        try std.testing.expectEqual(@as(usize, 0), atomic.callback_result_download_upper_bound_bytes);
+    }
+    try std.testing.expect(checked >= 7);
 }
