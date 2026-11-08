@@ -736,3 +736,112 @@ retention, without a fresh delete-object HEAD on every search. The adapter is
 installed only after admission of the native cut; strict external reads retain
 their catalog pin and qualification rules. Missing or unsupported version proofs
 continue to use the existing validation path.
+
+## Native-owner candidate qualification (November 7)
+
+The integrated candidate uses source `a6f7ece028753bf2017dfd9855cb9252db31a295`,
+including main through `e08df520acecd6431355852b4e60c430d0d19bfb`. Its server
+SHA-256 is `c5c98b06c2ab4cb4e7ccc428d34fe85b4a410a8b77d47c4b45d27a9ec9312530`.
+It is an ARM64 macOS ReleaseSafe build with stripping and Metal disabled, built
+with `zig build antfly capi -Doptimize=ReleaseSafe -Dstrip=true -Dmetal=false -j1`.
+The complete build passes all 85 steps. The matching Lite library SHA-256 is
+`4b8b9b2ac174ca0799807ff058043d40943769b18365d1141887bcc26f9245a2`.
+
+Integrated regression coverage passes 39 API, 5 embedded/storage, 22 catalog and
+44 error-ABI tests without failures or leaks. The full HN functional suite
+passes 220 tests and 50 subtests, with 18 conditional skips. The native HTTP
+gateway check also passes. Command ownership now includes nested source UUIDs,
+retained image references and provider generations, with allocation-failure
+coverage after integration with main's independent query-artifact collection.
+
+In the matched small local fixture, each mode prepares two sources across seven
+leaf calls. Resumed requests with pending replacements prepare twice across
+three leaf calls. Exact result IDs, cloud-bound reader destruction, cursor
+mutation/restart behavior, retention increases with blocked warehouse writes,
+and cancellation recovery are checked before accepting measurements. Native
+queries record zero cursor-publication calls; strict controls record three.
+These are retention-operation counters, not provider HTTP or billing counts.
+
+| Local objects, small fixture | Warm median | First query after restart | Serving-cache-cleared query | Sampled query footprint |
+| --- | ---: | ---: | ---: | ---: |
+| Strict, explicit index | 19.35 ms | 31.20 ms | 33.56 ms | 96.05 MiB |
+| Strict, inferred index | 16.77 ms | 31.84 ms | 39.16 ms | 93.83 MiB |
+| Native-owned, explicit index | 14.94 ms | 23.47 ms | 26.35 ms | 96.17 MiB |
+| Native-owned, inferred index | 14.84 ms | 23.60 ms | 23.19 ms | 97.38 MiB |
+
+Each warm median uses five requests. Native local bursts of 12 requests at
+concurrency four have medians of 21.71–21.78 ms and maxima of 32.76–36.70 ms.
+The shared developer host had 1–6 concurrent Zig compilers during these local
+cases; none belonged to this qualification. These samples are diagnostics,
+not tail-latency SLO qualification. Sampled query footprint excludes index
+construction and is not a whole-lifetime peak. Serving-cache clearing leaves OS
+and provider caches intact. The small fixture does not represent archive scale.
+
+For the same small sealed fixture, the GCS matrix passes all eight cases:
+
+| GCS configuration | Warm median | First query after restart | Serving-cache-cleared query | Sampled query footprint |
+| --- | ---: | ---: | ---: | ---: |
+| Strict, explicit, artifacts only | 1167.62 ms | 2033.10 ms | 5264.68 ms | 166.36 MiB |
+| Strict, explicit, sources + artifacts | 1834.39 ms | 2839.79 ms | 6243.11 ms | 182.56 MiB |
+| Strict, inferred, artifacts only | 1143.68 ms | 2025.17 ms | 5198.01 ms | 167.34 MiB |
+| Strict, inferred, sources + artifacts | 1748.01 ms | 2846.69 ms | 6190.33 ms | 178.10 MiB |
+| Native-owned, explicit, artifacts only | 15.26 ms | 246.39 ms | 3823.24 ms | 170.95 MiB |
+| Native-owned, explicit, sources + artifacts | 12.59 ms | 260.88 ms | 3886.37 ms | 165.39 MiB |
+| Native-owned, inferred, artifacts only | 13.96 ms | 251.89 ms | 3503.89 ms | 156.75 MiB |
+| Native-owned, inferred, sources + artifacts | 13.45 ms | 328.79 ms | 3879.67 ms | 173.67 MiB |
+
+Native-owned fully remote warm requests now have similar latency to the local
+fixture. This is consistent with removing required provider round trips from
+the hot path, including the redundant delete-object qualification HEAD.
+Restart and cache-cleared requests still pay remote reads: the fully remote
+native cases take 261–329 ms and about 3.9 s respectively. This is a warm-path
+improvement, not a claim of local-database cold performance. Both selectors
+retain exact mutation/restart pagination, two source preparations across repeated
+leaf calls and zero query-time cursor-publication calls in native mode.
+
+The larger fixture projects 10,000 real HN comment bodies into `id`, `body` and
+`deleted`; it does not preserve the full source schema. It contains 3,586,561
+UTF-8 body bytes after correctness markers (mean 358.66 bytes, range 1–7,554).
+The first 100 rows receive a marker for pagination assertions. Timed requests
+search the independent term `database`, request highlights and use either
+stored-source text or source-Parquet hydration. The original corpus-file
+SHA-256 values are:
+
+- `part-0.parquet`: `b34eb0bc2acd66944170158ef9a5492f0781060ee00070692c8850835ce35b3f`
+- `part-1.parquet`: `e34f09a1dd84b0e21ab4f0ab7c2f346ed4654da11a9a416003a423ea2ab5e39b`
+
+| 10,000 comment bodies, highlights | Warm median | First query after restart | Serving-cache-cleared query | Sampled query footprint |
+| --- | ---: | ---: | ---: | ---: |
+| Strict, local, stored source | 14.54 ms | 37.16 ms | 42.98 ms | 101.97 MiB |
+| Native-owned, local, stored source | 9.11 ms | 28.20 ms | 27.81 ms | 102.25 MiB |
+| Strict, fully remote GCS, stored source | 1835.45 ms | 5471.47 ms | 9592.48 ms | 192.60 MiB |
+| Native-owned, fully remote GCS, stored source | 12.63 ms | 2380.45 ms | 6957.05 ms | 171.92 MiB |
+| Strict, local, Parquet hydration | 13.22 ms | 48.00 ms | 31.85 ms | 136.09 MiB |
+| Native-owned, local, Parquet hydration | 9.52 ms | 21.55 ms | 25.76 ms | 133.16 MiB |
+| Strict, fully remote GCS, Parquet hydration | 1742.90 ms | 3680.36 ms | 11883.86 ms | 235.49 MiB |
+| Native-owned, fully remote GCS, Parquet hydration | 7.49 ms | 1074.20 ms | 8510.16 ms | 216.11 MiB |
+
+All 21 HTTP cases pass: 12 small-fixture cells, the native gateway check and eight
+real-body cells. Every measured case's binary hash matches the candidate above;
+all real-body cases have the same input corpus hashes. Each retained pending
+refill uses two preparations over three leaf calls. Native mode records no
+query-time cursor-publication calls in either source-storage mode. The fully
+remote real-body native bursts at concurrency four measure 19.51 ms median /
+25.54 ms maximum with stored source and 8.91 ms median / 12.26 ms maximum with
+Parquet hydration. The developer host records 0–6 other concurrent Zig compilers
+across the matrix. No qualification build runs during these measurements.
+
+The warm-path improvement is substantial on these fixtures. It does not remove
+cold/restart I/O: the real-body native GCS cases still take 1.07–2.38 s on the
+first query after restart and 6.96–8.51 s after clearing the serving cache
+(7.27–8.82 s including process startup). Their sampled query footprints are
+172–216 MiB. Stored-source and hydration cases have different cache access and
+host-contention histories; these few samples do not establish that hydration
+is generally faster. Raw timing reports, cursor references, access tokens and
+large fixtures are not committed to the repository.
+
+Full-archive capacity, diverse-query tail latency, replacement-owner cold loss,
+refreshing credentials beyond one token lifetime and the managed Cloud route
+remain separate deployment qualifications. These results neither deploy the
+candidate nor establish DuckDB cold-performance parity. Upgrade and release
+coordination still precede enabling durable native ownership in production.
