@@ -563,6 +563,159 @@ const OutcomeFixture = struct {
 
 const insert_one = "{\"statement\":\"INSERT INTO t (_id,n) VALUES ('r',1)\"}";
 
+test "capi SQL outcome native constraints join one checkpoint and rollback together" {
+    var f = try OutcomeFixture.init("native-sql-constraint-publication");
+    defer f.deinit();
+    try f.expectOk("{\"statement\":\"CREATE TABLE native_rows (id TEXT PRIMARY KEY, n BIGINT)\"}");
+    // Finish the CREATE recovery agenda before measuring the row publication.
+    try f.expectOk("{\"statement\":\"SELECT id FROM native_rows\"}");
+    const before_insert = f.file().activeCheckpoint().commit_sequence;
+    try f.expectOk("{\"statement\":\"INSERT INTO native_rows (_id,id,n) VALUES ('a','one',1)\"}");
+    std.debug.print("native SQL insert publications={d}\n", .{f.file().activeCheckpoint().commit_sequence - before_insert});
+    try std.testing.expectEqual(before_insert + 1, f.file().activeCheckpoint().commit_sequence);
+
+    const before_duplicate = f.file().activeCheckpoint().commit_sequence;
+    var duplicate = try f.sql("{\"statement\":\"INSERT INTO native_rows (_id,id,n) VALUES ('b','one',9)\"}");
+    defer duplicate.deinit();
+    try std.testing.expectEqualStrings("23505", duplicate.state().?);
+    std.debug.print("native SQL duplicate publications={d}\n", .{f.file().activeCheckpoint().commit_sequence - before_duplicate});
+    try std.testing.expectEqual(before_duplicate, f.file().activeCheckpoint().commit_sequence);
+
+    // A failed primary publication must not move the UNIQUE claim or apply
+    // the increment. Retrying the SQL statement after a known failure is safe.
+    var fault: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput };
+    fault.arm();
+    defer PrimaryFault.disarm();
+    var failed = try f.sql("{\"statement\":\"UPDATE native_rows SET id='two', n=n+1 WHERE _id='a'\"}");
+    PrimaryFault.disarm();
+    defer failed.deinit();
+    try std.testing.expectEqualStrings("58000", failed.state().?);
+    std.debug.print("native SQL failed publications={d}\n", .{f.file().activeCheckpoint().commit_sequence - before_duplicate});
+    try std.testing.expectEqual(before_duplicate, f.file().activeCheckpoint().commit_sequence);
+    try f.expectOk("{\"statement\":\"UPDATE native_rows SET id='two', n=n+1 WHERE _id='a'\"}");
+    try std.testing.expectEqual(before_duplicate + 1, f.file().activeCheckpoint().commit_sequence);
+    // The old claim disappeared with the row update, and the increment ran once.
+    try f.expectOk("{\"statement\":\"INSERT INTO native_rows (_id,id,n) VALUES ('b','one',3)\"}");
+    var values = try f.sql("{\"statement\":\"SELECT n FROM native_rows WHERE _id='a'\"}");
+    defer values.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, values.code);
+    try std.testing.expectEqualStrings("2", values.parsed.?.value.object.get("rows").?.array.items[0].array.items[0].string);
+    try f.reopen();
+    try f.expectOk("{\"statement\":\"SELECT id FROM native_rows WHERE id='two'\"}");
+    try std.testing.expect((try f.file().check()).valid);
+}
+
+test "capi SQL outcome native constraints publish foreign namespaces atomically" {
+    var f = try OutcomeFixture.init("native-sql-foreign-publication");
+    defer f.deinit();
+    try f.expectOk("{\"statement\":\"CREATE TABLE native_parents (id TEXT PRIMARY KEY)\"}");
+    try f.expectOk("{\"statement\":\"CREATE TABLE native_children (id TEXT PRIMARY KEY, parent_id TEXT NOT NULL REFERENCES native_parents(id))\"}");
+    try f.expectOk("{\"statement\":\"INSERT INTO native_parents (_id,id) VALUES ('p','parent')\"}");
+    try f.expectOk("{\"statement\":\"SELECT id FROM native_children\"}");
+    const before = f.file().activeCheckpoint().commit_sequence;
+    try f.expectOk("{\"statement\":\"INSERT INTO native_children (_id,id,parent_id) VALUES ('c','child','parent')\"}");
+    try std.testing.expectEqual(before + 1, f.file().activeCheckpoint().commit_sequence);
+    var blocked = try f.sql("{\"statement\":\"DELETE FROM native_parents WHERE _id='p'\"}");
+    defer blocked.deinit();
+    try std.testing.expectEqualStrings("23503", blocked.state().?);
+    const before_failure = f.file().activeCheckpoint().commit_sequence;
+    var fault: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput };
+    fault.arm();
+    var failed = try f.sql("{\"statement\":\"DELETE FROM native_children WHERE _id='c'\"}");
+    PrimaryFault.disarm();
+    defer failed.deinit();
+    try std.testing.expectEqualStrings("58000", failed.state().?);
+    try std.testing.expectEqual(before_failure, f.file().activeCheckpoint().commit_sequence);
+    var still_blocked = try f.sql("{\"statement\":\"DELETE FROM native_parents WHERE _id='p'\"}");
+    defer still_blocked.deinit();
+    try std.testing.expectEqualStrings("23503", still_blocked.state().?);
+    try f.expectOk("{\"statement\":\"DELETE FROM native_children WHERE _id='c'\"}");
+    try std.testing.expectEqual(before_failure + 1, f.file().activeCheckpoint().commit_sequence);
+    try f.expectOk("{\"statement\":\"DELETE FROM native_parents WHERE _id='p'\"}");
+    try f.reopen();
+    try f.expectOk("{\"statement\":\"SELECT id FROM native_children\"}");
+    try std.testing.expect((try f.file().check()).valid);
+}
+
+test "capi SQL outcome native constraints preserve foreign unknown receipts" {
+    for ([_]anyerror{ error.InputOutput, error.Canceled }) |injected| {
+        var f = try OutcomeFixture.init("native-sql-foreign-unknown");
+        defer f.deinit();
+        try f.expectOk("{\"statement\":\"CREATE TABLE native_parents (id TEXT PRIMARY KEY)\"}");
+        try f.expectOk("{\"statement\":\"CREATE TABLE native_children (id TEXT PRIMARY KEY, parent_id TEXT NOT NULL REFERENCES native_parents(id))\"}");
+        try f.expectOk("{\"statement\":\"INSERT INTO native_parents (_id,id) VALUES ('p','parent')\"}");
+        try f.expectOk("{\"statement\":\"SELECT id FROM native_children\"}");
+        var fault: PrimaryFault = .{ .fixture = &f, .err = injected, .publication = true };
+        fault.arm();
+        var failed = try f.sql("{\"statement\":\"INSERT INTO native_children (_id,id,parent_id) VALUES ('c','child','parent')\"}");
+        PrimaryFault.disarm();
+        defer failed.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, failed.code);
+        try std.testing.expectEqualStrings("40003", failed.state().?);
+        try std.testing.expect(failed.has("outcome_receipt"));
+        var fenced = try f.sql("{\"statement\":\"INSERT INTO native_children (_id,id,parent_id) VALUES ('c','child','parent')\"}");
+        defer fenced.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.stalled, fenced.code);
+        try f.reopen();
+        var rows = try f.sql("{\"statement\":\"SELECT id FROM native_children\"}");
+        defer rows.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, rows.code);
+        try std.testing.expectEqual(@as(usize, 0), rows.parsed.?.value.object.get("rows").?.array.items.len);
+        try f.expectOk("{\"statement\":\"INSERT INTO native_children (_id,id,parent_id) VALUES ('c','child','parent')\"}");
+        try std.testing.expect((try f.file().check()).valid);
+    }
+}
+
+test "capi SQL outcome native constraints session publishes all tables in one checkpoint" {
+    var f = try OutcomeFixture.init("native-sql-session-publication");
+    defer f.deinit();
+    try f.expectOk("{\"statement\":\"CREATE TABLE session_left (id TEXT PRIMARY KEY, n BIGINT)\"}");
+    try f.expectOk("{\"statement\":\"CREATE TABLE session_right (id TEXT PRIMARY KEY, n BIGINT)\"}");
+    try f.expectOk("{\"statement\":\"SELECT id FROM session_left\"}");
+    try f.expectOk("{\"statement\":\"SELECT id FROM session_right\"}");
+    var session: u64 = 0;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("sql_session.zig").antfly_db_sql_session_open(f.id, &session));
+    try std.testing.expectEqual(@as(u64, 1), session);
+    try f.expectOk("{\"statement\":\"BEGIN\",\"session_id\":1}");
+    try f.expectOk("{\"statement\":\"INSERT INTO session_left (_id,id,n) VALUES ('a','left',1)\",\"session_id\":1}");
+    try f.expectOk("{\"statement\":\"INSERT INTO session_right (_id,id,n) VALUES ('b','right',2)\",\"session_id\":1}");
+    const before = f.file().activeCheckpoint().commit_sequence;
+    try f.expectOk("{\"statement\":\"COMMIT\",\"session_id\":1}");
+    try std.testing.expectEqual(before + 1, f.file().activeCheckpoint().commit_sequence);
+    try f.reopen();
+    for ([_][]const u8{ "session_left", "session_right" }) |table| {
+        const request = try std.fmt.allocPrint(std.testing.allocator, "{{\"statement\":\"SELECT n FROM {s}\"}}", .{table});
+        defer std.testing.allocator.free(request);
+        var reply = try f.sql(request);
+        defer reply.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, reply.code);
+        try std.testing.expectEqual(@as(usize, 1), reply.parsed.?.value.object.get("rows").?.array.items.len);
+    }
+    try std.testing.expect((try f.file().check()).valid);
+}
+
+test "capi SQL outcome native constraints session also publishes document tables" {
+    var f = try OutcomeFixture.init("native-sql-document-session");
+    defer f.deinit();
+    const schema = "{\"version\":1,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}}}}}}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("tables.zig").antfly_db_create_table_json(f.id, .fromSlice("native_docs"), .fromSlice(schema)));
+    try f.expectOk("{\"statement\":\"SELECT n FROM native_docs\"}");
+    var session: u64 = 0;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("sql_session.zig").antfly_db_sql_session_open(f.id, &session));
+    try std.testing.expectEqual(@as(u64, 1), session);
+    try f.expectOk("{\"statement\":\"BEGIN\",\"session_id\":1}");
+    try f.expectOk("{\"statement\":\"INSERT INTO native_docs (_id,n) VALUES ('d',3)\",\"session_id\":1}");
+    const before = f.file().activeCheckpoint().commit_sequence;
+    try f.expectOk("{\"statement\":\"COMMIT\",\"session_id\":1}");
+    try std.testing.expectEqual(before + 1, f.file().activeCheckpoint().commit_sequence);
+    try f.reopen();
+    var reply = try f.sql("{\"statement\":\"SELECT n FROM native_docs WHERE _id='d'\"}");
+    defer reply.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, reply.code);
+    try std.testing.expectEqualStrings("3", reply.parsed.?.value.object.get("rows").?.array.items[0].array.items[0].string);
+    try std.testing.expect((try f.file().check()).valid);
+}
+
 /// Table `t` as a receipt names it: its name and current durable id.
 fn tableT(id: ?*anyopaque) !@import("outcome_receipts.zig").TableRef {
     const guard = @import("db.zig").enterHandle(id, .read).?;
@@ -577,8 +730,10 @@ const PrimaryFault = struct {
     fixture: *OutcomeFixture,
     err: anyerror,
     publication: bool = false,
+    armed: std.atomic.Value(bool) = .init(true),
 
     fn arm(self: *PrimaryFault) void {
+        self.armed.store(true, .release);
         @import("../storage/db/mutation_commit.zig").test_before_primary_commit = .{ .ptr = self, .run = run };
     }
     fn disarm() void {
@@ -586,6 +741,7 @@ const PrimaryFault = struct {
     }
     fn run(ptr: *anyopaque) anyerror!void {
         const self: *PrimaryFault = @ptrCast(@alignCast(ptr));
+        if (!self.armed.swap(false, .acq_rel)) return;
         if (!self.publication) return self.err;
         self.fixture.file().test_fail_checkpoint_publication = self.err;
     }
@@ -666,33 +822,20 @@ const SessionStatements = struct {
     }
 };
 
-const FailWith = struct {
-    err: anyerror,
-    fn run(ptr: *anyopaque) anyerror!void {
-        const self: *FailWith = @ptrCast(@alignCast(ptr));
-        return self.err;
-    }
-};
-
 test "capi SQL outcome COMMIT failures before the decision are not applied" {
-    const Boundary = enum { before_store, after_prepare };
-    for ([_]struct { at: Boundary, err: anyerror, code: h.capi.ErrorCode, state: []const u8 }{
-        .{ .at = .before_store, .err = error.InputOutput, .code = .internal, .state = "58000" },
-        .{ .at = .after_prepare, .err = error.Busy, .code = .busy, .state = "55P03" },
-        .{ .at = .after_prepare, .err = error.InputOutput, .code = .internal, .state = "58000" },
+    for ([_]struct { err: anyerror, code: h.capi.ErrorCode, state: []const u8 }{
+        .{ .err = error.InputOutput, .code = .internal, .state = "58000" },
+        .{ .err = error.Busy, .code = .busy, .state = "55P03" },
+        .{ .err = error.OutOfMemory, .code = .internal, .state = "53200" },
     }) |case| {
         var f = try OutcomeFixture.init("outcome-commit-pre");
         defer f.deinit();
         try SessionStatements.stage(&f);
-        var fail: FailWith = .{ .err = case.err };
-        switch (case.at) {
-            .before_store => test_before_store = .{ .ptr = &fail, .run = FailWith.run },
-            .after_prepare => test_after_prepare = .{ .ptr = &fail, .run = FailWith.run },
-        }
+        var fault: PrimaryFault = .{ .fixture = &f, .err = case.err };
+        fault.arm();
         var reply = try f.sql(SessionStatements.commit);
         defer reply.deinit();
-        test_before_store = null;
-        test_after_prepare = null;
+        PrimaryFault.disarm();
         try std.testing.expectEqual(case.code, reply.code);
         try std.testing.expectEqualStrings(case.state, reply.state().?);
         // Not applied: no receipt, nothing stored, and the abandoned
@@ -709,19 +852,10 @@ test "capi SQL outcome COMMIT decision failing before publication is not applied
     var f = try OutcomeFixture.init("outcome-commit-decision-pre");
     defer f.deinit();
     try SessionStatements.stage(&f);
-    // The coordinator decision is the next primary batch after preparing.
-    const Arm = struct {
-        fault: PrimaryFault,
-        fn run(ptr: *anyopaque) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.fault.arm();
-        }
-    };
-    var arm: Arm = .{ .fault = .{ .fixture = &f, .err = error.InputOutput } };
-    test_after_prepare = .{ .ptr = &arm, .run = Arm.run };
+    var fault: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput };
+    fault.arm();
     var reply = try f.sql(SessionStatements.commit);
     defer reply.deinit();
-    test_after_prepare = null;
     PrimaryFault.disarm();
     // Pending with no uncertain publication: provably not applied.
     try std.testing.expect(reply.code != .outcome_unknown and reply.code != .ok);
@@ -735,33 +869,26 @@ test "capi SQL outcome COMMIT decision failing inside publication is unknown wit
     var f = try OutcomeFixture.init("outcome-commit-decision-uncertain");
     defer f.deinit();
     try SessionStatements.stage(&f);
-    const Arm = struct {
-        fault: PrimaryFault,
-        fn run(ptr: *anyopaque) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.fault.arm();
-        }
-    };
-    var arm: Arm = .{ .fault = .{ .fixture = &f, .err = error.InputOutput, .publication = true } };
-    test_after_prepare = .{ .ptr = &arm, .run = Arm.run };
+    var fault: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput, .publication = true };
+    fault.arm();
     var reply = try f.sql(SessionStatements.commit);
     defer reply.deinit();
-    test_after_prepare = null;
     PrimaryFault.disarm();
     try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, reply.code);
     try std.testing.expectEqualStrings("40003", reply.state().?);
-    try std.testing.expect(reply.has("transaction_id"));
+    try std.testing.expect(!reply.has("transaction_id"));
+    try std.testing.expect(reply.has("outcome_receipt"));
 }
 
 test "capi SQL outcome COMMIT failure after a committed decision is committed" {
     var f = try OutcomeFixture.init("outcome-commit-post");
     defer f.deinit();
     try SessionStatements.stage(&f);
-    var fail: FailWith = .{ .err = error.InputOutput };
-    test_after_decision = .{ .ptr = &fail, .run = FailWith.run };
+    const mutation_commit = @import("../storage/db/mutation_commit.zig");
+    mutation_commit.test_fail_after_primary_commit = error.InputOutput;
+    defer mutation_commit.test_fail_after_primary_commit = null;
     var reply = try f.sql(SessionStatements.commit);
     defer reply.deinit();
-    test_after_decision = null;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, reply.code);
     try std.testing.expectEqualStrings("committed_pending", reply.outcome().?);
     try std.testing.expectEqual(@as(usize, 1), try f.rows());

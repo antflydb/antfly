@@ -14,8 +14,9 @@
 // limitations under the License.
 
 //! Connection-scoped SQL transactions. Statements read a pinned native view
-//! plus their own staged postimages. COMMIT prepares native intents and uses
-//! the durable database coordinator; SQL is never replayed to commit a session.
+//! plus their own staged postimages. Shared-file COMMIT publishes owned row
+//! and constraint plans through one native checkpoint. Other backends retain
+//! the durable coordinator; SQL is never replayed to commit a session.
 const h = @import("handles.zig");
 const api = @import("db.zig");
 const sql = @import("sql.zig");
@@ -445,12 +446,18 @@ pub const Session = struct {
         const metadata = adapter.localCatalog(a, requests[0].schema_version.?) catch |err| return outcomes.notApplied(err);
         var prepared = d.api_relational_integrity_commit.prepareWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, requests, adapter.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
         defer prepared.deinit();
-        const outcome = @import("sql_commit.zig").commit(self.handle, prepared.tables, out_id) catch |err| {
+        const outcome = commitNativeOrCoordinated(&adapter, a, prepared.tables, out_id) catch |err| {
             self.failed = true;
             return err;
         };
         self.reset();
         return outcome;
+    }
+
+    fn commitNativeOrCoordinated(adapter: anytype, alloc: std.mem.Allocator, requests: []const d.api_distributed_txn_contract.TableCommitRequest, out_id: *?types.TxnId) !catalog.MutationOutcome {
+        out_id.* = null;
+        if (try @import("sql_native_commit.zig").tryCommit(adapter, alloc, requests)) |outcome| return outcome;
+        return @import("sql_commit.zig").commit(adapter.handle.?, requests, out_id);
     }
 
     pub fn control(self: *Session, statement: d.sql_ast.Statement, out_id: *?types.TxnId) !?sql.runtime.Result {

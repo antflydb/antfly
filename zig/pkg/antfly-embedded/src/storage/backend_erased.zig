@@ -1317,6 +1317,11 @@ pub const Store = struct {
         return BoundaryAbi.call("native_publication_scope", self.boundary_dispatch, operation, .{ self.ptr, alloc });
     }
 
+    pub fn createNativeAtomicGroup(self: *Store, count: usize) !?@import("native_publication.zig").AtomicGroup {
+        const operation = self.vtable.create_native_atomic_group orelse return null;
+        return BoundaryAbi.call("create_native_atomic_group", self.boundary_dispatch, operation, .{ self.ptr, count });
+    }
+
     pub fn writeSerialization(self: *const Store) WriteSerialization {
         return if (self.write_gate != null) .intrinsic else self.write_serialization;
     }
@@ -1389,6 +1394,7 @@ pub const Store = struct {
         /// Open one stable, range-scoped replay-lane view. The returned
         /// transaction may outlive multiple bounded derived-index windows.
         begin_replay_lane_scan: ?*const fn (Allocator, *anyopaque, u8, u64) anyerror!CurrentScanTxn = null,
+        create_native_atomic_group: ?*const fn (*anyopaque, usize) anyerror!?@import("native_publication.zig").AtomicGroup = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -2411,6 +2417,10 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return try unbox(ptr).handle.nativePublicationScope(alloc);
         }
 
+        fn createNativeAtomicGroup(ptr: *anyopaque, count: usize) anyerror!?@import("native_publication.zig").AtomicGroup {
+            return try unbox(ptr).handle.createNativeAtomicGroup(count);
+        }
+
         fn capabilities(ptr: *anyopaque) backend_types.Capabilities {
             return unbox(ptr).handle.capabilities();
         }
@@ -2657,6 +2667,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             .deinit = vt.deinit,
             .capabilities = vt.capabilities,
             .native_publication_scope = if (Handle == Store or @hasDecl(Handle, "nativePublicationScope")) vt.nativePublicationScope else null,
+            .create_native_atomic_group = if (Handle == Store or @hasDecl(Handle, "createNativeAtomicGroup")) vt.createNativeAtomicGroup else null,
             .begin_read = vt.beginRead,
             .begin_read_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithBlockCacheAdmission")) vt.beginReadWithBlockCacheAdmission else null,
             .begin_probe = if (Handle == Store or @hasDecl(Handle, "beginProbe")) vt.beginProbe else null,

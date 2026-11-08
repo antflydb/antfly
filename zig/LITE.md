@@ -1373,6 +1373,12 @@ before evaluation or coordinator locking; they never retry evaluated SQL. Active
 transaction staging, reads, rollback and empty commits do not wait for producer
 credits. The physical commit still checks exact admission. Refusal occurs before commit. Visibility errors
 after commit retain the committed outcome and must not trigger a blind retry.
+Supported shared-file SQL constraints publish owned claim/reference effects
+with their primary rows in one native checkpoint. Multi-table SQL COMMIT uses
+the same atomic publication; all namespace snapshot barriers remain held until
+their in-memory activations finish. Unknown native COMMIT outcomes carry an
+`outcome_receipt`, resolved with the existing receipt API. Unsupported authority,
+lifecycle and backend shapes retain coordinator transaction-ID reconciliation.
 A refused batch carries an observed positive replay footprint. Waiting polls the
 small durable aggregate through a short read-only file pin, releasing that pin
 before sleeping; it does not rebuild serving indexes merely to discover the

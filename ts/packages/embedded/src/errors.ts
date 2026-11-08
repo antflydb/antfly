@@ -173,7 +173,7 @@ export class BusyError extends AntflyError {
 
 export class OutcomeUnknownError extends AntflyError {
   /**
-   * The receipt the database issued for an autocommit SQL write that ended
+   * The receipt the database issued for a SQL write or native SQL COMMIT that ended
    * with an unknown outcome, if any. Resolve it later with
    * `Database.outcomeReceiptStatus()`.
    */

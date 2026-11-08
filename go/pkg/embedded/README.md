@@ -127,7 +127,7 @@ Database failures retain an owned native diagnostic in `NativeError`. Use
 classify failures. The copied detail remains valid after later native calls;
 Go keeps each native call and diagnostic read on the same OS thread.
 
-When `Batch`, `BatchJSON`, or an autocommit SQL write fails with
+When `Batch`, `BatchJSON`, a SQL write, or native SQL COMMIT fails with
 `OutcomeUnknown`, the error may carry an outcome receipt
 (`NativeError.OutcomeReceipt` or `SQLError.OutcomeReceipt`; read either with
 `lite.OutcomeReceiptOf(err)`). Resolve it later on any handle for the same

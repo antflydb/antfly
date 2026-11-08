@@ -36,7 +36,7 @@ type SQLError struct {
 	Message       string `json:"message"`
 	Hint          string `json:"hint"`
 	Retryable     bool   `json:"retryable"`
-	// OutcomeReceipt is set when an autocommit SQL write ended with
+	// OutcomeReceipt is set when a SQL write or native SQL COMMIT ended with
 	// OutcomeUnknown and the database issued a receipt for it. Resolve it
 	// later with DB.OutcomeReceiptStatus.
 	OutcomeReceipt string `json:"-"`

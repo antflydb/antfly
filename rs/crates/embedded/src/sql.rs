@@ -75,7 +75,7 @@ impl SqlError {
     }
 }
 impl SqlError {
-    /// The outcome receipt of an autocommit write that ended with
+    /// The outcome receipt of a SQL write or native SQL COMMIT that ended with
     /// `OutcomeUnknown`, when the database issued one; resolve it with
     /// `Database::outcome_receipt_status`.
     pub fn outcome_receipt(&self) -> Option<&str> {

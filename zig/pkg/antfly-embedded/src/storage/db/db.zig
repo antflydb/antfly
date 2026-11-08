@@ -7687,6 +7687,10 @@ pub const DB = struct {
     }
 
     pub fn batchTrackedWithPreparedDocumentsAndVisibility(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker, prepared: ?*@import("prepared_document_batch.zig").Plan, completion: ?*execution_resources.BatchVisibilityCompletion) anyerror!void {
+        return self.batchTrackedWithNativeSqlIntegrity(req, primary_committed, marker, prepared, completion, null);
+    }
+
+    pub fn batchTrackedWithNativeSqlIntegrity(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker, prepared: ?*@import("prepared_document_batch.zig").Plan, completion: ?*execution_resources.BatchVisibilityCompletion, integrity_plan: ?*const @import("native_sql_integrity.zig").Plan) anyerror!void {
         primary_committed.* = false;
         var marker_key: [apply_receipts.outcome_marker_key_len]u8 = undefined;
         var marker_value: [apply_receipts.outcome_marker_value_len]u8 = undefined;
@@ -7699,7 +7703,7 @@ pub const DB = struct {
         const previous = backend_types.commit_progress;
         backend_types.commit_progress = &progress;
         defer backend_types.commit_progress = previous;
-        self.batchTrackedProfiled(req, primary_committed, marker_write, prepared, completion) catch |err| {
+        self.batchTrackedProfiled(req, primary_committed, marker_write, prepared, completion, integrity_plan) catch |err| {
             if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
                 std.log.warn("batch failed after its write may have applied: {s}", .{@errorName(err)});
                 return error.OutcomeUnknown;
@@ -7762,8 +7766,16 @@ pub const DB = struct {
         };
     }
 
-    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker_write: ?docstore_mod.KVPair, prepared: ?*@import("prepared_document_batch.zig").Plan, completion: ?*execution_resources.BatchVisibilityCompletion) anyerror!void {
-        const opts: BatchExecutionOptions = .{ .primary_committed = primary_committed, .outcome_marker_write = marker_write, .prepared_documents = prepared, .visibility_completion = completion };
+    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker_write: ?docstore_mod.KVPair, prepared: ?*@import("prepared_document_batch.zig").Plan, completion: ?*execution_resources.BatchVisibilityCompletion, integrity_plan: ?*const @import("native_sql_integrity.zig").Plan) anyerror!void {
+        const opts: BatchExecutionOptions = .{
+            .primary_committed = primary_committed,
+            .outcome_marker_write = marker_write,
+            .prepared_documents = prepared,
+            .visibility_completion = completion,
+            .native_sql_integrity = integrity_plan,
+            .store_batch_options = .{ .native_atomic_member = if (integrity_plan) |plan| plan.atomic_member else null },
+            .snapshot_mutation = if (integrity_plan) |plan| plan.snapshot_mutation else null,
+        };
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
             try self.batchInternal(req, &profile, opts);

@@ -23,7 +23,7 @@ export type CommitOutcome = "applied" | "not_applied" | "unknown";
 export class SqlError extends Error {
   readonly sqlstate: string;
   /**
-   * @param outcomeReceipt Set when an autocommit write ended with an unknown
+   * @param outcomeReceipt Set when a SQL write or native SQL COMMIT ended with an unknown
    *   outcome; resolve it later with `Database.outcomeReceiptStatus()`.
    */
   constructor(

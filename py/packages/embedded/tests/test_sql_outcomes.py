@@ -40,3 +40,22 @@ def test_commit_diagnostic_keeps_disposition_and_token(monkeypatch, outcome):
     assert mapped.sqlstate == "40003"
     assert mapped.commit_outcome == outcome
     assert mapped.transaction_id == "ab" * 16
+
+
+def test_native_commit_unknown_keeps_receipt_without_coordinator_id(monkeypatch):
+    payload = {
+        "error": {"code": "40003", "message": "Reconcile this commit.", "retryable": False},
+        "commit_outcome": "unknown",
+        "outcome_receipt": "native-commit-receipt",
+    }
+    monkeypatch.setattr(_sql._ffi, "take_buffer", lambda _: json.dumps(payload))
+    monkeypatch.setattr(_sql.errors, "last_outcome_receipt", lambda: None)
+    with pytest.raises(_sql.SQLStateError) as raised:
+        _sql.output(_sql.errors.OUTCOME_UNKNOWN, None)
+    error = raised.value
+    assert error.transaction_id is None
+    assert error.outcome_receipt == "native-commit-receipt"
+    mapped = dbapi._mapped(error)
+    assert mapped.commit_outcome == "unknown"
+    assert mapped.transaction_id is None
+    assert mapped.outcome_receipt == "native-commit-receipt"

@@ -1365,11 +1365,15 @@ pub fn trackedBatchWithPreparedDocuments(database: *db_mod.DB, req: db_mod.types
 }
 
 fn trackedBatchWithPreparedDocumentsAndVisibility(database: *db_mod.DB, req: db_mod.types.BatchRequest, primary_committed: *bool, table_name: ?[]const u8, prepared: ?*@import("../storage/db/prepared_document_batch.zig").Plan, completion: ?*@import("../storage/db/execution_resources.zig").BatchVisibilityCompletion) anyerror!void {
+    return trackedBatchWithNativeSqlIntegrity(database, req, primary_committed, table_name, prepared, completion, null);
+}
+
+pub fn trackedBatchWithNativeSqlIntegrity(database: *db_mod.DB, req: db_mod.types.BatchRequest, primary_committed: *bool, table_name: ?[]const u8, prepared: ?*@import("../storage/db/prepared_document_batch.zig").Plan, completion: ?*@import("../storage/db/execution_resources.zig").BatchVisibilityCompletion, integrity_plan: ?*const @import("../storage/db/native_sql_integrity.zig").Plan) anyerror!void {
     const receipts = @import("outcome_receipts.zig");
-    const writer = receipts.activeWriter() orelse return database.batchTrackedWithPreparedDocumentsAndVisibility(req, primary_committed, null, prepared, completion);
+    const writer = receipts.activeWriter() orelse return database.batchTrackedWithNativeSqlIntegrity(req, primary_committed, null, prepared, completion, integrity_plan);
     const named = if (table_name) |name| (if (std.mem.eql(u8, name, "default")) null else name) else null;
     const marker = writer.next(named);
-    database.batchTrackedWithPreparedDocumentsAndVisibility(req, primary_committed, marker, prepared, completion) catch |err| {
+    database.batchTrackedWithNativeSqlIntegrity(req, primary_committed, marker, prepared, completion, integrity_plan) catch |err| {
         if (!primary_committed.* and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err))
             writer.retire(marker, if (named) |name| .{ .name = name, .id = database.core.identity_namespace.table_id } else null);
         return err;
@@ -7102,7 +7106,7 @@ fn executePreparedEmbeddedSqlWithHandoff(handle: *Handle, table_name: []const u8
     try requireEmbeddedSqlCatalogOwnership(handle, compiled.statement);
     // Allocate the fallback receipt before entering any commit path.
     var commit_receipt: ?[]u8 = switch (compiled.statement) {
-        .insert, .update, .delete, .commit, .create_table, .drop_table, .catalog_ddl => try std.heap.c_allocator.alloc(u8, 512),
+        .insert, .update, .delete, .commit, .create_table, .drop_table, .catalog_ddl => try std.heap.c_allocator.alloc(u8, @import("outcome_receipts.zig").max_text_len + 512),
         else => null,
     };
     defer if (commit_receipt) |buffer| std.heap.c_allocator.free(buffer);
@@ -7114,7 +7118,11 @@ fn executePreparedEmbeddedSqlWithHandoff(handle: *Handle, table_name: []const u8
     if (session) |value| {
         var transaction_id: ?db_mod.types.TxnId = null;
         const controlled = value.control(compiled.statement, &transaction_id) catch |err| {
-            if (transaction_id) |id| out_buf.* = embeddedSqlUnknownReceipt(&commit_receipt, id);
+            if (transaction_id) |id| {
+                out_buf.* = embeddedSqlUnknownReceipt(&commit_receipt, id);
+            } else if (commit_receipt != null and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err)) {
+                out_buf.* = embeddedSqlNativeUnknownReceipt(&commit_receipt);
+            }
             return err;
         };
         if (controlled) |output| {
@@ -7137,9 +7145,11 @@ fn executePreparedEmbeddedSqlWithHandoff(handle: *Handle, table_name: []const u8
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
         if (err == error.SqlNotNullViolation or err == error.SqlUntranslatableCharacter) out_buf.* = try stringifyJson(.{ .@"error" = error_context.diagnostic(err) });
-        if (err == error.SqlMutationOutcomeUnknown) if (adapter.outcome_transaction_id) |txn_id| {
-            out_buf.* = embeddedSqlUnknownReceipt(&commit_receipt, txn_id);
-        };
+        if (commit_receipt != null and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err)) {
+            if (adapter.outcome_transaction_id) |txn_id| {
+                out_buf.* = embeddedSqlUnknownReceipt(&commit_receipt, txn_id);
+            } else out_buf.* = embeddedSqlNativeUnknownReceipt(&commit_receipt);
+        }
         return err;
     };
     defer result.deinit();
@@ -7199,6 +7209,28 @@ pub fn embeddedSqlUnknownReceipt(reserved: *?[]u8, txn_id: db_mod.types.TxnId) c
         .commit_outcome = "unknown",
         .@"error" = .{ .code = "40003", .message = "The mutation outcome is unknown. Reconcile the native transaction receipt; do not replay the statement.", .retryable = false },
     }, .{})}) catch unreachable;
+    reserved.* = null;
+    return .{ .ptr = buffer.ptr, .len = buffer.len };
+}
+
+/// Native SQL has one atomic row checkpoint, rather than a separate durable
+/// coordinator. Preserve its unknown disposition and receipt without any
+/// allocation after publication, including the longest supported table name.
+pub fn embeddedSqlNativeUnknownReceipt(reserved: *?[]u8) capi.Buffer {
+    const receipts = @import("outcome_receipts.zig");
+    const buffer = reserved.*.?;
+    @memset(buffer, ' ');
+    const diagnostic = .{ .code = "40003", .message = "The mutation outcome is unknown. Reconcile the native outcome receipt; do not replay the statement.", .retryable = false };
+    var text: [receipts.max_text_len]u8 = undefined;
+    if (receipts.lastReceipt()) |receipt| {
+        _ = std.fmt.bufPrint(buffer, "{f}", .{std.json.fmt(.{
+            .commit_outcome = "unknown",
+            .outcome_receipt = receipts.format(receipt, &text),
+            .@"error" = diagnostic,
+        }, .{})}) catch unreachable;
+    } else {
+        _ = std.fmt.bufPrint(buffer, "{f}", .{std.json.fmt(.{ .commit_outcome = "unknown", .@"error" = diagnostic }, .{})}) catch unreachable;
+    }
     reserved.* = null;
     return .{ .ptr = buffer.ptr, .len = buffer.len };
 }
@@ -13332,6 +13364,30 @@ test "capi SQL COMMIT response allocation failure preserves the applied incremen
     const row = try Sql.call(id, null, "SELECT n FROM numbers WHERE _id='counter'");
     defer row.deinit();
     try std.testing.expectEqualStrings("1", row.value.object.get("rows").?.array.items[0].array.items[0].string);
+}
+
+test "capi SQL COMMIT native unknown envelope fits the longest outcome receipt" {
+    const receipts = @import("outcome_receipts.zig");
+    receipts.clearLast();
+    defer receipts.clearLast();
+    var writer: receipts.Writer = .{ .id = @splat(7) };
+    defer writer.deinit();
+    const table: [receipts.max_table_len]u8 = @splat('x');
+    const marker = writer.next(&table);
+    writer.retire(marker, .{ .name = &table, .id = std.math.maxInt(u64) });
+    var reserved: ?[]u8 = try std.heap.c_allocator.alloc(u8, receipts.max_text_len + 512);
+    defer if (reserved) |bytes| std.heap.c_allocator.free(bytes);
+    var output = embeddedSqlNativeUnknownReceipt(&reserved);
+    defer antfly_buffer_free(&output);
+    try std.testing.expect(reserved == null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.ptr.?[0..output.len], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unknown", parsed.value.object.get("commit_outcome").?.string);
+    try std.testing.expectEqualStrings("40003", parsed.value.object.get("error").?.object.get("code").?.string);
+    try std.testing.expect(parsed.value.object.get("transaction_id") == null);
+    const receipt = try receipts.parse(parsed.value.object.get("outcome_receipt").?.string);
+    try std.testing.expectEqual(marker, receipt.marker);
+    try std.testing.expectEqualStrings(&table, receipt.table().?.name);
 }
 
 test "capi SQL COMMIT bounded refusal receipt retains its SQLSTATE when a diagnostic is oversized" {

@@ -158,6 +158,7 @@ pub const CommitProgress = struct {
 pub threadlocal var commit_progress: ?*CommitProgress = null;
 
 pub const BatchOptions = struct {
+    native_atomic_member: ?@import("native_publication.zig").AtomicMember = null,
     mode: BatchMode = .default,
     defer_commit_flush: bool = false,
     // Read-throughs performed by a write batch (for example, loading exact

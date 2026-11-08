@@ -1071,6 +1071,9 @@ pub const BatchVisibilityCursor = struct {
 };
 
 pub const BatchExecutionOptions = struct {
+    /// Owned local constraint effects, validated under apply and committed with
+    /// primary rows. Never accepted from public JSON or replicated ingress.
+    native_sql_integrity: ?*const @import("native_sql_integrity.zig").Plan = null,
     prepared_documents: ?*@import("prepared_document_batch.zig").Plan = null,
     publication_cohort: ?*const @import("publication_cohort.zig").Group = null,
     cohort_outcome_marker_writes: []const docstore_mod.KVPair = &.{},

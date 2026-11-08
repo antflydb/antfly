@@ -422,7 +422,7 @@ antfly_error_code antfly_db_batch_json(
     antfly_buffer *out
 );
 /*
- * Outcome receipts. When an autocommit SQL write or a batch export returns
+ * Outcome receipts. When a SQL write, native SQL COMMIT, or batch export returns
  * ANTFLY_OUTCOME_UNKNOWN, antfly_last_error_outcome_receipt (same thread,
  * before another call) returns a receipt string; SQL error bodies also carry
  * it as "outcome_receipt". antfly_db_outcome_receipt_status later resolves it

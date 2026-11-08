@@ -5601,8 +5601,9 @@ test "capi SQL recovery stays clean across row writes reads and cursors" {
     try std.testing.expectEqual(capi.ErrorCode.ok, CursorApi.antfly_db_sql_close_cursor(handle, cursor));
     const after = try sqlRecoveryScans(handle);
     try std.testing.expectEqual(before.ddl, after.ddl);
-    // One post-decision resolution per INSERT, no pre-statement record probes.
-    try std.testing.expectEqual(before.commit + 8, after.commit);
+    // Shared-file row and constraint publication creates no coordinator
+    // decision, so neither reads nor INSERTs need transaction recovery scans.
+    try std.testing.expectEqual(before.commit, after.commit);
     try sqlFkRecoveryStatement(handle, "ALTER TABLE t0 ADD CONSTRAINT positive CHECK(n>=0)");
     const changed = try sqlRecoveryScans(handle);
     try std.testing.expectEqual(after.ddl + 1, changed.ddl);

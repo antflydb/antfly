@@ -12104,18 +12104,32 @@ test "capi native consumerless source observes new tips without replaying empty 
     }
     try std.testing.expectEqual(source_turns, owner.publication_stats.maintenance_source_turns);
     try std.testing.expectEqual(runtime_opens, owner.test_runtime_snapshot_opens);
-    try std.testing.expect(owner.publication_stats.covered_source_observations > observations);
+    if (owner.publication_stats.covered_source_observations <= observations) return error.TestConsumerlessTipObservationMissing;
     // Catalog changes revoke the fast witness even without a source append.
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
     var changed: h.capi.Buffer = .{};
     defer api.antfly_buffer_free_zero(&changed);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"new-index-source\":{\"text\":\"catalog change needs service\"}},\"sync_level\":\"write\"}"), &changed));
-    for (0..32) |_| {
+    // Manual turns still honor real maintenance retry/housekeeping deadlines.
+    // A fixed number of immediate turns can finish before a deferred service
+    // becomes runnable on a fast or differently scheduled test host.
+    const deadline = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds + 5 * std.time.ns_per_s;
+    while (std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds < deadline) {
         _ = try owner.maintenanceTurnForTest();
         if (owner.publication_stats.maintenance_source_turns > source_turns) break;
+        try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
     }
-    try std.testing.expect(owner.publication_stats.maintenance_source_turns > source_turns);
-    try std.testing.expect((try owner.current.?.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+    if (owner.publication_stats.maintenance_source_turns <= source_turns) return error.TestConsumerlessCatalogChangeNotServiced;
+    // Detached publication can leave the serving writer on an older header.
+    // Allocator inspection needs current metadata, under admission; a cached
+    // logical source cut does not retain that checkpoint's allocator pages.
+    var lease = try fixture.connection.acquire();
+    defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    defer lease.close();
+    const refreshed = try owner.refresh();
+    const current_file = &refreshed.owned_lite_backend.?.native_docstore.?.file;
+    const current_check = try current_file.check();
+    if (!current_check.valid) return error.TestConsumerlessIntegrityFailed;
 }
 
 test "capi native group discovery releases admission and rebases individual commands" {

@@ -71,6 +71,40 @@ barriers until authenticated. Recovery and failure injection rules are described
 in [native-commit-proofs.md](native-commit-proofs.md); removing a synchronization
 call without those proofs is not a valid optimization.
 
+## Shared-file SQL publication
+
+SQL constraint planning produces owned claims, references and guards. Native
+publication binds those effects to the exact primary postimages, predicates,
+schema/catalog generation, table incarnation and physical namespace. It checks
+current values, reference prefixes and existing transaction-intent conflicts
+again under the namespace apply fence. Constraints do not require durable
+coordinator intents when every participant shares the same native store.
+
+For multiple namespaces, each participant prepares its final primary/index
+batch and joins an explicit atomic group. Staging releases the native writer
+slot before waiting for other participants. One composite request enters the
+native commit queue; the queue cannot split its participants into different
+checkpoints. A staging failure aborts all participants, including effects
+already staged in the physical transaction. Every participant waits for the
+shared durability result before activating its namespace's in-memory state.
+The caller retains all snapshot mutation barriers until every activation has
+finished. Producers retain these leases explicitly instead of reacquiring
+shared admission behind a waiting snapshot capture.
+
+The runtime reserves bounded task-pool capacity before submitting producers.
+It creates no per-statement threads. Groups contain at most sixteen namespaces;
+preparation allocations remain charged to the SQL request budget. Auxiliary
+artifact transactions never join the final primary rendezvous. Unsupported
+authority, lifecycle, range-guard and backend shapes retain their existing
+coordinator rather than silently dropping their guards.
+
+Autocommit and explicit native SQL COMMIT use the existing outcome receipt when
+the checkpoint result is uncertain. That receipt resolves the atomic group;
+there is no separate coordinator transaction ID. Confirmed primary success
+remains committed if later visibility or activation work fails. Other
+coordinator-backed paths retain transaction-ID reconciliation. SDK decoders
+already support both optional fields.
+
 ## Grouped-source publication
 
 Source discovery and fan-in use short, admitted read snapshots outside writer

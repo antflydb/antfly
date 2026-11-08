@@ -193,7 +193,7 @@ class OutcomeUnknownError(AntflyError):
     """The operation may have taken effect; do not retry it automatically.
 
     Attributes:
-        outcome_receipt: for a failed batch or autocommit SQL write, the
+        outcome_receipt: for a failed batch, SQL write, or native SQL COMMIT, the
             receipt the database issued for it (resolve it later with
             Database.outcome_receipt_status), else None.
     """

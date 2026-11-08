@@ -19,6 +19,36 @@
 const std = @import("std");
 const abi = @import("../runtime_callback_abi.zig");
 
+/// A private capability for final primary batches sharing one physical store.
+/// Each ordinal arrives once. A caller must cancel on any preparation failure,
+/// join all producers, and only then destroy the group. Auxiliary transactions
+/// must never receive this capability.
+pub const AtomicMember = struct {
+    owner: *anyopaque,
+    store: *anyopaque,
+    ordinal: usize,
+};
+
+pub const AtomicGroup = struct {
+    ptr: *anyopaque,
+    store: *anyopaque,
+    count: usize,
+    cancel_fn: *const fn (*anyopaque) void,
+    destroy_fn: *const fn (*anyopaque) void,
+
+    pub fn member(self: AtomicGroup, ordinal: usize) AtomicMember {
+        std.debug.assert(ordinal < self.count);
+        return .{ .owner = self.ptr, .store = self.store, .ordinal = ordinal };
+    }
+    pub fn cancel(self: AtomicGroup) void {
+        self.cancel_fn(self.ptr);
+    }
+    pub fn deinit(self: *AtomicGroup) void {
+        self.destroy_fn(self.ptr);
+        self.* = undefined;
+    }
+};
+
 /// All scoped publication paths use the same component and root validation.
 pub fn requireDestination(prefix: []const u8, path: []const u8) !void {
     if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidNativeIndexPath;
@@ -31,6 +61,7 @@ pub fn requireDestination(prefix: []const u8, path: []const u8) !void {
 
 pub const Scope = struct {
     inode: u64,
+    publication_store: ?*anyopaque = null,
     file_namespace: [32]u8 = @splat(0),
     prefix: []u8,
     pub fn deinit(self: *Scope, alloc: std.mem.Allocator) void {

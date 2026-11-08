@@ -116,7 +116,7 @@ func (code ErrorCode) Description() string {
 type NativeError struct {
 	Code   ErrorCode
 	Detail string
-	// OutcomeReceipt is set when an autocommit SQL write or a batch failed
+	// OutcomeReceipt is set when a SQL write, native SQL COMMIT, or batch failed
 	// with OutcomeUnknown and the database issued a receipt for it. Resolve
 	// it later with DB.OutcomeReceiptStatus.
 	OutcomeReceipt string

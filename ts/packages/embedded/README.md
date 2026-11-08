@@ -326,7 +326,7 @@ itself, not `CancelledError`), `InternalError` (255).
 
 ### Outcome receipts
 
-When an autocommit SQL write (`sqlJson`, `Connection` outside a transaction)
+When a SQL write or native SQL `COMMIT` (`sqlJson`, `Connection`)
 ends with ANTFLY_OUTCOME_UNKNOWN, the rejection (`SqlError`, or
 `OutcomeUnknownError` without a SQL diagnostic) carries `.outcomeReceipt`
 (`undefined` when none was issued). Resolve it on any handle for the same

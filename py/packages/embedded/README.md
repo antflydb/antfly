@@ -310,8 +310,8 @@ inventory; retry until it is `true` or your own deadline expires.
   `OutcomeUnknownError`, `UnsupportedError`, `StalledError`,
   `CancelledError`, `InternalError`. Unrecognized codes raise `AntflyError`
   directly.
-- **Outcome receipts**: when `batch()`, `batch_json()`, or an autocommit
-  `sql()` write fails with ANTFLY_OUTCOME_UNKNOWN, the `OutcomeUnknownError`
+- **Outcome receipts**: when `batch()`, `batch_json()`, a SQL write, or a native SQL
+  `COMMIT` fails with ANTFLY_OUTCOME_UNKNOWN, the `OutcomeUnknownError`
   (or `SQLStateError`, and the DB-API error mapped from either) carries
   `.outcome_receipt` (`None` when the call issued none). Resolve it on any
   handle for the same database with `db.outcome_receipt_status(receipt)`,

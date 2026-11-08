@@ -562,7 +562,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.transaction_resolution == null and !scoped_restore_replication_apply and !live_replication_apply) {
                 for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
                 for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
-                if (!req.graph_endpoint_cleanup_planned and hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
+                if (opts.native_sql_integrity == null and !req.graph_endpoint_cleanup_planned and hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
                     return error.ForeignKeyCoordinationRequired;
             }
             if (req.relational_schema_version) |version| {
@@ -1337,6 +1337,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // instead of scanning every outstanding transaction.
             if (opts.transaction_resolution == null) {
                 try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
+            }
+            if (opts.native_sql_integrity) |integrity_plan| {
+                if (opts.transaction_resolution != null or opts.ordered_apply_receipt != null or
+                    opts.replication_applied_lsn_marker != null or try self.maintenanceRequiresOrderedApply()) return error.InvalidIntegrityOperation;
+                try integrity_plan.validateCore(preparation_alloc, S.ownerField(self, "core").*, S.ownerField(self, "root_incarnation").*, req);
             }
             if (owned_resolution != null)
                 try opts.prepared_documents.?.validateOwnedTransforms(S.ownerField(self, "core").*.store)
@@ -2763,7 +2768,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const store_write_start_ns = monotonicTimeNs();
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
-            const store_batch_options: backend_types.BatchOptions = if (opts.store_batch_options.mode != .default)
+            const store_batch_options: backend_types.BatchOptions = if (opts.store_batch_options.mode != .default or opts.store_batch_options.native_atomic_member != null)
                 opts.store_batch_options
             else if (self.bulkSessionActive())
                 .{ .mode = .bulk_ingest, .defer_commit_flush = true }
@@ -3007,6 +3012,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &write_buffers.owned_store_values,
             );
             try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_writes);
+            // Constraint controls are not authored documents or independent
+            // replay sources. Their exact guards were validated under this
+            // apply fence and their effects join the same primary commit.
+            if (opts.native_sql_integrity) |integrity_plan| for (integrity_plan.effects.operations) |operation| switch (operation.kind) {
+                .guard => {},
+                .put => try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = operation.key, .value = operation.value orelse return error.InvalidIntegrityOperation }),
+                .delete => try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, operation.key),
+            };
             if (opts.outcome_marker_write) |marker| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, marker);
             try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.cohort_outcome_marker_writes);
             if (req.merge_page) |page| if (page.integrity.len != 0) {

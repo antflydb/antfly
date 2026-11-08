@@ -1428,6 +1428,99 @@ const MutationRequest = struct {
     result: anyerror!void = {},
 };
 
+/// Explicit all-or-nothing publication, independent of the opportunistic
+/// commit queue. Producers retain their prepared buffers until every callback
+/// has staged and the one checkpoint has completed. No producer may activate
+/// its namespace before this rendezvous returns durable success.
+const AtomicPublication = struct {
+    store: *Store,
+    requests: []?*MutationRequest,
+    mutex: std.Io.Mutex = .init,
+    ready: std.Io.Condition = .init,
+    arrived: usize = 0,
+    state: enum { preparing, publishing, done } = .preparing,
+    result: anyerror!void = {},
+    possible: bool = false,
+
+    fn create(store: *Store, count: usize) !@import("../native_publication.zig").AtomicGroup {
+        // Bounded participant stacks and preparation memory. This capability
+        // is only valid while the caller owns external file admission.
+        if (!store.file.externally_locked or store.writer_admission != null or count == 0 or count > 16) return error.UnsupportedAtomicPublication;
+        const self = try store.allocator.create(AtomicPublication);
+        errdefer store.allocator.destroy(self);
+        const requests = try store.allocator.alloc(?*MutationRequest, count);
+        @memset(requests, null);
+        self.* = .{ .store = store, .requests = requests };
+        return .{ .ptr = self, .store = store, .count = count, .cancel_fn = cancel, .destroy_fn = destroy };
+    }
+
+    fn cancel(ptr: *anyopaque) void {
+        const self: *AtomicPublication = @ptrCast(@alignCast(ptr));
+        const io = self.store.file.runtime();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.state != .preparing) return;
+        self.result = error.AtomicPublicationAborted;
+        self.state = .done;
+        self.ready.broadcast(io);
+    }
+
+    fn destroy(ptr: *anyopaque) void {
+        const self: *AtomicPublication = @ptrCast(@alignCast(ptr));
+        // Owner has cancelled if necessary and joined every producer.
+        std.debug.assert(self.state == .done);
+        const alloc = self.store.allocator;
+        alloc.free(self.requests);
+        alloc.destroy(self);
+    }
+
+    fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+        const self: *AtomicPublication = @ptrCast(@alignCast(ptr));
+        for (self.requests) |request| {
+            const item = request orelse return error.AtomicPublicationAborted;
+            try item.apply(item.context, file);
+        }
+    }
+
+    fn join(self: *AtomicPublication, ordinal: usize, request: *MutationRequest, possible: *bool) !void {
+        const io = self.store.file.runtime();
+        self.mutex.lockUncancelable(io);
+        // A completed group's success belongs only to its original callbacks.
+        // Reusing a member must never acknowledge a different, unstaged batch.
+        if (ordinal >= self.requests.len or self.requests[ordinal] != null) {
+            self.mutex.unlock(io);
+            return error.InvalidAtomicPublication;
+        }
+        if (self.state == .preparing) {
+            self.requests[ordinal] = request;
+            self.arrived += 1;
+            if (self.arrived == self.requests.len) {
+                self.state = .publishing;
+                self.mutex.unlock(io);
+                // Producers released their writer slots before arriving. One
+                // composite request enters the queue, so its members cannot
+                // be split across checkpoints by the queue's batch limit.
+                var publication_possible = false;
+                const result = blk: {
+                    self.store.reserveWriterSlotYielding() catch |err| break :blk err;
+                    defer self.store.releaseWriterSlot();
+                    break :blk self.store.submitMutationWithPublicationState(self, apply, &publication_possible);
+                };
+                self.mutex.lockUncancelable(io);
+                self.result = result;
+                self.possible = publication_possible;
+                self.state = .done;
+                self.ready.broadcast(io);
+            }
+        }
+        while (self.state != .done) self.ready.waitUncancelable(io, &self.mutex);
+        const result = self.result;
+        possible.* = self.possible;
+        self.mutex.unlock(io);
+        return result;
+    }
+};
+
 const ReadPin = struct {
     sequence: u64,
     pinned_at: std.Io.Timestamp,
@@ -3398,13 +3491,15 @@ pub const Store = struct {
     }
 
     pub fn beginBatchWithOptions(self: *Store, options: backend_types.BatchOptions) !Txn {
-        _ = options;
-        return try self.beginBatch();
+        var txn = try self.beginBatch();
+        txn.atomic_member = options.native_atomic_member;
+        return txn;
     }
 
     pub fn beginBatchWithOptionsYielding(self: *Store, options: backend_types.BatchOptions) !Txn {
-        _ = options;
-        return try self.beginBatchYielding();
+        var txn = try self.beginBatchYielding();
+        txn.atomic_member = options.native_atomic_member;
+        return txn;
     }
 
     pub fn lastReplaySequence(self: *Store, fallback_last: u64) u64 {
@@ -3469,7 +3564,14 @@ const RuntimeStore = struct {
     pub fn nativePublicationScope(self: *RuntimeStore, alloc: Allocator) !?@import("../native_publication.zig").Scope {
         if (self.store.read_only) return error.ReadOnly;
         const inode = (try self.store.file.file.stat(self.store.file.runtime())).inode;
-        return .{ .inode = inode, .file_namespace = self.store.file.header.reader_epoch_namespace, .prefix = try alloc.dupe(u8, self.prefix) };
+        return .{ .inode = inode, .publication_store = self.store, .file_namespace = self.store.file.header.reader_epoch_namespace, .prefix = try alloc.dupe(u8, self.prefix) };
+    }
+
+    pub fn createNativeAtomicGroup(self: *RuntimeStore, count: usize) !?@import("../native_publication.zig").AtomicGroup {
+        return AtomicPublication.create(self.store, count) catch |err| switch (err) {
+            error.UnsupportedAtomicPublication => null,
+            else => return err,
+        };
     }
 
     pub fn capabilities(self: *RuntimeStore) backend_types.Capabilities {
@@ -3496,8 +3598,11 @@ const RuntimeStore = struct {
     }
 
     pub fn beginBatchWithOptions(self: *RuntimeStore, options: backend_types.BatchOptions) !Txn {
-        _ = options;
-        return try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
+        var txn = try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
+        errdefer txn.abort();
+        if (options.native_atomic_member) |member| if (member.store != @as(*anyopaque, @ptrCast(self.store))) return error.InvalidAtomicPublication;
+        txn.atomic_member = options.native_atomic_member;
+        return txn;
     }
 
     pub fn lastReplaySequence(self: *RuntimeStore, fallback_last: u64) u64 {
@@ -3575,6 +3680,7 @@ pub const Txn = struct {
     read_generation: ?*ReadGeneration = null,
     read_pin: ?*ReadPin = null,
     native_publication: ?@import("../native_publication.zig").Participant = null,
+    atomic_member: ?@import("../native_publication.zig").AtomicMember = null,
     checkpoint: native.CheckpointSlot = .{},
 
     pub fn decodedResultsNamespace(self: *const Txn) []const u8 {
@@ -3720,7 +3826,7 @@ pub const Txn = struct {
         // Metadata probes may use a write transaction without staging changes.
         // Release their admission and snapshot directly: entering publication
         // would unnecessarily run retirement pressure and allocator proof work.
-        if (self.pending_count == 0 and self.native_publication == null) {
+        if (self.pending_count == 0 and self.native_publication == null and self.atomic_member == null) {
             self.abort();
             return;
         }
@@ -3755,7 +3861,16 @@ pub const Txn = struct {
             }
         }
         var possible = false;
-        store.submitMutationWithPublicationState(&context, Commit.apply, &possible) catch |err| {
+        const result = if (self.atomic_member) |member| blk: {
+            if (member.store != @as(*anyopaque, @ptrCast(store))) break :blk error.InvalidAtomicPublication;
+            const group: *AtomicPublication = @ptrCast(@alignCast(member.owner));
+            // Keep the immutable read pin and pending buffers until the group
+            // finishes; yield only the staging slot needed by the next member.
+            self.releaseWriterSlot();
+            var request: MutationRequest = .{ .context = &context, .apply = Commit.apply };
+            break :blk group.join(member.ordinal, &request, &possible);
+        } else store.submitMutationWithPublicationState(&context, Commit.apply, &possible);
+        result catch |err| {
             if (possible) if (backend_types.commit_progress) |progress| {
                 progress.maybe_applied = true;
             };
@@ -13055,4 +13170,107 @@ test "lite cohort source records share one checkpoint and roll back publication 
     }
     try std.testing.expectEqual(@as(usize, 0), uncommitted.len);
     try std.testing.expect((try owner.file.check()).valid);
+}
+
+test "lite native explicit atomic publication joins namespaces and rolls back staged members" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |fail_stage| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "atomic-namespaces.aflite");
+        defer a.free(path);
+        var coordinator = native.ReaderCoordinator.init(a, std.testing.io);
+        defer coordinator.deinit();
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .externally_locked = true, .no_sync = true, .reclamation = .{ .enabled = false } });
+        defer store.close();
+        store.maintenance_start_suppressed = true;
+        store.file.reader_coordinator = &coordinator;
+        var group = try AtomicPublication.create(&store, 2);
+        defer {
+            group.cancel();
+            group.deinit();
+        }
+        const Worker = struct {
+            store: *Store,
+            member: @import("../native_publication.zig").AtomicMember,
+            prefix: []const u8,
+            fail_stage: bool = false,
+            failure: ?anyerror = null,
+            fn stage(_: *anyopaque, _: @import("../native_publication.zig").View) !void {
+                return error.TestAtomicStageFailed;
+            }
+            fn execute(self: *@This()) !void {
+                var runtime: RuntimeStore = .{ .store = self.store, .prefix = self.prefix };
+                var txn = try runtime.beginBatchWithOptions(.{ .native_atomic_member = self.member });
+                errdefer txn.abort();
+                try txn.put("row", "postimage");
+                if (self.fail_stage) try txn.setNativePublication(.{ .ptr = self, .stage = stage });
+                try txn.commit();
+            }
+            fn run(self: *@This()) void {
+                self.execute() catch |err| {
+                    self.failure = err;
+                    AtomicPublication.cancel(self.member.owner);
+                };
+            }
+        };
+        var first: Worker = .{ .store = &store, .member = group.member(0), .prefix = "a/\x00" };
+        var second: Worker = .{ .store = &store, .member = group.member(1), .prefix = "b/\x00", .fail_stage = fail_stage };
+        const before = store.file.activeCheckpoint().commit_sequence;
+        var old = try store.beginRead();
+        defer old.abort();
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
+        second.run();
+        thread.join();
+        if (fail_stage) {
+            try std.testing.expectEqual(error.TestAtomicStageFailed, first.failure.?);
+            try std.testing.expectEqual(error.TestAtomicStageFailed, second.failure.?);
+            try std.testing.expectEqual(before, store.file.activeCheckpoint().commit_sequence);
+        } else {
+            try std.testing.expect(first.failure == null and second.failure == null);
+            try std.testing.expectEqual(before + 1, store.file.activeCheckpoint().commit_sequence);
+        }
+        var current = try store.beginRead();
+        defer current.abort();
+        for ([_][]const u8{ "a/\x00row", "b/\x00row" }) |key| {
+            try std.testing.expectError(error.NotFound, old.get(key));
+            if (fail_stage) try std.testing.expectError(error.NotFound, current.get(key)) else try std.testing.expectEqualStrings("postimage", try current.get(key));
+        }
+        try std.testing.expect((try store.checkWithCancel(null)).valid);
+    }
+}
+
+test "lite native explicit atomic publication refuses a consumed member" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "atomic-member-consumed.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .externally_locked = true, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var group = try AtomicPublication.create(&store, 1);
+    defer {
+        group.cancel();
+        group.deinit();
+    }
+    var runtime: RuntimeStore = .{ .store = &store };
+    const options: backend_types.BatchOptions = .{ .native_atomic_member = group.member(0) };
+    {
+        var write = try runtime.beginBatchWithOptions(options);
+        errdefer write.abort();
+        try write.put("row", "committed");
+        try write.commit();
+    }
+    const before = store.file.activeCheckpoint().commit_sequence;
+    {
+        var repeated = try runtime.beginBatchWithOptions(options);
+        defer repeated.abort();
+        try repeated.put("row", "must never be acknowledged");
+        try std.testing.expectError(error.InvalidAtomicPublication, repeated.commit());
+    }
+    try std.testing.expectEqual(before, store.file.activeCheckpoint().commit_sequence);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("committed", try read.get("row"));
 }
