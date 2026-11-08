@@ -113,6 +113,20 @@ class ArtifactIdentityTests(unittest.TestCase):
         with self.assertRaises(q.EvidenceUnavailable):
             identity.require_matching_artifacts(good, bad)
 
+    def test_task_scoped_artifacts_resolve_without_weakening_identity(self):
+        original = self.snapshot()
+        task = self.inventory["data"][0]["tasks"][0]
+        scoped = self.root / "models" / (task + "s") / "org/model"
+        scoped.parent.mkdir(parents=True)
+        self.model.rename(scoped)
+        self.assertEqual(original, self.snapshot())
+
+    def test_ambiguous_task_directory_fails_provenance(self):
+        scoped = self.root / "models/embedders/org/model"
+        scoped.mkdir(parents=True)
+        with self.assertRaises(q.EvidenceUnavailable):
+            self.snapshot()
+
     def test_linked_weight_shards_are_hashed_and_directory_cycles_rejected(self):
         cache = self.root / "cache"
         cache.mkdir()

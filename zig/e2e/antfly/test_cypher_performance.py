@@ -35,6 +35,7 @@ from conftest import (
 )
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
     monkeypatch.setenv(
         "ANTFLY_TRUSTED_PRINCIPAL_SECRET", "cypher-performance-principal-secret-v1"
@@ -1402,6 +1403,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         server.stop()
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_authenticated_cypher_producer_visibility_uses_bounded_scratch():
     """One wide producer must not be retained once per relationship or filter."""
     binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
@@ -1545,6 +1547,7 @@ def test_authenticated_cypher_producer_visibility_uses_bounded_scratch():
 
 
 @pytest.mark.parametrize("relational", [False, True], ids=["document", "relational"])
+@pytest.mark.e2e_resource("antfly_process")
 def test_authenticated_cypher_count_nullness_streams_wide_properties(relational):
     """COUNT keeps source payloads borrowed on both owner storage paths."""
     binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
@@ -2081,6 +2084,7 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
         server.stop()
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_authenticated_cypher_relationship_demand_skips_unused_metadata():
     """Relationship projections share scalar demand without truncating returned entities."""
     binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
@@ -2234,6 +2238,7 @@ def test_authenticated_cypher_relationship_demand_skips_unused_metadata():
 
 
 @pytest.mark.parametrize("relational", [False, True], ids=["document", "relational"])
+@pytest.mark.e2e_resource("antfly_process")
 def test_authenticated_cypher_nested_and_table_demand(relational, monkeypatch):
     """Nested cells and full entities from another table must not widen reads."""
     write_config = conftest._write_remote_content_e2e_config
@@ -2536,6 +2541,7 @@ def test_authenticated_cypher_nested_and_table_demand(relational, monkeypatch):
         server.stop()
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_authenticated_cypher_lineage_scopes_and_endpoint_domains(monkeypatch):
     """WITH and local names preserve narrow reads; mappings constrain endpoints."""
     write_config = conftest._write_remote_content_e2e_config
@@ -2825,6 +2831,7 @@ def test_authenticated_cypher_lineage_scopes_and_endpoint_domains(monkeypatch):
 
 
 @pytest.mark.parametrize("relational", [False, True], ids=["document", "relational"])
+@pytest.mark.e2e_resource("antfly_process")
 def test_authenticated_cypher_identity_membership_and_edge_domains(
     relational, monkeypatch
 ):
@@ -3333,6 +3340,7 @@ def test_authenticated_cypher_identity_membership_and_edge_domains(
         server.stop()
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_authenticated_cypher_immutable_metadata_and_visited_comparison_work(
     monkeypatch,
 ):

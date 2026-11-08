@@ -86,9 +86,15 @@ pub const Lattice = struct {
         return @intCast(@max(@abs(@as(i128, self.low)), @abs(@as(i128, self.high))));
     }
     pub fn exactFloat(self: Lattice) bool {
-        if (self.magnitude() > (@as(i128, 1) << 53) or self.shift < -1074) return false;
-        const bound: f128 = @as(f128, @floatFromInt(self.magnitude())) * @exp2(@as(f128, @floatFromInt(self.shift)));
-        return bound <= std.math.floatMax(f64);
+        const coefficient_bound = self.magnitude();
+        if (coefficient_bound > (@as(i128, 1) << 53) or self.shift < -1074) return false;
+        if (coefficient_bound == 0) return true;
+        // The coefficient already fits binary64's exact integer domain. Its
+        // highest set bit plus the binary scale must fit the finite exponent
+        // domain. This is exact, and avoids quad-precision exp2/ldexpl calls
+        // that are both unnecessary in planning and unavailable in browsers.
+        const highest_bit: i32 = std.math.log2_int(u64, @intCast(coefficient_bound));
+        return highest_bit + @as(i32, self.shift) <= 1023;
     }
     fn scale(n: i64, shift: i32) ?i128 {
         if (n == 0) return 0;
@@ -233,6 +239,22 @@ test "numeric lattices prove exact binary arithmetic and reject rounding and err
     try expect(Lattice.combine(input, subnormal, .multiply) != null);
     try expect(Lattice.combine(subnormal, Lattice.number(2).?, .divide) == null);
     try expect(Lattice.combine(.integer(std.math.maxInt(i64)), .integer(1), .add) == null);
+}
+
+test "binary lattice finite bounds match exact scaling across the binary64 range" {
+    const coefficients = [_]i64{ 0, 1, 2, 3, (1 << 52) - 1, 1 << 52, (1 << 53) - 1, 1 << 53 };
+    for (coefficients) |coefficient| {
+        var shift: i16 = -1074;
+        while (shift <= 1025) : (shift += 1) {
+            const bound = std.math.ldexp(@as(f128, @floatFromInt(coefficient)), shift);
+            const expected = bound <= std.math.floatMax(f64);
+            try std.testing.expectEqual(expected, (Lattice{ .low = -coefficient, .high = coefficient, .shift = shift }).exactFloat());
+        }
+    }
+    try std.testing.expect((Lattice{ .low = 0, .high = 0, .shift = std.math.maxInt(i16) }).exactFloat());
+    try std.testing.expect(!(Lattice{ .low = 1, .high = 1, .shift = -1075 }).exactFloat());
+    try std.testing.expect(!(Lattice{ .low = 0, .high = (1 << 53) + 1 }).exactFloat());
+    try std.testing.expect(!(Lattice{ .low = std.math.minInt(i64), .high = 0 }).exactFloat());
 }
 
 test "segment lineage proves total length without inventing joint extrema" {
