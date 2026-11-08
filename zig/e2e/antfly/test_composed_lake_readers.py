@@ -803,6 +803,13 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                     for line in commands.splitlines()
                 ),
             )
+            record_property(
+                "concurrent_go_compilers",
+                sum(
+                    bool(re.search(r"/pkg/tool/[^/ ]+/compile(?:\s|$)", line))
+                    for line in commands.splitlines()
+                ),
+            )
             samples = []
             profile_query = {k: v for k, v in query.items() if k != "filter_query"}
             profile_query["full_text_search"] = {"match": profile_term, "field": "body"}
