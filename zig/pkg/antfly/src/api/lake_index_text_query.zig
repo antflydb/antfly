@@ -863,6 +863,9 @@ const Execution = struct {
     dense_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.DenseIndex) = .empty,
     relocated_ties: std.ArrayList(*RelocatedTie) = .empty,
     runtimes: std.ArrayList(*@import("lake_index_native_runtime_cache.zig").Entry) = .empty,
+    // Small recipe digests captured while hydrating payloads. Never retain a
+    // runtime pin per winning parent merely to produce its revision later.
+    payload_recipes: std.StringHashMapUnmanaged([32]u8) = .empty,
     fn bindIndex(self: *Execution, name: []const u8) !void {
         self.index_resolver = try self.source.resolverForIndex(name);
     }
@@ -3822,7 +3825,7 @@ const Execution = struct {
         }
         // The shape function takes ownership, including its error paths.
         transferred = true;
-        return shape.postprocessVectorSearchResult(a, req, owned, chunk_backed, .{ .ctx = raw, .is_visible = visible, .resolve_parent_id = parent, .load_parent_stored = parentStored, .load_stored = loadOne, .load_many_stored = loadMany, .load_projected_stored = loadProjectedOne, .load_many_projected_stored = loadProjected });
+        return shape.postprocessVectorSearchResult(a, req, owned, chunk_backed, .{ .ctx = raw, .is_visible = visible, .resolve_parent_id = parent, .load_parent_stored = parentStored, .load_stored = loadOne, .load_many_stored = loadMany, .artifact_derivation_digest = artifactDerivationDigest, .load_projected_stored = loadProjectedOne, .load_many_projected_stored = loadProjected });
     }
     fn searchSparse(raw: ?*anyopaque, a: A, req: types.SearchRequest, query: types.SparseKnnQuery) !types.SearchResult {
         const self = from(raw);
@@ -3876,6 +3879,19 @@ const Execution = struct {
         const runtime = try self.server.lake_native_runtimes.acquire(self.server, declaration, try @import("lake_recent_vectors.zig").runtimeDomain(declaration), self.store.cache_identity, self.context, if (run) |value| value.cloud_generations else if (recent) self.recent_cloud else self.cloud_generations);
         return .{ .entry = runtime, .owned = true };
     }
+    fn artifactDerivationDigest(raw: ?*anyopaque, a: A, ref: types.ArtifactRef, payload: []const u8) !?[32]u8 {
+        // Select by the member's public parent, not the currently searched
+        // vector partition: fusion may hydrate archive and multiple WAL runs.
+        // payloadRuntime pins the exact publication/run cloud generations.
+        const suffix = "_chunks";
+        if (ref.kind != .chunk or !std.mem.endsWith(u8, ref.name, suffix)) return error.InvalidChunkArtifact;
+        const self = from(raw);
+        const index_name = ref.name[0 .. ref.name.len - suffix.len];
+        const key = try payloadRecipeKey(a, index_name, ref.document_id);
+        defer a.free(key);
+        const recipe = self.payload_recipes.get(key) orelse return error.InvalidChunkArtifact;
+        return try lakeArtifactDerivationDigest(a, recipe, payload);
+    }
     fn unitPayload(self: *Execution, a: A, key: []const u8) ![]u8 {
         try self.context.ensureActive();
         const unit_key = local.storage_internal_keys.isDocumentUnitArtifactRecordKey(key);
@@ -3891,6 +3907,17 @@ const Execution = struct {
         const selected = try self.payloadRuntime(index_name, public_parent);
         defer if (selected.owned) selected.entry.release();
         const runtime = selected.entry;
+        // Capture the recipe under this exact public parent/index while its
+        // authenticated runtime is pinned. Revision hydration reuses these
+        // 32 bytes instead of reopening remote runtimes for every member.
+        if (!unit_key) {
+            const recipe_key = try payloadRecipeKey(a, index_name, public_parent);
+            defer a.free(recipe_key);
+            if (!self.payload_recipes.contains(recipe_key)) {
+                const recipe = if (runtime.dense_metadata) |metadata| metadata.value.recipe else if (runtime.sparse_metadata) |metadata| metadata.value.recipe else return error.InvalidChunkArtifact;
+                try self.payload_recipes.put(self.arena, try self.arena.dupe(u8, recipe_key), recipe);
+            }
+        }
         const entry_name = if (runtime.dense_entry) |entry| entry.config.name else runtime.sparse_entry.?.config.name;
         const source_name = try std.fmt.allocPrint(a, "{s}_sources", .{entry_name});
         defer a.free(source_name);
@@ -4248,9 +4275,31 @@ const Execution = struct {
         return loadOne(raw, a, key);
     }
     fn postprocess(raw: ?*anyopaque, a: A, req: types.SearchRequest, result: types.SearchResult, _: bool) !types.SearchResult {
-        return shape.postprocessTextSearchResult(a, req, result, false, .{ .ctx = raw, .is_visible = visible, .resolve_parent_id = parent, .load_parent_stored = parentStored, .load_stored = loadOne, .load_many_stored = loadMany, .load_projected_stored = loadProjectedOne, .load_many_projected_stored = loadProjected });
+        return shape.postprocessTextSearchResult(a, req, result, false, .{ .ctx = raw, .is_visible = visible, .resolve_parent_id = parent, .load_parent_stored = parentStored, .load_stored = loadOne, .load_many_stored = loadMany, .artifact_derivation_digest = artifactDerivationDigest, .load_projected_stored = loadProjectedOne, .load_many_projected_stored = loadProjected });
     }
 };
+
+fn payloadRecipeKey(a: A, name: []const u8, parent_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{d}:{s}{s}", .{ parent_id.len, parent_id, name });
+}
+
+/// Immutable producer recipe plus the actual materialized source-unit input.
+/// Do not include a publication/WAL generation: unrelated writes or storage
+/// compaction must not change an unchanged member's derivation revision.
+fn lakeArtifactDerivationDigest(a: A, recipe: [32]u8, payload: []const u8) ![32]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidChunkArtifact;
+    const fingerprint = parsed.value.object.get("_artifact_unit_fingerprint") orelse return error.InvalidChunkArtifact;
+    if (fingerprint != .string or fingerprint.string.len != 64) return error.InvalidChunkArtifact;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-lake-artifact-derivation-v1");
+    hash.update(&recipe);
+    hash.update(fingerprint.string);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
 
 /// Late hydration is an explicit dependency contract: source-dependent
 /// operators keep the encoded provider path. Independent native retrieval
@@ -6609,4 +6658,16 @@ test "external lake owned serving recovery admission skips unrelated tables and 
     held = 0;
     try std.testing.expectError(error.IndexRebuilding, refreshOwnedCut(a, &server, table, .{}));
     try std.testing.expectEqual(@as(usize, 1), harness.captures);
+}
+
+test "lake artifact derivation uses pinned recipe and materialized unit input" {
+    const a = std.testing.allocator;
+    const first = "{\"text\":\"chunk one\",\"_artifact_unit_fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}";
+    const second = "{\"text\":\"chunk two\",\"_artifact_unit_fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}";
+    const changed = "{\"text\":\"chunk one\",\"_artifact_unit_fingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}";
+    const digest = try lakeArtifactDerivationDigest(a, @splat(1), first);
+    try std.testing.expectEqualSlices(u8, &digest, &(try lakeArtifactDerivationDigest(a, @splat(1), second)));
+    try std.testing.expect(!std.mem.eql(u8, &digest, &(try lakeArtifactDerivationDigest(a, @splat(2), first))));
+    try std.testing.expect(!std.mem.eql(u8, &digest, &(try lakeArtifactDerivationDigest(a, @splat(1), changed))));
+    try std.testing.expectError(error.InvalidChunkArtifact, lakeArtifactDerivationDigest(a, @splat(1), "{}"));
 }

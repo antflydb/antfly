@@ -1181,12 +1181,16 @@ def test_native_catalog_file_commit_read_and_restart(
                         hit["_source"]["text"] for hit in members["hits"]["hits"]
                     ), members
                     revisions = {
-                        hit["_id"]: hit["hierarchy"]["artifact"]["revision"]
+                        hit["_id"]: (
+                            hit["hierarchy"]["artifact"]["revision"],
+                            hit["hierarchy"]["artifact"]["derivation_revision"],
+                        )
                         for hit in members["hits"]["hits"]
                     }
                     assert all(
                         value.startswith("sha256:") and len(value) == 71
-                        for value in revisions.values()
+                        for pair in revisions.values()
+                        for value in pair
                     ), members
                     if first_chunk_revisions is None:
                         first_chunk_revisions = revisions
@@ -1209,7 +1213,10 @@ def test_native_catalog_file_commit_read_and_restart(
                         assert all(
                             hit["_source"]["text"]
                             and revisions[hit["_id"]]
-                            == hit["hierarchy"]["artifact"]["revision"]
+                            == (
+                                hit["hierarchy"]["artifact"]["revision"],
+                                hit["hierarchy"]["artifact"]["derivation_revision"],
+                            )
                             for hit in selected_members["hits"]["hits"]
                         ), selected_members
                     units = call(
@@ -1258,7 +1265,10 @@ def test_native_catalog_file_commit_read_and_restart(
                     hit["_source"]["text"] for hit in chunk_reopened["hits"]["hits"]
                 ), chunk_reopened
                 assert {
-                    hit["_id"]: hit["hierarchy"]["artifact"]["revision"]
+                    hit["_id"]: (
+                        hit["hierarchy"]["artifact"]["revision"],
+                        hit["hierarchy"]["artifact"]["derivation_revision"],
+                    )
                     for hit in chunk_reopened["hits"]["hits"]
                 } == first_chunk_revisions, chunk_reopened
                 mixed_restarted = call("POST", "/query", mixed_next)["responses"][0]

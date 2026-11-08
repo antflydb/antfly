@@ -359,17 +359,25 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 value = {"error": r.text}
             value = value.get("responses", [value])[0]
             if r.status_code == 200 and body and body.get("highlight"):
-                assert_highlights(value)
+                assert_highlights(value, body["full_text_search"]["match"])
             return r.status_code, value
 
-        def wait_query(name, query):
+        def wait_query(name, query, *, strict=False):
             deadline = time.monotonic() + 120
             while True:
                 status, value = call(
-                    "POST", f"/tables/{name}/query", query, allow=(409, 503)
+                    "POST",
+                    f"/tables/{name}/query",
+                    query,
+                    allow=(503,) if strict else (409, 503),
                 )
                 if status == 200:
                     return value
+                if strict:
+                    assert (
+                        value.get("code") == "index_rebuilding"
+                        and value.get("retryable") is True
+                    ), value
                 assert time.monotonic() < deadline, value
                 time.sleep(0.1)
 
@@ -813,9 +821,15 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             samples = []
             profile_query = {k: v for k, v in query.items() if k != "filter_query"}
             profile_query["full_text_search"] = {"match": profile_term, "field": "body"}
+            restart_started = time.monotonic()
             server.restart()
             read = logical_process_reader(server.proc.pid)
             for index in range(rounds + 1):
+                if index == rounds:
+                    # Isolate one actual profiling request in the asynchronous
+                    # metrics cache, outside its measured HTTP interval.
+                    time.sleep(6)
+                    profile_before = metrics()
                 if is_gcs and not owned:
                     time.sleep(1.2)
                 response, usage = measure(
@@ -832,7 +846,26 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 assert_highlights(value, profile_term)
                 assert len(value["hits"]["hits"]) == 7
                 samples.append({"mode": "restart" if index == 0 else "warm", **usage})
+                if index == 0:
+                    record_property(
+                        "restart_total_and_query_ms",
+                        (time.monotonic() - restart_started) * 1000,
+                    )
             record_property("query_samples", json.dumps(samples))
+            time.sleep(6)
+            profile_after = metrics()
+            profile_preparations = (
+                profile_after["antfly_lake_query_source_calls_total"]
+                - profile_before["antfly_lake_query_source_calls_total"]
+            )
+            profile_leaves = (
+                profile_after["antfly_lake_query_composed_leaf_calls_total"]
+                - profile_before["antfly_lake_query_composed_leaf_calls_total"]
+            )
+            assert profile_preparations == 2
+            assert profile_leaves >= profile_preparations
+            record_property("profile_query_preparations", profile_preparations)
+            record_property("profile_query_leaf_calls", profile_leaves)
             if owned:
                 from concurrent.futures import ThreadPoolExecutor
 
@@ -928,9 +961,12 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             server.restart()
             _, pinned = call("POST", "/query", query)
             stop = threading.Event()
+            first_read = threading.Event()
             reads = []
+            rebuilding = []
 
             def searching():
+                unavailable_since = None
                 while not stop.is_set():
                     started = time.monotonic()
                     response = requests.post(
@@ -939,18 +975,36 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                         auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
                         timeout=60,
                     )
+                    ended = time.monotonic()
+                    elapsed = (ended - started) * 1000
+                    if response.status_code == 503:
+                        failure = response.json()
+                        assert (
+                            failure.get("code") == "index_rebuilding"
+                            and failure.get("retryable") is True
+                        ), failure
+                        rebuilding.append(elapsed)
+                        if unavailable_since is None:
+                            unavailable_since = ended
+                        assert ended - unavailable_since < 120, failure
+                        stop.wait(0.05)
+                        continue
                     assert response.ok, (
                         f"Search during publication: {response.status_code}"
                     )
+                    unavailable_since = None
                     result = response.json()["responses"][0]
                     assert len(result["hits"]["hits"]) == 7
                     assert result["next_source_cursor"].startswith("source3:")
-                    reads.append((time.monotonic() - started) * 1000)
+                    reads.append((started, ended, elapsed))
+                    first_read.set()
 
             receipts = []
             with ThreadPoolExecutor(max_workers=3) as pool:
                 readers = [pool.submit(searching) for _ in range(3)]
                 try:
+                    assert first_read.wait(60), "No successful search before writes"
+                    publication_started = time.monotonic()
                     for checkpoint in range(3, 6):
                         _, receipt = call(
                             "POST",
@@ -976,26 +1030,88 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                         )
                         assert receipt["read_receipt"]
                         receipts.append(receipt["read_receipt"])
+                    last_ack = time.monotonic()
+                    expected_new_ids = {
+                        archive_rows + 1000 + checkpoint for checkpoint in range(3, 6)
+                    }
+                    # A receipt is table-scoped: first establish accepted
+                    # visibility on current, then verify the fresh composition.
+                    accepted = wait_query(
+                        "current",
+                        {
+                            "full_text_search": {"match": "raceproof", "field": "body"},
+                            "limit": 10,
+                            "read_requirements": {
+                                "visibility": "accepted",
+                                "after_write": receipts[-1],
+                                "wait_ms": 1000,
+                            },
+                        },
+                        strict=True,
+                    )
+                    assert {
+                        hit["_source"]["id"] for hit in accepted["hits"]["hits"]
+                    } == expected_new_ids
+                    fresh_query = {
+                        **query,
+                        "full_text_search": {"match": "raceproof", "field": "body"},
+                        "filter_query": {
+                            "disjuncts": [
+                                {"term": {"path": "/id", "value": value}}
+                                for value in sorted(expected_new_ids)
+                            ]
+                        },
+                        "limit": 10,
+                    }
+                    fresh_deadline = time.monotonic() + 120
+                    while True:
+                        status, fresh = call(
+                            "POST", "/query", fresh_query, allow=(503,)
+                        )
+                        if status == 200:
+                            break
+                        assert (
+                            fresh.get("code") == "index_rebuilding"
+                            and fresh.get("retryable") is True
+                            and time.monotonic() < fresh_deadline
+                        ), fresh
+                        time.sleep(0.05)
+                    assert {
+                        hit["_source"]["id"] for hit in fresh["hits"]["hits"]
+                    } == expected_new_ids, fresh
+                    published = wait_query(
+                        "current",
+                        {
+                            "full_text_search": {"match": "raceproof", "field": "body"},
+                            "limit": 10,
+                            "read_requirements": {
+                                "visibility": "published",
+                                "after_write": receipts[-1],
+                                "wait_ms": 1000,
+                            },
+                        },
+                        strict=True,
+                    )
+                    assert {
+                        hit["_source"]["id"] for hit in published["hits"]["hits"]
+                    } == expected_new_ids, published
+                    deadline = time.monotonic() + 120
+                    while not any(started >= last_ack for started, _, _ in reads):
+                        assert time.monotonic() < deadline, (
+                            "No successful search after the final acknowledgment"
+                        )
+                        time.sleep(0.05)
+                    publication_finished = time.monotonic()
                 finally:
                     stop.set()
                 for reader in readers:
                     reader.result()
             assert reads
-            published = wait_query(
-                "current",
-                {
-                    "full_text_search": {"match": "raceproof", "field": "body"},
-                    "limit": 10,
-                    "read_requirements": {
-                        "visibility": "published",
-                        "after_write": receipts[-1],
-                        "wait_ms": 1000,
-                    },
-                },
+            overlapping_reads = sum(
+                publication_started <= started <= ended <= publication_finished
+                for started, ended, _ in reads
             )
-            assert {hit["_source"]["id"] for hit in published["hits"]["hits"]} == {
-                archive_rows + 1000 + checkpoint for checkpoint in range(3, 6)
-            }
+            assert overlapping_reads > 0
             cursor = pinned["next_source_cursor"]
             seen = {hit["_source"]["id"] for hit in pinned["hits"]["hits"]}
             while cursor:
@@ -1006,7 +1122,14 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 cursor = page.get("next_source_cursor")
             assert seen == (set(range(100)) | {extra_id, later_id}) - {1, 2, 3, 50}
             record_property(
-                "concurrent_ingestion_publication_query_ms", json.dumps(reads)
+                "concurrent_ingestion_publication_query_ms",
+                json.dumps([elapsed for _, _, elapsed in reads]),
+            )
+            record_property(
+                "concurrent_publication_successful_reads", overlapping_reads
+            )
+            record_property(
+                "concurrent_retryable_rebuild_query_ms", json.dumps(rebuilding)
             )
             record_property("concurrent_ingestion_batches", len(receipts))
         failed = False
