@@ -177,7 +177,7 @@ pub const DistributedCandidateSource = struct {
             runtime.deinit();
             a.destroy(runtime);
         }
-        const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, request.timeout_ms) * std.time.ns_per_ms;
+        const deadline = try request.deadline(@import("antfly_platform").time.monotonicNs());
         var context = self.request_context orelse @import("antfly_local_sources").storage_db_enrichment_asset_producer.InvocationContext{};
         context.io = io;
         context.deadline_ns = if (context.deadline_ns) |caller| @min(caller, deadline) else deadline;

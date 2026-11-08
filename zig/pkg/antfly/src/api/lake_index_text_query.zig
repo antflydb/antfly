@@ -363,6 +363,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     prepared.store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null or prepared.native_cut != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
     const store = &prepared.store;
     defer if (!transferred) store.deinit();
+    if (retained == null) try server.retainLakeQueryStore(a, store, table.table_id, request);
     store.implementation.cloud_io = server.embedding_provider_runtime.io;
     var wal_cut: ?@import("lake_wal_cut_cache.zig").Pin = null;
     defer if (!transferred) if (wal_cut) |pin| pin.deinit();

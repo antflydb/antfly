@@ -24,6 +24,17 @@ pub const Reference = struct {
     id: []const u8,
     bytes: usize,
     generation: ?[]const u8 = null,
+    pub fn cloneOwned(self: Reference, a: std.mem.Allocator) !Reference {
+        var next = self;
+        next.id = try a.dupe(u8, self.id);
+        errdefer a.free(next.id);
+        next.generation = if (self.generation) |value| try a.dupe(u8, value) else null;
+        return next;
+    }
+    pub fn deinitOwned(self: Reference, a: std.mem.Allocator) void {
+        a.free(self.id);
+        if (self.generation) |value| a.free(value);
+    }
     pub fn validate(self: Reference) !void {
         if (self.id.len != 175 or !std.mem.startsWith(u8, self.id, "sha256:") or !std.mem.eql(u8, self.id[71..78], ":graph:") or self.id[142] != ':' or self.bytes == 0 or self.bytes > max_payload_bytes) return error.InvalidLakeIndexLifecycle;
         var digest: [32]u8 = undefined;
@@ -47,6 +58,17 @@ pub const Cut = struct {
     refresh_after_ms: u64,
     expires_ms: u64,
     cursor_ttl_ms: u64,
+    pub fn cloneOwned(self: Cut, a: std.mem.Allocator) !Cut {
+        var next = self;
+        next.state = try self.state.cloneOwned(a);
+        errdefer next.state.deinitOwned(a);
+        next.manifest = if (self.manifest) |value| try value.cloneOwned(a) else null;
+        return next;
+    }
+    pub fn deinitOwned(self: Cut, a: std.mem.Allocator) void {
+        self.state.deinitOwned(a);
+        if (self.manifest) |value| value.deinitOwned(a);
+    }
     pub fn validate(self: Cut) !void {
         try self.state.validate();
         if (self.manifest) |ref| try ref.validate();
@@ -69,6 +91,17 @@ pub const State = struct {
     accepted_lsn: u64 = 0,
     enabled: bool = false,
     current: ?Cut = null,
+    pub fn cloneOwned(self: State, a: std.mem.Allocator) !State {
+        var next = self;
+        next.source_uuid = try a.dupe(u8, self.source_uuid);
+        errdefer a.free(next.source_uuid);
+        next.current = if (self.current) |value| try value.cloneOwned(a) else null;
+        return next;
+    }
+    pub fn deinitOwned(self: State, a: std.mem.Allocator) void {
+        a.free(self.source_uuid);
+        if (self.current) |value| value.deinitOwned(a);
+    }
     pub fn validate(self: State) !void {
         if (self.version != 1 or self.epoch == 0 or std.mem.allEqual(u8, &self.owner, 0) or std.mem.allEqual(u8, &self.signing_key, 0) or std.mem.allEqual(u8, &self.source, 0) or self.source_uuid.len > 4096) return error.InvalidLakeIndexLifecycle;
         if (self.current) |cut| {

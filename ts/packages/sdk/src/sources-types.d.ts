@@ -27,6 +27,10 @@ export interface Capabilities {
   serialized_runs?: boolean;
 }
 
+export interface SourceIdentity {
+  namespace?: string;
+}
+
 export interface Source {
   id: string;
   name: string;
@@ -36,6 +40,8 @@ export interface Source {
   state: string;
   config: Record<string, unknown>;
   permissions: Permissions;
+  identity?: SourceIdentity;
+  rekeys?: boolean;
   permission_ttl_seconds?: number;
   streams?: Array<TextStream>;
 }

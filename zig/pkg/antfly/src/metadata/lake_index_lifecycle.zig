@@ -27,7 +27,16 @@ pub const max_readers = 256;
 pub const lease_ms: u64 = 10 * 60 * 1000;
 pub const grace_ms: u64 = 30 * 1000;
 pub const Reader = struct { token: catalog.Token, generation: u64, expires_ms: u64 };
-pub const StoreBinding = struct { identity: catalog.Digest, locator: catalog.StoreLocator, vacuum: ?@import("../serverless/artifacts/cloud_generations.zig").VacuumCut = null };
+pub const StoreBinding = struct {
+    identity: catalog.Digest,
+    locator: catalog.StoreLocator,
+    vacuum: ?@import("../serverless/artifacts/cloud_generations.zig").VacuumCut = null,
+    // Query ownership is independent of index publications and survives DROP.
+    // Clear only after the writer horizon and a complete auxiliary sweep.
+    query_until_ms: u64 = 0,
+    query_gc_phase: u8 = 0,
+    query_gc_receipt: ?catalog.Token = null,
+};
 pub const Collection = struct {
     token: catalog.Token,
     store: catalog.Digest,
@@ -87,6 +96,7 @@ pub const State = struct {
             }
         }
         for (self.stores, 0..) |store, index| {
+            if (store.query_gc_phase >= 6) return error.InvalidLakeIndexLifecycle;
             try store.locator.validate();
             if (store.vacuum) |cut| {
                 try cut.validate();
@@ -176,6 +186,46 @@ pub const State = struct {
         @memcpy(all[0..self.stores.len], self.stores);
         all[self.stores.len] = .{ .identity = identity, .locator = locator };
         self.stores = all;
+    }
+    pub fn retainQueryStore(self: State, a: A, binding: StoreBinding, until: u64) !State {
+        if (until == 0) return error.InvalidLakeIndexLifecycle;
+        var next = try self.advance();
+        const owned = try a.dupe(StoreBinding, self.stores);
+        next.stores = owned;
+        try next.retainStore(a, binding.identity, binding.locator);
+        for (@constCast(next.stores)) |*store| if (std.mem.eql(u8, &store.identity, &binding.identity)) {
+            store.query_until_ms = @max(store.query_until_ms, until);
+        };
+        try next.validate();
+        return next;
+    }
+    pub fn queryProgress(self: State, a: A, m: QueryProgress) !State {
+        if (m.phase >= 6 or m.now_ms == 0 or std.mem.allEqual(u8, &m.token, 0)) return error.InvalidLakeIndexLifecycle;
+        var next = try self.advance();
+        var bindings: std.ArrayList(StoreBinding) = .empty;
+        for (self.stores) |value| {
+            var store = value;
+            if (std.mem.eql(u8, &store.identity, &m.store)) {
+                store.query_gc_phase = m.phase;
+                store.query_gc_receipt = m.token;
+                // A concurrent writer renewal is never consumed by an older
+                // collector. The revision CAS also fences index retirement.
+                if (m.release and store.query_until_ms == m.observed_until_ms and m.now_ms > store.query_until_ms) {
+                    store.query_until_ms = 0;
+                    const index_owned = (if (self.collection) |c| std.mem.eql(u8, &c.store, &store.identity) else false) or
+                        (if (self.pending) |v| std.mem.eql(u8, &v.signature.store, &store.identity) else false) or
+                        (if (self.checkpoint) |v| std.mem.eql(u8, &v.signature.store, &store.identity) else false) or
+                        for (self.publications) |v| {
+                            if (std.mem.eql(u8, &v.signature.store, &store.identity)) break true;
+                        } else false;
+                    if (!index_owned and store.vacuum == null) continue;
+                }
+            }
+            try bindings.append(a, store);
+        }
+        next.stores = try bindings.toOwnedSlice(a);
+        try next.validate();
+        return next;
     }
     pub fn drop(self: State) !State {
         var next = try self.advance();
@@ -301,13 +351,14 @@ pub const State = struct {
                 if (std.mem.eql(u8, &publication.signature.store, &store.identity)) break true;
             } else false;
             const has_pending = if (next.pending) |pending| std.mem.eql(u8, &pending.signature.store, &store.identity) else false;
-            if (retain_store or !std.mem.eql(u8, &collection.store, &store.identity) or has_publication or has_pending or (if (next.checkpoint) |saved| std.mem.eql(u8, &saved.signature.store, &store.identity) else false)) try stores.append(a, store);
+            if (store.query_until_ms != 0 or retain_store or !std.mem.eql(u8, &collection.store, &store.identity) or has_publication or has_pending or (if (next.checkpoint) |saved| std.mem.eql(u8, &saved.signature.store, &store.identity) else false)) try stores.append(a, store);
         }
         next.stores = try stores.toOwnedSlice(a);
         try next.validate();
         return next;
     }
 };
+pub const QueryProgress = struct { store: catalog.Digest, observed_until_ms: u64, phase: u8, release: bool, now_ms: u64, token: catalog.Token };
 pub const Mutation = union(enum) {
     configure_source: struct { scope: SourceScope, state: source_admission.State },
     activate_source: SourceScope,
@@ -315,6 +366,8 @@ pub const Mutation = union(enum) {
     invalidate_source: struct { scope: SourceScope, epoch: u64 },
     admit_source: struct { scope: SourceScope, epoch: u64, source_uuid: []const u8, cut: source_admission.Cut, now_ms: u64 },
     retain_reader: struct { token: catalog.Token, now_ms: u64, until_ms: u64 },
+    retain_query_store: struct { binding: StoreBinding, until_ms: u64 },
+    query_gc_progress: QueryProgress,
     acquire: struct { token: catalog.Token, generation: u64, now_ms: u64 },
     renew: struct { token: catalog.Token, now_ms: u64 },
     release: catalog.Token,
@@ -331,6 +384,62 @@ pub const Mutation = union(enum) {
             else => null,
         };
     }
+    /// Decoded Raft commands own every JSON string independently of the input.
+    pub fn deinitOwned(self: *Mutation, a: A) void {
+        switch (self.*) {
+            .configure_source => |m| m.state.deinitOwned(a),
+            .admit_source => |m| {
+                a.free(m.source_uuid);
+                m.cut.deinitOwned(a);
+            },
+            .retain_query_store => |m| {
+                inline for (.{ "bucket", "prefix", "root" }) |name| a.free(@field(m.binding.locator, name));
+                if (m.binding.locator.connection) |name| a.free(name);
+            },
+            .checkpoint_collection => |m| {
+                if (m.previous) |previous| a.free(previous);
+                inline for (.{ "name", "artifact_id", "checksum" }) |name| a.free(@field(m.progress, name));
+            },
+            else => {},
+        }
+        self.* = undefined;
+    }
+    pub fn cloneOwned(self: Mutation, a: A) !Mutation {
+        return switch (self) {
+            .configure_source => |m| .{ .configure_source = .{ .scope = m.scope, .state = try m.state.cloneOwned(a) } },
+            .admit_source => |m| blk: {
+                var next = m;
+                next.source_uuid = try a.dupe(u8, m.source_uuid);
+                errdefer a.free(next.source_uuid);
+                next.cut = try m.cut.cloneOwned(a);
+                break :blk .{ .admit_source = next };
+            },
+            .retain_query_store => |m| blk: {
+                var next = m;
+                const locator = m.binding.locator;
+                next.binding.locator.bucket = try a.dupe(u8, locator.bucket);
+                errdefer a.free(next.binding.locator.bucket);
+                next.binding.locator.prefix = try a.dupe(u8, locator.prefix);
+                errdefer a.free(next.binding.locator.prefix);
+                next.binding.locator.root = try a.dupe(u8, locator.root);
+                errdefer a.free(next.binding.locator.root);
+                next.binding.locator.connection = if (locator.connection) |name| try a.dupe(u8, name) else null;
+                break :blk .{ .retain_query_store = next };
+            },
+            .checkpoint_collection => |m| blk: {
+                var next = m;
+                next.previous = if (m.previous) |previous| try a.dupe(u8, previous) else null;
+                errdefer if (next.previous) |previous| a.free(previous);
+                next.progress.name = try a.dupe(u8, m.progress.name);
+                errdefer a.free(next.progress.name);
+                next.progress.artifact_id = try a.dupe(u8, m.progress.artifact_id);
+                errdefer a.free(next.progress.artifact_id);
+                next.progress.checksum = try a.dupe(u8, m.progress.checksum);
+                break :blk .{ .checkpoint_collection = next };
+            },
+            else => self,
+        };
+    }
     /// Receipt observation may see a later reader mutation. Unique tokens and
     /// monotonic deadlines prove this command's effect without replaying it.
     pub fn observed(self: Mutation, state: State) bool {
@@ -343,6 +452,12 @@ pub const Mutation = union(enum) {
             .retain_reader => |m| for (state.readers) |reader| {
                 if (std.mem.eql(u8, &reader.token, &m.token) and reader.expires_ms >= m.until_ms) break true;
             } else false,
+            .retain_query_store => |m| for (state.stores) |store| {
+                if (std.mem.eql(u8, &store.identity, &m.binding.identity) and store.query_until_ms >= m.until_ms) break true;
+            } else false,
+            .query_gc_progress => |m| for (state.stores) |store| {
+                if (std.mem.eql(u8, &store.identity, &m.store)) break if (store.query_gc_receipt) |token| std.mem.eql(u8, &token, &m.token) else false;
+            } else m.release,
             .acquire => |m| for (state.readers) |reader| {
                 if (std.mem.eql(u8, &reader.token, &m.token) and reader.generation == m.generation and reader.expires_ms >= m.now_ms +| lease_ms) break true;
             } else false,
@@ -414,6 +529,8 @@ pub const Mutation = union(enum) {
                 next.readers = readers;
                 break :blk next;
             },
+            .retain_query_store => |m| state.retainQueryStore(a, m.binding, m.until_ms),
+            .query_gc_progress => |m| state.queryProgress(a, m),
             .acquire => |m| state.acquire(a, m.token, m.generation, m.now_ms),
             .renew => |m| state.renew(a, m.token, m.now_ms),
             .release => |token| state.release(a, token),
@@ -617,4 +734,64 @@ test "external lake resumable checkpoint is fenced and protected without becomin
     lifecycle = try lifecycle.beginCollection(ca, @splat(5), saved.signature.store, 200);
     try std.testing.expectEqual(@as(u64, 2), lifecycle.collection.?.upload_cutoff);
     try std.testing.expect((try lifecycle.drop()).checkpoint == null);
+}
+
+test "external lake query ownership survives DROP rotation restart and stale cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const locator: catalog.StoreLocator = .{ .protocol = .filesystem, .bucket = "indexes", .prefix = "", .root = "/artifacts" };
+    const old: StoreBinding = .{ .identity = @splat(4), .locator = locator };
+    var state = try (State{}).retainQueryStore(a, old, 100);
+    try std.testing.expect(state.namespace == null);
+    state = try state.retainQueryStore(a, .{ .identity = @splat(5), .locator = locator }, 200);
+    state = try state.drop();
+    state = try parse(a, try encode(a, state));
+    state = try state.queryProgress(a, .{ .store = old.identity, .observed_until_ms = 100, .phase = 4, .release = false, .now_ms = 101, .token = @splat(1) });
+    state = try parse(a, try encode(a, state));
+    try std.testing.expectEqual(@as(u8, 4), state.stores[0].query_gc_phase);
+    // A writer renews after discovery. A stale collector cannot consume it.
+    state = try state.retainQueryStore(a, old, 300);
+    state = try state.queryProgress(a, .{ .store = old.identity, .observed_until_ms = 100, .phase = 5, .release = true, .now_ms = 201, .token = @splat(2) });
+    try std.testing.expectEqual(@as(u64, 300), state.stores[0].query_until_ms);
+    state = try state.queryProgress(a, .{ .store = old.identity, .observed_until_ms = 300, .phase = 0, .release = true, .now_ms = 301, .token = @splat(3) });
+    try std.testing.expectEqual(@as(usize, 1), state.stores.len);
+    try std.testing.expectEqual(@as([32]u8, @splat(5)), state.stores[0].identity);
+    state = try state.queryProgress(a, .{ .store = @splat(5), .observed_until_ms = 200, .phase = 0, .release = true, .now_ms = 301, .token = @splat(4) });
+    try std.testing.expectEqual(@as(usize, 0), state.stores.len);
+}
+
+test "external lake index collection cannot forget independent query work" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const locator: catalog.StoreLocator = .{ .protocol = .filesystem, .bucket = "indexes", .prefix = "", .root = "/artifacts" };
+    var building = try (catalog.State{ .namespace = @splat(8) }).begin(testPublication(1).signature, @splat(1), 1, 100);
+    building.pending.?.store_locator = locator;
+    var state = try (State{}).synchronize(a, building);
+    state = try state.retainQueryStore(a, state.stores[0], 1000);
+    state = try state.drop();
+    state = try state.beginCollection(a, @splat(7), state.stores[0].identity, 3);
+    state = try state.finishCollection(a, @splat(7), 4);
+    try std.testing.expectEqual(@as(usize, 1), state.stores.len);
+    try std.testing.expectEqual(@as(u64, 1000), state.stores[0].query_until_ms);
+}
+
+test "external lake lifecycle command ownership unwinds every allocation failure" {
+    const Probe = struct {
+        fn run(a: A, mutation: Mutation) !void {
+            var owned = try mutation.cloneOwned(a);
+            defer owned.deinitOwned(a);
+        }
+    };
+    const scope: SourceScope = .{ .object_generation = 3, .desired = @splat(4), .owner = @splat(5) };
+    const reference: source_admission.Reference = .{ .id = "state-image", .bytes = 42, .generation = "gcs-generation" };
+    const cut: source_admission.Cut = .{ .desired = @splat(4), .store = @splat(6), .generation = 1, .reader_token = @splat(7), .state = reference, .manifest = reference, .wal_lsn = 10, .base_lsn = 8, .created_ms = 1, .refresh_after_ms = 2, .expires_ms = 3, .cursor_ttl_ms = 1 };
+    // Exercise every nested string, even a rejected configure frame containing
+    // a current image: decode ownership must unwind before/after validation.
+    const owner: source_admission.State = .{ .kind = .managed_iceberg, .owner = scope.owner, .signing_key = @splat(8), .object_generation = scope.object_generation, .source = @splat(9), .source_uuid = "source-uuid", .current = cut };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{Mutation{ .configure_source = .{ .scope = scope, .state = owner } }});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{Mutation{ .admit_source = .{ .scope = scope, .epoch = 1, .source_uuid = "source-uuid", .cut = cut, .now_ms = 1 } }});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{Mutation{ .retain_query_store = .{ .binding = .{ .identity = @splat(4), .locator = .{ .protocol = .s3, .connection = "artifacts", .bucket = "bucket", .prefix = "prefix", .root = "https://objects.example" } }, .until_ms = 100 } }});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{Mutation{ .checkpoint_collection = .{ .token = @splat(7), .previous = "previous", .progress = .{ .kind = .doc_values, .name = "checkpoint", .artifact_id = "artifact", .byte_len = 42, .checksum = "checksum" }, .now_ms = 100 } }});
 }
