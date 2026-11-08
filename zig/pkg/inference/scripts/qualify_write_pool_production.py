@@ -225,6 +225,27 @@ def frozen_boundary_output(expected, actual):
                     value(left, right, field=True)
 
 
+def require_extraction_observations(before, after, responses):
+    expected_items = sum(len(row["data"]) for row in responses)
+    expected_tokens = sum(row["usage"]["prompt_tokens"] for row in responses)
+    expected = {
+        "decoded_items": expected_items,
+        "returned_items": expected_items,
+        "decoded_prompt_tokens": expected_tokens,
+    }
+    observed = {}
+    for name, count in expected.items():
+        metric = f"antfly_inference_extract_v2_{name}_total"
+        if metric not in before or metric not in after:
+            raise q.EvidenceUnavailable(
+                f"missing extraction observation counter: {metric}"
+            )
+        delta = after[metric] - before[metric]
+        assert delta == count, (metric, "observed", delta, "expected", count)
+        observed[name] = delta
+    return observed
+
+
 class Campaign(w.WriteCampaign):
     def telemetry(self):
         code, raw, _ = q.http(self.args.url, "/metrics", text=True)
@@ -523,9 +544,13 @@ class Campaign(w.WriteCampaign):
                 assert_equivalent("extract", expected, row["response"])
                 frozen_boundary_output(case["expected"], row["response"]["data"][0])
             after = self.telemetry()
+            observations = require_extraction_observations(
+                before, after, [row["response"] for row in rows]
+            )
             result.append(
                 {
                     "case": case["id"],
+                    "caller_observations": observations,
                     "requests": 9,
                     "frozen_oracle_and_singleton_parity": True,
                     "native_batches": after[

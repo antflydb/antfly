@@ -120,6 +120,19 @@ pub const BoundaryCohort = struct {
         }
     }
 
+    pub fn checkRow(raw: ?*anyopaque, index: usize) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try self.consumers[index].control.check();
+    }
+
+    pub fn fail(raw: *anyopaque, index: usize, err: anyerror) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const consumer = self.consumers[index];
+        if (consumer.failure) |failure| failure.* = .{ .input_index = 0, .stage = "decoding" };
+        if (consumer.observer) |observer| observer.emit(.{ .phase = .execution });
+        consumer.slot.fail(err);
+    }
+
     pub fn publish(raw: *anyopaque, index: usize, source: wire.Item, sample: @import("../pipelines/gliner_boundary_pipeline.zig").Sample, tokens: usize) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const consumer = self.consumers[index];

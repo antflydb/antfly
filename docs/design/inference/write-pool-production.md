@@ -109,6 +109,24 @@ phase. It reserves the same explicit 2 GiB excluded-allocation allowance. This
 is a scaled guard test; ordinary write traffic far below 38 GiB cannot establish
 behavior at 38 GiB exhaustion or qualify a 40 GiB A100.
 
+The public fixture acquisition command removes the dependency on a private model
+directory. It pins each public Hugging Face revision, verifies Git blob identities
+for small artifacts and SHA-256 for LFS weights, and checks the speech corpus
+against the campaign's fixed SHA-256. Existing immutable cache entries are only
+read and verified; acquisition receipts live with the new campaign.
+
+```sh
+python3 zig/pkg/inference/scripts/qualify_write_pool_fixtures.py \
+  --models-dir .benchmark-results/write-pool-production/models \
+  --config .benchmark-results/write-pool-production/config.json
+```
+
+The returned config uses local aliases for the canonical model names; downloads
+are shared under `~/.cache/antfly/conformance-fixtures`. The campaign additionally
+checks decoded items, returned items and prompt-token counters against each
+schema-sweep cohort's actual responses. These counters must be present and exact;
+physical batching alone does not establish correct caller observations.
+
 Run the final campaign against the owned write service, with local model paths
 substituted in the canonical config:
 

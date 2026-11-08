@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from qualify_write_pool_production import require_extraction_observations
+
 import copy
 import unittest
 
@@ -26,6 +28,32 @@ from qualify_write_pool_production import (
 
 
 class QualificationTests(unittest.TestCase):
+    def test_cohort_success_requires_caller_observations(self):
+        prefix = "antfly_inference_extract_v2_"
+        before = {
+            prefix + key + "_total": 10
+            for key in ("decoded_items", "returned_items", "decoded_prompt_tokens")
+        }
+        after = dict(before)
+        for key, increment in (
+            ("decoded_items", 2),
+            ("returned_items", 2),
+            ("decoded_prompt_tokens", 34),
+        ):
+            after[prefix + key + "_total"] += increment
+        responses = [{"data": [{}], "usage": {"prompt_tokens": 17}}] * 2
+        self.assertEqual(
+            require_extraction_observations(before, after, responses)["returned_items"],
+            2,
+        )
+        for key in before:
+            changed = dict(after)
+            changed[key] = before[key]
+            with self.assertRaises(AssertionError):
+                require_extraction_observations(before, changed, responses)
+        with self.assertRaises(q.EvidenceUnavailable):
+            require_extraction_observations({}, after, responses)
+
     def test_queue_turnover_does_not_establish_physical_batching(self):
         for kind in ("embed", "extract", "whisper"):
             with self.assertRaises(q.EvidenceUnavailable):

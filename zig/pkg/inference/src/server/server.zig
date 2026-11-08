@@ -12256,7 +12256,6 @@ pub const Node = struct {
         options.failure = &failure;
         options.control = control;
         options.item_executions = evidence[0..items.len];
-        options.pipeline.max_output_values = try std.math.mul(usize, first.options.pipeline.max_output_values, items.len);
         options.brokered_request = true;
         // Published bytes can outlive this callback's heap and execution
         // reservation. Give them a separate owner retained by every result,
@@ -12281,7 +12280,7 @@ pub const Node = struct {
         options.prepared_samples = prepared_samples[0..items.len];
         var cohort = gliner_microbatch.BoundaryCohort{ .consumers = consumers[0..items.len], .evidence = evidence[0..items.len], .failure = &failure, .owner = output_owner, .output_limit = output_limit, .group_key = @intFromPtr(items.ptr) };
         options.observer = .{ .context = &cohort, .emit_fn = gliner_microbatch.BoundaryCohort.observe };
-        options.row_sink = .{ .context = &cohort, .emit_fn = gliner_microbatch.BoundaryCohort.publish };
+        options.row_sink = .{ .context = &cohort, .emit_fn = gliner_microbatch.BoundaryCohort.publish, .fail_fn = gliner_microbatch.BoundaryCohort.fail, .check_fn = gliner_microbatch.BoundaryCohort.checkRow };
         var budget = runtime.tier.memory.RunBudget.init(limits);
         try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = first.working_bytes, .scratch_tier = .host });
         const json = self.executeBoundaryLoaded(a, first.model, &request, options, &budget, first.working_bytes, false) catch |err| {

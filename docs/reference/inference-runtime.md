@@ -252,8 +252,9 @@ serial fallback; repacking repeats no tokenizer work.
 Cohorts that cannot admit their additional workspace return to the callers'
 existing serial paths before any model execution.
 Each caller retains its IDs, unpadded usage, output limits and cancellation.
-Responses are serialized independently, so an oversized result rejects only
-its caller. Extraction phases, decoded counts and solver diagnostics remain
+Responses are decoded and serialized with independent scalar, string and
+response-byte budgets. A row-local output or semantic rejection fails only
+its caller; driver failures and backing OOM fail the shared invocation. Extraction phases, decoded counts and solver diagnostics remain
 caller-local. Published responses retain a separate memory owner until all
 consumers rejoin. Pre-forward planning and admission refusals subdivide the
 cohort or return to serial execution; failures after dispatch are never replayed.
