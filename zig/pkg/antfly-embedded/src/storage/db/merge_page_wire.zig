@@ -354,7 +354,18 @@ test "time series merge wire preserves exact signed sources and legacy omission"
     defer chunk_decoded.deinit();
     try std.testing.expectEqualDeep(command.chunk.?.ttl_source, chunk_decoded.value.chunk.?.ttl_source);
     const Request = @import("types.zig").BatchRequest;
-    const original = pages.commandDigest(Request{ .merge_page = command });
-    command.chunk.?.ttl_source = null;
-    try std.testing.expect(!std.mem.eql(u8, &original, &pages.commandDigest(Request{ .merge_page = command })));
+    try std.testing.expectError(error.InvalidMergePage, pages.validateRequest(Request{ .merge_page = command }));
+    var request: Request = .{
+        .merge_page = command,
+        .merge_replication = .{
+            .transition_id = 5,
+            .donor_group_id = 2,
+            .receiver_group_id = 4,
+            .identity_namespace = .{ .table_id = 1, .shard_id = 4, .range_id = 4 },
+            .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+        },
+    };
+    const original = pages.commandDigest(request);
+    request.merge_page.?.chunk.?.ttl_source = null;
+    try std.testing.expect(!std.mem.eql(u8, &original, &pages.commandDigest(request)));
 }
