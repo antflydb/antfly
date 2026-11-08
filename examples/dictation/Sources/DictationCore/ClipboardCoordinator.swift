@@ -49,7 +49,7 @@ import Foundation
     if ownedCount != count() {
       saved = nil
       ownedCount = nil
-      restoration?.cancel()
+      cancelRestoration()
     }
     if saved == nil {
       let snapshot = try await read()
@@ -61,7 +61,7 @@ import Foundation
       if saved == nil { saved = snapshot }
     }
     try Task.checkCancellation()
-    restoration?.cancel()
+    cancelRestoration()
     let lease = writeText(text)
     ownedCount = lease
     do { try send() } catch {
@@ -76,6 +76,15 @@ import Foundation
       } catch { return }
       self?.restoreIfOwned(lease)
     }
+  }
+  /// Only shutdown waits for the lease; normal insertion remains nonblocking.
+  /// A newer paste may extend it while we await an older timer.
+  public func finishRestoration() async {
+    while let pending = restoration { await pending.value }
+  }
+  private func cancelRestoration() {
+    restoration?.cancel()
+    restoration = nil
   }
   private func restoreIfOwned(_ lease: Int) {
     guard ownedCount == lease else { return }

@@ -85,12 +85,29 @@ import SwiftUI
   private var audioRetentionEpoch = UUID()
   private var audioArchiveID: UUID?
   private var audioArchiveRun: UUID?
-  private var audioArchiveTasks: [UUID: Task<Void, Never>] = [:]
+  @MainActor private final class AudioArchiveRequest {
+    let id = UUID()
+    let run: UUID
+    let epoch: UUID
+    let encoding: Task<Data, Error>
+    // Eligibility belongs to the request, independently of the current selection.
+    // Once canceled, an older writer must never regain publication rights.
+    private(set) var eligible = true
+    func invalidate() { eligible = false }
+    init(run: UUID, epoch: UUID, encoding: Task<Data, Error>) {
+      self.run = run
+      self.epoch = epoch
+      self.encoding = encoding
+    }
+  }
+  private var activeAudioArchive: AudioArchiveRequest?
+  private var pendingAudioArchive: AudioArchiveRequest?
   private var retryRecording: PCMRecording?
   private var retryPreset: Preset?
   private let clientFactory: (@Sendable (Configuration) throws -> AntflyClient)?
   private let originalPaster:
     (@MainActor (String, @escaping @MainActor () throws -> Void) async throws -> Void)?
+  private let clipboardRestoration: @MainActor () async -> Void
   private let directory: URL
   private let archive: HistoryArchive
   private var settingsFile: URL { directory.appendingPathComponent("settings.json") }
@@ -107,6 +124,9 @@ import SwiftUI
     originalPaster: (
       @MainActor (String, @escaping @MainActor () throws -> Void) async throws -> Void
     )? = nil,
+    clipboardRestoration: @escaping @MainActor () async -> Void = {
+      await InsertionTarget.finishPendingPaste()
+    },
     credentialReader: @escaping @MainActor (String) -> String = { Credentials.read(server: $0) },
     credentialWriter: @escaping @MainActor (String, String) throws -> Void = {
       try Credentials.save($0, server: $1)
@@ -119,6 +139,7 @@ import SwiftUI
     },
     settingsOpener: @escaping @MainActor (String) -> Void = { DesktopSettings.open($0) }
   ) {
+    self.clipboardRestoration = clipboardRestoration
     self.originalPaster = originalPaster
     self.audioArchiveStage = audioArchiveStage
     self.keyboardAccess = keyboardAccess
@@ -834,9 +855,25 @@ import SwiftUI
     } catch { return error.localizedDescription }
   }
   func cancel() {
-    if state != .idle, audioArchiveRun == generation {
-      audioArchiveID = nil
-      audioArchiveTask?.cancel()
+    if state != .idle {
+      if activeAudioArchive?.run == generation { activeAudioArchive?.invalidate() }
+      if pendingAudioArchive?.run == generation {
+        pendingAudioArchive?.invalidate()
+        pendingAudioArchive = nil
+      }
+      if audioArchiveRun == generation {
+        // A completed older clip may resume ownership, but cancellation and
+        // retention changes permanently revoke that request's eligibility.
+        if let activeAudioArchive, activeAudioArchive.eligible,
+          activeAudioArchive.epoch == audioRetentionEpoch, config.retainAudio
+        {
+          audioArchiveID = activeAudioArchive.id
+          audioArchiveRun = activeAudioArchive.run
+        } else {
+          audioArchiveID = nil
+          audioArchiveRun = nil
+        }
+      }
     }
     generation = UUID()
     requestTask?.cancel()
@@ -871,11 +908,11 @@ import SwiftUI
     working = true
     hotkey?.unregister()
     cancel()
+    await clipboardRestoration()
     historyDeletionTask?.cancel()
     await historyDeletionTask?.value
     await historyPersistenceTask?.value
-    let audioTasks = Array(audioArchiveTasks.values)
-    for task in audioTasks { await task.value }
+    await audioArchiveTask?.value
   }
   func retry() {
     guard state == .idle, !working, let recording = retryRecording, let original = retryPreset
@@ -1161,12 +1198,22 @@ import SwiftUI
         try await journal.acknowledge(destination, ids: matching)
       }
       try Task.checkCancellation()
-      history.removeAll { ids.contains($0.id) }
-      historyRevision += 1
-      try await archive.store(history, revision: historyRevision)
-      try await journal.complete(ids)
-      deletingIDs = await journal.ids()
-      pendingHistoryDeletions = deletingIDs.count
+      var cleanupFailure: Error?
+      // Local cleanup and journal completion are one ordered persistence job.
+      // A new dictation may queue a later snapshot, but cannot supersede an
+      // uncommitted clear or make its journal disappear after a failed write.
+      let cleanup = enqueueHistoryWork { [self] in
+        do {
+          history.removeAll { ids.contains($0.id) }
+          historyRevision += 1
+          try await archive.store(history, revision: historyRevision)
+          try await journal.complete(ids)
+          deletingIDs = await journal.ids()
+          pendingHistoryDeletions = deletingIDs.count
+        } catch { cleanupFailure = error }
+      }
+      await cleanup.value
+      if let cleanupFailure { throw cleanupFailure }
       await outbox.resume(pauseToken)
       historySyncStatus = "Matching history deleted from its original destinations."
     } catch {
@@ -1225,24 +1272,34 @@ import SwiftUI
   }
   func archiveAudio(_ encoding: Task<Data, Error>, run: UUID) {
     guard generation == run, !terminating else { return }
-    audioArchiveTask?.cancel()
-    let id = UUID()
-    audioArchiveID = id
-    audioArchiveRun = run
-    let epoch = audioRetentionEpoch
-    let stage = audioArchiveStage
-    let task = Task { [weak self, directory] in
-      defer { self?.audioArchiveTasks.removeValue(forKey: id) }
+    let request = AudioArchiveRequest(
+      run: run, epoch: audioRetentionEpoch, encoding: encoding)
+    audioArchiveID = request.id
+    audioArchiveRun = request.run
+    // One active write plus only the newest pending clip. Cancellation cannot
+    // stop a synchronous write already inside the kernel, so it is not admission.
+    pendingAudioArchive = request
+    guard audioArchiveTask == nil else { return }
+    audioArchiveTask = Task { [weak self] in await self?.drainAudioArchives() }
+  }
+  private func drainAudioArchives() async {
+    defer {
+      activeAudioArchive = nil
+      audioArchiveTask = nil
+    }
+    while let request = pendingAudioArchive {
+      pendingAudioArchive = nil
+      activeAudioArchive = request
       do {
-        let data = try await encoding.value
-        try Task.checkCancellation()
-        let candidate = try await stage(data, directory)
+        let data = try await request.encoding.value
+        guard request.eligible, audioArchiveID == request.id,
+          audioRetentionEpoch == request.epoch, config.retainAudio
+        else { continue }
+        let candidate = try await audioArchiveStage(data, directory)
         defer { try? FileManager.default.removeItem(at: candidate) }
-        try Task.checkCancellation()
-        guard let self, audioArchiveID == id, audioRetentionEpoch == epoch, config.retainAudio
-        else {
-          return
-        }
+        guard request.eligible, audioArchiveID == request.id,
+          audioRetentionEpoch == request.epoch, config.retainAudio
+        else { continue }
         let file = directory.appendingPathComponent("last-recording.wav")
         if FileManager.default.fileExists(atPath: file.path) {
           _ = try FileManager.default.replaceItemAt(file, withItemAt: candidate)
@@ -1251,22 +1308,23 @@ import SwiftUI
         }
       } catch is CancellationError {
       } catch {
-        guard let self, generation == run, audioArchiveID == id, audioRetentionEpoch == epoch,
-          config.retainAudio
-        else {
-          return
-        }
+        guard request.eligible, generation == request.run, audioArchiveID == request.id,
+          audioRetentionEpoch == request.epoch, config.retainAudio
+        else { continue }
         processingWarning = "Audio archive unavailable: " + error.localizedDescription
       }
+      activeAudioArchive = nil
     }
-    audioArchiveTask = task
-    audioArchiveTasks[id] = task
   }
   private func removeAudio() throws {
     audioRetentionEpoch = UUID()
     audioArchiveID = nil
-    for task in audioArchiveTasks.values { task.cancel() }
-    audioArchiveTask = nil
+    audioArchiveRun = nil
+    activeAudioArchive?.invalidate()
+    pendingAudioArchive?.invalidate()
+    pendingAudioArchive = nil
+    // The active writer remains owned until it returns and removes its candidate.
+    // Retention fencing prevents publication, including during normal shutdown.
     try RecordingArchive.removeStaleCandidates(in: directory)
     let file = directory.appendingPathComponent("last-recording.wav")
     if FileManager.default.fileExists(atPath: file.path) {
