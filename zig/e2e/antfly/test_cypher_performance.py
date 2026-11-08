@@ -3559,12 +3559,27 @@ def test_authenticated_cypher_point_cohorts_catalog_churn_and_overlays(monkeypat
                 assert result["rows"] == [[{"type": "integer", "value": "1000"}]], (
                     result
                 )
-                result = call("/sql", {"statement": count_sql, "parameters": [keys]})
-                assert result["rows"] == [["1000"]], result
+                # SQL intentionally fences its logical schema/policy bindings
+                # against the global catalog revision. Concurrent DDL can
+                # serialize it with 40001; routing failures must still fail.
+                response = session.post(
+                    server.api_url.rstrip("/") + "/sql",
+                    json={"statement": count_sql, "parameters": [keys]},
+                    timeout=40,
+                )
+                result = response.json()
+                if response.status_code == 409:
+                    assert result["code"] == "40001", result
+                    assert "table or policy definition changed" in result["message"]
+                else:
+                    assert response.status_code == 200, result
+                    assert result["rows"] == [["1000"]], result
         finally:
             publisher.join(timeout=60)
         assert not publisher.is_alive()
         assert not errors, errors
+        result = call("/sql", {"statement": count_sql, "parameters": [keys]})
+        assert result["rows"] == [["1000"]], result
         # A READ COMMITTED overlay has no range guards. Updated and newly
         # inserted keys must remain visible while capture retains full cohorts.
         transaction = call(

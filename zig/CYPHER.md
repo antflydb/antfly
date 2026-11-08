@@ -5872,6 +5872,8 @@ and topology generations. Owner plans retain full immutable ranges for each
 selected owner and discard their selection keyset after routing. Whole-graph
 catalog and privilege validation, policy publication checks, table identity,
 privacy versions, topology validation and retained-cut fences remain mandatory.
+SQL also retains its logical schema/policy catalog-revision fence: concurrent
+catalog DDL can return SQLSTATE `40001` even when graph routing is unchanged.
 This changes private coordinator descriptors (kernel ABI 87 / runtime ABI 88),
 without changing the public JSON contract or shard query protocol.
 
