@@ -1075,6 +1075,25 @@ pub const BatchExecutionOptions = struct {
     merge_chunk_expected_progress: ?[32]u8 = null,
     transaction_resolution: ?TransactionResolution = null,
     durable_rows: ?*const std.StringHashMapUnmanaged([]const u8) = null,
+    /// lite-single-commit-write-path.md §3.3c. `.none` (default): a
+    /// coordinated-constraint table's ordinary writes are refused on this
+    /// plain batch path (`error.ForeignKeyCoordinationRequired`) and the
+    /// integrity namespace stays protected -- the durable 3-commit
+    /// `beginTransaction`/`writeTransaction`/`commitTransaction` sequence
+    /// is the only way to write such a table. `.local_decision`: this call
+    /// is the first and only decider for `req.integrity_commands` (set
+    /// only by `capi/sql.zig`'s `commitCoordinated` single-call fast
+    /// path, never by a multi-statement SQL session spanning calls) --
+    /// `mutation_commit.zig`'s `prepareLocalIntegrityDecision` validates
+    /// and folds the resulting UNIQUE-claim writes into this same native
+    /// commit. Unlike replaying an already-decided remote write
+    /// (`live_replication_apply`/`scoped_restore_replication_apply`,
+    /// structural re-validation only), `.local_decision` still runs the
+    /// full `checkVersionPredicates`/`relational_integrity.prepare`/
+    /// `validatePreparedEffects` sequence, inside the same apply-exclusive
+    /// section as the commit, so two concurrent `.local_decision` writers
+    /// racing the same UNIQUE value can never both win.
+    integrity_authority: enum { none, local_decision } = .none,
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
     visibility_cancellation: types.CancellationToken = .none,

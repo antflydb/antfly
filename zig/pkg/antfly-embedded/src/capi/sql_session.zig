@@ -274,7 +274,7 @@ pub const Session = struct {
         // table fast path (lite-single-commit-write-path.md §3.3c): every
         // table there already shares one physical commit domain.
         if (self.handle.owned_lite_backend != null and prepared.tables.len == 1 and std.mem.eql(u8, prepared.tables[0].table_name, adapter.table_name)) {
-            const outcome = adapter.commitCoordinated(prepared.tables[0]) catch |err| {
+            const outcome = adapter.commitCoordinated(a, prepared.tables[0]) catch |err| {
                 out_id.* = adapter.outcome_transaction_id;
                 self.failed = true;
                 return err;

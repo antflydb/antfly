@@ -557,7 +557,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // generation are revalidated below under the apply fence.
             const scoped_restore_replication_apply = opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope != null and opts.restore_staging == null;
             const live_replication_apply = opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope == null and opts.restore_staging == null;
-            if (opts.transaction_resolution == null and !scoped_restore_replication_apply and !live_replication_apply) {
+            // lite-single-commit-write-path.md §3.3c: a single-table write
+            // deciding its own UNIQUE claims for the first time, in this
+            // same call (`capi/sql.zig`'s `commitCoordinated`). Unlike
+            // `live_replication_apply`/`scoped_restore_replication_apply`
+            // (replaying a decision some OTHER writer already made), this
+            // caller is the first and only decider, so it still runs full
+            // validation below -- see `prepareLocalIntegrityDecision`.
+            const local_decision_apply = opts.integrity_authority == .local_decision;
+            if (opts.transaction_resolution == null and !scoped_restore_replication_apply and !live_replication_apply and !local_decision_apply) {
                 for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
                 for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
                 if (!req.graph_endpoint_cleanup_planned and hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
@@ -568,8 +576,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (view.storageMode() != .relational) return error.InvalidRelationalRowsRequest;
                 if (view.version() != version) return error.PreparedGenerationChanged;
             }
-            // Integrity effects may only enter through durable transaction prepare.
-            if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null) return error.InvalidIntegrityOperation;
+            // Integrity effects may only enter through durable transaction
+            // prepare, or (new) a `.local_decision` call's own
+            // `integrity_commands` -- validated and applied below, in this
+            // same apply-locked section, never read back from storage.
+            if (req.integrity.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null) return error.InvalidIntegrityOperation;
+            if (req.integrity_commands.len != 0 and !local_decision_apply) return error.InvalidIntegrityOperation;
             var relational_index_snapshot = S.ownerField(self, "core").*.relational_indexes.acquire();
             defer if (relational_index_snapshot) |*index_snapshot| index_snapshot.deinit();
             const index_ready = try preparation_alloc.alloc(bool, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan.boundIndexes().len else 0);
@@ -1394,6 +1406,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .use_preprepared_rows = use_preprepared_rows,
             };
             defer write_buffers.deinit();
+            if (local_decision_apply) {
+                // `preparation.effects_arena` outlives this call through
+                // the rest of the native commit below (see its own use for
+                // other inline-publication effects, e.g. line ~701), so
+                // the claim writes returned here stay valid without
+                // tracking individual frees against `preparation_alloc`.
+                const local_integrity_writes = try prepareLocalIntegrityDecision(
+                    self,
+                    preparation.effects_arena.allocator(),
+                    req.relational_schema_version orelse req.schema_version,
+                    req.relational_integrity_generation_set,
+                    req.integrity_commands,
+                );
+                for (local_integrity_writes) |intent| {
+                    if (intent.value) |value| {
+                        try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = intent.key, .value = value });
+                    } else {
+                        try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, intent.key);
+                    }
+                }
+            }
             if (S.ownerField(self, "local_execution").*.row_policy_table_name) |table_name| {
                 try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = internal_keys.graph_owning_table_key, .value = table_name });
             }
@@ -4478,6 +4511,110 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.mem.startsWith(u8, key, protection.writer_prefix) or
                 std.mem.startsWith(u8, key, protection.index_counter_prefix) or
                 std.mem.startsWith(u8, key, protection.index_writer_prefix);
+        }
+
+        /// lite-single-commit-write-path.md §3.3c: validates and
+        /// materializes UNIQUE-constraint integrity effects for a single
+        /// table write deciding them for the first time in this one call
+        /// (`BatchExecutionOptions.integrity_authority == .local_decision`,
+        /// set only by `capi/sql.zig`'s `commitCoordinated` fast path) --
+        /// no durable intent record, no begin record. Runs the same
+        /// `relational_integrity.prepare`/`validatePreparedEffects`/
+        /// `checkVersionPredicates` sequence `storage/db/db.zig`'s
+        /// `writeTransactionInternalOnce` runs for `req.integrity_commands`,
+        /// just without the durable round trip through "intents": the
+        /// caller must already be holding the SAME apply-exclusive lock
+        /// this commit is about to write under (this never acquires or
+        /// releases it), so the check and the write land in one native
+        /// batch with no gap a concurrent writer could land in between. A
+        /// `.foreign` generation command is refused: cross-table FK
+        /// bookkeeping (the parent's own `.attach`/`.detach` record) still
+        /// needs a multi-table coordinator, never this single-table path.
+        /// Returned intents are allocated from `alloc` and remain valid
+        /// for the caller's own commit lifetime (the same `preparation_alloc`
+        /// arena every other per-call buffer in this function uses).
+        fn prepareLocalIntegrityDecision(
+            self: anytype,
+            alloc: Allocator,
+            schema_version: ?u32,
+            generation_set: ?[32]u8,
+            commands: []const @import("relational_integrity_contract.zig").Command,
+        ) ![]const transactions_mod.WriteIntent {
+            if (commands.len == 0) return &.{};
+            const integrity_mod = @import("relational_integrity.zig");
+            const catalog_mod = @import("relational_integrity_catalog.zig");
+            const retirement_mod = @import("relational_integrity_retirement.zig");
+            const shadow_mod = @import("online_integrity_shadow.zig");
+            const store = S.ownerField(self, "core").*.store;
+            const byte_range = S.ownerField(self, "core").*.byteRange();
+
+            // Nothing was ever begun or written as an "intent" under any
+            // txn id for this call, so a fresh random id only needs to
+            // avoid colliding with a REAL pending transaction's id -- it
+            // exists purely so the read guard below can tell this call's
+            // (nonexistent) own pending writes apart from someone else's.
+            var scratch_txn_id: transactions_mod.TxnId = undefined;
+            const scratch_io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
+            try scratch_io.randomSecure(&scratch_txn_id);
+            var integrity_read = try integrity_mod.CurrentView.initForTransaction(store, alloc, scratch_txn_id);
+            defer integrity_read.deinit();
+
+            for (commands) |command| try shadow_mod.requireServing(&integrity_read, byte_range, &command.address.routing);
+
+            const raw_catalog = integrity_read.get(catalog_mod.key) catch |err| switch (err) {
+                error.NotFound => return error.IntegrityCatalogChanged,
+                else => return err,
+            };
+            var catalog = try catalog_mod.decode(alloc, raw_catalog);
+            defer catalog.deinit();
+            if (generation_set) |expected| {
+                const actual = @import("relational_integrity_activation.zig").generationSet(catalog);
+                if (!std.mem.eql(u8, &expected, &actual)) return error.IntegrityCatalogChanged;
+            }
+            const version = schema_version orelse return error.PreparedGenerationChanged;
+            if (catalog.schema_version != version) return error.PreparedGenerationChanged;
+            const incarnation = try catalog_mod.incarnationFromTableId(S.ownerField(self, "core").*.identity_namespace.table_id);
+            if (!std.mem.eql(u8, &incarnation, &catalog.incarnation)) return error.IntegrityCatalogIncarnationMismatch;
+            for (commands) |command| {
+                const generation = catalog.findGeneration(command.address.generation) orelse return error.IntegrityCatalogChanged;
+                if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
+                if (generation.retired and (command.operation == .establish or command.operation == .attach)) return error.IntegrityCatalogChanged;
+            }
+
+            try retirement_mod.requireMutable(&integrity_read);
+            try retirement_mod.admitCommands(&integrity_read, commands);
+
+            var effects = try integrity_mod.prepare(alloc, &integrity_read, commands);
+            defer effects.deinit();
+            try integrity_mod.validatePreparedEffects(alloc, &integrity_read, effects.operations);
+
+            var predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
+            defer predicates.deinit(alloc);
+            var intents = std.ArrayListUnmanaged(transactions_mod.WriteIntent).empty;
+            errdefer intents.deinit(alloc);
+            for (effects.operations) |operation| {
+                try shadow_mod.requireServing(&integrity_read, byte_range, operation.routing_key);
+                const parsed = try integrity_mod.parseKey(operation.key);
+                const generation = catalog.findGeneration(parsed.address.generation) orelse return error.IntegrityCatalogChanged;
+                if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
+                if (generation.retired and operation.kind != .delete) return error.IntegrityCatalogChanged;
+                try predicates.append(alloc, integrity_mod.predicate(operation));
+                if (operation.kind != .guard) {
+                    // Copy out of `effects.arena` (freed by the `defer`
+                    // above when this function returns) into `alloc`,
+                    // which the caller keeps alive for the whole commit.
+                    const key_copy = try alloc.dupe(u8, operation.key);
+                    const value_copy = if (operation.value) |value| try alloc.dupe(u8, value) else null;
+                    try intents.append(alloc, .{ .key = key_copy, .value = value_copy });
+                }
+            }
+
+            var manager = try S.ownerField(self, "core").*.initTxnManager();
+            defer manager.deinit();
+            try manager.checkVersionPredicates(predicates.items, null);
+            try manager.checkIntentConflicts(intents.items, null);
+
+            return try intents.toOwnedSlice(alloc);
         }
 
         pub fn tryLockApplyForPortableRuntime(self: anytype) !void {

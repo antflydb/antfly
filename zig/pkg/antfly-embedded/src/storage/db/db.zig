@@ -7550,6 +7550,35 @@ pub const DB = struct {
         };
     }
 
+    /// lite-single-commit-write-path.md §3.3c: `capi/sql.zig`'s
+    /// `commitCoordinated` single-call fast path. `req` carries the
+    /// primary row writes/deletes/predicates plus `integrity_commands`
+    /// for the UNIQUE claims this write decides for the first time, all
+    /// materialized in one native commit with no begin record and no
+    /// durable intent record -- see `BatchExecutionOptions.integrity_authority`
+    /// and `mutation_commit.zig`'s `prepareLocalIntegrityDecision`. Same
+    /// outcome classification as `batchTrackedWithMarkerAndWriterLaneHook`:
+    /// `primary_committed` distinguishes a durable write from one that
+    /// never applied when this returns `error.OutcomeUnknown`.
+    pub fn batchLocalCoordinated(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
+        primary_committed.* = false;
+        var progress: backend_types.CommitProgress = .{};
+        const previous = backend_types.commit_progress;
+        backend_types.commit_progress = &progress;
+        defer backend_types.commit_progress = previous;
+        const opts: BatchExecutionOptions = .{
+            .primary_committed = primary_committed,
+            .integrity_authority = .local_decision,
+        };
+        self.batchInternal(req, null, opts) catch |err| {
+            if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
+                std.log.warn("coordinated batch failed after its write may have applied: {s}", .{@errorName(err)});
+                return error.OutcomeUnknown;
+            }
+            return err;
+        };
+    }
+
     fn isOutcomeUnknownError(err: anyerror) bool {
         return switch (err) {
             error.OutcomeUnknown, error.WriteOutcomeUnknown, error.DurabilityOutcomeUnknown, error.CommitDecisionUnknown => true,
