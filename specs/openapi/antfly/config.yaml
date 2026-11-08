@@ -75,7 +75,7 @@ components:
           type: string
           enum: [typed, embedding_similarity, generated, cascade]
           default: typed
-          description: Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate questions only.
+          description: Execution contract. With provider antfly, typed invokes the Decisions endpoint; remote named deciders may return validated typed or generated answers, including upstream cascade outcomes. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate questions only.
         cascade:
           $ref: '#/components/schemas/DeciderCascade'
         generator:
@@ -222,7 +222,10 @@ components:
               minItems: 2
               maxItems: 2
               items: { type: number, minimum: 0, maximum: 1 }
-              description: Lower and upper bound, lower strictly below upper. The previous stage must not be verdict_only.
+              description: Lower and upper bound, lower strictly below upper. Inputs must have measured probabilities. The previous stage must not be verdict_only; a dynamically returned proxy verdict fails its producing stage under on_failure instead of driving the band.
+        require_agreement:
+          type: boolean
+          description: Require this stage to agree with the preceding stage on the band question, or every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and abstains; a keep_previous failure leaves agreement unverified and also abstains.
         on_failure:
           type: string
           enum: [fail, keep_previous]
