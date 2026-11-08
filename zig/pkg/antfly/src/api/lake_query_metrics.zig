@@ -48,6 +48,7 @@ pub const Phase = enum {
     composed_native_leaf,
     composed_cursor,
     admission,
+    owner_admission,
     wal_cut,
     public_total,
     public_binding,
@@ -105,6 +106,7 @@ pub const Stats = struct {
     // compiled runtime whose object-store module has independent atomics.
     object_operations: @import("objectstore").operation_metrics.Snapshot = .{ .calls = @splat(0), .errors = @splat(0), .nanoseconds = @splat(0), .max_nanoseconds = @splat(0), .retries = 0 },
     navigation: Navigation = .{},
+    cursor_publications: u64 = 0,
     best_first_calls: u64 = 0,
     best_first_segments: u64 = 0,
     best_first_pruned_nodes: u64 = 0,
@@ -120,6 +122,7 @@ pub const Stats = struct {
     public_tracking_drops: u64 = 0,
 };
 pub const Metrics = struct {
+    cursor_publications: std.atomic.Value(u64) = .init(0),
     navigation: [@typeInfo(Navigation).@"struct".field_names.len]std.atomic.Value(u64) = @splat(.init(0)),
     best_first_calls: std.atomic.Value(u64) = .init(0),
     best_first_segments: std.atomic.Value(u64) = .init(0),
@@ -218,7 +221,7 @@ pub const Metrics = struct {
         if (self.slowest_public == null or profile.duration(.public_total) > self.slowest_public.?.duration(.public_total)) self.slowest_public = profile;
     }
     pub fn snapshot(self: *Metrics) Stats {
-        var result: Stats = .{ .object_operations = @import("objectstore").operation_metrics.runtime.snapshot(), .best_first_calls = self.best_first_calls.load(.monotonic), .best_first_segments = self.best_first_segments.load(.monotonic), .best_first_pruned_nodes = self.best_first_pruned_nodes.load(.monotonic) };
+        var result: Stats = .{ .cursor_publications = self.cursor_publications.load(.monotonic), .object_operations = @import("objectstore").operation_metrics.runtime.snapshot(), .best_first_calls = self.best_first_calls.load(.monotonic), .best_first_segments = self.best_first_segments.load(.monotonic), .best_first_pruned_nodes = self.best_first_pruned_nodes.load(.monotonic) };
         inline for (@typeInfo(Navigation).@"struct".field_names, 0..) |field, index| @field(result.navigation, field) = self.navigation[index].load(.monotonic);
         for (0..count) |i| {
             result.calls[i] = self.calls[i].load(.monotonic);
@@ -249,6 +252,7 @@ pub const Metrics = struct {
 };
 
 pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: anytype) !void {
+    try prom.appendPromMetric(writer, "antfly_lake_query_cursor_publications_total", "counter", "Query-time lake leaf or composed cursor publication requests, including memo hits; excludes native table captures and background serving-cut construction", query.cursor_publications);
     const operations = @import("objectstore").operation_metrics;
     const object_stats = query.object_operations;
     inline for (@typeInfo(operations.Operation).@"enum".field_names, 0..) |name, i| {

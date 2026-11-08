@@ -150,7 +150,9 @@ def publish(
             or result.get("state") != "accepted"
             or not isinstance(result.get("wal_lsn"), int)
         ):
-            raise RuntimeError("native changes were not durably accepted")
+            raise RuntimeError(
+                "native changes acceptance is unconfirmed; retry the retained request"
+            )
     with state.transaction():
         for key, submitted in intent["pending"]:
             if state.db.get(key) == submitted:

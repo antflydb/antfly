@@ -17,6 +17,9 @@
 
 pub const antfly_sources = @import("source_owner_common.zig");
 
+/// Physical lake operations belong to this existing execution owner.
+pub const lake_execution_backend = @import("api/lake_execution_build_impl.zig");
+
 const std = @import("std");
 
 const bridge = @import("runtime_bridge.zig");
@@ -43,6 +46,7 @@ fn serverlessEntry(context: *const bridge.Context) callconv(.c) c_int {
 
 comptime {
     exportInternal(&serverlessEntry, "antfly_runtime_serverless");
+    if (@import("lake_execution_options").provide_lake_execution) @import("api/lake_execution_native_provider.zig").exportOperations();
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

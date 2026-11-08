@@ -183,6 +183,16 @@ static int run_signal_lifetime_smoke(void) {
     snprintf(second_path, sizeof(second_path), "%s/second.aflite.lock", directory);
     remove(first_path);
     remove(second_path);
+    /* Writer queues retain their coordination inode across ordinary close.
+     * Both fixture owners are closed; remove only the known idle tail so an
+     * unexpected live ticket still makes the final directory removal fail. */
+    const char *queue_names[] = {"first.aflite.lock.q", "second.aflite.lock.q"};
+    for (size_t i = 0; i < sizeof(queue_names) / sizeof(queue_names[0]); ++i) {
+        snprintf(first_path, sizeof(first_path), "%s/%s/tail", directory, queue_names[i]);
+        remove(first_path);
+        snprintf(first_path, sizeof(first_path), "%s/%s", directory, queue_names[i]);
+        rmdir(first_path);
+    }
     /* Maintenance leaves this coordination inode in place so concurrent owners
      * cannot acquire different locks. Both owners are closed and this fixture
      * owns the entire directory, so it is now safe to remove the guard. */
@@ -201,20 +211,6 @@ static int run_signal_lifetime_smoke(void) {
                 snprintf(identity_path, sizeof(identity_path), "%s/identity", namespace_path);
                 remove(identity_path);
                 rmdir(namespace_path);
-            } else if (strcmp(entry->d_name, "first.aflite.lock.q") == 0 ||
-                       strcmp(entry->d_name, "second.aflite.lock.q") == 0) {
-                /* A closed writer queue retains its tail counter so future
-                 * owners share the same ticket sequence. Remove only that
-                 * persistent metadata in this private fixture. Outstanding
-                 * tickets remain errors instead of being hidden by rm -rf. */
-                char queue_path[1400], tail_path[1500];
-                snprintf(queue_path, sizeof(queue_path), "%s/%s", directory, entry->d_name);
-                snprintf(tail_path, sizeof(tail_path), "%s/tail", queue_path);
-                remove(tail_path);
-                if (rmdir(queue_path) != 0) {
-                    fprintf(stderr, "signal smoke writer queue cleanup failed: %s: %s\n", queue_path, strerror(errno));
-                    failed = 1;
-                }
             } else if (strncmp(entry->d_name, ".aflite-maintenance-", 20) == 0) {
                 snprintf(first_path, sizeof(first_path), "%s/%s", directory, entry->d_name);
                 remove(first_path);

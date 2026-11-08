@@ -16,17 +16,65 @@
 //! Contract-only client for the compiled local-query provider.
 
 const std = @import("std");
-const abi = @import("kernel_owner_abi");
+const abi = @import("local_query_abi");
 const error_identity = @import("kernel_error_identity");
+
+/// A complete operation on an owner-issued opaque capability. This consumer
+/// knows neither the DB type nor its native layout. The owner controls handle
+/// validity, admission, generation leases, query execution and response memory.
+pub const OwnedQueryResponse = struct {
+    response: abi.QueryOwnedResponse = .{},
+
+    pub fn bytes(self: OwnedQueryResponse) []const u8 {
+        return self.response.buffer.slice();
+    }
+
+    pub fn identityReadGeneration(self: OwnedQueryResponse) ?u64 {
+        return if (self.response.has_identity_read_generation != 0) self.response.identity_read_generation else null;
+    }
+
+    pub fn deinit(self: *OwnedQueryResponse) void {
+        abi.antfly_storage_owner_buffer_destroy(&self.response.buffer);
+        self.* = undefined;
+    }
+};
+
+pub fn executeOwner(owner: ?*anyopaque, request: abi.QueryOperationRequest) !OwnedQueryResponse {
+    var response: OwnedQueryResponse = .{};
+    errdefer response.deinit();
+    var failure: abi.FailureIdentity = .{};
+    const status = abi.antfly_storage_owner_query_json(owner, &request, &response.response, &failure);
+    try error_identity.validateFailureEnvelope(status, &failure, abi.abi_version);
+    if (status != .ok and failure.boundary != .storage_owner and failure.boundary != .local_query)
+        return error.InvalidBoundaryFailureIdentity;
+    error_identity.statusToError(status) catch |err| {
+        logProviderFailure("storage-owner query", failure);
+        return err;
+    };
+    return response;
+}
 
 pub const QueryResponse = struct {
     json: []u8,
     identity_read_generation: ?u64,
 };
 
+/// Physical compatibility callers obtain their capability from the storage
+/// owner. Only that issuer resolves this checked borrow; the query dispatcher
+/// has no private type or layout dependency.
+fn issueExecution(db: anytype, out_failure: *abi.FailureIdentity) !abi.QueryExecution {
+    var execution: abi.QueryExecution = .{};
+    var failure: abi.FailureIdentity = .{};
+    const borrow = abi.CheckedDbBorrow.borrow(db);
+    const status = abi.antfly_storage_query_execution_v1(&borrow, &execution, &failure);
+    try acceptProviderFailure(status, failure, .validate_request, out_failure);
+    try error_identity.statusToError(status);
+    return execution;
+}
+
 pub fn executeJsonAlloc(
     alloc: std.mem.Allocator,
-    db: *anyopaque,
+    db: anytype,
     table_name: []const u8,
     request_json: []const u8,
     dialect: abi.LocalQueryDialect,
@@ -39,7 +87,7 @@ pub fn executeJsonAlloc(
     return executeAlloc(alloc, .{
         .dialect = dialect,
         .kind = .search,
-        .db = db,
+        .execution = try issueExecution(db, out_failure),
         .table_name = .fromSlice(table_name),
         .request_json = .fromSlice(request_json),
         .execution_options = execution_options,
@@ -53,7 +101,7 @@ pub fn executeJsonAlloc(
 pub fn executeControlledJsonAlloc(
     alloc: std.mem.Allocator,
     kind: abi.LocalQueryKind,
-    db: *anyopaque,
+    db: anytype,
     table_name: []const u8,
     request_json: []const u8,
     execution_deadline_ns: ?u64,
@@ -64,7 +112,7 @@ pub fn executeControlledJsonAlloc(
     std.debug.assert(kind != .search);
     const response = try executeAlloc(alloc, .{
         .kind = kind,
-        .db = db,
+        .execution = try issueExecution(db, out_failure),
         .table_name = .fromSlice(table_name),
         .request_json = .fromSlice(request_json),
         .has_execution_deadline = @intFromBool(execution_deadline_ns != null),

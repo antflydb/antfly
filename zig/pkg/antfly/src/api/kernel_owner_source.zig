@@ -3782,7 +3782,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var prepared = try self.prepareRestoreOwnerControl(alloc, group_id, table_name, descriptor, input, options, request);
         defer prepared.deinit();
         const encoded = prepared.value.batch_json orelse return prepared.value.response;
-        var batch = try @import("antfly_local_sources").api_batch.parseInternalBatchRequest(alloc, encoded);
+        var batch = try @import("antfly_local_sources").api_internal_batch.parseInternalBatchRequest(alloc, encoded);
         defer batch.deinit(alloc);
         const scope = batch.req.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
         if (!std.mem.eql(u8, &scope, &input.scope.digest()) or batch.req.restore_staging == null) return error.RestoreStagingScopeChanged;
