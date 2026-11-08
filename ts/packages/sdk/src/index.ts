@@ -545,7 +545,18 @@ export { AntflyHTTPError, AntflyResponseError } from "./errors.js";
 export type { GraphData, GraphDecoded, GraphIdentity, GraphValue } from "./graph-wire.js";
 export { decodeGraphValue, encodeGraphParameter } from "./graph-wire.js";
 export type { AudioReadMetadata, AudioReadOptions, AudioReadSegment } from "./inference-types.js";
-export type { MemoryNumbers, MemoryPaths, MemorySchemas } from "./memory.js";
+export type {
+  MemoryCallOptions,
+  MemoryEpisodeQuery,
+  MemoryHistoryQuery,
+  MemoryListQuery,
+  MemoryNumbers,
+  MemoryPageQuery,
+  MemoryPaths,
+  MemoryRememberInput,
+  MemorySchemas,
+  MemoryScopeOptions,
+} from "./memory.js";
 export { parseMemoryJSON, stringifyMemoryJSON } from "./memory.js";
 export * from "./models.js";
 export type {

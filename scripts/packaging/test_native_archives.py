@@ -115,7 +115,7 @@ class NativeArchivesTests(unittest.TestCase):
             "archive_arch": "arm64",
             "archive_suffix": "",
         }
-        limit = 88 * 1024**2
+        limit = 96 * 1024**2
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "antfly-embedded_test_Darwin_arm64.tar.gz"
@@ -136,9 +136,10 @@ class NativeArchivesTests(unittest.TestCase):
                     member.size = len(header)
                     member.mode = 0o755
                     archive.addfile(member, io.BytesIO(header))
-            for size in (limit - 1, limit, limit + 1):
+            for size in (94765184, limit - 1, limit, limit + 1):
                 with self.subTest(size=size), tarfile.open(path) as archive:
-                    # Exercise the inventory boundary without an 88 MiB payload.
+                    # Include RC.13's measured size and the exact budget boundary
+                    # without allocating a full library payload.
                     members = archive.getmembers()
                     members[0].size = size
                     with (
@@ -155,6 +156,6 @@ class NativeArchivesTests(unittest.TestCase):
                             verify(root, platform, ["embedded"])
                         else:
                             with self.assertRaisesRegex(
-                                ValueError, f"{size} bytes.*88MiB"
+                                ValueError, f"{size} bytes.*96MiB"
                             ):
                                 verify(root, platform, ["embedded"])

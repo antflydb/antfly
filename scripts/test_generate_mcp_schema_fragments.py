@@ -203,9 +203,6 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "search_after",
             "read_requirements",
             "remote_snapshot",
-            # Filtering is supported for member-level child navigation; the
-            # dedicated unit-level rejection remains a separate condition.
-            "filter_query",
         }
         self.assertEqual(
             set(query_schema["properties"]),
