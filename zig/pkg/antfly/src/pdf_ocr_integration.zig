@@ -196,7 +196,7 @@ pub fn main(init: std.process.Init) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.read_calls.fetchAdd(1, .monotonic);
             if (!std.mem.eql(u8, model, "multistage-integration") and
-                !std.mem.eql(u8, model, "multistage-integration@1111111111111111111111111111111111111111"))
+                !std.mem.eql(u8, model, "integration/multistage-integration@1111111111111111111111111111111111111111"))
                 return error.InvalidIntegrationReaderModel;
             if (request.images.len == 0 or request.images.len > 8 or request.prompt == null or
                 !std.mem.eql(u8, request.prompt.?, "<OCR>"))

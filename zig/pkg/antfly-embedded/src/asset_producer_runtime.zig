@@ -472,12 +472,28 @@ const ModelExecutionIdentity = struct {
 };
 
 fn immutableAntflyModel(model: ?[]const u8) bool {
-    const name = model orelse return false;
+    const raw = model orelse return false;
+    const name = if (std.mem.startsWith(u8, raw, "hf:")) raw[3..] else raw;
     const separator = std.mem.lastIndexOfScalar(u8, name, '@') orelse return false;
-    if (separator == 0) return false;
     const revision = name[separator + 1 ..];
     if (revision.len != 40 and revision.len != 64) return false;
     for (revision) |c| if (!std.ascii.isHex(c)) return false;
+    // Only registry references enforce the revision at model selection. A
+    // mutable directory or friendly alias named "model@<sha>" is not a pin.
+    const reference = name[0..separator];
+    const slash = std.mem.indexOfScalar(u8, reference, '/') orelse return false;
+    const owner = reference[0..slash];
+    const rest = reference[slash + 1 ..];
+    const model_end = std.mem.indexOfScalar(u8, rest, ':') orelse rest.len;
+    for ([_][]const u8{ owner, rest[0..model_end] }) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return false;
+        for (component) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.') return false;
+    }
+    if (model_end < rest.len) {
+        const variant = rest[model_end + 1 ..];
+        if (variant.len == 0) return false;
+        for (variant) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.' and c != ':') return false;
+    }
     return true;
 }
 
@@ -1422,7 +1438,11 @@ pub const Runtime = struct {
         var identity: ModelExecutionIdentity = .{ .expected = context.expected_model_revision };
         scoped.model_execution_identity = &identity;
         var batch = try produceBatchReported(&scoped, alloc, requests);
-        batch.executed_model_revision = identity.result();
+        // General batches may contain compatibility work whose adapter cannot
+        // report identity. Only the singleton reader/generator invocation used
+        // for speculative OCR has one authoritative execution binding.
+        batch.executed_model_revision = if (requests.len == 1 and
+            (requests[0].producer_type == .reader or requests[0].producer_type == .generator)) identity.result() else null;
         errdefer batch.deinit(alloc);
         try scoped.execution.check(platform.time.monotonicNs());
         return batch;
@@ -1441,7 +1461,11 @@ pub const Runtime = struct {
         var identity: ModelExecutionIdentity = .{ .expected = context.expected_model_revision };
         scoped.model_execution_identity = &identity;
         var batch = try produceBorrowedRasterBatchReported(&scoped, alloc, requests, rasters);
-        batch.executed_model_revision = identity.result();
+        // General batches may contain compatibility work whose adapter cannot
+        // report identity. Only the singleton reader/generator invocation used
+        // for speculative OCR has one authoritative execution binding.
+        batch.executed_model_revision = if (requests.len == 1 and
+            (requests[0].producer_type == .reader or requests[0].producer_type == .generator)) identity.result() else null;
         errdefer batch.deinit(alloc);
         try scoped.execution.check(platform.time.monotonicNs());
         return batch;
@@ -9888,5 +9912,8 @@ test "index document checkpoint producer execution identity rejects missing fenc
     try std.testing.expectError(error.ModelExecutionRevisionChanged, runtime.recordLeaseExecution(lease));
     try std.testing.expect(!immutableAntflyModel("alias"));
     try std.testing.expect(!immutableAntflyModel("model@main"));
-    try std.testing.expect(immutableAntflyModel("model@1111111111111111111111111111111111111111"));
+    try std.testing.expect(!immutableAntflyModel("model@1111111111111111111111111111111111111111"));
+    try std.testing.expect(!immutableAntflyModel("/tmp/model@1111111111111111111111111111111111111111"));
+    try std.testing.expect(!immutableAntflyModel("../model@1111111111111111111111111111111111111111"));
+    try std.testing.expect(immutableAntflyModel("owner/model@1111111111111111111111111111111111111111"));
 }

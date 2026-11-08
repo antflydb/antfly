@@ -21,7 +21,7 @@ normal asset producer. Reuse requires a successful result reporting the revision
 actually dispatched, matching the discovery expectation. The native adapter binds
 remote readers and generators to the exact server-enforced capability lease used
 for dispatch; a changed revision is rejected before inference. Linked readers and
-attachment generators require an immutable model reference. A catalog's revision
+attachment generators require an immutable registry model reference. A catalog's revision
 or embedding-pinning support flag alone never establishes execution identity.
 Unknown or mixed execution revisions are not reusable. The owner rechecks source
 allocation identity, OCR/render/quality policy, page identity, native text and current model capabilities before copying the

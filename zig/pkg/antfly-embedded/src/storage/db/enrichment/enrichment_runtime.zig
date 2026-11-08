@@ -13421,7 +13421,7 @@ pub fn runNativeDocumentPreparationIntegration(alloc: Allocator, io: Io, pdf_byt
     // Four independent one-page PDFs exercise refill after the initial pair.
     // Trailing PDF comments give each source a distinct immutable identity.
     const keys = [_][]const u8{ "current", "one", "two", "three", "four" };
-    const producer_json = "{\"type\":\"document_extraction\",\"config\":{\"content_type\":\"application/pdf\",\"ocr\":{\"mode\":\"always\",\"prompt\":\"<OCR>\",\"reader\":{\"provider\":\"antfly\",\"model\":\"multistage-integration@1111111111111111111111111111111111111111\"}}}}";
+    const producer_json = "{\"type\":\"document_extraction\",\"config\":{\"content_type\":\"application/pdf\",\"ocr\":{\"mode\":\"always\",\"prompt\":\"<OCR>\",\"reader\":{\"provider\":\"antfly\",\"model\":\"integration/multistage-integration@1111111111111111111111111111111111111111\"}}}}";
     var descriptions = std.heap.ArenaAllocator.init(alloc);
     defer descriptions.deinit();
     const description = descriptions.allocator();
