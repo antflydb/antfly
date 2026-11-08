@@ -22,7 +22,7 @@ pub fn configureTest(b: *std.Build, run: *std.Build.Step.Run, bridge: ?std.Build
     if (bridge) |path| {
         const arguments = run.argv.toOwnedSlice(b.allocator) catch @panic("OOM");
         run.addArg("env");
-        run.addPrefixedFileArg("ANTFLY_APPLE_BRIDGE_PATH=", path);
+        run.addFileArg2(path, .{ .prefix = "ANTFLY_APPLE_BRIDGE_PATH=", .make_absolute = true });
         run.argv.appendSlice(b.allocator, arguments) catch @panic("OOM");
         run.has_side_effects = true;
     }
