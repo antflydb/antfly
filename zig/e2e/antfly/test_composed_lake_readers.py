@@ -362,22 +362,43 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 assert_highlights(value, body["full_text_search"]["match"])
             return r.status_code, value
 
-        def wait_query(name, query, *, strict=False):
-            deadline = time.monotonic() + 120
+        def wait_query(
+            name, query, *, strict=False, setup_timeout=120, publication_barrier=False
+        ):
+            if publication_barrier:
+                assert strict
+                assert not query.get("remote_snapshot")
+                assert not query.get("source_cursor")
+                requirements = query["read_requirements"]
+                assert requirements["visibility"] == "published"
+                assert requirements["after_write"]
+            deadline = time.monotonic() + setup_timeout
+            conflicts = 0
             while True:
                 status, value = call(
                     "POST",
                     f"/tables/{name}/query",
                     query,
-                    allow=(503,) if strict else (409, 503),
+                    allow=(503,) if strict and not publication_barrier else (409, 503),
                 )
                 if status == 200:
+                    if publication_barrier:
+                        record_property("published_binding_conflicts", conflicts)
                     return value
                 if strict:
-                    assert (
-                        value.get("code") == "index_rebuilding"
-                        and value.get("retryable") is True
-                    ), value
+                    if status == 409:
+                        # Publication can replace the snapshot between binding
+                        # and opening it. Resubmit this fresh receipt barrier;
+                        # every attempt keeps the same table/incarnation fence.
+                        assert publication_barrier and value == {
+                            "error": "catalog changed during query binding"
+                        }, value
+                        conflicts += 1
+                    else:
+                        assert (
+                            value.get("code") == "index_rebuilding"
+                            and value.get("retryable") is True
+                        ), value
                 assert time.monotonic() < deadline, value
                 time.sleep(0.1)
 
@@ -517,7 +538,16 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             text["highlight"] = {"fields": ["body"]}
         if index_selector == "explicit":
             text["full_text_index"] = "body_text"
-        wait_query("history", {**text, "limit": 1})
+        initial_ready_started = time.monotonic()
+        wait_query(
+            "history",
+            {**text, "limit": 1},
+            setup_timeout=600 if archive_rows >= 10_000 else 120,
+        )
+        record_property(
+            "history_initial_ready_ms",
+            (time.monotonic() - initial_ready_started) * 1000,
+        )
         wait_query(
             "current",
             {
@@ -1091,6 +1121,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                             },
                         },
                         strict=True,
+                        publication_barrier=True,
                     )
                     assert {
                         hit["_source"]["id"] for hit in published["hits"]["hits"]
