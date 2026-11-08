@@ -13546,11 +13546,11 @@ pub fn runNativeDocumentPreparationIntegration(alloc: Allocator, io: Io, pdf_byt
     defer descriptions.deinit();
     const description = descriptions.allocator();
     var requests: [keys.len][1]enrichment_types.GeneratedEnrichmentRequest = undefined;
-    var plans: std.ArrayListUnmanaged(RequestPlanCacheEntry) = .empty;
+    var plans = RequestPlanCache{};
     defer plans.deinit(alloc);
     for (keys, 0..) |key, i| {
         requests[i] = .{.{ .kind = .asset, .index_name = "", .artifact_name = "units", .source_field = "url", .doc_key = key, .producer_json = producer_json }};
-        try plans.append(alloc, .{ .doc_key = @constCast(key), .requests = &requests[i] });
+        try plans.put(alloc, key, &requests[i]);
         const bytes = try std.fmt.allocPrint(description, "{s}\n% prefetch document {d}\n", .{ pdf_bytes, i });
         const base64 = std.base64.standard.Encoder;
         const encoded = try description.alloc(u8, base64.calcSize(bytes.len));
@@ -14016,7 +14016,7 @@ const DocumentPreparationPipeline = struct {
         }
         return free;
     }
-    fn startNext(self: *@This(), current: enrichment_worker.PendingDocumentGroup, next: enrichment_worker.PendingDocumentGroup, plans: *std.ArrayListUnmanaged(RequestPlanCacheEntry), cache: *PreparedDocumentSourceCache) !void {
+    fn startNext(self: *@This(), current: enrichment_worker.PendingDocumentGroup, next: enrichment_worker.PendingDocumentGroup, plans: *RequestPlanCache, cache: *PreparedDocumentSourceCache) !void {
         const io = self.runtime.config.io orelse return;
         if (!platform.env.getenvBoolDefault("ANTFLY_ENRICHMENT_DOCUMENT_PREFETCH", true)) return;
         const slot = for (&self.jobs) |*value| {
@@ -46136,10 +46136,10 @@ test "document preparation full queue does not plan or fetch another source" {
     var first: DocumentPreparationPipeline.Job = undefined;
     var second: DocumentPreparationPipeline.Job = undefined;
     var pipeline = DocumentPreparationPipeline{ .runtime = &runtime, .guard = .{}, .jobs = .{ &first, &second } };
-    var plans: std.ArrayListUnmanaged(RequestPlanCacheEntry) = .empty;
+    var plans = RequestPlanCache{};
     var cache: PreparedDocumentSourceCache = undefined;
     try pipeline.startNext(.{ .doc_key = "current", .sequence = 1 }, .{ .doc_key = "next", .sequence = 2 }, &plans, &cache);
-    try std.testing.expectEqual(@as(usize, 0), plans.items.len);
+    try std.testing.expectEqual(@as(usize, 0), plans.count());
 }
 
 const DocumentPreparationTestWindow = struct {
