@@ -164,6 +164,8 @@ final class StoreProtocol: URLProtocol, @unchecked Sendable {
   #expect(store.state == .idle)
   #expect(store.result == "Clean.")
   #expect(store.history.count == 1)
+  await store.historyPersistenceTask?.value
+  while await probe.uploads.isEmpty { await Task.yield() }
   let dispatched = await probe.uploads.count
   #expect(dispatched == 1)
   await probe.release()
@@ -401,4 +403,247 @@ func manualHistoryRetryDoesNotRetargetOldTranscriptsAfterConnectionChanges() asy
   try await queue.discard(ids: [entry.id])
   await queue.resume(hold)
   #expect((await queue.status()).paused)
+}
+
+private actor HistorySignal {
+  var sent = false
+  var waiters: [CheckedContinuation<Void, Never>] = []
+  func send() {
+    sent = true
+    let pending = waiters
+    waiters = []
+    pending.forEach { $0.resume() }
+  }
+  func wait() async { if !sent { await withCheckedContinuation { waiters.append($0) } } }
+}
+
+@Test @MainActor func retentionDisableFencesAnActiveManualHistoryUpload() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  var config = Configuration()
+  config.retainHistory = true
+  try JSONEncoder().encode(config).write(to: directory.appendingPathComponent("settings.json"))
+  let probe = HistoryProbe()
+  await probe.release()
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    historyUpload: { await probe.upload($0, to: $1) },
+    credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  let queue = try #require(store.outbox)
+  await store.historyPersistenceTask?.value
+  store.history = (0..<200).map { _ in historyEntry() }
+  store.syncHistory()
+  while await probe.uploads.isEmpty { await Task.yield() }
+  store.config.retainHistory = false
+  store.save()
+  await store.historySettingsTask?.value
+  let completedAtDisable = await probe.uploads.count
+  while store.historyWorking { await Task.yield() }
+  #expect(await probe.uploads.count == completedAtDisable)
+  #expect((await queue.status()).paused)
+  #expect((await queue.status()).pending == 0)
+  #expect(store.history.isEmpty)
+}
+
+@Test @MainActor func unreadableSettingsPreserveQueuedHistoryAndAudioUntilExplicitRecovery()
+  async throws
+{
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let queueDirectory = directory.appendingPathComponent("outbox")
+  let queue = try HistoryOutbox(
+    directory: queueDirectory, paused: true,
+    upload: { _, _ in Issue.record("Untrusted settings resumed uploads") })
+  let entry = historyEntry()
+  try await queue.enqueue(
+    entry, destination: .init(server: "https://original.example", table: "dictation"))
+  let historyFile = directory.appendingPathComponent("history.json")
+  let audioFile = directory.appendingPathComponent("last-recording.wav")
+  let archived = try JSONEncoder().encode([entry])
+  try archived.write(to: historyFile)
+  try Data([1, 2, 3]).write(to: audioFile)
+  try Data("{".utf8).write(to: directory.appendingPathComponent("settings.json"))
+  let probe = HistoryProbe()
+  await probe.release()
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    historyUpload: { await probe.upload($0, to: $1) },
+    credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  #expect(store.settingsLoadError != nil)
+  #expect(await store.outbox?.status().pending == 1)
+  #expect(await store.outbox?.status().paused == true)
+  #expect(try Data(contentsOf: historyFile) == archived)
+  #expect(try Data(contentsOf: audioFile) == Data([1, 2, 3]))
+  store.config.retainHistory = true
+  store.config.retainAudio = true
+  store.save()
+  await store.historySettingsTask?.value
+  await store.outbox?.waitUntilIdle()
+  #expect(store.settingsLoadError == nil && store.history.map(\.id) == [entry.id])
+  #expect(await probe.uploads == [entry.id])
+}
+
+@Test @MainActor func historyDiskWriteDoesNotGateResultOrNextRecording() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  var config = Configuration()
+  config.retainHistory = true
+  config.autoPaste = false
+  try JSONEncoder().encode(config).write(to: directory.appendingPathComponent("settings.json"))
+  let began = HistorySignal()
+  let release = HistorySignal()
+  let settings = URLSessionConfiguration.ephemeral
+  settings.protocolClasses = [StoreProtocol.self]
+  let connection = try AntflyClient(
+    server: "https://fixture.example", session: URLSession(configuration: settings))
+  let store = Store(
+    directory: directory, registerHotkey: false, historyUpload: { _, _ in },
+    historyArchiveBeforeWrite: {
+      await began.send()
+      await release.wait()
+    },
+    clientFactory: { _ in connection }, credentialReader: { _ in "" }, credentialWriter: { _, _ in }
+  )
+  await store.historyPersistenceTask?.value
+  store.submit(audio: Data([1]), preset: config.presets[0], snapshot: config, destination: nil)
+  await store.requestTask?.value
+  await began.wait()
+  #expect(store.result == "Clean." && store.state == .idle && store.phase == .ready)
+  store.config.retainHistory = false
+  store.save()
+  await release.send()
+  await store.historySettingsTask?.value
+  #expect(await store.outbox?.status().pending == 0)
+  let saved = try JSONDecoder().decode(
+    [HistoryEntry].self, from: Data(contentsOf: directory.appendingPathComponent("history.json")))
+  #expect(saved.isEmpty)
+}
+
+@Test func historyArchiveBoundsBytesAndCountBeforeEncoding() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  var large = historyEntry()
+  large.raw = String(repeating: "\u{0001}", count: 65536)
+  large.text = String(repeating: "t", count: 65536)
+  let entries = Array(repeating: large, count: 500)
+  let bounded = HistoryArchive.bounded(entries)
+  #expect(!bounded.isEmpty && bounded.count < 500)
+  let file = directory.appendingPathComponent("history.json")
+  let archive = HistoryArchive(file: file)
+  try await archive.store(entries, revision: 1)
+  let data = try Data(contentsOf: file)
+  #expect(data.count <= HistoryArchive.maxBytes)
+  #expect(try JSONDecoder().decode([HistoryEntry].self, from: data) == bounded)
+}
+
+@Test @MainActor func missingSettingsCannotTurnShortcutSetupIntoRetentionDeletion() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let queueDirectory = directory.appendingPathComponent("outbox")
+  let queue = try HistoryOutbox(directory: queueDirectory, paused: true, upload: { _, _ in })
+  let entry = historyEntry()
+  try await queue.enqueue(
+    entry, destination: .init(server: "https://original.example", table: "dictation"))
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    credentialReader: { _ in "" }, credentialWriter: { _, _ in }, keyboardAccess: { true })
+  #expect(store.settingsLoadError != nil)
+  store.setUpShortcut()
+  #expect(store.shortcutSetupStatus.contains("Settings are missing"))
+  #expect(
+    !FileManager.default.fileExists(atPath: directory.appendingPathComponent("settings.json").path))
+  #expect(await store.outbox?.status().pending == 1)
+  #expect(await store.outbox?.status().paused == true)
+}
+
+@Test @MainActor func anEmptyFirstLaunchOutboxDoesNotRequireSettingsRecovery() throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let first = Store(directory: directory, registerHotkey: false)
+  #expect(first.settingsLoadError == nil)
+  let restarted = Store(directory: directory, registerHotkey: false)
+  #expect(restarted.settingsLoadError == nil)
+}
+
+@Test @MainActor func normalQuitFinishesLocalHistoryWithoutWaitingForRemoteUpload() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  var config = Configuration()
+  config.retainHistory = true
+  config.autoPaste = false
+  try JSONEncoder().encode(config).write(to: directory.appendingPathComponent("settings.json"))
+  let began = HistorySignal()
+  let release = HistorySignal()
+  let probe = HistoryProbe()
+  let options = URLSessionConfiguration.ephemeral
+  options.protocolClasses = [StoreProtocol.self]
+  let connection = try AntflyClient(
+    server: "https://fixture.example", session: URLSession(configuration: options))
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    historyUpload: { await probe.upload($0, to: $1) },
+    historyArchiveBeforeWrite: {
+      await began.send()
+      await release.wait()
+    },
+    clientFactory: { _ in connection }, credentialReader: { _ in "" }, credentialWriter: { _, _ in }
+  )
+  await store.historyPersistenceTask?.value
+  store.submit(audio: Data([1]), preset: config.presets[0], snapshot: config, destination: nil)
+  await store.requestTask?.value
+  await began.wait()
+  var quitReady = false
+  let quit = Task {
+    await store.prepareToQuit()
+    quitReady = true
+  }
+  await Task.yield()
+  #expect(!quitReady)
+  await release.send()
+  await quit.value
+  let saved = try JSONDecoder().decode(
+    [HistoryEntry].self, from: Data(contentsOf: directory.appendingPathComponent("history.json")))
+  #expect(saved.count == 1 && saved[0].text == "Clean.")
+  #expect(await store.outbox?.status().pending == 1)
+  await probe.release()
+  await store.outbox?.waitUntilIdle()
+}
+
+@Test @MainActor func suspendedStorageBoundsPendingWorkAndCoalescesTheLatestArchive() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  var config = Configuration()
+  config.retainHistory = true
+  try JSONEncoder().encode(config).write(to: directory.appendingPathComponent("settings.json"))
+  let began = HistorySignal()
+  let release = HistorySignal()
+  let store = Store(
+    directory: directory, registerHotkey: false, historyUpload: { _, _ in },
+    historyArchiveBeforeWrite: {
+      await began.send()
+      await release.wait()
+    },
+    credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  await store.historyPersistenceTask?.value
+  let tasks = (0..<100).map { _ in
+    var entry = historyEntry()
+    entry.raw = String(repeating: "r", count: 65536)
+    entry.text = String(repeating: "t", count: 65536)
+    return Task { await store.recordHistory(entry, snapshot: config) }
+  }
+  await began.wait()
+  while store.pendingHistoryEntries < 80 { await Task.yield() }
+  for _ in 0..<100 { await Task.yield() }
+  #expect(store.pendingHistoryEntries < 100)
+  await release.send()
+  for task in tasks { await task.value }
+  await store.historyPersistenceTask?.value
+  await store.outbox?.waitUntilIdle()
+  #expect(store.pendingHistoryEntries == 0)
+  #expect(store.historySyncStatus.contains("backlog is full"))
+  let file = directory.appendingPathComponent("history.json")
+  let data = try Data(contentsOf: file)
+  #expect(data.count <= HistoryArchive.maxBytes)
+  let saved = try JSONDecoder().decode([HistoryEntry].self, from: data)
+  #expect(saved.map(\.id) == store.history.map(\.id))
 }

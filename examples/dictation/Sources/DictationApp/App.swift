@@ -6,19 +6,36 @@ import DictationCore
 import SwiftUI
 
 @main struct DictationApp: App {
+  @NSApplicationDelegateAdaptor(DictationLifecycle.self) private var lifecycle
   @StateObject private var store = Store()
   var body: some Scene {
     WindowGroup("Antfly Dictation", id: "settings") {
       SettingsView(store: store).frame(minWidth: 760, minHeight: 640)
+        .onAppear { lifecycle.store = store }
     }
     MenuBarExtra {
-      MenuContent(store: store)
+      MenuContent(store: store).onAppear { lifecycle.store = store }
     } label: {
       Image(
         systemName: store.state == .recording
           ? "mic.fill" : store.state == .processing ? "ellipsis.circle" : "waveform")
     }
     .menuBarExtraStyle(.window)
+  }
+}
+
+@MainActor final class DictationLifecycle: NSObject, NSApplicationDelegate {
+  weak var store: Store?
+  private var terminating = false
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    guard let store else { return .terminateNow }
+    guard !terminating else { return .terminateLater }
+    terminating = true
+    Task {
+      await store.prepareToQuit()
+      sender.reply(toApplicationShouldTerminate: true)
+    }
+    return .terminateLater
   }
 }
 
@@ -80,6 +97,9 @@ struct SettingsView: View {
         presets.tabItem { Text("Presets & dictionary") }.tag(1)
         transcript.tabItem { Text("Transcript") }.tag(2)
         history.tabItem { Text("History") }.tag(3)
+      }
+      if let error = store.settingsLoadError {
+        Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
       }
       Text(store.message).font(.callout).textSelection(.enabled).frame(
         maxWidth: .infinity, alignment: .leading)

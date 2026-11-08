@@ -401,9 +401,11 @@ final class CaptureConverter: @unchecked Sendable {
         "Focused text field changed. Copy the transcript to insert it manually.")
     }
   }
-  func paste(_ text: String) async throws {
+  func paste(_ text: String, validate: @MainActor () throws -> Void = {}) async throws {
+    try validate()
     try validatePasteTarget()
     try await DesktopClipboard.shared.paste(text) {
+      try validate()
       try validatePasteTarget()
       guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
         let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false)

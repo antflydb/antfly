@@ -231,3 +231,47 @@ private final class DiscoveryProtocol: URLProtocol, @unchecked Sendable {
   #expect(store.state == .idle && store.result == "Clean.")
   #expect(store.processingWarning.contains("Audio archive unavailable"))
 }
+
+@Test @MainActor func cancelingOriginalInsertionBeforeClipboardReadFinishesCannotPaste()
+  async throws
+{
+  let directory = try lifecycleDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let began = LifecycleSignal()
+  let release = LifecycleSignal()
+  var sends = 0
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    originalPaster: { _, validate in
+      await began.send()
+      await release.wait()
+      try validate()
+      sends += 1
+    }, credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  store.preview = "Recovered transcript"
+  store.canRecoverRaw = true
+  store.insertOriginal()
+  let insertion = store.requestTask
+  await began.wait()
+  store.cancel()
+  await release.send()
+  await insertion?.value
+  #expect(sends == 0)
+  #expect(store.state == .idle && store.phase == .canceled)
+}
+
+@Test @MainActor func oversizedSettingsCannotReplaceSavedPreferencesOrCredentials() throws {
+  let directory = try lifecycleDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let file = directory.appendingPathComponent("settings.json")
+  let saved = try Data(contentsOf: file)
+  var writes = 0
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    credentialReader: { _ in "" }, credentialWriter: { _, _ in writes += 1 })
+  store.config.presets[0].appIDs = [String(repeating: "a", count: Configuration.maxEncodedBytes)]
+  store.save()
+  #expect(store.message.contains("Settings exceed"))
+  #expect(try Data(contentsOf: file) == saved)
+  #expect(writes == 0)
+}

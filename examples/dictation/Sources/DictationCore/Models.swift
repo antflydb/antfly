@@ -72,6 +72,7 @@ extension Preset {
 }
 
 public struct Configuration: Codable, Equatable, Sendable {
+  public static let maxEncodedBytes = 1_048_576
   public var version = 1
   public var server = "http://localhost:8080"
   public var table = "dictation"
@@ -173,10 +174,14 @@ public struct Configuration: Codable, Equatable, Sendable {
     }
     var normalized = self
     normalized.server = origin
+    guard try JSONEncoder().encode(normalized).count <= Self.maxEncodedBytes else {
+      throw DictationError.invalid(
+        "Settings exceed 1 MiB. Reduce presets, dictionaries, or instructions before saving.")
+    }
     return normalized
   }
   public static func decode(_ data: Data) throws -> Configuration {
-    guard data.count <= 1_048_576 else {
+    guard data.count <= maxEncodedBytes else {
       throw DictationError.invalid("Settings file exceeds 1 MiB.")
     }
     return try JSONDecoder().decode(Configuration.self, from: data).validated()

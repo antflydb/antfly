@@ -405,3 +405,18 @@ History deletion waits for dispatched uploads even when retention is disabled du
 the wait. An unavailable outbox prevents successful remote deletion, preserving the local
 records for retry. Disabling retention retires an unavailable queue before removing its
 files, preventing later queue recovery from uploading discarded transcripts.
+
+
+History persistence also runs outside result delivery. The desktop app immediately
+returns to idle, then an ordered writer saves the latest bounded local snapshot and
+enqueues remote uploads. Local history is limited to 500 entries and a conservative
+16 MiB JSON budget; queued upload work is bounded separately. Normal application
+termination drains local persistence without waiting for remote synchronization.
+
+Saving retention off invalidates earlier history producers, including manual uploads
+and startup migration, and drains them before purging pending jobs. Unreadable or
+missing settings preserve existing retained data and pause uploads until settings
+are restored or explicitly saved. Settings validation and persistence share a 1 MiB
+limit, so accepted settings can always be loaded again. Recovery insertion uses the
+same owned cancellation task as normal delivery and checks recording generation
+immediately before sending the paste.

@@ -37,6 +37,7 @@ import SwiftUI
   @Published var working = false
   @Published var historySyncStatus = "History sync idle."
   @Published var historyWorking = false
+  @Published private(set) var settingsLoadError: String?
   @Published private(set) var shortcutStatus = ""
   private let hotkey: (any ShortcutManaging)?
   private var overlay: RecordingOverlay?
@@ -46,6 +47,14 @@ import SwiftUI
   private var overlayTask: Task<Void, Never>?
   private(set) var outbox: HistoryOutbox?
   private var historyRevision: UInt64 = 0
+  private var historyEpoch = UUID()
+  private var appliedHistoryRetention = false
+  private var terminating = false
+  private(set) var historyPersistenceTask: Task<Void, Never>?
+  private(set) var pendingHistoryEntries = 0
+  private var pendingHistoryBytes = 0
+  private var archiveOnlyQueued = false
+  private var historyPersistenceWarning: String?
   private(set) var historySettingsTask: Task<Void, Never>?
   private var microphone: Microphone?
   private var target: InsertionTarget?
@@ -73,6 +82,8 @@ import SwiftUI
   private var retryRecording: PCMRecording?
   private var retryPreset: Preset?
   private let clientFactory: (@Sendable (Configuration) throws -> AntflyClient)?
+  private let originalPaster:
+    (@MainActor (String, @escaping @MainActor () throws -> Void) async throws -> Void)?
   private let directory: URL
   private let archive: HistoryArchive
   private var settingsFile: URL { directory.appendingPathComponent("settings.json") }
@@ -80,11 +91,15 @@ import SwiftUI
   init(
     directory storageDirectory: URL? = nil, registerHotkey: Bool = true,
     historyUpload: HistoryOutbox.Upload? = nil,
+    historyArchiveBeforeWrite: @escaping @Sendable () async throws -> Void = {},
     audioArchiveStage: @escaping @Sendable (Data, URL) async throws -> URL = {
       try await RecordingArchive.stage($0, in: $1)
     },
     clientFactory: (@Sendable (Configuration) throws -> AntflyClient)? = nil,
     shortcutManager: (any ShortcutManaging)? = nil,
+    originalPaster: (
+      @MainActor (String, @escaping @MainActor () throws -> Void) async throws -> Void
+    )? = nil,
     credentialReader: @escaping @MainActor (String) -> String = { Credentials.read(server: $0) },
     credentialWriter: @escaping @MainActor (String, String) throws -> Void = {
       try Credentials.save($0, server: $1)
@@ -97,6 +112,7 @@ import SwiftUI
     },
     settingsOpener: @escaping @MainActor (String) -> Void = { DesktopSettings.open($0) }
   ) {
+    self.originalPaster = originalPaster
     self.audioArchiveStage = audioArchiveStage
     self.keyboardAccess = keyboardAccess
     self.keyboardAccessRequest = keyboardAccessRequest
@@ -109,22 +125,46 @@ import SwiftUI
       ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
       .appendingPathComponent("AntflyDictation")
     self.directory = directory
-    archive = HistoryArchive(file: directory.appendingPathComponent("history.json"))
+    archive = HistoryArchive(
+      file: directory.appendingPathComponent("history.json"), beforeWrite: historyArchiveBeforeWrite
+    )
     hotkey = shortcutManager ?? (registerHotkey ? Hotkey() : nil)
+    var loadedSettings = false
     do {
       try FileManager.default.createDirectory(
         at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
       try RecordingArchive.removeStaleCandidates(in: directory)
       if FileManager.default.fileExists(atPath: settingsFile.path) {
         config = try Configuration.decode(Data(contentsOf: settingsFile))
+        loadedSettings = true
       }
-      if !config.retainHistory, FileManager.default.fileExists(atPath: historyFile.path) {
+      if loadedSettings, !config.retainHistory,
+        FileManager.default.fileExists(atPath: historyFile.path)
+      {
         try FileManager.default.removeItem(at: historyFile)
       }
-      if !config.retainAudio { try removeAudio() }
-    } catch { message = error.localizedDescription }
+      if loadedSettings, !config.retainAudio { try removeAudio() }
+    } catch {
+      settingsLoadError =
+        "Settings could not be loaded. Retained data is preserved and uploads are paused. "
+        + error.localizedDescription
+    }
+    if !loadedSettings, settingsLoadError == nil,
+      ["history.json", "last-recording.wav"].contains(where: {
+        FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
+      })
+        || (try? FileManager.default.contentsOfDirectory(
+          atPath: directory.appendingPathComponent("outbox").path
+        ).isEmpty) == false
+    {
+      settingsLoadError =
+        "Settings are missing. Retained data is preserved and uploads are paused. Restore your settings or explicitly save the desired retention preferences."
+    }
+    appliedHistoryRetention = loadedSettings && config.retainHistory
     if config.retainHistory, let data = try? Data(contentsOf: historyFile) {
-      do { history = try JSONDecoder().decode([HistoryEntry].self, from: data) } catch {
+      do {
+        history = HistoryArchive.bounded(try JSONDecoder().decode([HistoryEntry].self, from: data))
+      } catch {
         historySyncStatus = "Local history could not be loaded: " + error.localizedDescription
       }
     }
@@ -138,7 +178,7 @@ import SwiftUI
     }
     do {
       // Disabled retention is authoritative after a crash, before any queue resumes.
-      if !config.retainHistory {
+      if loadedSettings, !config.retainHistory {
         let queue = directory.appendingPathComponent("outbox")
         if FileManager.default.fileExists(atPath: queue.path) {
           try FileManager.default.removeItem(at: queue)
@@ -152,9 +192,12 @@ import SwiftUI
             entry, table: destination.table)
         }, changed: { [weak self] status in await self?.updateHistoryStatus(status) })
     } catch { historySyncStatus = "History sync unavailable: " + error.localizedDescription }
-    if config.retainHistory {
+    if loadedSettings, config.retainHistory, settingsLoadError == nil {
       let legacyDestination = HistoryDestination(server: config.server, table: config.table)
-      Task { await restoreHistoryDestinations(legacyDestination: legacyDestination) }
+      let epoch = historyEpoch
+      enqueueHistoryWork {
+        await self.restoreHistoryDestinations(legacyDestination: legacyDestination, epoch: epoch)
+      }
     }
     if registerHotkey { loadCredential(for: config.server) }
     hotkey?.changed = { [weak self] down in self?.shortcut(down: down) }
@@ -230,6 +273,7 @@ import SwiftUI
     guard shortcutSetupPending, keyboardAccess() else { return }
     let previous = registered
     do {
+      if let settingsLoadError { throw DictationError.invalid(settingsLoadError) }
       // Apply only the shortcut, preserving saved preferences and credentials.
       let previousData =
         FileManager.default.fileExists(atPath: settingsFile.path)
@@ -273,6 +317,14 @@ import SwiftUI
   }
   private func persistSettings() throws -> String? {
     config = try config.validated()
+    let recoveringSettings = settingsLoadError != nil
+    if recoveringSettings, config.retainHistory,
+      FileManager.default.fileExists(atPath: historyFile.path)
+    {
+      history = HistoryArchive.bounded(
+        try JSONDecoder().decode([HistoryEntry].self, from: Data(contentsOf: historyFile)))
+      historyRevision += 1
+    }
     // Unloaded credentials are different from a token explicitly cleared by the user.
     if credentialOrigin != config.server && !credentialEdited { loadCredential(for: config.server) }
     try credentialWriter(token, config.server)
@@ -284,13 +336,15 @@ import SwiftUI
       shortcutIssue = error.localizedDescription
       shortcutStatus = error.localizedDescription
     }
-    let previousHistorySettings = historySettingsTask
+    settingsLoadError = nil
+    if !config.retainHistory || !appliedHistoryRetention { historyEpoch = UUID() }
+    appliedHistoryRetention = config.retainHistory
+    let epoch = historyEpoch
     if !config.retainHistory {
       history = []
       historyRevision += 1
       let revision = historyRevision
-      historySettingsTask = Task {
-        await previousHistorySettings?.value
+      historySettingsTask = enqueueHistoryWork { [self] in
         await outbox?.setEnabled(false)
         do {
           if let outbox {
@@ -298,26 +352,29 @@ import SwiftUI
           } else {
             // No worker exists when initialization failed. Atomically retire the
             // whole queue, including malformed jobs, before removing its files.
-            let queue = directory.appendingPathComponent("outbox")
-            if FileManager.default.fileExists(atPath: queue.path) {
-              let retired = directory.appendingPathComponent("retired-outbox-" + UUID().uuidString)
-              try FileManager.default.moveItem(at: queue, to: retired)
-              try FileManager.default.removeItem(at: retired)
-            }
+            try await archive.retireOutbox(at: directory.appendingPathComponent("outbox"))
           }
           try await archive.store([], revision: revision)
+          historyPersistenceWarning = nil
         } catch { historySyncStatus = error.localizedDescription }
       }
     } else {
-      historySettingsTask = Task {
-        await previousHistorySettings?.value
-        await outbox?.resume()
+      historySettingsTask = enqueueHistoryWork { [self] in
+        guard self.historyEpoch == epoch, self.config.retainHistory else { return }
+        if recoveringSettings {
+          await self.restoreHistoryDestinations(
+            legacyDestination: HistoryDestination(
+              server: self.config.server, table: self.config.table), epoch: epoch)
+        } else {
+          await self.outbox?.resume()
+        }
       }
     }
     if !config.retainAudio { try removeAudio() }
     return shortcutIssue
   }
   func save() {
+    guard !terminating else { return }
     perform {
       let issue = try self.persistSettings()
       self.message =
@@ -343,8 +400,9 @@ import SwiftUI
     if next == .recording { start() } else if next == .processing { finish() }
   }
   func start() {
-    guard state == .idle, !working, !capturingShortcut else { return }
+    guard !terminating, state == .idle, !working, !capturingShortcut else { return }
     do {
+      if let settingsLoadError { throw DictationError.invalid(settingsLoadError) }
       let snapshot = try config.validated()
       guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
         throw DictationError.invalid("Allow microphone access in Settings before recording.")
@@ -603,7 +661,7 @@ import SwiftUI
           let entry = HistoryEntry(
             preset: preset.name, model: preset.model, application: destination?.bundleID ?? "",
             raw: output.raw, text: output.text, status: status)
-          await recordHistory(entry, snapshot: snapshot)
+          scheduleHistory(entry, snapshot: snapshot)
         }
         guard generation == run else { return }
         if !snapshot.retainAudio { retryRecording = nil }
@@ -628,7 +686,7 @@ import SwiftUI
             preset: preset.name, model: preset.model, application: destination?.bundleID ?? "",
             raw: preview, text: "",
             status: "error: " + String(error.localizedDescription.prefix(2048)))
-          await recordHistory(entry, snapshot: snapshot)
+          scheduleHistory(entry, snapshot: snapshot)
         }
       }
     }
@@ -663,12 +721,21 @@ import SwiftUI
     let captured = target
     let run = generation
     state = .processing
-    Task {
+    requestTask = Task { [self] in
       do {
-        guard let captured else {
-          throw DictationError.invalid("No original text field. Copy the transcript instead.")
+        let validate: @MainActor () throws -> Void = { [self] in
+          try Task.checkCancellation()
+          guard generation == run else { throw CancellationError() }
         }
-        try await captured.paste(original)
+        try validate()
+        if let originalPaster {
+          try await originalPaster(original, validate)
+        } else {
+          guard let captured else {
+            throw DictationError.invalid("No original text field. Copy the transcript instead.")
+          }
+          try await captured.paste(original, validate: validate)
+        }
         guard generation == run else { return }
         state = .idle
         result = original
@@ -775,6 +842,15 @@ import SwiftUI
     retryRecording = nil
     message = "Canceled remaining work."
   }
+  /// Finish durable local work on normal app termination. Remote uploads remain
+  /// in the outbox for restart; quitting does not wait for network synchronization.
+  func prepareToQuit() async {
+    terminating = true
+    working = true
+    hotkey?.unregister()
+    cancel()
+    await historyPersistenceTask?.value
+  }
   func retry() {
     guard state == .idle, !working, let recording = retryRecording, let original = retryPreset
     else {
@@ -855,34 +931,87 @@ import SwiftUI
     }
   }
   private func updateHistoryStatus(_ status: HistoryOutbox.Status) {
-    historySyncStatus =
+    let current =
       status.error.map { "\(status.pending) pending · " + $0 }
       ?? (status.pending == 0 ? "History synced." : "\(status.pending) pending upload(s).")
+    historySyncStatus = historyPersistenceWarning.map { $0 + " " + current } ?? current
   }
-  /// Enqueue waits for durable local persistence only, never for the remote upload.
-  func recordHistory(_ entry: HistoryEntry, snapshot: Configuration) async {
-    guard config.retainHistory else { return }
-    var entry = entry
+  /// All producers and retention transitions share one ordered owner. A Save
+  /// invalidates producers immediately, then drains them before purging the queue.
+  @discardableResult private func enqueueHistoryWork(
+    _ action: @escaping @MainActor () async throws -> Void
+  ) -> Task<Void, Never> {
+    let previous = historyPersistenceTask
+    let task = Task { [self] in
+      await previous?.value
+      do { try await action() } catch {
+        historyPersistenceWarning = "Local history / sync error: " + error.localizedDescription
+        historySyncStatus = historyPersistenceWarning!
+      }
+    }
+    historyPersistenceTask = task
+    return task
+  }
+  @discardableResult private func scheduleHistory(_ original: HistoryEntry, snapshot: Configuration)
+    -> Task<Void, Never>?
+  {
+    guard config.retainHistory, settingsLoadError == nil else { return nil }
+    var entry = original
     entry.destination =
       entry.destination ?? HistoryDestination(server: snapshot.server, table: snapshot.table)
-    history.insert(entry, at: 0)
-    history = Array(history.prefix(500))
+    let bounded = HistoryArchive.bounded([entry] + history)
+    guard bounded.contains(where: { $0.id == entry.id }) else {
+      historyPersistenceWarning =
+        "Transcript exceeds the local history byte limit. It remains available to copy or export."
+      historySyncStatus = historyPersistenceWarning!
+      return nil
+    }
+    history = bounded
     historyRevision += 1
-    let revision = historyRevision
-    let archive = history
-    do {
-      try await self.archive.store(archive, revision: revision)
+    let epoch = historyEpoch
+    let bytes = HistoryArchive.estimatedBytes(entry)
+    guard pendingHistoryEntries < 500, bytes <= 64 * 1024 * 1024 - pendingHistoryBytes else {
+      historyPersistenceWarning =
+        "History upload backlog is full. Keeping bounded local history; upload it manually after storage recovers."
+      historySyncStatus = historyPersistenceWarning!
+      // One coalesced archive job preserves local retention without accumulating
+      // entry tasks or old snapshots while disk persistence is suspended.
+      guard !archiveOnlyQueued else { return historyPersistenceTask }
+      archiveOnlyQueued = true
+      return enqueueHistoryWork { [self] in
+        defer { archiveOnlyQueued = false }
+        while config.retainHistory, settingsLoadError == nil {
+          let revision = historyRevision
+          try await archive.store(history, revision: revision)
+          if revision == historyRevision { break }
+        }
+      }
+    }
+    pendingHistoryEntries += 1
+    pendingHistoryBytes += bytes
+    return enqueueHistoryWork { [self, entry] in
+      defer {
+        pendingHistoryEntries -= 1
+        pendingHistoryBytes -= bytes
+      }
+      guard historyEpoch == epoch, config.retainHistory else { return }
+      // Capture the latest bounded snapshot only when the worker runs. Queued
+      // records coalesce archive rewrites rather than retaining old arrays.
+      try await archive.store(history, revision: historyRevision)
+      guard historyEpoch == epoch, config.retainHistory else { return }
       guard let outbox else {
         historySyncStatus = "Transcript saved locally; history sync unavailable."
         return
       }
-      guard config.retainHistory else { return }
-      try await outbox.enqueue(
-        entry, destination: entry.destination!)
-    } catch { historySyncStatus = "Local history / sync error: " + error.localizedDescription }
+      try await outbox.enqueue(entry, destination: entry.destination!)
+    }
+  }
+  /// Explicit callers can await durability; recording delivery only schedules it.
+  func recordHistory(_ entry: HistoryEntry, snapshot: Configuration) async {
+    await scheduleHistory(entry, snapshot: snapshot)?.value
   }
   private func runHistory(_ action: @escaping @MainActor () async throws -> Void) {
-    guard !historyWorking else { return }
+    guard !historyWorking, !terminating else { return }
     historyWorking = true
     Task {
       defer { historyWorking = false }
@@ -897,18 +1026,30 @@ import SwiftUI
     }
   }
   func syncHistory() {
+    let epoch = historyEpoch
+    let entries = history
     runHistory {
       let snapshot = try self.config.validated()
+      guard self.settingsLoadError == nil, self.config.retainHistory else {
+        throw DictationError.invalid(
+          "Enable and save history retention before uploading local history.")
+      }
       guard let outbox = self.outbox else {
         throw DictationError.invalid("History sync unavailable.")
       }
-      for entry in self.history {
-        try await outbox.enqueue(
-          entry,
-          destination: entry.destination
-            ?? HistoryDestination(server: snapshot.server, table: snapshot.table))
+      let work = self.enqueueHistoryWork {
+        for entry in entries {
+          guard self.historyEpoch == epoch, self.config.retainHistory else { return }
+          try await outbox.enqueue(
+            entry,
+            destination: entry.destination
+              ?? HistoryDestination(server: snapshot.server, table: snapshot.table))
+        }
+        guard self.historyEpoch == epoch, self.config.retainHistory else { return }
+        self.historyPersistenceWarning = nil
+        await outbox.resume()
       }
-      await outbox.resume()
+      await work.value
     }
   }
   func clearHistory() {
@@ -927,6 +1068,10 @@ import SwiftUI
         "History sync is unavailable. Repair the outbox before deleting remote history; no deletion has been reported as complete."
       )
     }
+    historyEpoch = UUID()
+    await historyPersistenceTask?.value
+    historyRevision += 1
+    try await archive.store(history, revision: historyRevision)
     let pauseToken = await outbox.pause()
     do {
       let pending = await outbox.destinations(for: ids) ?? [:]
@@ -959,9 +1104,10 @@ import SwiftUI
       throw error
     }
   }
-  private func restoreHistoryDestinations(legacyDestination: HistoryDestination) async {
+  private func restoreHistoryDestinations(legacyDestination: HistoryDestination, epoch: UUID) async
+  {
     let pending = await outbox?.destinations(for: Set(history.map(\.id))) ?? [:]
-    guard config.retainHistory else { return }
+    guard config.retainHistory, historyEpoch == epoch else { return }
     var migrated = false
     for index in history.indices where history[index].destination == nil {
       history[index].destination =
@@ -976,7 +1122,7 @@ import SwiftUI
         historySyncStatus = "Could not migrate history destinations: " + error.localizedDescription
       }
     }
-    guard config.retainHistory else { return }
+    guard config.retainHistory, historyEpoch == epoch else { return }
     await outbox?.resume()
   }
   func clearLocalHistory() {

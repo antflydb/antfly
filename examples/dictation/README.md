@@ -238,6 +238,12 @@ History and audio retention are off by default:
   writer keeps local retention and deletion working even if the optional outbox
   cannot open. Upload local history can also
   retry writes by stable document ID without creating duplicates.
+  Recording completion schedules persistence and returns to idle immediately.
+  The ordered background writer coalesces archive snapshots, bounds pending upload
+  work, and limits local history to 500 entries and a conservative 16 MiB JSON byte
+  budget. An entry too large for that budget remains available to copy/export.
+  Persistence errors appear in History sync status. Normal Quit drains local work;
+  remote uploads remain durable in the outbox for restart.
 - The table's full-text index searches final transcript text. Search results are
   shown as the server's JSON response, including document IDs and sources.
 - Clear local history removes the local cache. Delete local history and matching
@@ -248,17 +254,24 @@ History and audio retention are off by default:
   uploads cannot restart automatically. If the queue cannot be loaded, remote deletion
   fails closed and retains local history; it never reports success while unknown jobs
   remain. Turning retention off retires the unavailable queue so it cannot upload on
-  restart. Manual uploads also preserve destinations.
+  restart. Retention changes invalidate and drain older producers, including manual
+  uploads and startup migration, before purging. Manual uploads also preserve destinations.
   Legacy archives recover destinations from pending jobs; already uploaded legacy
   entries without destination metadata bind once to the configuration that loads
   them, since their earlier destination cannot be reconstructed. Turning history retention off removes
   pending uploads and the local archive. Older remote
-  records beyond the local 500-entry window need normal Antfly table management.
+  records beyond the local count/byte retention window need normal Antfly table management.
 - Audio retention keeps only `last-recording.wav` locally, never in Antfly. Archival
   runs independently of recognition and insertion; a disk failure produces a separate
   warning. Canceled recordings and retention changes fence pending archive writes. Saving
   settings with retention disabled deletes retained local data; remote transcripts
   require explicit deletion. Inference providers have their own retention policy.
+- Missing or invalid settings preserve retained audio/history and pause uploads.
+  Restore/import settings or explicitly save the desired retention preferences to
+  recover. Recording and shortcut-only setup wait for recovery; a missing settings
+  file cannot silently turn shortcut setup into a retention change.
+- Settings are limited to 1 MiB across validation, saving, snapshots, and import.
+  Oversized edits leave the prior settings and Keychain credentials intact.
 
 See the [voice dictation guide](../../docs/guides/voice-dictation.mdx) for the
 complete mode/capability matrix and the stable-session/text-cleanup API contract.

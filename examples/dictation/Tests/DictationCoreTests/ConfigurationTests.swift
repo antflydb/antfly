@@ -147,3 +147,20 @@ import Testing
   #expect(!preset.usesNamedTranscriber && preset.cleanupModel.isEmpty)
   #expect(catalog.transcriber("whisper")?.id == "transcribers/whisper")
 }
+
+@Test func validatedSettingsAlwaysRoundTripWithinTheFileLimit() throws {
+  var configuration = Configuration()
+  configuration.dictionary = []
+  configuration.presets = (0..<64).map { index in
+    var preset = Preset(id: "preset-\(index)", name: "Preset \(index)")
+    preset.dictionary = Array(repeating: String(repeating: "a", count: 128), count: 256)
+    return preset
+  }
+  configuration.selectedPreset = "preset-0"
+  #expect(throws: DictationError.self) { try configuration.validated() }
+  configuration.presets = Array(configuration.presets.prefix(8))
+  let valid = try configuration.validated()
+  let encoded = try JSONEncoder().encode(valid)
+  #expect(encoded.count <= Configuration.maxEncodedBytes)
+  #expect(try Configuration.decode(encoded) == valid)
+}
