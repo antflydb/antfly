@@ -242,6 +242,28 @@ compatible rows through `/extract` and `/decisions`. These use the Node-owned
 executor broker independently of the generation controls. Other execution profiles retain their existing paths. See the
 [HTTP batching contract](../design/inference/read-pool-http-batching.md).
 
+The write profile also collects independent CUDA GLiNER boundary requests with
+matching schemas/options into cohorts of up to eight rows and 4,096 padded
+tokens, with at most 512 prepared tokens per row. Length buckets bound grouping
+padding to 25% when the encoder declares attention masks. Windowed documents,
+larger rows and regex validation retain their existing exclusive execution.
+Cohorts that cannot admit their additional workspace return to the callers'
+existing serial paths before any model execution.
+Each caller retains its IDs, unpadded usage, output limits and cancellation;
+published responses retain a separate memory owner until all consumers rejoin.
+The configured public item ceiling also applies before schema-v2 extraction
+dispatch, independently of the internal cross-request cohort size.
+
+Whisper small's CUDA encoder automatically collects up to four compatible audio
+rows with a bounded 5 ms collection window. Decoder caches retain exclusive
+per-request ownership. Full-context encoder position IDs repeat independently
+for each row; batch cardinality does not reduce an audio item's context limit.
+These encoder/boundary brokers work independently of `generation_batching`.
+The shipped write profile enables LightOnOCR's separate continuous scheduler
+with two decoder rows and a four-page active window. Internal Node callers can
+override the executor collection delay, including zero; omission uses the
+backend stage's default.
+
 The cooperative policy prefers shorter contexts for up to eight consecutive turns, then grants
 the next round-robin owner. Manual final-prefill turns participate in that
 selection, so queued long chunks cannot hide a short request's final chunk.
