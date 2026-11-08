@@ -19,6 +19,7 @@ const std = @import("std");
 pub const enabled = @import("engine_selection.zig").enabled;
 const db = @import("db/db.zig");
 const DB = db.DB;
+const graph_mod = @import("../graph/graph.zig");
 const Allocator = std.mem.Allocator;
 const types = @import("db/types.zig");
 const BatchProfile = db.BatchProfile;
@@ -44,6 +45,53 @@ pub const PortableExportOptions = struct {
 };
 
 pub const VTable = struct {
+    enqueueGeneratedArtifactCatalog: *const fn (*DB) Outcome(void),
+    captureQueryCutAtStatementFence: *const fn (self: *DB, request: @import("db/native_query_cut.zig").Request, fence: *const DB.StatementReadFence, cancellation: types.CancellationToken) Outcome(void),
+    releaseStatementQueryCut: *const fn (self: *DB, request: @import("db/native_query_cut.zig").Request) Outcome(void),
+    graphEdgesForCypherPageAt: *const fn (
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        cursor: ?graph_mod.CypherEdgeScanCursor,
+        limits: graph_mod.EdgePageLimits,
+        ttl_now_ns: u64,
+    ) Outcome(graph_mod.CypherEdgePage),
+    graphEdgesForCypherPageAuthorizedAt: *const fn (
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        cursor: ?graph_mod.CypherEdgeScanCursor,
+        limits: graph_mod.EdgePageLimits,
+        ttl_now_ns: u64,
+        principal_proof: []const u8,
+        database: []const u8,
+    ) Outcome(graph_mod.CypherEdgePage),
+    graphEdgesForCypherCapturePageAuthorizedAt: *const fn (self: *DB, fence: *const DB.StatementReadFence, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8) Outcome(graph_mod.CypherEdgePage),
+    cypherDocumentScanOptions: *const fn (self: *DB, alloc: Allocator, input: types.ScanOptions) Outcome(types.ScanOptions),
+    acquireCypherReadAuthority: *const fn (self: *DB, alloc: Allocator, proof: []const u8, database: []const u8) Outcome(DB.CypherReadLease),
+    permitsCypherDocument: *const fn (self: *DB, alloc: Allocator, document: std.json.Value, json_null_fields: []const []const u8, proof: []const u8, database: []const u8) Outcome(bool),
+    cypherFieldDerivedEdgeType: *const fn (self: *const DB, index_name: []const u8, edge_type: []const u8) Outcome(bool),
+    getCypherPinnedDocument: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, types.LookupOptions) Outcome(?types.LookupResult),
+    getCypherDocuments: *const fn (*DB, Allocator, []const []const u8, types.ScanOptions, u64) Outcome([]?types.LookupResult),
+    getCypherPinnedDocuments: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const []const u8, types.ScanOptions) Outcome([]?types.LookupResult),
+    captureCypherSelectedSnapshot: *const fn (*DB, Allocator, *const DB.StatementReadFence, []const []const u8, u64, types.CancellationToken) Outcome(DB.CypherPinnedSnapshot),
+    captureCypherPinnedSnapshot: *const fn (*DB, Allocator, *const DB.StatementReadFence, @import("cypher").catalog.Graph, []const u8) Outcome(DB.CypherPinnedSnapshot),
+    visitCypherDocuments: *const fn (*DB, Allocator, []const u8, []const u8, types.ScanOptions, types.ScanVisitor) Outcome(void),
+    visitCypherPinnedDocuments: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, types.ScanOptions, types.ScanVisitor) Outcome(void),
+    scanCypherPinnedSnapshot: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, types.ScanOptions) Outcome(types.ScanResult),
+    cypherAdjacencyRoutes: *const fn (*DB, Allocator) Outcome([]const @import("cypher").backend.AdjacencyRoute),
+    cypherPinnedAdjacencyRoutes: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot) Outcome([]const @import("cypher").backend.AdjacencyRoute),
+    graphEdgesForCypherPinnedSnapshot: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, []const []const u8, graph_mod.EdgeDirection, ?graph_mod.CypherEdgeScanCursor, graph_mod.EdgePageLimits) Outcome(graph_mod.CypherEdgePage),
+    cypherPinnedSnapshotDeinit: *const fn (*DB.CypherPinnedSnapshot) Outcome(void),
+    cypherGraphIndexIdentity: *const fn (self: *const DB, alloc: Allocator, index_name: []const u8) Outcome(?@import("cypher").catalog.IndexIdentity),
+    hasRetainedQueryCut: *const fn (self: *const DB) Outcome(bool),
+    searchCypherCut: *const fn (self: *DB, alloc: Allocator, req: types.SearchRequest, proof: []const u8, database: []const u8) Outcome(types.SearchResult),
     portableExportToWriterWithOptions: *const fn (Allocator, *@import("docstore.zig").DocStore, WriterBorrow, PortableExportOptions) Outcome(void),
     openVerifiedRestoreSource: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, expected_namespace: @import("db/doc_identity.zig").Namespace) Outcome(DB),
     restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, cancellation: types.CancellationToken) Outcome(void),
@@ -93,7 +141,7 @@ pub const VTable = struct {
     writeApplyLocalTableSchemaJson: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, schema_json: []const u8) Outcome(void),
     writePrepareOwnerSchemaBeforeIndexLoad: *const fn (alloc: std.mem.Allocator, schema_json: []const u8) Outcome(?@import("db/mod.zig").SchemaBeforeIndexLoad),
     writeConfigureStorageKernelOwnerDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig) Outcome(void),
-    writeConfigureStorageKernelOwnerDbAtOpen: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig, historical_ordered_apply: bool) Outcome(bool),
+    writeConfigureStorageKernelOwnerDbAtOpen: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig, historical_ordered_apply: u8) Outcome(bool),
     writeOpenStorageKernelRestoreDb: *const fn (alloc: std.mem.Allocator, path: []const u8, indexes_json: []const u8, lsm_root_generation: u64, backend_runtime: *@import("db/mod.zig").background_runtime.BackendRuntime, identity_namespace: ?@import("db/doc_identity.zig").Namespace, prepared_restore: *const @import("backup_restore.zig").PreparedRestore) Outcome(@import("db/mod.zig").DB),
     writeRepairStorageKernelRestoreDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, group_id: u64, schema_json: []const u8, indexes_json: []const u8, cancellation: @import("db/mod.zig").types.CancellationToken) Outcome(void),
     writeReconcileStorageKernelOwnerDb: *const fn (alloc: std.mem.Allocator, db: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, target_index_name: ?[]const u8, advance_index_repair: bool, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig) Outcome(@import("../api/write_contract.zig").StorageKernelReconcileResult),
@@ -347,6 +395,9 @@ pub const VTable = struct {
     relationalReaderLookupSqlBatch: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, documents: []const []const u8, layout: *const @import("../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) Outcome(@import("db/relational_rows.zig").Reader.Hydrated),
     relationalReaderLookupTypedRow: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?*const @import("../sql/catalog.zig").Row.TypedLayout) Outcome(?@import("db/relational_rows.zig").Row),
     relationalSessionDeinit: *const fn (session: *@import("db/relational_read_session.zig").Session) Outcome(void),
+    relationalSessionVisitCypherRows: *const fn (*@import("db/relational_read_session.zig").Session, Allocator, usize, types.ScanVisitor) Outcome(void),
+    relationalSessionSeekPrefix: *const fn (*@import("db/relational_read_session.zig").Session, []const std.json.Value, ?[]const u8) Outcome(void),
+    relationalReaderSeekPrefix: *const fn (*@import("db/relational_rows.zig").Reader, []const @import("db/relational_rows.zig").Value, ?[]const u8) Outcome(void),
     relationalSessionCheckpoint: *const fn (session: *const @import("db/relational_read_session.zig").Session) Outcome(void),
     relationalSessionRangeProofs: *const fn (session: *@import("db/relational_read_session.zig").Session, alloc: Allocator) Outcome([]@import("range_protection.zig").Proof),
     relationalSessionNextTypedPage: *const fn (session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) Outcome(@import("db/relational_rows.zig").Page),

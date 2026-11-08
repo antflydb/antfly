@@ -26,6 +26,7 @@ const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 // Accommodate their bounded envelope as well as ordinary 255-byte names.
 const catalog_name_key_buffer_bytes = 2048;
 const system_catalog_storage = @import("../../system_catalog/storage.zig");
+const transaction_session_record = @import("../transaction_session_record.zig");
 const resolver_curation = @import("antfly_local_sources").storage_db_resolver_curation;
 const relation_names = @import("antfly_local_sources").system_catalog_relation_names;
 const relation_reconciliation = @import("antfly_local_sources").system_catalog_relation_reconciliation;
@@ -5896,6 +5897,7 @@ pub fn onlineMergeAdmissionDigest(alloc: std.mem.Allocator, record: metadata.Mer
 }
 
 pub const TransitionCommand = union(enum) {
+    apply_transaction_sessions: []const u8,
     advance_resolver_namespace: @import("../resolver_authority.zig").ReplayAdvance,
     apply_resolver_authority: []const u8,
     apply_relation_reconciliation: []const u8,
@@ -6067,7 +6069,7 @@ pub const TransitionCommand = union(enum) {
             .mutate_lake_index_lifecycle => |*command| command.mutation.deinitOwned(alloc),
             .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .apply_resolver_authority, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_completion_reference, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .apply_transaction_sessions, .apply_resolver_authority, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_completion_reference, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -10396,9 +10398,11 @@ fn policyHasUnsupportedArtifactIndexes(alloc: std.mem.Allocator, indexes_json: [
         if (config != .object) return error.InvalidCatalogRecord;
         const kind = config.object.get("type") orelse return error.InvalidCatalogRecord;
         if (kind != .string) return error.InvalidCatalogRecord;
-        // Relational secondary indexes recheck primary typed rows before
-        // projection. Search modalities need owner-side candidate filtering.
-        if (!std.mem.eql(u8, kind.string, "relational")) return true;
+        // Graph reads require signed owner authority and recheck both endpoints.
+        // Relational indexes likewise recheck primary typed rows. Cypher
+        // full-text search filters candidates and corpus statistics first.
+        // Public raw graph/search APIs remain gated while a policy is active.
+        if (!std.mem.eql(u8, kind.string, "relational") and !std.mem.eql(u8, kind.string, "graph") and !std.mem.eql(u8, kind.string, "full_text") and !std.mem.eql(u8, kind.string, "embeddings") and !std.mem.eql(u8, kind.string, "dense_vector")) return true;
     }
     return false;
 }
@@ -10501,6 +10505,11 @@ pub const RaftApplyStore = struct {
             .block_cache = block_cache,
             .store = store,
         };
+    }
+    pub fn openSessionRead(self: *RaftApplyStore, alloc: std.mem.Allocator, _: u64) !@import("antfly_local_sources").storage_backend_erased.ReadTxn {
+        var txn = try self.store.beginReadTxn();
+        errdefer txn.abort();
+        return @import("antfly_local_sources").storage_backend_erased.readTxnFrom(alloc, txn);
     }
 
     pub fn deinit(self: *RaftApplyStore) void {
@@ -12230,6 +12239,13 @@ pub const RaftApplyStore = struct {
         return table;
     }
 
+    pub fn graphAuthority(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../../system_catalog/server_call.zig").GraphAuthority) !@import("../../system_catalog/server_call.zig").GraphAuthorityResult {
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        const id = try system_catalog_storage.findIdentity(alloc, &txn, group_id, .graph, 0, request.name);
+        return .{ .present = id != null and id.? == request.graph_id };
+    }
+
     pub fn systemCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Read) ![]u8 {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
@@ -12734,12 +12750,10 @@ pub const RaftApplyStore = struct {
         defer parsed.deinit(a);
         const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(a, parsed);
         if (native.storage_mode != .relational) return error.RowPolicyCatalogChanged;
-        var has_schema_search = native.index_sort.len != 0;
-        for (native.full_text_documents) |document| {
-            if (document.fields.len != 0 or document.dynamic_rules.len != 0 or
-                document.open_dynamic_paths.len != 0 or document.infer_type_dynamic_paths.len != 0)
-                has_schema_search = true;
-        }
+        // Search-capable scalar schema fields do not open a search API. The
+        // artifact whitelist above and native raw-search gate enforce that.
+        // The policy row evaluator must still understand every typed column.
+        var has_schema_search = false;
         for (native.relational_columns) |column| {
             if (column.column_type == .dense_vector) has_schema_search = true;
         }
@@ -14367,6 +14381,16 @@ pub const RaftApplyStore = struct {
             const value = try decodeTableIdentity(self.view.alloc, bytes);
             if (value.table_id != id) return error.InvalidCatalogRecord;
             return .{ .id = value.table_id, .name = value.name };
+        }
+        pub fn graphIndexIdentity(self: @This(), id: u64, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
+            var buf: [160]u8 = undefined;
+            const bytes = self.view.txn.get(try tableKeyForGroup(&buf, self.view.group_id, id)) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            const table = try decodeTableRecord(self.view.alloc, bytes);
+            if (table.table_id != id) return error.InvalidCatalogRecord;
+            return @import("../../system_catalog/graph_bindings.zig").indexIdentity(self.view.alloc, table.indexes_json, name);
         }
     };
 
@@ -18294,6 +18318,7 @@ pub const RaftApplyStore = struct {
 
     const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
     const MetadataSnapshotProjection = enum {
+        transaction_sessions,
         secret_collection,
         sql_completion_reference,
         system_catalog,
@@ -18366,6 +18391,7 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .transaction_sessions, .key = .{ .prefix = transaction_session_record.prefixForGroup } },
         .{ .projection = .job_state, .key = .{ .prefix = jobStatePrefixForGroup } },
         .{ .projection = .job_owner, .key = .{ .prefix = jobOwnerPrefixForGroup } },
         .{ .projection = .job_schedule, .key = .{ .prefix = jobSchedulePrefixForGroup } },
@@ -18441,6 +18467,7 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) MetadataSnapshotProjectionMask {
         const mask = switch (tag) {
+            .apply_transaction_sessions => metadataSnapshotProjectionBit(.transaction_sessions),
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) |
                 metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.topology_activation) | metadataSnapshotProjectionBit(.metadata_incarnation),
@@ -20838,6 +20865,9 @@ pub const RaftApplyStore = struct {
             },
             .apply_relation_reconciliation => |bytes| try self.applyRelationControlTxn(txn, group_id, bytes),
             .apply_system_catalog => |bytes| try self.applySystemCatalogTxn(txn, group_id, bytes),
+            .apply_transaction_sessions => |bytes| {
+                _ = try transaction_session_record.apply(txn, self.alloc, group_id, bytes);
+            },
             .apply_sql_settings => |bytes| try self.applySqlSettingsTxn(txn, group_id, bytes),
             .apply_sql_policies => |bytes| try self.applySqlPoliciesTxn(txn, group_id, bytes),
             .apply_sql_policy_publication => |bytes| try self.applySqlPolicyPublicationTxn(txn, group_id, bytes),
@@ -27872,7 +27902,8 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
     for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return runtime_status_protocol.schema_epoch_record_version;
     }
-    if (record.relational_topology_protocol_version != 0) return runtime_status_protocol.framed_index_record_version;
+    if (record.relational_topology_protocol_version != 0 or runtime_status_protocol.requiresFramedIndexStatus(record.runtime_statuses))
+        return runtime_status_protocol.framed_index_record_version;
     if (record.dense_native_storage_protocol_version != 0 or
         storeHasDenseNativeStorageStatus(record) or
         storeHasVectorProjectionStatus(record))
@@ -27891,6 +27922,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 const TransitionTag = enum(u8) {
     apply_sql_completion_reference = 81,
     advance_resolver_namespace = 80,
+    apply_transaction_sessions = 82,
     apply_resolver_authority = 78,
     apply_relation_reconciliation = 76,
     mutate_lake_index_lifecycle = 75,
@@ -28039,6 +28071,13 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .apply_system_catalog => |bytes| {
             if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
             try out.append(alloc, @backingInt(TransitionTag.apply_system_catalog));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_transaction_sessions => |bytes| {
+            if (bytes.len > transaction_session_record.max_bytes) return error.TransactionTooLarge;
+            const decoded = try transaction_session_record.decode(alloc, bytes);
+            defer alloc.free(decoded.changes);
+            try out.append(alloc, @backingInt(TransitionTag.apply_transaction_sessions));
             try appendRequiredString(alloc, &out, bytes);
         },
         .apply_sql_settings => |bytes| {
@@ -28498,6 +28537,14 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .apply_system_catalog => blk: {
             if (encoded.len > system_catalog.max_command_bytes + 16) return error.CatalogCommandTooLarge;
             break :blk .{ .apply_system_catalog = try readRequiredString(alloc, encoded, &pos) };
+        },
+        .apply_transaction_sessions => blk: {
+            if (encoded.len > transaction_session_record.max_bytes + 16) return error.TransactionTooLarge;
+            const bytes = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(bytes);
+            const decoded = try transaction_session_record.decode(alloc, bytes);
+            defer alloc.free(decoded.changes);
+            break :blk .{ .apply_transaction_sessions = bytes };
         },
         .apply_sql_settings => blk: {
             if (encoded.len > system_catalog.max_command_bytes + 16) return error.CatalogCommandTooLarge;
@@ -29903,7 +29950,7 @@ fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u1
                 version = @max(version, runtime_status_protocol.artifact_source_failure_status_record_version);
             }
         }
-        if (index.source_replay.len != 0) {
+        if (index.source_replay.len != 0 or index.graph_counts_pending) {
             version = @max(version, runtime_status_protocol.framed_index_status_record_version);
         }
         if (index.repair_status != null) {
@@ -38908,13 +38955,17 @@ test "inert SQL policy definitions survive standalone replay, snapshot, and rest
     }
 }
 
-test "row-policy ENABLE admits relational indexes but rejects search artifact modalities" {
+test "row-policy ENABLE admits authorized graph relational and full-text indexes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(alloc, "{}"));
     try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(alloc, "{\"by_account\":{\"type\":\"relational\"}}"));
-    inline for (.{ "full_text", "dense_vector", "graph", "embeddings", "enrichment" }) |kind| {
+    try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(alloc, "{\"links\":{\"type\":\"graph\"}}"));
+    try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(alloc, "{\"text\":{\"type\":\"full_text\"}}"));
+    try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(alloc, "{\"semantic\":{\"type\":\"embeddings\"}}"));
+    try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(alloc, "{\"vectors\":{\"type\":\"dense_vector\"}}"));
+    inline for (.{"enrichment"}) |kind| {
         const json = try std.fmt.allocPrint(alloc, "{{\"idx\":{{\"type\":\"{s}\"}}}}", .{kind});
         try std.testing.expect(try policyHasUnsupportedArtifactIndexes(alloc, json));
     }
@@ -41684,6 +41735,31 @@ test "metadata.lake index object table engine framing preserves empty topology a
     try std.testing.expectError(error.ObjectTableDefinitionConflict, metadata_table_manager.validateObjectTableMutation(a, table, invalid));
 }
 
+test "metadata runtime store producer completion selects framed envelope" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |completion_proof| {
+        var sources = [_]metadata.RuntimeIndexSourceReplayStatusReport{.{ .artifact_name = "kg", .producer_complete = completion_proof }};
+        var indexes = [_]metadata.RuntimeIndexStatusReport{.{ .name = "graph", .kind = "graph", .source_replay = if (completion_proof) &sources else &.{}, .graph_counts_pending = !completion_proof }};
+        var groups = [_]metadata.RuntimeGroupStatusReport{.{ .group_id = 10, .indexes = &indexes }};
+        const record: metadata.StoreRecord = .{ .store_id = 7, .node_id = 9, .runtime_statuses = &groups };
+        try std.testing.expectEqual(runtime_status_protocol.framed_index_record_version, runtimeGroupStatusRecordVersion(groups[0]));
+        try std.testing.expectEqual(@as(?u16, runtime_status_protocol.framed_index_record_version), storeRuntimeStatusRecordVersion(record));
+        var bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer bytes.deinit(alloc);
+        try appendStoreRecord(alloc, &bytes, record);
+        var position: usize = 0;
+        const decoded = try readStoreRecord(alloc, bytes.items, &position);
+        defer metadata_table_manager.freeStore(alloc, decoded);
+        try std.testing.expectEqual(bytes.items.len, position);
+        if (completion_proof) {
+            try std.testing.expect(decoded.runtime_statuses[0].indexes[0].source_replay[0].producer_complete);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), decoded.runtime_statuses[0].indexes[0].source_replay.len);
+        }
+        try std.testing.expectEqual(!completion_proof, decoded.runtime_statuses[0].indexes[0].graph_counts_pending);
+    }
+}
+
 test "resolver curation namespace propagation resumes bounded pages and enrolls late consumers" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -42324,6 +42400,58 @@ test "resolver curation namespace propagation persists compact bindings and mate
     try std.testing.expect(missing_configs[0].namespace_curation_missing);
     try std.testing.expectEqual(@as(usize, 0), missing_configs[0].merges.len);
     try std.testing.expectEqual(@as(usize, 1), store.resolver_projection_exports);
+}
+
+test "system catalog graph authority probes use bounded indexed identities across replacement" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-authority", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const large = try alloc.alloc(u8, 128 << 10);
+    defer alloc.free(large);
+    @memset(large, 'x');
+    const graph: system_catalog.Resource = .{ .kind = .graph, .id = 7, .name = "g", .source_json = large };
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try system_catalog_storage.applyDelta(alloc, &txn, 21, .{ .next_id = 8, .upserts = @constCast(&[_]system_catalog.Resource{graph}), .removes = &.{} }, .{}, @splat(0));
+        try txn.commit();
+    }
+    const first = try store.graphAuthority(alloc, 21, .{ .name = "g", .graph_id = 7 });
+    try std.testing.expect(first.present);
+    var buffer: [4096]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    // Every call checks the binding; even a present graph with a large body
+    // needs only bounded index/presence scratch and never decodes that body.
+    try std.testing.expect((try store.graphAuthority(bounded.allocator(), 21, .{ .name = "g", .graph_id = 7 })).present);
+    try std.testing.expect(!(try store.graphAuthority(alloc, 21, .{ .name = "g", .graph_id = 8 })).present);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try system_catalog_storage.applyDelta(alloc, &txn, 21, .{ .next_id = 8, .removes = @constCast(&[_]system_catalog.Resource{graph}), .upserts = &.{} }, .{ .revision = 1, .next_id = 8 }, @splat(0));
+        try txn.commit();
+    }
+    bounded.reset();
+    try std.testing.expect(!(try store.graphAuthority(bounded.allocator(), 21, .{ .name = "g", .graph_id = 7 })).present);
+    // A replacement may reuse an old revision. It cannot reuse cached presence.
+    var replacement = graph;
+    replacement.id = 8;
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var prefix_buffer: [160]u8 = undefined;
+        const meta_key = try std.fmt.allocPrint(alloc, "{s}meta", .{try system_catalog_storage.prefixForGroup(&prefix_buffer, 21)});
+        defer alloc.free(meta_key);
+        try txn.delete(meta_key); // Replace the persisted projection, including its revision.
+        try system_catalog_storage.importState(alloc, &txn, 21, .{ .revision = 1, .next_id = 9, .resources = &.{replacement} });
+        try txn.commit();
+    }
+    bounded.reset();
+    try std.testing.expect(!(try store.graphAuthority(bounded.allocator(), 21, .{ .name = "g", .graph_id = 7 })).present);
+    try std.testing.expect((try store.graphAuthority(alloc, 21, .{ .name = "g", .graph_id = 8 })).present);
 }
 
 test "resolver curation namespace propagation scoped discovery excludes ten thousand unrelated sources" {
@@ -43829,6 +43957,32 @@ test "metadata durable job state keeps quotas and due indexes atomic and paged" 
     defer after.deinit();
     for (after.value.rows) |row| try std.testing.expect(!std.mem.eql(u8, row.key, "documents/bounded-0"));
     try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, 41, "../bad-cursor"));
+}
+
+test "metadata durable job state and transaction sessions retain distinct command frames" {
+    const a = std.testing.allocator;
+    const record = try transaction_session_record.encode(a, .{ .changes = &.{.{ .key = "frame-check", .expected = null, .value = "session" }} });
+    defer a.free(record);
+    const transaction = try encodeTransitionCommand(a, .{ .apply_transaction_sessions = record });
+    defer a.free(transaction);
+    const job = try encodeTransitionCommand(a, .{ .compare_and_set_job_state = .{ .key = "documents/frame-check", .expected_hash = "", .value = "{\"owner\":\"alice\",\"state\":\"queued\"}" } });
+    defer a.free(job);
+    // Preserve main's durable job tag and give the graph branch's transaction
+    // journal its own frame, admitted only by the merged protocol floor.
+    try std.testing.expectEqual(@as(u8, 79), job[transition_magic.len]);
+    try std.testing.expectEqual(@as(u8, 82), transaction[transition_magic.len]);
+    const completion = try encodeTransitionCommand(a, .{ .apply_sql_completion_reference = "completion" });
+    defer a.free(completion);
+    try std.testing.expectEqual(@as(u8, 81), completion[transition_magic.len]);
+    var decoded_completion = (try decodeTransitionCommand(a, completion)).?;
+    defer decoded_completion.deinit(a);
+    try std.testing.expectEqualStrings("completion", decoded_completion.apply_sql_completion_reference);
+    var decoded_transaction = (try decodeTransitionCommand(a, transaction)).?;
+    defer decoded_transaction.deinit(a);
+    try std.testing.expectEqualStrings(record, decoded_transaction.apply_transaction_sessions);
+    var decoded_job = (try decodeTransitionCommand(a, job)).?;
+    defer decoded_job.deinit(a);
+    try std.testing.expectEqualStrings("documents/frame-check", decoded_job.compare_and_set_job_state.key);
 }
 
 test "resolver curation namespace propagation snapshot registry retains document jobs and scheduling" {

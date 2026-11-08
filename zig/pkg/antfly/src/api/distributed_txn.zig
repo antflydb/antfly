@@ -91,7 +91,17 @@ test "distributed txn range guard wire preserves absent and exact counters" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
+const PrepareExtensions = struct {
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    row_policy_admitted_at_seconds: i64 = 0,
+    normalized_graph_rows: bool = false,
+    graph_writes: []const db_mod.types.GraphEdgeWrite = &.{},
+    graph_deletes: []const db_mod.types.GraphEdgeDelete = &.{},
+};
+
 pub const TxnPrepareRequest = struct {
+    extensions_owner: ?std.json.Parsed(PrepareExtensions) = null,
     route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
     range_guards_owner: ?std.json.Parsed([]const @import("antfly_local_sources").storage_range_protection.Proof) = null,
     txn_id: db_mod.types.TxnId,
@@ -1259,9 +1269,12 @@ pub fn executeCrossGroup(
         .row_policy_principal_proof = req.row_policy_principal_proof,
         .row_policy_database = req.row_policy_database,
         .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+        .normalized_graph_rows = req.normalized_graph_rows,
         .writes = req.writes,
         .deletes = req.deletes,
         .transforms = req.transforms,
+        .graph_writes = req.graph_writes,
+        .graph_deletes = req.graph_deletes,
         .predicates = req.predicates,
         .integrity = req.integrity,
         .integrity_commands = req.integrity_commands,
@@ -1385,6 +1398,16 @@ fn executeMultiTableCommitOnce(
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.deletes.append(alloc, key);
         }
+        for (table.graph_writes) |edge| {
+            const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            try participant.graph_writes.append(alloc, edge);
+        }
+        for (table.graph_deletes) |edge| {
+            const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            try participant.graph_deletes.append(alloc, edge);
+        }
         for (table.predicates) |predicate| {
             const group_id = routing.resolveGroupForKey(predicate.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
@@ -1434,6 +1457,7 @@ fn executeMultiTableCommitOnce(
             participant.row_policy_principal_proof = table.row_policy_principal_proof;
             participant.row_policy_database = table.row_policy_database;
             participant.row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds;
+            participant.normalized_graph_rows = table.normalized_graph_rows;
             if (participant.relational_schema_version) |existing| {
                 if (table.relational_schema_version) |requested| {
                     if (existing != requested) return error.InvalidTxnRequest;
@@ -1643,7 +1667,9 @@ fn executeMultiTableCommitOnce(
                     // Preserve a typed retryable result without claiming
                     // not-proposed for the individual participant RPC. An
                     // uncertain abort above retains AbortDecisionNotDurable.
-                    return if (err == error.StorageReadTemporarilyUnavailable)
+                    return if (err == error.RowPolicyDenied)
+                        error.TransactionPrepareAbortedRowPolicyDenied
+                    else if (err == error.StorageReadTemporarilyUnavailable)
                         error.TransactionPrepareAbortedUnavailable
                     else
                         err;
@@ -1985,6 +2011,7 @@ const ParticipantTxn = struct {
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    normalized_graph_rows: bool = false,
     route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
     range_guards: std.ArrayListUnmanaged(@import("antfly_local_sources").storage_range_protection.Proof) = .empty,
     schema_version: ?u32 = null,
@@ -1999,6 +2026,8 @@ const ParticipantTxn = struct {
     writes: std.ArrayListUnmanaged(db_mod.types.TransactionWrite) = .empty,
     deletes: std.ArrayListUnmanaged([]const u8) = .empty,
     transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
+    graph_writes: std.ArrayListUnmanaged(db_mod.types.GraphEdgeWrite) = .empty,
+    graph_deletes: std.ArrayListUnmanaged(db_mod.types.GraphEdgeDelete) = .empty,
     predicates: std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate) = .empty,
     integrity: std.ArrayListUnmanaged(db_mod.types.TransactionIntegrityOperation) = .empty,
     integrity_commands: std.ArrayListUnmanaged(integrity_wire.Command) = .empty,
@@ -2015,6 +2044,8 @@ const ParticipantTxn = struct {
         self.writes.deinit(alloc);
         self.deletes.deinit(alloc);
         self.transforms.deinit(alloc);
+        self.graph_writes.deinit(alloc);
+        self.graph_deletes.deinit(alloc);
         self.predicates.deinit(alloc);
         self.integrity.deinit(alloc);
         self.integrity_commands.deinit(alloc);
@@ -2121,9 +2152,12 @@ const PrepareFanoutTask = struct {
                 .row_policy_principal_proof = participant.row_policy_principal_proof,
                 .row_policy_database = participant.row_policy_database,
                 .row_policy_admitted_at_seconds = participant.row_policy_admitted_at_seconds,
+                .normalized_graph_rows = participant.normalized_graph_rows,
                 .writes = participant.writes.items,
                 .deletes = participant.deletes.items,
                 .transforms = participant.transforms.items,
+                .graph_writes = participant.graph_writes.items,
+                .graph_deletes = participant.graph_deletes.items,
                 .predicates = participant.predicates.items,
                 .integrity = participant.integrity.items,
                 .integrity_commands = participant.integrity_commands.items,
@@ -2508,6 +2542,12 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         defer alloc.free(field);
         try out.appendSlice(alloc, field);
     }
+    inline for (.{ "row_policy_principal_proof", "row_policy_database", "row_policy_admitted_at_seconds", "normalized_graph_rows", "graph_writes", "graph_deletes" }) |field| {
+        try out.appendSlice(alloc, ",\"" ++ field ++ "\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, @field(req.req, field), .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
     if (req.req.schema_version) |version| try out.print(alloc, ",\"schema_version\":{d}", .{version});
     if (req.req.relational_repair) try out.appendSlice(alloc, ",\"relational_repair\":true");
     try appendRestorePlan(alloc, &out, req.req.restore_staging_plan_id);
@@ -2705,6 +2745,12 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
         .object => |obj| obj,
         else => return error.InvalidTxnRequest,
     };
+    var extensions = try std.json.parseFromValue(PrepareExtensions, alloc, root, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    errdefer extensions.deinit();
+    const ext = extensions.value;
+    if ((ext.row_policy_principal_proof.len == 0) != (ext.row_policy_database.len == 0) or
+        (ext.row_policy_principal_proof.len == 0) != (ext.row_policy_admitted_at_seconds == 0) or
+        ext.row_policy_admitted_at_seconds < 0) return error.InvalidTxnRequest;
     const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
     const writes = try parseTxnWrites(alloc, obj.get("writes") orelse return error.InvalidTxnRequest);
     errdefer freeTxnWrites(alloc, writes);
@@ -2750,10 +2796,17 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     if (wrapped and !row_semantics and !has_guards) return error.InvalidTxnRequest;
     if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
     return .{
+        .extensions_owner = extensions,
         .route_fence = if (route_fence) |fence| fence.value else null,
         .txn_id = txn_id,
         .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .req = .{
+            .row_policy_principal_proof = ext.row_policy_principal_proof,
+            .row_policy_database = ext.row_policy_database,
+            .row_policy_admitted_at_seconds = ext.row_policy_admitted_at_seconds,
+            .normalized_graph_rows = ext.normalized_graph_rows,
+            .graph_writes = ext.graph_writes,
+            .graph_deletes = ext.graph_deletes,
             .writes = writes,
             .deletes = deletes,
             .transforms = transforms,
@@ -2780,6 +2833,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
 }
 
 pub fn freeTxnPrepareRequest(alloc: std.mem.Allocator, req: *TxnPrepareRequest) void {
+    if (req.extensions_owner) |*owner| owner.deinit();
     if (req.range_guards_owner) |*owner| owner.deinit();
     freeTxnWrites(alloc, req.req.writes);
     freeTxnDeletes(alloc, req.req.deletes);
@@ -6983,4 +7037,21 @@ test "distributed txn prepare JSON null and insert preconditions survive allocat
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "distributed txn prepare retains signed graph mutations and normalized rows" {
+    const alloc = std.testing.allocator;
+    const request: TxnPrepareRequest = .{ .txn_id = @splat(1), .req = .{
+        .row_policy_principal_proof = "signed-admission",
+        .row_policy_database = "default",
+        .row_policy_admitted_at_seconds = 1800000000,
+        .normalized_graph_rows = true,
+        .graph_writes = &.{.{ .index_name = "links", .source = "a", .target = "b", .edge_type = "CITES", .edge_id = "edge", .metadata_json = "{}" }},
+        .graph_deletes = &.{.{ .index_name = "links", .source = "a", .target = "c", .edge_type = "CITES", .edge_id = "old" }},
+    } };
+    const encoded = try encodeTxnPrepareRequest(alloc, request);
+    defer alloc.free(encoded);
+    var decoded = try parseTxnPrepareRequest(alloc, encoded);
+    defer freeTxnPrepareRequest(alloc, &decoded);
+    try std.testing.expectEqualDeep(request.req, decoded.req);
 }

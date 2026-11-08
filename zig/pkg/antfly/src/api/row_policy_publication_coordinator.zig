@@ -19,6 +19,7 @@
 const std = @import("std");
 const policies = @import("antfly_local_sources").system_catalog_policies;
 const Receipt = @import("antfly_local_sources").storage_db_row_policy_bundle.Receipt;
+var receipt_mismatch_logs: std.atomic.Value(usize) = .init(0);
 
 pub const Port = struct {
     ptr: *anyopaque,
@@ -84,17 +85,30 @@ pub fn advance(alloc: std.mem.Allocator, table_name: []const u8, revision: u64, 
             .owner_group_id = owner.group_id,
             .expected_descriptor_digest = owner.descriptor_digest,
         };
-        const bytes = try port.bundle(port.ptr, alloc, request);
+        const bytes = port.bundle(port.ptr, alloc, request) catch |err| {
+            if (receipt_mismatch_logs.fetchAdd(1, .monotonic) < 4)
+                std.log.warn("row policy coordinator bundle unavailable table_id={} group={} phase={s} err={s}", .{ publication.table_id, owner.group_id, @tagName(publication.phase), @errorName(err) });
+            return err;
+        };
         defer alloc.free(bytes);
         if (bytes.len == 0 or bytes.len > policies.max_install_snapshot_bytes) return error.InvalidRowPolicyBundle;
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-        const receipt = try port.install(port.ptr, alloc, table_name, owner.group_id, request);
+        const receipt = port.install(port.ptr, alloc, table_name, owner.group_id, request) catch |err| {
+            if (receipt_mismatch_logs.fetchAdd(1, .monotonic) < 4)
+                std.log.warn("row policy coordinator owner unavailable table_id={} group={} phase={s} err={s}", .{ publication.table_id, owner.group_id, @tagName(publication.phase), @errorName(err) });
+            return err;
+        };
         if (receipt.table_id != publication.table_id or receipt.generation != publication.generation or
             receipt.catalog_epoch != publication.catalog_epoch or receipt.phase != publication.phase or
             receipt.applied_term == 0 or receipt.applied_index == 0 or
             !std.mem.eql(u8, &receipt.bundle_digest, &digest) or
-            !std.mem.eql(u8, &receipt.descriptor_digest, &owner.descriptor_digest)) return error.RowPolicyCatalogChanged;
+            !std.mem.eql(u8, &receipt.descriptor_digest, &owner.descriptor_digest))
+        {
+            if (receipt_mismatch_logs.fetchAdd(1, .monotonic) < 4)
+                std.log.warn("row policy coordinator receipt mismatch table_id={} group={} phase={s} received_phase={s} generation={} received_generation={} bundle_matches={} descriptor_matches={}", .{ publication.table_id, owner.group_id, @tagName(publication.phase), @tagName(receipt.phase), publication.generation, receipt.generation, std.mem.eql(u8, &receipt.bundle_digest, &digest), std.mem.eql(u8, &receipt.descriptor_digest, &owner.descriptor_digest) });
+            return error.RowPolicyCatalogChanged;
+        }
         const ack: policies.Publication.OwnerAck = .{
             .owner = owner,
             .catalog_epoch = receipt.catalog_epoch,

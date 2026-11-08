@@ -21,7 +21,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Storage layouts evolve independently of the shared failure envelope.
 // Version 85 adds privacy policy fences to lookup, scan and query requests.
 // Older owners must reject their operation identifiers before dispatch.
-pub const abi_version: u32 = 85;
+pub const abi_version: u32 = 86;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -999,6 +999,11 @@ pub const ResolutionCandidateNearestFn = *const fn (
     ResolutionCandidateConsumeFn,
 ) callconv(.c) Status;
 
+pub const ResolutionCandidateGetManyFn = *const fn (?*anyopaque, BorrowedBytes, ?[*]const BorrowedBytes, u64, ?*anyopaque, ResolutionCandidateConsumeFn) callconv(.c) Status;
+pub const ResolutionCandidateBeginBatchFn = *const fn (?*anyopaque, ?[*]const BorrowedBytes, u64, *ResolutionCandidateConfig) callconv(.c) Status;
+pub const ResolutionCandidateBoundTableFn = *const fn (?*anyopaque, BorrowedBytes, *BorrowedBytes) callconv(.c) Status;
+pub const ResolutionCandidateReleaseFn = *const fn (?*anyopaque) callconv(.c) void;
+
 pub const ResolutionCandidateConfig = extern struct {
     /// Same-toolchain native view, guarded by a runtime TypeContract before
     /// reconstruction. Retains batching, binding, adjudication, and caches.
@@ -1009,6 +1014,11 @@ pub const ResolutionCandidateConfig = extern struct {
     get_fn: ?ResolutionCandidateGetFn = null,
     scan_prefix_fn: ?ResolutionCandidateScanPrefixFn = null,
     nearest_fn: ?ResolutionCandidateNearestFn = null,
+    get_many_fn: ?ResolutionCandidateGetManyFn = null,
+    begin_batch_fn: ?ResolutionCandidateBeginBatchFn = null,
+    /// Borrowed until the batch release callback; never retained past it.
+    bound_table_fn: ?ResolutionCandidateBoundTableFn = null,
+    release_fn: ?ResolutionCandidateReleaseFn = null,
 };
 
 pub const EntityUpsert = extern struct {
@@ -1108,9 +1118,17 @@ pub const TargetAdvanceFn = *const fn (
     identities_json: BorrowedBytes,
 ) callconv(.c) void;
 
+/// Schedules a status observation; it must not reenter the owner. No target
+/// debt is created for receiver-local completion or runtime-only changes.
+pub const StatusChangedFn = *const fn (
+    ctx: ?*anyopaque,
+    table_name: BorrowedBytes,
+) callconv(.c) void;
+
 pub const TargetObserver = extern struct {
     ctx: ?*anyopaque = null,
     notify: ?TargetAdvanceFn = null,
+    status_changed: ?StatusChangedFn = null,
 };
 
 pub const RestoreAdmission = extern struct {
@@ -1151,6 +1169,7 @@ pub const OpenRequest = extern struct {
     online_source_authority: u8 = 1,
     /// This owner is being opened to apply an entry whose catalog descriptor
     /// may predate the configuration already persisted by this replica.
+    /// 2 additionally prepares missing graph indexes for exact mutation replay.
     historical_raft_apply: u8 = 0,
     /// Optional result: the physical owner opened for exact topology control
     /// while current-catalog index reconciliation remains fence-deferred.
@@ -1832,6 +1851,17 @@ pub extern fn antfly_metadata_apply_store_projection(
     request: *const MetadataProjectionRequest,
     out_json: *OwnedBytes,
 ) callconv(.c) Status;
+pub const MetadataSessionReadOperation = enum(u32) { get, first, last, next, prev, seek_at_or_after, seek_at_or_before };
+pub const MetadataSessionReadRequest = extern struct {
+    version: u32 = abi_version,
+    operation: MetadataSessionReadOperation,
+    key: BorrowedBytes = .{},
+};
+/// A retained, namespace-scoped metadata read. Concrete transactions remain
+/// kernel-owned; cursor replies are binary key-length/key/value envelopes.
+pub extern fn antfly_metadata_session_read_open(store: ?*anyopaque, request: *const MetadataApplyGroupRequest, out_read: *?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_metadata_session_read_invoke(read: ?*anyopaque, request: *const MetadataSessionReadRequest, out_value: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_metadata_session_read_close(read: ?*anyopaque) callconv(.c) void;
 pub extern fn antfly_metadata_apply_store_add_listeners(
     store: ?*anyopaque,
     request: *const MetadataListenerRequest,

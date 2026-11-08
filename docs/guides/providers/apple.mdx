@@ -193,8 +193,38 @@ refusals return errors rather than truncated output.
   each transcription or generation call reserves 512 MiB. Small process memory
   budgets can reject large documents with `DocumentExtractionWorkingSetTooLarge`.
 
+## Push-to-talk dictation
+
+Named Apple transcribers work with `POST /ai/v1/dictate` on database nodes. Set
+`model` to `transcribers/<name>` and optionally `cleanup_model` to a named generator
+(`cleanup` or `generators/cleanup`). Dictionary spellings, style, context, and
+instructions use the same cleanup prompts as Whisper. Without a cleanup generator,
+or with `style: verbatim`, the raw transcript is returned. Apple rejects
+Whisper-specific recognition hints, VAD tuning, and audio-context options.
+
+With `stream: true`, the raw transcript arrives before cleanup. Provider cleanup
+can emit the entire result as one delta; this does not enable live Apple
+transcription. Model discovery exposes named transcriber dictation capabilities,
+native availability, and installed speech locales without installing assets.
+
+The [`examples/dictation`](https://github.com/antflydb/antfly/tree/main/examples/dictation)
+macOS app demonstrates both engines, global hold/toggle shortcuts, per-app presets,
+a dictionary, local settings caching, Antfly snapshots, and searchable history.
+Apple runs on the Antfly server, so using a user's Mac requires a local Apple-enabled
+Antfly instance.
+
 ## Related
 
 - [Inference providers](/docs/guides/inference-providers): every provider and component
 - [Index PDFs and Scanned Documents](/docs/guides/index-documents): document extraction and OCR options
 - [Apple native provider design](https://github.com/antflydb/antfly/blob/main/docs/design/apple-intelligence-provider.md): bridge loading, validation, and test commands
+
+
+Dictation cleanup requires Apple bridge ABI 2 so completion checks cannot be
+silently skipped by an older sidecar. Apple’s token limit can return partial text
+without an error ([maximumResponseTokens](https://developer.apple.com/documentation/foundationmodels/generationoptions/maximumresponsetokens)).
+For dictation cleanup, the bridge therefore allows natural completion under the
+request deadline and a streaming byte bound of eight times the token budget.
+macOS 27 additionally checks measured output tokens against the budget. Failed
+or incomplete cleanup never replaces the raw transcript. Other generation calls
+retain their configured token cap.

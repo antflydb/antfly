@@ -861,3 +861,17 @@ def test_read_preserves_model_default_and_explicit_output_budget(model: str, max
         assert "max_tokens" not in captured[0]
     else:
         assert captured[0]["max_tokens"] == max_tokens
+
+
+def test_generated_dictation_binary_body_preserves_wire_content_type() -> None:
+    from io import BytesIO
+
+    from antfly.client_generated.api.default.dictate import _get_kwargs
+    from antfly.client_generated.types import File
+
+    envelope = b"AFATT001\x00\xffbinary-recording"
+    payload = BytesIO(envelope)
+    request = _get_kwargs(body=File(payload=payload))
+    assert request["headers"]["Content-Type"] == "application/vnd.antfly.attachments.v1"
+    assert request["content"] is payload
+    assert "json" not in request

@@ -85,6 +85,9 @@ pub const RaftApplyStore = struct {
     listeners: std.ArrayListUnmanaged(*ListenerRegistration) = .empty,
     listeners_mutex: std.Io.Mutex = .init,
     hot_standby_adapter: ?*@import("metadata_hot_standby_adapter.zig").Adapter = null,
+    pub fn openSessionRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64) !@import("antfly_local_sources").storage_backend_erased.ReadTxn {
+        return @import("metadata_session_read_client.zig").open(alloc, self.handle, group);
+    }
 
     pub const RestoreJobRow = struct {
         key: []u8,
@@ -270,17 +273,6 @@ pub const RaftApplyStore = struct {
         _ = try self.projection(bool, .{ .kind = .migrate_standalone_restore_jobs, .key = .fromSlice(encoded.written()) });
     }
 
-    pub fn getJobOwnerCount(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, owner: []const u8) !u64 {
-        return self.projectionWithAllocator(u64, alloc, .{ .kind = .job_owner_count, .group_id = group_id, .key = .fromSlice(owner) });
-    }
-
-    pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
-        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .job_state, .group_id = group_id, .key = .fromSlice(key) });
-    }
-    pub fn scanJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?[]const u8) ![]u8 {
-        return self.projectionWithAllocator([]u8, alloc, .{ .kind = .job_state_scan, .group_id = group_id, .key = .fromSlice(after orelse ""), .arg1 = @intFromBool(after != null) });
-    }
-
     pub fn getBackupCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
         return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .backup_cohort, .group_id = group_id, .arg0 = job_id });
     }
@@ -391,6 +383,9 @@ pub const RaftApplyStore = struct {
             try ids.appendSlice(alloc, update.removed_groups);
         }
         return self.catalogProjection(?metadata.StoreRecord, alloc, group_id, .{ .read_store_report_targets = .{ .store_id = update.report.store_id, .group_ids = ids.items, .full = update.base == null, .include_runtime = include_runtime } });
+    }
+    pub fn graphAuthority(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/server_call.zig").GraphAuthority) !@import("../system_catalog/server_call.zig").GraphAuthorityResult {
+        return self.catalogProjection(@import("../system_catalog/server_call.zig").GraphAuthorityResult, alloc, group_id, .{ .catalog_graph_authority = request });
     }
     pub fn systemCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Read) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_read = request });
@@ -1009,6 +1004,26 @@ pub const RaftApplyStore = struct {
 
     pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
         return try self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_job_value, .group_id = group_id, .key = .fromSlice(key) });
+    }
+
+    // Job values are opaque bytes; the kernel returns them directly rather
+    // than encoding ciphertext or checkpoints as JSON strings a second time.
+    fn jobStateBytes(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: contract.CatalogProjectionRequest) !?[]u8 {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(encoded);
+        var response: abi.OwnedBytes = .{};
+        try statusToError(abi.antfly_metadata_apply_store_projection(self.handle, &.{ .kind = .system_catalog, .group_id = group_id, .key = .fromSlice(encoded) }, &response));
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        return if (response.len == 0) null else try alloc.dupe(u8, response.slice());
+    }
+    pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
+        return self.jobStateBytes(alloc, group_id, .{ .job_state_get = key });
+    }
+    pub fn scanJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?[]const u8) ![]u8 {
+        return (try self.jobStateBytes(alloc, group_id, .{ .job_state_scan = after })) orelse error.StorageKernelFailure;
+    }
+    pub fn getJobOwnerCount(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, owner: []const u8) !u64 {
+        return self.catalogProjection(u64, alloc, group_id, .{ .job_owner_count = owner });
     }
 
     pub fn freeRestoreJobRows(_: *RaftApplyStore, alloc: std.mem.Allocator, rows: []RestoreJobRow) void {

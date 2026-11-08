@@ -2033,6 +2033,7 @@ pub const StatusSource = struct {
 
     pub const VTable = struct {
         supports_query_definitions: bool = false,
+        supports_graph_authority_probe: bool = false,
         /// Hosting requires native existence, definition CAS and policy authority.
         supports_object_tables: bool = false,
         supports_resolver_catalog_read: bool = false,
@@ -2865,6 +2866,7 @@ pub const StatusSource = struct {
             .system_catalog = Gen.systemCatalog,
             .tracks_sql_submission = true,
             .supports_query_definitions = true,
+            .supports_graph_authority_probe = true,
             .supports_object_tables = true,
             .supports_resolver_catalog_read = true,
             .supports_resolver_authority = true,
@@ -6694,6 +6696,7 @@ pub const ApiHttpServer = struct {
             .work = if (options) |v| v.max_marked else config.lake_indexes.artifact_gc.max_marked,
             .deadline_ns = @min(request.deadline_ns orelse std.math.maxInt(u64), platform_time.monotonicNs() +| 5 * std.time.ns_per_s),
             .cancellation = request.cancellation,
+            .sweep_interval_ms = config.lake_indexes.artifact_gc.interval_ms,
         };
     }
     fn collectExpiredLakeQueryArtifacts(self: *ApiHttpServer, a: std.mem.Allocator, store: *@import("lake_index_store.zig").Store, table: u64, now: u64, request: api_operation.RequestContext) !void {
@@ -6778,6 +6781,9 @@ pub const ApiHttpServer = struct {
         var store = try @import("lake_index_store.zig").Store.openRetainedNative(a, config, self.cfg.secret_store, binding.locator, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
         defer store.deinit();
         var budget = self.queryGcBudget(request);
+        var completion_proofs = @import("lake_query_gc.zig").CompletionProofs.init(a);
+        defer completion_proofs.deinit();
+        budget.proofs = &completion_proofs;
         if (!config.lake_indexes.artifact_gc.dry_run and !(if (self.cfg.lake_artifact_gc_options) |v| v.dry_run else false)) {
             const now = platform_time.realtimeNs() / std.time.ns_per_ms;
             // Admit legacy stores before the first sweep, including ones with
@@ -6790,21 +6796,39 @@ pub const ApiHttpServer = struct {
                     try authority.apply(item.table_id, .{ .retain_query_store = .{ .binding = binding, .until_ms = binding.query_until_ms } });
                 }
             }
-            const page_result: @import("lake_query_gc.zig").Result = if (binding.query_until_ms == 0)
+            budget.retire_after_ms = if (now > binding.query_until_ms) binding.query_until_ms else 0;
+            var page_result: @import("lake_query_gc.zig").Result = if (binding.query_until_ms == 0)
                 .{}
             else if (binding.query_gc_phase == 5 and item.state.namespace != null)
                 .{ .more = true, .progressed = true }
             else
                 @import("lake_query_gc.zig").collect(a, &store, item.table_id, binding.query_gc_phase % 5, now, &budget);
-            self.observeLakeQueryCollection(page_result);
             if (binding.query_until_ms != 0) {
-                const release = now > binding.query_until_ms and !page_result.more and !page_result.retained and !page_result.failed;
+                var release = now > binding.query_until_ms and !page_result.more and !page_result.retained and !page_result.failed;
+                // Drain independently proven checkpoints even when another
+                // category exhausted this turn's read budget. Ownership still
+                // requires a complete, unretained sweep and all five proofs.
+                if (budget.retire_after_ms != 0 and completion_proofs.bound) {
+                    var retirement_progress = false;
+                    const complete = @import("lake_query_gc.zig").retireCompleted(a, &store, item.table_id, &completion_proofs, &retirement_progress, &budget) catch |err| failed: {
+                        page_result.more = true;
+                        if (err != error.QueryGcBudgetExhausted and err != error.DeadlineExceeded and err != error.Canceled and err != error.Cancelled) {
+                            page_result.failed = true;
+                            std.log.warn("query cleanup checkpoint retirement deferred table_id={d} err={s}", .{ item.table_id, @errorName(err) });
+                        }
+                        break :failed false;
+                    };
+                    release = release and complete;
+                    page_result.progressed = page_result.progressed or retirement_progress;
+                    if (retirement_progress and !complete) page_result.more = true;
+                }
                 if (release or page_result.more or page_result.failed or binding.query_gc_receipt == null) {
                     var receipt: [16]u8 = undefined;
                     try self.embedding_provider_runtime.io.randomSecure(&receipt);
                     try authority.apply(item.table_id, .{ .query_gc_progress = .{ .store = binding.identity, .observed_until_ms = binding.query_until_ms, .phase = (binding.query_gc_phase + 1) % 6, .release = release, .now_ms = now, .token = receipt } });
                 }
             }
+            self.observeLakeQueryCollection(page_result);
             // Auxiliary corruption/provider failures never block index GC.
             // The witness above keeps every failed category discoverable.
         }
@@ -7737,7 +7761,7 @@ pub const ApiHttpServer = struct {
             // the requested index until each configured source has at least
             // one authoritative observation.
             for (index.source_replay) |source| {
-                if (source.observation_count == 0) return true;
+                if (source.observation_count == 0 or !source.producer_complete) return true;
             }
             // Refresh only for an incomplete proof attached to the requested
             // index. Table-level degradation may belong to another index, and
@@ -13975,6 +13999,9 @@ pub const ApiHttpServer = struct {
     }
 
     fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
+        // A replicated receipt read has its own linearizable barrier. Its
+        // availability must not depend on the original execution owner's life.
+        if (req.method == .GET and self.txn_sessions.durableMissIsAuthoritative()) return null;
         const owner_node_id = (try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id)) orelse
             if (self.txn_sessions.durableMissIsAuthoritative())
                 return null
@@ -14187,7 +14214,7 @@ pub const ApiHttpServer = struct {
             const resource = resources.get(table.table_name) orelse table.table_name;
             if (resource.len == 0) return false;
             if (table.range_guards != null and !admittedTablePermissionAllowed(authenticated_identity, resource, .read)) return false;
-            if ((table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0) and
+            if ((table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0 or table.batch.graph_writes.len != 0 or table.batch.graph_deletes.len != 0) and
                 !admittedTablePermissionAllowed(authenticated_identity, resource, .write)) return false;
         }
         return true;
@@ -14453,7 +14480,7 @@ pub const ApiHttpServer = struct {
         var indices: std.ArrayList(usize) = .empty;
         var names: std.ArrayList([]const u8) = .empty;
         for (tables, 0..) |table, index| {
-            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0) continue;
+            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0 and table.graph_writes.len == 0 and table.graph_deletes.len == 0 and table.predicates.len == 0 and table.range_guards.len == 0 and table.integrity_commands.len == 0) continue;
             try indices.append(a, index);
             try names.append(a, table.table_name);
         }
@@ -14710,6 +14737,8 @@ pub const ApiHttpServer = struct {
             .writes = txn_writes,
             .deletes = req.deletes,
             .transforms = req.transforms,
+            .graph_writes = req.graph_writes,
+            .graph_deletes = req.graph_deletes,
             .predicates = req.predicates,
             .schema_version = req.schema_version,
             .relational_schema_version = req.relational_schema_version,
@@ -28926,6 +28955,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: Authorizat
         if (route.kind == .table and route.name == null and isReadMethod(method)) return null;
         const resource_type: usermgr.ResourceType = switch (route.kind) {
             .query_source => .table,
+            .graph => .graph,
             .database => .database,
             .namespace => .namespace,
             .table => .table,
@@ -28934,7 +28964,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: Authorizat
         const resolver_route = if (route.kind == .table) @import("resolvers.zig").matchSuffix(route.suffix) else null;
         const resolver_read = if (resolver_route) |r| @import("resolvers.zig").readOnly(r.op) else false;
         const resolver_write = if (resolver_route) |r| r.op != .namespace else false;
-        const permission: usermgr.PermissionType = if (isReadMethod(method) or resolver_read or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (resolver_write or (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate")))) .write else .admin;
+        const permission: usermgr.PermissionType = if (isReadMethod(method) or (route.kind == .graph and std.mem.eql(u8, route.suffix, "query")) or resolver_read or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (resolver_write or (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate")))) .write else .admin;
         return .{ .resource_type = resource_type, .resource = try system_catalog_routes.resourceNameAlloc(alloc, route), .permission_type = permission, .owns_resource = true };
     }
 
@@ -29532,18 +29562,40 @@ pub fn foreignKeyParentsAllowed(alloc: std.mem.Allocator, identity: ?Authenticat
     return true;
 }
 
-pub fn tablePermissionCurrentlyAllowed(
+pub const GraphPermissionCheck = usermgr.UserManager.PermissionCheck;
+pub fn resourcePermissionsCurrentlyAllowed(alloc: std.mem.Allocator, authenticated_identity: ?AuthenticatedIdentity, checks: []const usermgr.UserManager.PermissionCheck) !bool {
+    const identity = authenticated_identity orelse return true;
+    for (checks) |check| if (!permissionsAllow(identity.permissions, check.resource_type, check.resource, check.permission_type)) return false;
+    const manager = identity.live_user_manager orelse return true;
+    const logical = try alloc.dupe(usermgr.UserManager.PermissionCheck, checks);
+    for (logical) |*check| if (check.resource_type == .table) {
+        for (identity.catalog_aliases) |alias| if (std.mem.eql(u8, alias.physical, check.resource)) {
+            check.resource = alias.logical;
+            break;
+        };
+    };
+    return manager.permissionsCurrentlyAllowed(identity.username, identity.credential_principal, logical);
+}
+
+pub fn tablePermissionCurrentlyAllowed(identity: ?AuthenticatedIdentity, table_name: []const u8, permission_type: usermgr.PermissionType) !bool {
+    return resourcePermissionCurrentlyAllowed(identity, .table, table_name, permission_type);
+}
+
+pub fn resourcePermissionCurrentlyAllowed(
     authenticated_identity: ?AuthenticatedIdentity,
+    resource_type: usermgr.ResourceType,
     table_name: []const u8,
     permission_type: usermgr.PermissionType,
 ) !bool {
     const identity = authenticated_identity orelse return true;
-    if (!permissionsAllow(identity.permissions, .table, table_name, permission_type))
+    if (!permissionsAllow(identity.permissions, resource_type, table_name, permission_type))
         return false;
     const manager = identity.live_user_manager orelse return true;
     const logical_name = logical: {
-        for (identity.catalog_aliases) |alias| {
-            if (std.mem.eql(u8, alias.physical, table_name)) break :logical alias.logical;
+        if (resource_type == .table) {
+            for (identity.catalog_aliases) |alias| {
+                if (std.mem.eql(u8, alias.physical, table_name)) break :logical alias.logical;
+            }
         }
         break :logical table_name;
     };
@@ -29555,12 +29607,12 @@ pub fn tablePermissionCurrentlyAllowed(
             else => return err,
         };
         defer freePermissions(manager.alloc, current);
-        return permissionsAllow(current, .table, logical_name, permission_type);
+        return permissionsAllow(current, resource_type, logical_name, permission_type);
     }
 
     return try manager.permissionCurrentlyAllowed(
         identity.username,
-        .table,
+        resource_type,
         logical_name,
         permission_type,
     );
@@ -30813,6 +30865,7 @@ fn resourceTypeFromOpenApi(value: usermgr_openapi.ResourceType) usermgr.Resource
         .tablespace => .tablespace,
         .user => .user,
         .inference => .inference,
+        .graph => .graph,
         .@"*" => .@"*",
     };
 }
@@ -30834,6 +30887,7 @@ fn resourceTypeToOpenApi(value: usermgr.ResourceType) usermgr_openapi.ResourceTy
         .tablespace => .tablespace,
         .user => .user,
         .inference => .inference,
+        .graph => .graph,
         .@"*" => .@"*",
     };
 }
@@ -50035,7 +50089,7 @@ test "api index status refreshes synthetic configured index status from write so
     }};
     try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(structural_dense_statuses[0..]));
 
-    const incomplete_source_replay = [_]db_mod.types.IndexSourceReplayStatus{.{
+    var incomplete_source_replay = [_]db_mod.types.IndexSourceReplayStatus{.{
         .artifact_name = "chunk_embedding",
         .published_sequence = 3,
         .target_sequence = 3,
@@ -50062,6 +50116,14 @@ test "api index status refreshes synthetic configured index status from write so
         source_incomplete_status,
         .{ .name = "vec", .identity = null },
     ));
+    // Replay/source observation can be current before receiver-local producer
+    // completion. The detail path must refresh until that proof arrives, then
+    // return to its cache fast path without polling an already complete source.
+    incomplete_source_replay[0].observation_count = 1;
+    incomplete_source_replay[0].producer_complete = false;
+    try std.testing.expect(ApiHttpServer.runtimeStatusTargetNeedsOwnerSnapshot(source_incomplete_status, .{ .name = "vec", .identity = null }));
+    incomplete_source_replay[0].producer_complete = true;
+    try std.testing.expect(!ApiHttpServer.runtimeStatusTargetNeedsOwnerSnapshot(source_incomplete_status, .{ .name = "vec", .identity = null }));
 }
 
 test "api index status refreshes writer when read snapshot omits requested index" {
@@ -62592,4 +62654,90 @@ test "external lake query cleanup scheduler drains multiple query-only tables fa
     server.observeLakeQueryCollection(.{ .more = true });
     server.observeLakeQueryCollection(.{ .more = true, .progressed = true, .failed = true });
     try std.testing.expectEqual(@as(u64, 30000), server.lakeArtifactCollectionIntervalMs(30000));
+}
+
+test "external lake query cleanup scheduler continues productive checkpoint retirement" {
+    const a = std.testing.allocator;
+    const lifecycle = @import("../metadata/lake_index_lifecycle.zig");
+    const Fixture = struct {
+        arena: std.heap.ArenaAllocator = .init(std.testing.allocator),
+        rows: [3]?[]const u8 = @splat(null),
+        visits: [3]usize = @splat(0),
+        calls: std.atomic.Value(usize) = .init(0),
+        const ids = [_]u64{ 0, 7, 8 };
+        fn slot(table: u64) !usize {
+            for (ids, 0..) |id, i| if (id == table) return i;
+            return error.TestUnexpectedResult;
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn read(raw: *anyopaque, alloc: std.mem.Allocator, table: u64, _: api_operation.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return alloc.dupe(u8, self.rows[try slot(table)] orelse "{}");
+        }
+        fn mutate(raw: *anyopaque, table: u64, revision: u64, mutation: lifecycle.Mutation, _: api_operation.RequestContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const scratch = self.arena.allocator();
+            const i = try slot(table);
+            const before = try lifecycle.parse(scratch, self.rows[i] orelse "{}");
+            if (before.revision != revision) return error.CatalogGenerationChanged;
+            self.rows[i] = try lifecycle.encode(scratch, try mutation.apply(scratch, before));
+        }
+        fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, _: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            if (call != .lake_index_lifecycle_work) return error.TestUnexpectedResult;
+            for (ids, 0..) |table, i| {
+                if (call.lake_index_lifecycle_work) |after| if (table <= after) continue;
+                if (self.rows[i]) |row| {
+                    self.visits[i] += 1;
+                    return std.json.Stringify.valueAlloc(alloc, lifecycle.WorkPage{ .item = .{ .table_id = table, .state = try lifecycle.parse(alloc, row) }, .after = table }, .{});
+                }
+            }
+            return std.json.Stringify.valueAlloc(alloc, lifecycle.WorkPage{}, .{});
+        }
+    };
+
+    for ([_]u64{ 128, 256, 512 }) |read_limit| {
+        var fixture: Fixture = .{};
+        defer fixture.arena.deinit();
+        var directory = try TestDirectory.init("retirement-fast-scheduling");
+        defer directory.cleanup();
+        var config = try common_config.Config.parseFromSlice(a, "{}");
+        defer config.deinit();
+        config.lake_indexes.artifact_gc.max_deleted = 1;
+        config.lake_indexes.artifact_gc.max_read_bytes = read_limit;
+        var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{});
+        defer runtime.deinit();
+        var store = try @import("lake_index_store.zig").Store.openNative(a, &config, null, false, .standalone, directory.path());
+        defer store.deinit();
+        const gc = @import("lake_query_gc.zig");
+        const now = platform_time.realtimeNs() / std.time.ns_per_ms;
+        var budget: gc.Budget = .{ .deletes = 128, .reads = 16384, .work = 128, .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s };
+        const seeded = gc.collect(a, &store, 7, 0, now, &budget);
+        try std.testing.expect(!seeded.more and !seeded.failed and !seeded.retained);
+        var state = try (lifecycle.State{}).retainQueryStore(fixture.arena.allocator(), .{ .identity = store.identity, .locator = store.locator }, now - 1000);
+        state = try state.queryProgress(fixture.arena.allocator(), .{ .store = store.identity, .observed_until_ms = now - 1000, .phase = 0, .release = false, .now_ms = now, .token = @splat(1) });
+        fixture.rows[try Fixture.slot(7)] = try lifecycle.encode(fixture.arena.allocator(), state);
+        var server = ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .node_config = &config, .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path(), .lake_artifact_gc_enabled = false }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.catalog, .get_lake_index_lifecycle = Fixture.read, .mutate_lake_index_lifecycle = Fixture.mutate } }, null, null);
+        defer server.deinit();
+        try server.runLakeArtifactCollectionOnce();
+        const prefix = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/7/", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/" });
+        defer a.free(prefix);
+        var remaining = try store.opened.client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 16 });
+        defer remaining.deinit(store.opened.client.allocator);
+        try std.testing.expectEqual(@as(usize, 4), remaining.entries.len);
+        try server.runLakeArtifactCollectionOnce();
+        try std.testing.expectEqual(@as(u64, 50), server.lakeArtifactCollectionIntervalMs(30000));
+        // Productive debt survives whole metadata rounds until the witness and
+        // every checkpoint are gone, without index or native-query debt.
+        for (0..12) |_| try server.runLakeArtifactCollectionOnce();
+        var empty = try store.opened.client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 16 });
+        defer empty.deinit(store.opened.client.allocator);
+        try std.testing.expectEqual(@as(usize, 0), empty.entries.len);
+        const final = try lifecycle.parse(fixture.arena.allocator(), fixture.rows[try Fixture.slot(7)].?);
+        try std.testing.expectEqual(@as(usize, 0), final.stores.len);
+        try std.testing.expectEqual(@as(u64, 30000), server.lakeArtifactCollectionIntervalMs(30000));
+    }
 }

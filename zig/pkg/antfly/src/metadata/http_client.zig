@@ -3626,6 +3626,7 @@ fn consumerTests() type {
         test "metadata http client preserves extension ownership across forwarding" {
             const ExtensionOwnedExecutor = struct {
                 outcome: []const u8,
+
                 fn ownedHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !http_common.Header {
                     const owned_name = try alloc.dupe(u8, name);
                     errdefer alloc.free(owned_name);

@@ -25,7 +25,7 @@ const std = @import("std");
 const error_abi = @import("runtime_error_abi.zig");
 const native_abi = @import("runtime_native_abi.zig");
 
-test "boundary dispatcher preserves graph metric readiness and storage contention across runtime units" {
+test "boundary dispatcher preserves readiness and storage contention across runtime units" {
     const VTable = struct {
         query: *const fn (*const anyerror) anyerror!u64,
     };
@@ -44,7 +44,7 @@ test "boundary dispatcher preserves graph metric readiness and storage contentio
             return TestBoundary.local_dispatch(contract, callback, args, output);
         }
     };
-    for ([_]anyerror{ error.MetricNotReady, error.MetricStale, error.FileBusy, error.WouldBlock }) |err| {
+    for ([_]anyerror{ error.MetricNotReady, error.MetricStale, error.FileBusy, error.WouldBlock, error.SqlStatementReadUnavailable }) |err| {
         try std.testing.expectError(err, TestBoundary.call("query", &Callbacks.foreignDispatch, &Callbacks.query, .{&err}));
     }
 }
@@ -82,7 +82,7 @@ fn BoundaryImpl(comptime VTable: type) type {
             const Function = functionType(Callback);
             const Args = std.meta.ArgsTuple(Function);
             const Payload = payloadType(Callback);
-            _ = std.meta.fieldIndex(VTable, field_name) orelse
+            if (!@hasField(VTable, field_name))
                 @compileError("unknown boundary vtable field: " ++ field_name);
             var typed_args: Args = args;
 
