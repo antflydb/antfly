@@ -23,7 +23,7 @@ settings change. Real text generation, history recall, and byte bounds passed.
 
 The opt-in build uses the SDK 27 Swift toolchain. Vision remains directly linked;
 Foundation Models and Speech live in a bundled macOS 26+ dylib. A small C loader
-checks the running OS before loading, verifies ABI version 1, caches its entry
+checks the running OS before loading, verifies ABI version 2, caches its entry
 point with `pthread_once`, and retains the library for process lifetime. The CLI
 and Lite can keep their older deployment target without Swift/framework linkage.
 Discovery is relative to the owning executable or `libantfly`, with an explicit

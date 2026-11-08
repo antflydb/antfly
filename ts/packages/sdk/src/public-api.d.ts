@@ -5513,6 +5513,28 @@ export interface paths {
          *     `dictionary` are applied. Clips longer than the 30 s Whisper window
          *     are transcribed in windows cut at the quietest pause near the boundary.
          *
+         *     Database nodes also accept named transcribers such as
+         *     `transcribers/apple-speech`. Apple uses the server's native SpeechAnalyzer
+         *     for recorded clips and requires an Apple-provider build, macOS 26+, and
+         *     installed locale assets. Select a named cleanup generator with its bare
+         *     name or `generators/name`; this shares cleanup with named Whisper
+         *     transcribers. The standalone runtime continues to accept local Whisper
+         *     and generator model names.
+         *
+         *     Named non-Whisper providers apply `dictionary` during cleanup; they reject
+         *     Whisper-only `transcript_prompt`, `vad`, and `audio_context` options.
+         *     Apple does not support live transcription sessions. For provider-backed
+         *     cleanup, a delta may contain the entire cleaned result; the raw transcript
+         *     is delivered before cleanup starts. Missing token usage remains absent.
+         *
+         *     Empty recognition is a successful empty result and does not run cleanup.
+         *     Cleanup must confirm a complete text response: token-limited, filtered,
+         *     tool-only, empty, and unconfirmed outputs fail rather than replacing the
+         *     transcript. In streaming mode the error follows `dictation.transcript`
+         *     and no `dictation.completed` event is emitted. Strict Apple cleanup runs
+         *     to natural completion within context, deadline, and bounded output bytes;
+         *     macOS 27+ also verifies measured output tokens against the token budget.
+         *
          *     Set `cleanup_model` to the generator that rewrites the transcript.
          *     Without it, or with `style: verbatim`, the response carries the raw
          *     transcript and no generation runs.
@@ -24656,6 +24678,13 @@ export interface components {
              * @description Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows.
              */
             audio: string;
+            /**
+             * @description Clean an already finalized recognition segment without running recognition
+             *     again. Supported by named transcribers advertising text_cleanup. Set
+             *     audio to the empty string and omit attachments and recognition hints.
+             *     Partial hypotheses must never be submitted as finalized segments.
+             */
+            transcript_text?: string;
             /**
              * @description Force the transcript language (ISO 639-1). Omit for automatic detection.
              * @example en
@@ -44582,6 +44611,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["InferenceDictateRequest"];
+                "application/vnd.antfly.attachments.v1": string;
             };
         };
         responses: {
