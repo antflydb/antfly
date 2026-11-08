@@ -83,7 +83,13 @@ class QualificationTests(unittest.TestCase):
     def test_native_attribution_without_measured_ocr_width_is_incomplete(self):
         for response in (
             {},
-            {"execution": {"native_items": 1}},
+            {
+                "execution": {
+                    "native_items": 1,
+                    "requested_items": 1,
+                    "rejected_items": 0,
+                }
+            },
             {"execution": {"max_native_step_items": 1}},
         ):
             with self.assertRaises(q.EvidenceUnavailable):
@@ -131,17 +137,32 @@ class QualificationTests(unittest.TestCase):
                     "completion_tokens": 3,
                     "total_tokens": 20,
                 },
-                "execution": {"native_items": 1},
+                "execution": {
+                    "native_items": 1,
+                    "requested_items": 1,
+                    "rejected_items": 0,
+                },
             }
             candidate = copy.deepcopy(reference)
-            candidate["execution"] = {"native_items": 8}
+            candidate["execution"]["native_items"] = 8
             assert_equivalent(kind, reference, candidate)
-            for field in ("model", "object", "usage", "id", "index", "audio"):
+            for field in (
+                "model",
+                "object",
+                "usage",
+                "id",
+                "index",
+                "audio",
+                "requested_items",
+                "rejected_items",
+            ):
                 changed = copy.deepcopy(candidate)
                 if field in ("model", "object"):
                     changed[field] = "other"
                 elif field == "usage":
                     changed[field]["prompt_tokens"] = 999
+                elif field in ("requested_items", "rejected_items"):
+                    changed["execution"][field] += 1
                 else:
                     changed["data"][0][field] = "other"
                 with (

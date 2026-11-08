@@ -40,6 +40,14 @@ device failures are never replayed. Cancellation stops a physical cohort only
 after every member is gone. The public request item ceiling applies before
 schema-v2 dispatch and is independent of the cross-request cohort width.
 
+Independent cohorts also plan a conservative bound for scalar downloads from
+record, relation, attribute, enum and joint-decoding callbacks. The bound uses
+prepared geometry, schema routes and the existing task ceilings, without tensor
+reads or allocations. Cohorts exceeding either cumulative download ceiling
+subdivide before dispatch; singleton requests retain exact incremental checks.
+Record shape admission emits typed row-limit rejections before scorer execution.
+Resource failures from shared backend/workspace execution remain fatal.
+
 Qualification exposed Whisper's old 4,096-entry flattened position-ID buffer:
 three full-context rows need 4,500 entries and four need 6,000. The encoder now
 allocates checked batch-sized position IDs, repeats positions independently for
@@ -129,6 +137,10 @@ are shared under `~/.cache/antfly/conformance-fixtures`. The campaign additional
 checks decoded items, returned items and prompt-token counters against each
 schema-sweep cohort's actual responses. These counters must be present and exact;
 physical batching alone does not establish correct caller observations.
+Recognition parity compares the complete stable response contract, including
+usage, model and item identity; only physical execution attribution may differ.
+Published fixture reads need no write access. Cache writers lock transfer and
+publication and recheck after acquiring the lock, including the speech corpus.
 
 Run the final campaign against the owned write service, with local model paths
 substituted in the canonical config:

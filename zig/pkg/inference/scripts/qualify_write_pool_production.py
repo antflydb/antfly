@@ -76,8 +76,18 @@ def assert_equivalent(kind, reference, candidate):
         # Physical batching attribution may legitimately differ. Everything
         # else is the caller's public response contract, including usage/IDs.
         left, right = copy.deepcopy(reference), copy.deepcopy(candidate)
-        left.pop("execution", None)
-        right.pop("execution", None)
+        for response in (left, right):
+            attribution = response.get("execution")
+            if attribution is not None:
+                assert isinstance(attribution, dict), "invalid execution attribution"
+                for field in (
+                    "native_batches",
+                    "native_items",
+                    "max_native_step_items",
+                    "serial_items",
+                    "fallback_items",
+                ):
+                    attribution.pop(field, None)
         try:
             equivalent(left["usage"], right["usage"], tolerance=0)
             equivalent(left, right, tolerance=0.0005)

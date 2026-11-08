@@ -126,6 +126,18 @@ class FixtureAcquisitionTests(unittest.TestCase):
         data = b"verified corpus"
         started = threading.Event()
         release = threading.Event()
+        competing = threading.Event()
+        attempts_lock = threading.Lock()
+        attempts = 0
+        flock = fixtures.fcntl.flock
+
+        def tracked_flock(fd, operation):
+            nonlocal attempts
+            with attempts_lock:
+                attempts += 1
+                if attempts == 2:
+                    competing.set()
+            return flock(fd, operation)
 
         class Source(io.BytesIO):
             def read(self, size=-1):
@@ -142,6 +154,7 @@ class FixtureAcquisitionTests(unittest.TestCase):
                     "urlopen",
                     side_effect=lambda *args, **kwargs: Source(data),
                 ) as request,
+                patch.object(fixtures.fcntl, "flock", side_effect=tracked_flock),
                 ThreadPoolExecutor(2) as pool,
             ):
                 first = pool.submit(
@@ -156,6 +169,9 @@ class FixtureAcquisitionTests(unittest.TestCase):
                     "url",
                     path,
                     sha256=hashlib.sha256(data).hexdigest(),
+                )
+                self.assertTrue(
+                    competing.wait(5), "second writer did not attempt publication lock"
                 )
                 release.set()
                 self.assertEqual(first.result(timeout=5), second.result(timeout=5))

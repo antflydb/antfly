@@ -2194,3 +2194,37 @@ test "gliner microbatch preflight includes record callback downloads" {
     options.engine.limits.max_batch = 1;
     try std.testing.expect(try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options) > 0);
 }
+
+test "gliner microbatch callback planning covers every frozen schema route" {
+    const a = std.testing.allocator;
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const bytes = try fixtures.fixtureBytes(a, "pipeline_cases_base.json");
+    defer a.free(bytes);
+    const Cases = struct { cases: []const struct { id: []const u8, schema: std.json.Value } };
+    const cases = try std.json.parseFromSlice(Cases, a, bytes, .{ .ignore_unknown_fields = true });
+    defer cases.deinit();
+    const config = QualificationGeometryTest.config();
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var checked: usize = 0;
+    for (cases.value.cases) |case| {
+        const json = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "m", .schema = case.schema, .inputs = .{ .{ .content = "Ada met Bob." }, .{ .content = "Bob met Ada." } } }, .{});
+        defer a.free(json);
+        var request = try wire.parseJson(a, json, .{});
+        defer request.deinit();
+        var prepared = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, .{});
+        defer prepared.deinit();
+        const schemas = [_]*const @TypeOf(request.items[0].compiled){ &request.items[0].compiled, &request.items[1].compiled };
+        var options = device_request.Options{ .independent_requests = true };
+        const plan = try device_request.plan(&config, &prepared, &schemas, options);
+        if (plan.callback_result_download_upper_bound_bytes == 0) continue;
+        checked += 1;
+        options.limits.scorer.max_result_download_bytes = plan.minimum_result_download_bytes + plan.callback_result_download_upper_bound_bytes - 1;
+        try std.testing.expectError(error.ResourceLimitExceeded, device_request.plan(&config, &prepared, &schemas, options));
+        // The exact same initial transfers fit without independent-caller
+        // admission. Only callback headroom is responsible for subdivision.
+        options.independent_requests = false;
+        const atomic = try device_request.plan(&config, &prepared, &schemas, options);
+        try std.testing.expectEqual(@as(usize, 0), atomic.callback_result_download_upper_bound_bytes);
+    }
+    try std.testing.expect(checked >= 7);
+}
