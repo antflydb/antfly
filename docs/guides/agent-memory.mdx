@@ -223,7 +223,7 @@ while True:
     cursor = page["next_cursor"]
 ```
 
-A curator can create reviewable work with `memory.prepare_consolidation("agent", idempotency_key="review-2026-01")`. The receipt contains `proposal_ids` for the supersession verdict flow and `review_cursor` for the next preparation request. Proposal creation leaves beliefs unchanged. Verifying a claim with `correct` to active/settled records `last_verified_at` and resets staleness.
+A curator can create reviewable work with `memory.prepare_consolidation("agent", idempotency_key="review-2026-01")`. The receipt contains `proposal_ids` for the supersession verdict flow and `review_cursor` for the next preparation request. Preparation returns only open proposals whose pins match current authorized views, and refreshes stale work while retaining its audit history. Continue `review_cursor` even when a page returns no proposal IDs. Proposal creation leaves beliefs unchanged. Verifying a claim with `correct` to active/settled records `last_verified_at` and resets staleness.
 
 After consuming recall or brief results, call `memory.access("agent", ["deploy-helm"], idempotency_key="session-42-recall-1")`. Reuse the key on retries. `memory.usage("agent", "deploy-helm")` returns your branch-local count, last access, verification time and utility. Reads themselves do not create access events. Inspection includes paged `statistics` for retained space growth; continue with `memory.execute("agent", "inspect", body={"cursor": next_cursor})` and sum counts.
 

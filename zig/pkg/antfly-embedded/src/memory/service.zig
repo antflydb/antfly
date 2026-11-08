@@ -54,8 +54,9 @@ const GenerationProvenance = struct {
 };
 const JudgmentArtifact = struct { input_version: u8 = 0, operation: prov.Resource, inputs: GenerationProvenance, reason: []const u8, output_assertion_id: ?[]const u8 = null };
 const ExplainedRecord = struct { resource: prov.Resource, record: std.json.Value, links: []const prov.Link };
-const StoredOutcome = struct { outcome: t.Outcome, owner: []const u8, recorded_at: i64, revision: u64 = 0 };
-const OutcomeSignal = struct { id: []const u8, success: bool, used_memory_ids: []const []const u8, owner: []const u8, recorded_at: i64 };
+const StoredOutcome = struct { outcome: t.Outcome, owner: []const u8, recorded_at: i64, revision: u64 = 0, branch: ?[]const u8 = null };
+const OutcomeSignal = struct { id: []const u8, success: bool, used_memory_ids: []const []const u8, owner: []const u8, recorded_at: i64, branch: ?[]const u8 = null };
+const ConsolidationCurrent = struct { proposal_id: []const u8 };
 const StoredUsage = struct { id: []const u8, owner: []const u8, branch: []const u8, recalls: u64 = 0, last_recalled_at: ?i64 = null };
 const max_utility_signal_bytes = 192 * 1024;
 const max_utility_read_bytes = 4 * 1024 * 1024;
@@ -1420,8 +1421,44 @@ const Run = struct {
         const position = try std.fmt.allocPrint(self.a, "{d:0>20}/{d:0>10}", .{ self.state.revision, items.items.len });
         const audiences = try self.a.alloc([]const u8, 1);
         const private_branch = if (self.lineage_head) |head| self.service.context.branch.len > 0 and head.visibility == .private else false;
-        audiences[0] = try self.feedAudience(if (private_branch) self.lineage_head.?.owner else owner, if (private_branch) .private else visibility, curator);
+        // A private record keeps its owner audience even inside someone
+        // else's private branch. Branch access is also rechecked on delivery.
+        audiences[0] = try self.feedAudience(if (private_branch and visibility == .team) self.lineage_head.?.owner else owner, if (private_branch) .private else visibility, curator);
         try items.append(self.a, .{ .event = .{ .branch = self.service.context.branch, .id = position, .kind = kind, .target = target, .revision = self.state.revision, .recorded_at = self.service.context.now_ms }, .audiences = audiences });
+    }
+    fn feedbackInvalidation(self: *Run, items: *std.ArrayList(FeedRecord), branch: []const u8, owner: []const u8, visibility: t.Visibility) !void {
+        const prior_branch = self.service.context.branch;
+        const prior_head = self.lineage_head;
+        defer {
+            self.service.context.branch = prior_branch;
+            self.lineage_head = prior_head;
+        }
+        self.service.context.branch = branch;
+        if (self.state.config.features.lineage) {
+            self.lineage_head = try self.rawRead(t.LineageHead, try key(self.a, "lineage-head", if (branch.len == 0) "main" else branch));
+            if (branch.len > 0 and self.lineage_head == null) return;
+        }
+        try self.feedEmit(items, .context_invalidated, null, owner, visibility, false);
+    }
+    fn publishFeedbackFeed(self: *Run, items: *std.ArrayList(FeedRecord)) !void {
+        for (self.changes.items) |change| {
+            const pin = std.mem.startsWith(u8, change.key, "brief-pin/");
+            if (!pin and !std.mem.startsWith(u8, change.key, "outcome-signal/")) continue;
+            // Deletions need the old audience; staged tombstones cannot
+            // provide it. This remains a bounded point read per changed row.
+            const json = change.json orelse if (try self.backendGet(change.key)) |row| row.json else continue;
+            if (pin) {
+                const stored = try parse(t.StoredPin, self.a, json);
+                const path = try key(self.a, "assertion", stored.id);
+                const record = (try self.rawRead(t.StoredAssertion, path)) orelse if (try self.backendGet(path)) |row| try parse(t.StoredAssertion, self.a, row.json) else continue;
+                try self.feedbackInvalidation(items, stored.branch, record.owner, record.assertion.visibility);
+            } else {
+                const stored = try parse(OutcomeSignal, self.a, json);
+                // Legacy signals lack branch identity. A targetless trunk
+                // invalidation conservatively refreshes this owner's context.
+                try self.feedbackInvalidation(items, stored.branch orelse "", stored.owner, .private);
+            }
+        }
     }
     fn publishFeed(self: *Run, operation: t.Operation) !void {
         // Inspect the final staged values, so retried planners and intermediate
@@ -1454,6 +1491,7 @@ const Run = struct {
                 try self.feedEmit(&items, .entity_changed, .{ .kind = .entity, .id = record.entity.id, .revision = record.revision }, record.owner, record.entity.visibility, false);
             }
         }
+        try self.publishFeedbackFeed(&items);
         if (operation.evaluation_id != null) try self.feedEmit(&items, .evaluation_changed, null, operation.owner, .team, true);
         if (eql(u8, operation.action, "fork_lineage") or eql(u8, operation.action, "checkpoint_lineage") or eql(u8, operation.action, "revert_lineage")) try self.feedEmit(&items, .lineage_changed, null, operation.owner, .team, false);
         if (eql(u8, operation.action, "prepare_consolidation")) {
@@ -2554,7 +2592,7 @@ const Run = struct {
         return out;
     }
     fn putOutcomeSignal(self: *Run, stored: StoredOutcome) !void {
-        try self.put(try key(self.a, "outcome-signal", stored.outcome.id), OutcomeSignal{ .id = stored.outcome.id, .success = stored.outcome.success, .used_memory_ids = stored.outcome.used_memory_ids, .owner = stored.owner, .recorded_at = stored.recorded_at });
+        try self.put(try key(self.a, "outcome-signal", stored.outcome.id), OutcomeSignal{ .id = stored.outcome.id, .success = stored.outcome.success, .used_memory_ids = stored.outcome.used_memory_ids, .owner = stored.owner, .recorded_at = stored.recorded_at, .branch = stored.branch });
     }
     fn utilitySignal(self: *Run, id: []const u8) !?OutcomeSignal {
         const path = try key(self.a, "outcome-signal", id);
@@ -5952,8 +5990,9 @@ const Run = struct {
             try self.authorize(record.owner, record.assertion.visibility);
             if (!try self.evidenceVisible(record)) return error.MemoryNotFound;
         }
-        try self.put(path, StoredOutcome{ .outcome = request, .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision });
-        try self.putOutcomeSignal(.{ .outcome = request, .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision });
+        const stored: StoredOutcome = .{ .outcome = request, .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision, .branch = self.service.context.branch };
+        try self.put(path, stored);
+        try self.putOutcomeSignal(stored);
         // Reverse bindings let reads derive per-memory utility without
         // scanning every outcome. Reads recheck the outcome itself.
         for (request.used_memory_ids) |id| try self.put(try outcomeUseKey(self.a, self.service.context.branch, id, request.id), OutcomeUse{ .outcome_id = request.id, .memory_id = id });
@@ -6620,6 +6659,10 @@ const Run = struct {
         } else if (std.mem.startsWith(u8, row.key, "lineage-entity/")) {
             const entity_record = try parse(t.EntityRecord, self.a, row.json);
             if (!try self.entityRetained(entity_record)) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "consolidation-current/")) {
+            const binding = try parse(ConsolidationCurrent, self.a, row.json);
+            const proposal = try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", binding.proposal_id));
+            if (try self.read(bool, "forgotten-all") != null or proposal == null or !try self.supersessionProposalRetained(proposal.?)) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "supersession-proposal/")) {
             const proposal = try parse(t.SupersessionProposal, self.a, row.json);
             if (!try self.supersessionProposalRetained(proposal)) {
@@ -8136,6 +8179,11 @@ const Run = struct {
         const lhs = if (left.memory_ids.len > 0) left.memory_ids[0] else left.entity_id orelse "";
         const rhs = if (right.memory_ids.len > 0) right.memory_ids[0] else right.entity_id orelse "";
         if (!eql(u8, lhs, rhs)) return std.mem.lessThan(u8, lhs, rhs);
+        if (left.kind == .dispute) {
+            const lp = if (left.memory_ids.len > 1) left.memory_ids[1] else "";
+            const rp = if (right.memory_ids.len > 1) right.memory_ids[1] else "";
+            if (!eql(u8, lp, rp)) return std.mem.lessThan(u8, lp, rp);
+        }
         return std.mem.lessThan(u8, left.target_id orelse "", right.target_id orelse "");
     }
     /// Keep only the best requested findings in O(log(limit)) work per input.
@@ -8194,14 +8242,22 @@ const Run = struct {
         defer self.retention_maintenance = prior;
         return !try self.retained(record, 0);
     }
+    fn consolidationPeer(self: *Run, record: t.StoredAssertion, id: []const u8) !?t.StoredAssertion {
+        const peer = (try self.assertion(id)) orelse return null;
+        if ((peer.lifecycle != .active and peer.lifecycle != .disputed) or !try self.claimsOverlap(record, peer)) return null;
+        if (try self.recallHit(peer, .{}, null, false) == null) return null;
+        return peer;
+    }
     fn claimFindings(self: *Run, hit: t.RecallHit, pinned: std.StringArrayHashMapUnmanaged(void), outcomes: bool, request: t.ConsolidationRequest, now: i64, retired_links: *std.StringHashMapUnmanaged(bool), findings: *BoundedFindings) !void {
         const record = hit.memory;
         const claim = record.assertion;
         if (record.lifecycle == .disputed) {
-            var ids: std.ArrayList([]const u8) = .empty;
-            try ids.append(self.a, claim.id);
-            for (record.conflicts_with) |other| if (try self.publicAssertionRef(other)) try ids.append(self.a, other);
-            try findings.append(self.a, .{ .kind = .dispute, .memory_ids = ids.items, .reason = record.reason orelse "conflicting current claims need a supersession verdict", .suggested_action = .review_supersession });
+            var peers: usize = 0;
+            for (record.conflicts_with) |other| if (try self.consolidationPeer(record, other) != null) {
+                peers += 1;
+                try findings.append(self.a, .{ .kind = .dispute, .memory_ids = &.{ claim.id, other }, .reason = record.reason orelse "conflicting current claims need a supersession verdict", .suggested_action = .review_supersession });
+            };
+            if (peers == 0) try findings.append(self.a, .{ .kind = .dispute, .memory_ids = &.{claim.id}, .reason = record.reason orelse "disputed claim has no current peer; review its lifecycle", .suggested_action = .correct });
         }
         const single = self.singlePredicate(claim.predicate);
         if (single and claim.valid_from == null and record.lifecycle == .active) try findings.append(self.a, .{ .kind = .unordered, .memory_ids = &.{claim.id}, .reason = "single-valued predicate without valid_from cannot be ordered against later values", .suggested_action = .add_valid_from });
@@ -8256,6 +8312,11 @@ const Run = struct {
         if (candidate_authority != other_authority) return candidate_authority > other_authority;
         return std.mem.lessThan(u8, candidate.assertion.id, other.assertion.id);
     }
+    fn consolidationPinsMatch(proposal: t.SupersessionProposal, incoming: t.ClaimView, previous: t.ClaimView) bool {
+        return proposal.config_generation == incoming.config_generation and
+            eql(u8, proposal.incoming.id, incoming.memory.assertion.id) and proposal.incoming.revision == incoming.memory.revision and eql(u8, proposal.incoming.fingerprint, incoming.fingerprint) and
+            eql(u8, proposal.previous.id, previous.memory.assertion.id) and proposal.previous.revision == previous.memory.revision and eql(u8, proposal.previous.fingerprint, previous.fingerprint);
+    }
     fn prepareConsolidation(self: *Run, supplied: t.ConsolidationRequest, operation: *t.Operation) !void {
         var request = supplied;
         request.limit = @min(request.limit, 32);
@@ -8266,24 +8327,58 @@ const Run = struct {
         var seen: ResourceSet = .empty;
         for (report.findings) |finding| {
             if ((finding.kind != .duplicate and finding.kind != .dispute) or finding.memory_ids.len < 2) continue;
-            const ordered = std.mem.lessThan(u8, finding.memory_ids[0], finding.memory_ids[1]);
-            const left = (try self.assertion(finding.memory_ids[if (ordered) 0 else 1])) orelse continue;
-            const right = (try self.assertion(finding.memory_ids[if (ordered) 1 else 0])) orelse continue;
-            const id = try hash(self.a, .{ "consolidation-proposal/v1", self.service.context.principal, self.service.context.branch, left.assertion.id, left.revision, right.assertion.id, right.revision, self.state.config.generation });
-            if (seen.contains(id)) continue;
-            try seen.put(self.a, id, {});
-            if (try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", id)) == null) {
+            const seed = (try self.assertion(finding.memory_ids[0])) orelse continue;
+            if (seed.lifecycle != .active and seed.lifecycle != .disputed) continue;
+            // Review emits one eligible pair per finding, with cursor support
+            // inside wide disputes. Every reported pair fits this page's cap.
+            for (finding.memory_ids[1..]) |peer_id| {
+                const peer = (try self.consolidationPeer(seed, peer_id)) orelse continue;
+                const ordered = std.mem.lessThan(u8, seed.assertion.id, peer.assertion.id);
+                const left = if (ordered) seed else peer;
+                const right = if (ordered) peer else seed;
+                const left_view = try self.claimView(left);
+                const right_view = try self.claimView(right);
                 const reverse = try self.preferReplacement(right, left);
-                const incoming = try self.claimView(if (reverse) right else left);
-                const previous = try self.claimView(if (reverse) left else right);
-                try self.proposeSupersession(.{ .id = id, .expected_revision = self.state.revision - 1, .incoming = .{ .id = incoming.memory.assertion.id, .revision = incoming.memory.revision, .fingerprint = incoming.fingerprint }, .previous = .{ .id = previous.memory.assertion.id, .revision = previous.memory.revision, .fingerprint = previous.fingerprint } }, operation);
+                const incoming = if (reverse) right_view else left_view;
+                const previous = if (reverse) left_view else right_view;
+                // Public views can change without claim revisions, e.g. when
+                // verification evidence is forgotten or source access changes.
+                var id = try hash(self.a, .{ "consolidation-proposal/v2", self.service.context.principal, self.service.context.branch, left.assertion.id, left_view.fingerprint, right.assertion.id, right_view.fingerprint, incoming.memory.assertion.id, self.state.config.generation });
+                if (seen.contains(id)) continue;
+                try seen.put(self.a, id, {});
+                const current_path = try std.fmt.allocPrint(self.a, "consolidation-current/{s}", .{try hash(self.a, .{ self.service.context.principal, self.service.context.branch, left.assertion.id, right.assertion.id })});
+                const current = try self.read(ConsolidationCurrent, current_path);
+                const prior_id = if (current) |value| value.proposal_id else try hash(self.a, .{ "consolidation-proposal/v1", self.service.context.principal, self.service.context.branch, left.assertion.id, left.revision, right.assertion.id, right.revision, self.state.config.generation });
+                if (try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", prior_id))) |prior| {
+                    // Reuse valid legacy pins and preserve already-reviewed
+                    // decisions. Migration never reopens unchanged work.
+                    if (consolidationPinsMatch(prior, incoming, previous) and try self.supersessionProposalRetained(prior)) {
+                        if (current == null) try self.put(current_path, ConsolidationCurrent{ .proposal_id = prior.id });
+                        if (prior.verdict == null) try proposals.append(self.a, prior.id);
+                        continue;
+                    }
+                    try self.remove(try self.supersessionOpenKey(prior.id));
+                }
+                var proposal = try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", id));
+                if ((proposal != null and !try self.supersessionProposalRetained(proposal.?)) or try self.read(bool, try key(self.a, "forgotten-supersession-proposal", id)) != null) {
+                    // A deferred review's extra provenance can retire while
+                    // its claim pins stay unchanged. Allocate one fresh,
+                    // receipt-stable attempt, preserving the forgotten fence.
+                    id = try hash(self.a, .{ "consolidation-attempt/v1", id, operation.id });
+                    proposal = try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", id));
+                }
+                if (proposal == null) {
+                    try self.proposeSupersession(.{ .id = id, .expected_revision = self.state.revision - 1, .incoming = .{ .id = incoming.memory.assertion.id, .revision = incoming.memory.revision, .fingerprint = incoming.fingerprint }, .previous = .{ .id = previous.memory.assertion.id, .revision = previous.memory.revision, .fingerprint = previous.fingerprint } }, operation);
+                    proposal = try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", id));
+                }
+                if (current == null or !eql(u8, current.?.proposal_id, id)) try self.put(current_path, ConsolidationCurrent{ .proposal_id = id });
+                if (proposal.?.verdict == null) try proposals.append(self.a, id);
             }
-            try proposals.append(self.a, id);
         }
         operation.proposal_ids = proposals.items;
         operation.review_cursor = report.next_cursor;
     }
-    const FindingPosition = struct { kind: t.FindingKind, id: []const u8, target: ?[]const u8 = null };
+    const FindingPosition = struct { kind: t.FindingKind, id: []const u8, target: ?[]const u8 = null, peer: ?[]const u8 = null };
     const ReviewCursor = struct {
         stage: enum { claims, duplicates, entities, references, done } = .claims,
         after: ?[]const u8 = null,
@@ -8473,7 +8568,7 @@ const Run = struct {
             if (cursor.stage == .claims) {
                 if (cursor.finding_after == null) result.count_claim = hit.memory;
                 var local: BoundedFindings = .{ .limit = limit };
-                if (cursor.finding_after) |prior| local.after = .{ .kind = prior.kind, .memory_ids = &.{prior.id}, .target_id = prior.target, .reason = "", .suggested_action = .verify };
+                if (cursor.finding_after) |prior| local.after = .{ .kind = prior.kind, .memory_ids = if (prior.peer) |peer| &.{ prior.id, peer } else &.{prior.id}, .target_id = prior.target, .reason = "", .suggested_action = .verify };
                 var retired_links: std.StringHashMapUnmanaged(bool) = .empty;
                 try self.claimFindings(hit, pinned, outcomes, request, cursor.at, &retired_links, &local);
                 const items = try local.sorted(self.a);
@@ -8481,7 +8576,7 @@ const Run = struct {
                 result.findings = findings.items;
                 if (local.total > items.len) {
                     const last = items[items.len - 1];
-                    cursor.finding_after = .{ .kind = last.kind, .id = last.memory_ids[0], .target = last.target_id };
+                    cursor.finding_after = .{ .kind = last.kind, .id = last.memory_ids[0], .target = last.target_id, .peer = if (last.kind == .dispute and last.memory_ids.len > 1) last.memory_ids[1] else null };
                     result.omitted = local.total - items.len;
                     result.stop = true;
                     return result;
@@ -8533,7 +8628,7 @@ const Run = struct {
         if (value.after) |text| cursor.after = try self.a.dupe(u8, text);
         if (value.posting) |text| cursor.posting = try self.a.dupe(u8, text);
         if (value.finding_after) |position| {
-            cursor.finding_after = .{ .kind = position.kind, .id = try self.a.dupe(u8, position.id), .target = if (position.target) |text| try self.a.dupe(u8, text) else null };
+            cursor.finding_after = .{ .kind = position.kind, .id = try self.a.dupe(u8, position.id), .target = if (position.target) |text| try self.a.dupe(u8, text) else null, .peer = if (position.peer) |text| try self.a.dupe(u8, text) else null };
         }
         return cursor;
     }
