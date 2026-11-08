@@ -360,7 +360,7 @@ pub fn referenceEncoderDeviceBytes(backend: compute.BackendKind, allocator: Allo
             var pipeline_options = items[0].options.native(self.options.pipeline);
             pipeline_options.control = self.options.control;
             _ = try device_request.plan(self.config, prepared, schemas[0..items.len], .{
-                .independent_requests = self.options.brokered_request,
+                .independent_requests = self.options.row_sink != null or self.options.brokered_request,
                 .precision = self.precision,
                 .execution_policy = .reference_v1,
                 .limits = device_limits,
@@ -598,7 +598,6 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
                 var device_limits = options.device;
                 device_limits.encoder = engine_options.limits;
                 break :device (try device_request.run(cb, allocator, config, &prepared, schemas, .{
-                    .independent_requests = options.brokered_request,
                     .precision = options.identity.?.precision,
                     .execution_policy = options.metal_execution_policy,
                     .limits = device_limits,
@@ -2191,6 +2190,14 @@ test "gliner microbatch preflight includes record callback downloads" {
     options.brokered_request = true;
     options.device.head.max_result_download_bytes = combined.minimum_result_download_bytes + 12;
     try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options));
+    const Sink = struct {
+        fn emit(_: *anyopaque, _: usize, _: wire.Item, _: pipeline.Sample, _: usize) void {}
+        fn fail(_: *anyopaque, _: usize, _: anyerror) void {}
+        fn check(_: ?*anyopaque, _: usize) !void {}
+    };
+    options.brokered_request = false;
+    options.row_sink = .{ .context = &tokenizer, .emit_fn = Sink.emit, .fail_fn = Sink.fail, .check_fn = Sink.check };
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options));
     options.engine.limits.max_batch = 1;
     try std.testing.expect(try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options) > 0);
 }
@@ -2223,6 +2230,12 @@ test "gliner microbatch callback planning covers every frozen schema route" {
         // The exact same initial transfers fit without independent-caller
         // admission. Only callback headroom is responsible for subdivision.
         options.independent_requests = false;
+        var errors: [2]?anyerror = @splat(null);
+        options.pipeline.independent_rows = .{ .errors = errors[0..1] };
+        try std.testing.expectError(error.InvalidBoundaryPipelineOptions, device_request.plan(&config, &prepared, &schemas, options));
+        options.pipeline.independent_rows = .{ .errors = &errors };
+        try std.testing.expectError(error.ResourceLimitExceeded, device_request.plan(&config, &prepared, &schemas, options));
+        options.pipeline.independent_rows = null;
         const atomic = try device_request.plan(&config, &prepared, &schemas, options);
         try std.testing.expectEqual(@as(usize, 0), atomic.callback_result_download_upper_bound_bytes);
     }

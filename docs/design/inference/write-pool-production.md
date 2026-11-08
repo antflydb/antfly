@@ -45,7 +45,10 @@ record, relation, attribute, enum and joint-decoding callbacks. The bound uses
 prepared geometry, schema routes and the existing task ceilings, without tensor
 reads or allocations. Cohorts exceeding either cumulative download ceiling
 subdivide before dispatch; singleton requests retain exact incremental checks.
-Record shape admission emits typed row-limit rejections before scorer execution.
+Independent mode is derived from the row sink and pipeline error storage, so
+callers cannot bypass the transfer bound by omitting a planning flag. Row error
+storage is validated before dispatch. Record shape admission emits typed row-limit
+rejections before scorer execution.
 Resource failures from shared backend/workspace execution remain fatal.
 
 Qualification exposed Whisper's old 4,096-entry flattened position-ID buffer:

@@ -43,7 +43,8 @@ pub const Limits = struct {
 };
 
 pub const Options = struct {
-    /// Independent HTTP callers must fit aggregate callback transfers before dispatch.
+    /// Planning-only declaration, before row error storage is installed.
+    /// Execution also derives this requirement from pipeline.independent_rows.
     independent_requests: bool = false,
     /// Obtain from the validated opened model artifact's immutable identity.
     precision: artifact.Precision = .fp32,
@@ -155,6 +156,7 @@ pub fn plan(config: *const model.Config, prepared: *const processor.PreparedBatc
     if (batch > max_admission_batch) return error.ResourceLimitExceeded;
     if (batch == 0 or schemas.len != batch) return error.InvalidBoundaryPipelineInput;
     if (options.per_sample.len != 0 and options.per_sample.len != batch) return error.InvalidBoundaryPipelineOptions;
+    if (options.pipeline.independent_rows) |rows| if (rows.errors.len != batch) return error.InvalidBoundaryPipelineOptions;
     for (options.per_sample) |item| try pipeline.validateOptions(item);
     const cpu_limits = options.pipeline.head_limits;
     if (batch > cpu_limits.max_batch or prepared.word_width > cpu_limits.max_text_words or prepared.query_width > cpu_limits.max_queries)
@@ -187,7 +189,8 @@ pub fn plan(config: *const model.Config, prepared: *const processor.PreparedBatc
     const minimum_download = try add(head_download_bytes, try mul(classification_elements, 4));
     if (head_download_bytes > options.limits.head.max_result_download_bytes or minimum_download > options.limits.scorer.max_result_download_bytes)
         return error.ResourceLimitExceeded;
-    const callback_download = if (options.independent_requests and batch > 1) try callbackDownloadUpperBound(config, prepared, schemas, options) else 0;
+    const independent_requests = options.independent_requests or options.pipeline.independent_rows != null;
+    const callback_download = if (independent_requests and batch > 1) try callbackDownloadUpperBound(config, prepared, schemas, options) else 0;
     if (try add(head_download_bytes, callback_download) > options.limits.head.max_result_download_bytes or
         try add(minimum_download, callback_download) > options.limits.scorer.max_result_download_bytes) return error.ResourceLimitExceeded;
     const head_budget = if (headed != null) options.limits.head.max_device_bytes else 0;
