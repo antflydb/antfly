@@ -35,6 +35,13 @@ pub const AtomicGroup = struct {
     count: usize,
     cancel_fn: *const fn (*anyopaque) void,
     destroy_fn: *const fn (*anyopaque) void,
+    /// Read only after all producers have joined. Captured under the physical
+    /// store mutex, before rollback or another publication can erase it.
+    replay_refusal_fn: ?*const fn (*anyopaque) ?@import("lite/replay_admission.zig").WaitHint = null,
+
+    pub fn replayRefusal(self: AtomicGroup) ?@import("lite/replay_admission.zig").WaitHint {
+        return if (self.replay_refusal_fn) |read| read(self.ptr) else null;
+    }
 
     pub fn member(self: AtomicGroup, ordinal: usize) AtomicMember {
         std.debug.assert(ordinal < self.count);

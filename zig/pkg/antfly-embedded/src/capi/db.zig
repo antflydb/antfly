@@ -823,6 +823,10 @@ pub const HandleGuard = struct {
     /// Keep registry references and the provider snapshot alive, releasing both
     /// process and file locks while inference runs on an owned request plan.
     pub fn suspendQuery(self: *HandleGuard) void {
+        self.suspendQueryImpl(false);
+    }
+
+    fn suspendQueryImpl(self: *HandleGuard, retain_connection: bool) void {
         const connection = self.connection orelse return;
         std.debug.assert(self.connection_gate_held and self.entry_error == null);
         const root = connection.current.?;
@@ -840,8 +844,10 @@ pub const HandleGuard = struct {
         self.path_lease = null;
         self.connection_gate_held = false;
         connection.gate.mutex.unlock(handleLockIo());
-        connection.mutex.unlock(handleLockIo());
-        self.connection_mutex_held = false;
+        if (!retain_connection) {
+            connection.mutex.unlock(handleLockIo());
+            self.connection_mutex_held = false;
+        }
     }
 
     pub fn suspendQueryWithPrimarySnapshot(self: *HandleGuard) !void {
@@ -874,7 +880,10 @@ pub const HandleGuard = struct {
         if (self.suspended_query_root == null) return true;
         // Original registry references keep the connection/owner alive.
         const entry = HandleEntry.capture(ptr) orelse return false;
-        const next = enterWithAdmissionBudget(entry, ptr, access, if (access == .read) .read_only else .mutation, false, self.admission_budget_ns) orelse return false;
+        const next = if (self.connection_mutex_held)
+            enterWithHeldConnection(entry, access, self.admission_budget_ns)
+        else
+            enterWithAdmissionBudget(entry, ptr, access, if (access == .read) .read_only else .mutation, false, self.admission_budget_ns) orelse return false;
         const connection = self.connection.?;
         if (!next.connection_gate_held) connection.gate.mutex.lockUncancelable(handleLockIo());
         // Release before collectRetired can destroy the pin's Store. Keep it
@@ -913,6 +922,7 @@ pub const HandleGuard = struct {
             root.query_borrows -= 1;
             connection.collectRetired();
             connection.gate.mutex.unlock(io);
+            if (self.connection_mutex_held) connection.mutex.unlock(io);
             return;
         }
         if (self.connection) |connection| {
@@ -1115,6 +1125,57 @@ fn enterCapturedHandle(entry: HandleEntry, access: HandleAccess, intent: Storage
 }
 
 fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool, deadline: ?i96, active_ns: ?*u64) HandleGuard {
+    return enterCapturedHandleWithDeadlineMode(entry, access, intent, pinned, deadline, active_ns, false);
+}
+
+/// Session COMMIT owns the connection lane across detached preparation and
+/// capacity waiting. All same-connection calls acquire this lane before the
+/// owner gate, so they cannot destroy or mutate the borrowed Session. Replay
+/// uses the owner gate independently and remains able to return credits.
+fn enterWithHeldConnection(entry: HandleEntry, access: HandleAccess, budget_ns: ?i96) HandleGuard {
+    const connection = entry.lock_handle.lite_connection.?;
+    const io = handleLockIo();
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + @max(0, budget_ns orelse @as(i96, connection.options.busy_timeout_ms) * std.time.ns_per_ms);
+    var active_ns: u64 = 0;
+    var backoff: i96 = std.time.ns_per_ms;
+    while (true) {
+        var guard = enterCapturedHandleWithDeadlineMode(entry, access, .mutation, false, deadline + @as(i96, active_ns), &active_ns, true);
+        guard.admission_budget_ns = @max(0, deadline + @as(i96, active_ns) - std.Io.Clock.awake.now(io).nanoseconds);
+        if (guard.entry_error == null) {
+            std.debug.assert(guard.connection_gate_held);
+            const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started));
+            const stats = &connection.owner.publication_stats;
+            stats.mutation_admission_count +|= 1;
+            stats.mutation_admission_ns +|= elapsed;
+            stats.mutation_admission_max_ns = @max(stats.mutation_admission_max_ns, elapsed);
+            stats.mutation_admission_log2_ns[std.math.log2_int(u64, @max(1, elapsed))] +|= 1;
+            capi.clearLastError();
+        }
+        if (guard.entry_error != .busy or connection.options.busy_timeout_ms == 0 or guard.admission_budget_ns.? == 0) return guard;
+        // Drop only this attempt's owner/path locks; the original call owns
+        // both registry pins and the connection lane throughout the wait.
+        guard.connection_mutex_held = false;
+        guard.leaveAccess();
+        io.sleep(.fromNanoseconds(@min(backoff, guard.admission_budget_ns.?)), .awake) catch |err| {
+            var failed = entry.failedGuard(access, capi.mapError(err));
+            failed.connection = connection;
+            failed.connection_mutex_held = true;
+            failed.access_held = true;
+            return failed;
+        };
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline + @as(i96, active_ns)) {
+            var failed = entry.failedGuard(access, capi.mapError(error.FileBusy));
+            failed.connection = connection;
+            failed.connection_mutex_held = true;
+            failed.access_held = true;
+            return failed;
+        }
+        backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
+    }
+}
+
+fn enterCapturedHandleWithDeadlineMode(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool, deadline: ?i96, active_ns: ?*u64, connection_already_locked: bool) HandleGuard {
     const handle = entry.handle;
     const slot = entry.slot;
     const lock_handle = entry.lock_handle;
@@ -1127,10 +1188,12 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
         // it refuses foreign path waits. A configured nonzero budget bounds
         // both local lanes and all cross-process admissions in this call.
         const bounded = !pinned and connection.options.busy_timeout_ms != 0;
-        if (!bounded) connection.mutex.lockUncancelable(io) else connection.mutex.lockUntil(io, effective_deadline) catch |err| {
-            guard.entry_error = capi.mapError(err);
-            return guard;
-        };
+        if (!connection_already_locked) {
+            if (!bounded) connection.mutex.lockUncancelable(io) else connection.mutex.lockUntil(io, effective_deadline) catch |err| {
+                guard.entry_error = capi.mapError(err);
+                return guard;
+            };
+        }
         guard.connection_mutex_held = true;
         connection.admission_deadline_ns = if (bounded) effective_deadline else null;
         defer connection.admission_deadline_ns = null;
@@ -5027,6 +5090,10 @@ pub fn antfly_db_write_transaction(
 /// A changed inode/catalog or absent aggregate requests normal revalidation;
 /// only the actual mutation transaction may admit and consume durable credits.
 pub var test_replay_capacity_polls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
+pub var test_replay_capacity_sleep: if (builtin.is_test) ?struct {
+    ptr: *anyopaque,
+    sleep: *const fn (*anyopaque, std.Io.Duration) anyerror!void,
+} else void = if (builtin.is_test) null else {};
 
 fn waitForReplayCapacity(ptr: ?*anyopaque, path: []const u8, hint: lite_backend.native.replay_admission.WaitHint, deadline: i96, backoff: *i96) !void {
     const alloc = std.heap.c_allocator;
@@ -5034,7 +5101,10 @@ fn waitForReplayCapacity(ptr: ?*anyopaque, path: []const u8, hint: lite_backend.
     while (true) {
         const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
         if (remaining <= 0) return error.LiteReplayBacklogExceeded;
-        try io.sleep(.fromNanoseconds(@min(backoff.*, remaining)), .awake);
+        const delay = std.Io.Duration.fromNanoseconds(@min(backoff.*, remaining));
+        if (comptime builtin.is_test) {
+            if (test_replay_capacity_sleep) |hook| try hook.sleep(hook.ptr, delay) else try io.sleep(delay, .awake);
+        } else try io.sleep(delay, .awake);
         if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.LiteReplayBacklogExceeded;
         backoff.* = @min(backoff.* * 2, 50 * std.time.ns_per_ms);
         const entry = HandleEntry.capture(ptr) orelse return error.InvalidArgument;
@@ -6880,8 +6950,8 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
 /// Autocommit normalization owns an immutable session and a separate runtime
 /// lifetime pin. Re-entry can retire the serving wrapper, so the SQL frame's
 /// policy lease, allocation owner and cursor destructors must outlive refresh.
-/// Active SQL sessions retain serialized admission until they have their own
-/// independent session-lifetime protocol.
+/// Session COMMIT retains its connection lane while releasing owner admission;
+/// its staged postimages and the Session therefore remain exclusively owned.
 const SqlPreparationHandoff = struct {
     guard: *HandleGuard,
     connection: ?*@import("lite_connection.zig").Connection = null,
@@ -6893,18 +6963,26 @@ const SqlPreparationHandoff = struct {
     incarnation: u128 = 0,
     inode: u64 = 0,
     metadata: [16]u8 = @splat(0),
+    retain_connection: bool = false,
+    replay_backoff: i96 = std.time.ns_per_ms,
 
     fn init(guard: *HandleGuard, handle_ptr: ?*anyopaque, prepared: ?*PreparedEmbeddedSql) @This() {
         var result: @This() = .{ .guard = guard, .handle_ptr = handle_ptr };
         const connection = guard.connection orelse return result;
         const program = prepared orelse return result;
-        if (connection.options.profile != .native or program.parsed.value.session_id != null) return result;
         switch (program.compiled.statement) {
-            .insert, .update => {},
+            .insert, .update, .delete => {
+                result.retain_connection = program.parsed.value.session_id != null;
+            },
+            .commit => {
+                if (program.parsed.value.session_id == null) return result;
+                result.retain_connection = true;
+            },
             else => return result,
         }
         const root = guard.handle;
-        const file = &root.owned_lite_backend.?.native_docstore.?.file;
+        const backend = if (root.owned_lite_backend) |*value| value else return result;
+        const file = &(backend.native_docstore orelse return result).file;
         if (std.mem.allEqual(u8, &file.activeCheckpoint().logical.metadata, 0)) return result;
         root.query_borrows += 1;
         result.retained_root = root;
@@ -6931,7 +7009,7 @@ const SqlPreparationHandoff = struct {
 
     fn handoff(self: *@This()) ?@import("sql.zig").PreparationHandoff {
         if (self.retained_root == null) return null;
-        return .{ .ptr = self, .release_admission = releaseAdmission, .reacquire_admission = reacquireAdmission };
+        return .{ .ptr = self, .release_admission = releaseAdmission, .reacquire_admission = reacquireAdmission, .wait_replay = waitReplay, .stage_foreground = stageForeground };
     }
 
     fn releaseAdmission(ptr: *anyopaque, name: []const u8) !void {
@@ -6954,7 +7032,7 @@ const SqlPreparationHandoff = struct {
                 root.query_borrows += 1;
             }
         }
-        self.guard.suspendQuery();
+        self.guard.suspendQueryImpl(self.retain_connection);
         if (comptime builtin.is_test) if (test_sql_normalization_detached) |hook| hook.notify(hook.ptr);
     }
 
@@ -6970,6 +7048,40 @@ const SqlPreparationHandoff = struct {
         if (database.core.identity_namespace.table_id != self.table_id or database.root_incarnation != self.incarnation) return error.PreparedGenerationChanged;
         try @import("sql_ddl.zig").requireRecovered(root, database, self.table_name);
         return root;
+    }
+
+    fn stageForeground(ptr: *anyopaque, rows: *@import("../storage/db/prepared_document_batch.zig").Plan) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        std.debug.assert(self.guard.suspended_query_root != null);
+        var budget: PreparationBudget = .{ .remaining_ns = std.math.cast(u64, @max(0, self.guard.admission_budget_ns orelse 0)) orelse std.math.maxInt(u64) };
+        defer self.guard.admission_budget_ns = budget.remaining_ns;
+        try rows.stageIndependentForegroundTextWithBudget(&budget);
+    }
+
+    fn waitReplay(ptr: *anyopaque, hint: lite_backend.native.replay_admission.WaitHint) !*Handle {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const connection = self.connection.?;
+        if (connection.options.busy_timeout_ms == 0) return error.LiteReplayBacklogExceeded;
+        const budget = self.guard.admission_budget_ns orelse 0;
+        if (budget <= 0) return error.LiteReplayBacklogExceeded;
+        const io = handleLockIo();
+        // The failed native attempt has released every snapshot barrier and
+        // producer before calling this hook. Retain the session lane, never
+        // the file lease or owner gate that replay needs to make progress.
+        const deadline = std.Io.Clock.awake.now(io).nanoseconds + budget;
+        connection.owner.publication_stats.replay_backpressure_waits +|= 1;
+        connection.owner.wake.set(io);
+        self.guard.suspendQueryImpl(self.retain_connection);
+        const waited = waitForReplayCapacity(self.handle_ptr, connection.path, hint, deadline, &self.replay_backoff);
+        self.guard.admission_budget_ns = @max(0, deadline - std.Io.Clock.awake.now(io).nanoseconds);
+        // Failed waits retain the suspended lifetime pin until normal teardown.
+        // A session still owns its connection lane. Neither error cleanup nor
+        // setting its failed flag needs a writer lease or allocator proof.
+        try waited;
+        if (!self.guard.resumeAccess(self.handle_ptr, .exclusive)) return error.InvalidArgument;
+        if (self.guard.entry_error != null) return error.AdmissionFailed;
+        capi.clearLastError();
+        return self.guard.handle;
     }
 };
 
@@ -7043,7 +7155,7 @@ fn enterSqlWithReplayAdmission(entry: HandleEntry, ptr: ?*anyopaque, intent: Sto
         const guard = enterWithAdmissionBudget(entry, ptr, .exclusive, intent, true, remaining).?;
         if (guard.entry_error != null or prepared == null or guard.handle.parent_id != null) return guard;
         const connection = guard.connection orelse return guard;
-        if (connection.options.profile != .native or !liteOpenModeCanWrite(connection.options.open_mode) or
+        if (!liteOpenModeCanWrite(connection.options.open_mode) or
             !sqlNeedsReplayAdmission(guard.handle, prepared.?)) return guard;
         const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
         file.requireReplayCoordinatorCapacity() catch |err| {
@@ -7094,7 +7206,8 @@ fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_j
 
 fn executePreparedEmbeddedSqlWithHandoff(handle: *Handle, table_name: []const u8, request_json: []const u8, budget: *EmbeddedSqlBudget, prepared: *PreparedEmbeddedSql, out_buf: *capi.Buffer, handoff: ?@import("sql.zig").PreparationHandoff) !void {
     const session = try @import("sql_session.zig").requestSession(handle, request_json);
-    errdefer if (session) |value| {
+    var abort_session_on_error = true;
+    errdefer if (abort_session_on_error) if (session) |value| {
         if (value.active) value.failed = true;
     };
     var row_policy_lease = try handle.database().*.local_execution.row_policy_gate.enterRaw();
@@ -7117,7 +7230,8 @@ fn executePreparedEmbeddedSqlWithHandoff(handle: *Handle, table_name: []const u8
     }
     if (session) |value| {
         var transaction_id: ?db_mod.types.TxnId = null;
-        const controlled = value.control(compiled.statement, &transaction_id) catch |err| {
+        const controlled = value.controlWithHandoff(compiled.statement, &transaction_id, handoff) catch |err| {
+            if (err == error.SqlNativeCommitCapacityNotApplied) abort_session_on_error = false;
             if (transaction_id) |id| {
                 out_buf.* = embeddedSqlUnknownReceipt(&commit_receipt, id);
             } else if (commit_receipt != null and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err)) {
@@ -11234,6 +11348,8 @@ test "capi SQL owned normalization releases admission and rejects metadata chang
         var probe: Probe = .{ .id = id, .connection = wrapper.lite_connection.?, .metadata_change = scenario == .metadata_change };
         test_sql_normalization_detached = .{ .ptr = &probe, .notify = Probe.notify };
         defer test_sql_normalization_detached = null;
+        const owned_rows = @import("../storage/db/owned_relational_rows.zig");
+        const prepared_before = owned_rows.test_prepare_calls.load(.monotonic);
         const result = antfly_db_sql_json(id, .fromSlice(if (scenario == .normalization_failure)
             "{\"statement\":\"INSERT INTO values_table (_id,n) VALUES ('row',-1) RETURNING n\"}"
         else
@@ -11249,9 +11365,9 @@ test "capi SQL owned normalization releases admission and rejects metadata chang
         const parsed = try std.json.parseFromSlice(std.json.Value, a, output.ptr.?[0..output.len], .{});
         defer parsed.deinit();
         try std.testing.expectEqual(@as(usize, if (scenario == .primary_change) 1 else 0), parsed.value.object.get("rows").?.array.items.len);
-        // Normalization and commit must share one authority, so successful
-        // autocommit does not detach a second time to pack the same postimage.
-        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        // Normalization and commit share one packed authority. Text artifact
+        // staging and assembly can detach again without repeating row packing.
+        try std.testing.expectEqual(prepared_before + 1, owned_rows.test_prepare_calls.load(.monotonic));
     }
 }
 

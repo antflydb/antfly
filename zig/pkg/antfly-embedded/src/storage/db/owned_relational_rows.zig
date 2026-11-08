@@ -24,6 +24,8 @@ const resources = @import("execution_resources.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const Allocator = std.mem.Allocator;
 
+pub var test_prepare_calls: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {};
+
 pub const OwnedRows = struct {
     alloc: Allocator,
     inputs: std.heap.ArenaAllocator,
@@ -74,6 +76,7 @@ pub const OwnedRows = struct {
         guard.* = .{ .child = self.alloc, .io = io orelse std.Options.debug_io };
         // Reuse the ordinary defaults/generated/CHECK, extraction and packing
         // pipeline. A null DB forbids provider calls and live storage reads.
+        if (comptime @import("builtin").is_test) _ = test_prepare_calls.fetchAdd(1, .monotonic);
         try @import("db.zig").prepareOwnedRelationalRows(guard, io, self.writes, schema, plan, @intCast(@max(0, @import("antfly_platform").time.realtimeNs())), self.rows);
         self.complete = true;
     }
@@ -127,9 +130,17 @@ pub const OwnedRows = struct {
     }
 
     pub fn matchesWrites(self: *const OwnedRows, writes: []const types.BatchWrite) bool {
+        if (!self.matchesPostimages(writes)) return false;
+        for (self.rows) |row| if (row == null) return false;
+        return true;
+    }
+
+    /// The exact postimage witness remains valid after packed-row ownership
+    /// transfers to commit. It does not grant another transfer of those rows.
+    pub fn matchesPostimages(self: *const OwnedRows, writes: []const types.BatchWrite) bool {
         if (!self.complete or self.writes.len != writes.len) return false;
-        for (self.writes, writes, self.rows) |owned, actual, row| {
-            if (row == null or !std.mem.eql(u8, owned.key, actual.key) or !std.mem.eql(u8, owned.value, actual.value) or
+        for (self.writes, writes) |owned, actual| {
+            if (!std.mem.eql(u8, owned.key, actual.key) or !std.mem.eql(u8, owned.value, actual.value) or
                 owned.json_null_fields.len != actual.json_null_fields.len) return false;
             for (owned.json_null_fields, actual.json_null_fields) |lhs, rhs| if (!std.mem.eql(u8, lhs, rhs)) return false;
         }

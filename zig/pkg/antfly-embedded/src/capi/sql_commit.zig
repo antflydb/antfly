@@ -605,6 +605,111 @@ test "capi SQL outcome native constraints join one checkpoint and rollback toget
     try std.testing.expect((try f.file().check()).valid);
 }
 
+test "capi SQL native publication repairs CHECK coverage while rejecting invalid postimages" {
+    var f = try OutcomeFixture.init("sql-native-check-repair");
+    defer f.deinit();
+    try f.expectOk("{\"statement\":\"CREATE TABLE checked (n BIGINT)\"}");
+    try f.expectOk("{\"statement\":\"INSERT INTO checked (_id,n) VALUES ('a',-1)\"}");
+    {
+        var reply = try f.sql("{\"statement\":\"ALTER TABLE checked ADD CONSTRAINT positive CHECK (n > 0)\"}");
+        defer reply.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, reply.code);
+        try std.testing.expectEqualStrings("invalid", reply.parsed.?.value.object.get("ddl_receipt").?.object.get("state").?.string);
+    }
+    {
+        var reply = try f.sql("{\"statement\":\"UPDATE checked SET n=-2 WHERE _id='a'\"}");
+        defer reply.deinit();
+        try std.testing.expectEqualStrings("23514", reply.state().?);
+    }
+    const before = f.file().activeCheckpoint().commit_sequence;
+    try f.expectOk("{\"statement\":\"UPDATE checked SET n=1 WHERE _id='a'\"}");
+    try std.testing.expectEqual(before + 1, f.file().activeCheckpoint().commit_sequence);
+    {
+        var reply = try f.sql("{\"statement\":\"ALTER TABLE checked VALIDATE CONSTRAINT positive\"}");
+        defer reply.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, reply.code);
+        try std.testing.expectEqualStrings("ready", reply.parsed.?.value.object.get("ddl_receipt").?.object.get("state").?.string);
+    }
+    try std.testing.expect((try f.file().check()).valid);
+}
+
+test "capi SQL prepared text joins primary publication for autocommit and session COMMIT" {
+    const api = @import("db.zig");
+    const tables = @import("tables.zig");
+    const sessions = @import("sql_session.zig");
+    for ([_]bool{ false, true }) |session_commit| {
+        var f = try OutcomeFixture.init("sql-prepared-text-publication");
+        defer f.deinit();
+        try f.expectOk("{\"statement\":\"CREATE TABLE words (body TEXT DEFAULT 'alpha canary',n BIGINT DEFAULT 1)\"}");
+        var table: ?*anyopaque = null;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(f.id, .fromSlice("words"), &table));
+        defer api.antfly_db_close(table);
+        for ([_][]const u8{
+            "{\"name\":\"first\",\"type\":\"full_text\"}",
+            "{\"name\":\"second\",\"type\":\"full_text\"}",
+        }) |config| try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(table, .fromSlice(config)));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(f.id));
+        var session: u64 = 0;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, sessions.antfly_db_sql_session_open(f.id, &session));
+        defer _ = sessions.antfly_db_sql_session_close(f.id, session);
+        const statements = [_][]const u8{
+            "INSERT INTO words (_id) VALUES ('row')",
+            "UPDATE words SET body='beta canary', n=n+1 WHERE _id='row'",
+            "DELETE FROM words WHERE _id='row'",
+        };
+        for (statements, 0..) |statement, ordinal| {
+            if (session_commit) {
+                const begin = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .statement = "BEGIN", .session_id = session }, .{});
+                defer std.testing.allocator.free(begin);
+                try f.expectOk(begin);
+            }
+            const request = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .statement = statement, .session_id = if (session_commit) @as(?u64, session) else null }, .{});
+            defer std.testing.allocator.free(request);
+            const before = f.file().activeCheckpoint().commit_sequence;
+            try f.expectOk(request);
+            if (session_commit) {
+                try std.testing.expectEqual(before, f.file().activeCheckpoint().commit_sequence);
+                const commit_request = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .statement = "COMMIT", .session_id = session }, .{});
+                defer std.testing.allocator.free(commit_request);
+                try f.expectOk(commit_request);
+            }
+            try std.testing.expectEqual(before + 1, f.file().activeCheckpoint().commit_sequence);
+            for ([_][]const u8{ "first", "second" }) |name| {
+                const query_guard = api.enterHandle(table, .read) orelse return error.InvalidArgument;
+                defer query_guard.leave();
+                try std.testing.expect(query_guard.entry_error == null);
+                const database = query_guard.handle.database();
+                const target = database.core.store.lastReplaySequence(0);
+                const snapshot = database.core.index_manager.textIndex(name).?.acquireSnapshot();
+                defer snapshot.release();
+                try std.testing.expectEqual(@as(u32, if (ordinal == 2) 0 else 1), snapshot.liveDocCount());
+                try std.testing.expect(try database.core.loadAppliedSequence(std.testing.allocator, name) >= target);
+                // SQL TEXT is a keyword field by default. Verify its complete
+                // normalized value without changing the configured analyzer.
+                var alpha = try api.searchTextOwned(query_guard.handle, name, .{ .match = .{ .field = "body", .text = "alpha canary" } }, 10, 0);
+                defer alpha.deinit();
+                var beta = try api.searchTextOwned(query_guard.handle, name, .{ .match = .{ .field = "body", .text = "beta canary" } }, 10, 0);
+                defer beta.deinit();
+                if (alpha.ids.len != @as(usize, if (ordinal == 0) 1 else 0) or beta.ids.len != @as(usize, if (ordinal == 1) 1 else 0)) {
+                    std.debug.print("SQL_TEXT session={any} operation={d} alpha={d} beta={d} segments={d}\n", .{ session_commit, ordinal, alpha.ids.len, beta.ids.len, snapshot.segments.len });
+                    for (snapshot.segments) |segment| for (segment.reader.fields) |field| {
+                        std.debug.print("SQL_TEXT field={s}\n", .{field.name});
+                    };
+                }
+                try std.testing.expectEqual(@as(usize, if (ordinal == 0) 1 else 0), alpha.ids.len);
+                try std.testing.expectEqual(@as(usize, if (ordinal == 1) 1 else 0), beta.ids.len);
+            }
+            if (ordinal == 1) {
+                var row = try f.sql("{\"statement\":\"SELECT n FROM words WHERE _id='row'\"}");
+                defer row.deinit();
+                try std.testing.expectEqual(h.capi.ErrorCode.ok, row.code);
+                try std.testing.expectEqualStrings("2", row.parsed.?.value.object.get("rows").?.array.items[0].array.items[0].string);
+            }
+        }
+        try std.testing.expect((try f.file().check()).valid);
+    }
+}
+
 test "capi SQL outcome native constraints publish foreign namespaces atomically" {
     var f = try OutcomeFixture.init("native-sql-foreign-publication");
     defer f.deinit();

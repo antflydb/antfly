@@ -98,6 +98,42 @@ artifact transactions never join the final primary rendezvous. Unsupported
 authority, lifecycle, range-guard and backend shapes retain their existing
 coordinator rather than silently dropping their guards.
 
+Both single-namespace autocommit and session COMMIT use this prepared publisher.
+The initial replay check is only an opportunity check: an exact native append can
+still refuse a larger footprint. A failed physical group captures its capacity
+hint under the store mutex before rollback or another group can overwrite it.
+Only a confirmed precommit refusal may release admission, wait for those credits,
+and reconstruct its plans from the already-owned postimages and predicates.
+Every producer and snapshot barrier is drained before waiting. SQL expressions
+are never reevaluated, and applied or uncertain outcomes never enter this loop.
+One remaining busy-wait budget covers capacity waits and admission reentry.
+A session retains its connection lane while releasing the file lease and owner
+gate, preventing concurrent session mutation or destruction while replay runs.
+If that exact native capacity wait expires, COMMIT reports not applied and keeps
+its staged owned postimages available for the advertised retry. This proof is
+not inferred from a generic Busy error or an uncertain publication. Cancellation
+returns directly through suspended lifetime cleanup without another writer
+admission; ordinary cancellation/conflict and unknown-outcome handling remains.
+Autocommit reuses normalization's matching row authority rather than projecting
+the same document again. Attempt arenas reuse their retained capacity across
+refusals instead of accumulating allocations in the enclosing SQL arena.
+
+Eligible SQL text updates complete the same owned foreground publication as
+document batches. Artifact staging and replacement assembly run after releasing
+writer admission; only finite live witnesses and immutable index inputs are
+captured under the gate. Matching normalized row authorities are reused. Text
+projection reads their packed normalized values, including defaults and null
+provenance, without repeating row mapping. Tokenization waits until SQL has
+selected its final conflict postimages; merely staged or unused candidates do
+not build text artifacts. The exact postimage witness survives packed-row
+transfer without granting another transfer. Both text metadata and source
+progress join primary/constraint effects in the native atomic group. Detached
+staging debits the same remaining admission budget. A
+lost optional text-source witness permits one canonical asynchronous fallback
+with the same owned SQL postimages and predicates, rather than reevaluating SQL
+or repeatedly preparing against a moving source tip. Native-backed hosted Lite
+handles also use this handoff when their logical identity supports exact checks.
+
 Autocommit and explicit native SQL COMMIT use the existing outcome receipt when
 the checkpoint result is uncertain. That receipt resolves the atomic group;
 there is no separate coordinator transaction ID. Confirmed primary success

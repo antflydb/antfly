@@ -426,6 +426,10 @@ pub const Session = struct {
     }
 
     pub fn commit(self: *Session, out_id: *?types.TxnId) !catalog.MutationOutcome {
+        return self.commitWithHandoff(out_id, null);
+    }
+
+    fn commitWithHandoff(self: *Session, out_id: *?types.TxnId, handoff: ?sql.PreparationHandoff) !catalog.MutationOutcome {
         if (!self.active) return .committed;
         if (self.failed) {
             return error.SqlTransactionAborted;
@@ -442,12 +446,15 @@ pub const Session = struct {
             self.reset();
             return .committed;
         }
-        var adapter = sql.Adapter(h.antfly){ .handle = self.handle, .db = @import("tables.zig").get(self.handle, requests[0].table_name) catch |err| return outcomes.notApplied(err), .table_name = requests[0].table_name };
+        var adapter = sql.Adapter(h.antfly){ .preparation_handoff = handoff, .handle = self.handle, .db = @import("tables.zig").get(self.handle, requests[0].table_name) catch |err| return outcomes.notApplied(err), .table_name = requests[0].table_name };
         const metadata = adapter.localCatalog(a, requests[0].schema_version.?) catch |err| return outcomes.notApplied(err);
         var prepared = d.api_relational_integrity_commit.prepareWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, requests, adapter.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
         defer prepared.deinit();
         const outcome = commitNativeOrCoordinated(&adapter, a, prepared.tables, out_id) catch |err| {
-            self.failed = true;
+            // A proven native capacity refusal preserves the staged owned
+            // postimages so the advertised retryable COMMIT is actually usable.
+            // All other failures retain ordinary transaction-abort semantics.
+            self.failed = err != error.SqlNativeCommitCapacityNotApplied;
             return err;
         };
         self.reset();
@@ -461,6 +468,10 @@ pub const Session = struct {
     }
 
     pub fn control(self: *Session, statement: d.sql_ast.Statement, out_id: *?types.TxnId) !?sql.runtime.Result {
+        return self.controlWithHandoff(statement, out_id, null);
+    }
+
+    pub fn controlWithHandoff(self: *Session, statement: d.sql_ast.Statement, out_id: *?types.TxnId, handoff: ?sql.PreparationHandoff) !?sql.runtime.Result {
         // An earlier COMMIT's outcome is unresolved: refuse new statements.
         // They were not applied, so this is not itself an unknown outcome.
         if (self.handle.sql_decision_uncertain) return error.SqlReconciliationRequired;
@@ -475,7 +486,7 @@ pub const Session = struct {
             .commit => {
                 var result = try sql.runtime.Result.empty(self.handle.alloc, "COMMIT");
                 errdefer result.deinit();
-                const outcome = try self.commit(out_id);
+                const outcome = try self.commitWithHandoff(out_id, handoff);
                 result.output.mutation_outcome = outcome;
                 return result;
             },

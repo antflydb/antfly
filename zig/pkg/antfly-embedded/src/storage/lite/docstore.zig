@@ -1425,6 +1425,7 @@ const MutationRequest = struct {
     artifact_lease: bool = false,
     artifact_retirement: bool = false,
     publication_possible: bool = false,
+    replay_refusal: ?native.replay_admission.WaitHint = null,
     result: anyerror!void = {},
 };
 
@@ -1441,6 +1442,13 @@ const AtomicPublication = struct {
     state: enum { preparing, publishing, done } = .preparing,
     result: anyerror!void = {},
     possible: bool = false,
+    replay_refusal: ?native.replay_admission.WaitHint = null,
+
+    fn replayRefusal(ptr: *anyopaque) ?native.replay_admission.WaitHint {
+        const self: *AtomicPublication = @ptrCast(@alignCast(ptr));
+        std.debug.assert(self.state == .done);
+        return if (self.possible) null else self.replay_refusal;
+    }
 
     fn create(store: *Store, count: usize) !@import("../native_publication.zig").AtomicGroup {
         // Bounded participant stacks and preparation memory. This capability
@@ -1451,7 +1459,7 @@ const AtomicPublication = struct {
         const requests = try store.allocator.alloc(?*MutationRequest, count);
         @memset(requests, null);
         self.* = .{ .store = store, .requests = requests };
-        return .{ .ptr = self, .store = store, .count = count, .cancel_fn = cancel, .destroy_fn = destroy };
+        return .{ .ptr = self, .store = store, .count = count, .cancel_fn = cancel, .destroy_fn = destroy, .replay_refusal_fn = replayRefusal };
     }
 
     fn cancel(ptr: *anyopaque) void {
@@ -1504,7 +1512,7 @@ const AtomicPublication = struct {
                 const result = blk: {
                     self.store.reserveWriterSlotYielding() catch |err| break :blk err;
                     defer self.store.releaseWriterSlot();
-                    break :blk self.store.submitMutationWithPublicationState(self, apply, &publication_possible);
+                    break :blk self.store.submitScopedMutation(self, apply, true, false, false, false, &publication_possible, &self.replay_refusal);
                 };
                 self.mutex.lockUncancelable(io);
                 self.result = result;
@@ -3202,18 +3210,18 @@ pub const Store = struct {
     }
 
     pub fn submitMutationWithPublicationState(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, publication_possible: *bool) !void {
-        return self.submitScopedMutation(context, apply, true, false, false, false, publication_possible);
+        return self.submitScopedMutation(context, apply, true, false, false, false, publication_possible, null);
     }
 
     pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, true, false, false, null);
+        return self.submitScopedMutation(context, apply, durable, true, false, false, null, null);
     }
 
     /// Report the group's decision, captured before another group can change
     /// the file's uncertainty flags. Queued callers receive the same snapshot
     /// as their leader, including cancellation before checkpoint publication.
     pub fn submitIndexMutationWithPublicationState(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, publication_possible: *bool) !void {
-        return self.submitScopedMutation(context, apply, durable, true, false, false, publication_possible);
+        return self.submitScopedMutation(context, apply, durable, true, false, false, publication_possible, null);
     }
 
     /// A durability barrier allocates no pages and requires no allocator
@@ -3237,24 +3245,25 @@ pub const Store = struct {
     }
 
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, false, false, false, null);
+        return self.submitScopedMutation(context, apply, durable, false, false, false, null, null);
     }
 
     /// Immutable source aliases are read-path metadata, not authored writes.
     /// Only groups containing exclusively these aliases may defer reuse proof.
     pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
-        return self.submitScopedMutation(context, apply, true, false, true, false, null);
+        return self.submitScopedMutation(context, apply, true, false, true, false, null, null);
     }
 
     /// Only the typed retirement capability may submit these groups. Keep them
     /// separate from authored changes so physical unlink cannot rotate logical
     /// index identities or bypass the admission of a primary mutation.
     pub fn submitArtifactRetirement(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
-        return self.submitScopedMutation(context, apply, true, true, false, true, null);
+        return self.submitScopedMutation(context, apply, true, true, false, true, null, null);
     }
 
-    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool, artifact_retirement: bool, publication_possible: ?*bool) !void {
+    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool, artifact_retirement: bool, publication_possible: ?*bool, replay_refusal: ?*?native.replay_admission.WaitHint) !void {
         if (publication_possible) |out| out.* = false;
+        if (replay_refusal) |out| out.* = null;
         if (self.read_only) return error.ReadOnly;
         defer {
             // Start after publication: even one large final mutation crossing
@@ -3266,6 +3275,9 @@ pub const Store = struct {
         var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease, .artifact_retirement = artifact_retirement };
         defer if (publication_possible) |out| {
             out.* = request.publication_possible;
+        };
+        defer if (replay_refusal) |out| {
+            out.* = request.replay_refusal;
         };
         self.commit_mutex.lockUncancelable(io);
         if (self.commit_tail) |tail| tail.next = &request else self.commit_head = &request;
@@ -3358,7 +3370,9 @@ pub const Store = struct {
         // This runs after rollback but before unlocking. A later group's
         // success must not erase an earlier uncertain decision, and ordinary
         // admission/staging cancellation must not manufacture uncertainty.
-        errdefer publication_possible.* = self.file.checkpoint_publication_uncertain or self.secret_store_uncertain;
+        errdefer {
+            publication_possible.* = self.file.checkpoint_publication_uncertain or self.secret_store_uncertain;
+        }
         if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
         try self.refreshAdmissionAssumeLocked();
         try self.initializeReadGenerationAssumeLocked();
@@ -3374,6 +3388,11 @@ pub const Store = struct {
             try self.file.beginTransactionWithRetirementPressure();
         }
         errdefer self.file.abortTransaction();
+        errdefer if (!self.file.checkpoint_publication_uncertain and !self.secret_store_uncertain) {
+            var refused: ?*MutationRequest = head;
+            while (refused) |item| : (refused = item.next)
+                item.replay_refusal = self.file.replay_wait_hint;
+        };
         const coordinator = self.file.reader_coordinator;
         const releases = if (artifact_lease_only and coordinator != null) coordinator.?.takeArtifactReleases(64) else null;
         errdefer if (releases) |first| coordinator.?.enqueueArtifactReleases(first);

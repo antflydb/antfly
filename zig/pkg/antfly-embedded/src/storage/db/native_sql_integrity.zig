@@ -251,7 +251,18 @@ fn requireMutable(alloc: A, view: anytype, catalog: ?catalog_mod.Catalog, change
     try @import("relational_integrity_topology.zig").requireUnfenced(view);
     try @import("online_integrity_shadow.zig").requireCatalogMutable(view);
     try @import("relational_integrity_retirement.zig").requireMutable(view);
-    if (changes_rows) if (catalog) |value| try activation.requireReady(view, value);
+    // CHECK-only catalogs have no coordinated claims or references. Their
+    // ordinary packed-row validation also admits repairs of invalid coverage:
+    // the replacement row must satisfy every current CHECK. Requiring global
+    // coverage here would prevent the very row edits needed to repair it.
+    // Routed constraints still require their authoritative activation fence;
+    // explicit coordinated repairs retain their existing guarded coordinator.
+    if (changes_rows) if (catalog) |value| {
+        for (value.bindings) |binding| if (!binding.retired) {
+            try activation.requireReady(view, value);
+            break;
+        };
+    };
 }
 
 /// Bind effects to the exact primary postimages and observations selected by

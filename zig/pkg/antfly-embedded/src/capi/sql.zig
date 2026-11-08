@@ -120,6 +120,10 @@ pub const PreparationHandoff = struct {
     ptr: *anyopaque,
     release_admission: *const fn (*anyopaque, []const u8) anyerror!void,
     reacquire_admission: *const fn (*anyopaque) anyerror!*@import("handles.zig").Handle,
+    /// Only a confirmed precommit native capacity refusal may enter this wait.
+    /// The caller has already destroyed the failed attempt's borrowed state.
+    wait_replay: ?*const fn (*anyopaque, @import("../storage/lite/replay_admission.zig").WaitHint) anyerror!*@import("handles.zig").Handle = null,
+    stage_foreground: ?*const fn (*anyopaque, *@import("../storage/db/prepared_document_batch.zig").Plan) anyerror!void = null,
 };
 
 pub fn Adapter(comptime native: type) type {
@@ -1191,13 +1195,10 @@ pub fn Adapter(comptime native: type) type {
                     try writes.append(temporary, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(temporary, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });
                 } else try deletes.append(temporary, mutation.key);
             }
-            var request: types.BatchRequest = .{ .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null };
+            const request: types.BatchRequest = .{ .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null };
             const outcomes = dependencies.sql_errors;
             var prepared: ?integrity.Prepared = null;
             defer if (prepared) |*value| value.deinit();
-            const NativeIntegrity = @import("../storage/db/native_sql_integrity.zig");
-            var native_integrity: ?NativeIntegrity.Plan = null;
-            defer if (native_integrity) |*plan| plan.deinit();
             var view = self.db.core.acquireSchemaView() orelse return error.IntegrityCatalogUnavailable;
             defer view.release();
             if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
@@ -1216,35 +1217,20 @@ pub fn Adapter(comptime native: type) type {
                 const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
                 // Preparation only reads: any failure here is not applied.
                 prepared = integrity.prepareWithRepairAdmission(scratch_alloc, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
-                if (prepared.?.tables.len == 1 and std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) {
-                    if (try NativeIntegrity.batchRequest(alloc, prepared.?.tables[0])) |native_request| {
-                        if (try NativeIntegrity.Inputs.capture(alloc, self.db, native_request)) |captured| {
-                            var inputs = captured;
-                            defer inputs.deinit();
-                            if (adapter_owner.preparation_handoff) |handoff| {
-                                try handoff.release_admission(handoff.ptr, table.physical_name);
-                                var preparation_error: ?anyerror = null;
-                                if (inputs.prepare()) |plan| native_integrity = plan else |err| preparation_error = err;
-                                // Inputs.prepare releases its borrowed read scopes
-                                // before refresh can retire the originating DB.
-                                const root = try handoff.reacquire_admission(handoff.ptr);
-                                adapter_owner.handle = root;
-                                adapter_owner.db = root.database();
-                                selected_adapter = try adapter_owner.selected(table.physical_name);
-                                if (preparation_error) |err| return err;
-                            } else native_integrity = try inputs.prepare();
-                            request = native_request;
-                            request.integrity_commands = &.{};
-                        }
-                    }
-                }
-                if (native_integrity == null) {
-                    if (try @import("sql_native_commit.zig").tryCommit(adapter_owner, alloc, prepared.?.tables)) |outcome| return outcome;
-                    selected_adapter = try adapter_owner.selected(table.physical_name);
-                    if (self.handle) |handle| return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
-                    if (prepared.?.tables.len != 1 or !std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) return error.UnsupportedSqlExecution;
-                    return self.commitCoordinated(prepared.?.tables[0]);
-                }
+                if (try @import("sql_native_commit.zig").tryCommit(adapter_owner, alloc, prepared.?.tables)) |outcome| return outcome;
+                selected_adapter = try adapter_owner.selected(table.physical_name);
+                if (self.handle) |handle| return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
+                if (prepared.?.tables.len != 1 or !std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) return error.UnsupportedSqlExecution;
+                return self.commitCoordinated(prepared.?.tables[0]);
+            }
+            if (adapter_owner.handle != null) {
+                const input_writes = try temporary.alloc(types.TransactionWrite, writes.items.len);
+                for (writes.items, input_writes) |write, *out| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
+                const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = request.relational_schema_version };
+                // A single namespace uses the same owned publication and
+                // precommit capacity protocol as explicit session COMMIT.
+                if (try @import("sql_native_commit.zig").tryCommit(adapter_owner, alloc, &.{input})) |outcome| return outcome;
+                selected_adapter = try adapter_owner.selected(table.physical_name);
             }
             // Final SQL postimages (including conflict-update results) are now
             // known. Capture immutable row/schema authority, prepare outside
@@ -1278,7 +1264,7 @@ pub fn Adapter(comptime native: type) type {
             var primary_committed = false;
             // Named tables commit to their own database, which holds the marker.
             const receipt_table: ?[]const u8 = if (self.handle != null) self.table_name else null;
-            @import("db.zig").trackedBatchWithNativeSqlIntegrity(self.db, request, &primary_committed, receipt_table, reused_rows orelse (if (owned_rows) |*plan| plan else null), null, if (native_integrity) |*plan| plan else null) catch |err| {
+            @import("db.zig").trackedBatchWithNativeSqlIntegrity(self.db, request, &primary_committed, receipt_table, reused_rows orelse (if (owned_rows) |*plan| plan else null), null, null) catch |err| {
                 // A confirmed primary write wins: later uncertainty in derived
                 // or control publication leaves it committed, not unknown.
                 if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;

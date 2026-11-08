@@ -8087,15 +8087,15 @@ test "capi native allocator proof admits a slow stable proof after the retry dea
         const result = fixture.call(operation);
         if (probe.failure) |err| return err;
         try std.testing.expectEqual(h.capi.ErrorCode.ok, result);
-        // SQL releases admission to prepare its owned relational postimage,
-        // then re-enters once to validate/commit. Both physical entries are
-        // counted; neither may repeat this stable allocator proof.
-        const admissions: u64 = switch (operation) {
-            .read => 0,
-            .batch => 1,
-            .sql => 2,
-        };
-        try std.testing.expectEqual(admissions, stats.mutation_admission_count - admissions_before);
+        // SQL records initial admission and re-entry after owned preparation;
+        // eligible artifact staging/assembly can add more bounded entries.
+        // Regardless of those publication stages, the stable proof runs once.
+        const admissions = stats.mutation_admission_count - admissions_before;
+        switch (operation) {
+            .read => try std.testing.expectEqual(@as(u64, 0), admissions),
+            .batch => try std.testing.expectEqual(@as(u64, 1), admissions),
+            .sql => try std.testing.expect(admissions >= 2),
+        }
         if (operation != .read) try std.testing.expect(stats.mutation_admission_ns - admission_ns_before >= std.time.ns_per_s);
         try std.testing.expectEqual(h.capi.ErrorCode.ok, h.capi.lastErrorCode());
         try std.testing.expectEqual(@as(usize, 1), probe.captures);
@@ -9319,6 +9319,266 @@ test "capi native SQL waits for replay capacity before autocommit or session COM
     }
 }
 
+test "capi native SQL COMMIT waits for its exact footprint after opportunity admission" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Probe = ConstraintOverlayProbe;
+    const sessions = @import("sql_session.zig");
+    for ([_]bool{ false, true }) |session_commit| for ([_]bool{ false, true }) |replace_table| {
+        var fixture = try AdmissionFollowupFixture.init("sql-exact-replay-capacity", 5000, .sql);
+        defer fixture.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.sql));
+        var session: u64 = 0;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, sessions.antfly_db_sql_session_open(fixture.id, &session));
+        defer _ = sessions.antfly_db_sql_session_close(fixture.id, session);
+        if (session_commit) {
+            _ = try Probe.run(fixture.id, session, "BEGIN", null);
+            _ = try Probe.run(fixture.id, session, "UPDATE numbers SET n=n+1 WHERE _id='accepted'", null);
+        }
+        {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            const file = &fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+            var state = (try file.replayAdmission()).?;
+            try std.testing.expect(state.records != 0);
+            state.limits.bytes = state.bytes + 1;
+            try file.putDocument(native.replay_admission.key, &state.encode());
+            // This is exactly the boundary the original importer reached: some
+            // capacity exists, but the staged transaction cannot fit in it.
+            try file.requireReplayCoordinatorCapacity();
+        }
+        const Consumer = struct {
+            fixture: *AdmissionFollowupFixture,
+            polls: u64,
+            failure: ?anyerror = null,
+            connection_retained: bool = false,
+            session_commit: bool,
+            replace_table: bool,
+            fn run(self: *@This()) void {
+                self.releaseCapacity() catch |err| {
+                    self.failure = err;
+                };
+            }
+            fn releaseCapacity(self: *@This()) !void {
+                const io = h.handleLockIo();
+                const deadline = std.Io.Clock.awake.now(io).nanoseconds + 6 * std.time.ns_per_s;
+                while (api.test_replay_capacity_polls.load(.monotonic) == self.polls) {
+                    if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.CapacityWaitDidNotStart;
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                }
+                // A same-connection session close or statement must not enter.
+                const unlocked = self.fixture.connection.mutex.tryLock();
+                if (unlocked) self.fixture.connection.mutex.unlock(io);
+                if (unlocked == self.session_commit) return error.IncorrectSessionLaneOwnership;
+                self.connection_retained = !unlocked;
+                // The maintenance owner does not need that connection lane. It
+                // must be able to acquire writer admission and return credits.
+                var lease = try self.fixture.connection.acquire();
+                defer self.fixture.connection.gate.mutex.unlock(io);
+                defer lease.close();
+                const root = try self.fixture.connection.owner.refresh();
+                const database = try @import("tables.zig").get(root, "numbers");
+                const raw = (try database.get(std.testing.allocator, "accepted")).?;
+                defer std.testing.allocator.free(raw);
+                var row = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+                defer row.deinit();
+                try std.testing.expectEqual(@as(i64, 7), row.value.object.get("n").?.integer);
+                if (self.replace_table) {
+                    var output: h.capi.Buffer = .{};
+                    defer api.antfly_buffer_free_zero(&output);
+                    try api.executeEmbeddedSql(root, "default", "{\"statement\":\"DROP TABLE numbers\"}", &output);
+                    api.antfly_buffer_free_zero(&output);
+                    try api.executeEmbeddedSql(root, "default", "{\"statement\":\"CREATE TABLE numbers (n BIGINT)\"}", &output);
+                }
+                const file = &root.owned_lite_backend.?.native_docstore.?.file;
+                var state = (try file.replayAdmission()).?;
+                state.limits.bytes = 16 * 1024 * 1024;
+                try file.putDocument(native.replay_admission.key, &state.encode());
+            }
+        };
+        const polls = api.test_replay_capacity_polls.load(.monotonic);
+        var consumer = Consumer{ .fixture = &fixture, .polls = polls, .session_commit = session_commit, .replace_table = replace_table };
+        const worker = try std.Thread.spawn(.{}, Consumer.run, .{&consumer});
+        var joined = false;
+        defer if (!joined) worker.join();
+        const result = Probe.run(fixture.id, if (session_commit) session else null, if (session_commit) "COMMIT" else "UPDATE numbers SET n=n+1 WHERE _id='accepted'", if (replace_table) "40001" else null);
+        worker.join();
+        joined = true;
+        try std.testing.expectEqual(@as(?anyerror, null), consumer.failure);
+        try std.testing.expectEqual(session_commit, consumer.connection_retained);
+        _ = try result;
+        try std.testing.expect(api.test_replay_capacity_polls.load(.monotonic) > polls);
+        if (replace_table) {
+            try std.testing.expectEqual(@as(?i64, null), try Probe.run(fixture.id, null, "SELECT n FROM numbers WHERE _id='accepted'", null));
+            if (session_commit) _ = try Probe.run(fixture.id, session, "ROLLBACK", null);
+            continue;
+        }
+        try std.testing.expectEqual(@as(?i64, 8), try Probe.run(fixture.id, null, "SELECT n FROM numbers WHERE _id='accepted'", null));
+        // A second exact-footprint refusal with no consumer must exhaust the
+        // same bounded wait budget without applying or reevaluating the row.
+        if (session_commit) {
+            _ = try Probe.run(fixture.id, session, "BEGIN", null);
+            _ = try Probe.run(fixture.id, session, "UPDATE numbers SET n=n+1 WHERE _id='accepted'", null);
+        }
+        {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            const file = &fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+            var state = (try file.replayAdmission()).?;
+            state.limits.bytes = state.bytes + 1;
+            try file.putDocument(native.replay_admission.key, &state.encode());
+            try file.requireReplayCoordinatorCapacity();
+        }
+        fixture.connection.options.busy_timeout_ms = 20;
+        _ = try Probe.run(fixture.id, if (session_commit) session else null, if (session_commit) "COMMIT" else "UPDATE numbers SET n=n+1 WHERE _id='accepted'", "55P03");
+        fixture.connection.options.busy_timeout_ms = 5000;
+        try std.testing.expectEqual(@as(?i64, 8), try Probe.run(fixture.id, null, "SELECT n FROM numbers WHERE _id='accepted'", null));
+        if (session_commit) {
+            try std.testing.expect(fixture.connection.sql_sessions.get(session).?.active);
+            try std.testing.expect(!fixture.connection.sql_sessions.get(session).?.failed);
+        }
+        {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            const file = &fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+            var state = (try file.replayAdmission()).?;
+            state.limits.bytes = 16 * 1024 * 1024;
+            try file.putDocument(native.replay_admission.key, &state.encode());
+        }
+        // Retry the same COMMIT, with no restaging or SQL reevaluation. The
+        // staged increment must become visible once, after credits return.
+        _ = try Probe.run(fixture.id, if (session_commit) session else null, if (session_commit) "COMMIT" else "UPDATE numbers SET n=n+1 WHERE _id='accepted'", null);
+        try std.testing.expectEqual(@as(?i64, 9), try Probe.run(fixture.id, null, "SELECT n FROM numbers WHERE _id='accepted'", null));
+        {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            const file = &fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+            var state = (try file.replayAdmission()).?;
+            state.limits.bytes = state.bytes + 1;
+            try file.putDocument(native.replay_admission.key, &state.encode());
+        }
+        // Cancellation may clean up under the owner gate, but must not enter
+        // mutation admission or start another allocator proof after sleep.
+        if (session_commit) {
+            _ = try Probe.run(fixture.id, session, "BEGIN", null);
+            _ = try Probe.run(fixture.id, session, "UPDATE numbers SET n=n+1 WHERE _id='accepted'", null);
+        }
+        const Cancellation = struct {
+            owner: *Owner,
+            calls: usize = 0,
+            admissions: u64 = 0,
+            fn sleep(ptr: *anyopaque, _: std.Io.Duration) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+                self.owner.gate.mutex.lockUncancelable(h.handleLockIo());
+                defer self.owner.gate.mutex.unlock(h.handleLockIo());
+                self.admissions = self.owner.publication_stats.mutation_admission_count;
+                return error.Canceled;
+            }
+        };
+        var cancellation: Cancellation = .{ .owner = fixture.connection.owner };
+        api.test_replay_capacity_sleep = .{ .ptr = &cancellation, .sleep = Cancellation.sleep };
+        defer api.test_replay_capacity_sleep = null;
+        const canceled = Probe.run(fixture.id, if (session_commit) session else null, if (session_commit) "COMMIT" else "UPDATE numbers SET n=n+1 WHERE _id='accepted'", "57014");
+        api.test_replay_capacity_sleep = null;
+        _ = try canceled;
+        try std.testing.expectEqual(@as(usize, 1), cancellation.calls);
+        try std.testing.expectEqual(cancellation.admissions, fixture.connection.owner.publication_stats.mutation_admission_count);
+        try std.testing.expectEqual(@as(?i64, 9), try Probe.run(fixture.id, null, "SELECT n FROM numbers WHERE _id='accepted'", null));
+        if (session_commit) _ = try Probe.run(fixture.id, session, "ROLLBACK", null);
+        // Both timeout and cancellation return the session serialization lane.
+        _ = try Probe.run(fixture.id, session, "BEGIN", null);
+        _ = try Probe.run(fixture.id, session, "ROLLBACK", null);
+    };
+}
+
+test "capi native SQL capacity wait lets the replay owner return actual credits" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Probe = ConstraintOverlayProbe;
+    const sessions = @import("sql_session.zig");
+    for ([_]bool{ false, true }) |session_commit| {
+        var fixture = try AdmissionFollowupFixture.init("sql-replay-actual-credits", 10000, .sql);
+        defer fixture.deinit();
+        const peer = try open(fixture.path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 10000 }, false);
+        const peer_id = try api.publishHandle(peer);
+        defer api.antfly_db_close(peer_id);
+        {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            const root = try fixture.connection.owner.refresh();
+            const database = try @import("tables.zig").get(root, "numbers");
+            if (database.core.index_manager.text_indexes.items.len == 0)
+                try database.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        }
+        @import("sql_native_commit.zig").test_force_async_text = true;
+        const seed = fixture.call(.sql);
+        @import("sql_native_commit.zig").test_force_async_text = false;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, seed);
+        var session: u64 = 0;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, sessions.antfly_db_sql_session_open(fixture.id, &session));
+        defer _ = sessions.antfly_db_sql_session_close(fixture.id, session);
+        if (session_commit) {
+            _ = try Probe.run(fixture.id, session, "BEGIN", null);
+            _ = try Probe.run(fixture.id, session, "UPDATE numbers SET n=n+1 WHERE _id='accepted'", null);
+        }
+        {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            const root = try fixture.connection.owner.refresh();
+            const database = try @import("tables.zig").get(root, "numbers");
+            try std.testing.expect(try Owner.hasPendingReplay(database));
+            const file = &root.owned_lite_backend.?.native_docstore.?.file;
+            var state = (try file.replayAdmission()).?;
+            try std.testing.expect(state.records != 0);
+            state.limits.bytes = state.bytes + 1;
+            try file.putDocument(native.replay_admission.key, &state.encode());
+            try file.requireReplayCoordinatorCapacity();
+        }
+        const Consumer = struct {
+            id: ?*anyopaque,
+            polls: u64,
+            result: h.capi.ErrorCode = .invalid_argument,
+            timed_out: bool = false,
+            fn run(self: *@This()) void {
+                const io = h.handleLockIo();
+                const deadline = std.Io.Clock.awake.now(io).nanoseconds + 12 * std.time.ns_per_s;
+                while (api.test_replay_capacity_polls.load(.monotonic) == self.polls) {
+                    if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) {
+                        self.timed_out = true;
+                        return;
+                    }
+                    io.sleep(.fromMilliseconds(1), .awake) catch return;
+                }
+                // Use the real replay/retirement service through another
+                // connection. Never manufacture credits or raise the quota.
+                self.result = api.antfly_db_run_until_idle(self.id);
+            }
+        };
+        const polls = api.test_replay_capacity_polls.load(.monotonic);
+        var consumer: Consumer = .{ .id = peer_id, .polls = polls };
+        const worker = try std.Thread.spawn(.{}, Consumer.run, .{&consumer});
+        var joined = false;
+        defer if (!joined) worker.join();
+        const committed = Probe.run(fixture.id, if (session_commit) session else null, if (session_commit) "COMMIT" else "UPDATE numbers SET n=n+1 WHERE _id='accepted'", null);
+        worker.join();
+        joined = true;
+        try std.testing.expect(!consumer.timed_out);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, consumer.result);
+        _ = try committed;
+        try std.testing.expect(api.test_replay_capacity_polls.load(.monotonic) > polls);
+        try std.testing.expectEqual(@as(?i64, 8), try Probe.run(fixture.id, null, "SELECT n FROM numbers WHERE _id='accepted'", null));
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        try std.testing.expect((try fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+    }
+}
+
 test "capi native replay admission preserves oversized record input ownership" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -10361,6 +10621,11 @@ test "capi native named runtime replacement hands off immutable artifact sources
 
 test "capi native maintenance relational replay diagnoses bounded runtime reuse" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    // Preserve real SQL validation and journal publication while explicitly
+    // creating replay debt. Successful foreground text publication is tested
+    // separately and must not silently turn this into an idle-maintenance test.
+    @import("sql_native_commit.zig").test_force_async_text = true;
+    defer @import("sql_native_commit.zig").test_force_async_text = false;
     const a = std.testing.allocator;
     const io = h.handleLockIo();
     inline for (.{ 1, 2 }) |namespace_count| {

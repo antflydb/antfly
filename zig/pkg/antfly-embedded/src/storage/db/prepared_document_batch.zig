@@ -39,6 +39,7 @@ pub const Plan = struct {
     schema: ?@import("schema_registry.zig").SchemaView = null,
     rows: std.StringHashMapUnmanaged(Entry) = .empty,
     relational: ?@import("owned_relational_rows.zig").OwnedRows = null,
+    relational_text_prepared: bool = false,
     value_authorities: @import("../document_mutation_revision.zig").PreparedValues = .{},
     text: std.ArrayListUnmanaged(Text) = .empty,
     text_delete_keys: []const []const u8 = &.{},
@@ -48,6 +49,7 @@ pub const Plan = struct {
     explicit_deletes: std.StringHashMapUnmanaged(void) = .empty,
     effects_seen: std.StringHashMapUnmanaged(void) = .empty,
     ordinal_postimages: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    relational_ordinal_keys: std.StringHashMapUnmanaged([]const u8) = .empty,
     effect_request: ?mutation_effects.OwnedRequest = null,
     transform_base_keys: [][]const u8 = &.{},
     transform_inputs: ?owned_transform_inputs.Inputs = null,
@@ -111,6 +113,7 @@ pub const Plan = struct {
         self.explicit_deletes.deinit(self.alloc);
         self.effects_seen.deinit(self.alloc);
         self.ordinal_postimages.deinit(self.alloc);
+        self.relational_ordinal_keys.deinit(self.alloc);
         self.rows.deinit(self.alloc);
         self.value_authorities.deinit(self.alloc);
         if (self.resolved_effects) |*effects| effects.deinit(self.alloc);
@@ -278,16 +281,48 @@ pub const Plan = struct {
         };
     }
 
+    /// Build text only after SQL has selected its final conflict postimages.
+    /// Normalization/staging may validate candidate rows that never commit;
+    /// neither step should tokenize those candidates or retain index artifacts.
+    pub fn prepareRelationalForegroundText(self: *Plan, request: types.BatchRequest) !void {
+        if (self.relational_text_prepared) return;
+        const relational = if (self.relational) |*value| value else return;
+        if (!relational.matchesWrites(request.writes)) return;
+        try self.prepareForegroundText(request);
+        self.relational_text_prepared = true;
+    }
+
     fn prepareForegroundText(self: *Plan, request: types.BatchRequest) !void {
         // A transform's final value depends on its validated primary read set.
         // Until that owned read set is captured, only exact authored postimages
         // can take this path. The canonical journal retains all other effects.
-        if (request.transforms.len != 0 or self.catalog.plan().foreground_text.len == 0 or (self.rows.count() == 0 and request.deletes.len == 0)) return;
+        const row_count = if (self.relational) |*relational| relational.writes.len else self.rows.count();
+        if (request.transforms.len != 0 or self.catalog.plan().foreground_text.len == 0 or (row_count == 0 and request.deletes.len == 0)) return;
         const a = self.alloc;
         var docs: std.ArrayListUnmanaged(mapper.MapperDoc) = .empty;
         defer docs.deinit(a);
         var delete_keys: std.ArrayListUnmanaged([]const u8) = .empty;
         defer delete_keys.deinit(a);
+        if (self.relational) |*relational| {
+            const owned = self.inputs.allocator();
+            for (relational.writes, relational.rows) |write, maybe_row| {
+                const row = maybe_row orelse return error.InvalidArgument;
+                const ordinal_key = try @import("../internal_keys.zig").identityDocToOrdinalKeyAlloc(owned, write.key);
+                try self.relational_ordinal_keys.put(a, write.key, ordinal_key);
+                try self.ordinal_postimages.put(a, ordinal_key, null);
+                const logical = (try row.extracted.logicalJson()) orelse return error.InvalidArgument;
+                // Packed rows transfer into commit and can be destroyed before
+                // this plan. Retain the exact normalized bytes independently
+                // of their row region; the usual SQL witness already owns them.
+                const value = if (std.mem.eql(u8, logical, write.value)) write.value else try owned.dupe(u8, logical);
+                // Defaults/generated columns and JSON-null provenance come
+                // from the packed authority, not the original SQL input. Parse
+                // its cached logical rendering once for every text index.
+                const root = try std.json.parseFromSliceLeaky(std.json.Value, owned, value, .{});
+                try docs.append(a, .{ .key = write.key, .value = value, .root = root });
+                try delete_keys.append(a, write.key);
+            }
+        }
         var entries = self.rows.iterator();
         while (entries.next()) |entry| {
             entry.value_ptr.ordinal_key = try @import("../internal_keys.zig").identityDocToOrdinalKeyAlloc(self.inputs.allocator(), entry.key_ptr.*);
@@ -309,7 +344,7 @@ pub const Plan = struct {
         // Final validation must neither allocate nor scan the remaining input
         // for every row. These bounds cover only captured keys; unknown keys
         // are rejected before inserting into the scratch set.
-        try self.effects_seen.ensureTotalCapacity(a, @intCast(self.rows.count() + self.explicit_deletes.count()));
+        try self.effects_seen.ensureTotalCapacity(a, @intCast(row_count + self.explicit_deletes.count()));
         self.text_delete_keys = try delete_keys.toOwnedSlice(a);
         const count = self.catalog.plan().foreground_text.len;
         self.text_guards = try a.alloc(manager_mod.OwnedForegroundTextPublication.Guard, count);
@@ -375,6 +410,12 @@ pub const Plan = struct {
         }
     }
 
+    /// Whether an eligible index replacement needs detached assembly.
+    pub fn hasCapturedForegroundText(self: *const Plan) bool {
+        for (self.text.items) |item| if (item.publication != null) return true;
+        return false;
+    }
+
     /// Finish private replacements after releasing current-runtime admission.
     pub fn finishForegroundText(self: *Plan) !void {
         for (self.text.items) |*item| {
@@ -406,6 +447,7 @@ pub const Plan = struct {
             if (!entry.found_existing) deletes += 1;
         }
         if (deletes != self.explicit_deletes.count()) return false;
+        if (self.relational) |*relational| return relational.matchesPostimages(request.writes);
         var count: usize = 0;
         var cursor = request.writes.len;
         while (cursor != 0) {
@@ -460,8 +502,11 @@ pub const Plan = struct {
             for (self.text.items[index].built.staged) |*segment| {
                 const ordinals = if (segment.ordinals) |*value| value else return error.InvalidDocIdentity;
                 for (ordinals.keys, ordinals.assigned) |key, *assigned| {
-                    const entry = self.rows.get(key) orelse return error.InvalidDocIdentity;
-                    const raw = self.ordinal_postimages.get(entry.ordinal_key).? orelse try read.get(entry.ordinal_key);
+                    const ordinal_key = if (self.relational != null)
+                        self.relational_ordinal_keys.get(key) orelse return error.InvalidDocIdentity
+                    else
+                        (self.rows.get(key) orelse return error.InvalidDocIdentity).ordinal_key;
+                    const raw = self.ordinal_postimages.get(ordinal_key).? orelse try read.get(ordinal_key);
                     if (raw.len != @sizeOf(u32)) return error.InvalidDocIdentity;
                     assigned.* = std.mem.readInt(u32, raw[0..4], .big);
                 }
