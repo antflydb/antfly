@@ -31,6 +31,26 @@ class NoRedirect(HTTPRedirectHandler):
 _opener = build_opener(NoRedirect())
 
 
+def correlation_evidence(headers):
+    """Retain bounded opaque request IDs, never arbitrary response headers."""
+    if not headers:
+        return {}
+    request_id = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    ray = r"[0-9a-f]{16,32}(?:-[a-z]{3})?"
+    fields = (
+        ("request_id", "X-Request-ID", request_id),
+        ("cf_ray", "CF-Ray", ray),
+        ("upstream_request_id", "X-Antfly-Upstream-Request-ID", request_id),
+        ("upstream_cf_ray", "X-Antfly-Upstream-CF-Ray", ray),
+    )
+    return {
+        name: value
+        for name, header, pattern in fields
+        if (value := headers.get(header))
+        and re.fullmatch(pattern, value, re.IGNORECASE)
+    }
+
+
 def open_request(request, *, timeout):
     if isinstance(request, str):
         request = Request(request)
