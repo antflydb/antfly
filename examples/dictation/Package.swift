@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-  name: "AntflyDictation", platforms: [.macOS(.v14)],
+  name: "AntflyDictation", platforms: [.macOS(.v15)],
   products: [.executable(name: "AntflyDictation", targets: ["DictationApp"])],
   dependencies: [
     .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.1")

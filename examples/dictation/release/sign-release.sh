@@ -75,7 +75,7 @@ xcrun stapler validate "$app"
 codesign --verify --deep --strict "$app"
 spctl --assess --type execute --verbose "$app"
 version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$identity_file")"
-archive="$PWD/dist/release/Antfly-Dictation-$version-universal.zip"
+archive="$PWD/dist/release/Antfly-Dictation-$version-arm64.zip"
 ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
 bash release/fetch-tools.sh
 # Pass private key material through stdin, never a command argument or output.

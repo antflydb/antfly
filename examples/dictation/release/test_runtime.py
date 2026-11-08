@@ -97,10 +97,12 @@ while true; do sleep 0.1; done
 
     def test_busy_port_blocks_launch_instead_of_attaching(self):
         with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 listener.bind(("127.0.0.1", 47831))
             except OSError:
                 self.skipTest("Another engine already uses the managed port")
+            listener.listen(1)
             process = self.launch()
             self.assertEqual(process.wait(timeout=10), 78)
             self.assertFalse((self.root / "pid").exists())
@@ -183,62 +185,56 @@ class LiveRuntimeTests(unittest.TestCase):
                                 "provider": "antfly",
                                 "model": "openai/whisper-tiny",
                             },
-                            "apple-speech": {
-                                "provider": "apple",
-                                "language_code": "en-US",
-                                "download_assets": False,
-                            },
-                        },
-                        "generators": {
-                            "cleanup": {"provider": "apple", "max_tokens": 1024}
                         },
                     }
                 )
             )
             password = "synthetic-live-bootstrap-password"
-            process = subprocess.Popen(
-                [
-                    os.environ["DICTATION_TEST_APP"],
-                    "--managed-runtime",
-                    os.environ["DICTATION_TEST_RUNTIME"],
-                    str(root),
-                ],
-                stdin=subprocess.PIPE,
-            )
-            try:
-                process.stdin.write((password + "\n").encode())
-                process.stdin.flush()
-                url = "http://127.0.0.1:47831/ai/v1/models"
-                request = urllib.request.Request(
-                    url,
-                    headers={
-                        "Authorization": "Basic "
-                        + base64.b64encode(("admin:" + password).encode()).decode()
-                    },
+            # Reuse the same data, credential, and ports immediately after real HTTP traffic.
+            for _ in range(2):
+                process = subprocess.Popen(
+                    [
+                        os.environ["DICTATION_TEST_APP"],
+                        "--managed-runtime",
+                        os.environ["DICTATION_TEST_RUNTIME"],
+                        str(root),
+                    ],
+                    stdin=subprocess.PIPE,
                 )
-                deadline = time.monotonic() + 60
-                body = None
-                while time.monotonic() < deadline and process.poll() is None:
-                    try:
-                        with urllib.request.urlopen(request, timeout=1) as response:
-                            body = json.load(response)
-                        break
-                    except (OSError, urllib.error.HTTPError):
-                        time.sleep(0.2)
-                self.assertIsNotNone(
-                    body,
-                    (root / "runtime.log").read_text()
-                    if (root / "runtime.log").exists()
-                    else "no runtime log",
-                )
-                with self.assertRaises(urllib.error.HTTPError) as unauthenticated:
-                    urllib.request.urlopen(url, timeout=2)
-                self.assertIn(unauthenticated.exception.code, (401, 403))
-                self.assertTrue((root / "data").is_dir())
-            finally:
-                process.stdin.close()
                 try:
-                    process.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                    process.stdin.write((password + "\n").encode())
+                    process.stdin.flush()
+                    url = "http://127.0.0.1:47831/ai/v1/models"
+                    request = urllib.request.Request(
+                        url,
+                        headers={
+                            "Authorization": "Basic "
+                            + base64.b64encode(("admin:" + password).encode()).decode()
+                        },
+                    )
+                    deadline = time.monotonic() + 60
+                    body = None
+                    while time.monotonic() < deadline and process.poll() is None:
+                        try:
+                            with urllib.request.urlopen(request, timeout=1) as response:
+                                body = json.load(response)
+                            break
+                        except (OSError, urllib.error.HTTPError):
+                            time.sleep(0.2)
+                    self.assertIsNotNone(
+                        body,
+                        (root / "runtime.log").read_text()
+                        if (root / "runtime.log").exists()
+                        else "no runtime log",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as unauthenticated:
+                        urllib.request.urlopen(url, timeout=2)
+                    self.assertIn(unauthenticated.exception.code, (401, 403))
+                    self.assertTrue((root / "data").is_dir())
+                finally:
+                    process.stdin.close()
+                    try:
+                        process.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()

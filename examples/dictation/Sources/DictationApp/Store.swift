@@ -924,6 +924,11 @@ import SwiftUI
     }
   }
   func useLocalApple() {
+    guard runtime.supportsAppleSpeech else {
+      message =
+        "Native Apple providers are unavailable in the pinned Antfly release. Use Whisper or an external Apple-enabled server."
+      return
+    }
     runModelSetup {
       try await self.runtime.enableAppleAssets()
       try Task.checkCancellation()

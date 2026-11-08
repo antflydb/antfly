@@ -21,8 +21,10 @@ args=(--force --sign "$identity")
 if [[ "$identity" != '-' ]]; then args+=(--options runtime --timestamp); fi
 runtime="$app/Contents/Resources/Runtime"
 if [[ -d "$runtime" ]]; then
-  codesign "${args[@]}" "$runtime/lib/libantfly-apple.dylib"
-  codesign "${args[@]}" "$runtime/antfly"
+  if [[ "$identity" != "-" && -f "$runtime/lib/libantfly-apple.dylib" ]]; then
+    codesign "${args[@]}" "$runtime/lib/libantfly-apple.dylib"
+  fi
+  if [[ "$identity" != "-" ]]; then codesign "${args[@]}" "$runtime/antfly"; fi
 fi
 framework="$app/Contents/Frameworks/Sparkle.framework"
 # Sign from the inside out. --deep is for verification, never for signing.

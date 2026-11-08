@@ -116,7 +116,11 @@ class PublicReader:
         try:
             with urlopen(
                 Request(
-                    self.base_url + "/" + key, headers={"Cache-Control": "no-cache"}
+                    self.base_url + "/" + key,
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "User-Agent": "Antfly-Release/1.0",
+                    },
                 ),
                 timeout=30,
             ) as response:

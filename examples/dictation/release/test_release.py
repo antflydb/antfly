@@ -91,7 +91,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_payload_contains_signed_enclosure_and_exact_identity(self):
         with tempfile.TemporaryDirectory() as d:
-            archive = Path(d) / "Antfly-Dictation-1.0.0-universal.zip"
+            archive = Path(d) / "Antfly-Dictation-1.0.0-arm64.zip"
             archive.write_bytes(b"archive")
             identity = r.version("dictation/v1.0.0") | {"tag": "dictation/v1.0.0"}
             root = r.ET.fromstring(r.appcast(identity, archive, SIGNATURE))
@@ -205,7 +205,7 @@ class PublicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             directory = Path(d)
             identity = self.identity()
-            archive = directory / "Antfly-Dictation-1.0.0-universal.zip"
+            archive = directory / "Antfly-Dictation-1.0.0-arm64.zip"
             archive.write_bytes(b"archive")
             feed = r.appcast(identity, archive, SIGNATURE)
             (directory / "appcast.xml").write_bytes(feed)

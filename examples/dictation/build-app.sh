@@ -18,8 +18,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p .build/clang .build/cache .build/modules
 export CLANG_MODULE_CACHE_PATH="$PWD/.build/clang"
-args=(-c release --cache-path "$PWD/.build/cache" -Xswiftc -module-cache-path -Xswiftc "$PWD/.build/modules")
-if [[ "${UNIVERSAL_BUILD:-0}" == 1 ]]; then args+=(--arch arm64 --arch x86_64); fi
+args=(--arch arm64 -c release --cache-path "$PWD/.build/cache" -Xswiftc -module-cache-path -Xswiftc "$PWD/.build/modules")
 swift build "${args[@]}"
 app="${APP_OUTPUT_DIR:-$PWD/dist}/Antfly Dictation.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$app/Contents/Frameworks"
@@ -41,9 +40,9 @@ cp .build/checkouts/Sparkle/LICENSE "$app/Contents/Resources/.Sparkle-LICENSE.ne
 chmod 644 "$app/Contents/Resources/.Sparkle-LICENSE.next"
 mv -f "$app/Contents/Resources/.Sparkle-LICENSE.next" "$app/Contents/Resources/Sparkle-LICENSE.txt"
 if [[ "${BUNDLE_RUNTIME:-${RELEASE_TAG:+1}}" == 1 ]]; then
-  bash release/build-runtime.sh
+  python3 release/fetch-runtime.py
   rm -rf "$app/Contents/Resources/Runtime"
-  ditto .build/runtime/universal "$app/Contents/Resources/Runtime"
+  ditto .build/runtime/released "$app/Contents/Resources/Runtime"
 else
   rm -rf "$app/Contents/Resources/Runtime"
 fi

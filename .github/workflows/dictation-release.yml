@@ -49,8 +49,9 @@ jobs:
 
   build:
     needs: resolve
+    if: ${{ github.ref_name == github.event.repository.default_branch }}
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -63,20 +64,15 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
       - name: Test app and release policy
         run: |
           bash examples/dictation/release/fetch-tools.sh
           python3 -m unittest discover -s examples/dictation/release -p 'test_*.py'
           examples/dictation/test.sh
-      - name: Build universal app without signing credentials
+      - name: Build Apple Silicon app without signing credentials
         env:
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           SPARKLE_PUBLIC_KEY: ${{ vars.DICTATION_SPARKLE_PUBLIC_KEY }}
-          UNIVERSAL_BUILD: '1'
         run: |
           examples/dictation/build-app.sh
           DICTATION_TEST_APP="$PWD/examples/dictation/dist/Antfly Dictation.app/Contents/MacOS/AntflyDictation" DICTATION_TEST_RUNTIME="$PWD/examples/dictation/dist/Antfly Dictation.app/Contents/Resources/Runtime/antfly" python3 -m unittest discover -s examples/dictation/release -p 'test_runtime.py'

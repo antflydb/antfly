@@ -316,7 +316,7 @@ class UploadRecoveryTests(unittest.TestCase):
             self.assertIsNone(r.gh_api("fixture", "DELETE"))
 
     def test_publication_repairs_feed_without_mutating_complete_downloads(self):
-        archive = self.directory / "Antfly-Dictation-1.0.0-universal.zip"
+        archive = self.directory / "Antfly-Dictation-1.0.0-arm64.zip"
         archive.write_bytes(b"fixture")
         import base64
 

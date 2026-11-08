@@ -14,7 +14,7 @@ Antfly's existing native provider; the app does not ship a second speech engine.
 
 ## Build and run
 
-Requires macOS 14+ and a Swift 6 toolchain. Apple transcription additionally
+Requires an Apple Silicon Mac with macOS 15+ and a Swift 6 toolchain. Apple transcription additionally
 requires **the Antfly host** to run macOS 26+ with eligible Speech hardware,
 supported locale assets, and an Apple-provider build. A Mac client connected to
 a Linux server cannot use the Mac's Speech engine through that server.
@@ -84,9 +84,9 @@ hints and decoding options on the recognition stage.
 
 ## Downloaded apps and local engine
 
-Official downloads include a supervised Antfly runtime for Apple Silicon and
-Intel. New installations use **On this Mac** by default. In Settings, explicitly
-download Whisper Tiny or select Apple speech (macOS 26+). The app handles startup,
+Official downloads are Apple Silicon only and include a pinned, released Antfly runtime. New installations use **On this Mac** by default. In Settings, explicitly
+download Whisper Tiny. The current pinned release does not contain native Apple
+providers; use an external Apple-enabled server for that route. The app handles startup,
 authentication, model discovery, and shutdown. No separate server install is needed.
 Existing configurations keep their chosen external server. See [updates and
 managed runtime](UPDATES.md#managed-runtime-for-downloaded-apps) for lifecycle,

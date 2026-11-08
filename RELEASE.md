@@ -61,11 +61,13 @@ required. Add the selected prefix's `bin` directory to `PATH`.
 
 The macOS dictation app has independent `dictation/vX.Y.Z` and
 `dictation/vX.Y.Z-{beta,rc}.N` tags. Its default-branch controller builds a
-universal app without credentials, then uses a protected `dictation-release`
+Apple Silicon app with a pinned, released ARM64 Antfly runtime, without
+compiling the server or exposing credentials, then uses a protected `dictation-release`
 environment for Developer ID signing, notarization, and signed Sparkle updates.
 Publication consumes the exact signed artifact and advances stable/beta feeds
-after immutable downloads exist. It does not update Antfly servers, models, or
-the repository-wide Latest release. See
+on `releases.antfly.io/antfly-dictation` after immutable R2 downloads exist.
+App updates replace the bundled runtime but do not update user-selected external
+servers, model weights, or the repository-wide Latest release. See
 [dictation updates and release setup](examples/dictation/UPDATES.md).
 
 ## Release Artifacts
@@ -645,12 +647,3 @@ lifecycle decision.
 
 Package registries are immutable. If an RC publish reaches npm or PyPI, the same
 version cannot be republished after recreating the tag; cut the next RC instead.
-
-## Dictation desktop releases
-
-The independent `dictation/v…` product publishes signed app downloads and Sparkle
-feeds through the same R2 bucket and shared immutable storage/CAS infrastructure,
-under `antfly-dictation/`. The universal app includes its compatible managed
-Antfly runtime. Server aliases, registries, and garbage collection remain scoped
-to `antfly/`. See [Dictation updates](examples/dictation/UPDATES.md) for signing,
-protected environments, optional GitHub mirroring, and sealed-payload recovery.

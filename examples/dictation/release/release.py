@@ -191,7 +191,7 @@ def verify_bundle(bundle, identity, key):
     ):
         raise ValueError("Embedded Sparkle differs from the trusted release policy")
     binary = bundle / "Contents/MacOS/AntflyDictation"
-    for arch in ("arm64", "x86_64"):
+    for arch in ("arm64",):
         run("lipo", "-verify_arch", arch, str(binary))
     load_commands = run("xcrun", "vtool", "-show-build", str(binary))
     minimums = re.findall(r"\bminos\s+(\d+(?:\.\d+)+)", load_commands)
@@ -199,39 +199,43 @@ def verify_bundle(bundle, identity, key):
     def components(value):
         return (tuple(int(v) for v in value.split(".")) + (0, 0, 0))[:3]
 
-    if len(minimums) != 2 or any(
+    if len(minimums) != 1 or any(
         components(m) > components(POLICY["minimum_system_version"]) for m in minimums
     ):
         raise ValueError(
             "App binary requires a newer macOS than the update feed advertises"
         )
 
+    import importlib.util
+
+    specification = importlib.util.spec_from_file_location(
+        "dictation_runtime", HERE / "fetch-runtime.py"
+    )
+    runtime_policy = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(runtime_policy)
     runtime = bundle / "Contents/Resources/Runtime"
-    source = json.loads((runtime / "source.json").read_bytes())
-    if source != {"schema_version": 1, "source_commit": identity["source_commit"]}:
-        raise ValueError("Bundled runtime source differs from the app")
+    runtime_policy.verify_staged(runtime)
     executable = runtime / "antfly"
-    bridge = runtime / "lib/libantfly-apple.dylib"
-    for path in (executable, bridge):
-        for arch in ("arm64", "x86_64"):
-            run("lipo", "-verify_arch", arch, str(path))
-        for dependency in run("otool", "-L", str(path)).splitlines():
-            if not dependency[:1].isspace():
-                continue  # Fat binary architecture headings are not dependencies.
+    run("lipo", "-verify_arch", "arm64", str(executable))
+    if run("lipo", "-archs", str(binary)).strip() != "arm64":
+        raise ValueError("The app must contain only Apple Silicon code")
+    if run("lipo", "-archs", str(executable)).strip() != "arm64":
+        raise ValueError("The runtime must contain only Apple Silicon code")
+    for dependency in run("otool", "-L", str(executable)).splitlines():
+        if dependency[:1].isspace():
             linked = dependency.strip().split(" ", 1)[0]
             if linked.startswith("/") and not linked.startswith(
                 ("/System/Library/", "/usr/lib/")
             ):
                 raise ValueError(
-                    "Bundled runtime has an external library dependency: " + linked
+                    "Released runtime has an external library dependency: " + linked
                 )
     commands = run("xcrun", "vtool", "-show-build", str(executable))
     minimums = re.findall(r"\bminos\s+(\d+(?:\.\d+)+)", commands)
-    if len(minimums) != 2 or any(
-        components(m) > components(POLICY["minimum_system_version"]) for m in minimums
+    if len(minimums) != 1 or components(minimums[0]) > components(
+        POLICY["minimum_system_version"]
     ):
-        raise ValueError("Bundled runtime requires a newer macOS than the app")
-    # Apple bridge is deliberately lazy loaded only on supported macOS versions.
+        raise ValueError("Released runtime requires a newer macOS than the app")
 
 
 def verify_unsigned_zip(archive):
@@ -426,7 +430,7 @@ def verify_feed(identity, directory):
         raise ValueError("Appcast bundle version mismatch")
     if item.findtext(f"{{{SPARKLE}}}shortVersionString") != identity["version"]:
         raise ValueError("Appcast release version mismatch")
-    archive = directory / ("Antfly-Dictation-" + identity["version"] + "-universal.zip")
+    archive = directory / ("Antfly-Dictation-" + identity["version"] + "-arm64.zip")
     enclosure = item.find("enclosure")
     expected_url = (
         f"{POLICY['public_base_url']}/releases/{identity['version']}/{archive.name}"
@@ -482,7 +486,7 @@ def release_prefix(identity):
 def write_manifest(identity, directory, key):
     validate_identity(identity)
     names = {
-        "Antfly-Dictation-" + identity["version"] + "-universal.zip",
+        "Antfly-Dictation-" + identity["version"] + "-arm64.zip",
         "appcast.xml",
         "SHA256SUMS",
     }
@@ -525,7 +529,7 @@ def validate_payload(identity, directory, ledger_sha256=None):
     )
     document = json.loads(ledger_path.read_bytes())
     expected_names = {
-        "Antfly-Dictation-" + identity["version"] + "-universal.zip",
+        "Antfly-Dictation-" + identity["version"] + "-arm64.zip",
         "appcast.xml",
         "SHA256SUMS",
     }
@@ -817,7 +821,7 @@ def publish_github_mirror(identity, directory):
             "--title",
             "Antfly Dictation " + identity["version"],
             "--notes",
-            "Signed and notarized universal macOS app. Install in Applications; see the dictation release guide for setup.",
+            "Signed and notarized Apple Silicon macOS app. Install in Applications; see the dictation release guide for setup.",
         ]
         if identity["channel"] == "beta":
             args.append("--prerelease")

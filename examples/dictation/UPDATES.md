@@ -1,13 +1,13 @@
 # App updates and releases
 
 Antfly Dictation uses Sparkle 2 for signed, independent macOS app updates.
-Official apps include a universal Antfly runtime built from the same source
-commit. Sparkle replaces that runtime with the app. User-selected external
+Official Apple Silicon apps include a pinned, released Antfly runtime.
+Sparkle replaces that runtime with the app. Antfly is never compiled as part of the app build. User-selected external
 servers and downloaded models have independent lifecycles.
 
 ## Installation and everyday updates
 
-Download the official universal ZIP from `releases.antfly.io/antfly-dictation` (or the optional GitHub mirror), quit
+Download the official Apple Silicon ZIP from `releases.antfly.io/antfly-dictation` (or the optional GitHub mirror), quit
 any development copy, and move **Antfly Dictation.app** into `/Applications`
 (or your user account's `~/Applications`). Launch that installed copy. The first
 migration from an ad hoc development build to Developer ID signing may require
@@ -142,8 +142,7 @@ git push origin refs/tags/dictation/v0.1.0-beta.1
 
 The read-only tag workflow emits an untrusted request. A controller loaded from
 the default branch checks the actual tag event, repository, exact tag commit,
-and source ancestry. A read-only macOS job tests and builds a universal ARM64 /
-Intel bundle with locked Sparkle dependencies. No signing credential is exposed
+and source ancestry. A read-only macOS job tests and builds an Apple Silicon bundle with locked Sparkle dependencies. No signing credential is exposed
 to source builds or their tests.
 
 After environment approval, a clean signing job uses controller-owned scripts to
@@ -184,7 +183,7 @@ Feed URLs:
 - `https://releases.antfly.io/antfly-dictation/channels/beta/appcast.xml`
 
 Archive URL:
-`https://releases.antfly.io/antfly-dictation/releases/<version>/Antfly-Dictation-<version>-universal.zip`
+`https://releases.antfly.io/antfly-dictation/releases/<version>/Antfly-Dictation-<version>-arm64.zip`
 
 The signed XML feed is the channel's atomic commit point. Conditional R2 writes
 use the previous ETag (or create-only on first publication), with up to three
@@ -238,7 +237,7 @@ busy waits for dictation. This cannot be replaced by ad hoc signing tests.
 bash examples/dictation/release/fetch-tools.sh
 python3 -m unittest discover -s examples/dictation/release -p 'test_*.py'
 examples/dictation/test.sh
-UNIVERSAL_BUILD=1 APP_OUTPUT_DIR="$PWD/examples/dictation/.build/validation-app" \
+APP_OUTPUT_DIR="$PWD/examples/dictation/.build/validation-app" \
   examples/dictation/build-app.sh
 codesign --verify --deep --strict \
   'examples/dictation/.build/validation-app/Antfly Dictation.app'
@@ -255,13 +254,30 @@ without `connectionMode` retain their external server; users can switch explicit
 The external server field and credentials remain available and are preserved
 when switching. Remote settings replacement cannot change the connection mode.
 
-The unsigned build compiles the engine and Apple sidecar for ARM64 and Intel
-from the app's exact source commit, using worktree-local Zig caches, then combines
-the slices. Release verification requires both architectures, matching source
-metadata, portable library dependencies, and a macOS-14-compatible engine.
-The Apple bridge is loaded only on macOS 26 or newer. The signer signs both
-nested binaries before signing and notarizing the complete app. No Homebrew,
-Node, Zig, terminal setup, or standalone Antfly installation is required by users.
+The unsigned build downloads the pinned **released** ARM64 Antfly archive from
+`releases.antfly.io/antfly/<tag>/`. `release/policy.json` pins its tag, independent
+source commit, ledger hash, archive hash and size, and extracted payload hash.
+The fetcher checks the immutable release ledger before extraction, rejects unsafe
+archive paths and links, and verifies the staged payload, including licenses.
+Cached downloads are verified before reuse. It never follows a mutable latest URL
+at app startup and never invokes Zig or builds Antfly from source.
+
+The current pin is **v0.3.0-rc.12**, the published next-channel release used for
+this app's compatibility qualification. The app and runtime require macOS 15 and
+Apple Silicon. Intel app builds and runtime fallbacks are not supported.
+The signed app contains the released CLI and its notices, not a separately built
+engine. Before signing, the controller verifies the exact released payload;
+Developer ID signing changes only the runtime's code signature. The normal hosted
+macOS runner is sufficient: no internal Mac runner group or server toolchain setup
+is required. Build-time execution checks happen before signing credentials are
+available; the signing job only inspects the unsigned artifact as data.
+
+Updating the pin requires a reviewed policy change and compatibility smoke tests.
+The current released archive does **not** include the native Apple provider
+bridge. Local mode therefore offers Whisper; native Apple selection stays disabled.
+An external Antfly server built with Apple providers remains supported. When
+upstream publishes a release containing the bridge, qualify it and update the pin
+and capability metadata; do not silently substitute a source-built sidecar.
 
 The app launches a headless copy of itself as a supervisor. An exclusive lock
 protects the runtime data directory. Its Antfly child binds only to
@@ -284,19 +300,16 @@ The supervised environment excludes developer DYLD overrides and provider keys.
 Whisper models and engine data live in `~/Library/Application Support/AntflyDictation/Runtime`,
 outside the app. **Download Whisper Tiny…** explicitly downloads the transcription
 model and restarts the engine to discover it. Downloads have their own supervisor, an explicit Cancel model setup action,
-and stop when the app exits. **Use Apple speech** selects native recognition and
-allows Apple's OS-managed asset setup; locale, OS, hardware, and Apple Intelligence readiness
-remain visible through model discovery. Both choices select recognition without
-cleanup. Users can choose a discovered cleanup generator explicitly. An existing
+and stop when the app exits. Native Apple providers are available only when supplied by the selected runtime
+or external server. The current managed pin selects recognition without cleanup. Users can choose a discovered cleanup generator explicitly. An existing
 server configuration is never edited or upgraded by this flow.
 
 App updates wait for model setup through the normal working-state gate, stop the
 supervisor before replacement, and restart it if Sparkle installation is canceled
 or fails. Runtime data, models, credentials, and presets survive app replacement.
 For local development without a bundled engine, choose External Antfly server.
-Use `BUNDLE_RUNTIME=1 UNIVERSAL_BUILD=1 examples/dictation/build-app.sh` to exercise
-the complete bundled path. Building the Apple bridge requires a macOS 27 SDK and
-Swift 6; official release builders must provide that toolchain.
+Use `BUNDLE_RUNTIME=1 examples/dictation/build-app.sh` to exercise
+the released-runtime path. No Antfly compiler or Apple bridge build is required.
 
 References: [Sparkle setup](https://sparkle-project.org/documentation/),
 [manual nested signing](https://sparkle-project.org/documentation/sandboxing/),

@@ -13,6 +13,13 @@ import Security
 @MainActor final class ManagedRuntime: ObservableObject {
   nonisolated static let credentialAccount = "managed-runtime-admin-v1"
   private(set) var password = ""
+  var supportsAppleSpeech: Bool {
+    guard let root = Bundle.main.resourceURL,
+      let data = try? Data(contentsOf: root.appendingPathComponent("Runtime/release.json")),
+      let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return false }
+    return metadata["apple_providers"] as? Bool == true
+  }
   nonisolated static let origin = "http://127.0.0.1:47831"
   @Published private(set) var status = "Local engine stopped."
   @Published private(set) var ready = false
@@ -93,7 +100,7 @@ import Security
           password = Data(bytes).base64EncodedString()
           try credentialWrite(password)
         }
-        let config: [String: Any] = [
+        var config: [String: Any] = [
           "enable_auth": true,
           "public_inference": ["enabled": true],
           "transcribers": [
@@ -106,6 +113,12 @@ import Security
           ],
           "generators": ["cleanup": ["provider": "apple", "max_tokens": 1024]],
         ]
+        if !supportsAppleSpeech {
+          config["transcribers"] = [
+            "whisper": ["provider": "antfly", "model": "openai/whisper-tiny"]
+          ]
+          config.removeValue(forKey: "generators")
+        }
         try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
           .write(to: directory.appendingPathComponent("antfly.json"), options: .atomic)
         let pipe = Pipe()
@@ -146,7 +159,7 @@ import Security
             (response as? HTTPURLResponse)?.statusCode == 200, child.isRunning
           {
             ready = true
-            status = "Local engine ready. Choose Apple speech or download Whisper to start."
+            status = "Local engine ready. Download Whisper to start, or discover installed models."
             changed?()
             return
           }
@@ -279,6 +292,12 @@ func superviseManagedRuntime(arguments: [String]) -> Int32 {
   for port: UInt16 in (pulling ? [] : [47831, 47832]) {
     let socket = Darwin.socket(AF_INET, SOCK_STREAM, 0)
     guard socket >= 0 else { return 71 }
+    // Match the server listener's reuse policy so a normal restart is not
+    // blocked by completed HTTP connections still in TCP TIME_WAIT.
+    var reuse: Int32 = 1
+    _ = withUnsafePointer(to: &reuse) {
+      setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, $0, socklen_t(MemoryLayout<Int32>.size))
+    }
     var address = sockaddr_in()
     address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     address.sin_family = sa_family_t(AF_INET)

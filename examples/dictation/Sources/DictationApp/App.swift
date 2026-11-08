@@ -419,11 +419,12 @@ private struct RuntimeControls: View {
         runtime.busy || runtime.ready)
       Button("Download Whisper Tiny…") { store.installLocalWhisper() }.disabled(
         !runtime.ready || runtime.busy)
-      Button("Use Apple speech") { store.useLocalApple() }.disabled(!runtime.ready || runtime.busy)
+      Button("Use Apple speech") { store.useLocalApple() }.disabled(
+        !runtime.ready || runtime.busy || !runtime.supportsAppleSpeech)
       Button("Open engine log") { NSWorkspace.shared.open(runtime.logURL) }
     }
     Text(
-      "Whisper requires a model download. Apple speech requires macOS 26; selecting it allows Apple speech asset downloads. Model discovery shows readiness. No cleanup model is selected automatically."
+      "Whisper requires a model download. This released runtime does not include native Apple providers; an external server can provide them. No cleanup model is selected automatically."
     ).font(.caption)
   }
 }

@@ -460,9 +460,10 @@ optional managed-local-runtime design.
 
 ## Downloaded macOS app
 
-Official Antfly Dictation builds include a managed local engine. New installs
-start it automatically; Settings offers an explicit Whisper Tiny download or
-Apple speech selection on supported Macs. Existing external-server settings
+Official Apple Silicon Antfly Dictation builds require macOS 15+ and include a pinned, released Antfly engine. New installs
+start it automatically; Settings offers an explicit Whisper Tiny download.
+The current released runtime lacks the Apple bridge; native Apple providers can
+be supplied by an external Antfly server. Existing external-server settings
 are preserved. The app and compatible engine update together using signed
 Sparkle feeds and immutable downloads on `releases.antfly.io/antfly-dictation`.
 Models and user data remain in Application Support; server credentials stay in

@@ -42,9 +42,7 @@ class R2PublicationTests(unittest.TestCase):
             identity["version"] + "-" + str(len(list(self.root.iterdir())))
         )
         directory.mkdir()
-        archive = directory / (
-            "Antfly-Dictation-" + identity["version"] + "-universal.zip"
-        )
+        archive = directory / ("Antfly-Dictation-" + identity["version"] + "-arm64.zip")
         archive.write_bytes(b"signed and notarized app fixture")
         (directory / "appcast.xml").write_bytes(r.appcast(identity, archive, SIGNATURE))
         (directory / "SHA256SUMS").write_text(
