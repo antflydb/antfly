@@ -30561,6 +30561,8 @@ pub const InferenceDictateRequest = struct {
     model: []const u8,
     /// Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows.
     audio: []const u8,
+    /// Clean an already finalized recognition segment without running recognition again. Supported by named transcribers advertising text_cleanup. Set audio to the empty string and omit attachments and recognition hints. Partial hypotheses must never be submitted as finalized segments.
+    transcript_text: ?[]const u8 = null,
     /// Force the transcript language (ISO 639-1). Omit for automatic detection.
     language: ?[]const u8 = null,
     /// Enable timestamp-aware decoding. Omitted preserves the dictation default (on).
@@ -30587,6 +30589,7 @@ pub const InferenceDictateRequest = struct {
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "audio", "audio", false },
+        .{ "transcript_text", "transcript_text", true },
         .{ "language", "language", true },
         .{ "timestamps", "timestamps", true },
         .{ "cleanup_model", "cleanup_model", true },
@@ -30615,6 +30618,10 @@ pub const InferenceDictateRequest = struct {
         try jw.write(self.model);
         try jw.objectField("audio");
         try jw.write(self.audio);
+        if (self.transcript_text) |value| {
+            try jw.objectField("transcript_text");
+            try jw.write(value);
+        }
         if (self.language) |value| {
             try jw.objectField("language");
             try jw.write(value);

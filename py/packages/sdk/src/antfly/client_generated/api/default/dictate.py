@@ -9,12 +9,12 @@ from ...models.inference_dictate_request import InferenceDictateRequest
 from ...models.inference_dictate_response import InferenceDictateResponse
 from ...models.inference_error import InferenceError
 from ...models.inference_transient_capacity_error import InferenceTransientCapacityError
-from ...types import Response
+from ...types import File, Response
 
 
 def _get_kwargs(
     *,
-    body: InferenceDictateRequest,
+    body: InferenceDictateRequest | File,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -23,9 +23,14 @@ def _get_kwargs(
         "url": "/ai/v1/dictate",
     }
 
-    _kwargs["json"] = body.to_dict()
+    if isinstance(body, InferenceDictateRequest):
+        _kwargs["json"] = body.to_dict()
 
-    headers["Content-Type"] = "application/json"
+        headers["Content-Type"] = "application/json"
+    if isinstance(body, File):
+        _kwargs["content"] = body.payload
+
+        headers["Content-Type"] = "application/vnd.antfly.attachments.v1"
 
     _kwargs["headers"] = headers
     return _kwargs
@@ -89,7 +94,7 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: InferenceDictateRequest,
+    body: InferenceDictateRequest | File,
 ) -> Response[InferenceDictateResponse | InferenceError | InferenceTransientCapacityError]:
     r"""Dictate speech into clean written text
 
@@ -99,6 +104,28 @@ def sync_detailed(
     punctuation and paragraphing are added, and preferred spellings from
     `dictionary` are applied. Clips longer than the 30 s Whisper window
     are transcribed in windows cut at the quietest pause near the boundary.
+
+    Database nodes also accept named transcribers such as
+    `transcribers/apple-speech`. Apple uses the server's native SpeechAnalyzer
+    for recorded clips and requires an Apple-provider build, macOS 26+, and
+    installed locale assets. Select a named cleanup generator with its bare
+    name or `generators/name`; this shares cleanup with named Whisper
+    transcribers. The standalone runtime continues to accept local Whisper
+    and generator model names.
+
+    Named non-Whisper providers apply `dictionary` during cleanup; they reject
+    Whisper-only `transcript_prompt`, `vad`, and `audio_context` options.
+    Apple does not support live transcription sessions. For provider-backed
+    cleanup, a delta may contain the entire cleaned result; the raw transcript
+    is delivered before cleanup starts. Missing token usage remains absent.
+
+    Empty recognition is a successful empty result and does not run cleanup.
+    Cleanup must confirm a complete text response: token-limited, filtered,
+    tool-only, empty, and unconfirmed outputs fail rather than replacing the
+    transcript. In streaming mode the error follows `dictation.transcript`
+    and no `dictation.completed` event is emitted. Strict Apple cleanup runs
+    to natural completion within context, deadline, and bounded output bytes;
+    macOS 27+ also verifies measured output tokens against the token budget.
 
     Set `cleanup_model` to the generator that rewrites the transcript.
     Without it, or with `style: verbatim`, the response carries the raw
@@ -126,6 +153,8 @@ def sync_detailed(
 
     Args:
         body (InferenceDictateRequest):
+        body (File): AFATT001 envelope with DictateRequest metadata, audio set to attachment:0,
+            and exactly one audio attachment.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -149,7 +178,7 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: InferenceDictateRequest,
+    body: InferenceDictateRequest | File,
 ) -> InferenceDictateResponse | InferenceError | InferenceTransientCapacityError | None:
     r"""Dictate speech into clean written text
 
@@ -159,6 +188,28 @@ def sync(
     punctuation and paragraphing are added, and preferred spellings from
     `dictionary` are applied. Clips longer than the 30 s Whisper window
     are transcribed in windows cut at the quietest pause near the boundary.
+
+    Database nodes also accept named transcribers such as
+    `transcribers/apple-speech`. Apple uses the server's native SpeechAnalyzer
+    for recorded clips and requires an Apple-provider build, macOS 26+, and
+    installed locale assets. Select a named cleanup generator with its bare
+    name or `generators/name`; this shares cleanup with named Whisper
+    transcribers. The standalone runtime continues to accept local Whisper
+    and generator model names.
+
+    Named non-Whisper providers apply `dictionary` during cleanup; they reject
+    Whisper-only `transcript_prompt`, `vad`, and `audio_context` options.
+    Apple does not support live transcription sessions. For provider-backed
+    cleanup, a delta may contain the entire cleaned result; the raw transcript
+    is delivered before cleanup starts. Missing token usage remains absent.
+
+    Empty recognition is a successful empty result and does not run cleanup.
+    Cleanup must confirm a complete text response: token-limited, filtered,
+    tool-only, empty, and unconfirmed outputs fail rather than replacing the
+    transcript. In streaming mode the error follows `dictation.transcript`
+    and no `dictation.completed` event is emitted. Strict Apple cleanup runs
+    to natural completion within context, deadline, and bounded output bytes;
+    macOS 27+ also verifies measured output tokens against the token budget.
 
     Set `cleanup_model` to the generator that rewrites the transcript.
     Without it, or with `style: verbatim`, the response carries the raw
@@ -186,6 +237,8 @@ def sync(
 
     Args:
         body (InferenceDictateRequest):
+        body (File): AFATT001 envelope with DictateRequest metadata, audio set to attachment:0,
+            and exactly one audio attachment.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -204,7 +257,7 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: InferenceDictateRequest,
+    body: InferenceDictateRequest | File,
 ) -> Response[InferenceDictateResponse | InferenceError | InferenceTransientCapacityError]:
     r"""Dictate speech into clean written text
 
@@ -214,6 +267,28 @@ async def asyncio_detailed(
     punctuation and paragraphing are added, and preferred spellings from
     `dictionary` are applied. Clips longer than the 30 s Whisper window
     are transcribed in windows cut at the quietest pause near the boundary.
+
+    Database nodes also accept named transcribers such as
+    `transcribers/apple-speech`. Apple uses the server's native SpeechAnalyzer
+    for recorded clips and requires an Apple-provider build, macOS 26+, and
+    installed locale assets. Select a named cleanup generator with its bare
+    name or `generators/name`; this shares cleanup with named Whisper
+    transcribers. The standalone runtime continues to accept local Whisper
+    and generator model names.
+
+    Named non-Whisper providers apply `dictionary` during cleanup; they reject
+    Whisper-only `transcript_prompt`, `vad`, and `audio_context` options.
+    Apple does not support live transcription sessions. For provider-backed
+    cleanup, a delta may contain the entire cleaned result; the raw transcript
+    is delivered before cleanup starts. Missing token usage remains absent.
+
+    Empty recognition is a successful empty result and does not run cleanup.
+    Cleanup must confirm a complete text response: token-limited, filtered,
+    tool-only, empty, and unconfirmed outputs fail rather than replacing the
+    transcript. In streaming mode the error follows `dictation.transcript`
+    and no `dictation.completed` event is emitted. Strict Apple cleanup runs
+    to natural completion within context, deadline, and bounded output bytes;
+    macOS 27+ also verifies measured output tokens against the token budget.
 
     Set `cleanup_model` to the generator that rewrites the transcript.
     Without it, or with `style: verbatim`, the response carries the raw
@@ -241,6 +316,8 @@ async def asyncio_detailed(
 
     Args:
         body (InferenceDictateRequest):
+        body (File): AFATT001 envelope with DictateRequest metadata, audio set to attachment:0,
+            and exactly one audio attachment.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -262,7 +339,7 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: InferenceDictateRequest,
+    body: InferenceDictateRequest | File,
 ) -> InferenceDictateResponse | InferenceError | InferenceTransientCapacityError | None:
     r"""Dictate speech into clean written text
 
@@ -272,6 +349,28 @@ async def asyncio(
     punctuation and paragraphing are added, and preferred spellings from
     `dictionary` are applied. Clips longer than the 30 s Whisper window
     are transcribed in windows cut at the quietest pause near the boundary.
+
+    Database nodes also accept named transcribers such as
+    `transcribers/apple-speech`. Apple uses the server's native SpeechAnalyzer
+    for recorded clips and requires an Apple-provider build, macOS 26+, and
+    installed locale assets. Select a named cleanup generator with its bare
+    name or `generators/name`; this shares cleanup with named Whisper
+    transcribers. The standalone runtime continues to accept local Whisper
+    and generator model names.
+
+    Named non-Whisper providers apply `dictionary` during cleanup; they reject
+    Whisper-only `transcript_prompt`, `vad`, and `audio_context` options.
+    Apple does not support live transcription sessions. For provider-backed
+    cleanup, a delta may contain the entire cleaned result; the raw transcript
+    is delivered before cleanup starts. Missing token usage remains absent.
+
+    Empty recognition is a successful empty result and does not run cleanup.
+    Cleanup must confirm a complete text response: token-limited, filtered,
+    tool-only, empty, and unconfirmed outputs fail rather than replacing the
+    transcript. In streaming mode the error follows `dictation.transcript`
+    and no `dictation.completed` event is emitted. Strict Apple cleanup runs
+    to natural completion within context, deadline, and bounded output bytes;
+    macOS 27+ also verifies measured output tokens against the token budget.
 
     Set `cleanup_model` to the generator that rewrites the transcript.
     Without it, or with `style: verbatim`, the response carries the raw
@@ -299,6 +398,8 @@ async def asyncio(
 
     Args:
         body (InferenceDictateRequest):
+        body (File): AFATT001 envelope with DictateRequest metadata, audio set to attachment:0,
+            and exactly one audio attachment.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
