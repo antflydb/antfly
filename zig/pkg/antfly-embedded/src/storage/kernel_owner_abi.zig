@@ -21,7 +21,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Storage layouts evolve independently of the shared failure envelope.
 // Version 85 adds privacy policy fences to lookup, scan and query requests.
 // Older owners must reject their operation identifiers before dispatch.
-pub const abi_version: u32 = 86;
+// Version 87 adds certified document-key domains to graph table descriptors.
+pub const abi_version: u32 = 87;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

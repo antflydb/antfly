@@ -23,6 +23,14 @@ const operation = local.api_operation;
 const port = local.storage_statement_read_fence;
 
 pub const WriteOutcome = enum { not_started, aborted, committed, unknown };
+pub fn readDomains(a: std.mem.Allocator, graph: cypher.catalog.Graph, query: cypher.ast.Query, parameters: []const cypher.value.Entry, context: operation.RequestContext) !cypher.read_domains.Plan {
+    return cypher.read_domains.plan(a, graph, query, parameters, .{ .checkpoint = .{ .ptr = &context, .call = struct {
+        fn check(ptr: *const anyopaque) !void {
+            const current: *const operation.RequestContext = @ptrCast(@alignCast(ptr));
+            try current.ensureActive();
+        }
+    }.check } });
+}
 
 /// Shared operator ceilings for text queries and SQL GRAPH_TABLE execution.
 pub fn limits(server: *const server_mod.ApiHttpServer) cypher.runtime.Limits {
@@ -91,10 +99,14 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     var client: cypher.rpc.Client = undefined;
     var channel: AuthorityChannel = .{ .read_owner = &read, .server = server, .identity = identity, .context = context, .name = name, .record_id = record.id, .tables = tables.items, .writes = writes and !compiled.query.explain, .role_revision = role_revision };
     const needed = try cypher.dependencies.required(scratch, compiled.query, graph);
+    const domains = try readDomains(scratch, graph, compiled.query, request.parameters, context);
     var read_tables: std.ArrayList(port.GraphTable) = .empty;
     for (tables.items) |table| if (cypher.dependencies.contains(needed, table.name)) {
         var selected = table;
         selected.indexes = if (writes) null else try cypher.dependencies.indexesForTable(scratch, compiled.query, graph, table.name);
+        if (!writes) if (domains.table(table.name)) |key_domain| {
+            selected.keys = key_domain.keys;
+        };
         try read_tables.append(scratch, selected);
     };
     if (!compiled.query.explain and read_tables.items.len != 0) {

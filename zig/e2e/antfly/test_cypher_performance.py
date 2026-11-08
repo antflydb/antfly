@@ -106,6 +106,37 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             f"/graphs/{graph}",
             {"labels": [{"name": "D", "table": table}], "relationships": []},
         )
+        # Point cohorts are invocation-bound. Exercise parameter rebinding,
+        # keyset unions and residual predicates through both public hosts.
+        for key in ("n0", "n1999"):
+            point = call(
+                f"/graphs/{graph}/query",
+                {
+                    "query": "MATCH(n:D) WHERE antfly.documentKey(n)=$key AND n.score>=0 RETURN n.score",
+                    "parameters": {"key": key},
+                    "limits": {"scanned_anchors": 1},
+                },
+            )
+            assert point["rows"] == [[{"type": "integer", "value": key[1:]}]], point
+            sql_point = call(
+                "/sql",
+                {
+                    "statement": f"SELECT q.score FROM GRAPH_TABLE({graph} MATCH(n IS D) WHERE antfly.documentKey(n)=$1 COLUMNS(n.score AS score)) q",
+                    "parameters": [key],
+                },
+            )
+            assert sql_point["rows"] == [[int(key[1:])]], sql_point
+        key_union = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH(n:D) WHERE antfly.documentKey(n)=$first OR antfly.documentKey(n)=$second RETURN n.score ORDER BY n.score",
+                "parameters": {"first": "n0", "second": "n1999"},
+            },
+        )
+        assert key_union["rows"] == [
+            [{"type": "integer", "value": "0"}],
+            [{"type": "integer", "value": "1999"}],
+        ], key_union
         result = call(
             f"/graphs/{graph}/query",
             {
@@ -3397,4 +3428,35 @@ def test_authenticated_cypher_immutable_metadata_and_visited_comparison_work(
             assert dag["rows"] == [[{"type": "boolean", "value": expected}]], dag
     finally:
         session.close()
+        server.stop()
+
+
+def test_authenticated_cypher_certified_point_domains_across_owners(monkeypatch):
+    monkeypatch.setenv(
+        "ANTFLY_TRUSTED_PRINCIPAL_SECRET", "cypher-point-cohort-authority-secret-v1"
+    )
+    monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_ISSUER", "cypher-point-cohort")
+    binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port())
+    try:
+        script = (
+            Path(__file__).resolve().parents[2] / "scripts" / "verify_cypher_http.py"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script), "--url", server.url, "--shards", "8"],
+            env={
+                **os.environ,
+                "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+            },
+            capture_output=True,
+            text=True,
+            timeout=240,
+        )
+        assert result.returncode == 0, (
+            result.stdout + result.stderr + server.log_path.read_text()[-10000:]
+        )
+        assert "checks passed" in result.stdout, result.stdout
+    finally:
         server.stop()

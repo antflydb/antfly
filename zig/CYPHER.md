@@ -5838,3 +5838,39 @@ their immutable inputs expire. The 30-layer shared-DAG comparisons use 360–363
 work units, including equal outer lists that share the large subtree. Independent
 equal containers still consume actual traversal work and stop at their work or
 cancellation boundary; full DAG output still requires expanded admission.
+
+### Certified point cohorts and identity-hash admission
+
+Read-only text Cypher and SQL `GRAPH_TABLE` bind a conservative physical
+key-domain proof before opening their distributed statement. Isolated node
+patterns with literal or parameter `antfly.documentKey` equality / `IN` anchors
+can select only the owners of those keys. Ordinary total property predicates may
+accompany the anchor. Conjunctions retain the union of possible anchor candidates
+because streaming and materialized execution can select different conjuncts;
+disjunctions require bounded domains on every branch. Multiple relations,
+scopes, labels and UNION arms union their observations by physical table. Any
+unbounded observation dominates that table's point domains.
+
+Proof construction uses invocation-owned parameters, a bounded analysis budget,
+and request cancellation checkpoints. Prepared SQL statements never cache bound
+keys. Unknown expressions, traversals, procedures, writes, transaction overlays,
+empty domains and keysets exceeding 4,096 entries retain full-table cohorts.
+These fallbacks preserve the runtime's error, empty-input and write semantics.
+
+The coordinator resolves the certified keys against the request's pinned routing
+generation **before** read-index admission and owner capture. The indexed routing
+session deduplicates owners; the legacy resolver still requires matching catalog
+and topology generations. Owner plans retain full immutable ranges for each
+selected owner and discard their selection keyset after routing. Whole-graph
+catalog and privilege validation, policy publication checks, table identity,
+privacy versions, topology validation and retained-cut fences remain mandatory.
+This changes private coordinator descriptors (kernel ABI 87 / runtime ABI 88),
+without changing the public JSON contract or shard query protocol.
+
+Identity-based grouping hashes charge node and relationship table/key bytes,
+and path hashes charge every visited node and edge. Wide byte hashing admits
+work and checks cancellation in at most 4 KiB chunks while preserving the
+existing hash format. This closes the gap where a megabyte of path identity
+bytes could consume a single work charge. Focused regressions cover a valid
+2,048-node chain, identity byte ceilings, cancellation during path traversal,
+and digest compatibility across chunk boundaries.

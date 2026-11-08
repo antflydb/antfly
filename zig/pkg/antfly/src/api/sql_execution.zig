@@ -2034,6 +2034,24 @@ pub const Adapter = struct {
         const client: *@import("cypher").rpc.Client = @ptrCast(@alignCast(ptr));
         return (try client.projectDocument(a, .{ .table = table, .key = key }, document, json_null_fields, false)).node != null;
     }
+    fn graphParametersForScan(self: *Adapter, a: std.mem.Allocator, binding: *const catalog.graph_relation.Binding, request: catalog.Scan) ![]const @import("cypher").value.Entry {
+        const cypher = @import("cypher");
+        const parameters = try a.alloc(cypher.value.Entry, binding.definition.parameters.len);
+        for (binding.definition.parameters, parameters) |name, *parameter| {
+            const index = std.fmt.parseUnsigned(usize, name, 10) catch return error.InvalidSqlParameters;
+            var value = try self.graphParameter(a, index);
+            if (index <= request.graph_parameter_types.len) if (request.graph_parameter_types[index - 1]) |kind| {
+                if (value == .string) value = switch (kind) {
+                    .integer => .{ .integer = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidSqlParameters },
+                    .number => .{ .float = std.fmt.parseFloat(f64, value.string) catch return error.InvalidSqlParameters },
+                    .boolean => if (std.ascii.eqlIgnoreCase(value.string, "true")) .{ .bool = true } else if (std.ascii.eqlIgnoreCase(value.string, "false")) .{ .bool = false } else return error.InvalidSqlParameters,
+                    else => value,
+                };
+            };
+            parameter.* = .{ .name = name, .value = try cypher.value.Value.fromJson(a, value) };
+        }
+        return parameters;
+    }
     fn openGraphStatement(self: *Adapter, a: std.mem.Allocator, requests: []const catalog.StatementScan) !catalog.StatementRead {
         const cypher = @import("cypher");
         const port = @import("antfly_local_sources").storage_statement_read_fence;
@@ -2084,6 +2102,19 @@ pub const Adapter = struct {
             }
         }
         const role_revision = if (self.identity.*) |principal| if (principal.live_user_manager) |manager| @as(?u64, manager.rowPolicyRoleRevision()) else null else null;
+        // Bind once before cohort planning, then reuse those exact values in
+        // each graph cursor. A prepared SQL query never stores bound domains.
+        const parameter_rows = try owned.alloc([]const cypher.value.Entry, requests.len);
+        const domain_plans = try owned.alloc(?cypher.read_domains.Plan, requests.len);
+        for (requests, parameter_rows, domain_plans) |request, *parameters, *domains| {
+            parameters.* = &.{};
+            domains.* = null;
+            if (request.table.graph) |binding| {
+                try self.verify(owned, request.table);
+                parameters.* = try self.graphParametersForScan(owned, binding, request.request);
+                if (self.range_reads == null) domains.* = try @import("graph_execution.zig").readDomains(owned, binding.graph, binding.definition.query, parameters.*, self.context);
+            }
+        }
         const inputs = try owned.alloc(port.GraphTable, tables.items.len);
         for (tables.items, inputs) |table, *input| input.* = .{ .name = table.physical_name, .table_id = table.id, .schema_version = table.schema_version, .principal_proof = (try self.rowPolicyProof(owned, table)) orelse "", .database = table.scope.?.database, .filter_query_json = (try http_server.resolveEffectiveRowFilterJson(owned, self.identity.*, table.physical_name)) orelse "" };
         for (inputs) |*input| {
@@ -2103,6 +2134,36 @@ pub const Adapter = struct {
                 selected = unioned.items;
             }
             input.indexes = if (self.range_reads != null) null else selected;
+            if (self.range_reads == null) {
+                var keys: std.StringHashMapUnmanaged(void) = .empty;
+                var full = false;
+                var observed = false;
+                for (requests, domain_plans) |request, domains| {
+                    if (request.table.graph == null) {
+                        if (request.table.id == input.table_id) full = true;
+                        continue;
+                    }
+                    const domain = if (domains) |plan| plan.table(input.name) else null;
+                    if (domain) |d| {
+                        observed = true;
+                        if (d.keys == null) {
+                            full = true;
+                            break;
+                        }
+                        for (d.keys.?) |key| try keys.put(owned, key, {});
+                        if (keys.count() > cypher.read_domains.max_keys) {
+                            full = true;
+                            break;
+                        }
+                    }
+                }
+                if (observed and !full and keys.count() != 0) {
+                    const names = try owned.alloc([]const u8, keys.count());
+                    var iterator = keys.keyIterator();
+                    for (names) |*name| name.* = iterator.next().?.*;
+                    input.keys = names;
+                }
+            }
         }
         var nonce: [32]u8 = undefined;
         try self.server.embedding_provider_runtime.io.randomSecure(&nonce);
@@ -2165,7 +2226,7 @@ pub const Adapter = struct {
         try authority.validateAuthority(true);
         authority.guarded_operation = true;
         defer authority.guarded_operation = false;
-        for (requests, owner.cursors) |request, *out| {
+        for (requests, owner.cursors, 0..) |request, *out, request_index| {
             try self.verify(owned, request.table);
             const child: catalog.Cursor = if (request.table.graph) |binding| blk: {
                 const graph_client = try owned.create(cypher.rpc.Client);
@@ -2175,20 +2236,7 @@ pub const Adapter = struct {
                 graph_client.* = client;
                 graph_client.incarnation = binding.graph.incarnation;
                 graph_client.revision = binding.graph.revision;
-                const parameters = try owned.alloc(cypher.value.Entry, binding.definition.parameters.len);
-                for (binding.definition.parameters, parameters) |name, *parameter| {
-                    const index = std.fmt.parseUnsigned(usize, name, 10) catch return error.InvalidSqlParameters;
-                    var value = try self.graphParameter(owned, index);
-                    if (index <= request.request.graph_parameter_types.len) if (request.request.graph_parameter_types[index - 1]) |kind| {
-                        if (value == .string) value = switch (kind) {
-                            .integer => .{ .integer = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidSqlParameters },
-                            .number => .{ .float = std.fmt.parseFloat(f64, value.string) catch return error.InvalidSqlParameters },
-                            .boolean => if (std.ascii.eqlIgnoreCase(value.string, "true")) .{ .bool = true } else if (std.ascii.eqlIgnoreCase(value.string, "false")) .{ .bool = false } else return error.InvalidSqlParameters,
-                            else => value,
-                        };
-                    };
-                    parameter.* = .{ .name = name, .value = try cypher.value.Value.fromJson(owned, value) };
-                }
+                const parameters = parameter_rows[request_index];
                 var changed = for (staged_rows.items) |row| {
                     const member = for (binding.graph.labels) |label| {
                         if (std.mem.eql(u8, label.table, row.identity.table)) break true;
@@ -4445,6 +4493,7 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
     const Fake = struct {
         const Self = @This();
         captures: usize = 0,
+        points: bool = false,
         releases: usize = 0,
         catalog_reads: usize = 0,
         guard_batches: usize = 0,
@@ -4484,7 +4533,8 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
         fn scan(_: *anyopaque, a: std.mem.Allocator, _: []const u8, after: ?[]const u8, _: usize) !cypher.backend.Page(*const cypher.value.Node) {
             return .{ .items = if (after == null) try a.dupe(*const cypher.value.Node, &.{ &nodes[0], &nodes[1] }) else &.{} };
         }
-        fn get(_: *anyopaque, _: std.mem.Allocator, _: cypher.value.Identity) !?*const cypher.value.Node {
+        fn get(_: *anyopaque, _: std.mem.Allocator, id: cypher.value.Identity) !?*const cypher.value.Node {
+            for (&nodes) |*node| if (std.mem.eql(u8, id.table, node.identity.table) and std.mem.eql(u8, id.key, node.identity.key)) return node;
             return null;
         }
         fn expand(_: *anyopaque, _: std.mem.Allocator, _: cypher.catalog.Relationship, _: cypher.value.Identity, _: cypher.ast.Direction, _: ?[]const u8, _: usize) !cypher.backend.Page(*const cypher.value.Relationship) {
@@ -4511,6 +4561,17 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
             try std.testing.expectEqualStrings("docs", input.tables[0].name);
             try std.testing.expect(input.tables[0].indexes != null);
             try std.testing.expectEqual(@as(usize, 0), input.tables[0].indexes.?.len);
+            if (self.points) {
+                const keys = input.tables[0].keys orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 2), keys.len);
+                var a_key = false;
+                var b_key = false;
+                for (keys) |key| {
+                    a_key = a_key or std.mem.eql(u8, key, "a");
+                    b_key = b_key or std.mem.eql(u8, key, "b");
+                }
+                try std.testing.expect(a_key and b_key);
+            } else try std.testing.expect(input.tables[0].keys == null);
             const cut = try a.create(Cut);
             cut.* = .{ .a = a, .fake = self };
             self.captures += 1;
@@ -4536,6 +4597,22 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
     // fetch graph JSON and still fence the uncaptured table in one batch.
     try std.testing.expectEqual(@as(usize, 2), fake.catalog_reads);
     try std.testing.expect(fake.guard_batches >= 2);
+    fake.points = true;
+    var point_query = try @import("antfly_local_sources").sql_compiler.compile(a, "SELECT g.key,h.key FROM GRAPH_TABLE(knowledge MATCH (n IS Document) WHERE antfly.documentKey(n)=$1 COLUMNS (antfly.documentKey(n) AS key)) g JOIN GRAPH_TABLE(knowledge MATCH (n IS Document) WHERE antfly.documentKey(n)=$2 COLUMNS (antfly.documentKey(n) AS key)) h ON true", .{});
+    defer point_query.deinit();
+    // Both graph relations share one physical table. The cohort must union
+    // their separately bound keys, and reuse those bindings in both cursors.
+    for (0..2) |iteration| {
+        const first_key: []const u8 = if (iteration == 0) "a" else "b";
+        const second_key: []const u8 = if (iteration == 0) "b" else "a";
+        var points = try adapter.execute(a, &point_query, &.{ .{ .string = first_key }, .{ .string = second_key } }, .{}, null);
+        defer points.deinit();
+        try std.testing.expectEqual(@as(usize, 1), points.output.rows.len);
+        try std.testing.expectEqualStrings(first_key, points.output.rows[0][0].string);
+        try std.testing.expectEqualStrings(second_key, points.output.rows[0][1].string);
+    }
+    try std.testing.expectEqual(@as(usize, 3), fake.captures);
+    try std.testing.expectEqual(fake.captures, fake.releases);
 }
 
 test "SQL pgwire native graph arguments borrow scalars without materializing unrelated parameters" {

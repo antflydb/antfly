@@ -1,0 +1,420 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Conservative, parameter-bound physical document-key domains. A bounded
+//! domain is licensed by identity anchors and total residual tests on isolated nodes.
+//! Every other data access contributes a full-table domain, which dominates
+//! all bounded observations of that table across scopes and UNION arms.
+const std = @import("std");
+const ast = @import("ast.zig");
+const catalog = @import("catalog.zig");
+const v = @import("value.zig");
+const A = std.mem.Allocator;
+pub const max_keys = 4096;
+pub const Options = struct {
+    max_work: usize = 65536,
+    checkpoint: ?struct { ptr: *const anyopaque, call: *const fn (*const anyopaque) anyerror!void } = null,
+};
+pub const Domain = struct { table: []const u8, keys: ?[]const []const u8 };
+pub const Plan = struct {
+    domains: []const Domain,
+    pub fn table(self: Plan, name: []const u8) ?Domain {
+        for (self.domains) |domain| if (std.mem.eql(u8, domain.table, name)) return domain;
+        return null;
+    }
+};
+const Bound = struct { safe: bool = true, keys: ?[]const []const u8 = null };
+const Entry = struct { full: bool = false, keys: std.StringHashMapUnmanaged(void) = .empty };
+const Builder = struct {
+    a: A,
+    graph: catalog.Graph,
+    parameters: []const v.Entry,
+    tables: std.StringHashMapUnmanaged(Entry) = .empty,
+    writes: bool = false,
+    exhausted: bool = false,
+    options: Options,
+    remaining: usize,
+    fn spend(self: *Builder, amount: usize) !bool {
+        if (self.exhausted) return false;
+        if (self.options.checkpoint) |check| {
+            if (self.remaining == self.options.max_work or amount / 256 != 0 or self.remaining / 256 != (self.remaining -| amount) / 256) try check.call(check.ptr);
+        }
+        if (amount > self.remaining) {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining -= amount;
+        return true;
+    }
+    fn appendKey(self: *Builder, list: *std.ArrayList([]const u8), key: []const u8) !bool {
+        if (!try self.spend(1 + key.len / 64)) return false;
+        try list.append(self.a, key);
+        return true;
+    }
+    fn add(self: *Builder, table_name: []const u8, keys: ?[]const []const u8) !void {
+        const slot = try self.tables.getOrPut(self.a, table_name);
+        if (!slot.found_existing) slot.value_ptr.* = .{};
+        if (keys == null) {
+            slot.value_ptr.full = true;
+            return;
+        }
+        if (slot.value_ptr.full) return;
+        for (keys.?) |key| {
+            try slot.value_ptr.keys.put(self.a, key, {});
+            if (slot.value_ptr.keys.count() > max_keys) {
+                slot.value_ptr.full = true;
+                return;
+            }
+        }
+    }
+    fn all(self: *Builder) !void {
+        for (self.graph.labels) |label| try self.add(label.table, null);
+    }
+    fn node(self: *Builder, n: ast.Node, predicate: ?*const ast.Expr, aliases: []const []const u8) !void {
+        const literal_properties = for (n.properties) |property| {
+            if (!try self.spend(1) or self.constant(property.value) == null) break false;
+        } else true;
+        const bound: Bound = if (n.alias != null and literal_properties and predicate != null)
+            try self.predicateDomain(predicate.?, n.alias.?, aliases)
+        else
+            .{ .safe = false };
+        const keys = if (bound.safe) bound.keys else null;
+        if (n.labels.len == 0) {
+            for (self.graph.labels) |label| try self.add(label.table, keys);
+        } else for (n.labels) |name| if (self.graph.label(name)) |label| {
+            try self.add(label.table, keys);
+        };
+    }
+    fn path(self: *Builder, p: ast.Path, predicate: ?*const ast.Expr, aliases: []const []const u8) !void {
+        // Traversals can fetch unknown endpoints from either orientation.
+        for (p.nodes) |n| {
+            if (!try self.spend(1)) return;
+            try self.node(n, if (p.edges.len == 0) predicate else null, aliases);
+        }
+        for (p.edges) |edge| {
+            for (self.graph.relationships) |mapping| {
+                if (!try self.spend(1)) return;
+                const selected = edge.types.len == 0 or for (edge.types) |name| {
+                    if (std.mem.eql(u8, name, mapping.name)) break true;
+                } else false;
+                if (selected) {
+                    if (self.graph.label(mapping.source_label)) |label| try self.add(label.table, null);
+                    if (self.graph.label(mapping.target_label)) |label| try self.add(label.table, null);
+                }
+            }
+            try self.walk(edge.properties);
+        }
+        for (p.nodes) |n| try self.walk(n.properties);
+    }
+    fn clauses(self: *Builder, list: []const ast.Clause) !void {
+        for (list) |clause| {
+            if (!try self.spend(1)) return;
+            switch (clause.operation) {
+                .match => |m| {
+                    var aliases: std.ArrayList([]const u8) = .empty;
+                    for (m.paths) |p| {
+                        for (p.nodes) |n| {
+                            if (!try self.spend(1)) return;
+                            if (n.alias) |name| try aliases.append(self.a, name);
+                        }
+                    }
+                    for (m.paths) |p| try self.path(p, m.predicate, aliases.items);
+                    try self.walk(m.predicate);
+                },
+                .project => |p| try self.walk(p.value),
+                .unwind => |u| try self.walk(u.expression),
+                .subquery => |nested| try self.clauses(nested),
+                .call => {
+                    try self.all();
+                },
+                .create, .merge, .set, .remove, .delete => {
+                    self.writes = true;
+                },
+            }
+        }
+    }
+    fn walk(self: *Builder, value: anytype) anyerror!void {
+        if (!try self.spend(1)) return;
+        const T = @TypeOf(value);
+        if (T == ast.Expr) {
+            switch (value.value) {
+                .exists => |nested| {
+                    try self.clauses(nested);
+                    return;
+                },
+                .pattern_comprehension => |p| {
+                    var aliases: std.ArrayList([]const u8) = .empty;
+                    for (p.path.nodes) |n| if (n.alias) |name| {
+                        try aliases.append(self.a, name);
+                    };
+                    try self.path(p.path, p.predicate, aliases.items);
+                    try self.walk(p.predicate);
+                    try self.walk(p.projection);
+                    return;
+                },
+                else => {},
+            }
+        }
+        switch (@typeInfo(T)) {
+            .@"struct" => |s| inline for (s.field_names) |name| {
+                try self.walk(@field(value, name));
+            },
+            .@"union" => |u| if (u.tag_type != null) {
+                inline for (u.field_names) |name| {
+                    if (std.mem.eql(u8, @tagName(value), name)) try self.walk(@field(value, name));
+                }
+            },
+            .optional => if (value) |child| {
+                try self.walk(child);
+            },
+            .pointer => |p| {
+                if (p.size == .one and p.child == ast.Expr) try self.walk(value.*) else if (p.size == .slice and p.child != u8) for (value) |child| {
+                    if (self.exhausted) break;
+                    try self.walk(child);
+                };
+            },
+            else => {},
+        }
+    }
+    fn constant(self: *Builder, expression: *const ast.Expr) ?v.Value {
+        return switch (expression.value) {
+            .literal => |lit| switch (lit) {
+                .string => |x| .{ .string = x },
+                .null => .null,
+                .boolean => |x| .{ .boolean = x },
+                .integer => |x| .{ .integer = x },
+                .number => |x| .{ .number = x },
+            },
+            .parameter => |name| blk: {
+                for (self.parameters) |parameter| if (std.mem.eql(u8, parameter.name, name)) break :blk parameter.value;
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+    fn keyAlias(expression: *const ast.Expr, aliases: []const []const u8) ?[]const u8 {
+        if (expression.value != .call) return null;
+        const call = expression.value.call;
+        if (!std.ascii.eqlIgnoreCase(call.name, "antfly.documentKey") or call.args.len != 1 or call.args[0].value != .variable) return null;
+        const name = call.args[0].value.variable;
+        for (aliases) |known| if (std.mem.eql(u8, known, name)) return name;
+        return null;
+    }
+    fn constantKeys(self: *Builder, expression: *const ast.Expr, membership: bool) !?[]const []const u8 {
+        var result: std.ArrayList([]const u8) = .empty;
+        if (membership and expression.value == .list) {
+            if (expression.value.list.len > max_keys) return null;
+            for (expression.value.list) |item| {
+                const value = self.constant(item) orelse return null;
+                if (value == .null) continue;
+                if (value != .string) return null;
+                if (!try self.appendKey(&result, value.string)) return null;
+            }
+        } else {
+            const value = self.constant(expression) orelse return null;
+            if (value == .null) return &.{};
+            if (!membership) {
+                if (value != .string) return null;
+                if (!try self.appendKey(&result, value.string)) return null;
+            } else {
+                if (value != .list or value.list.len > max_keys) return null;
+                for (value.list) |item| {
+                    if (item == .null) continue;
+                    if (item != .string) return null;
+                    if (!try self.appendKey(&result, item.string)) return null;
+                }
+            }
+        }
+        return result.items;
+    }
+    fn atom(self: *Builder, op: ast.Binary, left: *const ast.Expr, right: *const ast.Expr, alias: []const u8, aliases: []const []const u8) !Bound {
+        if (op != .eq and op != .in) return .{ .safe = false };
+        const name = keyAlias(left, aliases) orelse if (op == .eq) keyAlias(right, aliases) else null;
+        const selected = name orelse return .{ .safe = false };
+        const rhs = if (keyAlias(left, aliases) != null) right else left;
+        const domain = (try self.constantKeys(rhs, op == .in)) orelse return .{ .safe = false };
+        return .{ .keys = if (std.mem.eql(u8, selected, alias)) domain else null };
+    }
+    fn simpleData(self: *Builder, e: *const ast.Expr, aliases: []const []const u8) anyerror!bool {
+        if (!try self.spend(1)) return false;
+        if (self.constant(e) != null) return true;
+        return switch (e.value) {
+            .property => |p| p.base.value == .variable and for (aliases) |name| {
+                if (std.mem.eql(u8, name, p.base.value.variable)) break true;
+            } else false,
+            .call => keyAlias(e, aliases) != null,
+            else => false,
+        };
+    }
+    // Only total predicates may accompany a key anchor. Unknown arithmetic,
+    // calls and constructors could otherwise hide errors on a scan fallback.
+    fn totalTest(self: *Builder, e: *const ast.Expr, aliases: []const []const u8) anyerror!bool {
+        if (!try self.spend(1)) return false;
+        return switch (e.value) {
+            .literal => |lit| lit == .boolean or lit == .null,
+            .unary => |u| switch (u.op) {
+                .is_null, .is_not_null => self.simpleData(u.operand, aliases),
+                .not => self.totalTest(u.operand, aliases),
+                else => false,
+            },
+            .binary => |b| switch (b.op) {
+                .eq, .neq, .lt, .lte, .gt, .gte => try self.simpleData(b.left, aliases) and try self.simpleData(b.right, aliases),
+                .@"and", .@"or", .xor => try self.totalTest(b.left, aliases) and try self.totalTest(b.right, aliases),
+                else => false,
+            },
+            .comparison => |c| blk: {
+                for (c.operators) |op| switch (op) {
+                    .eq, .neq, .lt, .lte, .gt, .gte => {},
+                    else => break :blk false,
+                };
+                for (c.operands) |item| if (!try self.simpleData(item, aliases)) break :blk false;
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+    fn predicateDomain(self: *Builder, e: *const ast.Expr, alias: []const u8, aliases: []const []const u8) anyerror!Bound {
+        if (!try self.spend(1)) return .{ .safe = false };
+        switch (e.value) {
+            .literal => |value| switch (value) {
+                .boolean => |x| return .{ .keys = if (x) null else &.{} },
+                .null => return .{ .keys = &.{} },
+                else => {},
+            },
+            .comparison => |c| if (c.operators.len == 1 and c.operands.len == 2) {
+                if ((c.operators[0] == .eq or c.operators[0] == .in) and (keyAlias(c.operands[0], aliases) != null or keyAlias(c.operands[1], aliases) != null))
+                    return self.atom(c.operators[0], c.operands[0], c.operands[1], alias, aliases);
+            },
+            .binary => |b| {
+                if (b.op != .@"and" and b.op != .@"or") {
+                    if ((b.op == .eq or b.op == .in) and (keyAlias(b.left, aliases) != null or keyAlias(b.right, aliases) != null)) return self.atom(b.op, b.left, b.right, alias, aliases);
+                    return .{ .safe = try self.totalTest(e, aliases) };
+                }
+                const l = try self.predicateDomain(b.left, alias, aliases);
+                const r = try self.predicateDomain(b.right, alias, aliases);
+                if (!l.safe or !r.safe) return .{ .safe = false };
+                if (b.op == .@"or" and (l.keys == null or r.keys == null)) return .{};
+                if (b.op == .@"and") {
+                    if (l.keys == null) return r;
+                    if (r.keys == null) return l;
+                }
+                // Stream and materialized plans can choose different conjuncts.
+                // Keep every possible candidate key, not just the intersection.
+                if (l.keys.?.len + r.keys.?.len > max_keys) return .{ .safe = false };
+                var result: std.ArrayList([]const u8) = .empty;
+                try result.appendSlice(self.a, l.keys.?);
+                try result.appendSlice(self.a, r.keys.?);
+                return .{ .keys = result.items };
+            },
+            else => {},
+        }
+        return .{ .safe = try self.totalTest(e, aliases) };
+    }
+};
+/// The invocation-arena result borrows graph and parameter strings. It must
+/// never be stored in a prepared query or reused with different bindings.
+pub fn plan(a: A, graph: catalog.Graph, query: ast.Query, parameters: []const v.Entry, options: Options) !Plan {
+    var builder: Builder = .{ .a = a, .graph = graph, .parameters = parameters, .options = options, .remaining = options.max_work };
+    try builder.clauses(query.clauses);
+    for (query.unions) |arm| try builder.clauses(arm.clauses);
+    if (builder.exhausted) try builder.all();
+    const result = try a.alloc(Domain, builder.tables.count());
+    var entries = builder.tables.iterator();
+    var index: usize = 0;
+    while (entries.next()) |entry| : (index += 1) {
+        var names: std.ArrayList([]const u8) = .empty;
+        if (!entry.value_ptr.full and !builder.writes) {
+            var keys = entry.value_ptr.keys.keyIterator();
+            while (keys.next()) |name| try names.append(a, name.*);
+            std.mem.sort([]const u8, names.items, {}, struct {
+                fn less(_: void, l: []const u8, r: []const u8) bool {
+                    return std.mem.order(u8, l, r) == .lt;
+                }
+            }.less);
+        }
+        // Empty domains conservatively retain a cohort: the runtime still owns
+        // empty-input and error semantics, including aggregate defaults.
+        result[index] = .{ .table = entry.key_ptr.*, .keys = if (entry.value_ptr.full or builder.writes or names.items.len == 0) null else names.items };
+    }
+    return .{ .domains = result };
+}
+
+test "point domains compose identity predicates and conservatively retain unknown reads" {
+    const compiler = @import("compiler.zig");
+    const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{ .{ .name = "D", .table = "docs" }, .{ .name = "D2", .table = "docs" }, .{ .name = "O", .table = "other" } }, .relationships = &.{.{ .name = "R", .source_label = "D", .target_label = "O", .index = "g", .stored_type = "r" }} };
+    const Case = struct { text: []const u8, keys: ?[]const []const u8 };
+    for ([_]Case{
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n)='b' RETURN n", .keys = &.{"b"} },
+        .{ .text = "MATCH(n:D) WHERE 'b'=antfly.documentKey(n) RETURN n", .keys = &.{"b"} },
+        .{ .text = "OPTIONAL MATCH(n:D) WHERE antfly.documentKey(n) IN ['b','a','b',null] RETURN count(n)", .keys = &.{ "a", "b" } },
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n) IN ['a','b'] AND antfly.documentKey(n)='b' RETURN n", .keys = &.{ "a", "b" } },
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n)='b' OR antfly.documentKey(n)='a' RETURN n", .keys = &.{ "a", "b" } },
+        .{ .text = "MATCH(n:D),(m:D2) WHERE antfly.documentKey(n)='a' AND antfly.documentKey(m)='b' RETURN n,m", .keys = &.{ "a", "b" } },
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n)='a' RETURN n UNION MATCH(n:D) WHERE antfly.documentKey(n)='b' RETURN n", .keys = &.{ "a", "b" } },
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n)='a' RETURN n UNION MATCH(n:D) RETURN n", .keys = null },
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n)='a' AND n.x=1 RETURN n", .keys = &.{"a"} },
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n)='a' AND n.x/0>1 RETURN n", .keys = null },
+        .{ .text = "MATCH(n:D {x:1/0}) WHERE antfly.documentKey(n)='a' RETURN n", .keys = null },
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n)='a' OR true RETURN n", .keys = null },
+        .{ .text = "MATCH(n:D {x:1}) WHERE antfly.documentKey(n)='a' RETURN n", .keys = &.{"a"} },
+        .{ .text = "MATCH(n:D)-[:R]->(o:O) WHERE antfly.documentKey(n)='a' RETURN n", .keys = null },
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n)='a' SET n.x=1 RETURN n", .keys = null },
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n)='a' RETURN [(m:D)-[:R]->(o:O)|m]", .keys = null },
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n)='a' RETURN EXISTS {MATCH(m:D) RETURN m}", .keys = null },
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n) IN [] RETURN count(n)", .keys = null },
+        .{ .text = "MATCH(n:D) WHERE antfly.documentKey(n)=$missing RETURN n", .keys = null },
+    }) |case| {
+        var diagnostic: compiler.Diagnostic = .{};
+        var compiled = compiler.compile(std.testing.allocator, case.text, .{}, &diagnostic) catch |err| {
+            std.debug.print("domain syntax case: {s}\n", .{case.text});
+            return err;
+        };
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try plan(arena.allocator(), graph, compiled.query, &.{}, .{});
+        const actual = result.table("docs").?.keys;
+        errdefer std.debug.print("domain case failed: {s}\n", .{case.text});
+        try std.testing.expectEqual(case.keys == null, actual == null);
+        if (case.keys) |expected| {
+            try std.testing.expectEqual(expected.len, actual.?.len);
+            for (expected, actual.?) |l, r| try std.testing.expectEqualStrings(l, r);
+        }
+    }
+}
+
+test "point domains bind parameters per invocation and bound planning work without changing query semantics" {
+    const compiler = @import("compiler.zig");
+    const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} };
+    var diagnostic: compiler.Diagnostic = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "MATCH(n:D) WHERE antfly.documentKey(n) IN $keys RETURN n", .{}, &diagnostic);
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{ "first", "second" }) |key| {
+        const parameters: []const v.Entry = &.{.{ .name = "keys", .value = .{ .list = &.{ .{ .string = key }, .null } } }};
+        const result = try plan(arena.allocator(), graph, compiled.query, parameters, .{});
+        try std.testing.expectEqualStrings(key, result.table("docs").?.keys.?[0]);
+        const declined = try plan(arena.allocator(), graph, compiled.query, parameters, .{ .max_work = 0 });
+        try std.testing.expect(declined.table("docs").?.keys == null);
+    }
+    const Guard = struct {
+        fn canceled(_: *const anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    var marker: u8 = 0;
+    try std.testing.expectError(error.Canceled, plan(arena.allocator(), graph, compiled.query, &.{}, .{ .checkpoint = .{ .ptr = &marker, .call = Guard.canceled } }));
+}

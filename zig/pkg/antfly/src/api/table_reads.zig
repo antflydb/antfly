@@ -4199,7 +4199,7 @@ pub const ProvisionedTableReadSource = struct {
         const opts: db_mod.types.ScanOptions = .{ .execution_deadline_ns = input.deadline_ns, .cancellation = input.cancellation };
         for (input.tables, prepared) |table, *owned| {
             try input.cancellation.check();
-            owned.* = try self.prepareRoutedSpanRead(alloc, table.name, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, .read_index, .general);
+            owned.* = try self.prepareRoutedDomainRead(alloc, table.name, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, .read_index, .general, table.keys);
             retained += 1;
             if (owned.table_id != table.table_id) return error.CatalogGenerationChanged;
             try certifyDelayedOwnerCut(owned.group_ids.len);
@@ -4234,7 +4234,11 @@ pub const ProvisionedTableReadSource = struct {
                     try ranges.append(alloc, .{ .start = start, .end = end });
                 };
                 if (ranges.items.len == 0) return error.TopologyChanged;
-                try plans.append(alloc, .{ .table = table, .fence = fence, .ranges = try ranges.toOwnedSlice(alloc), .route = switch (route) {
+                // Selection keys are no longer needed after routing. Do not
+                // duplicate an entire keyset in every retained owner plan.
+                var owner_table = table;
+                owner_table.keys = null;
+                try plans.append(alloc, .{ .table = owner_table, .fence = fence, .ranges = try ranges.toOwnedSlice(alloc), .route = switch (route) {
                     .local => .{ .local = self.groupLocalSourceWithFence(fence) },
                     .remote => |remote| .{ .remote = .{ .executor = self.distributedInternalExecutor(), .base_uri = remote.base_uri } },
                 } });
@@ -4579,13 +4583,27 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
         kind: ReadPreparation.Kind,
     ) !PreparedSpanRead {
+        return self.prepareRoutedDomainRead(alloc, table_name, from_key, to_key, request, consistency, kind, null);
+    }
+
+    fn prepareRoutedDomainRead(
+        self: *ProvisionedTableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        request: ProvisionedConsistencyRequest,
+        consistency: raft_mod.ReadConsistency,
+        kind: ReadPreparation.Kind,
+        keys: ?[]const []const u8,
+    ) !PreparedSpanRead {
         const deadline_ns = provisionedConsistencyDeadline(self.catalog, request);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             if (consistency == .stale) {
                 var activity = self.beginPreparedRead(table_name, kind);
                 errdefer if (activity) |*held| held.deinit();
-                const route = try requestRoutedSpanSnapshot(alloc, self.catalog, table_name, from_key, to_key, request, deadline_ns);
+                const route = try requestRoutedDomainSnapshot(alloc, self.catalog, table_name, from_key, to_key, request, deadline_ns, keys);
                 const routes = route.routes;
                 const group_ids = route.group_ids;
                 var route_owned = true;
@@ -4606,7 +4624,7 @@ pub const ProvisionedTableReadSource = struct {
                 return .{ .alloc = alloc, .routes = routes, .group_ids = group_ids, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = route.table_id, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
             }
 
-            const route = try requestRoutedSpanSnapshot(alloc, self.catalog, table_name, from_key, to_key, request, deadline_ns);
+            const route = try requestRoutedDomainSnapshot(alloc, self.catalog, table_name, from_key, to_key, request, deadline_ns, keys);
             const routes = route.routes;
             const group_ids = route.group_ids;
             var route_owned = true;
@@ -11365,6 +11383,16 @@ fn isDocumentLookupBatch(req: db_mod.types.SearchRequest) bool {
         req.full_text == null and req.full_text_queries.len == 0 and req.dense == null and req.sparse == null and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.graph_queries.len == 0 and req.graph_metric_queries.len == 0 and req.graph_metric_rerank == null and req.hierarchy_children == null and !req.hierarchy_grouped_matches and req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0 and req.filter_text == null and req.exclusion_text == null and req.aggregations_json.len == 0 and !searchRequestHasResolvedDocFilter(req);
 }
 
+/// Select all key owners from one routing generation before read-index
+/// admission. RoutingSession provides indexed batched resolution; legacy
+/// catalogs retain exact generation checks in the shared keyset resolver.
+fn requestRoutedDomainSnapshot(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, table: []const u8, from: []const u8, to: []const u8, request: ProvisionedConsistencyRequest, deadline: ?u64, keys: ?[]const []const u8) !table_catalog.RoutedSpanSnapshot {
+    if (keys) |selected| if (selected.len != 0 and selected.len <= @import("cypher").read_domains.max_keys) {
+        return table_catalog.routedDocumentKeysSnapshotUntil(alloc, catalog, table, selected, deadline);
+    };
+    return requestRoutedSpanSnapshot(alloc, catalog, table, from, to, request, deadline);
+}
+
 fn requestRoutedSpanSnapshot(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, table_name: []const u8, from: []const u8, to: []const u8, request: ProvisionedConsistencyRequest, deadline: ?u64) !table_catalog.RoutedSpanSnapshot {
     if (request == .search) if (request.search.native_query_cut) |cut| if (cut.cover.len != 0) {
         var current = try table_catalog.routedSpanSnapshotUntil(alloc, catalog, table_name, "", "", deadline);
@@ -17638,6 +17666,70 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(builtin.is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "certified graph point cohorts admit only selected owners before read index" {
+            const a = std.testing.allocator;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const owned = arena.allocator();
+            const Fixture = struct {
+                tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "docs" }},
+                ranges: []metadata_table_manager.RangeRecord,
+                admitted: std.ArrayList(u64) = .empty,
+                fn snapshot(raw: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return .{ .tables = &self.tables, .ranges = self.ranges };
+                }
+                fn free(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+                fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedAdminRead;
+                }
+                fn freeAdmin(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn wait(raw: *anyopaque, group: u64, _: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.admitted.append(std.testing.allocator, group);
+                }
+            };
+            const ranges = try owned.alloc(metadata_table_manager.RangeRecord, 64);
+            for (ranges, 0..) |*range, i| range.* = .{
+                .table_id = 7,
+                .group_id = i + 1,
+                .range_id = i + 1,
+                .start_key = if (i == 0) "" else try std.fmt.allocPrint(owned, "{d:0>2}", .{i}),
+                .end_key = if (i == 63) null else try std.fmt.allocPrint(owned, "{d:0>2}", .{i + 1}),
+            };
+            var fixture: Fixture = .{ .ranges = ranges };
+            defer fixture.admitted.deinit(a);
+            const base: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{
+                .admin_snapshot = Fixture.admin,
+                .free_admin_snapshot = Fixture.freeAdmin,
+                .routing_snapshot = Fixture.snapshot,
+                .linearizable_routing_snapshot = Fixture.snapshot,
+                .free_routing_snapshot = Fixture.free,
+            } };
+            // Exercise both the legacy resolver and the request-pinned indexed generation.
+            inline for (.{ false, true }) |pinned| {
+                const generation = try table_catalog.RoutingGeneration.create(a, try Fixture.snapshot(&fixture, null), .{});
+                var session = generation.session(a, base, true);
+                defer session.deinit();
+                var provider = ProvisionedTableReadSource.init("unused", if (pinned) session.catalog() else base, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.wait } });
+                const cases = [_]struct { keys: ?[]const []const u8, expected: usize }{
+                    .{ .keys = &.{"31-key"}, .expected = 1 },
+                    .{ .keys = &.{ "31-a", "31-b", "31-a" }, .expected = 1 },
+                    .{ .keys = &.{ "31-a", "63-z" }, .expected = 2 },
+                    .{ .keys = null, .expected = 64 },
+                    .{ .keys = &.{}, .expected = 64 },
+                };
+                for (cases) |case| {
+                    fixture.admitted.clearRetainingCapacity();
+                    var prepared = try provider.prepareRoutedDomainRead(a, "docs", "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = .{} } }, .read_index, .general, case.keys);
+                    defer prepared.deinit();
+                    try std.testing.expectEqual(case.expected, prepared.group_ids.len);
+                    try std.testing.expectEqualSlices(u64, prepared.group_ids, fixture.admitted.items);
+                    if (case.expected == 1) try std.testing.expectEqual(@as(u64, 32), prepared.group_ids[0]);
+                    if (case.expected == 2) try std.testing.expectEqualSlices(u64, &.{ 32, 64 }, prepared.group_ids);
+                }
+            }
+        }
         test "privacy source vtables retain static lifetime across capability selection" {
             const Fake = struct {
                 fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
