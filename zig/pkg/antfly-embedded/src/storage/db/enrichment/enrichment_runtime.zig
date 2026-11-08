@@ -13457,7 +13457,8 @@ pub fn runNativeDocumentPreparationIntegration(alloc: Allocator, io: Io, pdf_byt
         const job = for (pipeline.jobs) |value| {
             if (value) |j| if (std.mem.eql(u8, j.doc_key, key)) break j;
         } else return error.DocumentPreparationNotScheduled;
-        if (!job.computed or job.units.items.len != 1) return error.DocumentPreparationNotComputed;
+        if (!job.computed) return job.failure orelse error.DocumentPreparationNotComputed;
+        if (job.units.items.len != 1) return error.DocumentPreparationExpectedOnePage;
         const source = job.source.?.entry();
         var completed = [_]document_extraction_mod.Unit{try cloneDocumentExtractionUnit(alloc, job.original_first.?)};
         defer completed[0].deinit(alloc);
@@ -13524,6 +13525,7 @@ const DocumentPreparationPipeline = struct {
         raster: bool = false,
         capabilities: ?inference_work.InferenceCapabilities = null,
         computed: bool = false,
+        failure: ?anyerror = null,
         original_first: ?document_extraction_mod.Unit = null,
         consumed: bool = false,
         future: ?Io.Future(void) = null,
@@ -13542,7 +13544,8 @@ const DocumentPreparationPipeline = struct {
             return isCancelled(ptr orelse return true);
         }
         fn run(self: *@This()) void {
-            self.prepare() catch {
+            self.prepare() catch |err| {
+                self.failure = err;
                 pipeline_metrics.prefetch(.failed);
                 self.ready.store(true, .release);
                 return;
@@ -45858,6 +45861,11 @@ test "document preparation rejects canceled work before touching source or provi
     job.cancel = .init(true);
     job.budgeted = null;
     try std.testing.expectError(error.Canceled, job.prepare());
+    job.ready = .init(false);
+    job.failure = null;
+    job.run();
+    try std.testing.expect(job.ready.load(.acquire));
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), job.failure);
 }
 
 test "document preparation overlaps owner work and joins before releasing descriptions" {

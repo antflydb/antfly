@@ -400,7 +400,10 @@ pub fn main(init: std.process.Init) !void {
     );
     if (local.read_calls.load(.monotonic) != 4) return error.IntegrationGroundingReaderWasNotInvoked;
     local.revisioned = true;
-    try enrichment_runtime.runNativeDocumentPreparationIntegration(alloc, io_impl.io(), fixture.reader_two_lines_scanned_pdf, runtime.producer());
+    const bounded_runtime = try asset_producer_runtime.Runtime.createOwned(alloc, io_impl.io(), .{ .antfly_provider = local.provider() });
+    const bounded_producer = bounded_runtime.ownedProducer();
+    defer bounded_producer.deinit(alloc);
+    try enrichment_runtime.runNativeDocumentPreparationIntegration(alloc, io_impl.io(), fixture.reader_two_lines_scanned_pdf, bounded_producer);
     if (local.read_calls.load(.monotonic) != 8 or local.prefetch_entered.load(.acquire) != 4) return error.IntegrationPrefetchRepeatedInference;
 }
 
