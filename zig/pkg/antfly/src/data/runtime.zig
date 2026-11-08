@@ -2800,6 +2800,16 @@ pub const HealthSource = struct {
         try writeAsyncIndexingMetrics(writer, async_indexing_stats, replay_not_visible_skipped_by_index);
         try antfly.db.query_metrics.writePrometheus(writer);
         try antfly.db.enrichment_utf8_text.writePrometheus(writer);
+        const pipeline_metrics = @import("antfly_platform").document_pipeline_metrics;
+        var pipeline_snapshot = pipeline_metrics.snapshot();
+        if (comptime linked_storage) if (self.data_server.kernel_owner_source) |owner| {
+            var response = try owner.context.pipelineMetricsJson();
+            defer response.deinit();
+            const parsed = try std.json.parseFromSlice(pipeline_metrics.Snapshot, self.data_server.alloc, response.bytes(), .{});
+            defer parsed.deinit();
+            try pipeline_snapshot.merge(parsed.value);
+        };
+        try pipeline_snapshot.writePrometheus(writer);
     }
 
     fn writeHotStandbyMetrics(self: *HealthSource, writer: *std.Io.Writer) !void {
@@ -12702,7 +12712,7 @@ pub const DataServer = struct {
         if (req.resolver_review != null) return @import("../common/data_raft_protocol.zig").batch_resolver_review_protocol_version;
         if (req.group_source != null) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (antfly.db.types.requiresGraphRelationshipProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
-        if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.writes, req.predicates))
+        if (@import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(req.writes, req.predicates))
             return @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
         if (req.merge_proof_adoption != null) return data_raft_batch.merge_proof_adoption_protocol_version;
         if (req.artifact_publication_transport != null) return @import("../common/data_raft_protocol.zig").batch_artifact_publication_transport_protocol_version;
@@ -13839,7 +13849,7 @@ pub const DataServer = struct {
                                     self.api_server_cfg.internal_service_secret,
                                     self.api_server_cfg.internal_service_issuer,
                                 );
-                                const body = try antfly.public_api.batch.encodeBatchRequest(alloc, proposal_req);
+                                const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, proposal_req);
                                 defer alloc.free(body);
                                 const forwarding = self.nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse {
                                     try self.sleepDataRaftBatchLeaderRetry();
@@ -14062,7 +14072,7 @@ pub const DataServer = struct {
             self.api_server_cfg.internal_service_secret,
             self.api_server_cfg.internal_service_issuer,
         );
-        const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
+        const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
         const forwarding = self.nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse return false;
         const encoded_route_fence = if (route.write_route_fence) |fence|

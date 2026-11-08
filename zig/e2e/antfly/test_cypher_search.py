@@ -90,6 +90,7 @@ def test_cypher_semantic_and_hybrid_owner_cut_search(
 
 @pytest.mark.parametrize("num_shards", [1, 2])
 @pytest.mark.parametrize("predicate_label", [False, True])
+@pytest.mark.e2e_resource("antfly_process")
 def test_authenticated_cypher_protected_semantic_and_hybrid(
     openai_embedder, monkeypatch, num_shards, predicate_label
 ):
@@ -254,6 +255,7 @@ def test_authenticated_cypher_protected_semantic_and_hybrid(
         server.stop()
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_authenticated_cypher_hides_relationship_from_hidden_producer(monkeypatch):
     import os
     import time

@@ -2559,8 +2559,9 @@ fn applyCommonSearchRequestOptions(
     if (request.count) |count| req.count_only = count;
     if (request.remote_snapshot) |snapshot| {
         const retained_lake = (std.mem.startsWith(u8, snapshot, "lake2:") or std.mem.startsWith(u8, snapshot, "native2:")) and snapshot.len > 64 and (snapshot.len <= 512 or @import("../serverless/manifest/artifact_ref.zig").retainedGenerationToken(snapshot));
-        if (snapshot.len != 64 and !retained_lake) return error.InvalidQueryRequest;
-        if (retained_lake) for (snapshot) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidQueryRequest;
+        const owned_lake = std.mem.startsWith(u8, snapshot, "lake3:") and snapshot.len > 64 and snapshot.len <= 16 * 1024;
+        if (snapshot.len != 64 and !retained_lake and !owned_lake) return error.InvalidQueryRequest;
+        if (retained_lake or owned_lake) for (snapshot) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidQueryRequest;
         req.remote_snapshot = try alloc.dupe(u8, snapshot);
     }
     const has_result_page_options =

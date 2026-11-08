@@ -17,6 +17,23 @@ const std = @import("std");
 const Namespace = @import("doc_identity_namespace.zig").Namespace;
 pub const ttl_ms: u64 = 300_000;
 pub const max_ttl_ms: u64 = std.time.ms_per_hour;
+/// A frozen DB retains the creator's lock until all physical reads close.
+/// File and executor state remain in the issuing owner. Move this capability;
+/// copies do not acquire independent ownership.
+pub const ReadLease = extern struct {
+    version: u32 = 1,
+    context: ?*anyopaque = null,
+    release: ?*const fn (*anyopaque) callconv(.c) void = null,
+
+    pub fn deinit(self: *ReadLease) !void {
+        const context = self.context orelse return;
+        if (self.version != 1) return error.UnsupportedVersion;
+        const release = self.release orelse return error.InvalidArgument;
+        self.context = null;
+        self.release = null;
+        release(context);
+    }
+};
 /// Original committed key cover. Group IDs identify logical fanout slots;
 /// namespaces identify immutable physical generations, independently of owners.
 pub const Range = struct {

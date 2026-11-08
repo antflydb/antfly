@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const batch_api = @import("antfly_local_sources").api_batch;
+const batch_api = @import("antfly_local_sources").api_internal_batch;
 const distributed_txn = @import("distributed_txn.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;

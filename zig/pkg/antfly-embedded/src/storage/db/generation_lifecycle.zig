@@ -423,7 +423,8 @@ const Manager = struct {
             self.removeEmptyPathStateLocked(path_key);
         }
         try self.active.putNoClobber(self.allocator, id, .{ .path = owned_path, .path_key = path_key, .id = id, .kind = .read });
-        return .{ .manager = self, .path = owned_path, .path_key = path_key, .id = id };
+        errdefer std.debug.assert(self.active.remove(id));
+        return try @import("read_session_backend").issuePublicationReadLease(self.allocator, self, owned_path, id, null, null, Manager.finishRead);
     }
 
     /// Commits a cached read only after its caller holds the shared
@@ -465,7 +466,8 @@ const Manager = struct {
             self.removeEmptyPathStateLocked(path_key);
         }
         try self.active.putNoClobber(self.allocator, id, .{ .path = owned_path, .path_key = active_path_key, .id = id, .kind = .read });
-        return .{ .manager = self, .path = owned_path, .path_key = active_path_key, .id = id };
+        errdefer std.debug.assert(self.active.remove(id));
+        return try @import("read_session_backend").issuePublicationReadLease(self.allocator, self, owned_path, id, null, null, Manager.finishRead);
     }
 
     fn hasReaders(self: *Manager, path: []const u8) !bool {
@@ -647,14 +649,10 @@ const ReconciliationLease = struct {
         if (!self.active) return error.InvalidGenerationTransition;
         try self.manager.promoteReconciliationToRead(self.path, self.id, mark_reconciled);
         self.active = false;
-        return .{
-            .manager = self.manager,
-            .path = self.path,
-            .path_key = self.path_key,
-            .id = self.id,
-            .publication_lock = publication_lock,
-            .io = io,
-        };
+        // Promotion consumed reconciliation. Roll back the reader registration
+        // if capability allocation fails; the caller still owns the file lock.
+        errdefer self.manager.finishRead(self.path, self.id);
+        return try @import("read_session_backend").issuePublicationReadLease(self.manager.allocator, self.manager, self.path, self.id, publication_lock, io, Manager.finishRead);
     }
 
     pub fn deinit(self: *@This()) void {
@@ -664,29 +662,7 @@ const ReconciliationLease = struct {
     }
 };
 
-pub const ReadLease = struct {
-    manager: *Manager,
-    path: []const u8,
-    path_key: []const u8,
-    id: u64,
-    publication_lock: ?std.Io.File = null,
-    io: ?std.Io = null,
-    active: bool = true,
-
-    pub fn deinit(self: *@This()) void {
-        if (!self.active) return;
-        const publication_lock = self.publication_lock;
-        self.publication_lock = null;
-        // Retire local reader/cache state before releasing the interprocess
-        // lock so no local opener can trust stale reconciliation state across
-        // an external publication window.
-        self.manager.finishRead(self.path, self.id);
-        if (publication_lock) |file| {
-            if (self.io) |io| closePublicationLockWithIo(io, file) else closePublicationLock(file);
-        }
-        self.active = false;
-    }
-};
+pub const ReadLease = @import("read_session_backend").PublicationReadLease;
 
 pub const PreparationTransition = struct {
     manager: *Manager,
@@ -1831,14 +1807,20 @@ fn reconcilePublishedGenerationExclusive(
 }
 
 pub fn acquirePublishedGenerationRead(alloc: Allocator, path: []const u8) !?ReadLease {
+    if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("acquirePublicationReadLease", .{ alloc, path, @as(?std.Io, null) });
     return try acquirePublishedGenerationReadWithRuntime(alloc, path, null);
 }
 
 pub fn acquirePublishedGenerationReadWithRuntime(alloc: Allocator, path: []const u8, runtime: ?*background_runtime.BackendRuntime) !?ReadLease {
+    if (comptime @import("../engine_selection.zig").enabled) {
+        const io: ?std.Io = if (runtime) |active| active.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else null;
+        return @import("antfly_source_root").antfly_sources.storage_engine.call("acquirePublicationReadLease", .{ alloc, path, io });
+    }
     return try acquirePublishedGenerationReadWithRuntimeAndIo(alloc, path, runtime, null);
 }
 
 pub fn acquirePublishedGenerationReadWithIo(alloc: Allocator, path: []const u8, io: std.Io) !?ReadLease {
+    if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("acquirePublicationReadLease", .{ alloc, path, io });
     return try acquirePublishedGenerationReadWithRuntimeAndIo(alloc, path, null, io);
 }
 
@@ -1872,8 +1854,8 @@ fn acquirePublishedGenerationReadWithRuntimeAndIo(
         errdefer if (lock_owned) closePublicationLockWithIo(io, publication_lock);
         if (try process_manager.beginReadIfReconciledCanonical(path, path_key)) |read_value| {
             var read_lease = read_value;
-            read_lease.publication_lock = publication_lock;
-            read_lease.io = retained_io;
+            errdefer read_lease.deinit();
+            try @import("read_session_backend").installPublicationReadLeaseLock(read_lease, &process_manager, Manager.finishRead, publication_lock, retained_io);
             lock_owned = false;
             return read_lease;
         }
@@ -2037,10 +2019,12 @@ pub fn beginProcessPreparationWithRuntimeAndIo(
 }
 
 pub fn hasPublishedGenerationRead(path: []const u8) !bool {
+    if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("hasPublicationReadLease", .{ path, @as(?std.Io, null) });
     return try process_manager.hasReaders(path);
 }
 
 pub fn hasPublishedGenerationReadWithIo(path: []const u8, io: std.Io) !bool {
+    if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("hasPublicationReadLease", .{ path, io });
     return try process_manager.hasReadersWithIo(path, io);
 }
 
@@ -2189,9 +2173,12 @@ test "generation lifecycle retains shared readers until the final owner closes" 
     defer manager.deinit();
 
     var first = try manager.beginRead(path);
+    defer first.deinit();
     var second = try manager.beginRead(path_alias);
+    defer second.deinit();
     try std.testing.expectEqual(@as(usize, 1), manager.path_states.count());
-    const state = manager.path_states.get(first.path_key) orelse return error.TestUnexpectedResult;
+    var states = manager.path_states.valueIterator();
+    const state = (states.next() orelse return error.TestUnexpectedResult).*;
     try std.testing.expectEqual(@as(usize, 2), state.readers);
     try std.testing.expectError(error.GenerationTransitionActive, manager.beginExclusive(path));
 
@@ -2202,6 +2189,91 @@ test "generation lifecycle retains shared readers until the final owner closes" 
 
     var transition = try manager.beginExclusive(path);
     transition.deinit();
+}
+
+test "publication lease lock installation validates owner before transferring files" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/install-read", .{tmp.sub_path});
+    defer a.free(path);
+    var manager = Manager.init(a);
+    defer manager.deinit();
+    var other = Manager.init(a);
+    defer other.deinit();
+    var lease = try manager.beginRead(path);
+    defer lease.deinit();
+    const file = try tmp.dir.createFile(std.testing.io, "publication-lock", .{});
+    var caller_owns_file = true;
+    defer if (caller_owns_file) file.close(std.testing.io);
+    const backend = @import("read_session_backend");
+    var invalid = lease;
+    invalid.version = 0;
+    invalid.context = @ptrFromInt(1);
+    try std.testing.expectError(error.UnsupportedVersion, backend.installPublicationReadLeaseLock(invalid, &manager, Manager.finishRead, file, std.testing.io));
+    invalid = lease;
+    invalid.close_fn = @ptrFromInt(0x1000);
+    try std.testing.expectError(error.UnsupportedVersion, backend.installPublicationReadLeaseLock(invalid, &manager, Manager.finishRead, file, std.testing.io));
+    invalid = lease;
+    invalid.context = @ptrFromInt(1);
+    try std.testing.expectError(error.InvalidGenerationTransition, backend.installPublicationReadLeaseLock(invalid, &manager, Manager.finishRead, file, std.testing.io));
+    try std.testing.expectError(error.InvalidGenerationTransition, backend.installPublicationReadLeaseLock(lease, &other, Manager.finishRead, file, std.testing.io));
+    try backend.installPublicationReadLeaseLock(lease, &manager, Manager.finishRead, file, std.testing.io);
+    caller_owns_file = false;
+    const second = try tmp.dir.createFile(std.testing.io, "second-lock", .{});
+    defer second.close(std.testing.io);
+    try std.testing.expectError(error.InvalidGenerationTransition, backend.installPublicationReadLeaseLock(lease, &manager, Manager.finishRead, second, std.testing.io));
+    lease.deinit();
+    try std.testing.expectEqual(@as(usize, 0), manager.active.count());
+}
+
+test "generation publication lease allocation failure unwinds read registration" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/owned-read", .{tmp.sub_path});
+    defer a.free(path);
+    const Probe = struct {
+        fn run(allocator: Allocator, target: []const u8) !void {
+            var manager = Manager.init(allocator);
+            defer manager.deinit();
+            var read = try manager.beginRead(target);
+            defer read.deinit();
+            try std.testing.expectEqual(@as(usize, 1), manager.active.count());
+            read.deinit();
+            read.deinit();
+            try std.testing.expectEqual(@as(usize, 0), manager.active.count());
+            try std.testing.expectEqual(@as(usize, 0), manager.path_states.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{path});
+}
+
+test "generation publication lease promotion allocation failure releases registration" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/owned-promoted-read", .{tmp.sub_path});
+    defer a.free(path);
+    const Probe = struct {
+        fn run(allocator: Allocator, target: []const u8, dir: std.Io.Dir) !void {
+            var manager = Manager.init(allocator);
+            defer manager.deinit();
+            var reconciliation = (try manager.beginReconciliation(target)).?;
+            defer reconciliation.deinit();
+            const file = try dir.createFile(std.testing.io, "publication-lock", .{});
+            var transferred = false;
+            defer if (!transferred) file.close(std.testing.io);
+            var read = try reconciliation.promoteToRead(file, std.testing.io, false);
+            transferred = true;
+            defer read.deinit();
+            try std.testing.expect(!reconciliation.active);
+            read.deinit();
+            try std.testing.expectEqual(@as(usize, 0), manager.active.count());
+            try std.testing.expectEqual(@as(usize, 0), manager.path_states.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{ path, tmp.dir });
 }
 
 test "serving reconciliation serializes with exclusive generation transition" {

@@ -87,10 +87,37 @@ jobs:
       base_sha: ${{ needs.approve.outputs.base_sha }}
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
+  operation-owners:
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      id-token: write
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'zig') || contains(fromJSON(needs.approve.outputs.suites), 'full')
+    uses: ./.github/workflows/zig-owner-qualification.yml
+    with:
+      full_validation: ${{ contains(fromJSON(needs.approve.outputs.suites), 'full') }}
+      cache_matrices: ${{ contains(fromJSON(needs.approve.outputs.suites), 'full') }}
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
   sdks:
     needs: approve
     if: contains(fromJSON(needs.approve.outputs.suites), 'sdks')
     uses: ./.github/workflows/sdks-ci.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+  dictation:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'dictation')
+    uses: ./.github/workflows/dictation-example.yml
     with:
       pr_number: ${{ inputs.pr_number }}
       head_sha: ${{ needs.approve.outputs.head_sha }}
@@ -170,7 +197,7 @@ jobs:
       comment_id: ${{ inputs.comment_id }}
   result:
     name: PR CI result
-    needs: [approve, policy, zig, sdks, scale, gpu, vopr, darwin, linux-release, apple-video]
+    needs: [approve, policy, zig, operation-owners, sdks, dictation, scale, gpu, vopr, darwin, linux-release, apple-video]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -185,6 +212,7 @@ jobs:
             for (const suite of JSON.parse(needs.approve.outputs.suites)) {
               const job = {full: 'zig', soak: 'vopr'}[suite] || suite;
               if (needs[job]?.result !== 'success') throw new Error(`${suite} did not pass`);
+              if (['zig', 'full'].includes(suite) && needs['operation-owners']?.result !== 'success') throw new Error('Operation owner qualification did not pass');
             }
 
   publish:

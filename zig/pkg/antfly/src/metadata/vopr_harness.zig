@@ -6910,6 +6910,7 @@ pub const MetadataAdminVoprSource = struct {
             // newly added Call remains visible to exhaustive compilation.
             .resolver_authority_mutate,
             .native_memory_create,
+            .lake_source_owner_read,
             .lake_index_lifecycle_read,
             .lake_index_lifecycle_work,
             .lake_index_lifecycle_mutate,

@@ -191,7 +191,12 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
-    const wasm_storage_boundary = @import("storage_boundary.zig").create(b, wasm_target, optimize);
+    const wasm_runtime_abi_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_storage_boundary = @import("storage_boundary.zig").createWithOptions(b, wasm_target, optimize, .{ .runtime_abi = wasm_runtime_abi_mod });
     @call(.auto, configureBrowserModule, .{ b, wasm_storage_boundary, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
     embedded_support_wasm_mod.addImport("sql_parser", wasm_sql_parser_mod);
     const wasm_cypher_mod = @import("../../lib/cypher/build_support.zig").createModule(b, b.path("lib/cypher"), wasm_target, optimize);
@@ -213,11 +218,6 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     });
     wasm_cache_budget_mod.addImport("antfly_platform", wasm_platform_mod);
     embedded_support_wasm_mod.addImport("antfly_cache_budget", wasm_cache_budget_mod);
-    const wasm_runtime_abi_mod = b.createModule(.{
-        .root_source_file = b.path("lib/runtime/src/root.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
     wasm_cancellation_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     wasm_runtime_abi_mod.addImport("httpx", httpx_mod);
     wasm_runtime_abi_mod.addImport("antfly_platform", wasm_platform_mod);
@@ -516,6 +516,10 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const wasm_cloudflare_mod = b.createModule(.{ .root_source_file = b.path("lib/cloudflare/root.zig"), .target = wasm_target, .optimize = optimize });
     wasm_cloudflare_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     wasm_decisions_mod.addImport("antfly_cloudflare", wasm_cloudflare_mod);
+    // Browser enrichment needs provider capabilities, not native transport,
+    // credentials or audio acquisition implementations.
+    const wasm_transcribing_types_mod = b.createModule(.{ .root_source_file = b.path("lib/transcribing/src/types.zig"), .target = wasm_target, .optimize = optimize });
+    embedded_support_wasm_mod.addImport("antfly_transcribing", wasm_transcribing_types_mod);
     const wasm_extracting_mod = b.createModule(.{ .root_source_file = b.path("lib/extracting/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     wasm_extracting_mod.addImport("antfly_cloudflare", wasm_cloudflare_mod);
     wasm_extracting_mod.addImport("antfly_image", wasm_image_mod);

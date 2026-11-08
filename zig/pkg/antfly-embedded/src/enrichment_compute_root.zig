@@ -20,7 +20,13 @@ pub const antfly_sources = struct {
 };
 const provider = @import("storage/enrichment_compute_provider.zig");
 comptime {
+    provider.exportPdfNativeOperations();
     @export(&provider.extractStream, .{ .name = "antfly_enrichment_extract_stream", .visibility = .hidden });
     @export(&provider.renderPdfPagePng, .{ .name = "antfly_enrichment_render_pdf_page_png", .visibility = .hidden });
+    @export(&provider.pdfSessionOpen, .{ .name = "antfly_enrichment_pdf_session_open", .visibility = .hidden });
+    @export(&provider.pdfSessionRenderPng, .{ .name = "antfly_enrichment_pdf_session_render_png", .visibility = .hidden });
+    @export(&provider.pdfSessionClose, .{ .name = "antfly_enrichment_pdf_session_close", .visibility = .hidden });
+    @export(&provider.pdfBackend, .{ .name = "antfly_enrichment_pdf_backend", .visibility = .hidden });
     @export(&provider.bufferDestroy, .{ .name = "antfly_enrichment_buffer_destroy", .visibility = .hidden });
+    @export(&provider.pipelineMetricsJson, .{ .name = "antfly_enrichment_pipeline_metrics_json", .visibility = .hidden });
 }

@@ -3084,79 +3084,8 @@ const LookupProjectionPlans = struct {
     }
 };
 
-const DocumentPrimaryReadWindow = struct {
-    const max_bytes: usize = 8 * 1024 * 1024;
-    arena: std.heap.ArenaAllocator,
-    scope: ?@import("../backend_erased.zig").ReadScope = null,
-    bytes: usize = 0,
-    retirements: usize = 0,
-    fn init(alloc: Allocator) @This() {
-        return .{ .arena = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)) };
-    }
-    fn retire(self: *@This()) void {
-        if (self.scope) |*scope| {
-            scope.close();
-            self.scope = null;
-            self.retirements += 1;
-        }
-        _ = self.arena.reset(.free_all);
-        self.bytes = 0;
-    }
-    fn deinit(self: *@This()) void {
-        self.retire();
-        self.arena.deinit();
-    }
-    fn get(self: *@This(), txn: *docstore_mod.DocStore.Txn, physical: []const u8, expected: ?u64) ![]const u8 {
-        if (self.bytes > 0 and (expected == null or expected.? > max_bytes -| self.bytes)) self.retire();
-        if (self.scope == null) self.scope = try txn.openReadScope(self.arena.allocator());
-        const raw = try self.scope.?.get(physical);
-        self.bytes +|= raw.len;
-        return raw;
-    }
-    fn getMany(self: *@This(), txn: *docstore_mod.DocStore.Txn, physical: []const []const u8, output: []?[]const u8) !void {
-        if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
-        self.retire();
-        self.scope = try txn.openReadScope(self.arena.allocator());
-        self.bytes = try readMany(&self.scope.?, physical, output);
-    }
-    fn readMany(scope: *@import("../backend_erased.zig").ReadScope, physical: []const []const u8, output: []?[]const u8) !usize {
-        if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
-        const Entry = struct {
-            key: []const u8,
-            row: usize,
-            value_index: usize = 0,
-            fn less(_: void, left: @This(), right: @This()) bool {
-                return std.mem.order(u8, left.key, right.key) == .lt;
-            }
-        };
-        var entries: [64]Entry = undefined;
-        for (physical, 0..) |key, i| entries[i] = .{ .key = key, .row = i };
-        std.mem.sort(Entry, entries[0..physical.len], {}, Entry.less);
-        var keys: [64][]const u8 = undefined;
-        var values: [64]?[]const u8 = undefined;
-        var count: usize = 0;
-        for (entries[0..physical.len]) |*entry| {
-            if (count == 0 or !std.mem.eql(u8, keys[count - 1], entry.key)) {
-                keys[count] = entry.key;
-                count += 1;
-            }
-            entry.value_index = count - 1;
-        }
-        try scope.getManySorted(keys[0..count], values[0..count]);
-        for (entries[0..physical.len]) |entry| output[entry.row] = values[entry.value_index];
-        // Duplicate keys borrow the same retained value. Account actual scope
-        // payload once, independently of caller order or repeated rows.
-        var bytes: usize = 0;
-        for (values[0..count]) |value| if (value) |raw| {
-            bytes +|= raw.len;
-        };
-        return bytes;
-    }
+const DocumentPrimaryReadWindow = @import("read_session_backend").DocumentPrimaryReadWindow;
 
-    fn finishRow(self: *@This(), uncached: bool) void {
-        if (uncached or self.bytes >= max_bytes) self.retire();
-    }
-};
 const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 };
 
 var next_query_schema_identity: std.atomic.Value(u64) = .init(1);
@@ -3178,7 +3107,7 @@ pub const DB = struct {
     resolver_query_schema_digest: [32]u8 = undefined,
     /// Installed only after immutable query-cut admission. Never persisted.
     retained_value_scope: ?@import("../../search/value_membership.zig").Scope = null,
-    retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
+    retained_query_lease: ?@import("native_query_cut_contract.zig").ReadLease = null,
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
     native_query_warming: @import("native_query_warming.zig").Owner = .{},
     /// Shared local mutation state outlives foreground and recovery execution.
@@ -3641,34 +3570,24 @@ pub const DB = struct {
         try self.core.store.runtime_store.sync(true);
     }
 
-    pub const RelationalRows = @import("relational_rows.zig");
+    pub const RelationalRows = @import("read_session_backend").RelationalRows;
 
     /// One owner-local immutable visibility cut for delayed SQL scans. The
     /// caller must obtain it under a statement capture fence after read-index
     /// admission. It deliberately cannot be serialized across owners.
-    pub const RelationalStatementSnapshot = struct {
-        /// Optional immutable index authority captured with the primary cut.
-        /// Legacy delayed SQL readers deliberately retain only the primary path.
-        index_catalog_captured: bool = false,
-        indexes: ?relational_index_catalog.WriteSnapshot = null,
-        row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null,
-        row_policy_phase: table_catalog_mod.RowPolicyPhase = .disabled,
-        row_policy_generation: u64 = 0,
-        row_policy_catalog_epoch: u64 = 0,
-        read: docstore_mod.DocStore.Txn,
-        schema_version: u32,
+    pub const RelationalStatementSnapshot = @import("read_session_backend").Statement;
 
-        pub fn deinit(self: *@This()) void {
-            if (comptime storage_engine.enabled) return storage_engine.call("relationalSnapshotDeinit", .{self}) catch @panic("incompatible storage owner");
-            if (self.indexes) |*indexes| indexes.deinit();
-            self.read.abort();
-            if (self.row_policy_lease) |*lease| lease.release();
-            self.* = undefined;
-        }
-    };
+    /// Capture through the admitted owner capability. This keeps fence leases
+    /// and the snapshot transaction in the same compilation owner.
+    pub fn captureRelationalStatementSnapshotAtFence(self: *DB, fence: *const StatementReadFence) !RelationalStatementSnapshot {
+        if (fence.owner != @as(*const anyopaque, self)) return error.InvalidArgument;
+        if (comptime storage_engine.enabled) return fence.captureStatement();
+        if (!fence.primary.active or !fence.replay.active) return error.InvalidArgument;
+        return self.captureRelationalStatementSnapshot();
+    }
 
     pub fn captureRelationalStatementSnapshot(self: *DB) !RelationalStatementSnapshot {
-        if (comptime storage_engine.enabled) return storage_engine.call("captureRelationalStatementSnapshot", .{self});
+        if (comptime storage_engine.enabled) return RelationalStatementSnapshot.fromIssued(try storage_engine.call("captureRelationalStatementSnapshot", .{self}));
         // Capturing a visibility cut does not expose row bytes. A protected
         // statement captures only the owner policy epoch; each later scan
         // must present an authenticated proof for that same epoch and retain
@@ -3707,7 +3626,7 @@ pub const DB = struct {
     }
 
     pub fn beginRelationalRows(self: *DB, alloc: Allocator, request: RelationalRows.Request) !RelationalRows.Reader {
-        if (comptime storage_engine.enabled) return storage_engine.call("beginRelationalRows", .{ self, alloc, request });
+        if (comptime storage_engine.enabled) return RelationalRows.Reader.fromHandle(try storage_engine.call("beginRelationalRows", .{ self, alloc, request }));
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         errdefer row_policy_lease.release();
         var reader = try self.beginRelationalRowsAtSnapshot(alloc, request, null);
@@ -6316,7 +6235,7 @@ pub const DB = struct {
         // state has closed.
         if (self.generation_read_lease) |*lease| lease.deinit();
         self.generation_read_lease = null;
-        if (self.retained_query_lease) |*lease| lease.deinit();
+        if (self.retained_query_lease) |*lease| lease.deinit() catch unreachable;
         self.retained_query_lease = null;
         if (self.retained_remote_query_lease) |*lease| lease.deinit();
         self.retained_remote_query_lease = null;
@@ -10089,12 +10008,6 @@ pub const DB = struct {
     pub const appendGraphTransformWrite = local_mutation.appendGraphTransformWrite;
 
     pub const appendGraphTransformDelete = local_mutation.appendGraphTransformDelete;
-
-    pub const resetCoalescedEntryToDelete = local_mutation.resetCoalescedEntryToDelete;
-
-    pub const setCoalescedEntryToBorrowedWrite = local_mutation.setCoalescedEntryToBorrowedWrite;
-
-    pub const setCoalescedEntryToOwnedWrite = local_mutation.setCoalescedEntryToOwnedWrite;
 
     pub const coalesceKeyValueRequest = local_mutation.coalesceKeyValueRequest;
 
@@ -21202,15 +21115,15 @@ pub const DB = struct {
         };
         return cut.admitWithDurability(self.alloc, io, self.core.path, id, if (repository) |value| value.limits else .{}, cancellation, if (repository) |*value| .{ .ptr = value, .confirm = Confirm.durable } else null);
     }
-    pub fn captureQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !void {
+    pub fn captureQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("captureQueryCut", .{ self, request, cancellation });
         return self.captureQueryCutInternal(request, cancellation, true);
     }
     /// Capture a graph/search generation under an already-held distributed
     /// statement cohort. Borrowing the supplied fences avoids reacquiring an
     /// exclusive admission lock or waiting for replay while replay is frozen.
-    pub fn captureQueryCutAtStatementFence(self: *DB, request: @import("native_query_cut.zig").Request, fence: *const StatementReadFence, cancellation: types.CancellationToken) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("captureQueryCutAtStatementFence", .{ self, request, fence, cancellation });
+    pub fn captureQueryCutAtStatementFence(self: *DB, request: @import("native_query_cut_contract.zig").Request, fence: *const StatementReadFence, cancellation: types.CancellationToken) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("captureQueryCutAtStatementFence", .{ self, request, (fence.handle orelse return error.InvalidArgument), cancellation });
         const cut = @import("native_query_cut.zig");
         try request.validate(cut.nowMs());
         if (!request.create or request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
@@ -21226,13 +21139,13 @@ pub const DB = struct {
 
     /// Statement cuts are local, unpublished generations with no continuation
     /// cursor. Reclaim them only after the statement's final reader closes.
-    pub fn releaseStatementQueryCut(self: *DB, request: @import("native_query_cut.zig").Request) void {
+    pub fn releaseStatementQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request) void {
         if (comptime storage_engine.enabled) return storage_engine.call("releaseStatementQueryCut", .{ self, request }) catch @panic("incompatible storage owner");
         self.discardStatementQueryCut(request) catch |err| {
             std.log.warn("Cypher statement cut cleanup failed: {s}", .{@errorName(err)});
         };
     }
-    fn discardStatementQueryCut(self: *DB, request: @import("native_query_cut.zig").Request) !void {
+    fn discardStatementQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request) !void {
         const cut = @import("native_query_cut.zig");
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         const control: cut.Control = .{ .parent = .none, .deadline_ns = monotonicTimeNs() +| 5 * std.time.ns_per_s };
@@ -21299,7 +21212,7 @@ pub const DB = struct {
     }
     /// Query-pin guard is held. Validate unchanged state at a short read point,
     /// release mutation fences before repository I/O, then rebind exact extents.
-    fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !bool {
+    fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !bool {
         const repository = self.backend_runtime.query_cut_repository orelse return false;
         const basis = self.local_execution.native_query_reuse orelse return false;
         if (!basis.matchesIndexes(request.indexes)) return false;
@@ -21316,7 +21229,7 @@ pub const DB = struct {
         self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
         return true;
     }
-    fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
+    fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
         try request.validate(@import("native_query_cut.zig").nowMs());
         _ = try request.namespace(self.core.identity_namespace);
         if (!request.create or request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
@@ -21473,7 +21386,7 @@ pub const DB = struct {
         }
     }
 
-    pub fn openQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !DB {
+    pub fn openQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !DB {
         if (comptime storage_engine.enabled) return storage_engine.call("openQueryCut", .{ self, request, cancellation });
         const cut = @import("native_query_cut.zig");
         try request.validate(cut.nowMs());
@@ -21535,11 +21448,11 @@ pub const DB = struct {
             try self.admitQueryCut(io, cache_id, control.token());
             source_proof = try cut.validateWithSourceProof(self.alloc, io, path, request, origin, control.token());
         } else return error.CatalogGenerationChanged;
-        var reader = try cut.readLease(self.alloc, io, self.core.path, cache_id, control.token());
+        var reader = try cut.readLeaseOwned(self.alloc, io, self.core.path, cache_id, control.token());
         guard.deinit();
         guarded = false;
         var transferred = false;
-        defer if (!transferred) reader.deinit();
+        defer if (!transferred) reader.deinit() catch unreachable;
         var readonly = try DB.open(self.alloc, path, .{
             .open_mode = .query_readonly,
             .query_indexes = request.indexes,
@@ -21633,7 +21546,7 @@ pub const DB = struct {
         maintenance_deadline_ns: ?u64,
         expected_topology_fence: ?@import("relational_integrity_topology.zig").Fence,
         backup_seal_only: bool,
-        query_cut: ?@import("native_query_cut.zig").Request,
+        query_cut: ?@import("native_query_cut_contract.zig").Request,
     ) !u64 {
         if (comptime storage_engine.enabled) return storage_engine.call("snapshotInternal", .{ self, id, requested_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut });
         return self.snapshotInternalWithStatementFence(id, requested_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut, null);
@@ -21647,7 +21560,7 @@ pub const DB = struct {
         maintenance_deadline_ns: ?u64,
         expected_topology_fence: ?@import("relational_integrity_topology.zig").Fence,
         backup_seal_only: bool,
-        query_cut: ?@import("native_query_cut.zig").Request,
+        query_cut: ?@import("native_query_cut_contract.zig").Request,
         statement_fence: ?*const StatementReadFence,
     ) !u64 {
         if (statement_fence) |fence| {
@@ -22966,6 +22879,40 @@ pub const DB = struct {
         staged_opts.staged_generation = staged_generation;
         try restoreSnapshotStoreTo(alloc, snapshot_root, path, staged_opts, null, null, .none, null, .{ .identity_preserving = expected_namespace });
         try finishSnapshotRuntimeRepair(alloc, path, staged_opts);
+    }
+
+    /// Materialize, validate and close a disposable source decoder as one owner
+    /// operation. The caller retains staging authority and publishes only after
+    /// this returns; file handles, DB/store state and IO adapters never escape.
+    pub fn materializeRestoreSourceDecoder(staged_generation: *const generation_lifecycle.StagedGeneration, alloc: Allocator, io: std.Io, path: []const u8, opts: OpenOptions, plan: @import("../restore_decoder_contract.zig").Plan) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("materializeRestoreSourceDecoder", .{ staged_generation, alloc, io, path, opts, plan });
+        try plan.cancellation.check();
+        try staged_generation.validatePath(path);
+        if (plan.expected_namespace.table_id == 0 or opts.prefer_existing_identity_namespace or
+            !(opts.identity_namespace orelse return error.IdentityNamespaceMismatch).eql(plan.expected_namespace)) return error.IdentityNamespaceMismatch;
+        var decoder_opts = opts;
+        decoder_opts.identity_namespace = plan.expected_namespace;
+        decoder_opts.staged_generation = staged_generation;
+        decoder_opts.start_index_workers = false;
+        decoder_opts.start_optional_runtimes = false;
+        switch (plan.format) {
+            .native => {
+                var decoder = try openVerifiedRestoreSourceWithCancellation(staged_generation, alloc, plan.source_path, path, decoder_opts, plan.expected_namespace, plan.cancellation);
+                defer decoder.close();
+            },
+            .portable => {
+                var decoder = try DB.open(alloc, path, decoder_opts);
+                defer decoder.close();
+                const file = try std.Io.Dir.cwd().openFile(io, plan.source_path, .{});
+                defer file.close(io);
+                const stat = try file.stat(io);
+                if (plan.cohort_seal) |seal| {
+                    try decoder.importCohortPortableFileIntoUnpublishedEmpty(alloc, io, file, stat.size, .{ .seal = seal, .namespace = plan.expected_namespace }, plan.cancellation);
+                } else try decoder.importPortableFileIntoUnpublishedEmpty(alloc, io, file, stat.size, plan.expected_namespace);
+                try @import("../portable_decoder.zig").bindRange(alloc, decoder.core.store, plan.owner_range);
+            },
+        }
+        try plan.cancellation.check();
     }
 
     /// Materialize an authenticated native backup into a disposable source
@@ -28955,12 +28902,12 @@ pub const DB = struct {
         return self.graphEdgesForCypherPageInternal(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database, null);
     }
     pub fn graphEdgesForCypherCapturePageAuthorizedAt(self: *DB, fence: *const StatementReadFence, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8) !graph_mod.CypherEdgePage {
-        if (comptime storage_engine.enabled) return storage_engine.call("graphEdgesForCypherCapturePageAuthorizedAt", .{ self, fence, alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database });
-        if (fence.source != self) return error.CypherSnapshotRequired;
+        if (comptime storage_engine.enabled) return storage_engine.call("graphEdgesForCypherCapturePageAuthorizedAt", .{ self, (fence.handle orelse return error.InvalidArgument), alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database });
+        if (fence.owner != @as(*const anyopaque, self)) return error.CypherSnapshotRequired;
         return self.graphEdgesForCypherPageInternal(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database, fence);
     }
     fn graphEdgesForCypherPageInternal(self: *DB, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8, capture_fence: ?*const StatementReadFence) !graph_mod.CypherEdgePage {
-        if (ttl_now_ns == 0 or (!self.hasRetainedQueryCut() and (capture_fence == null or capture_fence.?.source != self))) return error.CypherSnapshotRequired;
+        if (ttl_now_ns == 0 or (!self.hasRetainedQueryCut() and (capture_fence == null or capture_fence.?.owner != @as(*const anyopaque, self)))) return error.CypherSnapshotRequired;
         var verified: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified) |*value| value.deinit();
         const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
@@ -28985,13 +28932,13 @@ pub const DB = struct {
     pub const CypherEdgeScanCursor = graph_mod.CypherEdgeScanCursor;
     pub const CypherEdgePage = graph_mod.CypherEdgePage;
     pub fn captureCypherPinnedSnapshot(self: *DB, alloc: Allocator, fence: *const StatementReadFence, graph: @import("cypher").catalog.Graph, table: []const u8) !CypherPinnedSnapshot {
-        if (comptime storage_engine.enabled) return storage_engine.call("captureCypherPinnedSnapshot", .{ self, alloc, fence, graph, table });
+        if (comptime storage_engine.enabled) return storage_engine.call("captureCypherPinnedSnapshot", .{ self, alloc, (fence.handle orelse return error.InvalidArgument), graph, table });
         return @import("cypher_pinned_read.zig").capture(self, alloc, fence, graph, table);
     }
     /// Retain local immutable roots for a non-resumable graph statement.
     pub fn captureCypherSelectedSnapshot(self: *DB, alloc: Allocator, fence: *const StatementReadFence, names: []const []const u8, now: u64, cancellation: types.CancellationToken) !CypherPinnedSnapshot {
-        if (comptime storage_engine.enabled) return storage_engine.call("captureCypherSelectedSnapshot", .{ self, alloc, fence, names, now, cancellation });
-        if (fence.source != self or !fence.primary.active or !fence.replay.active or fence.primary.admission != self.core.snapshot_admission or fence.replay.admission != self.core.snapshot_replay_admission) return error.CypherSnapshotRequired;
+        if (comptime storage_engine.enabled) return storage_engine.call("captureCypherSelectedSnapshot", .{ self, alloc, (fence.handle orelse return error.InvalidArgument), names, now, cancellation });
+        if (fence.owner != @as(*const anyopaque, self) or !fence.primary.active or !fence.replay.active or fence.primary.admission != self.core.snapshot_admission or fence.replay.admission != self.core.snapshot_replay_admission) return error.CypherSnapshotRequired;
         try cancellation.check();
         try self.enforcePortableRuntimeGate();
         if (names.len != 0) if (self.enrichment_runtime) |runtime| try runtime.requireHealthyForQueryCapture();
@@ -29009,6 +28956,27 @@ pub const DB = struct {
         errdefer cut.deinit();
         try cancellation.check();
         return cut;
+    }
+    pub fn openCypherPinnedDocumentSession(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
+        if (comptime storage_engine.enabled) return DocumentReadSession.fromHandle(alloc, try storage_engine.call("openCypherPinnedDocumentSession", .{ self, alloc, cut, from, to, opts }));
+        var schema = self.core.acquireSchemaView();
+        defer if (schema) |*view| view.release();
+        if ((if (schema) |view| view.version() else 0) != cut.schema_version) return error.SchemaVersionChanged;
+        return DocumentReadSession.openSnapshot(alloc, self.core.store, try cut.primary.forkRead(), schema, cut.byte_range, from, to, opts, cut.now);
+    }
+    pub fn openCypherPinnedRelationalSession(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) !*RelationalReadSession {
+        if (comptime storage_engine.enabled) return RelationalReadSession.fromHandle(alloc, try storage_engine.call("openCypherPinnedRelationalSession", .{ self, alloc, cut, from, to, opts }));
+        var statement: RelationalStatementSnapshot = snapshot: {
+            var read = try cut.primary.forkRead();
+            errdefer read.abort();
+            const lease = try self.acquireCypherReadAuthority(alloc, opts.row_policy_principal_proof, opts.row_policy_database);
+            break :snapshot .{ .index_catalog_captured = true, .indexes = if (cut.indexes) |indexes| .{ .head = indexes.head, .plan = indexes.plan.clone() } else null, .read = read, .schema_version = cut.schema_version, .row_policy_lease = lease, .row_policy_phase = cut.row_policy_phase, .row_policy_generation = cut.row_policy_generation, .row_policy_catalog_epoch = cut.row_policy_catalog_epoch };
+        };
+        defer statement.deinit();
+        const session = try self.openRelationalReadSessionAtSnapshot(alloc, from, to, opts, &statement);
+        errdefer session.deinit();
+        try session.setReadTime(cut.now);
+        return session;
     }
     pub fn getCypherPinnedDocument(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         if (comptime storage_engine.enabled) return storage_engine.call("getCypherPinnedDocument", .{ self, alloc, cut, key, opts });
@@ -29048,7 +29016,7 @@ pub const DB = struct {
         page_opts.limit = @min(opts.limit, 4096);
         const session = try self.openRelationalReadSession(alloc, from, to, page_opts);
         defer session.deinit();
-        try @import("relational_rows.zig").visitCypherRows(&session.reader, alloc, self.backend_runtime.io(), opts.limit, visitor);
+        try @import("read_session_backend").RelationalRows.visitCypherRows(&session.reader, alloc, self.backend_runtime.io(), opts.limit, visitor);
         try session.checkpoint();
     }
     pub fn scanCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) !types.ScanResult {
@@ -42162,18 +42130,7 @@ pub const DB = struct {
         return try collector.finish();
     }
 
-    pub const StatementReadFence = struct {
-        source: ?*DB,
-        primary: snapshot_admission_mod.SnapshotAdmission.CaptureLease,
-        replay: snapshot_admission_mod.SnapshotAdmission.CaptureLease,
-
-        pub fn release(fence: *StatementReadFence) void {
-            if (comptime storage_engine.enabled) return storage_engine.call("statementFenceRelease", .{fence}) catch @panic("incompatible storage owner");
-            fence.source = null;
-            fence.replay.release();
-            fence.primary.release();
-        }
-    };
+    pub const StatementReadFence = @import("read_session_backend").StatementReadFence;
 
     /// A short capture fence, not a transaction-long writer lock. The caller
     /// captures every participating owner, pins their read views, then releases
@@ -42181,7 +42138,10 @@ pub const DB = struct {
     /// ALL earlier fences before retrying: a prepared transaction may need one
     /// of those owners to finish resolution. Never drain it under this fence.
     pub fn tryStatementReadFence(self: *DB) !?StatementReadFence {
-        if (comptime storage_engine.enabled) return storage_engine.call("tryStatementReadFence", .{self});
+        if (comptime storage_engine.enabled) {
+            const handle = try storage_engine.call("tryStatementReadFence", .{self});
+            return if (handle) |issued| try StatementReadFence.fromHandle(issued, self) else null;
+        }
         return self.tryPrimaryReadFence(false);
     }
 
@@ -42189,7 +42149,10 @@ pub const DB = struct {
     /// the committed primary state. It need not wait for an open transaction
     /// to finish, while still excluding primary and replay mutation races.
     pub fn tryEmbeddedBackupReadFence(self: *DB) !?StatementReadFence {
-        if (comptime storage_engine.enabled) return storage_engine.call("tryEmbeddedBackupReadFence", .{self});
+        if (comptime storage_engine.enabled) {
+            const handle = try storage_engine.call("tryEmbeddedBackupReadFence", .{self});
+            return if (handle) |issued| try StatementReadFence.fromHandle(issued, self) else null;
+        }
         return self.tryPrimaryReadFence(true);
     }
 
@@ -42211,18 +42174,18 @@ pub const DB = struct {
             primary.release();
             return null;
         }
-        return .{ .source = self, .primary = primary, .replay = replay };
+        return .{ .owner = self, .primary = primary, .replay = replay };
     }
 
     /// Owns a retained schema/store snapshot and its authorization predicate.
     /// The DB owner and request cancellation source must outlive this session;
     /// no query, projection, bound or filter bytes are borrowed from the caller.
-    pub const RelationalReadSession = @import("relational_read_session.zig").Session;
+    pub const RelationalReadSession = @import("read_session_backend").Relational;
 
-    pub const DocumentReadSession = @import("document_rows.zig").Session;
+    pub const DocumentReadSession = @import("read_session_backend").Document;
 
     pub fn openDocumentReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
-        if (comptime storage_engine.enabled) return storage_engine.call("openDocumentReadSession", .{ self, alloc, from_key, to_key, opts });
+        if (comptime storage_engine.enabled) return DocumentReadSession.fromHandle(alloc, try storage_engine.call("openDocumentReadSession", .{ self, alloc, from_key, to_key, opts }));
         try self.maybeFinalizePendingRowPolicyPublication();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         errdefer row_policy_lease.release();
@@ -42250,12 +42213,15 @@ pub const DB = struct {
     }
 
     pub fn openRelationalReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*RelationalReadSession {
-        if (comptime storage_engine.enabled) return storage_engine.call("openRelationalReadSession", .{ self, alloc, from_key, to_key, opts });
+        if (comptime storage_engine.enabled) return RelationalReadSession.fromHandle(alloc, try storage_engine.call("openRelationalReadSession", .{ self, alloc, from_key, to_key, opts }));
         return self.openRelationalReadSessionAtSnapshot(alloc, from_key, to_key, opts, null);
     }
 
     pub fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*RelationalStatementSnapshot) !*RelationalReadSession {
-        if (comptime storage_engine.enabled) return storage_engine.call("openRelationalReadSessionAtSnapshot", .{ self, alloc, from_key, to_key, opts, statement });
+        if (comptime storage_engine.enabled) {
+            const snapshot_handle: ?@import("../read_session_contract.zig").Handle = if (statement) |cut| cut.handle else null;
+            return RelationalReadSession.fromHandle(alloc, try storage_engine.call("openRelationalReadSessionAtSnapshot", .{ self, alloc, from_key, to_key, opts, snapshot_handle }));
+        }
         try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*proof| proof.deinit();
@@ -43028,364 +42994,44 @@ pub const DB = struct {
     /// Delayed document hydration over the exact primary generation captured
     /// with ranking. A byte-bounded document window stays pinned; callers copy
     /// selected cells before the next lookup or page release retires it.
-    pub const DocumentRows = struct {
-        db: *DB,
-        read: docstore_mod.DocStore.Txn,
-        schema: schema_registry_mod.SchemaView,
-        policy: row_policy_gate_mod.Gate.Lease,
-        window: DocumentPrimaryReadWindow,
-        metadata: std.heap.ArenaAllocator,
-        // Heap-owned to keep parser allocator pointers stable if this reader
-        // moves into a SQL cursor. The query lease fences this catalog cut.
-        privacy_arena: *std.heap.ArenaAllocator,
-        privacy_policy: ?@import("privacy_read.zig").PolicySnapshot,
-        keys: [64][]const u8 = undefined,
-        ids: [64][]const u8 = undefined,
-        sizes: [64]?u64 = undefined,
-        proofs: [64]?@import("../document_mutation_revision.zig").Content = undefined,
-        cached: usize = 0,
-        next_cached: usize = 0,
-        repair_requested: bool = false,
-        directory_arena: std.heap.ArenaAllocator,
-        directory_scope: ?@import("../backend_erased.zig").ReadScope = null,
-        directories: [64]?[]const u8 = @splat(null),
-        directories_loaded: [64]bool = @splat(false),
-        values: [64]?[]const u8 = undefined,
-        sources: [64]Source = undefined,
-        pub const Batch = struct { values: []const ?[]const u8, consumed: usize };
-        pub const Source = @import("../document_projection.zig").Source;
-        pub const ProjectedBatch = struct { values: []const Source, consumed: usize };
-
-        fn retireDirectories(self: *@This()) void {
-            if (self.directory_scope) |*scope| scope.close();
-            self.directory_scope = null;
-            _ = self.directory_arena.reset(.free_all);
-            @memset(&self.directories_loaded, false);
-            @memset(&self.directories, null);
-        }
-
-        // Keep keys and scalar size proofs separate from body scratch: sorted
-        // reads retire body scratch, and a small byte target can consume this
-        // metadata window over several calls. Never reuse proofs across pages.
-        fn prepare(self: *@This(), documents: []const []const u8) !void {
-            const available = self.cached - self.next_cached;
-            const common = @min(available, documents.len);
-            if (common != 0) {
-                const matches = for (documents[0..common], self.ids[self.next_cached..][0..common]) |wanted, cached_id| {
-                    if (!std.mem.eql(u8, wanted, cached_id)) break false;
-                } else true;
-                if (matches) return;
-            }
-            self.cached = 0;
-            self.next_cached = 0;
-            self.retireDirectories();
-            _ = self.metadata.reset(.free_all);
-            const a = self.metadata.allocator();
-            const count = @min(documents.len, self.keys.len);
-            for (documents[0..count], 0..) |id, index| {
-                self.ids[index] = try a.dupe(u8, id);
-                self.keys[index] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, id, self.schema);
-            }
-            var contents: [64]?@import("../document_mutation_revision.zig").Content = undefined;
-            var timestamps: [64]u64 = undefined;
-            var scope = try self.read.openReadScope(a);
-            defer scope.close();
-            try @import("../document_mutation_revision.zig").loadWindow(&scope, a, self.keys[0..count], self.ids[0..count], contents[0..count], timestamps[0..count]);
-            for (contents[0..count], 0..) |content, index| self.sizes[index] = if (content) |proof| proof.bytes else null;
-            @memcpy(self.proofs[0..count], contents[0..count]);
-            self.cached = count;
-        }
-
-        /// Sorted physical reads restore caller order. Metadata lengths are
-        /// revision-bound to this snapshot; unknown or oversized rows read in
-        /// isolation. A legal single document may exceed the soft byte target.
-        /// Results expire on the next lookup, batch or page release.
-        pub fn lookupBatch(self: *@This(), documents: []const []const u8, max_bytes: usize) !Batch {
-            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsLookupBatch", .{ self, documents, max_bytes });
-            const hydrated = try self.lookupBatchImpl(documents, &.{}, max_bytes);
-            return .{ .values = self.values[0..hydrated.consumed], .consumed = hydrated.consumed };
-        }
-        pub fn lookupProjectedBatch(self: *@This(), documents: []const []const u8, fields: []const []const u8, max_bytes: usize) !ProjectedBatch {
-            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsLookupProjectedBatch", .{ self, documents, fields, max_bytes });
-            return self.lookupBatchImpl(documents, fields, max_bytes);
-        }
-        fn lookupBatchImpl(self: *@This(), documents: []const []const u8, fields: []const []const u8, max_bytes: usize) !ProjectedBatch {
-            if (documents.len == 0 or documents.len > 64 or max_bytes == 0) return error.InvalidBatch;
-            self.window.retire();
-            errdefer self.window.retire();
-            const policy = self.privacy_policy;
-            if (policy != null and policy.?.prepared.policy.mode != .monitor) {
-                self.values[0] = try self.lookup(documents[0]);
-                self.sources[0] = .{ .bytes = self.values[0].? };
-                return .{ .values = self.sources[0..1], .consumed = 1 };
-            }
-            if (documents.len == 1 and fields.len == 0) {
-                self.values[0] = try self.lookup(documents[0]);
-                self.sources[0] = .{ .bytes = self.values[0].? };
-                return .{ .values = self.sources[0..1], .consumed = 1 };
-            }
-            try self.prepare(documents);
-            if (fields.len != 0) if (try self.projectBatch(documents.len, fields, max_bytes)) |projected| return projected;
-            // A declined projection must not retain its metadata/range buffers
-            // beside the full body. The proof cache has a separate owner.
-            self.window.retire();
-            const available = @min(documents.len, self.cached - self.next_cached);
-            const limit = @min(max_bytes, DocumentPrimaryReadWindow.max_bytes);
-            var count: usize = 0;
-            var bytes: u64 = 0;
-            while (count < available) : (count += 1) {
-                const length = self.sizes[self.next_cached + count] orelse break;
-                if (count != 0 and fields.len != 0 and length >= @import("../document_projection.zig").minimum_bytes) break;
-                if (length > limit -| bytes) break;
-                bytes += length;
-            }
-            count = @max(count, 1);
-            const keys = self.keys[self.next_cached..][0..count];
-            if (count == 1) {
-                self.values[0] = self.window.get(&self.read, keys[0], self.sizes[self.next_cached]) catch |err| switch (err) {
-                    error.NotFound => return error.StorageReadTemporarilyUnavailable,
-                    else => return err,
-                };
-            } else try self.window.getMany(&self.read, keys, self.values[0..count]);
-            for (self.values[0..count]) |value| if (value == null) return error.StorageReadTemporarilyUnavailable;
-            self.next_cached += count;
-            for (self.sources[0..count], self.values[0..count]) |*source, value| source.* = .{ .bytes = value.? };
-            return .{ .values = self.sources[0..count], .consumed = count };
-        }
-
-        fn requestRepair(self: *@This()) void {
-            if (self.repair_requested or openModeRequiresReadOnlyBackends(self.db.open_mode)) return;
-            self.repair_requested = true;
-            self.db.document_authority_backfill_requested.store(true, .release);
-        }
-        fn projectBatch(self: *@This(), maximum: usize, fields: []const []const u8, max_bytes: usize) !?ProjectedBatch {
-            const projection = @import("../document_projection.zig");
-            const revision = @import("../document_mutation_revision.zig");
-            const ranges_mod = @import("../value_ranges.zig");
-            const available = @min(maximum, self.cached - self.next_cached);
-            const limit = @min(max_bytes, DocumentPrimaryReadWindow.max_bytes);
-            const a = self.window.arena.allocator();
-            self.window.scope = try self.read.openReadScope(a);
-            const scope = &self.window.scope.?;
-            // Directory metadata is separately bounded by 64 * 32 KiB. Only
-            // projected payload cohorts enter the caller's soft byte window.
-            var directory_keys: [64]projection.Key = undefined;
-            var keys: [64][]const u8 = undefined;
-            var pending: [64]usize = undefined;
-            var pending_count: usize = 0;
-            var fetched: [64]?[]const u8 = @splat(null);
-            var candidates: usize = 0;
-            for (0..available) |i| {
-                const proof = self.proofs[self.next_cached + i] orelse {
-                    self.requestRepair();
-                    break;
-                };
-                if (proof.bytes < projection.minimum_bytes) break;
-                if (!self.directories_loaded[self.next_cached + i]) {
-                    directory_keys[pending_count] = projection.keyForRevision(revision.keyForPhysical(self.keys[self.next_cached + i]).?);
-                    keys[pending_count] = &directory_keys[pending_count];
-                    pending[pending_count] = self.next_cached + i;
-                    pending_count += 1;
-                }
-                candidates += 1;
-            }
-            if (candidates == 0) return null;
-            if (pending_count != 0) {
-                // Keep this bounded metadata lease across payload windows. A
-                // one-row byte limit must not re-read all remaining directories.
-                errdefer self.retireDirectories();
-                if (self.directory_scope == null) self.directory_scope = try self.read.openReadScope(self.directory_arena.allocator());
-                _ = try DocumentPrimaryReadWindow.readMany(&self.directory_scope.?, keys[0..pending_count], fetched[0..pending_count]);
-                for (pending[0..pending_count], fetched[0..pending_count]) |index, raw| {
-                    self.directories[index] = raw;
-                    self.directories_loaded[index] = true;
-                }
-            }
-            const Prepared = struct { fields: []projection.FieldValue, ranges: []ranges_mod.Range, values: [][]const u8, hashes: [][32]u8, duplicate: bool = false };
-            var prepared: [64]Prepared = undefined;
-            var requests: [64]ranges_mod.Request = undefined;
-            var request_count: usize = 0;
-            var count: usize = 0;
-            var retained: usize = 0;
-            while (count < candidates) : (count += 1) {
-                const physical = self.keys[self.next_cached + count];
-                const duplicate = for (0..count) |prior| {
-                    if (std.mem.eql(u8, physical, self.keys[self.next_cached + prior])) break prior;
-                } else null;
-                if (duplicate) |prior| {
-                    prepared[count] = prepared[prior];
-                    prepared[count].duplicate = true;
-                    continue;
-                }
-                const proof = self.proofs[self.next_cached + count].?;
-                const raw = self.directories[self.next_cached + count] orelse {
-                    self.requestRepair();
-                    break;
-                };
-                const directory = (try projection.Directory.open(a, raw, proof)) orelse {
-                    if (!try projection.isCurrent(a, raw, proof)) self.requestRepair();
-                    break;
-                };
-                var selected_bytes: u64 = 0;
-                var selected_count: usize = 0;
-                for (fields) |name| if (directory.find(name)) |field| {
-                    selected_bytes +|= field.length;
-                    selected_count += 1;
-                };
-                if (selected_bytes >= proof.bytes / 2 or selected_count > ranges_mod.maximum_ranges) break;
-                const ranges = try a.alloc(ranges_mod.Range, selected_count);
-                var slot: usize = 0;
-                for (fields) |name| if (directory.find(name)) |field| {
-                    ranges[slot] = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
-                    slot += 1;
-                };
-                const cost = if (scope.supportsRange()) try ranges_mod.retainedBytes(std.math.cast(usize, proof.bytes) orelse return error.InvalidDocumentContentAuthority, ranges) else if (selected_count == 0) 0 else proof.bytes;
-                if (count != 0 and cost > limit -| retained) break;
-                retained +|= std.math.cast(usize, cost) orelse return error.InvalidDocumentContentAuthority;
-                const output = try a.alloc(projection.FieldValue, selected_count);
-                const values = try a.alloc([]const u8, selected_count);
-                const hashes = try a.alloc([32]u8, selected_count);
-                slot = 0;
-                for (fields) |name| if (directory.find(name)) |field| {
-                    output[slot] = .{ .name = field.name, .value = undefined };
-                    hashes[slot] = field.digest;
-                    slot += 1;
-                };
-                prepared[count] = .{ .fields = output, .ranges = ranges, .values = values, .hashes = hashes };
-                if (selected_count != 0) {
-                    requests[request_count] = .{ .key = physical, .ranges = ranges, .output = values };
-                    request_count += 1;
-                }
-            }
-            if (count == 0) return null;
-            std.mem.sort(ranges_mod.Request, requests[0..request_count], {}, struct {
-                fn less(_: void, left: ranges_mod.Request, right: ranges_mod.Request) bool {
-                    return std.mem.order(u8, left.key, right.key) == .lt;
-                }
-            }.less);
-            scope.getRangesMany(requests[0..request_count]) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
-            for (prepared[0..count], self.sources[0..count]) |item, *source| {
-                if (!item.duplicate) for (item.values, item.hashes, item.fields) |value, hash, *field| {
-                    var digest: [32]u8 = undefined;
-                    std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
-                    if (!std.mem.eql(u8, &digest, &hash)) return error.InvalidDocumentContentAuthority;
-                    field.value = value;
-                };
-                source.* = .{ .fields = item.fields };
-            }
-            self.window.bytes = retained;
-            self.next_cached += count;
-            return .{ .values = self.sources[0..count], .consumed = count };
-        }
-
-        pub fn lookup(self: *@This(), key: []const u8) ![]const u8 {
-            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsLookup", .{ self, key });
-            self.window.retire();
-            const a = self.window.arena.allocator();
-            const physical = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, key, self.schema);
-            // Ranking already applied visibility/TTL at the captured cut.
-            // Never fall back to a fresh read if the captured row is absent.
-            const raw = self.window.get(&self.read, physical, 0) catch |err| switch (err) {
-                error.NotFound => return error.StorageReadTemporarilyUnavailable,
-                else => return err,
-            };
-            const privacy = @import("privacy_read.zig");
-            const policy = self.privacy_policy orelse return raw;
-            return privacy.project(a, policy, key, raw, &self.read);
-        }
-        /// Page cells already own their selected payloads. Retire the last
-        /// source scope before a portal suspends, keeping only the snapshot.
-        pub fn releasePage(self: *@This()) void {
-            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsReleasePage", .{self}) catch @panic("incompatible storage owner");
-            self.window.retire();
-            self.retireDirectories();
-            _ = self.metadata.reset(.free_all);
-            self.cached = 0;
-            self.next_cached = 0;
-        }
-        pub fn deinit(self: *@This()) void {
-            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsDeinit", .{self}) catch @panic("incompatible storage owner");
-            self.window.deinit();
-            self.retireDirectories();
-            self.directory_arena.deinit();
-            self.metadata.deinit();
-            const privacy_backing = self.privacy_arena.child_allocator;
-            self.privacy_arena.deinit();
-            privacy_backing.destroy(self.privacy_arena);
-            self.read.abort();
-            self.schema.release();
-            self.policy.release();
-            self.* = undefined;
-        }
-    };
+    pub const DocumentRows = @import("read_session_backend").DocumentRows(DB);
+    pub fn queryDocumentKeyOwned(self: *DB, alloc: Allocator, key: []const u8, schema: schema_registry_mod.SchemaView) ![]const u8 {
+        if (comptime storage_engine.enabled) @compileError("document key encoding belongs to the storage owner");
+        return encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema);
+    }
+    pub fn queryDocumentRequestRepairOwned(self: *DB) bool {
+        if (comptime storage_engine.enabled) @compileError("document repair admission belongs to the storage owner");
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
+        self.document_authority_backfill_requested.store(true, .release);
+        return true;
+    }
 
     /// Own one primary read generation across a local query's selection and
     /// aggregation collection. Acquire only after the Raft read barrier; never
     /// wait for another apply barrier while this lease excludes writers.
-    pub const QueryReadLease = struct {
-        db: *DB,
-        row_policy_lease: row_policy_gate_mod.Gate.Lease,
+    pub const QueryReadLease = @import("read_session_backend").QueryReadLease(DB, SearchWithDenseProfileResult);
 
-        /// Capture a primary typed reader under this lease's existing apply
-        /// fence. Do not recursively acquire the fence behind a queued writer.
-        pub fn relationalRows(self: *const QueryReadLease, alloc: Allocator, fields: []const []const u8, schema_version: u32) !RelationalRows.Reader {
-            if (comptime storage_engine.enabled) return storage_engine.call("relationalRowsUnderLease", .{ self, alloc, fields, schema_version });
-            var view = self.db.core.acquireSchemaView() orelse return error.RelationalTableRequired;
-            defer view.release();
-            var reader = try RelationalRows.Reader.open(alloc, self.db.core.store, view, null, .{
-                .fields = fields,
-                .expected_schema_version = schema_version,
-            }, currentTimeNs());
-            reader.row_policy_lease = self.row_policy_lease.clone();
-            return reader;
-        }
-
-        pub fn documentRows(self: *const QueryReadLease, alloc: Allocator, schema_version: u32) !DocumentRows {
-            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsUnderLease", .{ self, alloc, schema_version });
-            var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
-            errdefer view.release();
-            if (view.storageMode() != .document or view.version() != schema_version) return error.PreparedGenerationChanged;
-            const privacy_backing = @import("antfly_platform").allocator.reclaimingScratch(alloc);
-            const privacy_arena = try privacy_backing.create(std.heap.ArenaAllocator);
-            privacy_arena.* = .init(privacy_backing);
-            errdefer {
-                privacy_arena.deinit();
-                privacy_backing.destroy(privacy_arena);
-            }
-            const privacy_policy = try @import("privacy_read.zig").capture(self.db, privacy_arena.allocator());
-            var read = try self.db.core.store.beginReadTxn();
-            errdefer read.abort();
-            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .privacy_arena = privacy_arena, .privacy_policy = privacy_policy, .window = .init(alloc), .directory_arena = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)), .metadata = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)) };
-        }
-
-        pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
-            if (comptime storage_engine.enabled) return storage_engine.call("searchLease", .{ self, alloc, req });
-            const db = self.db;
-            const snapshot_req = try db.searchRequestAtCurrentIdentityGeneration(req);
-            if (!types.canonicalHierarchyExecutionWithinBudget(snapshot_req)) return error.InvalidQueryRequest;
-            var identity_prefix = try db.searchRequestWithIdentityPrefixFilterAlloc(snapshot_req);
-            defer identity_prefix.deinit();
-            var profile: db_query_search.DenseSearchProfile = .{};
-            const result = try db.searchLockedWithExecutionContextImpl(alloc, identity_prefix.req, .{}, true, if (req.profile) &profile else null);
-            return .{
-                .request = snapshot_req,
-                .result = result,
-                .dense_profile = if (profile.search_route.len > 0) profile else null,
-            };
-        }
-
-        pub fn release(self: *QueryReadLease) void {
-            if (comptime storage_engine.enabled) return storage_engine.call("queryReadLeaseRelease", .{self}) catch @panic("incompatible storage owner");
-            const db = self.db;
-            db.core.unlockApplyShared();
-            if (db.async_context.resource_manager) |manager| manager.finishForegroundQuery();
-            self.row_policy_lease.release();
-            self.* = undefined;
-        }
-    };
+    pub fn queryLeaseClockNowNs() u64 {
+        return currentTimeNs();
+    }
+    pub fn queryLeaseSearchOwned(self: *DB, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+        if (comptime storage_engine.enabled) @compileError("query lease search execution belongs to the storage owner");
+        const db = self;
+        const snapshot_req = try db.searchRequestAtCurrentIdentityGeneration(req);
+        if (!types.canonicalHierarchyExecutionWithinBudget(snapshot_req)) return error.InvalidQueryRequest;
+        var identity_prefix = try db.searchRequestWithIdentityPrefixFilterAlloc(snapshot_req);
+        defer identity_prefix.deinit();
+        var profile: db_query_search.DenseSearchProfile = .{};
+        const result = try db.searchLockedWithExecutionContextImpl(alloc, identity_prefix.req, .{}, true, if (req.profile) &profile else null);
+        return .{
+            .request = snapshot_req,
+            .result = result,
+            .dense_profile = if (profile.search_route.len > 0) profile else null,
+        };
+    }
 
     pub fn beginQueryReadLease(self: *DB) !QueryReadLease {
-        if (comptime storage_engine.enabled) return storage_engine.call("beginQueryReadLease", .{self});
+        if (comptime storage_engine.enabled) return QueryReadLease.fromHandle(try storage_engine.call("beginQueryReadLease", .{self}));
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         errdefer row_policy_lease.release();
@@ -75205,7 +74851,7 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
         }
     };
     const id: [64]u8 = @splat('a');
-    const request: @import("native_query_cut.zig").Request = .{
+    const request: @import("native_query_cut_contract.zig").Request = .{
         .id = &id,
         .table_id = 7,
         .expires_ms = @import("native_query_cut.zig").nowMs() + 300_000,
@@ -75504,7 +75150,7 @@ test "db query capture retains settled terminal repair debt without acknowledgin
     try std.testing.expectError(error.EnrichmentWorkerFailed, db.runMaintenanceUntilWithCancellation(sequence, .{}, .none, std.math.maxInt(u64)));
 
     const id: [64]u8 = @splat('b');
-    const request: @import("native_query_cut.zig").Request = .{
+    const request: @import("native_query_cut_contract.zig").Request = .{
         .id = &id,
         .table_id = 7,
         .expires_ms = @import("native_query_cut.zig").nowMs() + 300_000,
@@ -148769,6 +148415,10 @@ test "db manual text producers merge capacity without optional workers visibilit
     var completed = try std.json.parseFromSlice(std.json.Value, alloc, visible, .{});
     defer completed.deinit();
     try std.testing.expectEqual(@as(i64, 1), completed.value.object.get("count").?.integer);
+}
+
+comptime {
+    if (@import("builtin").is_test) _ = @import("mutation_commit_disposition_test.zig");
 }
 
 test "transient leann re-embedding renders templates through content parts like the producer" {

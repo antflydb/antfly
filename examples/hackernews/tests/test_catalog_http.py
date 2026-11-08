@@ -28,7 +28,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from urllib.parse import urlsplit, unquote
+from urllib.parse import parse_qs, urlencode, urlsplit, unquote
+from xml.etree import ElementTree as ET
 from pyiceberg.io.pyarrow import PyArrowFileIO, PyArrowFile
 
 import pyarrow as pa
@@ -169,8 +170,63 @@ class RestAuthority(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def object_listing(self, query):
+        # This oracle models an unversioned bucket: every current object has
+        # the S3 null version. Version listing is a separate XML protocol.
+        versions = "versions" in query
+        prefix = query.get("prefix", [""])[0]
+        marker = query.get(
+            "key-marker" if versions else "continuation-token",
+            query.get("start-after", [""]),
+        )[0]
+        maximum = int(query.get("max-keys", ["1000"])[0])
+        assert 0 <= maximum <= 1000
+        files = {
+            path.relative_to(self.server.root).as_posix(): path
+            for path in self.server.root.rglob("*")
+            if path.is_file()
+        }
+        keys = sorted(key for key in files if key.startswith(prefix) and key > marker)
+        page = keys[:maximum]
+        truncated = bool(page) and len(page) < len(keys)
+        root = ET.Element("ListVersionsResult" if versions else "ListBucketResult")
+        ET.SubElement(root, "Name").text = "archive"
+        ET.SubElement(root, "Prefix").text = prefix
+        ET.SubElement(root, "MaxKeys").text = str(maximum)
+        ET.SubElement(root, "IsTruncated").text = str(truncated).lower()
+        if truncated:
+            ET.SubElement(
+                root, "NextKeyMarker" if versions else "NextContinuationToken"
+            ).text = page[-1]
+            if versions:
+                ET.SubElement(root, "NextVersionIdMarker").text = "null"
+        for key in page:
+            data = files[key].read_bytes()
+            entry = ET.SubElement(root, "Version" if versions else "Contents")
+            ET.SubElement(entry, "Key").text = key
+            if versions:
+                ET.SubElement(entry, "VersionId").text = "null"
+                ET.SubElement(entry, "IsLatest").text = "true"
+            ET.SubElement(entry, "Size").text = str(len(data))
+            ET.SubElement(entry, "ETag").text = (
+                '"' + hashlib.md5(data).hexdigest() + '"'
+            )
+            ET.SubElement(entry, "LastModified").text = "2026-10-08T00:00:00.000Z"
+        payload = ET.tostring(root, short_empty_elements=False)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/xml")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     @atomic_authority_operation
     def do_GET(self):
+        parsed = urlsplit(self.path)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if parsed.path.rstrip("/") == "/archive" and (
+            "versions" in query or "list-type" in query
+        ):
+            return self.object_listing(query)
         if self.path.startswith("/archive"):
             return self.object_read()
         if self.path == "/v1/config":
@@ -324,6 +380,60 @@ class MaintenanceAuthority(RestAuthority):
         )
 
 
+def test_object_authority_lists_current_objects_and_null_versions(tmp_path):
+    authority = ThreadingHTTPServer(("127.0.0.1", 0), RestAuthority)
+    authority.root = tmp_path
+    worker = threading.Thread(target=authority.serve_forever, daemon=True)
+    worker.start()
+    origin = f"http://127.0.0.1:{authority.server_port}/archive"
+    try:
+        for versions in (False, True):
+            query = {"versions": ""} if versions else {"list-type": "2"}
+            with urlopen(origin + "?" + urlencode(query), timeout=5) as response:
+                empty = ET.fromstring(response.read())
+            assert empty.tag == (
+                "ListVersionsResult" if versions else "ListBucketResult"
+            )
+            assert empty.findtext("IsTruncated") == "false"
+            assert not empty.findall("Version" if versions else "Contents")
+        (tmp_path / "prefix").mkdir()
+        (tmp_path / "prefix/a&b").write_bytes(b"first")
+        (tmp_path / "prefix/last").write_bytes(b"second")
+        (tmp_path / "other").write_bytes(b"excluded")
+        for versions in (False, True):
+            query = {"versions": ""} if versions else {"list-type": "2"}
+            query.update(prefix="prefix/", **{"max-keys": "1"})
+            seen = []
+            for page in range(2):
+                with urlopen(origin + "?" + urlencode(query), timeout=5) as response:
+                    result = ET.fromstring(response.read())
+                entries = result.findall("Version" if versions else "Contents")
+                assert len(entries) == 1
+                entry = entries[0]
+                seen.append(entry.findtext("Key"))
+                assert entry.findtext("Size") == str(
+                    len(b"first" if page == 0 else b"second")
+                )
+                if versions:
+                    assert entry.findtext("VersionId") == "null"
+                    assert entry.findtext("IsLatest") == "true"
+                assert result.findtext("IsTruncated") == str(page == 0).lower()
+                if page == 0:
+                    marker = result.findtext(
+                        "NextKeyMarker" if versions else "NextContinuationToken"
+                    )
+                    query["key-marker" if versions else "continuation-token"] = marker
+                    if versions:
+                        query["version-id-marker"] = result.findtext(
+                            "NextVersionIdMarker"
+                        )
+            assert seen == ["prefix/a&b", "prefix/last"]
+    finally:
+        authority.shutdown()
+        authority.server_close()
+        worker.join()
+
+
 @pytest.mark.parametrize("provider", ["nessie", "polaris"])
 def test_external_maintenance_controller_protocol_and_restart(tmp_path, provider):
     test_native_catalog_file_commit_read_and_restart(
@@ -442,9 +552,9 @@ def test_native_catalog_file_commit_read_and_restart(
             native_rows == "overlay"
             and body is not None
             and "full_text_search" in body
-            and "indexes" not in body
+            and "full_text_index" not in body
         ):
-            body = dict(body, indexes=["body_text"])
+            body = dict(body, full_text_index="body_text")
         request = Request(
             endpoint + path,
             None if body is None else json.dumps(body).encode(),
@@ -1034,6 +1144,7 @@ def test_native_catalog_file_commit_read_and_restart(
                         deleted.get("responses", [deleted])[0]["hits"]["hits"] == []
                     ), deleted
                 chunk_requests = []
+                first_chunk_revisions = None
                 for name in ("managed_chunks", "managed_chunks_second"):
                     chunk_query = {
                         "embeddings": {name: [1, 0]},
@@ -1069,6 +1180,45 @@ def test_native_catalog_file_commit_read_and_restart(
                     assert all(
                         hit["_source"]["text"] for hit in members["hits"]["hits"]
                     ), members
+                    revisions = {
+                        hit["_id"]: (
+                            hit["hierarchy"]["artifact"]["revision"],
+                            hit["hierarchy"]["artifact"]["derivation_revision"],
+                        )
+                        for hit in members["hits"]["hits"]
+                    }
+                    assert all(
+                        value.startswith("sha256:") and len(value) == 71
+                        for pair in revisions.values()
+                        for value in pair
+                    ), members
+                    if first_chunk_revisions is None:
+                        first_chunk_revisions = revisions
+                    # Both accepted replacements and archived chunks must use
+                    # the pinned lake producer state during revision shaping.
+                    for amount in (1, 3):
+                        selected_members = call(
+                            "POST",
+                            "/tables/hn/query",
+                            dict(
+                                chunk_query,
+                                hierarchy={},
+                                fields=["text"],
+                                filter_query={
+                                    "term": {"path": "/amount", "value": amount}
+                                },
+                            ),
+                        )["responses"][0]
+                        assert selected_members["hits"]["hits"], selected_members
+                        assert all(
+                            hit["_source"]["text"]
+                            and revisions[hit["_id"]]
+                            == (
+                                hit["hierarchy"]["artifact"]["revision"],
+                                hit["hierarchy"]["artifact"]["derivation_revision"],
+                            )
+                            for hit in selected_members["hits"]["hits"]
+                        ), selected_members
                     units = call(
                         "POST",
                         "/tables/hn/query",
@@ -1114,6 +1264,13 @@ def test_native_catalog_file_commit_read_and_restart(
                 assert all(
                     hit["_source"]["text"] for hit in chunk_reopened["hits"]["hits"]
                 ), chunk_reopened
+                assert {
+                    hit["_id"]: (
+                        hit["hierarchy"]["artifact"]["revision"],
+                        hit["hierarchy"]["artifact"]["derivation_revision"],
+                    )
+                    for hit in chunk_reopened["hits"]["hits"]
+                } == first_chunk_revisions, chunk_reopened
                 mixed_restarted = call("POST", "/query", mixed_next)["responses"][0]
                 assert [
                     hit["_source"]["amount"] for hit in mixed_restarted["hits"]["hits"]
@@ -1164,7 +1321,7 @@ def test_native_catalog_file_commit_read_and_restart(
                     "/sql",
                     {
                         "statement": "SELECT amount FROM hn ORDER BY amount",
-                        "lake_visibility": "accepted",
+                        "read_requirements": {"visibility": "accepted"},
                     },
                 )["rows"] == [["1"], ["3"], ["4"]]
                 assert call(
@@ -1172,7 +1329,7 @@ def test_native_catalog_file_commit_read_and_restart(
                     "/sql",
                     {
                         "statement": "SELECT COUNT(*) FROM hn WHERE amount = 2",
-                        "lake_visibility": "accepted",
+                        "read_requirements": {"visibility": "accepted"},
                     },
                 )["rows"] == [["0"]]
                 assert call(
@@ -1180,7 +1337,7 @@ def test_native_catalog_file_commit_read_and_restart(
                     "/sql",
                     {
                         "statement": "SELECT a.amount FROM hn a JOIN hn b ON a.amount=b.amount ORDER BY a.amount",
-                        "lake_visibility": "accepted",
+                        "read_requirements": {"visibility": "accepted"},
                     },
                 )["rows"] == [["1"], ["3"], ["4"]]
                 published = call(
@@ -1189,11 +1346,12 @@ def test_native_catalog_file_commit_read_and_restart(
                     {
                         "full_text_search": {"match": "original", "field": "body"},
                         "fields": ["amount"],
-                        "lake_read": {"visibility": "published"},
+                        "read_requirements": {"visibility": "published"},
                     },
                 )
                 assert len(published["responses"][0]["hits"]["hits"]) == 3
-                receipt = {
+                receipt = accepted["read_receipt"]
+                assert receipt == {
                     key: accepted[key]
                     for key in ("table_id", "object_generation", "wal_lsn")
                 }
@@ -1203,9 +1361,9 @@ def test_native_catalog_file_commit_read_and_restart(
                         "/tables/hn/query",
                         {
                             "full_text_search": {"match": "original", "field": "body"},
-                            "lake_read": {
+                            "read_requirements": {
                                 "visibility": "published",
-                                "through": receipt,
+                                "after_write": receipt,
                                 "wait_ms": 0,
                             },
                         },
@@ -1217,8 +1375,8 @@ def test_native_catalog_file_commit_read_and_restart(
                         "/tables/hn/query",
                         {
                             "full_text_search": {"match": "comet", "field": "body"},
-                            "lake_read": {
-                                "through": dict(
+                            "read_requirements": {
+                                "after_write": dict(
                                     receipt, table_id=receipt["table_id"] + 1
                                 ),
                                 "wait_ms": 0,
@@ -1244,16 +1402,33 @@ def test_native_catalog_file_commit_read_and_restart(
             # Arrow verifies actual native pages, null levels and Iceberg IDs.
             import pyarrow.parquet as pq
 
-            native_data = sorted((root / "hn" / "data").glob("antfly-*-data.parquet"))
-            assert len(native_data) == 1
-            assert pq.read_table(native_data[0]).select(
-                ["amount", "body"]
-            ).to_pylist() == [
+            from pyiceberg.manifest import DataFileContent
+
+            refreshed = catalog.load_table("hackernews.items")
+            snapshot = refreshed.current_snapshot()
+            manifests = snapshot.manifests(refreshed.io)
+            assert len(manifests) >= 3
+            # Discover the committed files through Iceberg, independent of
+            # native file naming, partition count or chunk ordinals.
+            native_data = [
+                unquote(urlsplit(LocalS3IO().local(entry.data_file.file_path)).path)
+                for manifest in manifests
+                for entry in manifest.fetch_manifest_entry(
+                    refreshed.io, discard_deleted=True
+                )
+                if entry.snapshot_id == snapshot.snapshot_id
+                and entry.data_file.content == DataFileContent.DATA
+            ]
+            assert native_data
+            native_rows_read = [
+                row
+                for path in native_data
+                for row in pq.read_table(path).select(["amount", "body"]).to_pylist()
+            ]
+            assert sorted(native_rows_read, key=lambda row: row["amount"]) == [
                 {"amount": 1, "body": "native searchable comet"},
                 {"amount": 4, "body": ""},
             ]
-            refreshed = catalog.load_table("hackernews.items")
-            assert len(list(refreshed.current_snapshot().manifests(refreshed.io))) >= 3
             # Publication is automatic: no create-index/refresh action here.
             while True:
                 try:
@@ -1463,9 +1638,15 @@ def test_native_catalog_file_commit_read_and_restart(
                     "max_deleted": 1,
                 },
             )
-            for _ in range(8):
-                if gc["complete"]:
-                    break
+            # Incremental collection preserves its barrier across calls and
+            # waits the production 60-second reader grace before sweeping.
+            # Keep the owner alive and resume bounded one-object jobs safely.
+            gc_deadline = time.monotonic() + 120
+            while not gc["complete"]:
+                assert time.monotonic() < gc_deadline, gc
+                time.sleep(
+                    0.5 if gc.get("collection", {}).get("phase") == "waiting" else 0.025
+                )
                 gc = call(
                     "POST",
                     maintenance,
@@ -1508,10 +1689,8 @@ def test_native_catalog_file_commit_read_and_restart(
                     progress = scheduled.get("state")
                     if progress and progress.get("last_result"):
                         assert not progress.get("last_error"), scheduled
-                        assert json.loads(progress["last_result"])["complete"], (
-                            scheduled
-                        )
-                        break
+                        if json.loads(progress["last_result"])["complete"]:
+                            break
                     assert time.monotonic() < deadline, (
                         tmp_path / "server.log"
                     ).read_text()[-5000:]

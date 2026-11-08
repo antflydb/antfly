@@ -46,9 +46,11 @@ pub fn create(ctx: Context) Suite {
         // footprint and leaves room for the socket/reference coverage.
         // Native aarch64 Linux CPU document orchestration (Zig 0.17,
         // ReleaseFast) peaked at 14.26 GB. Reserve 16 GiB for this closure.
+        // The ReleaseSafe boundary admission regression peaked at
+        // 20,025,544,704 bytes with cold caches; reserve 24 GiB in that mode.
         // The focused native CPU ReleaseFast suite peaked at 10,032,644,096
         // bytes. Its old 9 GiB declaration rejected a successful compilation.
-        .max_rss = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) 16 * 1024 * 1024 * 1024 else if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) @as(usize, if (ctx.optimize == .safe) 24 else 16) * 1024 * 1024 * 1024 else if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -113,12 +115,12 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     tests.root_module.addImport("antfly_media", ctx.graph.inference_mod.import_table.get("antfly_media").?);
-    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
-    tests.root_module.addImport("antfly_documents", ctx.graph.inference_mod.import_table.get("antfly_documents").?);
+    tests.root_module.addImport("antfly_pdf", ctx.graph.pdf_source_mod);
+    tests.root_module.addImport("antfly_documents", runtime_build.sourceDocumentsModule(b, ctx.graph.inference_mod.import_table.get("antfly_documents").?, ctx.graph.pdf_source_mod));
     tests.root_module.addImport("antfly_video", ctx.graph.inference_mod.import_table.get("antfly_video").?);
-    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
+    tests.root_module.addImport("antfly_pdf", ctx.graph.pdf_source_mod);
     tests.root_module.addImport("inference_chunker", ctx.graph.inference_chunker_mod);
-    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
+    tests.root_module.addImport("antfly_pdf", ctx.graph.pdf_source_mod);
     tests.root_module.addImport("jinja", ctx.graph.jinja_mod);
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
@@ -299,17 +301,17 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_lifecycle_tests = ctx.addRunArtifact(lifecycle_tests);
     test_step.dependOn(&run_lifecycle_tests.step);
     ctx.step("test-cuda-allocation-lifecycle", "Verify failed-free quarantine across primary-context lifetimes without a GPU").dependOn(&run_lifecycle_tests.step);
-    const read_batch_root = b.createModule(.{ .root_source_file = ctx.path("src/test_read_pool_microbatch.zig"), .target = ctx.target, .optimize = ctx.optimize });
-    var read_batch_imports = suite.tests.root_module.import_table.iterator();
-    while (read_batch_imports.next()) |entry| read_batch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
-    read_batch_root.link_libc = true;
-    const read_batch_tests = b.addTest(.{ .max_rss = 4 * 1024 * 1024 * 1024, .root_module = read_batch_root, .filters = &.{ "read pool microbatch", "executor_microbatch.test.", "embedding text batch", "gliner span v2 batch admission", "test_0" } });
-    const run_read_batch_tests = ctx.addRunArtifact(read_batch_tests);
-    test_step.dependOn(&run_read_batch_tests.step);
-    ctx.step("test-read-pool-microbatch", "Verify read-model row ownership, capacity and cancellation").dependOn(&run_read_batch_tests.step);
+    const microbatch_root = b.createModule(.{ .root_source_file = ctx.path("src/test_executor_microbatch.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var microbatch_imports = suite.tests.root_module.import_table.iterator();
+    while (microbatch_imports.next()) |entry| microbatch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    microbatch_root.link_libc = true;
+    const microbatch_tests = b.addTest(.{ .max_rss = 4 * 1024 * 1024 * 1024, .root_module = microbatch_root, .filters = &.{ "gliner microbatch", "executor microbatch", "executor_microbatch.test.", "embedding text batch", "gliner span v2 batch admission", "tensor microbatch", "test_0" } });
+    const run_microbatch_tests = ctx.addRunArtifact(microbatch_tests);
+    test_step.dependOn(&run_microbatch_tests.step);
+    ctx.step("test-executor-microbatch", "Verify executor batching, GLiNER adapters, row ownership, capacity and cancellation").dependOn(&run_microbatch_tests.step);
     const inference_unit = ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites");
     inference_unit.dependOn(&run_tests.step);
-    inference_unit.dependOn(&run_read_batch_tests.step);
+    inference_unit.dependOn(&run_microbatch_tests.step);
     inference_unit.dependOn(&run_lifecycle_tests.step);
     inference_unit.dependOn(&run_batch_tests.step);
     inference_unit.dependOn(&run_cooperative_tests.step);
