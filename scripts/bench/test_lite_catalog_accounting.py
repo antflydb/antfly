@@ -25,12 +25,31 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
-from lite_catalog_accounting import CatalogAccounting
+from lite_catalog_accounting import CatalogAccounting, is_control_record
 from lite_contention import sdk
 
 ROOT = Path(__file__).resolve().parents[2]
 LIBRARY = os.environ.get("ANTFLY_LIBRARY")
+
+
+class ControlRecordKeys(unittest.TestCase):
+    def test_dictionary_registry_requires_a_complete_canonical_tuple(self):
+        key = b"22:dictionary_registry:v1|4:text|8:identity"
+        self.assertTrue(is_control_record(key))
+        self.assertTrue(is_control_record(b"22:dictionary_registry:v1|0:|8:identity"))
+        self.assertTrue(is_control_record(b"\x02db/table\x00" + key))
+        for end in range(len(key)):
+            self.assertFalse(is_control_record(key[:end]), end)
+        for invalid in (
+            b"document:" + key,
+            key + b"|1:x",
+            b"0" + key,
+            b"999999999999999999999999999999:dictionary_registry:v1|0:|8:identity",
+            b"22:dictionary_registry:v1|4:text|0:",
+        ):
+            self.assertFalse(is_control_record(invalid), invalid)
 
 
 @unittest.skipUnless(LIBRARY and Path(LIBRARY).is_file(), "ANTFLY_LIBRARY is required")
@@ -62,12 +81,13 @@ class NativeAccountingParity(unittest.TestCase):
                 self.assertTrue(native["valid"])
             source = CatalogAccounting(database)
             try:
-                self.assertEqual(source.version, 15)
+                self.assertEqual(source.version, 17)
                 offline = source.account(include_documents=True)
                 document_index = source.slot[7]
                 page_size = source.page_size
             finally:
                 source.close()
+
             for label, expected in native["live_accounting"].items():
                 self.assertEqual(
                     {key: offline[label][key] for key in expected}, expected, label
@@ -90,6 +110,27 @@ class NativeAccountingParity(unittest.TestCase):
                     source.account(include_documents=True)
             finally:
                 source.close()
+
+    def test_revision17_checkpoint_authentication_covers_logical_identity(self):
+        directory = ROOT / ".tools" / "accounting-tests"
+        directory.mkdir(parents=True, exist_ok=True)
+        af = sdk(LIBRARY)
+        with tempfile.TemporaryDirectory(dir=directory) as temporary:
+            database = Path(temporary) / "identity.aflite"
+            with af.create(database, no_sync=True) as db:
+                db.batch_json({"inserts": {"plain": {"text": "authenticated row"}}})
+            with database.open("r+b") as output:
+                for slot in range(2):
+                    offset = 208 + slot * 48
+                    output.seek(offset)
+                    byte = output.read(1)
+                    output.seek(offset)
+                    output.write(bytes([byte[0] ^ 1]))
+            with database.open("rb") as source_file:
+                with mock.patch.object(Path, "open", return_value=source_file):
+                    with self.assertRaisesRegex(ValueError, "checksummed checkpoint"):
+                        CatalogAccounting(database)
+                self.assertTrue(source_file.closed)
 
 
 if __name__ == "__main__":

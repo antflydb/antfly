@@ -40,8 +40,17 @@ from pathlib import Path
 class CatalogAccounting:
     def __init__(self, path: Path):
         self.file = path.open("rb")
-        fcntl.flock(self.file, fcntl.LOCK_SH)
-        self.data = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            fcntl.flock(self.file, fcntl.LOCK_SH)
+            self.data = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
+            self._read_header()
+        except BaseException:
+            if hasattr(self, "data"):
+                self.data.close()
+            self.file.close()
+            raise
+
+    def _read_header(self):
         header = self.data[:4096]
         if header[:6] != b"AFLITE" or header[6] not in (
             3,
@@ -57,6 +66,8 @@ class CatalogAccounting:
             13,
             14,
             15,
+            16,
+            17,
         ):
             raise ValueError("unsupported diagnostic file signature")
         self.version = struct.unpack_from("<I", header, 8)[0]
@@ -73,9 +84,7 @@ class CatalogAccounting:
         for i in range(2):
             raw = header[64 + i * 72 : 136 + i * 72]
             extra = (
-                header[208 + i * 48 : 256 + i * 48]
-                if self.version in (7, 8, 9, 10, 11, 12, 13, 14, 15)
-                else b""
+                header[208 + i * 48 : 256 + i * 48] if 7 <= self.version <= 17 else b""
             )
             if self.version >= 15:
                 proof = header[304 + i * 48 : 352 + i * 48]
@@ -335,7 +344,42 @@ def is_control_record(key: bytes) -> bool:
             else:
                 return True
         return True
-    return key.startswith((b"\x00\x00__", b"\x00antfly/"))
+    return key.startswith((b"\x00\x00__", b"\x00antfly/")) or is_dictionary_registry(
+        key
+    )
+
+
+def is_dictionary_registry(key: bytes) -> bool:
+    """Recognize the complete canonical tuple from storage/control_key.zig."""
+    position = 0
+    for component in range(3):
+        start = position
+        length = 0
+        while position < len(key) and ord("0") <= key[position] <= ord("9"):
+            length = length * 10 + key[position] - ord("0")
+            if length > len(key):
+                return False
+            position += 1
+        if (
+            position == start
+            or position == len(key)
+            or key[position] != ord(":")
+            or (position - start > 1 and key[start] == ord("0"))
+        ):
+            return False
+        position += 1
+        if length > len(key) - position or (length == 0 and component != 1):
+            return False
+        end = position + length
+        if component == 0 and key[position:end] != b"dictionary_registry:v1":
+            return False
+        position = end
+        if component == 2:
+            return position == len(key)
+        if position == len(key) or key[position] != ord("|"):
+            return False
+        position += 1
+    return False
 
 
 def main():
