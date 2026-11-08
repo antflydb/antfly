@@ -6724,13 +6724,17 @@ fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool, cursor: ?[
         owner.maintenance_round_pending = false;
     }
     var ttl_failures: usize = 0;
-    for (0..64) |_| {
+    // Producer service is independently owned. Keep driving consumers while
+    // awaiting that actor; a fixed count of immediate calls is not a drain.
+    const deadline = std.Io.Clock.awake.now(shared.handleLockIo()).nanoseconds + 10 * std.time.ns_per_s;
+    while (std.Io.Clock.awake.now(shared.handleLockIo()).nanoseconds < deadline) {
         const pending = owner.maintenanceTurnForTest() catch |err| {
             if (!ttl_failure or err != error.InvalidGraphTtlCandidate) return err;
             ttl_failures += 1;
             continue;
         };
         if (!pending) break;
+        try shared.handleLockIo().sleep(.fromMilliseconds(1), .awake);
     }
     if (ttl_failure) try std.testing.expectEqual(@as(usize, 1), ttl_failures);
     const guard = public.enterHandle(handle, .read).?;
@@ -6763,8 +6767,8 @@ test "capi native resolver maintenance retries transient inference and survives 
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const producer = @import("antfly_local_sources").storage_db_enrichment_asset_producer;
     const Fixture = struct {
-        failures: usize = 0,
-        successful: usize = 0,
+        failures: std.atomic.Value(usize) = .init(0),
+        successful: std.atomic.Value(usize) = .init(0),
         fn memory(_: *anyopaque, _: std.mem.Allocator, _: []const producer.Request) !@import("antfly_inference_work").InvocationMemoryPlan {
             return .{ .attachment_transport = .data_uri, .fixed_bytes = 16 << 20, .allocator_limit_bytes = 16 << 20, .max_result_bytes_per_item = 1 << 20, .max_result_bytes = 1 << 20 };
         }
@@ -6772,11 +6776,15 @@ test "capi native resolver maintenance retries transient inference and survives 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             // Admission pressure and an open provider circuit must preserve
             // durable replay debt, not require another foreground write.
-            if (self.failures < 2) {
-                self.failures += 1;
-                return if (self.failures == 1) error.ResourceTemporarilyUnavailable else error.InferenceCircuitOpen;
+            var failures = self.failures.load(.monotonic);
+            while (failures < 2) {
+                if (self.failures.cmpxchgWeak(failures, failures + 1, .monotonic, .monotonic)) |observed| {
+                    failures = observed;
+                    continue;
+                }
+                return if (failures == 0) error.ResourceTemporarilyUnavailable else error.InferenceCircuitOpen;
             }
-            self.successful += 1;
+            _ = self.successful.fetchAdd(1, .monotonic);
             return a.dupe(u8, "{\"entities\":[{\"id\":\"a\",\"text\":\"Antfly\",\"label\":\"technology\"}],\"relations\":[]}");
         }
         fn produceBounded(ptr: *anyopaque, a: std.mem.Allocator, request: producer.Request, context: producer.InvocationContext) ![]u8 {
@@ -6841,7 +6849,12 @@ test "capi native resolver maintenance retries transient inference and survives 
         }
         _ = try owner.maintenanceTurnForTest();
     }
-    try std.testing.expect(fixture.failures > 0);
+    const first_attempt_deadline = std.Io.Clock.awake.now(shared.handleLockIo()).nanoseconds + 10 * std.time.ns_per_s;
+    while (fixture.failures.load(.acquire) == 0 and std.Io.Clock.awake.now(shared.handleLockIo()).nanoseconds < first_attempt_deadline) {
+        _ = try owner.maintenanceTurnForTest();
+        try shared.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(fixture.failures.load(.acquire) > 0);
     antfly_db_close(handle);
     handle = null;
     // Reopen with unfinished work and no new mutation or foreground drain.
@@ -6870,8 +6883,8 @@ test "capi native resolver maintenance retries transient inference and survives 
     }
     if (!settled) try dumpMaintenanceProgress(owner);
     try std.testing.expect(settled);
-    try std.testing.expectEqual(@as(usize, 2), fixture.failures);
-    try std.testing.expect(fixture.successful >= 30);
+    try std.testing.expectEqual(@as(usize, 2), fixture.failures.load(.acquire));
+    try std.testing.expect(fixture.successful.load(.acquire) >= 30);
     {
         const guard = public.enterHandle(handle, .read).?;
         defer guard.leave();
@@ -6881,9 +6894,9 @@ test "capi native resolver maintenance retries transient inference and survives 
         try std.testing.expect(!stats.promotion.catch_up_required);
         try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
     }
-    const completed = fixture.successful;
+    const completed = fixture.successful.load(.acquire);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
-    try std.testing.expectEqual(completed, fixture.successful);
+    try std.testing.expectEqual(completed, fixture.successful.load(.acquire));
 }
 
 test "capi native bounded admission coalesces allocator proof outside publication gates" {

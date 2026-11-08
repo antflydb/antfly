@@ -62,6 +62,10 @@ pub const State = struct {
     /// Serializes replay/retirement scopes borrowing the DocStore's deferred
     /// retirement pointer. Group command discovery retains its separate lock.
     replay_service_mutex: std.atomic.Mutex = .unlocked,
+    /// Native file owners run expensive providers on an independently owned
+    /// lane. Consumer replay must remain runnable while that lane awaits IO.
+    external_producers: std.atomic.Value(bool) = .init(false),
+    producer_inflight: std.atomic.Value(bool) = .init(false),
     slice_mutex: std.atomic.Mutex = .unlocked,
     allocator: ?std.mem.Allocator = null,
     worker: ?work.Worker = null,

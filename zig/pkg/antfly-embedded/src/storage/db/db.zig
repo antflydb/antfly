@@ -32642,6 +32642,9 @@ pub const DB = struct {
         drain_relational_indexes: bool = true,
         drain_graph_replacements: bool = true,
         bounded_replay: bool = false,
+        /// A producer actor (or an explicit foreground drain) services these
+        /// stages even when ordinary consumer turns delegate them to an owner.
+        service_producers: bool = false,
         /// A background consumer may only inspect its selected dependency cut.
         replay_target_cap: u64 = std.math.maxInt(u64),
         /// Native replay releases its primary snapshot before artifact work.
@@ -32894,6 +32897,11 @@ pub const DB = struct {
     }
 
     fn runEnrichmentUntilForDrain(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
+        const owner_state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
+        if (options.bounded_replay and !options.service_producers and owner_state.external_producers.load(.acquire)) return;
+        // An explicit full drain must release admission while the independent
+        // producer may need it to publish its completed provider output.
+        if (owner_state.producer_inflight.load(.acquire)) return error.ReplayServiceBusy;
         if (options.bounded_replay) {
             if (self.enrichment_runtime) |runtime| {
                 const state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
@@ -33297,7 +33305,9 @@ pub const DB = struct {
             try self.runMaintenanceUntilWithOptions(self.currentMaintenanceTargetSequence(), .{}, options);
             const drained_sequence = self.core.nextDerivedSequence();
 
-            const drain_resolver_replay = self.resolverReplayNeedsDrain();
+            const owner_state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
+            const external_producers = options.bounded_replay and owner_state.external_producers.load(.acquire);
+            const drain_resolver_replay = !external_producers and self.resolverReplayNeedsDrain();
             if (drain_resolver_replay) {
                 if (self.resolution_runtime) |runtime| {
                     // nextDerivedSequence() is the highest committed sequence,
@@ -35034,6 +35044,14 @@ pub const DB = struct {
 
     pub fn runExplicitReplayDrainTurn(self: *DB, state: *GroupSourceMaintenanceState, producer_after: u64) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runExplicitReplayDrainTurn", .{ self, state, producer_after });
+        // A detached producer can need this admission to publish. Yield before
+        // borrowing its state, and let the C API reap it outside admission.
+        if (state.producer_inflight.load(.acquire)) return error.ReplayServiceBusy;
+        // The bounded consumer turn deliberately skips external producers.
+        // An explicit drain owns their service once that actor has drained;
+        // otherwise producer debt keeps the cohort spinning without advancing.
+        if (state.external_producers.load(.acquire))
+            _ = try self.runBackgroundTurnWithState(.none, .producers, state);
         const before = self.core.nextDerivedSequence();
         var pressure_pending = false;
         _ = self.runBackgroundTurnWithState(.none, .replay, state) catch |err| switch (err) {
@@ -35183,6 +35201,31 @@ pub const DB = struct {
     }
 
     fn runBackgroundTurnWithState(self: *DB, cancellation: types.CancellationToken, phase: types.BackgroundMaintenancePhase, state: *GroupSourceMaintenanceState) !bool {
+        if (phase == .producers) {
+            // This actor owns only producer state. It may wait for provider IO
+            // or model loading, without borrowing the consumer replay mutex.
+            // Its caller owns its runtime and publication ports until drained.
+            const options: ReplayDrainOptions = .{ .bounded_replay = true, .service_producers = true, .cancellation = cancellation, .source_work_only = true, .group_source_state = state };
+            try ensureSnapshotActive(cancellation);
+            try self.runEnrichmentUntilForDrain(self.currentMaintenanceTargetSequence(), options);
+            try ensureSnapshotActive(cancellation);
+            if (self.hasConfiguredResolvers()) {
+                if (self.resolution_runtime == null) try self.initResolutionRuntime();
+                if (self.promotion_runtime == null) try self.initPromotionRuntime();
+            }
+            if (self.resolverReplayNeedsDrain()) {
+                if (self.resolution_runtime) |runtime| {
+                    runtime.notifySequence(self.core.nextDerivedSequence());
+                    try runtime.catchUpOnce(monotonicTimeNs() +| @import("derived/replay_budget.zig").Controller.quantum_ns, state.resolution_backfill_turn.fetchXor(1, .monotonic) == 0);
+                }
+                if (self.promotion_runtime) |runtime| {
+                    try ensureSnapshotActive(cancellation);
+                    runtime.notifySequence(self.core.nextDerivedSequence());
+                    try runtime.catchUpOnce(monotonicTimeNs() +| @import("derived/replay_budget.zig").Controller.quantum_ns);
+                }
+            }
+            return false;
+        }
         const split_retirement = phase == .replay or phase == .retirement or phase == .retirement_batched;
         if (split_retirement) {
             // A foreground drain already owns file admission. Detached

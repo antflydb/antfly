@@ -5926,6 +5926,10 @@ fn runMaintenanceAdmitted(guard: *HandleGuard, handle_ptr: ?*anyopaque, comptime
         operation(guard.handle) catch |err| {
             if (err != error.ReplayServiceBusy or guard.connection == null) return err;
             guard.suspendQuery();
+            // A workerless native owner can still own an independent producer
+            // job. Reap a drained job outside admission before retrying a full
+            // drain; otherwise its completed in-flight fence never clears.
+            guard.connection.?.owner.collectCompletedProducer();
             try handleLockIo().sleep(.fromMilliseconds(1), .awake);
             if (!guard.resumeAccess(handle_ptr, access)) return error.InvalidArgument;
             if (guard.entry_error != null) return error.AdmissionFailed;

@@ -132,6 +132,65 @@ const PendingTextMerge = struct {
     }
 };
 
+/// A producer may await a model or remote provider for much longer than a
+/// replay quantum. It owns a separate actor and stable publication frame, so
+/// consumer replay and retirement never have to await that provider future.
+const PendingProducer = struct {
+    owner: *Owner,
+    root: *h.Handle,
+    database: *h.db_mod.DB,
+    parent_state: *h.db_mod.DB.GroupSourceMaintenanceState,
+    state: h.db_mod.DB.GroupSourceMaintenanceState = .{},
+    arena: *std.heap.ArenaAllocator,
+    catalog: PublicationCatalog,
+    publication: PreparedPublication,
+    source_read: ?SourceRead,
+    progress: Owner.ReplayProgress,
+    done: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+    elapsed_ns: u64 = 0,
+    advanced: bool = false,
+
+    fn execute(self: *PendingProducer) void {
+        const started = @import("antfly_platform").time.monotonicNs();
+        const before = self.database.core.nextDerivedSequence();
+        const applied = if (self.database.enrichment_runtime) |runtime| runtime.stats().applied_sequence else 0;
+        if (comptime h.builtin.is_test) if (self.owner.test_after_capture) |hook| hook.notify(hook.ptr, self.root);
+        if (comptime h.builtin.is_test) if (self.owner.test_before_producer_service) |hook| hook.run(hook.ptr, self);
+        _ = self.database.runBackgroundTurnWithCancellation(h.db_mod.types.CancellationToken.fromAtomic(&self.owner.stopping), .producers) catch |err| failed: {
+            self.failure = err;
+            break :failed false;
+        };
+        self.advanced = self.database.core.nextDerivedSequence() > before or
+            (if (self.database.enrichment_runtime) |runtime| runtime.stats().applied_sequence > applied else false) or
+            self.progress.advanced(self.database);
+        self.elapsed_ns = @import("antfly_platform").time.monotonicNs() -| started;
+    }
+
+    fn deinit(self: *PendingProducer) void {
+        std.debug.assert(self.done.load(.acquire));
+        if (self.database.enrichment_runtime) |runtime| {
+            runtime.dense_result_cache = null;
+            runtime.generated_publication = null;
+        }
+        self.database.async_context.replay_index_publication = null;
+        self.database.async_context.replay_metadata_publication = null;
+        self.database.async_context.replay_publication = null;
+        self.database.borrowed_group_source_state = null;
+        if (self.source_read) |*read| read.abort();
+        self.source_read = null;
+        self.root.maintenance_publication = null;
+        self.root.owned_lite_backend.?.native_docstore.?.writer_admission = null;
+        self.root.maintenance_owner = null;
+        self.state.deinit();
+        Owner.closeMaintenanceSnapshot(self.root);
+        self.catalog.deinit();
+        self.arena.deinit();
+        alloc.destroy(self.arena);
+        alloc.destroy(self);
+    }
+};
+
 /// Owned logical fingerprints need no turn-wide catalog pin. New metadata
 /// records persist their content digest, so even large catalogs can be checked
 /// with bounded record reads, including after their physical pages are reused.
@@ -1574,6 +1633,7 @@ pub const Owner = struct {
         text_merge_caps: std.AutoHashMapUnmanaged(u64, u32) = .empty,
         serviced_sequence: u64 = 0,
         next_database_audit_ns: i96 = 0,
+        next_producer_ns: i96 = 0,
         shadow_next: bool = true,
         startup_replay_pending: bool = true,
         source_recovery_next: bool = true,
@@ -1611,12 +1671,22 @@ pub const Owner = struct {
     gate: *PathGate,
     connections: std.ArrayList(*Connection) = .empty,
     worker: ?std.Thread = null,
+    producer_worker: ?std.Thread = null,
+    producer_mutex: std.Io.Mutex = .init,
+    producer_wake: std.Io.Event = .unset,
+    producer_mailbox: ?*PendingProducer = null,
+    pending_producer: ?*PendingProducer = null,
+    producer_jobs_active: std.atomic.Value(usize) = .init(0),
     // The path gate permits one foreground lease wait per owner. The global
     // debug Io cannot spawn tasks; this lazy pool supplies exactly the lock
     // waiter and its deadline timer, and is shared by compatible connections.
     path_lock_io: std.Io.Threaded,
     test_maintenance_wait_ns: if (h.builtin.is_test) ?i96 else void = if (h.builtin.is_test) null else {},
     test_text_merge_segment_limit: if (h.builtin.is_test) ?u64 else void = if (h.builtin.is_test) null else {},
+    test_before_producer_service: if (h.builtin.is_test) ?struct {
+        ptr: *anyopaque,
+        run: *const fn (*anyopaque, *PendingProducer) void,
+    } else void = if (h.builtin.is_test) null else {},
     stopping: std.atomic.Value(bool) = .init(false),
     // One graph walk per owner. Admission waits without the foreground gate;
     // the worker only try-locks under that gate and yields to an active proof.
@@ -1673,6 +1743,9 @@ pub const Owner = struct {
         maintenance_rounds: u64 = 0,
         maintenance_database_turns: u64 = 0,
         maintenance_source_turns: u64 = 0,
+        producer_jobs_started: u64 = 0,
+        producer_jobs_completed: u64 = 0,
+        producer_service_ns: u64 = 0,
         group_source_control_batches: u64 = 0,
         group_source_control_commands: u64 = 0,
         group_source_control_commits: u64 = 0,
@@ -2663,6 +2736,7 @@ pub const Owner = struct {
         if (self.current) |root| if (needsOutcomeReconciliation(root)) return true;
         if (self.maintenance_snapshot) |root| if (needsOutcomeReconciliation(root)) return true;
         if (self.pending_text_merge) |pending| if (needsOutcomeReconciliation(pending.root)) return true;
+        if (self.pending_producer) |pending| if (needsOutcomeReconciliation(pending.root)) return true;
         return false;
     }
 
@@ -2672,7 +2746,7 @@ pub const Owner = struct {
         self.immutable_sources.clear();
         const current = self.current orelse return;
         const current_store = current.owned_lite_backend.?.native_docstore.?;
-        for ([_]?*h.Handle{ self.maintenance_snapshot, if (self.pending_text_merge) |pending| pending.root else null }) |maybe_root| {
+        for ([_]?*h.Handle{ self.maintenance_snapshot, if (self.pending_text_merge) |pending| pending.root else null, if (self.pending_producer) |pending| pending.root else null }) |maybe_root| {
             const root = maybe_root orelse continue;
             const source_store = root.owned_lite_backend.?.native_docstore.?;
             current.sql_decision_uncertain = current.sql_decision_uncertain or root.sql_decision_uncertain;
@@ -3364,7 +3438,134 @@ pub const Owner = struct {
     /// Captures one table under the connection fence. The pinned runtime owns
     /// all provider/catalog state while computation runs outside that fence.
     /// Every short publication revalidates its inode and checkpoint.
+    fn producerLoop(self: *Owner) void {
+        const io = h.handleLockIo();
+        while (true) {
+            self.producer_wake.wait(io) catch {};
+            self.producer_mutex.lockUncancelable(io);
+            const pending = self.producer_mailbox;
+            self.producer_mailbox = null;
+            self.producer_wake.reset();
+            self.producer_mutex.unlock(io);
+            if (pending) |job| {
+                job.execute();
+                // No access to job follows this release. All provider futures
+                // and their borrowed frames have drained before reclamation.
+                job.done.store(true, .release);
+                // A workerless owner may be waiting to drain this actor.
+                // Reaping cannot depend on another owner-loop iteration.
+                self.collectCompletedProducer();
+                self.wake.set(io);
+            }
+            if (self.stopping.load(.acquire)) return;
+        }
+    }
+
+    fn producerNeedsWork(database: *h.db_mod.DB) !bool {
+        if (database.enrichment_runtime) |runtime| {
+            const stats = runtime.stats();
+            if (stats.retrying or stats.applied_sequence < @max(stats.target_sequence, database.core.nextDerivedSequence())) return true;
+        }
+        if (database.core.index_manager.resolvers.items.len != 0) {
+            const state = h.db_mod.enrichment_state;
+            const target = database.core.nextDerivedSequence();
+            if (database.resolution_runtime) |runtime| {
+                if (runtime.stats().catch_up_required) return true;
+            } else if (try state.loadAppliedSequence(alloc, database.core.store, "resolution") < target) return true;
+            if (database.promotion_runtime) |runtime| {
+                if (runtime.stats().catch_up_required) return true;
+            } else if (try state.loadAppliedSequence(alloc, database.core.store, "promotion") < target) return true;
+            if (database.resolution_runtime == null and
+                try @import("../storage/db/resolution_runtime.zig").hasDurableReresolveBacklog(database.core.store)) return true;
+        }
+        return false;
+    }
+
+    /// Transfer this admitted capture to the independently owned producer lane.
+    /// Every fallible operation precedes exposing the frame to its worker.
+    fn beginProducerAssumeAdmitted(self: *Owner, root: *h.Handle, database: *h.db_mod.DB, parent_state: *h.db_mod.DB.GroupSourceMaintenanceState, arena: *std.heap.ArenaAllocator, catalog: PublicationCatalog, source_read: ?SourceRead, publication: PreparedPublication, progress: ReplayProgress) !void {
+        std.debug.assert(self.pending_producer == null and !parent_state.producer_inflight.load(.acquire));
+        const job = try alloc.create(PendingProducer);
+        errdefer alloc.destroy(job);
+        job.* = .{ .owner = self, .root = root, .database = database, .parent_state = parent_state, .arena = arena, .catalog = catalog, .publication = publication, .source_read = source_read, .progress = progress };
+        job.state.producer_replay_budget = parent_state.producer_replay_budget;
+        job.state.resolution_backfill_turn.store(parent_state.resolution_backfill_turn.fetchXor(1, .monotonic), .monotonic);
+        if (self.producer_worker == null)
+            self.producer_worker = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Owner.producerLoop, .{self});
+        if (!try self.retainMaintenanceTurnAssumeLocked()) return error.FileBusy;
+        retainMaintenanceSnapshot(root);
+        job.publication.catalog = &job.catalog;
+        job.publication.source_read = if (job.source_read) |*read| read else null;
+        job.publication.publication_overhead_ns = &job.state.publication_overhead_ns;
+        root.maintenance_publication = &job.publication;
+        database.borrowed_group_source_state = &job.state;
+        database.async_context.replay_publication = .{ .ptr = &job.publication, .publish = PreparedPublication.publishReplay };
+        if (database.enrichment_runtime) |runtime|
+            runtime.generated_publication = .{ .ptr = &job.publication, .commit = PreparedPublication.commit, .heartbeat = PreparedPublication.heartbeat, .acquire_store = PreparedPublication.acquireStore };
+        parent_state.producer_inflight.store(true, .release);
+        self.pending_producer = job;
+        _ = self.producer_jobs_active.fetchAdd(1, .release);
+        self.publication_stats.producer_jobs_started +|= 1;
+        if (qualificationMetricsEnabled()) std.log.info("antfly_bench_native_producer_start table_id={d}", .{publication.identity.table_id});
+        // The selected actor is now producing, not consuming. Give its
+        // independent consumer actor the next bounded ticket immediately.
+        self.runnable_sources.notify(h.handleLockIo(), .{ .table_id = publication.identity.table_id, .incarnation = publication.incarnation });
+        // The producer owns this actor exclusively. Consumer service must open
+        // or reuse a separate actor rather than adopting its mutable file view.
+        self.clearTextSourceRuntimeCache();
+        self.maintenance_retained_logical = null;
+        if (self.maintenance_snapshot == root) {
+            self.maintenance_snapshot = null;
+            closeMaintenanceSnapshot(root);
+        }
+        const io = h.handleLockIo();
+        self.producer_mutex.lockUncancelable(io);
+        std.debug.assert(self.producer_mailbox == null);
+        self.producer_mailbox = job;
+        self.producer_wake.set(io);
+        self.producer_mutex.unlock(io);
+    }
+
+    /// The worker has drained before done is published. Retire actor/epoch
+    /// resources outside admission; preserve uncertainty before losing a root.
+    pub fn collectCompletedProducer(self: *Owner) void {
+        const io = h.handleLockIo();
+        self.gate.mutex.lockUncancelable(io);
+        const job = self.pending_producer orelse {
+            self.gate.mutex.unlock(io);
+            return;
+        };
+        if (!job.done.load(.acquire)) {
+            self.gate.mutex.unlock(io);
+            return;
+        }
+        if (needsOutcomeReconciliation(job.root)) self.preserveMaintenanceOutcomeFence();
+        if (!needsOutcomeReconciliation(job.root)) self.preserveImmutableTextHandoff(job.root, job.database);
+        self.pending_producer = null;
+        self.publication_stats.producer_jobs_completed +|= 1;
+        self.publication_stats.producer_service_ns +|= job.elapsed_ns;
+        if (qualificationMetricsEnabled()) std.log.info("antfly_bench_native_producer_done table_id={d} advanced={any} elapsed_ns={d} error={s}", .{ job.publication.identity.table_id, job.advanced, job.elapsed_ns, if (job.failure) |err| @errorName(err) else "none" });
+        _ = job.parent_state.publication_overhead_ns.fetchAdd(job.state.publication_overhead_ns.load(.monotonic), .monotonic);
+        job.parent_state.producer_replay_budget = job.state.producer_replay_budget;
+        job.parent_state.producer_inflight.store(false, .release);
+        const key: MaintenanceKey = .{ .table_id = job.publication.identity.table_id, .incarnation = job.publication.incarnation };
+        if (self.maintenance_schedules.getPtr(key)) |schedule| {
+            schedule.database_pending = true;
+            schedule.next_producer_ns = std.Io.Clock.awake.now(io).nanoseconds + if (job.advanced) @as(i96, 0) else std.time.ns_per_s;
+        }
+        if (job.failure) |err| self.noteMaintenanceFailure(err, key.table_id, .source);
+        self.runnable_sources.notify(io, key);
+        self.maintenance_pending = true;
+        std.debug.assert(job.root.maintenance_references != 0);
+        job.root.maintenance_references -= 1;
+        self.releaseMaintenanceTurnAssumeLocked();
+        self.gate.mutex.unlock(io);
+        job.deinit();
+        _ = self.producer_jobs_active.fetchSub(1, .release);
+    }
+
     fn maintenanceTurn(self: *Owner) !bool {
+        self.collectCompletedProducer();
         const turn_started = @import("antfly_platform").time.monotonicNs();
         if (self.stopping.load(.acquire)) return false;
         // Independent background snapshots must not repeatedly invalidate each
@@ -3552,6 +3753,9 @@ pub const Owner = struct {
             while (ids.next()) |id| try live_ids.put(alloc, id.*, {});
             var stale = self.maintenance_schedules.iterator();
             while (stale.next()) |entry| if (!live_ids.contains(entry.key_ptr.table_id)) {
+                // The independent producer owns this scheduling state until
+                // its old-incarnation publication has drained or been refused.
+                if (self.pending_producer) |job| if (job.parent_state == entry.value_ptr.group_sources) continue;
                 if (entry.value_ptr.group_sources) |state| {
                     state.deinit();
                     alloc.destroy(state);
@@ -3635,8 +3839,12 @@ pub const Owner = struct {
         const entry_readiness = if (self.options.profile == .native) try namespaceReadiness(selection_root, readiness_namespace) else null;
         var authority_arena = std.heap.ArenaAllocator.init(alloc);
         defer authority_arena.deinit();
-        if (self.options.open_mode == .writer and try @import("resolver_authority.zig").hasProjectionDebt(selection_root, database, authority_arena.allocator())) namespace_pending = true;
+        const projection_pending = self.options.open_mode == .writer and try @import("resolver_authority.zig").hasProjectionDebt(selection_root, database, authority_arena.allocator());
+        if (projection_pending) namespace_pending = true;
         const group_state = try self.groupSourceStateNamed(database, if (selected) |table| table.name else "default");
+        // Conservative legacy turns do not dispatch an independent actor.
+        // They must keep servicing producers through their complete turn.
+        group_state.external_producers.store(self.options.profile == .native and selection_file.header.indexed_reclamation, .release);
         clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.debt_checks_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.debt_checks_ns);
         const allocator_stats = stats: {
             const foreground_store = selection_root.owned_lite_backend.?.native_docstore.?;
@@ -3836,8 +4044,13 @@ pub const Owner = struct {
         // Immutable text construction runs independently of the replay actor;
         // publication and native staging remain bounded maintenance slices.
 
-        var turn_arena = std.heap.ArenaAllocator.init(alloc);
-        defer turn_arena.deinit();
+        const turn_arena = try alloc.create(std.heap.ArenaAllocator);
+        turn_arena.* = .init(alloc);
+        var turn_arena_owned = true;
+        defer if (turn_arena_owned) {
+            turn_arena.deinit();
+            alloc.destroy(turn_arena);
+        };
         const turn_alloc = turn_arena.allocator();
         var shadow_scopes: std.ArrayList(ShadowScope) = .empty;
         if (run_source and schedule.shadow_next) {
@@ -3875,10 +4088,8 @@ pub const Owner = struct {
             // the separate primary snapshot owns its cross-process epoch.
             root.owned_lite_backend.?.native_docstore.?.artifact_reader_fence = false;
         }
-        const publication_name = try alloc.dupe(u8, if (selected) |table| table.name else "default");
-        defer alloc.free(publication_name);
-        const index_prefix = try std.fmt.allocPrint(alloc, "{s}/", .{database.core.index_manager.base_path});
-        defer alloc.free(index_prefix);
+        const publication_name = try turn_alloc.dupe(u8, if (selected) |table| table.name else "default");
+        const index_prefix = try std.fmt.allocPrint(turn_alloc, "{s}/", .{database.core.index_manager.base_path});
         // Replay may lazily open reads against this captured primary tip.
         // Retain its data frontier through the bounded replay window; artifact
         // leases and catalog fingerprints do not protect these primary roots.
@@ -4046,6 +4257,20 @@ pub const Owner = struct {
             return self.finishMaintenanceVisit(lookup_pending, true, audit_round_end);
         }
         clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.finish_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.finish_ns);
+        if (split_index_work and run_source and !group_source_turn and !projection_pending and shadow_scopes.items.len == 0 and
+            self.pending_producer == null and now >= schedule.next_producer_ns and try producerNeedsWork(database))
+        {
+            try self.beginProducerAssumeAdmitted(root, database, group_state, turn_arena, catalog.?, source_read, publication, replay_progress.?);
+            // The job now owns the publication frame, primary epoch and active
+            // runtime borrow. The ordinary turn retains none of those borrows.
+            turn_arena_owned = false;
+            catalog = null;
+            source_read = null;
+            active_runtime_borrow = false;
+            self.maintenance_pending = true;
+            schedule.database_pending = true;
+            return self.finishMaintenanceVisit(true, false, audit_round_end);
+        }
         lease.close();
         MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.turn_capture, turn_held_from);
         lease_held = false;
@@ -4118,6 +4343,7 @@ pub const Owner = struct {
         // Its durable fragment/coverage is useful progress even though the
         // complete source round must remain pending.
         const source_advanced = if (run_source and !group_source_turn and maintenance_error == null) replay_progress.?.advanced(database) else false;
+        if (run_source and qualificationMetricsEnabled()) std.log.info("antfly_bench_native_source_turn table_id={d} group={any} advanced={any} pending={any} capacity_yield={any} elapsed_ns={d} error={s}", .{ publication.identity.table_id, group_source_turn, source_advanced, source_more, source_capacity_yield, replay_finished -| detached_started, if (maintenance_error) |err| @errorName(err) else "none" });
         // The schedule map can grow while the owner gate is released.
         var artifact_more = !run_database and captured_artifact_pending;
         var artifact_delay_ns: u64 = 100 * std.time.ns_per_ms;
@@ -4379,7 +4605,7 @@ pub const Owner = struct {
             self.maintenance_round_pending = false;
         }
         self.collectRetired();
-        return self.runnable_sources.pending(h.handleLockIo()) or self.maintenance_storage_pending or self.maintenance_pending or self.maintenance_table_cursor != 0 or changed or ttl_pending;
+        return self.producer_jobs_active.load(.acquire) != 0 or self.runnable_sources.pending(h.handleLockIo()) or self.maintenance_storage_pending or self.maintenance_pending or self.maintenance_table_cursor != 0 or changed or ttl_pending;
     }
 
     /// A storage-only capture has no provider calls or long-lived replay read
@@ -4493,7 +4719,7 @@ pub const Owner = struct {
         const io = h.handleLockIo();
         self.gate.mutex.lockUncancelable(io);
         defer self.gate.mutex.unlock(io);
-        if (self.pending_text_merge != null or self.maintenance_storage_pending or self.maintenance_pending or
+        if (self.producer_jobs_active.load(.acquire) != 0 or self.pending_text_merge != null or self.maintenance_storage_pending or self.maintenance_pending or
             self.maintenance_table_cursor != 0 or self.runnable_sources.pending(io)) return true;
         var schedules = self.maintenance_schedules.valueIterator();
         while (schedules.next()) |schedule| if (schedule.database_pending or schedule.artifact_pending) return true;
@@ -4540,7 +4766,7 @@ pub const Owner = struct {
         // through path leases, marker scans and the foreground gate at zero delay.
         if (!self.allocator_proof_mutex.tryLock()) return 100;
         self.allocator_proof_mutex.unlock(h.handleLockIo());
-        return if (self.runnable_sources.pending(h.handleLockIo()) or self.maintenance_storage_pending or self.maintenance_table_cursor != 0) 0 else if (pending or self.pending_text_merge != null) 100 else 1000;
+        return if (self.runnable_sources.pending(h.handleLockIo()) or self.maintenance_storage_pending or self.maintenance_table_cursor != 0) 0 else if (pending or self.producer_jobs_active.load(.acquire) != 0 or self.pending_text_merge != null) 100 else 1000;
     }
 
     pub fn maintenanceWaitMillisForTest(self: *Owner, pending: bool) i64 {
@@ -4763,6 +4989,7 @@ pub const Owner = struct {
         // Numeric/enum diagnostics only: no path, SQL, model or document data.
         // Preparation overlaps actor service; durations are not additive.
         std.log.info("antfly_bench_native_owner source_turns={d} capture_ns={d} replay_ns={d} artifacts_ns={d} storage_ns={d} runtime_refreshes={d} maintenance_errors={d} maintenance_timeouts={d} merge_started={d} merge_applied={d} merge_discarded={d} merge_prepare_ns={d} merge_staging_ns={d} merge_staged_bytes={d} merge_publication_ns={d} sql_overlay_hits={d} sql_overlay_scope_extensions={d} sql_overlay_rebuilds={d} sql_overlay_rebuild_entries={d} sql_overlay_evictions={d} sql_staged_statements={d} replay_waits={d} replay_refused_prepare_ns={d} last_failure={s}", .{ p.maintenance_source_turns, p.maintenance_capture_ns, p.maintenance_replay_ns, p.maintenance_artifacts_ns, p.maintenance_storage_ns, p.serving_runtime_refreshes, p.maintenance_errors, p.maintenance_queue_timeouts, p.text_merge_jobs_started, p.text_merge_jobs_applied, p.text_merge_jobs_discarded, p.text_merge_prepare_ns, p.text_merge_staging_ns, p.text_merge_staged_bytes, p.text_merge_publication_ns, p.sql_constraint_overlay_hits, p.sql_constraint_overlay_scope_extensions, p.sql_constraint_overlay_rebuilds, p.sql_constraint_overlay_rebuild_entries, p.sql_constraint_overlay_evictions, p.sql_constraint_staged_statements, p.replay_backpressure_waits, p.replay_refused_preparation_ns, p.last_maintenance_failure orelse "none" });
+        std.log.info("antfly_bench_native_producers started={d} completed={d} service_ns={d}", .{ p.producer_jobs_started, p.producer_jobs_completed, p.producer_service_ns });
         std.log.info("antfly_bench_native_group_controls batches={d} commands={d} native_commits={d}", .{ p.group_source_control_batches, p.group_source_control_commands, p.group_source_control_commits });
         std.log.info("antfly_bench_native_service covered_observations={d} serving_physical_turns={d} admitted_merge_captures={d} ready_merge_publication_turns={d}", .{ p.covered_source_observations, p.serving_physical_turns, p.admitted_merge_captures, p.ready_merge_publication_turns });
         inline for (@typeInfo(MaintenanceHoldSites).@"struct".field_names) |field_name| {
@@ -4799,13 +5026,17 @@ pub const Owner = struct {
 
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
+        self.producer_wake.set(h.handleLockIo());
+        if (self.producer_worker) |worker| worker.join();
+        const uncertain_producer = if (self.pending_producer) |pending| needsOutcomeReconciliation(pending.root) else false;
+        self.collectCompletedProducer();
         self.immutable_sources.clear();
         self.clearImmutableTextHandoff();
         self.clearTextSourceRuntimeCache();
         const uncertain_merge = if (self.pending_text_merge) |pending| needsOutcomeReconciliation(pending.root) else false;
         self.discardPendingTextMerge();
         self.logQualificationSummary();
-        if (!uncertain_merge) self.certifyAllocatorOnClose() catch |err| {
+        if (!uncertain_merge and !uncertain_producer) self.certifyAllocatorOnClose() catch |err| {
             // Failure only loses the optimization; the previous checkpoint
             // remains recoverable and the next owner uses ordinary proof.
             std.log.warn("native Lite allocator certificate deferred: {s}", .{@errorName(err)});
@@ -10840,6 +11071,243 @@ test "capi native maintenance text source reuse refreshes relational rows and fe
     try change.put(@import("../storage/db/table_catalog.zig").key, &changed_catalog.encode());
     try change.commit();
     try std.testing.expect(!try owner.text_source_runtime_cache.?.matches(file));
+}
+
+const ProducerServiceBlockForTest = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    stopped: std.atomic.Value(bool) = .init(false),
+
+    fn run(ptr: *anyopaque, job: *PendingProducer) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.entered.store(true, .release);
+        while (!self.release.load(.acquire) and !job.owner.stopping.load(.acquire))
+            h.handleLockIo().sleep(.fromMilliseconds(1), .awake) catch return;
+        if (job.owner.stopping.load(.acquire)) self.stopped.store(true, .release);
+    }
+
+    fn start(self: *@This(), fixture: *AdmissionFollowupFixture) !void {
+        const owner = fixture.connection.owner;
+        {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            try owner.current.?.db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "text", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+        }
+        owner.test_before_producer_service = .{ .ptr = self, .run = run };
+        try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "producer-source", .value = "{\"text\":\"owned producer source\"}" }}, .sync_level = .write });
+        const io = h.handleLockIo();
+        const deadline = std.Io.Clock.awake.now(io).nanoseconds + 5 * std.time.ns_per_s;
+        while (!self.entered.load(.acquire)) {
+            try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds < deadline);
+            _ = try owner.maintenanceTurnForTest();
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+};
+
+test "capi native independent producer discovers durable backfill without a resident resolver" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("independent-producer-backfill", 5000, .batch);
+    defer fixture.deinit();
+    var lease = try fixture.connection.acquire();
+    defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    defer lease.close();
+    const database = &fixture.connection.owner.current.?.db;
+    try database.addResolver(.{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{_key}}", .promote = false });
+    // Exercise the cold-driver fallback without destroying the owned runtime
+    // or altering its append-context lifetimes.
+    const runtime = database.resolution_runtime;
+    database.resolution_runtime = null;
+    defer database.resolution_runtime = runtime;
+    try std.testing.expect(!try Owner.producerNeedsWork(database));
+    const key = @import("../storage/db/catalog/resolver_catalog.zig").reresolve_resume_key;
+    {
+        var write = try database.core.store.beginWriteTxn();
+        errdefer write.abort();
+        try write.put(key, "last-checked-source");
+        try write.commit();
+    }
+    try std.testing.expect(try Owner.producerNeedsWork(database));
+}
+
+test "capi native independent producer shutdown drains its owned publication frame" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("independent-producer-shutdown", 5000, .batch);
+    var closed = false;
+    defer if (!closed) fixture.deinit() else {
+        std.testing.allocator.free(fixture.path);
+        fixture.tmp.cleanup();
+    };
+    var block: ProducerServiceBlockForTest = .{};
+    defer block.release.store(true, .release);
+    try block.start(&fixture);
+    try std.testing.expect(fixture.connection.owner.pending_producer != null);
+    api.antfly_db_close(fixture.id);
+    closed = true;
+    try std.testing.expect(block.stopped.load(.acquire));
+    const reopened = try open(fixture.path, .{ .profile = .native, .open_mode = .query_readonly, .no_sync = true }, false);
+    const id = try api.publishHandle(reopened);
+    defer api.antfly_db_close(id);
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_lookup_json(id, .fromSlice("producer-source"), &out));
+}
+
+test "capi native independent producer uncertainty fences the owner after job retirement" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("independent-producer-uncertainty", 5000, .batch);
+    defer fixture.deinit();
+    const owner = fixture.connection.owner;
+    var block: ProducerServiceBlockForTest = .{};
+    defer block.release.store(true, .release);
+    try block.start(&fixture);
+    const job = owner.pending_producer.?;
+    owner.gate.mutex.lockUncancelable(h.handleLockIo());
+    job.root.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true;
+    owner.gate.mutex.unlock(h.handleLockIo());
+    defer {
+        owner.gate.mutex.lockUncancelable(h.handleLockIo());
+        owner.current.?.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = false;
+        owner.gate.mutex.unlock(h.handleLockIo());
+    }
+    try std.testing.expectError(error.OutcomeReconciliationRequired, owner.maintenanceTurnForTest());
+    block.release.store(true, .release);
+    const io = h.handleLockIo();
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + 5 * std.time.ns_per_s;
+    while (true) {
+        owner.gate.mutex.lockUncancelable(io);
+        const pending = owner.pending_producer != null;
+        owner.gate.mutex.unlock(io);
+        if (!pending) break;
+        try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds < deadline);
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    owner.collectCompletedProducer();
+    try std.testing.expect(owner.pending_producer == null);
+    try std.testing.expectError(error.OutcomeReconciliationRequired, owner.maintenanceTurnForTest());
+    // This new operation is refused by the retained reconciliation fence;
+    // only the original ambiguous publication has an unknown commit outcome.
+    try std.testing.expectEqual(h.capi.ErrorCode.stalled, fixture.call(.batch));
+    owner.test_before_producer_service = null;
+}
+
+test "capi native independent producer wait keeps real text replay and credits runnable" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("independent-producer-credits", 5000, .batch);
+    defer fixture.deinit();
+    const owner = fixture.connection.owner;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"raw\",\"type\":\"full_text\"}")));
+    var names: [128][32]u8 = undefined;
+    var writes: [128]h.db_mod.types.BatchWrite = undefined;
+    for (&writes, 0..) |*write, i| write.* = .{
+        .key = try std.fmt.bufPrint(&names[i], "old-{d}", .{i}),
+        .value = "{\"text\":\"old independent text credit canary\"}",
+    };
+    // These old records have only text consumers. A later expensive producer
+    // must not prevent that text consumer from returning their retained bytes.
+    for (0..8) |batch|
+        try fixture.writeReplaySource(.{ .writes = writes[batch * 16 ..][0..16], .sync_level = .write });
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        try owner.current.?.db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "text", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    }
+    try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "new-producer-input", .value = "{\"text\":\"new provider input\"}" }}, .sync_level = .write });
+    const Block = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        fn run(ptr: *anyopaque, job: *PendingProducer) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire) and !job.owner.stopping.load(.acquire))
+                h.handleLockIo().sleep(.fromMilliseconds(1), .awake) catch return;
+        }
+    };
+    var block: Block = .{};
+    defer block.release.store(true, .release);
+    owner.test_before_producer_service = .{ .ptr = &block, .run = Block.run };
+    const io = h.handleLockIo();
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + 5 * std.time.ns_per_s;
+    while (!block.entered.load(.acquire)) {
+        try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds < deadline);
+        _ = try owner.maintenanceTurnForTest();
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(owner.pending_producer != null);
+    var before_bytes: u64 = 0;
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(io);
+        defer lease.close();
+        const root = try owner.refresh();
+        const file = &root.owned_lite_backend.?.native_docstore.?.file;
+        var state = (try file.replayAdmission()).?;
+        before_bytes = state.bytes;
+        state.limits.bytes = state.bytes + 1;
+        try file.putDocument(native.replay_admission.key, &state.encode());
+    }
+    const Request = struct {
+        fixture: *AdmissionFollowupFixture,
+        done: std.atomic.Value(bool) = .init(false),
+        result: h.capi.ErrorCode = .internal,
+        fn run(self: *@This()) void {
+            self.result = self.fixture.call(.batch);
+            self.done.store(true, .release);
+        }
+    };
+    const polls = api.test_replay_capacity_polls.load(.monotonic);
+    var request: Request = .{ .fixture = &fixture };
+    const caller = try std.Thread.spawn(.{}, Request.run, .{&request});
+    var joined = false;
+    defer if (!joined) caller.join();
+    while (api.test_replay_capacity_polls.load(.monotonic) == polls and !request.done.load(.acquire)) {
+        try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds < deadline);
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(api.test_replay_capacity_polls.load(.monotonic) > polls);
+    // Keep the provider blocked throughout real consumer service. No test
+    // changes watermarks, deletes journal records, or raises the quota. The
+    // writer's exact footprint, not the first small refund, determines success.
+    var reclaimed = false;
+    while (!request.done.load(.acquire) and std.Io.Clock.awake.now(io).nanoseconds < deadline) {
+        _ = owner.maintenanceTurnForTest() catch |err| switch (err) {
+            error.EnrichmentWaitCanceled => true,
+            else => return err,
+        };
+        {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(io);
+            defer lease.close();
+            const root = try owner.refresh();
+            const state = try root.owned_lite_backend.?.native_docstore.?.file.replayAdmission();
+            reclaimed = state.?.bytes < before_bytes;
+        }
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    caller.join();
+    joined = true;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, request.result);
+    try std.testing.expect(reclaimed);
+    try std.testing.expect(!owner.pending_producer.?.done.load(.acquire));
+    try std.testing.expect(block.entered.load(.acquire) and !block.release.load(.acquire));
+    // Structural mutation may retire the producer's old catalog, but cannot
+    // relocate an inline index array still borrowed by its separate actor.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"other\",\"type\":\"full_text\"}")));
+    var deleted = false;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(fixture.id, .fromSlice("other"), &deleted));
+    try std.testing.expect(deleted);
+    try std.testing.expect(!owner.pending_producer.?.done.load(.acquire));
+    block.release.store(true, .release);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(fixture.id));
+    owner.test_before_producer_service = null;
+    try std.testing.expect(owner.pending_producer == null);
+    try std.testing.expect(owner.publication_stats.producer_jobs_completed != 0);
+    var lease = try fixture.connection.acquire();
+    defer fixture.connection.gate.mutex.unlock(io);
+    defer lease.close();
+    try std.testing.expect((try owner.current.?.owned_lite_backend.?.native_docstore.?.file.check()).valid);
 }
 
 test "capi native cooperative replay separates raw text from generated artifact dependencies" {
