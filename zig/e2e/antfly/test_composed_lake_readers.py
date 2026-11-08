@@ -71,6 +71,12 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
     assert 6 <= body_bytes <= 4096
     record_property("archive_rows", archive_rows)
     record_property("body_bytes", body_bytes)
+    cache_mib = int(os.environ.get("ANTFLY_E2E_COMPOSED_CACHE_MIB", "64"))
+    pending_rows = int(os.environ.get("ANTFLY_E2E_COMPOSED_PENDING_ROWS", "0"))
+    assert 1 <= cache_mib <= 256
+    assert 0 <= pending_rows <= 10_000
+    record_property("cache_mib", cache_mib)
+    record_property("additional_pending_rows", pending_rows)
     switches = {
         name: os.environ.get("ANTFLY_E2E_COMPOSED_" + name, default)
         for name, default in (("HIGHLIGHTS", "0"), ("STORE_SOURCE", "1"))
@@ -114,7 +120,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             config.setdefault("lake_indexes", {})["serving_cuts"] = {"enabled": True}
         config["lake_cache"] = {
             "root": str(root / "serving-cache"),
-            "max_memory_bytes": 64 * 1024**2,
+            "max_memory_bytes": cache_mib * 1024**2,
             "max_disk_bytes": 1024**3,
         }
         config["storage"] = {"engine": "local", "local": {"base_dir": str(root)}}
@@ -600,6 +606,12 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 for k, v in [line.split()]
             }
 
+        def assert_ready():
+            for name in ("history", "current"):
+                _, resource = call("GET", f"/tables/{name}/indexes/body_text")
+                assert resource["status"]["readiness"]["queryable"], resource
+
+        assert_ready()
         # The health endpoint exposes an asynchronous five-second cache.
         time.sleep(6)
         before = metrics()
@@ -725,12 +737,26 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                         {"id": 50, "body": "different", "deleted": False},
                         {"id": later_id, "body": "quasar", "deleted": False},
                     )
+                ]
+                + [
+                    {
+                        "op": "upsert",
+                        "row": {
+                            "id": archive_rows + 10_000 + offset,
+                            "body": "overlaypressuretoken",
+                            "deleted": True,
+                        },
+                    }
+                    for offset in range(pending_rows)
                 ],
             },
         )
         _, committed = call("GET", "/tables/current/lake/catalog")
         assert committed["metadata"]["properties"]["antfly.wal.coverage"] == "1"
         _, accepted_first = call("POST", "/query", query)
+        # Owned readiness must use the accepted cut even while publishing is
+        # blocked and the retained WAL overlay is nonempty.
+        assert_ready()
         assert accepted_first["next_source_cursor"].startswith(
             "source3:" if owned else "source2:"
         )

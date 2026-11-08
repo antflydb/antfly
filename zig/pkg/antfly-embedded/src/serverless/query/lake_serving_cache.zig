@@ -23,6 +23,9 @@ const ObjectReader = @import("lake_object_reader.zig").ObjectStorageRangeReader;
 const Allocator = std.mem.Allocator;
 pub const Cache = struct {
     alloc: Allocator,
+    /// Optional demand history contains only immutable identities and offsets.
+    /// Credentials, leases and request capabilities never enter this cache.
+    text_demand: @import("lake_text_demand.zig").History = .{},
     decoded: @import("lake_decoded_cache.zig").Cache,
     /// Pinned tree paths must not evict compact planning metadata or prevent
     /// file-order admission. Navigation has independent bounded residency.

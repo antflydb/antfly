@@ -238,7 +238,7 @@ const Prepared = struct {
         }, retainedCancellation(&self.retained_context), &server.lake_retained_payloads);
         return self.durable_token.?;
     }
-    fn deinit(self: *Prepared) void {
+    pub fn deinit(self: *Prepared) void {
         self.selected.deinit();
         if (self.manifest_pin) |pin| pin.release();
         self.source.deinit();
@@ -253,7 +253,7 @@ const Prepared = struct {
         backing.destroy(self);
     }
 };
-fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, request_profile: *@import("lake_query_metrics.zig").ComposedProfile, is_lake: *bool, allow_owned: bool) !?*Prepared {
+fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, request_profile: ?*@import("lake_query_metrics.zig").ComposedProfile, is_lake: *bool, allow_owned: bool) !?*Prepared {
     const prepared = try backing.create(Prepared);
     prepared.* = .{ .backing = backing, .arena = .init(backing) };
     var transferred = false;
@@ -280,7 +280,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     const now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
     prepared.native_owner = owner: {
         const started = @import("antfly_platform").time.monotonicNs();
-        defer request_profile.record(&server.lake_query_metrics, .owner_admission, started);
+        defer if (request_profile) |profile| profile.record(&server.lake_query_metrics, .owner_admission, started);
         break :owner try source_owner.lookup(a, server, table, request);
     };
     const compatible_owned = allow_owned and !buildsVector(req) and (req.full_text_queries.len == 0 or (req.full_text_queries.len == 1 and req.full_text == null));
@@ -336,7 +336,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     const publication = state.value.published orelse return error.ExternalLakeIndexNotPublished;
     const lease = admitted: {
         const admission_started = @import("antfly_platform").time.monotonicNs();
-        defer request_profile.record(&server.lake_query_metrics, .admission, admission_started);
+        defer if (request_profile) |profile| profile.record(&server.lake_query_metrics, .admission, admission_started);
         break :admitted try server.lake_reader_leases.acquireRetained(server.embedding_provider_runtime.io, authority, table.table_id, publication.generation, context, if (retained) |cut| cut.reader_token else null);
     };
     defer if (!transferred) lease.deinit();
@@ -390,7 +390,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     // authority rather than silently ignoring locally acknowledged WAL rows.
     if (retained == null and schema.binding.write_policy == .iceberg_writer and server.cfg.node_config != null) {
         const wal_started = @import("antfly_platform").time.monotonicNs();
-        defer request_profile.record(&server.lake_query_metrics, .wal_cut, wal_started);
+        defer if (request_profile) |profile| profile.record(&server.lake_query_metrics, .wal_cut, wal_started);
         const catalog = local.serverless_external_source_mod.lake_catalog;
         var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, schema.binding, options, context, .load);
         defer current.deinit(a);
@@ -429,7 +429,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     if (retained != null) if (req.lake_read) |read| if (read.through) |receipt| if (retained_pending.lsn < receipt.wal_lsn) return error.IndexRebuilding;
     var source = blk: {
         const source_started = @import("antfly_platform").time.monotonicNs();
-        defer request_profile.record(&server.lake_query_metrics, .source, source_started);
+        defer if (request_profile) |profile| profile.record(&server.lake_query_metrics, .source, source_started);
         break :blk try @import("lake_published_navigation.zig").open(a, server, table.table_id, table.lake_index_catalog_json, .{ .storage_mode = .relational, .external_base_source = source_schema }, options.lakeOptions(), context, request, lease);
     };
     defer if (!transferred) source.deinit();
@@ -447,7 +447,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     server.attachLakeRepairHint(&source);
     var selected = blk: {
         const publication_started = @import("antfly_platform").time.monotonicNs();
-        defer request_profile.record(&server.lake_query_metrics, .publication, publication_started);
+        defer if (request_profile) |profile| profile.record(&server.lake_query_metrics, .publication, publication_started);
         break :blk (try @import("lake_index_selection.zig").selectCachedWithLease(ca, sql_table, &source, store, context, .required, &server.lake_read_cache, lease)) orelse return error.ExternalLakeIndexUnavailable;
     };
     defer if (!transferred) selected.deinit();
@@ -472,6 +472,13 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     transferred = true;
     return prepared;
 }
+/// Readiness for owned text/ordered-row tables uses the same admitted cut,
+/// credential validation and retained reader lifetime as a real query. Other
+/// consumers keep their strict live-catalog qualification in readiness.names.
+pub fn prepareReadiness(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, request: local.api_operation.RequestContext) !*Prepared {
+    var is_lake = false;
+    return (try prepare(a, server, table, .{}, request, null, &is_lake, true)) orelse error.ExternalLakeIndexUnavailable;
+}
 fn buildsVector(req: types.SearchRequest) bool {
     return req.dense != null or req.sparse != null or req.dense_queries.len != 0 or req.sparse_queries.len != 0;
 }
@@ -482,9 +489,11 @@ const Manifest = struct {
     }
     fn load(a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, token: @import("antfly_cancellation").CancellationToken, cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead) !Manifest {
         var artifacts = store;
+        // The decoded-cache arena owns the verified result directly. Never
+        // borrow the immutable-byte cache's evictable storage or copy it twice.
+        artifacts.allocator = a;
         const bytes = try @import("lake_retained_cut.zig").readRetainedCached(&artifacts, .{ .id = ref.artifact_id, .bytes = @intCast(ref.byte_len), .generation = if (ref.name.len != 0) @constCast(ref.name) else null }, token, cached);
-        defer artifacts.allocator.free(bytes);
-        return .{ .bytes = try a.dupe(u8, bytes) };
+        return .{ .bytes = bytes };
     }
 };
 pub fn refreshOwnedCut(backing: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, caller: local.api_operation.RequestContext) !void {

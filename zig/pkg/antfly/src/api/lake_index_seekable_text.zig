@@ -111,20 +111,63 @@ pub fn warmBounded(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
         spent += bytes.len;
         bundled = true;
     };
-    for ([_][]const Piece{ if (bundled) &.{} else directory.metadata, directory.blocks }) |pieces| {
-        // Cover dictionary/locator opening pages and a bounded sample of
-        // posting/source blocks; actual query blocks remain in the shared
-        // memory/disk cache after their first authenticated demand read.
-        for (pieces, 0..) |piece, index| {
-            if (index == 4) break;
-            if (piece.ref.byte_len > maximum_bytes -| spent) break;
-            try read.check();
-            var held = try readPieceLease(a, read.store, piece, read.cancellation, read.cache);
-            spent += @intCast(piece.ref.byte_len);
-            held.deinit();
-        }
+    // Opening metadata is the publication's authenticated navigation manifest.
+    // Cover it before spending the allowance on arbitrary posting prefixes.
+    if (!bundled) for (directory.metadata) |piece| {
+        if (piece.ref.byte_len > maximum_bytes -| spent) break;
+        try read.check();
+        var held = try readPieceLease(a, read.store, piece, read.cancellation, read.cache);
+        spent += @intCast(piece.ref.byte_len);
+        held.deinit();
+    };
+    var recent: [16]u32 = undefined;
+    const preferred = if (read.cache) |cached| cached.cache.text_demand.recent(@TypeOf(cached.cache.text_demand).identity(cached.scope, ref.artifact_id), &recent) else &.{};
+    // Replay actual demand first. No hints is a bounded cold-start fallback;
+    // hints never authorize a block or survive outside the cache scope.
+    const fallback = [_]u32{ 0, 1, 2, 3 };
+    for (if (preferred.len != 0) preferred else &fallback) |index| {
+        if (index >= directory.blocks.len) continue;
+        const piece = directory.blocks[index];
+        if (piece.ref.byte_len > maximum_bytes -| spent) continue;
+        try read.check();
+        var held = try readPieceLease(a, read.store, piece, read.cancellation, read.cache);
+        spent += @intCast(piece.ref.byte_len);
+        held.deinit();
     }
     return spent;
+}
+
+test "external lake seekable warming prioritizes late demand within the byte allowance" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("warm-demand");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    const bytes = try a.alloc(u8, 8 * block_bytes);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @intCast(i / block_bytes);
+    const ref = try publish(a, a, &store, bytes, .none);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const routing = try loadDirectory(scratch.allocator(), .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, ref);
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const scope: [32]u8 = @splat(3);
+    cache.text_demand.record(@TypeOf(cache.text_demand).identity(scope, ref.artifact_id), 6);
+    const allowance: usize = @intCast(ref.byte_len + block_bytes);
+    const spent = try warmBounded(scratch.allocator(), .{ .store = store, .cache = .{ .cache = &cache, .scope = scope, .context = .{} }, .context = .{}, .cancellation = .none }, ref, allowance);
+    try std.testing.expect(spent <= allowance);
+    for ([_]usize{ 6, 0 }) |index| {
+        const piece = routing.blocks[index];
+        var held = try cache.lookupImmutableBlockLease(a, scope, piece.ref.artifact_id, @intCast(piece.ref.byte_len), try stores.sha256DigestFromChecksum(piece.ref.checksum), .{});
+        defer if (held) |*lease| lease.deinit();
+        try std.testing.expect((held != null) == (index == 6));
+        if (held) |lease| try std.testing.expectEqualSlices(u8, bytes[piece.offset..][0..@intCast(piece.ref.byte_len)], lease.bytes());
+    }
 }
 fn upload(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation) !Ref {
     var writer = store.*;
@@ -1447,6 +1490,9 @@ const Owner = struct {
             const within = offset - piece.offset;
             const take = @min(out.len - done, data.len - within);
             @memcpy(out[done..][0..take], data[within..][0..take]);
+            if (!publication) if (block) |index| if (self.directory_ref) |ref| if (capability.cache) |cached| {
+                cached.cache.text_demand.record(@TypeOf(cached.cache.text_demand).identity(cached.scope, ref.artifact_id), index);
+            };
             if (block) |index| if (self.directory_ref == null) {
                 @import("antfly_platform").sync.lockYielding(&self.mutex);
                 self.loaded[index] = true;

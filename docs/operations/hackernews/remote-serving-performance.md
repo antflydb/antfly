@@ -893,3 +893,45 @@ timings. The deployment qualifications described above still apply.
 Full-lake E2E now collects a native HN managed-overlay bridge, exercising the
 hierarchy/restart regression through the assembled artifacts. This additional
 local, credential-free bridge passed with the locked lake/Iceberg extras.
+
+
+## Cold working-set follow-up
+
+The follow-up to PR #1550 keeps the existing 16-segment / 16 MiB optional
+warming allowance and reader/cancellation fences. Within each admitted segment,
+opening metadata takes priority over arbitrary posting prefixes. A process-local
+history records up to 16 recently demanded blocks for each of 64 immutable
+segment directories. History keys include the credential cache scope and exact
+directory identity; entries contain no credentials, provider clients, leases or
+request pointers. Recording uses a nonblocking mutex attempt, so optional
+history cannot stall demand I/O. Warming resolves hints through the current
+validated directory and authenticates every block normally.
+
+This history improves rewarming after eviction within a process. It is not a
+durable hot-set manifest: after restart, the verified disk cache and publication
+opening metadata provide the cold-start path. The bounded publication traversal
+still limits coverage of large archives; no full-archive residency claim follows
+from this change.
+
+Owned text/ordered-row readiness now selects the retained native cut through the
+same preparation path as queries. It retains credential/store/definition checks,
+reader protection, cut expiry and accepted-WAL visibility while avoiding fresh
+live-source catalog discovery. Readiness does not contribute query-phase metrics.
+Tables containing vector or materialization definitions retain strict live-source
+qualification. Manifest loading transfers its verified allocation into the decoded
+owner, and source planning transfers its manifest into the serving source instead
+of duplicating it. Parallel views continue borrowing from their parent source.
+
+The composed HTTP fixture accepts `ANTFLY_E2E_COMPOSED_CACHE_MIB` (1–256,
+default 64) and `ANTFLY_E2E_COMPOSED_PENDING_ROWS` (0–10,000, default 0). Extra
+pending rows do not match the correctness query, but must survive retained-cut
+construction, resumed pagination and suppression checks. These options extend the
+existing real-corpus, selectivity, concurrent-write, restart and cache-cleared
+checks without changing their expected results or retry contracts.
+
+Remaining deployment qualification uses a released candidate on the existing
+managed route and intended CPU/memory shape, sustained credential refresh and
+owner replacement with loss of local cache. Full-archive query diversity and
+cache pressure must be measured before making archive-wide latency claims. Real
+S3 qualification remains waived for this task. Keep compact new results here;
+the November 8 baseline above does not need duplicated artifacts or reruns.

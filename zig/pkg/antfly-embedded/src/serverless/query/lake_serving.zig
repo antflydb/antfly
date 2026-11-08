@@ -650,7 +650,11 @@ pub const ServingSource = struct {
                 const manifest_api = @import("lake_parquet_manifest.zig");
                 const manifest_uri = base orelse binding.source_uri;
                 const bytes = if (options.retained_manifest) |manifest| try alloc.dupe(u8, manifest) else try @import("lake_iceberg_snapshot.zig").readFullObjectAlloc(alloc, &client, null, manifest_uri, .iceberg_metadata, null, 1024 * 1024);
-                defer alloc.free(bytes);
+                // Transfer this allocation into the serving source after the
+                // plan is admitted. Failure and plan construction still own it
+                // here; parallel views borrow it from the parent source.
+                var bytes_transferred = false;
+                defer if (!bytes_transferred) alloc.free(bytes);
                 var snapshot: @import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan = undefined;
                 if (cache) |shared| {
                     const scope = try cacheScope(alloc, store, binding);
@@ -664,12 +668,11 @@ pub const ServingSource = struct {
                         defer if (!adopted) header.deinit(alloc);
                         file_navigation = try navigation.?.resolve(navigation.?.ptr, alloc, .{ .requested = key, .current = key, .selected = key }, header, context);
                         if (file_navigation != null) {
-                            const metadata_copy = try alloc.dupe(u8, bytes);
-                            errdefer alloc.free(metadata_copy);
                             const uri_copy = try alloc.dupe(u8, manifest_uri);
                             errdefer alloc.free(uri_copy);
                             const snapshot_copy = if (binding.snapshot_mode.pinnedSnapshotId()) |value| try alloc.dupe(u8, value) else null;
-                            deferred_snapshot = .{ .metadata = metadata_copy, .uri = uri_copy, .snapshot = snapshot_copy, .cache = shared, .key = key, .scope = scope };
+                            deferred_snapshot = .{ .metadata = bytes, .uri = uri_copy, .snapshot = snapshot_copy, .cache = shared, .key = key, .scope = scope };
+                            bytes_transferred = true;
                             snapshot = .{ .inventory = header };
                             adopted = true;
                         }
@@ -685,7 +688,10 @@ pub const ServingSource = struct {
                         snapshot = lease.item.payload.snapshot;
                     }
                 } else snapshot = try manifest_api.plan(alloc, .{ .client = client, .source = binding.table_id, .uri = binding.source_uri, .schema = binding.schema_fingerprint, .context = context }, bytes);
-                if (deferred_snapshot == null) sealed_manifest = try alloc.dupe(u8, bytes);
+                if (deferred_snapshot == null) {
+                    sealed_manifest = bytes;
+                    bytes_transferred = true;
+                }
                 break :blk snapshot.inventory;
             },
             .iceberg => blk: {
