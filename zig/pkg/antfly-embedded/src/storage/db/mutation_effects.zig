@@ -18,7 +18,7 @@
 //! can resolve postimages before entering either writer gate.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const types = @import("types.zig");
+const types = @import("mutation_values.zig");
 
 /// Immutable request inputs independent of the caller's buffers. Both
 /// publication cohorts and transform preparation retain this same representation.

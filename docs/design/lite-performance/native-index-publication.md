@@ -300,6 +300,34 @@ semantic index generations do not change merely because an obsolete physical
 artifact was removed. Foreign allocator state is validated once and its verified
 ledger/digest can transfer to a replacement runtime under exact checkpoint checks.
 
+Cold runtime construction is observational even for a writer handle. Loading
+an optional posting checkpoint ahead of the general replay watermark leaves it
+on disk and keeps the observer on its legacy authority. The producer may have
+published that checkpoint before finishing the multi-index turn. Deleting it
+from a visibility probe invalidates the producer's exact input witness and can
+create a restart loop. Authoritative native checkpoints still fail closed when
+their required coverage is unavailable.
+
+Vector generation observation also preserves unpublished construction and
+incomplete WAL tails. An admitted append writer reconciles an observed tail only
+after validating the exact CURRENT bytes and committed WAL boundary. A changed
+manifest or a peer's newer committed prefix requires reopening; an old reader
+cannot authorize appending to that state. Collection belongs to publication,
+where exclusion from active builders is established.
+
+Cold graph recovery derives its debt from the durable staging-key prefix,
+including at sequence zero. Visibility polling parks while that debt is being
+recovered and still propagates a failed worker. Detached activity uses a
+mutex-protected epoch condition so a new cohort cannot reset an event while
+previous waiters are returning from it.
+
+Physical retirement captures a consumer cut for each bounded sweep. A growing
+output tip queues another sweep instead of restarting the current cursor; a
+lower permission cut clamps it immediately. Each turn examines at most 64
+canonical records and reads only the fixed consumer-reference header. Physical
+transaction success remains the point at which deletion progress is recorded
+and credits can return.
+
 ## Prepared background merges
 
 A merge captures immutable sources and deletion state under a short admitted
