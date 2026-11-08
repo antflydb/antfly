@@ -209,6 +209,12 @@ return only after every required reference and physical retained payload has bee
 deleted. Partial continuation accounting follows physical ownership rather than
 pretending a retained whole record is free.
 
+Explicit native drains service a fair cohort of namespaces too. A projection,
+resolver or promotion publication that exhausts replay capacity remains pending
+while downstream replay and physical retirement receive their turns. This
+applies both to independent producer service and workerless replay. A capacity
+yield never enlarges the reserve, refunds retained bytes or hides another error.
+
 Text producer capacity is shared by the foreground and replay paths. The owned
 foreground plan checks the current per-index segment limit before capture and
 checks the actual replacement inventory again under final admission. Declining

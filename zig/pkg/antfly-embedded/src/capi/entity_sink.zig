@@ -646,7 +646,15 @@ fn drainNativeReplayCohort(root: *h.Handle) !void {
         for (entries.items) |entry| {
             _ = arena.reset(.retain_capacity);
             // Resolver pulls share the same fair round as producer/index work.
-            const projected = try @import("resolver_authority.zig").pullProjection(root, entry.database, arena.allocator());
+            const projected = @import("resolver_authority.zig").pullProjection(root, entry.database, arena.allocator()) catch |err| switch (err) {
+                // Projection is a producer too. Retain its debt while this
+                // same fair round services the consumers which free credits.
+                error.LiteReplayBacklogExceeded => blk: {
+                    pending = true;
+                    break :blk false;
+                },
+                else => return err,
+            };
             const replay_pending = try entry.database.runExplicitReplayDrainTurn(entry.state, entry.producer_after);
             pending = pending or projected or replay_pending;
             if (entry.database.enrichment_runtime) |runtime| retrying = retrying or runtime.stats().retrying;

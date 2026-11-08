@@ -35825,11 +35825,29 @@ pub const DB = struct {
         // The bounded consumer turn deliberately skips external producers.
         // An explicit drain owns their service once that actor has drained;
         // otherwise producer debt keeps the cohort spinning without advancing.
-        if (state.external_producers.load(.acquire))
-            _ = try self.runBackgroundTurnWithState(.none, .producers, state);
+        var capacity_pending = false;
+        if (state.external_producers.load(.acquire)) {
+            _ = self.runBackgroundTurnWithState(.none, .producers, state) catch |err| switch (err) {
+                // Resolver/promotion outputs use the same finite reserve as
+                // enrichment. Their refusal must not skip the consumers and
+                // physical retirement that return those credits.
+                error.LiteReplayBacklogExceeded => blk: {
+                    capacity_pending = true;
+                    break :blk false;
+                },
+                else => return err,
+            };
+        }
         const before = self.core.nextDerivedSequence();
         var pressure_pending = false;
         _ = self.runBackgroundTurnWithState(.none, .replay, state) catch |err| switch (err) {
+            // Workerless owners also drive resolvers from the replay turn.
+            // Partial committed progress survives this yield; no credits are
+            // returned until the retirement phase deletes the retained bytes.
+            error.LiteReplayBacklogExceeded => blk: {
+                capacity_pending = true;
+                break :blk true;
+            },
             error.TextMergeBackpressureTimeout => blk: {
                 _ = try self.runBackgroundTurnWithState(.none, .pressure_artifacts, state);
                 pressure_pending = true;
@@ -35850,7 +35868,7 @@ pub const DB = struct {
         if (self.run_until_idle_no_progress_timeout_ns != 0)
             try self.checkTargetAdvanceNoProgress(self.run_until_idle_no_progress_timeout_ns);
         const retirement_pending = try self.runBackgroundTurnWithState(.none, .retirement, state);
-        return pressure_pending or self.replayWorkPending(before, false) or retirement_pending;
+        return capacity_pending or pressure_pending or self.replayWorkPending(before, false) or retirement_pending;
     }
 
     /// A connection's explicit drain borrows the same cursor/lease identity as
