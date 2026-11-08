@@ -129,6 +129,16 @@ entry point. Deletes set a
 flag; deleted nodes stay traversable and are filtered from results. The paper
 suggests rebuilding once `deletedFraction()` passes about 5%.
 
+**Filtered search.** `SearchOptions.filter` restricts results to nodes it
+allows. Both walks still pass through rejected nodes to reach allowed ones,
+but only allowed nodes enter the beam, the results and (in `bounds` mode)
+the recompute pool, so a selective filter keeps walking until it holds `ef`
+allowed candidates. Layer-0 edges are directed and reachability is only
+guaranteed from the entry point, so a walk that runs dry restarts there,
+then falls back to scoring the remaining unvisited allowed nodes from their
+codes (no embeddings). `LeannStore` and the replicated state pass id, key
+and prefix filters this way; only distance bounds still over-fetch.
+
 ### Differences from the paper
 
 - **RaBitQ and bound-driven reranking** replace the paper's PQ and fixed
@@ -559,13 +569,10 @@ Three modes:
    re-embedded text) during handoff.
 3. **Remote storage and native backups.** Store `leann.store` through the
    dense storage abstraction and include it in native checkpoints.
-4. **Filter-aware traversal.** Filters are applied after an over-fetched
-   search today; very selective filters would be better served by passing
-   them into the graph walk.
-5. **Leader replication follow-ups.** See
+4. **Leader replication follow-ups.** See
    [Leader replication](#leader-replication): splits, a cluster VOPR, and
    CI verification of the data runtime pieces.
-6. **E2E coverage.** Add a Python e2e test that creates an
+5. **E2E coverage.** Add a Python e2e test that creates an
    `algorithm: "leann"` index over HTTP and queries it.
 
 ## Leader replication

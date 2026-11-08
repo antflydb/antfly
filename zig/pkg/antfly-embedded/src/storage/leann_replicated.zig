@@ -657,28 +657,33 @@ pub const ReplicatedState = struct {
         const loader = self.loader orelse return error.MissingVectorLoader;
         var ctx = KeyLoader{ .state = @constCast(self), .loader = loader };
         var want: u32 = @intCast(@max(req.k, 1));
-        const filtered = req.filter_ids.len > 0 or req.exclude_ids.len > 0 or req.key_predicate != null or
-            req.filter_prefix.len > 0 or req.distance_over != null or req.distance_under != null;
+        // Id, key and prefix filters go into the graph walk; only distance
+        // bounds are applied afterwards, over an enlarged result set.
+        const key_filtered = req.filter_ids.len > 0 or req.exclude_ids.len > 0 or req.key_predicate != null or
+            req.filter_prefix.len > 0;
+        const filtered = req.distance_over != null or req.distance_under != null;
         if (filtered) want = @intCast(@max(req.k * 4, req.k + 64));
         const live: u32 = @intCast(@max(self.replica.liveCount(), 1));
+        var key_filter = KeyRequestFilter{ .state = self, .req = &req };
         while (true) {
             want = @min(want, live);
             const hits = try self.replica.search(alloc, req.query, want, .{
                 .ef = self.opts.search_ef,
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
+                .filter = if (key_filtered) .{ .ctx = &key_filter, .allows_fn = KeyRequestFilter.allows } else null,
             }, ctx.keyLoader());
             defer alloc.free(hits);
             var passed: usize = 0;
             for (hits) |h| {
                 const vector_id = self.bindings.get(h.key) orelse continue;
-                if (!try allows(req, vector_id, h.key, h.distance)) continue;
+                if (!try allows(req, vector_id, h.key, h.distance, true)) continue;
                 passed += 1;
             }
             if (passed >= req.k or want >= live or !filtered) {
                 for (hits) |h| {
                     const vector_id = self.bindings.get(h.key) orelse continue;
-                    if (!try allows(req, vector_id, h.key, h.distance)) continue;
+                    if (!try allows(req, vector_id, h.key, h.distance, true)) continue;
                     out.addResultWithOwnedMetadata(vector_id, h.distance, 0, if (req.load_metadata) try alloc.dupe(u8, h.key) else null);
                 }
                 return out;
@@ -687,11 +692,23 @@ pub const ReplicatedState = struct {
         }
     }
 
-    fn allows(req: search_types.SearchRequest, vector_id: u64, key: []const u8, dist: f32) !bool {
+    const KeyRequestFilter = struct {
+        state: *const ReplicatedState,
+        req: *const search_types.SearchRequest,
+
+        fn allows(raw: *const anyopaque, key: []const u8) anyerror!bool {
+            const self: *const KeyRequestFilter = @ptrCast(@alignCast(raw));
+            const vector_id = self.state.bindings.get(key) orelse return false;
+            return ReplicatedState.allows(self.req.*, vector_id, key, 0, false);
+        }
+    };
+
+    fn allows(req: search_types.SearchRequest, vector_id: u64, key: []const u8, dist: f32, check_distance: bool) !bool {
         if (req.filter_ids.len > 0 and std.mem.indexOfScalar(u64, req.filter_ids, vector_id) == null) return false;
         if (std.mem.indexOfScalar(u64, req.exclude_ids, vector_id) != null) return false;
         if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, key, req.filter_prefix)) return false;
         if (req.key_predicate) |p| if (!try p.allows(p.ptr, key)) return false;
+        if (!check_distance) return true;
         if (req.distance_over) |t| if (!(dist > t)) return false;
         if (req.distance_under) |t| if (!(dist < t)) return false;
         return true;

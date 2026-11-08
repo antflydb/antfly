@@ -186,8 +186,22 @@ pub const Rerank = enum {
     bounds,
 };
 
+/// Restricts results to nodes it allows. The walk still passes through
+/// rejected nodes, so a selective filter keeps exploring until `ef` allowed
+/// candidates are found instead of returning a short page.
+pub const Filter = struct {
+    ctx: *const anyopaque,
+    allows_fn: *const fn (ctx: *const anyopaque, id: u32) anyerror!bool,
+
+    pub fn allows(self: Filter, id: u32) !bool {
+        return self.allows_fn(self.ctx, id);
+    }
+};
+
 pub const SearchOptions = struct {
     k: u32 = 10,
+    /// Only nodes this allows are returned (or recomputed in `bounds` mode).
+    filter: ?Filter = null,
     /// Beam width, raised to `k` when smaller. Zero picks a default per
     /// rerank mode: 64 for `ratio`, where every beam slot costs
     /// recomputation, and 512 for `bounds`, where the walk only costs
@@ -722,6 +736,66 @@ pub const Index = struct {
             try out.append(alloc, .{ .id = c.id, .distance = c.dist });
         }
         return .{ .results = try out.toOwnedSlice(alloc), .stats = stats };
+    }
+
+    /// Filtered-search fallback: adds every unvisited, live, allowed node to
+    /// the recompute pool by its estimate.
+    fn scoreUnvisitedAllowed(
+        self: *const Index,
+        alloc: Allocator,
+        approx: *Approx,
+        filter: Filter,
+        visited: *std.DynamicBitSetUnmanaged,
+        scale: f32,
+        pool: anytype,
+        stats: *SearchStats,
+    ) !void {
+        var chunk = std.ArrayListUnmanaged(u32).empty;
+        defer chunk.deinit(alloc);
+        var next: u32 = 0;
+        while (next < self.node_count) {
+            chunk.clearRetainingCapacity();
+            while (next < self.node_count and chunk.items.len < 1024) : (next += 1) {
+                if (visited.isSet(next) or self.isDeleted(next)) continue;
+                visited.set(next);
+                if (try filter.allows(next)) try chunk.append(alloc, next);
+            }
+            const ests = try approx.score(chunk.items);
+            stats.approx_evaluated += @intCast(chunk.items.len);
+            for (chunk.items, ests) |id, e| try pool.append(alloc, .{ .id = id, .lower = e.dist - scale * e.bound });
+        }
+    }
+
+    /// Two-level fallback: queues every unvisited, live, allowed node by its
+    /// estimate, to be promoted for recomputation as the beam has room.
+    fn queueUnvisitedAllowed(
+        self: *const Index,
+        alloc: Allocator,
+        approx: *Approx,
+        filter: Filter,
+        visited: *std.DynamicBitSetUnmanaged,
+        queue: anytype,
+        stats: *SearchStats,
+    ) !void {
+        var chunk = std.ArrayListUnmanaged(u32).empty;
+        defer chunk.deinit(alloc);
+        var next: u32 = 0;
+        while (next < self.node_count) {
+            chunk.clearRetainingCapacity();
+            while (next < self.node_count and chunk.items.len < 1024) : (next += 1) {
+                if (visited.isSet(next) or self.isDeleted(next)) continue;
+                visited.set(next);
+                if (try filter.allows(next)) try chunk.append(alloc, next);
+            }
+            const ests = try approx.score(chunk.items);
+            stats.approx_evaluated += @intCast(chunk.items.len);
+            for (chunk.items, ests) |id, e| try queue.push(alloc, .{ .dist = e.dist, .id = id });
+        }
+    }
+
+    fn allowedNode(filter: ?Filter, id: u32) !bool {
+        const f = filter orelse return true;
+        return f.allows(id);
     }
 
     /// The `k` live nodes nearest by approximate distance, by scanning every
@@ -1310,13 +1384,42 @@ pub const Index = struct {
         var fresh = std.ArrayListUnmanaged(u32).empty;
         defer fresh.deinit(alloc);
 
+        // `beam` holds the best `ef` allowed estimates; it bounds the walk.
+        // Rejected nodes are still expanded while they could lead to better
+        // allowed ones, but never enter the beam or the recompute pool.
         const first = try approx.scoreOne(start);
         visited.set(start);
-        try pool.append(alloc, .{ .id = start, .lower = first.dist - scale * first.bound });
+        if (try allowedNode(opts.filter, start)) {
+            try pool.append(alloc, .{ .id = start, .lower = first.dist - scale * first.bound });
+            try beam.push(alloc, .{ .dist = first.dist, .id = start });
+        }
         try candidates.push(alloc, .{ .dist = first.dist, .id = start });
-        try beam.push(alloc, .{ .dist = first.dist, .id = start });
         stats.approx_evaluated += 1;
-        while (candidates.len() > 0) {
+        // Layer-0 edges are directed and only reachability from the entry
+        // point is guaranteed, so a filtered walk that runs dry before
+        // finding `ef` allowed nodes restarts from the entry point, then
+        // scores what is still unvisited (codes only, no embeddings).
+        var reseeded = false;
+        walk: while (true) {
+            if (candidates.len() == 0) {
+                if (opts.filter == null or beam.len() >= ef) break :walk;
+                if (!reseeded) {
+                    reseeded = true;
+                    if (!visited.isSet(self.entry)) {
+                        visited.set(self.entry);
+                        const e = try approx.scoreOne(self.entry);
+                        stats.approx_evaluated += 1;
+                        if (try allowedNode(opts.filter, self.entry)) {
+                            try pool.append(alloc, .{ .id = self.entry, .lower = e.dist - scale * e.bound });
+                            if (beam.len() < ef) try beam.push(alloc, .{ .dist = e.dist, .id = self.entry });
+                        }
+                        try candidates.push(alloc, .{ .dist = e.dist, .id = self.entry });
+                        continue :walk;
+                    }
+                }
+                try self.scoreUnvisitedAllowed(alloc, approx, opts.filter.?, &visited, scale, &pool, stats);
+                break :walk;
+            }
             const c = candidates.pop();
             if (beam.len() >= ef and c.dist > beam.top().dist) break;
             stats.expanded += 1;
@@ -1329,13 +1432,16 @@ pub const Index = struct {
             const ests = try approx.score(fresh.items);
             stats.approx_evaluated += @intCast(fresh.items.len);
             for (fresh.items, ests) |nb, e| {
-                try pool.append(alloc, .{ .id = nb, .lower = e.dist - scale * e.bound });
                 const nc = Cand{ .dist = e.dist, .id = nb };
-                if (beam.len() < ef) {
-                    try beam.push(alloc, nc);
-                } else if (nc.dist < beam.top().dist) {
-                    beam.replaceTop(nc);
-                } else continue;
+                const allowed = try allowedNode(opts.filter, nb);
+                // Every allowed estimate joins the pool, as without a filter.
+                if (allowed) try pool.append(alloc, .{ .id = nb, .lower = e.dist - scale * e.bound });
+                if (beam.len() >= ef and nc.dist >= beam.top().dist) continue;
+                if (allowed) {
+                    if (beam.len() < ef) {
+                        try beam.push(alloc, nc);
+                    } else beam.replaceTop(nc);
+                }
                 try candidates.push(alloc, nc);
             }
         }
@@ -1444,45 +1550,69 @@ pub const Index = struct {
                 res: *Heap(true),
                 limit: usize,
                 st: *SearchStats,
+                filter: ?Filter,
             ) !void {
                 if (ids.items.len == 0) return;
                 try ds.resize(a, ids.items.len);
                 try index.recomputeDistances(a, src, query, ids.items, vectors, ds.items, st);
                 for (ids.items, ds.items) |id, dist| {
                     const c = Cand{ .dist = dist, .id = id };
-                    if (res.len() < limit) {
-                        try res.push(a, c);
-                    } else if (c.dist < res.top().dist) {
-                        res.replaceTop(c);
-                    } else continue;
+                    const full = res.len() >= limit;
+                    if (full and c.dist >= res.top().dist) continue;
+                    // Rejected nodes still steer the walk; only allowed ones
+                    // enter the results that bound it.
+                    if (try allowedNode(filter, id)) {
+                        if (full) res.replaceTop(c) else try res.push(a, c);
+                    }
                     try eq.push(a, c);
                 }
                 ids.clearRetainingCapacity();
             }
         };
 
+        var reseeded = false;
+        var queued_unvisited = false;
         visited.set(start);
         try pending.append(alloc, start);
-        try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
+        try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter);
 
         while (true) {
             if (exact_queue.len() == 0) {
                 if (pending.items.len > 0) {
-                    try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
+                    try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter);
                     continue;
                 }
                 // The exact queue ran dry. Like the paper, stop once the beam
                 // is full; only keep promoting while it still has room.
-                if (approx_queue.len() == 0 or results.len() >= ef) break;
+                if (results.len() >= ef) break;
+                if (approx_queue.len() == 0) {
+                    // A filtered walk that ran dry restarts from the entry
+                    // point (layer-0 reachability is only guaranteed from
+                    // there), then queues what is still unvisited.
+                    const filter = opts.filter orelse break;
+                    if (!reseeded) {
+                        reseeded = true;
+                        if (!visited.isSet(self.entry)) {
+                            visited.set(self.entry);
+                            try pending.append(alloc, self.entry);
+                            try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter);
+                            continue;
+                        }
+                    }
+                    if (queued_unvisited) break;
+                    queued_unvisited = true;
+                    try self.queueUnvisitedAllowed(alloc, approx, filter, &visited, &approx_queue, stats);
+                    if (approx_queue.len() == 0) break;
+                }
                 try promote(alloc, &approx_queue, &pending, ratio);
-                try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
+                try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter);
                 continue;
             }
 
             const c = exact_queue.pop();
             if (results.len() >= ef and c.dist > results.top().dist) {
                 if (pending.items.len > 0) {
-                    try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
+                    try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter);
                     continue;
                 }
                 break;
@@ -1505,7 +1635,7 @@ pub const Index = struct {
                 while (approx_queue.len() > 0) try pending.append(alloc, approx_queue.pop().id);
             }
             if (opts.batch_size == 0 or pending.items.len >= opts.batch_size) {
-                try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
+                try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter);
             }
         }
 
@@ -3307,6 +3437,57 @@ test "leann: rabitq bounds search recall and recompute budget" {
     var pq_index = try Index.build(alloc, .{ .dims = 128, .max_degree = 8 }, fx.data[0 .. 300 * 128]);
     defer pq_index.deinit();
     try testing.expectError(error.BoundsRequireRaBitQ, pq_index.search(alloc, src.source(), fx.query(0), .{ .rerank = .bounds }));
+}
+
+test "leann: filtered search walks past rejected nodes to fill k allowed results" {
+    const alloc = testing.allocator;
+    const n = 2000;
+    const dims = 64;
+    var fx = try Fixture.init(alloc, n, 20, dims, 24, 41);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = dims };
+
+    // 5% of nodes pass: a filter that an over-fetch of 4k would mostly miss.
+    const EveryTwentieth = struct {
+        fn allows(_: *const anyopaque, id: u32) anyerror!bool {
+            return id % 20 == 0;
+        }
+    };
+    const filter = Filter{ .ctx = undefined, .allows_fn = EveryTwentieth.allows };
+
+    for ([_]Quantizer{ .rabitq, .pq }) |quantizer| {
+        var index = try Index.build(alloc, .{ .dims = dims, .quantizer = quantizer, .max_degree = 16, .ef_construction = 64 }, fx.data);
+        defer index.deinit();
+        var hits: usize = 0;
+        const k = 10;
+        for (0..20) |qi| {
+            const q = fx.query(qi);
+            var resp = try index.search(alloc, src.source(), q, .{ .k = k, .ef = 64, .filter = filter });
+            defer resp.deinit(alloc);
+            if (resp.results.len != k) std.debug.print("filtered short quantizer={s} q={d} got={d} expanded={d} approx={d} recomputed={d}\n", .{ @tagName(quantizer), qi, resp.results.len, resp.stats.expanded, resp.stats.approx_evaluated, resp.stats.recomputed });
+            try testing.expectEqual(@as(usize, k), resp.results.len);
+            for (resp.results) |r| try testing.expect(r.id % 20 == 0);
+            for (resp.results[1..], resp.results[0 .. k - 1]) |r, prev| try testing.expect(prev.distance <= r.distance);
+
+            // Exact top k among allowed nodes.
+            var allowed = std.ArrayListUnmanaged(Cand).empty;
+            defer allowed.deinit(alloc);
+            const qn = try alloc.dupe(f32, q);
+            defer alloc.free(qn);
+            var id: u32 = 0;
+            while (id < n) : (id += 20) try allowed.append(alloc, .{ .id = id, .dist = distance(index.config.metric, qn, fx.data[id * dims ..][0..dims]) });
+            std.mem.sortUnstable(Cand, allowed.items, {}, candLessThan);
+            for (resp.results) |r| for (allowed.items[0..k]) |g| if (g.id == r.id) {
+                hits += 1;
+                break;
+            };
+        }
+        const recall = @as(f64, @floatFromInt(hits)) / (20.0 * k);
+        testing.expect(recall >= 0.85) catch |err| {
+            std.debug.print("filtered recall quantizer={s} recall={d:.3}\n", .{ @tagName(quantizer), recall });
+            return err;
+        };
+    }
 }
 
 test "leann: rabitq serialization and inserts without recomputation" {

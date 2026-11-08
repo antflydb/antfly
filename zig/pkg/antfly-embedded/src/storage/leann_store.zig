@@ -652,10 +652,12 @@ pub const LeannStore = struct {
         const live: usize = self.node_of.count();
         if (live == 0) return out;
 
-        // Over-fetch when filters can reject graph results, widening until
+        // Id, key and prefix filters go into the graph walk. Distance bounds
+        // can only be checked afterwards, so they over-fetch, widening until
         // k results pass or the whole graph has been considered.
-        var want: usize = if (filter.active()) @max(req.k * 4, req.k + 64) else req.k;
+        var want: usize = if (filter.distanceActive()) @max(req.k * 4, req.k + 64) else req.k;
         var ctx = SourceCtx{ .store = self, .far_from = req.query };
+        const node_filter = NodeFilter{ .store = self, .filter = &filter };
         while (true) {
             want = @min(want, live);
             var resp = try index.search(alloc, ctx.source(), req.query, .{
@@ -663,6 +665,7 @@ pub const LeannStore = struct {
                 .ef = if (self.opts.search_ef > 0) @max(self.opts.search_ef, @as(u32, @intCast(want))) else 0,
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
+                .filter = if (filter.nodeActive()) .{ .ctx = &node_filter, .allows_fn = NodeFilter.allows } else null,
             });
             defer resp.deinit(alloc);
             var passed: usize = 0;
@@ -672,7 +675,7 @@ pub const LeannStore = struct {
                 if (!filter.distanceAllowed(r.distance)) continue;
                 passed += 1;
             }
-            if (passed >= req.k or want >= live or !filter.active()) {
+            if (passed >= req.k or want >= live or !filter.distanceActive()) {
                 for (resp.results) |r| {
                     const node = self.nodes.items[r.id];
                     if (!try filter.allows(node.vector_id, node.metadata)) continue;
@@ -880,6 +883,18 @@ pub const LeannStore = struct {
 };
 
 /// HBC request filters, applied to graph and buffer candidates.
+/// Adapts a request filter to graph node ids.
+const NodeFilter = struct {
+    store: *const LeannStore,
+    filter: *const Filter,
+
+    fn allows(raw: *const anyopaque, id: u32) anyerror!bool {
+        const self: *const NodeFilter = @ptrCast(@alignCast(raw));
+        const node = self.store.nodes.items[id];
+        return self.filter.allows(node.vector_id, node.metadata);
+    }
+};
+
 const Filter = struct {
     allowed: std.AutoHashMapUnmanaged(u64, void) = .empty,
     excluded: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -908,9 +923,14 @@ const Filter = struct {
         self.excluded.deinit(alloc);
     }
 
-    fn active(self: *const Filter) bool {
+    /// Filters on the node itself (id, key, prefix), applied in the walk.
+    fn nodeActive(self: *const Filter) bool {
         return self.has_allowed or self.excluded.count() > 0 or self.key_predicate != null or
-            self.prefix.len > 0 or self.over != null or self.under != null;
+            self.prefix.len > 0;
+    }
+
+    fn distanceActive(self: *const Filter) bool {
+        return self.over != null or self.under != null;
     }
 
     fn allows(self: *const Filter, vector_id: u64, metadata: []const u8) !bool {
@@ -1050,6 +1070,18 @@ test "leann store: buffer, build, search, filters, delete, persist" {
         var res = try store.search(alloc, .{ .query = data[id * dims ..][0..dims], .k = 5 });
         defer res.deinit();
         try testing.expectEqual(id, res.items.items[0].vector_id);
+        try expectAscending(res.items.items);
+    }
+
+    // A selective id filter is applied inside the walk and still returns
+    // every allowed node, nearest first.
+    {
+        const allowed = [_]u64{ 3, 97, 211, 404, 577 };
+        var res = try store.search(alloc, .{ .query = data[211 * dims ..][0..dims], .k = 5, .filter_ids = &allowed });
+        defer res.deinit();
+        try testing.expectEqual(@as(usize, 5), res.items.items.len);
+        try testing.expectEqual(@as(u64, 211), res.items.items[0].vector_id);
+        for (res.items.items) |item| try testing.expect(std.mem.indexOfScalar(u64, &allowed, item.vector_id) != null);
         try expectAscending(res.items.items);
     }
 

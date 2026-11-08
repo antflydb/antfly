@@ -654,11 +654,28 @@ pub const Replica = struct {
     /// state change. `source` recomputes exact vectors by graph node id;
     /// see `nodeKey`.
     /// Graph search tuning (see `leann.SearchOptions`).
+    /// Restricts hits to keys it allows; passed into the graph walk.
+    pub const KeyFilter = struct {
+        ctx: *const anyopaque,
+        allows_fn: *const fn (ctx: *const anyopaque, key: []const u8) anyerror!bool,
+    };
+
     pub const SearchTuning = struct {
         /// Beam width; 0 picks the quantizer's default. Raised to `k`.
         ef: u32 = 0,
         bound_scale: f32 = 1.0,
         batch_size: u32 = 0,
+        filter: ?KeyFilter = null,
+    };
+
+    const NodeKeyFilter = struct {
+        replica: *const Replica,
+        filter: KeyFilter,
+
+        fn allows(raw: *const anyopaque, id: u32) anyerror!bool {
+            const self: *const NodeKeyFilter = @ptrCast(@alignCast(raw));
+            return self.filter.allows_fn(self.filter.ctx, self.replica.keys.items[id]);
+        }
     };
 
     pub fn search(self: *const Replica, alloc: Allocator, query: []const f32, k: u32, tuning: SearchTuning, loader: VectorLoader) ![]Hit {
@@ -671,17 +688,20 @@ pub const Replica = struct {
         const tmp = try alloc.alloc(f32, query.len);
         defer alloc.free(tmp);
         for (self.buffer_keys.items, self.buffer_vectors.items) |key, v| {
+            if (tuning.filter) |f| if (!try f.allows_fn(f.ctx, key)) continue;
             @memcpy(tmp, v);
             if (metric == .cosine) normalize(tmp);
             try hits.append(alloc, .{ .key = key, .distance = leann.distance(metric, q, tmp) });
         }
         if (self.index) |*index| {
             var ctx = SearchSource{ .replica = self, .loader = loader, .far_from = query };
+            const node_filter: ?NodeKeyFilter = if (tuning.filter) |f| .{ .replica = self, .filter = f } else null;
             var resp = try index.search(alloc, ctx.source(), query, .{
                 .k = k,
                 .ef = if (tuning.ef > 0) @max(tuning.ef, k) else 0,
                 .bound_scale = tuning.bound_scale,
                 .batch_size = tuning.batch_size,
+                .filter = if (node_filter) |*nf| leann.Filter{ .ctx = nf, .allows_fn = NodeKeyFilter.allows } else null,
             });
             defer resp.deinit(alloc);
             for (resp.results) |r| try hits.append(alloc, .{ .key = self.keys.items[r.id], .distance = r.distance });
