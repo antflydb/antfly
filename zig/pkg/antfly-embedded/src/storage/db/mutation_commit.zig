@@ -4755,6 +4755,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (intents.prepared_rows, 0..) |maybe_row, i| if (maybe_row) |row| {
                     try durable_rows.put(alloc, intents.writes[i].key, row);
                 };
+                // This transaction's intents are materialized into real rows
+                // through the same combined-batch path an ordinary primary
+                // write uses (`transaction_resolution` folds the resolution's
+                // own KV changes into that one native commit), so without
+                // this tag the commit would attribute to `.primary_commit`
+                // like any other write instead of `.relational_intent_resolve`.
+                const wal_trace_scope = wal_trace.scope(.relational_intent_resolve);
+                defer wal_trace_scope.end();
                 self.batchInternalWithPreparationAllocator(.{
                     .writes = writes,
                     .deletes = intents.deletes,

@@ -55,6 +55,7 @@ const traversal_mod = @import("../../graph/traversal.zig");
 const enrichment_types = @import("enrichment/enrichment_types.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const transactions_mod = @import("../transactions.zig");
+const backend_erased = @import("../backend_erased.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const types = @import("types.zig");
 
@@ -2277,6 +2278,28 @@ pub const DBCore = struct {
         if (bound.schema_binding == null)
             bound.schema_binding = .{ .version = if (self.schema) |schema| schema.version else null };
         try manager.writeIntentsExtraBatch(txn_id, intents, predicates, bound);
+    }
+
+    /// Staged counterpart of `writeIntentsExtraBatch`: see
+    /// `TxnManager.writeIntentsExtraBatchStaged`'s doc comment.
+    /// `manager.deinit()` only frees this call's lightweight erased-`Store`
+    /// adapter, never the underlying native handle the returned ticket
+    /// owns, so it is safe to run before the caller waits on that ticket.
+    pub fn writeIntentsExtraBatchStaged(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+        predicates: []const transactions_mod.VersionPredicate,
+        extra_batch: transactions_mod.MutationExtraBatch,
+    ) !backend_erased.Ticket {
+        var manager = try transactions_mod.TxnManager.init(extra_batch.preparation_allocator orelse self.alloc, self.store);
+        defer manager.deinit();
+        var bound = extra_batch;
+        if (bound.max_intent_admission_bytes == 0)
+            bound.max_intent_admission_bytes = self.table_catalog.transaction_admission_bytes;
+        if (bound.schema_binding == null)
+            bound.schema_binding = .{ .version = if (self.schema) |schema| schema.version else null };
+        return try manager.writeIntentsExtraBatchStaged(txn_id, intents, predicates, bound);
     }
 
     pub fn checkVersionPredicates(

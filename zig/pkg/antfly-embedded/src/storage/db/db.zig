@@ -25189,7 +25189,13 @@ pub const DB = struct {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.writeTransactionInternal(txn_id, req, null);
+        // The tag must wrap `wait()`, not just the staged call: the actual
+        // apply/fsync happens there, not at `enqueue` time (see
+        // `writeTransactionInternal`'s own doc comment below).
+        const wal_trace_scope = wal_trace.scopeDefault(.relational_intent_write);
+        defer wal_trace_scope.end();
+        const ticket = try self.writeTransactionInternal(txn_id, req, null);
+        try ticket.wait();
     }
 
     pub fn writeReplicatedTransactionAtOrderedReceipt(
@@ -25200,15 +25206,28 @@ pub const DB = struct {
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("writeReplicatedTransactionAtOrderedReceipt", .{ self, txn_id, req, identity });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try self.writeTransactionInternal(txn_id, req, identity);
+        const wal_trace_scope = wal_trace.scopeDefault(.relational_intent_write);
+        defer wal_trace_scope.end();
+        const ticket = try self.writeTransactionInternal(txn_id, req, identity);
+        try ticket.wait();
     }
 
+    /// Returns a durability ticket instead of blocking for the fsync; see
+    /// `writeTransactionInternalOnce`'s doc comment. Both callers above wait
+    /// on it immediately, so this split changes no observable behavior --
+    /// a prerequisite for a future staged caller was explored and found
+    /// unsafe here: `writeTransactionInternalOnce` reads back the record
+    /// `beginTransaction` wrote, and a group-commit member is only applied
+    /// (and so only readable) once something drives/waits its group, not
+    /// at `enqueue` time (`lite/docstore.zig`'s `MutationPlan.apply`). A
+    /// caller cannot defer `wait()` across a step that reads an earlier
+    /// step's own write.
     fn writeTransactionInternal(
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
         ordered_receipt: ?OrderedApplyReceipt,
-    ) !void {
+    ) !backend_erased_mod.Ticket {
         if (ordered_receipt == null) try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
@@ -25238,7 +25257,7 @@ pub const DB = struct {
         const max_prepared_retries = 2;
         var retries: usize = 0;
         while (true) {
-            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
+            const ticket = self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
@@ -25246,10 +25265,16 @@ pub const DB = struct {
                 },
                 else => return preparation.mapError(err),
             };
-            return;
+            return ticket;
         }
     }
 
+    /// Returns a durability ticket instead of blocking for the fsync; its
+    /// single caller, `writeTransactionInternal`, waits on it immediately,
+    /// so every entry point (`writeTransaction`,
+    /// `writeReplicatedTransactionAtOrderedReceipt`) keeps its prior
+    /// fully-synchronous behavior. See `writeTransactionInternal`'s own
+    /// doc comment for why this cannot safely be staged further.
     fn writeTransactionInternalOnce(
         self: *DB,
         txn_id: types.TxnId,
@@ -25258,7 +25283,7 @@ pub const DB = struct {
         preparation_alloc: Allocator,
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
-    ) !void {
+    ) !backend_erased_mod.Ticket {
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
                 req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or
@@ -25583,19 +25608,19 @@ pub const DB = struct {
         if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         if (ordered_receipt) |identity| {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
-                .already_applied => return,
+                .already_applied => return backend_erased_mod.Ticket.alreadyDurable(),
                 .apply => {},
             }
             var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(identity, &value_buf);
-            try self.core.writeIntentsExtraBatch(
+            return try self.core.writeIntentsExtraBatchStaged(
                 txn_id,
                 intents.items,
                 predicates.items,
                 .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans },
             );
         } else {
-            try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+            return try self.core.writeIntentsExtraBatchStaged(txn_id, intents.items, predicates.items, .{
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
                 .index_span_digests = index_spans,

@@ -21,6 +21,7 @@ const std = h.std;
 const dependencies = h.antfly.capi_dependencies;
 const contract = dependencies.api_distributed_txn_contract;
 const catalog = dependencies.sql_catalog;
+const wal_trace = @import("../storage/write_amplification_trace.zig");
 const key = "\x00antfly/embedded/sql-commit/v1";
 const Record = struct { id: h.db_mod.types.TxnId, timestamp: u64, tables: []const []const u8 };
 
@@ -70,6 +71,14 @@ pub fn commit(handle: *h.Handle, requests: []const contract.TableCommitRequest, 
 }
 
 fn store(handle: *h.Handle, record: ?Record) !void {
+    // The cross-database two-phase commit coordinator's own recovery hint:
+    // written before preparing any participant, cleared after every
+    // participant resolves. See `Stage.relational_coordinator_hint`'s doc
+    // comment -- `sql.zig`'s single-store fast path bypasses this
+    // coordinator (and so this commit site) entirely for the common
+    // single-table coordinated-constraint write.
+    const wal_trace_scope = wal_trace.scopeDefault(.relational_coordinator_hint);
+    defer wal_trace_scope.end();
     handle.sql_commit_recovery_needed = true;
     const bytes = if (record) |value| try std.json.Stringify.valueAlloc(handle.alloc, value, .{}) else null;
     defer if (bytes) |value| handle.alloc.free(value);
