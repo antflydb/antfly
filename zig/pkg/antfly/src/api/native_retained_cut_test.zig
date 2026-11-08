@@ -434,7 +434,7 @@ test "external lake Cypher execution reads immutable native document and graph c
         }
         defer materialized.deinit();
         // An unrelated owner capability must never authorize mutable capture.
-        var wrong_owner: DB.StatementReadFence = .{ .source = &snapshot, .primary = undefined, .replay = undefined };
+        var wrong_owner: DB.StatementReadFence = .{ .owner = &snapshot, .primary = undefined, .replay = undefined };
         var invalid_capture: DB.CypherBackend = .{ .tables = &.{.{ .name = "docs", .db = &db, .capture_fence = &wrong_owner }}, .authority = authority, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() };
         try std.testing.expectError(error.CypherSnapshotRequired, cypher.snapshot.Materialized.create(a, invalid_capture.backend(), graph, .{}));
         const read_input: local.storage_statement_read_fence.GraphInput = .{ .durable = durable, .indexes = if (durable) null else &.{"links"}, .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('d'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() };
