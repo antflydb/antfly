@@ -557,8 +557,11 @@ Three modes:
    stored copy would cut them about 4x without query-time embedding.
 2. **Splits.** Rebuild both children from the parent's stored vectors (or
    re-embedded text) during handoff.
-3. **Remote storage and native backups.** Store `leann.store` through the
-   dense storage abstraction and include it in native checkpoints.
+3. **Native backups of replicated LEANN.** Local `leann.store` files are
+   pinned with native checkpoints, and stores persist through the dense
+   storage provider (Lite, remote dense storage). Replicated `leann.replica`
+   state carries the source group's Raft positions, so it still uses the
+   logical path until restore resets that domain.
 4. **Filter-aware traversal.** Filters are applied after an over-fetched
    search today; very selective filters would be better served by passing
    them into the graph walk.

@@ -38,6 +38,7 @@ const Allocator = std.mem.Allocator;
 const leann = @import("antfly_vectorindex").leann;
 const search_results = @import("antfly_vectorindex").search_results;
 const search_types = @import("antfly_vectorindex").search_types;
+const lsm_backend = @import("lsm_backend/mod.zig");
 const vec = @import("antfly_vector").vector;
 const replicated_mod = @import("leann_replicated.zig");
 const replica_mod = @import("leann_replica.zig");
@@ -58,6 +59,9 @@ pub const Options = struct {
     search_ef: u32 = 0,
     bound_scale: f32 = 1.0,
     batch_size: u32 = 0,
+    /// Persist through this storage provider (Lite, remote dense storage)
+    /// instead of host files. The path is the same logical path.
+    storage: ?lsm_backend.Storage = null,
     /// Vectors served by exact search before the first graph build.
     build_threshold: u32 = 256,
     /// Rebuild on sync once this fraction of graph nodes is deleted.
@@ -152,20 +156,14 @@ pub const LeannStore = struct {
             const state = try alloc.create(replicated_mod.ReplicatedState);
             errdefer alloc.destroy(state);
             const ropts = replicatedOptions(opts);
-            const existing = std.Io.Dir.cwd().readFileAlloc(io, self.path, alloc, .unlimited) catch |err| switch (err) {
-                error.FileNotFound => null,
-                else => return err,
-            };
+            const existing = try self.readPersisted();
             defer if (existing) |b| alloc.free(b);
             state.* = if (existing) |b| try replicated_mod.ReplicatedState.decode(alloc, ropts, b) else try replicated_mod.ReplicatedState.init(alloc, ropts);
             self.replicated = state;
             self.durable_raft_index = state.applied_raft_index;
             return self;
         }
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, self.path, alloc, .unlimited) catch |err| switch (err) {
-            error.FileNotFound => return self,
-            else => return err,
-        };
+        const bytes = (try self.readPersisted()) orelse return self;
         defer alloc.free(bytes);
         self.decode(bytes) catch |err| {
             self.clearState();
@@ -765,7 +763,7 @@ pub const LeannStore = struct {
             if (!self.dirty) return;
             const bytes = try state.encode(self.alloc);
             defer self.alloc.free(bytes);
-            try writeFileAtomicallyDurable(self.alloc, self.io, self.path, bytes);
+            try self.persist(bytes);
             self.durable_raft_index = state.applied_raft_index;
             self.dirty = false;
             return;
@@ -779,9 +777,55 @@ pub const LeannStore = struct {
         if (!self.dirty) return;
         const bytes = try self.encode();
         defer self.alloc.free(bytes);
-        try writeFileAtomicallyDurable(self.alloc, self.io, self.path, bytes);
+        try self.persist(bytes);
         self.dirty = false;
         self.elide_durable = self.elide.items.len;
+    }
+
+    /// The persisted file, or null when it was never written.
+    fn readPersisted(self: *LeannStore) !?[]u8 {
+        if (self.opts.storage) |storage| {
+            return storage.readFileAlloc(self.alloc, self.path, std.math.maxInt(usize)) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => null,
+                else => err,
+            };
+        }
+        return std.Io.Dir.cwd().readFileAlloc(self.io, self.path, self.alloc, .unlimited) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => err,
+        };
+    }
+
+    /// Atomically replaces the persisted file. Every write lands in a new
+    /// file (temp + rename), which native backups rely on to pin it.
+    fn persist(self: *LeannStore, bytes: []const u8) !void {
+        if (self.opts.storage) |storage| {
+            var sink = try storage.beginAtomicWrite(self.alloc, self.path);
+            var sink_active = true;
+            defer if (sink_active) sink.abort();
+            try sink.appendSlice(bytes);
+            sink_active = false;
+            try sink.finish();
+            return;
+        }
+        try writeFileAtomicallyDurable(self.alloc, self.io, self.path, bytes);
+    }
+
+    /// Native backups: the persisted file to pin, or null while the store
+    /// has never been persisted (it is empty). Fails while state newer than
+    /// the file exists, since the capture must match the applied sequence.
+    pub fn nativeBackupPath(self: *LeannStore) !?[]const u8 {
+        self.lock.lockSharedUncancelable(self.io);
+        defer self.lock.unlockShared(self.io);
+        if (self.dirty) return error.NativeBackupProjectionNotQuiescent;
+        if (self.replicated) |state| if (self.durable_raft_index != state.applied_raft_index)
+            return error.NativeBackupProjectionNotQuiescent;
+        if (self.opts.storage != null) return error.NativeBackupProjectionBackendUnsupported;
+        std.Io.Dir.cwd().access(self.io, self.path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return self.path;
     }
 
     fn encode(self: *const LeannStore) ![]u8 {
@@ -1009,6 +1053,35 @@ fn addAll(alloc: Allocator, store: *LeannStore, data: []const f32, dims: usize, 
         });
     }
     try store.apply(items.items, &.{});
+}
+
+test "leann store: persists through a storage provider and reopens" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const dims = 16;
+    const n = 300;
+    const data = try testData(alloc, n, dims);
+    defer alloc.free(data);
+    var vectors = TestVectors{ .data = data, .dims = dims };
+    const opts = Options{ .dims = dims, .metric = .l2_squared, .max_degree = 8, .build_threshold = 100, .storage = memory.storage() };
+    {
+        var store = try LeannStore.open(alloc, io, "__test/leann_idx", opts);
+        defer store.deinit();
+        store.setLoader(vectors.loader());
+        try addAll(alloc, store, data, dims, 0, n);
+        try store.sync();
+        // Native backups pin host files only.
+        try testing.expectError(error.NativeBackupProjectionBackendUnsupported, store.nativeBackupPath());
+    }
+    var reopened = try LeannStore.open(alloc, io, "__test/leann_idx", opts);
+    defer reopened.deinit();
+    reopened.setLoader(vectors.loader());
+    try testing.expectEqual(@as(u64, n), reopened.liveCount());
+    var res = try reopened.search(alloc, .{ .query = data[42 * dims ..][0..dims], .k = 3 });
+    defer res.deinit();
+    try testing.expectEqual(@as(u64, 42), res.items.items[0].vector_id);
 }
 
 fn expectAscending(items: []const search_results.SearchResult) !void {

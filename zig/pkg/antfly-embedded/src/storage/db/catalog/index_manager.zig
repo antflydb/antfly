@@ -8895,10 +8895,12 @@ pub const IndexManager = struct {
         return switch (kind) {
             .full_text => self.text_main_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveTextMainStorage()),
             .dense_vector => if (self.denseIndex(name)) |entry|
-                if (entry.index.leann != null)
-                    // The LEANN file is not part of HBC's native checkpoint;
-                    // backups use the logical path and restore rebuilds from
-                    // stored embeddings.
+                if (entry.index.leann != null and entry.index.leann.?.isReplicated())
+                    // Replicated LEANN state carries the source group's Raft
+                    // positions (applied index, record keys); a restored
+                    // group's log can restart below them. Until restore
+                    // resets that domain, backups use the logical path.
+                    // Local LEANN files are pinned with the checkpoint.
                     false
                 else if (entry.index.experimentalPostingWalAuthoritative())
                     // Native postings are the projection authority. Shared
@@ -9098,6 +9100,21 @@ pub const IndexManager = struct {
             }
         }
         for (self.dense_indexes.items) |*entry| {
+            // A LEANN index's graph lives in one file next to its HBC files.
+            // It was synced under the capture fence, and every write replaces
+            // it (temp + rename), so pinning the current file is stable.
+            // Restore installs it at the same path.
+            if (entry.index.leann) |leann_store| if (try leann_store.nativeBackupPath()) |host_path| {
+                const relative = try self.retainNativeBackupAllocation(
+                    &native_owned,
+                    try std.fmt.allocPrint(self.alloc, "indexes/{s}/{s}", .{ entry.config.name, std.fs.path.basename(host_path) }),
+                );
+                const source = try self.retainNativeBackupAllocation(&native_owned, try self.alloc.dupe(u8, host_path));
+                try native_specs.append(self.alloc, .{
+                    .relative_path = relative,
+                    .source = .{ .immutable_file = source },
+                });
+            };
             if (try entry.index.nativeBackupGeneration(self.alloc, capture_target_sequence)) |generation_value| {
                 var generation = generation_value;
                 defer generation.deinit();
@@ -23558,7 +23575,6 @@ pub const IndexManager = struct {
                 if (dense_cfg.leann) |leann_opts| {
                     // LEANN keeps its graph in a file beside the (empty) HBC
                     // root; remote dense storage is not supported yet.
-                    if (self.effectiveDenseStorage() != null) return error.UnsupportedLeannStorage;
                     const leann_store = try leann_store_mod.LeannStore.open(self.alloc, self.checkpointIo(), path, .{
                         .dims = dense_cfg.dims,
                         .metric = dense_cfg.metric,
@@ -23568,6 +23584,7 @@ pub const IndexManager = struct {
                         .search_ef = leann_opts.search_ef,
                         .bound_scale = leann_opts.bound_scale,
                         .batch_size = leann_opts.batch_size,
+                        .storage = self.effectiveDenseStorage(),
                         .replicated = self.leann_replication,
                         .transient = leann_opts.vector_storage.elides(),
                     });
@@ -51843,8 +51860,10 @@ test "leann dense index applies writes, searches, deletes, and reopens" {
         }
 
         try std.testing.expectError(error.UnsupportedLeannSplit, manager.pruneDenseSplitRange(&store, "doc:0150"));
-        try std.testing.expect(!manager.nativeBackupSupportsImmutableCheckpoint("leann_idx", .dense_vector));
         try manager.syncAll(true);
+        // Local LEANN files go into native backups with their checkpoint.
+        try std.testing.expect(manager.nativeBackupSupportsImmutableCheckpoint("leann_idx", .dense_vector));
+        try std.testing.expect((try entry.index.leann.?.nativeBackupPath()) != null);
     }
 
     // Reopen: the graph and key map come back from the LEANN file.
