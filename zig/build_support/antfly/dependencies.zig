@@ -63,6 +63,7 @@ pub const Shared = struct {
     optimize: std.lang.Optimize,
     vopr_mod: *std.Build.Module,
     strip: bool,
+    apple_bridge: ?*std.Build.Step.InstallFile,
     lmdb_backend: LmdbBackend,
     lmdb_evented_async_io: bool,
     with_tla: bool,
@@ -320,6 +321,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     b.step("lib-sql-parser-bench", "Build and install lib-sql-parser-bench").dependOn(&b.addInstallArtifact(yacc_steps.benchmark, .{}).step);
     const cypher_mod = @import("../../lib/cypher/build_support.zig").addSteps(b, .{
         .root = b.path("lib/cypher"),
+        .filters = selectTestFilters(b, &.{}),
         .target = target,
         .optimize = optimize,
         .codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), b.graph.host, .safe),
@@ -1222,6 +1224,12 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     readers_mod.addImport("antfly_inference_work", inference_work_mod);
     readers_mod.addImport("antfly_platform", platform_mod);
     generating_mod.addImport("antfly_apple_native", inference_graph.apple_native_mod);
+    const apple_bridge = @import("../../lib/apple_native/build_support.zig").configure(b, target, optimize, link_libc, .{
+        .native = inference_graph.apple_native_mod,
+        .readers = readers_mod,
+        .generating = generating_mod,
+        .transcribing = transcribing_mod,
+    });
     inference_host_mod.addImport("antfly_readers", readers_mod);
     inference_host_mod.addImport("antfly_transcribing", transcribing_mod);
     inference_host_mod.addImport("antfly_extracting", extracting_mod);
@@ -1525,6 +1533,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
         .vopr_mod = vopr_mod,
         .strip = strip,
+        .apple_bridge = apple_bridge,
         .lmdb_backend = lmdb_backend,
         .lmdb_evented_async_io = lmdb_evented_async_io,
         .with_tla = with_tla,

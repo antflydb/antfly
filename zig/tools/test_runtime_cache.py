@@ -575,16 +575,22 @@ class RuntimeCacheTest(unittest.TestCase):
                                 f"OBSERVABILITY_REVISION {before + 1} {structlog_revision}",
                                 changed,
                             )
-                        source.unlink()
-                        self.build("--help")
-                        self.assertIn(
-                            "BENCH_PROFILE debug debug",
-                            self.build("cache-antfly-inference-audio-bench"),
-                        )
-                        failure = self.build(target, succeeds=False)
-                        self.assertIn("FileNotFound", failure)
-                        self.assertNotIn("panic:", failure)
-                        source.write_bytes(contents)
+                        # Temporarily hide the source without replacing its
+                        # inode on restore. This probes dependency availability,
+                        # independently of file-identity cache invalidation.
+                        hidden = source.with_name(source.name + ".cache-test-hidden")
+                        source.rename(hidden)
+                        try:
+                            self.build("--help")
+                            self.assertIn(
+                                "BENCH_PROFILE debug debug",
+                                self.build("cache-antfly-inference-audio-bench"),
+                            )
+                            failure = self.build(target, succeeds=False)
+                            self.assertIn("FileNotFound", failure)
+                            self.assertNotIn("panic:", failure)
+                        finally:
+                            hidden.rename(source)
                         self.assertRegex(
                             self.build(target), rf"compile {artifact} debug \S+ cached"
                         )
@@ -1753,7 +1759,11 @@ class RuntimeCacheTest(unittest.TestCase):
                         "src/backends/metal_compile_options.h",
                     ]
                     if backend == "metal"
-                    else ["src/ops/cuda/kernels.zig"]
+                    else [
+                        "src/ops/cuda/kernels.zig",
+                        "src/ops/cuda/kernels/rms_q8_1_2560.cuh",
+                        "src/ops/cuda/kernels/gemma4_e4b_prefetch.cuh",
+                    ]
                 ) + ["src/graph/kernel_jit.zig", "src/graph/quant_kernel_compiler.zig"]
                 if backend == "cuda":
                     qualifier.append("src/graph/quant_kernel_cuda_renderer.zig")
@@ -1769,6 +1779,8 @@ class RuntimeCacheTest(unittest.TestCase):
                         self.bundle_digest(
                             [
                                 "src/ops/cuda/cuda_compute.zig",
+                                "src/ops/cuda/kernels/rms_q8_1_2560.cuh",
+                                "src/ops/cuda/kernels/gemma4_e4b_prefetch.cuh",
                                 "src/graph/quant_kernel_compiler.zig",
                                 "src/graph/quant_matmul.zig",
                                 "src/gguf/tensor_types.zig",
