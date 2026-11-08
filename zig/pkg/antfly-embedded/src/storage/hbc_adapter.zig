@@ -9587,12 +9587,10 @@ pub const HBCIndex = struct {
         };
         const posting_root = try std.fs.path.join(self.alloc, &.{ location.root_dir, "posting-segments" });
         defer self.alloc.free(posting_root);
-        if (switch (self.env_owner) {
-            .native => |owner| owner.read_only,
-            .namespaces => |owner| owner.read_only,
-            .lsm => false,
-        }) return try posting_segment_store_mod.Store.openReadOnlyWithSegmentAlloc(self.alloc, location.storage, posting_root);
-        return try posting_segment_store_mod.Store.openWithSegmentAlloc(self.alloc, location.storage, posting_root);
+        // Activation is observation, including for a writer runtime. Recovery
+        // may truncate a live publisher's uncommitted tail, so it belongs to
+        // the separately admitted mutation store, never a cold read open.
+        return try posting_segment_store_mod.Store.openReadOnlyWithSegmentAlloc(self.alloc, location.storage, posting_root);
     }
 
     fn discardExperimentalPostingCheckpointBuild(self: *HBCIndex) void {

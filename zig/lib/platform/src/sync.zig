@@ -42,7 +42,7 @@ pub const BroadcastCondition = struct {
 
     pub const init: BroadcastCondition = .{};
 
-    pub fn waitUncancelable(self: *BroadcastCondition, io: std.Io, mutex: *std.Io.Mutex) void {
+    pub fn waitUncancelable(self: *BroadcastCondition, io: std.Io, mutex: anytype) void {
         const observed = self.epoch.load(.acquire);
         std.debug.assert(self.waiters < std.math.maxInt(u32));
         self.waiters += 1;

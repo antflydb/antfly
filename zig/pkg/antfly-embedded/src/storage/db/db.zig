@@ -33636,8 +33636,8 @@ pub const DB = struct {
         cancellation: types.CancellationToken,
         deadline_ns: ?u64,
     ) !void {
-        if (sequence == 0) return;
         if (self.enrichment_runtime) |runtime| {
+            if (sequence == 0 and !runtime.hasPendingGraphStageRecovery()) return;
             if (!self.local_execution.optional_runtime_workers_enabled) {
                 if (deadline_ns == null and cancellation.ptr == null) {
                     // Explicit maintenance/drain callers historically execute
@@ -33679,8 +33679,8 @@ pub const DB = struct {
     /// behavior (see the `TestLiteHostedPauseResumeGeneratedEnrichment`
     /// regression this scoping fixes).
     fn runEnrichmentUntilForDrainUnbounded(self: *DB, sequence: u64) !void {
-        if (sequence == 0) return;
         const runtime = self.enrichment_runtime orelse return;
+        if (sequence == 0 and !runtime.hasPendingGraphStageRecovery()) return;
         runtime.notifySequence(sequence);
         try runtime.catchUpUntilForDrain(sequence);
     }
@@ -38458,7 +38458,13 @@ pub const DB = struct {
                 }
             }
             if (primary) if (self.enrichment_runtime) |runtime| {
-                try runtime.requireHealthyForQueryCapture();
+                runtime.requireHealthyForQueryCapture() catch |err| switch (err) {
+                    // A cold runtime must reconcile staged graph effects
+                    // before visibility can be certified. This is pending
+                    // work for the publisher, not a failed committed batch.
+                    error.EnrichmentRetryInProgress => return false,
+                    else => return err,
+                };
                 if (runtime.stats().applied_sequence < sequence) return false;
             };
         }
@@ -143306,6 +143312,37 @@ test "db graph endpoint cleanup pages cancellation stops between commits" {
     // Cancellation preserves the primary commit and the unfinished durable job.
     try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStep());
     try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+}
+
+test "db graph endpoint cleanup pages owned visibility waits for cold graph recovery" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |with_document| {
+        var directory = try TestDirectory.init("owned-cold-graph-visibility");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_optional_runtime_workers = false, .start_index_workers = false });
+        defer db.close();
+        if (with_document) try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{}" }}, .sync_level = .write });
+        const sequence = db.core.nextDerivedSequence();
+        const stage = "\x00\x00__graph_stage__:v1:orphan";
+        try db.core.store.putBatch(&.{.{ .key = stage, .value = "orphan" }}, &.{});
+        var config: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
+        try db.initOptionalEnrichmentRuntime(&config);
+        const runtime = db.enrichment_runtime.?;
+        var completion: execution_resources.BatchVisibilityCompletion = .{ .sequence = sequence, .sync_level = .enrichments };
+        var cursor: execution_resources.BatchVisibilityCursor = .{};
+        defer cursor.deinit();
+        // Even an applied replay watermark does not prove recovery has finished.
+        try runtime.markAppliedThrough(sequence);
+        try std.testing.expect(runtime.hasPendingGraphStageRecovery());
+        try std.testing.expect(!try db.pollBatchVisibilityCompletion(&completion, &cursor));
+        try db.runUntilIdle();
+        try std.testing.expect(!runtime.hasPendingGraphStageRecovery());
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stage));
+        try std.testing.expect(try db.pollBatchVisibilityCompletion(&completion, &cursor));
+        runtime.worker_failed = true;
+        try std.testing.expectError(error.EnrichmentWorkerFailed, db.pollBatchVisibilityCompletion(&completion, &cursor));
+        runtime.worker_failed = false;
+    }
 }
 
 test "db graph endpoint cleanup pages owned visibility retains its publication cut" {

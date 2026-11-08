@@ -454,6 +454,9 @@ fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []co
 /// Namespace-owned retirement continuation. No snapshot or borrowed key survives a turn.
 pub const ReplayRetirement = struct {
     pub const max_keys = 4096;
+    /// Each canonical candidate can require eight point reads. Bound that
+    /// work separately from cheap lane deletes and large artifact batches.
+    pub const max_canonical_examined = 64;
     // Even a record copied into every lane must retire faster than bounded
     // replay creates journal debt once cleanup is outstanding.
     pub const record_cap = max_keys / (replay_hints.len + 1);
@@ -468,6 +471,7 @@ pub const ReplayRetirement = struct {
     clean_lanes: usize = 0,
     sweep_bound: u64 = 0,
     sweep_lane_bounds: [9]u64 = @splat(0),
+    sweep_active: bool = false,
     canonical_after: u64 = 0,
     runnable: bool = false,
 };
@@ -2980,7 +2984,7 @@ pub const DocStore = struct {
     pub fn truncateReplayUpTo(self: *DocStore, alloc: Allocator, up_to_sequence: u64) !void {
         if (self.deferred_replay_retirement) |state| {
             if (!self.bounded_replay_retirement) {
-                if (up_to_sequence > state.watermark) state.clean_lanes = 0;
+                if (up_to_sequence > state.watermark and !state.sweep_active) state.clean_lanes = 0;
                 state.watermark = @max(state.watermark, up_to_sequence);
                 return;
             }
@@ -2997,7 +3001,7 @@ pub const DocStore = struct {
         for (bounds) |bound| maximum = @max(maximum, bound);
         if (self.deferred_replay_retirement) |state| {
             if (!self.bounded_replay_retirement) {
-                if (maximum > state.watermark) state.clean_lanes = 0;
+                if (maximum > state.watermark and !state.sweep_active) state.clean_lanes = 0;
                 state.watermark = @max(state.watermark, maximum);
                 return;
             }
@@ -3020,9 +3024,17 @@ pub const DocStore = struct {
             return;
         }
         var lane = state.lane;
-        const same_bounds = state.sweep_bound == up_to_sequence and std.mem.eql(u64, &state.sweep_lane_bounds, &bounds);
-        var clean_lanes = if (same_bounds) state.clean_lanes else 0;
-        var canonical_after = if (same_bounds) state.canonical_after else 0;
+        // Finish a captured consumer cut before chasing newer acknowledgments.
+        // Advancing tips must not restart every bounded canonical page at zero.
+        // A lowered permission, however, immediately invalidates the old cut.
+        var continue_sweep = state.sweep_active and up_to_sequence >= state.sweep_bound;
+        for (bounds, state.sweep_lane_bounds) |current, captured| {
+            if (current < captured) continue_sweep = false;
+        }
+        const sweep_bound = if (continue_sweep) state.sweep_bound else up_to_sequence;
+        const sweep_bounds = if (continue_sweep) state.sweep_lane_bounds else bounds;
+        var clean_lanes = if (continue_sweep) state.clean_lanes else 0;
+        var canonical_after = if (continue_sweep) state.canonical_after else 0;
         var scan_incomplete = false;
         var deletes = std.ArrayListUnmanaged([]u8).empty;
         defer {
@@ -3034,6 +3046,14 @@ pub const DocStore = struct {
         // cannot mistake their old captured values for surviving consumers.
         var deleted_lanes: std.AutoHashMapUnmanaged(u64, u8) = .empty;
         defer deleted_lanes.deinit(alloc);
+        const ReferenceRead = struct {
+            txn: *Txn,
+            buffer: [@import("db/derived/replay_reference.zig").reference_size]u8 = undefined,
+            pub fn get(reader: *@This(), key: []const u8) ![]const u8 {
+                if (reader.txn.current_scan) |*replay_scan| return replay_scan.getPrefixInto(key, &reader.buffer);
+                return reader.txn.get(key);
+            }
+        };
         // Skip empty lanes within the same bounded turn. A quiet lane must
         // not consume the service capacity needed by an active journal lane.
         for (0..replay_hints.len + 1) |_| {
@@ -3055,16 +3075,14 @@ pub const DocStore = struct {
                 while (entry) |kv| : (entry = try cur.next()) {
                     if (std.mem.order(u8, kv.key, &upper) != .lt) break;
                     const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
-                    if (sequence > bounds[lane]) break;
-                    if (ordinal == internal_keys.replay_all_kind and examined == ReplayRetirement.max_keys) {
+                    if (sequence > sweep_bounds[lane]) break;
+                    if (ordinal == internal_keys.replay_all_kind and examined == ReplayRetirement.max_canonical_examined) {
                         scan_incomplete = true;
                         break;
                     }
                     examined += 1;
                     const previous_after = canonical_after;
                     if (ordinal == internal_keys.replay_all_kind) canonical_after = sequence;
-                    if (ordinal == internal_keys.replay_all_kind and txn.current_scan.?.vtable.get != null and
-                        !try @import("db/derived/replay_reference.zig").canonicalMayRetireAfterLaneDeletes(&txn, sequence, deleted_lanes.get(sequence) orelse 0)) continue;
                     const chunk_codec = @import("db/derived/replay_chunks.zig");
                     var manifest_buffer: [chunk_codec.manifest_size + 1]u8 = undefined;
                     const raw = if (ordinal == internal_keys.replay_all_kind and prefixes)
@@ -3082,10 +3100,16 @@ pub const DocStore = struct {
                             // minimum rather than adding payload reads here.
                             @as(u8, 0);
                         var safe = true;
-                        for (bounds[0..8], 0..) |bound, hint| {
+                        for (sweep_bounds[0..8], 0..) |bound, hint| {
                             if ((mask == 0 or mask & (@as(u8, 1) << @intCast(hint)) != 0) and sequence > bound) safe = false;
                         }
                         if (!safe) continue;
+                        // Inspect references only after logical eligibility.
+                        // Prefix reads never hydrate a large legacy lane body.
+                        if (txn.current_scan.?.vtable.get != null or txn.current_scan.?.vtable.get_prefix_into != null) {
+                            var references: ReferenceRead = .{ .txn = &txn };
+                            if (!try @import("db/derived/replay_reference.zig").canonicalMayRetireAfterLaneDeletes(&references, sequence, deleted_lanes.get(sequence) orelse 0)) continue;
+                        }
                     }
                     if (ordinal == internal_keys.replay_all_kind and chunk_codec.isManifest(raw)) {
                         const manifest = try chunk_codec.Manifest.decode(raw);
@@ -3134,11 +3158,12 @@ pub const DocStore = struct {
         // retries the same lane and bound without claiming unchecked work clean.
         state.lane = lane;
         state.clean_lanes = clean_lanes;
-        state.sweep_bound = up_to_sequence;
-        state.sweep_lane_bounds = bounds;
+        state.sweep_bound = sweep_bound;
+        state.sweep_lane_bounds = sweep_bounds;
+        state.sweep_active = clean_lanes < replay_hints.len + 1;
         state.canonical_after = canonical_after;
         state.bounded_continuation = scan_incomplete or deletes.items.len == ReplayRetirement.max_keys;
-        state.runnable = clean_lanes < replay_hints.len + 1;
+        state.runnable = state.sweep_active or sweep_bound < up_to_sequence or !std.mem.eql(u64, &sweep_bounds, &bounds);
         if (!state.runnable and up_to_sequence >= state.watermark) state.watermark = 0;
     }
 
@@ -5609,15 +5634,18 @@ test "docstore replay retirement defers source work and bounds fair cleanup acro
     state.lane = replay_hints.len;
     try store.truncateReplayUpTo(alloc, cutoff);
     // One bounded batch preserves the next eligible row for a later turn.
-    const boundary = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 301 + ReplayRetirement.max_keys);
+    const boundary = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 301 + ReplayRetirement.max_canonical_examined);
     const value = try store.get(alloc, &boundary);
     alloc.free(value);
     // A full canonical batch resumes at its exact last inspected sequence;
     // it cannot claim the remainder of this lane clean by rotating past it.
     try std.testing.expect(state.runnable);
     try std.testing.expectEqual(replay_hints.len, state.lane);
-    try std.testing.expectEqual(@as(u64, 300 + ReplayRetirement.max_keys), state.canonical_after);
-    for (0..(replay_hints.len + 1) * 5) |_| try store.truncateReplayUpTo(alloc, cutoff);
+    try std.testing.expectEqual(@as(u64, 300 + ReplayRetirement.max_canonical_examined), state.canonical_after);
+    for (0..(replay_hints.len + 1) * 5 + 3 * cutoff / ReplayRetirement.max_canonical_examined) |_| {
+        if (!state.runnable) break;
+        try store.truncateReplayUpTo(alloc, cutoff);
+    }
     try std.testing.expectEqual(@as(u64, 0), state.watermark);
     for (hints) |hint| {
         const retired = internal_keys.replayEntryKey(hint, cutoff);
@@ -6964,6 +6992,11 @@ test "docstore replay retirement atomically separates source and output consumer
     // that the newly acknowledged output lane is physically gone.
     bounds[1] = 2;
     try store.truncateReplayByConsumerBounds(a, bounds);
+    for (0..32) |_| {
+        if (!state.runnable) break;
+        try store.truncateReplayByConsumerBounds(a, bounds);
+    }
+    try std.testing.expect(!state.runnable);
     try std.testing.expectError(error.NotFound, store.get(a, &output_index));
     try std.testing.expectError(error.NotFound, store.get(a, &output));
     {
@@ -6990,7 +7023,7 @@ test "docstore replay retirement atomically bounds scans past pinned source reco
     var store = try DocStore.open(a, path, .{});
     defer store.close();
     const refs = @import("db/derived/replay_reference.zig");
-    const last_source = ReplayRetirement.max_keys + 3;
+    const last_source = 2 * ReplayRetirement.max_canonical_examined + 3;
     const output_sequence = last_source + 1;
     {
         var write = try store.beginWriteBatch();
@@ -7016,13 +7049,41 @@ test "docstore replay retirement atomically bounds scans past pinned source reco
     bounds[0] = 0;
     try store.truncateReplayByConsumerBounds(a, bounds);
     try std.testing.expect(state.runnable);
-    try std.testing.expectEqual(@as(u64, ReplayRetirement.max_keys), state.canonical_after);
-    for (0..16) |_| {
+    try std.testing.expectEqual(@as(u64, ReplayRetirement.max_canonical_examined), state.canonical_after);
+    // A moving output tip must not send a partial scan back to its first page.
+    const next_output = output_sequence + 1;
+    {
+        const raw = try change_journal_mod.encodeRecord(a, .{ .sequence = next_output, .changed_doc_keys = &.{"next"}, .target_hints = &.{.full_text} });
+        defer a.free(raw);
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.put(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, next_output), raw);
+        try write.put(&internal_keys.replayEntryKey(1, next_output), &refs.encodeReference(next_output, .full_text));
+        try write.commit();
+    }
+    bounds = @splat(next_output);
+    bounds[0] = 0;
+    try store.truncateReplayByConsumerBounds(a, bounds);
+    try std.testing.expectEqual(@as(u64, 2 * ReplayRetirement.max_canonical_examined), state.canonical_after);
+    try std.testing.expectEqual(@as(u64, output_sequence), state.sweep_bound);
+    // A lowered consumer permission must invalidate the captured cut at once.
+    bounds[1] = 0;
+    try store.truncateReplayByConsumerBounds(a, bounds);
+    try std.testing.expectEqual(@as(u64, 0), state.sweep_lane_bounds[1]);
+    {
+        var captured = try store.beginReadTxn();
+        defer captured.abort();
+        _ = try captured.get(&internal_keys.replayEntryKey(1, next_output));
+        _ = try captured.get(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, next_output));
+    }
+    bounds[1] = next_output;
+    for (0..64) |_| {
         if (!state.runnable) break;
         try store.truncateReplayByConsumerBounds(a, bounds);
     }
     try std.testing.expect(!state.runnable);
     try std.testing.expectError(error.NotFound, store.get(a, &internal_keys.replayEntryKey(internal_keys.replay_all_kind, output_sequence)));
+    try std.testing.expectError(error.NotFound, store.get(a, &internal_keys.replayEntryKey(internal_keys.replay_all_kind, next_output)));
     var captured = try store.beginReadTxn();
     defer captured.abort();
     _ = try captured.get(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1));

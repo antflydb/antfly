@@ -572,7 +572,7 @@ pub const PreparedPublication = struct {
         try live_file.inheritAllocatorVerification(&self.snapshot_root.owned_lite_backend.?.native_docstore.?.file);
         if (!live_file.free_pages_verified) {
             self.owner.publication_stats.allocator_refusals +|= 1;
-            return error.EnrichmentWaitCanceled;
+            return Owner.refuseMaintenance(.primary, "serving_allocator_unverified");
         }
         return database;
     }
@@ -2435,6 +2435,7 @@ pub const Owner = struct {
         for (indexes) |index| if (index.catch_up_required) return true;
         const state = h.db_mod.enrichment_state;
         if (database.enrichment_runtime) |runtime| {
+            if (runtime.hasPendingGraphStageRecovery()) return true;
             const stats = runtime.stats();
             // Durable retry/notification targets also need reconciliation.
             // The runtime may know a newer target than this view's cached
@@ -2582,6 +2583,12 @@ pub const Owner = struct {
         return enterMaintenanceWriterForIndex(ptr, scope, null);
     }
 
+    fn refuseMaintenance(scope: PublicationScope, comptime reason: []const u8) error{EnrichmentWaitCanceled} {
+        if (qualificationMetricsEnabled())
+            std.log.info("antfly_bench_native_publication_refusal scope={s} reason={s}", .{ @tagName(scope), reason });
+        return error.EnrichmentWaitCanceled;
+    }
+
     fn enterMaintenanceWriterForIndex(ptr: *anyopaque, scope: PublicationScope, index_name: ?[]const u8) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         const self = root.maintenance_owner.?;
@@ -2599,14 +2606,14 @@ pub const Owner = struct {
             null;
         // Nested storage writes borrow only the already validated index domain.
         if (root.maintenance_writer_references != 0 and index_name != null) {
-            if (publication_context) |p| if (p.admitted_index_scope != scoped_index) return error.EnrichmentWaitCanceled;
+            if (publication_context) |p| if (p.admitted_index_scope != scoped_index) return refuseMaintenance(scope, "nested_index_scope");
         }
         // A primary publication can rebase onto changed index inputs while
         // recording completed replay progress. Nesting shares its writer
         // lease, but cannot grant its stale index runtimes new authority.
         if (scope == .index or scope == .index_read) if (root.maintenance_publication) |p| if (p.index_inputs_changed and scoped_index == null) {
             self.publication_stats.index_input_refusals +|= 1;
-            return error.EnrichmentWaitCanceled;
+            return refuseMaintenance(scope, "unscoped_index_changed");
         };
         if (root.maintenance_writer_references != 0) {
             count_admission = false; // Included in the outer publication's hold.
@@ -2635,7 +2642,7 @@ pub const Owner = struct {
         defer probe.close();
         const file = &root.owned_lite_backend.?.native_docstore.?.file;
         const probe_inode = (try probe.file.stat(probe.runtime())).inode;
-        if (probe_inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
+        if (probe_inode != (try file.file.stat(file.runtime())).inode) return refuseMaintenance(scope, "replaced_inode");
         self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());
         // Allocator-only adoption can advance this file without validating
         // its captured catalog. Scoped permission must recheck the durable
@@ -2672,13 +2679,24 @@ pub const Owner = struct {
                     publication.index_inputs_changed = true;
                     if ((scope == .index or scope == .index_read) and scoped_index == null) {
                         self.publication_stats.index_input_refusals +|= 1;
-                        return error.EnrichmentWaitCanceled;
+                        if (qualificationMetricsEnabled()) std.log.info("antfly_bench_native_publication_refusal_context clean={any} indexed={any} named={any} scopes={d} shadows={d} resolver={any} admitted_reads={any} captured_commit={d} latest_commit={d}", .{
+                            if (publication.catalog) |proof| proof.recovery_clean else false,
+                            file.header.indexed_reclamation,
+                            index_name != null,
+                            publication.index_scopes.len,
+                            publication.shadow_scopes.len,
+                            publication.resolver_dependency != null,
+                            root.owned_lite_backend.?.native_docstore.?.index_reads_require_admission,
+                            file.activeCheckpoint().commit_sequence,
+                            latest.activeCheckpoint().commit_sequence,
+                        });
+                        return refuseMaintenance(scope, "rebased_index_changed");
                     }
                 }
             }
             if (scoped_index) |i| if (!try publication.indexScopeUnchanged(i, &latest)) {
                 self.publication_stats.index_input_refusals +|= 1;
-                return error.EnrichmentWaitCanceled;
+                return refuseMaintenance(scope, "rebased_index_scope_changed");
             };
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
             if (self.current) |current| try file.inheritAllocatorVerification(&current.owned_lite_backend.?.native_docstore.?.file);
@@ -2686,12 +2704,14 @@ pub const Owner = struct {
         }
         if (scoped_index) |i| if (!try publication_context.?.indexScopeUnchanged(i, file)) {
             self.publication_stats.index_input_refusals +|= 1;
-            return error.EnrichmentWaitCanceled;
+            return refuseMaintenance(scope, "admitted_index_scope_changed");
         };
         if (requires_publication) {
             const publication = root.maintenance_publication orelse return error.Canceled;
             publication.requireCurrentCatalog() catch |err| {
                 publication.index_inputs_changed = true;
+                if (qualificationMetricsEnabled())
+                    std.log.info("antfly_bench_native_publication_refusal scope={s} reason=catalog error={s}", .{ @tagName(scope), @errorName(err) });
                 return err;
             };
         }
@@ -2705,7 +2725,7 @@ pub const Owner = struct {
             _ = try file.inheritAllocatorCertificate();
         if ((scope == .primary or scope == .index) and !file.free_pages_verified) {
             self.publication_stats.allocator_refusals +|= 1;
-            return error.EnrichmentWaitCanceled;
+            return refuseMaintenance(scope, "admitted_allocator_unverified");
         }
         if (scope == .allocator_service) self.publication_stats.allocator_service_admissions +|= 1;
         root.maintenance_writer_lease = lease;
@@ -3509,6 +3529,8 @@ pub const Owner = struct {
 
     fn producerNeedsWork(database: *h.db_mod.DB) !bool {
         if (database.enrichment_runtime) |runtime| {
+            // Startup cleanup can owe work even at an applied journal cut.
+            if (runtime.hasPendingGraphStageRecovery()) return true;
             const stats = runtime.stats();
             if (stats.retrying or stats.applied_sequence < @max(stats.target_sequence, database.core.nextDerivedSequence())) return true;
         }

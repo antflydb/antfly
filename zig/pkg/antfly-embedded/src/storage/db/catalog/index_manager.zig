@@ -4191,11 +4191,11 @@ pub const IndexManager = struct {
         }
     }
 
-    fn bindPrimaryStore(self: *IndexManager, store: anytype, read_only: bool) void {
+    fn bindPrimaryStore(self: *IndexManager, store: anytype) void {
         const Store = @TypeOf(store);
         if (comptime Store == *docstore_mod.DocStore) {
             self.primary_store = store;
-            self.loadVectorBlockGenerationIfPresent(read_only) catch |err| {
+            self.loadVectorBlockGenerationIfPresent() catch |err| {
                 std.log.warn("shared vector-block generation open failed; primary artifact fallback remains active err={s}", .{@errorName(err)});
             };
         }
@@ -5523,7 +5523,19 @@ pub const IndexManager = struct {
         }
     }
 
-    fn loadVectorBlockGenerationIfPresent(self: *IndexManager, read_only: bool) !void {
+    fn activateOptionalDensePostingReads(index: *hbc_mod.HBCIndex, name: []const u8, applied_sequence: u64) void {
+        // A source publisher can durably advance its optional projection before
+        // the multi-index replay watermark advances. Cold observers must leave
+        // that checkpoint intact: invalidating it makes the publisher's exact
+        // input witness stale and can prevent replay from ever finishing.
+        // Failed activation leaves this fresh runtime on its legacy authority.
+        index.activateExperimentalPostingReads(applied_sequence) catch |err| switch (err) {
+            error.FileNotFound, error.MissingPostingCheckpoint, error.PostingCheckpointSequenceMismatch => {},
+            else => std.log.warn("dense posting sidecar startup validation failed index={s} err={s}", .{ name, @errorName(err) }),
+        };
+    }
+
+    fn loadVectorBlockGenerationIfPresent(self: *IndexManager) !void {
         if (self.vector_block_storage == null) return;
         if (self.acquireVectorBlockGeneration()) |current| {
             current.release();
@@ -5540,31 +5552,14 @@ pub const IndexManager = struct {
             };
             break :blk true;
         };
-        if (!current_exists) {
-            // A reader may open while the writer is staging its first base.
-            // Only the writer can distinguish live staging from crash debt.
-            if (read_only) return;
-            // A crash may leave first-generation blocks before CURRENT. Avoid
-            // creating vector state for tables that have never staged it, but
-            // still enter recovery when the native root contains debt.
-            const names = self.vector_block_storage.?.listFileNamesAlloc(self.alloc, root) catch |err| switch (err) {
-                error.FileNotFound, error.DirectoryListingUnsupported => return,
-                else => return err,
-            };
-            defer lsm_backend_mod.Storage.freeFileNames(self.alloc, names);
-            if (names.len == 0) return;
-        }
-        var opened = if (read_only)
-            try vector_block_store_mod.Store.openReadOnlyWithBlocks(self.alloc, self.vector_block_storage.?, root)
-        else
-            try vector_block_store_mod.Store.openWithBlocks(self.alloc, self.vector_block_storage.?, root);
+        // Opening a serving runtime is observation, including writer opens.
+        // Another owner may be staging the first base: opening a mutable Store
+        // here resets its WAL and startup collection can delete its live files.
+        // Publication owns recovery/collection under its construction fence.
+        if (!current_exists) return;
+        var opened = try vector_block_store_mod.Store.openReadOnlyWithBlocks(self.alloc, self.vector_block_storage.?, root);
         var opened_owned = true;
         errdefer if (opened_owned) opened.deinit();
-        if (!read_only) {
-            _ = opened.store.reclaimUnreferencedFiles() catch |err| {
-                std.log.warn("shared vector-block startup cleanup deferred root={s} err={s}", .{ root, @errorName(err) });
-            };
-        }
         if (opened.store.manifest == null) {
             opened.deinit();
             opened_owned = false;
@@ -5754,7 +5749,7 @@ pub const IndexManager = struct {
         };
         defer store.deinit();
         if (store.manifest != null and store.covered_source_sequence == applied_sequence) {
-            try self.loadVectorBlockGenerationIfPresent(false);
+            try self.loadVectorBlockGenerationIfPresent();
             if (!converting and self.vectorBlockReadyAtSequenceAndCount(
                 applied_sequence,
                 entry,
@@ -12724,7 +12719,7 @@ pub const IndexManager = struct {
     pub fn loadSelectedNoBackfill(self: *IndexManager, store: anytype, names: []const []const u8) !void {
         defer self.invalidateWritePlanSnapshot();
         try self.loadCatalogOnly(store);
-        self.bindPrimaryStore(store, true);
+        self.bindPrimaryStore(store);
         const configs = self.status_only_index_configs;
         self.status_only_index_configs = &.{};
         defer {
@@ -12762,7 +12757,7 @@ pub const IndexManager = struct {
     fn loadWithBackfill(self: *IndexManager, store: anytype, allow_backfill: bool, read_only: bool) !void {
         defer self.invalidateWritePlanSnapshot();
         const load_started_ns = nowNs();
-        self.bindPrimaryStore(store, read_only);
+        self.bindPrimaryStore(store);
         self.clearStatusOnlyIndexConfigs();
         self.clearFailedIndexLoads();
         try self.loadEnrichmentCatalog(store);
@@ -13508,7 +13503,7 @@ pub const IndexManager = struct {
     ) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.bindPrimaryStore(store, false);
+        self.bindPrimaryStore(store);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
         if (prepared == null) {
             const jobs = try self.graphReplacementBuildsAlloc(store, self.alloc);
@@ -13658,7 +13653,7 @@ pub const IndexManager = struct {
     pub fn addAllNoBackfill(self: *IndexManager, store: anytype, configs: []const types.IndexConfig) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.bindPrimaryStore(store, false);
+        self.bindPrimaryStore(store);
         if (configs.len == 0) return;
 
         var stored_configs = try self.alloc.alloc(types.IndexConfig, configs.len);
@@ -13738,7 +13733,7 @@ pub const IndexManager = struct {
     pub fn registerReplacementIndex(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.bindPrimaryStore(store, false);
+        self.bindPrimaryStore(store);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
         // A replacement opens only its target generation, but named artifact
         // sources still depend on the canonical durable producer/resolver
@@ -15740,7 +15735,7 @@ pub const IndexManager = struct {
     ) !?DetachedIndex {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.bindPrimaryStore(store, false);
+        self.bindPrimaryStore(store);
 
         if (std.meta.activeTag(replacement.*) != cfg.kind or
             types.indexConfigHash(detachedIndexConfig(replacement).*) != types.indexConfigHash(cfg))
@@ -24833,19 +24828,7 @@ pub const IndexManager = struct {
                             cfg.name,
                         );
                         posting_sequence = applied_sequence;
-                        index.activateExperimentalPostingReads(applied_sequence) catch |err| switch (err) {
-                            error.MissingPostingCheckpoint, error.PostingCheckpointSequenceMismatch => {
-                                if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
-                                    std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
-                                };
-                            },
-                            else => {
-                                std.log.warn("dense posting sidecar startup validation failed index={s} err={s}", .{ cfg.name, @errorName(err) });
-                                if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
-                                    std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
-                                };
-                            },
-                        };
+                        activateOptionalDensePostingReads(index, cfg.name, applied_sequence);
                     }
                     if (index.experimentalPostingReadsEnabled()) {
                         std.log.debug("dense posting sidecar activated index={s} sequence={}", .{ cfg.name, posting_sequence });
@@ -38812,7 +38795,7 @@ test "repair shadow cleanup isolates malformed pointer ownership" {
     defer store.close();
     var manager = try IndexManager.init(alloc, base_path);
     defer manager.deinit();
-    manager.bindPrimaryStore(&store, false);
+    manager.bindPrimaryStore(&store);
 
     const corrupt_name = "dense_corrupt";
     const protected_root = ".repair-shadow-protected";
@@ -46096,7 +46079,7 @@ test "algebraic retirement pages generation keys and resumes from its durable cu
     {
         var restarted = try IndexManager.init(alloc, std.mem.span(path));
         defer restarted.deinit();
-        restarted.bindPrimaryStore(&store, false);
+        restarted.bindPrimaryStore(&store);
         while (true) {
             var result = try restarted.drainGeneratedArtifactCleanupOutboxPage(&store);
             defer result.deinit();
@@ -46156,7 +46139,7 @@ test "orphan algebraic generation cleanup resumes from deleted durable pages" {
     {
         var manager = try IndexManager.init(alloc, std.mem.span(path));
         defer manager.deinit();
-        manager.bindPrimaryStore(&store, false);
+        manager.bindPrimaryStore(&store);
         try std.testing.expect(try manager.cleanupInactiveRepairShadowRootsPage());
         const remaining = try store.scanPrefix(alloc, fact_prefix);
         defer docstore_mod.DocStore.freeResults(alloc, remaining);
@@ -46169,7 +46152,7 @@ test "orphan algebraic generation cleanup resumes from deleted durable pages" {
     {
         var restarted = try IndexManager.init(alloc, std.mem.span(path));
         defer restarted.deinit();
-        restarted.bindPrimaryStore(&store, false);
+        restarted.bindPrimaryStore(&store);
         while (try restarted.cleanupInactiveRepairShadowRootsPage()) {}
     }
     const remaining = try store.scanPrefix(alloc, fact_prefix);
@@ -51453,6 +51436,65 @@ test "dense vector block physical order drains one low-bit shard at a time" {
         reads[3].position,
         reads[4].position,
     });
+}
+
+test "optional dense posting cold opens preserve a publisher ahead of replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/posting-observation", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    const config: hbc_mod.HBCConfig = .{ .dims = 2, .leaf_size = 8, .branching_factor = 2, .search_width = 8, .use_quantization = false, .storage_backend = .lsm };
+    {
+        var publisher = try hbc_mod.HBCIndex.open(alloc, path, config);
+        defer publisher.close();
+        try publisher.beginExperimentalPostingMutationCapture();
+        try publisher.insert(1, &.{ 1.0, 0.0 });
+        try publisher.persistExperimentalPostingSidecarAtAppliedSequence(2, .{});
+    }
+    // Repeated foreground observations at the older general watermark must
+    // neither activate future state nor destroy the publisher's checkpoint.
+    for (0..3) |_| {
+        var observer = try hbc_mod.HBCIndex.open(alloc, path, config);
+        defer observer.close();
+        IndexManager.activateOptionalDensePostingReads(&observer, "embedding", 0);
+        try std.testing.expect(!observer.experimentalPostingReadsEnabled());
+        try observer.activateExperimentalPostingReads(2);
+        try std.testing.expect(observer.experimentalPostingReadsEnabled());
+        var found = try observer.search(&.{ 1.0, 0.0 }, 1);
+        defer found.deinit();
+        try std.testing.expectEqual(@as(usize, 1), found.items.items.len);
+    }
+}
+
+test "native vector block cold opens preserve unpublished construction" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    const storage = manager.vector_block_storage orelse return error.TestMissingVectorStorage;
+    const root = try manager.vectorBlockRootAlloc();
+    defer alloc.free(root);
+    try storage.createDirPath(root);
+    const wal = try std.fs.path.join(alloc, &.{ root, "wal-1.afvw" });
+    defer alloc.free(wal);
+    const block = try std.fs.path.join(alloc, &.{ root, "block-1-0.afvb" });
+    defer alloc.free(block);
+    // No CURRENT exists yet. These bytes belong to the admitted publisher;
+    // a cold observer cannot distinguish active construction from crash debt.
+    try storage.writeFileAbsolute(wal, "inflight WAL");
+    try storage.writeFileAbsolute(block, "inflight block");
+    try manager.loadVectorBlockGenerationIfPresent();
+    const kept_wal = try storage.readFileAlloc(alloc, wal, 100);
+    defer alloc.free(kept_wal);
+    const kept_block = try storage.readFileAlloc(alloc, block, 100);
+    defer alloc.free(kept_block);
+    try std.testing.expectEqualStrings("inflight WAL", kept_wal);
+    try std.testing.expectEqualStrings("inflight block", kept_block);
+    try std.testing.expect(manager.acquireVectorBlockGeneration() == null);
 }
 
 test "native vector block readiness fails closed when storage is detached" {

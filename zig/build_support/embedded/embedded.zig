@@ -685,6 +685,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
+        .imports = &.{.{ .name = "antfly_platform", .module = antfly_imports.platform }},
     }) });
     const run_maintenance_activity = b.addRunArtifact(maintenance_activity_tests);
     run_capi_tests.step.dependOn(&run_maintenance_activity.step);

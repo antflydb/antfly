@@ -380,6 +380,10 @@ pub const Store = struct {
     covered_source_sequence: u64 = 0,
     segment_covered_source_sequence: u64 = 0,
     poisoned: bool = false,
+    /// Observers retain a committed prefix without rewriting an active file.
+    /// A later admitted writer must reconcile that tail before appending.
+    wal_tail_recovery_pending: bool = false,
+    observed_manifest_digest: ?[32]u8 = null,
 
     const SharedManifest = struct {
         refs: std.atomic.Value(usize) = .init(1),
@@ -755,6 +759,7 @@ pub const Store = struct {
     }
 
     fn appendWriter(self: *Store, batch_id: u64, covered_source_sequence: u64, bytes: []const u8, options: AppendOptions) !void {
+        try self.recoverObservedWalTailForAppend();
         const next_bytes = std.math.add(u64, self.wal_committed_bytes, bytes.len) catch return error.VectorWalTooLarge;
         if (next_bytes > max_wal_bytes) return error.VectorWalTooLarge;
         const path = try self.walPathAlloc(self.wal_generation);
@@ -766,6 +771,27 @@ pub const Store = struct {
         self.wal_committed_bytes = next_bytes;
         self.last_committed_batch = batch_id;
         self.covered_source_sequence = covered_source_sequence;
+    }
+
+    fn recoverObservedWalTailForAppend(self: *Store) !void {
+        if (!self.wal_tail_recovery_pending) return;
+        errdefer self.poisoned = true;
+        // The caller owns writer/publication exclusion. Validate CURRENT
+        // before entering recovery; a stale observer cannot reset a different
+        // generation's WAL merely because it once saw an incomplete tail.
+        const expected = self.observed_manifest_digest orelse return error.VectorBlockStoreRequiresReopen;
+        const path = try self.currentPathAlloc();
+        defer self.alloc.free(path);
+        const actual = try self.storage.readFileAlloc(self.alloc, path, max_manifest_bytes);
+        defer self.alloc.free(actual);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(actual, &digest, .{});
+        if (!std.mem.eql(u8, &expected, &digest)) return error.VectorBlockStoreRequiresReopen;
+        var recovered = try Store.open(self.alloc, self.storage, self.root_dir);
+        defer recovered.deinit();
+        if (!std.meta.eql(self.walPrefixBoundary(), recovered.walPrefixBoundary()))
+            return error.VectorBlockStoreRequiresReopen;
+        self.wal_tail_recovery_pending = false;
     }
 
     /// Publishes either a complete replacement base or a sparse delta. Every
@@ -2201,6 +2227,10 @@ pub const Opened = struct {
         errdefer if (tree) |node| node.release();
         var store = try self.store.clone(alloc);
         errdefer store.deinit();
+        // This postimage becomes live only after appendWriter reconciles the
+        // observed tail and commits these bytes. Pure reader clones keep the
+        // recovery obligation for any later writer that borrows their state.
+        if (writer.bytes().len != 0) store.wal_tail_recovery_pending = false;
         store.wal_committed_bytes = try std.math.add(u64, store.wal_committed_bytes, writer.bytes().len);
         store.last_committed_batch = writer.last_committed_batch;
         store.covered_source_sequence = writer.covered_source_sequence;
@@ -4627,6 +4657,11 @@ fn openInternalWithState(
         };
         defer alloc.free(current);
         if (current.len != 0) {
+            if (read_only) {
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(current, &digest, .{});
+                store.observed_manifest_digest = digest;
+            }
             var decoded = try vector_manifest.decodeAlloc(alloc, current);
             store.manifest_segments = decoded.owned_segments;
             decoded.owned_segments = &.{};
@@ -4733,6 +4768,7 @@ fn openInternalWithState(
         }
     }
     if (wal_bytes.len != wal.committed_bytes) {
+        store.wal_tail_recovery_pending = read_only;
         const committed = try alloc.dupe(u8, wal_bytes[0..wal.committed_bytes]);
         alloc.free(wal_bytes);
         wal_bytes = committed;
@@ -5653,6 +5689,51 @@ test "vector block store publishes snapshot base with committed WAL suffix" {
     try std.testing.expect(current.store.wal_has_mutations);
     try std.testing.expectEqualSlices(f32, &.{2.0}, (try current.get("artifact-a", 0, 2)).vector.vectorView().?);
     try std.testing.expectEqualSlices(f32, &.{3.0}, (try current.get("artifact-a", 1, 3)).vector.vectorView().?);
+}
+
+test "vector block observational tail recovery belongs to the admitted append writer" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |peer_committed| {
+        var memory = lsm_backend.MemoryStorage.init(alloc);
+        defer memory.deinit();
+        const storage = memory.storage();
+        const root = "/vector-observed-tail";
+        var initial = try Store.open(alloc, storage, root);
+        defer initial.deinit();
+        try initial.publishEmptyBase(1, 0, .{});
+        try initial.appendBatch(1, &.{.{ .kind = .upsert, .key = "initial", .source_sequence = 1, .revision = 1, .vector = &.{1} }}, 1, .{});
+        const path = try initial.walPathAlloc(initial.wal_generation);
+        defer alloc.free(path);
+        var partial = try initial.encodeBatch(2, &.{.{ .kind = .upsert, .key = "partial", .source_sequence = 2, .revision = 2, .vector = &.{2} }}, 2);
+        defer partial.deinit();
+        const incomplete = partial.bytes()[0 .. partial.bytes().len - 1];
+        try storage.appendFileAbsolute(alloc, path, incomplete, false);
+        const observed_size = try storage.fileSize(path);
+        var observer = try Store.openReadOnlyWithBlocks(alloc, storage, root);
+        defer observer.deinit();
+        try std.testing.expect(observer.store.wal_tail_recovery_pending);
+        try std.testing.expectEqual(observed_size, try storage.fileSize(path));
+        var writer = try observer.store.clone(alloc);
+        defer writer.deinit();
+        if (peer_committed) {
+            var peer = try Store.open(alloc, storage, root);
+            defer peer.deinit();
+            try peer.appendBatch(2, &.{.{ .kind = .upsert, .key = "peer", .source_sequence = 2, .revision = 2, .vector = &.{2} }}, 2, .{});
+            try std.testing.expectError(error.VectorBlockStoreRequiresReopen, writer.appendBatch(2, &.{.{ .kind = .upsert, .key = "accepted", .source_sequence = 2, .revision = 3, .vector = &.{3} }}, 2, .{}));
+        } else {
+            try writer.appendBatch(2, &.{.{ .kind = .upsert, .key = "accepted", .source_sequence = 2, .revision = 3, .vector = &.{3} }}, 2, .{});
+            try std.testing.expect(!writer.wal_tail_recovery_pending);
+        }
+        var reopened = try Store.openReadOnlyWithBlocks(alloc, storage, root);
+        defer reopened.deinit();
+        try std.testing.expect(!reopened.store.wal_tail_recovery_pending);
+        try std.testing.expectEqualSlices(f32, &.{1}, (try reopened.get("initial", 2, null)).vector.vectorView().?);
+        const final_key = if (peer_committed) "peer" else "accepted";
+        const expected: []const f32 = if (peer_committed) &.{2} else &.{3};
+        try std.testing.expectEqualSlices(f32, expected, (try reopened.get(final_key, 2, null)).vector.vectorView().?);
+        try std.testing.expect(try reopened.get("partial", 2, null) == .missing);
+        try std.testing.expect(try observer.get(final_key, 2, null) == .missing);
+    }
 }
 
 test "incremental vector WAL successor agrees with recovery and checkpoint" {

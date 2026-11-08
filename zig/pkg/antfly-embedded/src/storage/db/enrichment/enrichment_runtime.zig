@@ -2585,6 +2585,14 @@ fn requireEnrichmentHealthyForQueryCapture(runtime: *EnrichmentRuntime) !void {
         if (runtime.graph_stage_recovery_pending) return RuntimeError.EnrichmentRetryInProgress;
 }
 
+fn enrichmentHasPendingGraphStageRecovery(runtime: *EnrichmentRuntime) bool {
+    const maybe_io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, maybe_io);
+    if (comptime @hasField(EnrichmentRuntime, "graph_stage_recovery_pending"))
+        return runtime.graph_stage_recovery_pending;
+    return false;
+}
+
 fn requireEnrichmentDrainSuccessfulThrough(runtime: *EnrichmentRuntime, after_sequence: u64, through_sequence: u64) !void {
     const maybe_io = lockRuntime(runtime);
     const envelope = terminalFailureEnvelopeSnapshot(runtime);
@@ -7343,6 +7351,7 @@ const UnsupportedEnrichmentRuntime = struct {
     }
 
     pub const requireHealthyForQueryCapture = requireEnrichmentHealthyForQueryCapture;
+    pub const hasPendingGraphStageRecovery = enrichmentHasPendingGraphStageRecovery;
     pub const requireDrainSuccessfulThrough = requireEnrichmentDrainSuccessfulThrough;
 
     pub fn syncWaitTimeoutMs(self: *const @This()) u64 {
@@ -7806,6 +7815,10 @@ const PlatformEnrichmentRuntime = struct {
         // Providers transfer only on successful return. Unwind local ownership
         // allocations without releasing another worker's durable lease.
         errdefer runtime.ownership.deinitPreserveLease(alloc);
+        // A fresh serving view must distinguish orphaned preparation from an
+        // empty staging namespace. Otherwise every refresh reintroduces a
+        // recovery fence which only a different, detached actor can clear.
+        runtime.graph_stage_recovery_pending = try graphStagesPresent(alloc, &runtime.store);
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
         restoreThreadedRuntimeStatus(&runtime, persisted_status);
@@ -7818,6 +7831,7 @@ const PlatformEnrichmentRuntime = struct {
     pub fn reloadDurableState(self: *EnrichmentRuntime) !void {
         if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentReloadDurableState", .{self});
         if (self.future != null) return error.EnrichmentRuntimeStarted;
+        self.graph_stage_recovery_pending = try graphStagesPresent(self.alloc, &self.store);
         self.applied_sequence = try enrichment_state.loadAppliedSequence(self.alloc, self.store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(self.alloc, self.store, scope_name);
         restoreThreadedRuntimeStatus(self, persisted_status);
@@ -8024,6 +8038,7 @@ const PlatformEnrichmentRuntime = struct {
     }
 
     pub const requireHealthyForQueryCapture = requireEnrichmentHealthyForQueryCapture;
+    pub const hasPendingGraphStageRecovery = enrichmentHasPendingGraphStageRecovery;
     pub const requireDrainSuccessfulThrough = requireEnrichmentDrainSuccessfulThrough;
 
     pub fn syncWaitTimeoutMs(self: *const EnrichmentRuntime) u64 {
@@ -10333,6 +10348,13 @@ fn scavengeSharedPdfConsumerAttempts(runtime: *EnrichmentRuntime) !void {
     }
 }
 
+/// Only inspect one key; opening a cold view never drains a staging backlog.
+fn graphStagesPresent(alloc: Allocator, store: *backend_erased.Store) !bool {
+    var page = try backend_scan.scanPrefixKeysPage(alloc, store, graph_stage_prefix, 1);
+    defer page.deinit(alloc);
+    return page.keys.len != 0;
+}
+
 /// Stages are disposable preparation, never replay authority. Every prior
 /// pass drains its lanes before returning, so the next exclusive replay owner
 /// can reclaim this durable namespace before dispatching any new work. Both
@@ -10421,12 +10443,14 @@ test "enrichment runtime graph stage recovery is bounded and fences superseded o
     };
     defer runtime.ownership.deinit(alloc);
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    try std.testing.expect(!try graphStagesPresent(alloc, &runtime.store));
     for (0..graph_stage_recovery_page_keys + 3) |i| {
         var buf: [80]u8 = undefined;
         const key = try std.fmt.bufPrint(&buf, "{s}{d:0>8}", .{ graph_stage_prefix, i });
         try storePutBatch(&runtime, &.{.{ .key = key, .value = "orphan" }}, &.{});
     }
     try std.testing.expectError(error.GraphStageRecoveryPending, scavengeGraphStagesPage(&runtime));
+    try std.testing.expect(try graphStagesPresent(alloc, &runtime.store));
     var page = try backend_scan.scanPrefixKeysPage(alloc, &runtime.store, graph_stage_prefix, 4);
     defer page.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 3), page.keys.len);
@@ -10449,6 +10473,7 @@ test "enrichment runtime graph stage recovery is bounded and fences superseded o
     std.mem.swap(ownership_mod.State, &runtime.ownership, &successor);
     try scavengeGraphStagesPage(&runtime);
     try std.testing.expect(!runtime.graph_stage_recovery_pending);
+    try std.testing.expect(!try graphStagesPresent(alloc, &runtime.store));
     try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, page.keys[0]));
 }
 
