@@ -176,9 +176,12 @@ class McpSchemaFragmentTests(unittest.TestCase):
         child_mode_rejection = next(
             branch
             for branch in query_schema["not"]["anyOf"]
-            if branch.get("description", "").startswith(
-                "Relevance, filtering, backward/offset pagination"
-            )
+            if branch.get("allOf", [{}])[0]
+            == {
+                "required": ["hierarchy"],
+                "properties": {"hierarchy": {"required": ["children"]}},
+            }
+            and "anyOf" in branch["allOf"][1]
         )
         rejected_child_fields = {
             item["required"][0] for item in child_mode_rejection["allOf"][1]["anyOf"]
@@ -196,6 +199,9 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "search_after",
             "read_requirements",
             "remote_snapshot",
+            # Filtering is supported for member-level child navigation; the
+            # dedicated unit-level rejection remains a separate condition.
+            "filter_query",
         }
         self.assertEqual(
             set(query_schema["properties"]),
@@ -239,6 +245,15 @@ class McpSchemaFragmentTests(unittest.TestCase):
         invalid_wait = copy.deepcopy(with_read_requirement)
         invalid_wait["read_requirements"]["wait_ms"] = 60001
         self.assertTrue(list(validator.iter_errors(invalid_wait)))
+
+        filtered_members = copy.deepcopy(valid)
+        filtered_members["hierarchy"]["children"].update(
+            level="member", artifact="extraction"
+        )
+        filtered_members["filter_query"] = {
+            "term": {"path": "/tenant", "value": "acme"}
+        }
+        self.assertEqual([], list(validator.iter_errors(filtered_members)))
 
         invalid_variants = []
         for field, value in (

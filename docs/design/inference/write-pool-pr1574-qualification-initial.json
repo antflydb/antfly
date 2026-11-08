@@ -1,0 +1,984 @@
+{
+  "status": "passed",
+  "date_utc": "2026-11-08",
+  "host": "glowworm (spark-beb5)",
+  "code_commit": "c845eded3c8f6a86552d57bc321ea27c61859203",
+  "merged_main": "3e8975a1da80d692466cf847ef56175b53b26929",
+  "scope": "Qualify bounded write serving, observed HTTP batching, and accuracy evidence.\n\nUses the pinned, locally cached LibriSpeech dummy dev-clean shard (73 clips,\none speaker), frozen GLiNER oracles and synthetic OCR pages. Passing this\nenvelope does not establish general ASR/OCR accuracy or A100 performance.\nRequires numpy, av and pyarrow for the independent speech fixtures.\n",
+  "binary_sha256": "850cbe958ea8f29d65a5edf017d95d21a9f177d6159b8956cf11a4d8fc0deb22",
+  "gpu": {
+    "name": "NVIDIA GB10",
+    "uuid": "GPU-3bd71415-6064-a1a7-5d0e-4e12158b383a"
+  },
+  "harness_sha256": "b2370f53d10914790dbdd36a2fe1e5ee926f67b25ed733da0a8a51ae18eefb32",
+  "runtime_environment": {
+    "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "0",
+    "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": null,
+    "ANTFLY_INFERENCE_CUDA_GREEDY_DEVICE_TOKEN_HANDOFF": null,
+    "ANTFLY_INFERENCE_REQUIRED_BACKEND": "cuda",
+    "ANTFLY_SERVER_DECODE_GRAPH_REPLAY": "0"
+  },
+  "config_sha256": "c7a1bbfb43a8a45bd04f0c8a91bdf0f947f33cadf14f20eca2c4597b394e4cf6",
+  "raw_evidence_bundle_sha256": "c2290036db7fd61d4cc1a5c6ed98897fd79a1b19535bba0dd680d24e80261d26",
+  "evidence_directory": ".benchmark-results/pr1574",
+  "configuration": {
+    "resources": {
+      "memory": {
+        "max_bytes": 77309411328
+      },
+      "inference": {
+        "memory": {
+          "max_host_bytes": 34359738368,
+          "max_device_bytes": 40802189312,
+          "max_combined_bytes": 75161927680,
+          "max_kv_bytes": 21474836480,
+          "max_scratch_bytes": 12884901888
+        },
+        "admission": {
+          "max_concurrent_requests": 16,
+          "max_work_units": 1024
+        },
+        "request_limits": {
+          "max_items_per_request": 8,
+          "max_input_tokens_per_item": 32768,
+          "max_output_tokens_per_item": 1024,
+          "max_decoded_pixels_per_batch": 4000000
+        }
+      }
+    },
+    "inference": {
+      "models_dir": "/home/ajroetker/antfly/.worktrees/qualification-pr-1574/.benchmark-results/pr1574/models",
+      "ml_dir": "/home/ajroetker/antfly/.worktrees/qualification-pr-1574/.benchmark-results/pr1574/ml",
+      "max_loaded_models": 4,
+      "keep_alive": "0",
+      "preload": [
+        {
+          "kind": "embedder",
+          "name": "google/embeddinggemma-2",
+          "backend": "cuda"
+        },
+        {
+          "kind": "transcriber",
+          "name": "openai/whisper-small",
+          "backend": "cuda"
+        },
+        {
+          "kind": "extractor",
+          "name": "antflydb/GLiNER2.5",
+          "backend": "cuda"
+        },
+        {
+          "kind": "reader",
+          "name": "lightonai/LightOnOCR-3-0.8B",
+          "backend": "cuda"
+        }
+      ],
+      "kernel_jit": {
+        "mode": "off"
+      },
+      "prompt_cache": {
+        "enabled": false
+      },
+      "generation_batching": {
+        "mode": "on",
+        "max_step_items": 2,
+        "max_step_query_tokens": 512,
+        "max_decode_wait_us": 1000,
+        "max_idle_prefill_chunk_size": 512
+      }
+    }
+  },
+  "model_artifacts": {
+    "version": 1,
+    "models": [
+      {
+        "model": "antflydb/GLiNER2.5",
+        "backend": "cuda",
+        "tasks": [
+          "extractor"
+        ],
+        "files": [
+          {
+            "path": "config.json",
+            "size": 4103,
+            "sha256": "d6b515c21ae2100c12267fb42a3f02c1e99ad87580366aebedb161efd74441c7"
+          },
+          {
+            "path": "encoder_config/config.json",
+            "size": 857,
+            "sha256": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4"
+          },
+          {
+            "path": "model.safetensors",
+            "size": 774366564,
+            "sha256": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a"
+          },
+          {
+            "path": "tokenizer.json",
+            "size": 8341713,
+            "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3"
+          },
+          {
+            "path": "tokenizer_config.json",
+            "size": 645,
+            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+          },
+          {
+            "path": "write-pool-acquisition.json",
+            "size": 1568,
+            "sha256": "9220c294cd3df0fd6eb978d1f14c9d947b44e0238edbe5ef725f3fcbeb149775"
+          }
+        ]
+      },
+      {
+        "model": "google/embeddinggemma-2",
+        "backend": "cuda",
+        "tasks": [
+          "classifier",
+          "embedder"
+        ],
+        "files": [
+          {
+            "path": "1_Pooling/config.json",
+            "size": 90,
+            "sha256": "8759bdf7c77efc7df7723f64856a593c8943b71ee38baf2a88771fbaf78438f9"
+          },
+          {
+            "path": "2_Normalize/config.json",
+            "size": 97,
+            "sha256": "cdb09dfca347a56aa2d691744e38d5ad3c7cbc2834e7181272b9a15328b82524"
+          },
+          {
+            "path": "chat_template.jinja",
+            "size": 1016,
+            "sha256": "4b852efc0b9960283e735363331e6f325b33bc74bdbaa076f595bc4e9b94d85e"
+          },
+          {
+            "path": "config.json",
+            "size": 4455,
+            "sha256": "b8f1e9931b57fbc054acdb445c41765d55b0074c58d145fa82839941ad1b5bb3"
+          },
+          {
+            "path": "config_sentence_transformers.json",
+            "size": 1565,
+            "sha256": "031e56a498d33c349ab489a21885bcfe25b4fcba841149dc99e1e90d4a7c28f5"
+          },
+          {
+            "path": "model.safetensors",
+            "size": 1488915288,
+            "sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79"
+          },
+          {
+            "path": "modules.json",
+            "size": 413,
+            "sha256": "3d02572a0455b832de67fb8e63a54981bc7e8b46e337c95e917bd8122a533bfd"
+          },
+          {
+            "path": "preprocessor_config.json",
+            "size": 511,
+            "sha256": "ea2ae257e901064abdd98dceb19f2b0da06af600bed15e0f99f5c85c37ee9d78"
+          },
+          {
+            "path": "processor_config.json",
+            "size": 1788,
+            "sha256": "168f6a08522f3ce5dea596d94d003af2fd691742d4f41fe1f9d8cce76bfbf69c"
+          },
+          {
+            "path": "sentence_bert_config.json",
+            "size": 747,
+            "sha256": "b1bcd9f2dce3ae863b359e87d0710b5dbc3314a59ecb4e2f97c7778fc8e4b228"
+          },
+          {
+            "path": "tokenizer.json",
+            "size": 32170510,
+            "sha256": "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4"
+          },
+          {
+            "path": "tokenizer.model",
+            "size": 4689013,
+            "sha256": "e594c8a90eb08d8bda498ff4747977dc827ae0c3c56b5c0d41a605a22d02ef03"
+          },
+          {
+            "path": "tokenizer_config.json",
+            "size": 1599,
+            "sha256": "17bd5d6e9364ca49a534e1502076593317c298d4a663623091ed45388f004874"
+          },
+          {
+            "path": "write-pool-acquisition.json",
+            "size": 3867,
+            "sha256": "cee0c38ccf5294b0ab9a1648d5259fe444db86a38362138899ddea08aed49cc5"
+          }
+        ]
+      },
+      {
+        "model": "lightonai/LightOnOCR-3-0.8B",
+        "backend": "cuda",
+        "tasks": [
+          "generator",
+          "reader"
+        ],
+        "files": [
+          {
+            "path": "chat_template.jinja",
+            "size": 435,
+            "sha256": "2178c43e4543160bd8293bf9bf1c4305543b33ea21c368e3123b251d0ea9b961"
+          },
+          {
+            "path": "config.json",
+            "size": 2692,
+            "sha256": "842fafd8f06807269960515fa6f0e4b5dd27f9e645b67a2b3e84f1699ee8d60c"
+          },
+          {
+            "path": "generation_config.json",
+            "size": 205,
+            "sha256": "b1cfebea5837fc69aa89c3e2210dbe6494bb29a04e1e88beb227ddad53b9dfc1"
+          },
+          {
+            "path": "merges.txt",
+            "size": 3353259,
+            "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+          },
+          {
+            "path": "model.safetensors",
+            "size": 1706030528,
+            "sha256": "ae46aa6fd7136d57297ac006ed9ec345b7a2083feb2e99501bedcb014ca3efdf"
+          },
+          {
+            "path": "model_manifest.json",
+            "size": 111,
+            "sha256": "7b7ad22ff1cd5d468344db57acfaa435deac5f8c697e118ea5a8c1c74af6673c"
+          },
+          {
+            "path": "preprocessor_config.json",
+            "size": 390,
+            "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+          },
+          {
+            "path": "processor_config.json",
+            "size": 1191,
+            "sha256": "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1"
+          },
+          {
+            "path": "tokenizer.json",
+            "size": 19989325,
+            "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+          },
+          {
+            "path": "tokenizer_config.json",
+            "size": 1168,
+            "sha256": "c908cd42c5e6eac721445fb70841e45845a6a269c6ef2c595e97a578a9724671"
+          },
+          {
+            "path": "vocab.json",
+            "size": 6722759,
+            "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+          },
+          {
+            "path": "write-pool-acquisition.json",
+            "size": 3028,
+            "sha256": "dd4a88c184869b66f2de162fc590479cf6429f6811fdf29ff3cdbf885fdd1365"
+          }
+        ]
+      },
+      {
+        "model": "openai/whisper-small",
+        "backend": "cuda",
+        "tasks": [
+          "transcriber"
+        ],
+        "files": [
+          {
+            "path": "acquisition-receipt.json",
+            "size": 4266,
+            "sha256": "ab5fcc0826bdc69f33697978bebc4d221a1de587504fd32976df76d1d5b91599"
+          },
+          {
+            "path": "added_tokens.json",
+            "size": 34604,
+            "sha256": "9715fd2243b6f06a5858b5e32950d2853f73dd5bc201aafcf76f5082a2d8acd1"
+          },
+          {
+            "path": "config.json",
+            "size": 1967,
+            "sha256": "e6a2b489da1b5aed65a8eb8d1e7466fa867ad5643a8bc138ba708bd56b2875c4"
+          },
+          {
+            "path": "generation_config.json",
+            "size": 3868,
+            "sha256": "71565b8ef50d0bf7a1193ed4bbed195b94e70c18894d81bba2f1233dcec3ab53"
+          },
+          {
+            "path": "merges.txt",
+            "size": 493869,
+            "sha256": "2df2990a395e35e8dfbc7511e08c12d56018d8d04691e0133e5d63b21e154dc6"
+          },
+          {
+            "path": "model.safetensors",
+            "size": 966995080,
+            "sha256": "1d7734884874f1a1513ed9aa760a4f8e97aaa02fd6d93a3a85d27b2ae9ca596b"
+          },
+          {
+            "path": "normalizer.json",
+            "size": 52666,
+            "sha256": "bf1c507dc8724ca9cf9903640dacfb69dae2f00edee4f21ceba106a7392f26dd"
+          },
+          {
+            "path": "preprocessor_config.json",
+            "size": 184990,
+            "sha256": "9b5cd03a36fbb8a627c64d98a5b5b126ead95a77720723944487311f0110b666"
+          },
+          {
+            "path": "special_tokens_map.json",
+            "size": 2194,
+            "sha256": "e67ae3a0aaa99abcd9f187138e12db1f65c16a14761c50ef10eef2c174a7a691"
+          },
+          {
+            "path": "tokenizer.json",
+            "size": 2480466,
+            "sha256": "27fc476bfe7f17299480be2273fc0608e4d5a99aba2ab5dec5374b4482d1a566"
+          },
+          {
+            "path": "tokenizer_config.json",
+            "size": 282683,
+            "sha256": "2a4c4281cf9f51ac6ccc406fdc711a087afe6530f671fa7b80953edc498275ce"
+          },
+          {
+            "path": "vocab.json",
+            "size": 835550,
+            "sha256": "8f680bba319e01a653d2e8a5dbc17a9157179e0576e6ce74ce0c06356c6e24f9"
+          }
+        ]
+      }
+    ]
+  },
+  "controlled_rounds": 5,
+  "batching": {
+    "embed": {
+      "serialized_seconds": [
+        0.12154477900185157,
+        0.12297768999997061,
+        0.12110356400080491,
+        0.12390156000037678,
+        0.12677398899541004
+      ],
+      "concurrent_seconds": [
+        0.07674997900176095,
+        0.0763178359993617,
+        0.06163231700338656,
+        0.07755212299525738,
+        0.07116062600107398
+      ],
+      "observed": [
+        {
+          "native_batches": 1.0,
+          "native_items": 2.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 1.0,
+          "native_items": 2.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 3.0,
+          "native_items": 6.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 1.0,
+          "native_items": 2.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 2.0,
+          "native_items": 4.0,
+          "decoder_widths": []
+        }
+      ],
+      "physical_evidence": {
+        "native_batches": 8.0,
+        "native_items": 16.0,
+        "stage": "model forward"
+      },
+      "throughput_ratio": 1.611388588127671,
+      "promotion_10_percent_pass": true
+    },
+    "extract": {
+      "serialized_seconds": [
+        0.1425243080011569,
+        0.14356541000597645,
+        0.14297726599761518,
+        0.14978385099675506,
+        0.13528589899942745
+      ],
+      "concurrent_seconds": [
+        0.048392570002761204,
+        0.058613952001906,
+        0.048274027001752984,
+        0.04641818800155306,
+        0.07160657700296724
+      ],
+      "observed": [
+        {
+          "native_batches": 3.0,
+          "native_items": 8.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 2.0,
+          "native_items": 6.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 3.0,
+          "native_items": 8.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 3.0,
+          "native_items": 8.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 2.0,
+          "native_items": 5.0,
+          "decoder_widths": []
+        }
+      ],
+      "physical_evidence": {
+        "native_batches": 13.0,
+        "native_items": 35.0,
+        "stage": "model forward"
+      },
+      "throughput_ratio": 2.9545293004578412,
+      "promotion_10_percent_pass": true
+    },
+    "whisper": {
+      "serialized_seconds": [
+        1.425737735000439,
+        1.4307687079999596,
+        1.4133499960007612,
+        1.4167219170049066,
+        1.428757041998324
+      ],
+      "concurrent_seconds": [
+        1.0223038390031434,
+        1.0298920480054221,
+        1.0287115309984074,
+        1.0264698960017995,
+        1.0401898569980403
+      ],
+      "observed": [
+        {
+          "native_batches": 2.0,
+          "native_items": 6.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 2.0,
+          "native_items": 5.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 2.0,
+          "native_items": 5.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 3.0,
+          "native_items": 6.0,
+          "decoder_widths": []
+        },
+        {
+          "native_batches": 3.0,
+          "native_items": 7.0,
+          "decoder_widths": []
+        }
+      ],
+      "physical_evidence": {
+        "native_batches": 12.0,
+        "native_items": 29.0,
+        "stage": "encoder"
+      },
+      "throughput_ratio": 1.3859451284819382,
+      "promotion_10_percent_pass": true
+    },
+    "ocr": {
+      "serialized_seconds": [
+        8.546958501996414,
+        8.587101777004136,
+        8.568991483996797,
+        8.627218339999672,
+        8.613351367006544
+      ],
+      "concurrent_seconds": [
+        4.695079686993267,
+        4.4206395740038715,
+        4.252640147002239,
+        4.499648770004569,
+        4.514879936999932
+      ],
+      "observed": [
+        {
+          "native_batches": 0.0,
+          "native_items": 0.0,
+          "decoder_widths": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        {
+          "native_batches": 0.0,
+          "native_items": 0.0,
+          "decoder_widths": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        {
+          "native_batches": 0.0,
+          "native_items": 0.0,
+          "decoder_widths": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        {
+          "native_batches": 0.0,
+          "native_items": 0.0,
+          "decoder_widths": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        {
+          "native_batches": 0.0,
+          "native_items": 0.0,
+          "decoder_widths": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ]
+        }
+      ],
+      "physical_evidence": {
+        "max_observed_rows": 2,
+        "batched_requests": 40
+      },
+      "throughput_ratio": 1.908393791588186,
+      "promotion_10_percent_pass": true
+    }
+  },
+  "soak": {
+    "rounds": 172,
+    "requests": 1376,
+    "seconds": 300.9448702160007
+  },
+  "mixed_latency": {
+    "embed": {
+      "requests": 344,
+      "successful": 344,
+      "statuses": {
+        "200": 344
+      },
+      "p50_ms": 14.686709004308796,
+      "p95_ms": 21.650518996466417,
+      "first_content_p50_ms": null,
+      "first_content_p95_ms": null
+    },
+    "extract": {
+      "requests": 344,
+      "successful": 344,
+      "statuses": {
+        "200": 344
+      },
+      "p50_ms": 22.19693249935517,
+      "p95_ms": 50.75714099803008,
+      "first_content_p50_ms": null,
+      "first_content_p95_ms": null
+    },
+    "whisper": {
+      "requests": 344,
+      "successful": 344,
+      "statuses": {
+        "200": 344
+      },
+      "p50_ms": 296.50781899908907,
+      "p95_ms": 445.82268499652855,
+      "first_content_p50_ms": null,
+      "first_content_p95_ms": null
+    },
+    "ocr": {
+      "requests": 344,
+      "successful": 344,
+      "statuses": {
+        "200": 344
+      },
+      "p50_ms": 1006.742094999936,
+      "p95_ms": 2458.8630759972148,
+      "first_content_p50_ms": null,
+      "first_content_p95_ms": null
+    }
+  },
+  "boundary_context_sweep": [
+    {
+      "target_tokens": 64,
+      "actual_tokens": [
+        42,
+        45,
+        48,
+        51,
+        54,
+        57,
+        60,
+        63
+      ],
+      "observed": {
+        "native_batches": 3.0,
+        "native_items": 8.0,
+        "stage": "model forward"
+      },
+      "singleton_reference_parity": true
+    },
+    {
+      "target_tokens": 128,
+      "actual_tokens": [
+        105,
+        108,
+        111,
+        114,
+        117,
+        120,
+        123,
+        126
+      ],
+      "observed": {
+        "native_batches": 1.0,
+        "native_items": 4.0,
+        "stage": "model forward"
+      },
+      "singleton_reference_parity": true
+    },
+    {
+      "target_tokens": 256,
+      "actual_tokens": [
+        234,
+        237,
+        240,
+        243,
+        246,
+        249,
+        252,
+        255
+      ],
+      "observed": {
+        "native_batches": 2.0,
+        "native_items": 7.0,
+        "stage": "model forward"
+      },
+      "singleton_reference_parity": true
+    },
+    {
+      "target_tokens": 512,
+      "actual_tokens": [
+        489,
+        492,
+        495,
+        498,
+        501,
+        504,
+        507,
+        510
+      ],
+      "observed": {
+        "native_batches": 2.0,
+        "native_items": 8.0,
+        "stage": "model forward"
+      },
+      "singleton_reference_parity": true
+    },
+    {
+      "target_tokens": 1024,
+      "actual_tokens": [
+        1002,
+        1005,
+        1008,
+        1011,
+        1014,
+        1017,
+        1020,
+        1023
+      ],
+      "observed": null,
+      "singleton_reference_parity": true
+    }
+  ],
+  "boundary_schema_sweep": [
+    {
+      "case": "mixed_tasks",
+      "caller_observations": {
+        "decoded_items": 8.0,
+        "returned_items": 8.0,
+        "decoded_prompt_tokens": 368.0
+      },
+      "requests": 9,
+      "frozen_oracle_and_singleton_parity": true,
+      "native_batches": 3.0
+    },
+    {
+      "case": "unicode_offsets",
+      "caller_observations": {
+        "decoded_items": 8.0,
+        "returned_items": 8.0,
+        "decoded_prompt_tokens": 336.0
+      },
+      "requests": 9,
+      "frozen_oracle_and_singleton_parity": true,
+      "native_batches": 2.0
+    },
+    {
+      "case": "entity_attributes",
+      "caller_observations": {
+        "decoded_items": 8.0,
+        "returned_items": 8.0,
+        "decoded_prompt_tokens": 320.0
+      },
+      "requests": 9,
+      "frozen_oracle_and_singleton_parity": true,
+      "native_batches": 3.0
+    },
+    {
+      "case": "legacy_structure",
+      "caller_observations": {
+        "decoded_items": 8.0,
+        "returned_items": 8.0,
+        "decoded_prompt_tokens": 176.0
+      },
+      "requests": 9,
+      "frozen_oracle_and_singleton_parity": true,
+      "native_batches": 3.0
+    },
+    {
+      "case": "record_natural",
+      "caller_observations": {
+        "decoded_items": 8.0,
+        "returned_items": 8.0,
+        "decoded_prompt_tokens": 176.0
+      },
+      "requests": 9,
+      "frozen_oracle_and_singleton_parity": true,
+      "native_batches": 2.0
+    },
+    {
+      "case": "record_latent",
+      "caller_observations": {
+        "decoded_items": 8.0,
+        "returned_items": 8.0,
+        "decoded_prompt_tokens": 176.0
+      },
+      "requests": 9,
+      "frozen_oracle_and_singleton_parity": true,
+      "native_batches": 1.0
+    },
+    {
+      "case": "record_anchorless",
+      "caller_observations": {
+        "decoded_items": 8.0,
+        "returned_items": 8.0,
+        "decoded_prompt_tokens": 176.0
+      },
+      "requests": 9,
+      "frozen_oracle_and_singleton_parity": true,
+      "native_batches": 2.0
+    },
+    {
+      "case": "enum_field",
+      "caller_observations": {
+        "decoded_items": 8.0,
+        "returned_items": 8.0,
+        "decoded_prompt_tokens": 216.0
+      },
+      "requests": 9,
+      "frozen_oracle_and_singleton_parity": true,
+      "native_batches": 2.0
+    },
+    {
+      "case": "constrained_classification",
+      "scope": "classification-only uses the decisions API; excluded from write extraction"
+    },
+    {
+      "case": "joint_ie",
+      "caller_observations": {
+        "decoded_items": 8.0,
+        "returned_items": 8.0,
+        "decoded_prompt_tokens": 280.0
+      },
+      "requests": 9,
+      "frozen_oracle_and_singleton_parity": true,
+      "native_batches": 3.0
+    }
+  ],
+  "speech": {
+    "corpus_sha256": "4e69a06fa5edc90921e5e7e39a7084881f8b3ed9c805c574f4f39c6fde27c603",
+    "clips": 73,
+    "speakers": [
+      1272
+    ],
+    "wer": 0.07565217391304348,
+    "errors": 87,
+    "reference_words": 1150
+  },
+  "long_speech": [
+    {
+      "seconds": 86.345,
+      "clips": 8,
+      "score": {
+        "errors": 24,
+        "substitutions": 17,
+        "deletions": 7,
+        "insertions": 0,
+        "reference_words": 200,
+        "wer": 0.12
+      },
+      "input_sha256": "9ef20b32bc7a18ef36f9e199637beed29726d3ddb580438f010da7bb84280d9a"
+    },
+    {
+      "seconds": 156.08,
+      "clips": 16,
+      "score": {
+        "errors": 45,
+        "substitutions": 25,
+        "deletions": 19,
+        "insertions": 1,
+        "reference_words": 361,
+        "wer": 0.12465373961218837
+      },
+      "input_sha256": "3a9b86f62f3f8199bd601afd0a11802e611ac1b0198d9df76d089522977ecb58"
+    }
+  ],
+  "known_accuracy_limits": [
+    {
+      "case": "identical sentence repeated 24 times",
+      "wer": 0.875,
+      "text": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.",
+      "serving_status": 200,
+      "interpretation": "Known checkpoint accuracy limitation; not a passed accuracy case. The declared varied-speech and serving gates do not qualify arbitrary repetitive speech."
+    }
+  ],
+  "reservations": {
+    "warmed": {
+      "antfly_inference_admission_host_scratch_bytes": 67637248.0,
+      "antfly_inference_admission_backend_scratch_bytes": 1611251712.0,
+      "antfly_inference_admission_backend_kv_bytes": 0.0,
+      "antfly_admission_inference_in_flight_requests": 0.0
+    },
+    "recovered": {
+      "antfly_inference_admission_host_scratch_bytes": 67637248.0,
+      "antfly_inference_admission_backend_scratch_bytes": 1611251712.0,
+      "antfly_inference_admission_backend_kv_bytes": 0.0,
+      "antfly_admission_inference_in_flight_requests": 0.0
+    }
+  },
+  "memory_evidence": {
+    "complete": true,
+    "errors": [],
+    "samples_per_phase": {
+      "boundary-context-sweep": 16,
+      "boundary-schema-sweep": 4,
+      "deadlines-and-disconnects": 10,
+      "dense-varied-long-speech": 14,
+      "embed-automatic-batching": 3,
+      "embed-serialized": 5,
+      "extract-automatic-batching": 3,
+      "extract-serialized": 6,
+      "known-checkpoint-accuracy-limit": 3,
+      "mixed-sustained-turnover": 1185,
+      "ocr-automatic-batching": 90,
+      "ocr-serialized": 205,
+      "recovery": 26,
+      "request-limits-and-isolation": 4,
+      "speech-corpus": 44,
+      "warmup": 30,
+      "whisper-automatic-batching": 22,
+      "whisper-serialized": 36
+    },
+    "service_nvml_requested": true
+  },
+  "memory_peaks": {
+    "service_nvml_bytes_max": 6833618944,
+    "memory.current_max": 2277928960,
+    "memory.peak_max": 3987664896
+  },
+  "cuda_managed_live_bytes_max": 6307409404.0,
+  "legacy_write": {
+    "status": "passed",
+    "memory_evidence": {
+      "complete": true,
+      "errors": [],
+      "samples_per_phase": {
+        "baseline": 13,
+        "limits-and-silence": 3,
+        "mixed-burst-and-batches": 55,
+        "mixed-steady": 54,
+        "ocr-deadline": 3,
+        "recovery": 6,
+        "warmup": 4,
+        "windowed-audio-and-eight-pages": 9
+      },
+      "service_nvml_requested": true
+    }
+  },
+  "physical_recovery": {
+    "status": "passed",
+    "binary_sha256": "3200ca966fad96ced447ab5f826b7978f14035f8f7421590e2a343860f357921",
+    "elapsed_seconds": 5.554218483004661,
+    "stable_samples_by_phase": {
+      "guard-rejected": 7,
+      "failed-free": 7,
+      "quarantined": 7,
+      "reloaded": 17
+    },
+    "raw_samples": 50,
+    "excluded_allowance_bytes": 2147483648,
+    "managed_limit_bytes": 67108864
+  },
+  "receipts_sha256": {
+    "acquisition/embedders/google/embeddinggemma-2.json": "cee0c38ccf5294b0ab9a1648d5259fe444db86a38362138899ddea08aed49cc5",
+    "acquisition/extractors/antflydb/GLiNER2.5.json": "9220c294cd3df0fd6eb978d1f14c9d947b44e0238edbe5ef725f3fcbeb149775",
+    "acquisition/readers/lightonai/LightOnOCR-3-0.8B.json": "dd4a88c184869b66f2de162fc590479cf6429f6811fdf29ff3cdbf885fdd1365",
+    "acquisition/transcribers/openai/whisper-small.json": "79e35f59ed20842b4002cc1dd6c5e0fcb983061cb31120377b5613ed3f0f1867",
+    "final/qualification.json": "493ba78a7634db56078886a1a54ddb789f5f8bd8c8281be585cf7b911f791c3f",
+    "final/report.json": "2784ad245f6252dcc515267251e4e886be08960328f4f98cba0ff14269fd2a24",
+    "legacy-write/report.json": "c3e3629e3cacfa445ade09405672103f9f2df838600d340a688a776def6a5f96",
+    "physical-recovery/summary.json": "9f87d514f5a7c7ff3614a1c652eea273e593681a505f2951ec5239d344328e86"
+  }
+}

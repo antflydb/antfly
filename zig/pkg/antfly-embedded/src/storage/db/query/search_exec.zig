@@ -9465,7 +9465,7 @@ pub fn graphIndexedPredicateAlloc(a: Allocator, req: types.SearchRequest, execut
     defer snapshot.release();
     var deletion_hash = std.hash.Wyhash.init(0);
     for (snapshot.segments) |seg| {
-        const revision = seg.shared.deletion_revision.load(.acquire);
+        const revision = seg.shared.deletionRevision();
         deletion_hash.update(std.mem.asBytes(&revision));
     }
     const key = try std.fmt.allocPrint(a, "{d}:{d}:{d}:{d}:{s}", .{ entry.instance_id, entry.projection_revision, req.identity_read_generation orelse 0, deletion_hash.final(), json });

@@ -4735,41 +4735,47 @@ test "evaluated list axes carry multiplicity and reversed consumers retain only 
 }
 
 test "lexical source DAGs share validation and keep added producer frames" {
+    // Keep the large sources, memory ceilings and ownership checks. Capturing
+    // a native stack on every streamed row allocation is not part of the DAG
+    // sharing contract and dominates this Debug fixture on macOS.
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (checked.deinit() != 0) @panic("source DAG fixture leaked allocations");
+    const allocator = checked.allocator();
     for ([_][]const u8{
         "WITH range(1,1000000000) AS xs UNWIND (xs+range(1000000001,2000000000)) AS x RETURN count(*)",
         "WITH range(1,1000000000) AS xs UNWIND (xs+xs) AS x RETURN count(*)",
         "WITH range(1,1000000000) AS xs WITH (xs+xs) AS ys UNWIND reverse(ys) AS x RETURN count(*)",
     }) |text| {
         var diagnostic: c.Diagnostic = .{};
-        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        var compiled = try c.compile(allocator, text, .{}, &diagnostic);
         defer compiled.deinit();
         var fixture: Fixture = .{};
-        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
+        var result = try runtime.execute(allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
         defer result.deinit();
         try std.testing.expectEqual(@as(i64, 2000000000), result.rows[0][0].integer);
     }
     var chain: std.ArrayList(u8) = .empty;
-    defer chain.deinit(std.testing.allocator);
-    try chain.appendSlice(std.testing.allocator, "WITH [x IN range(1,10000)|toString(x)] AS xs,1 AS seed ");
-    for (0..16) |_| try chain.appendSlice(std.testing.allocator, "WITH xs AS xs,seed AS seed ");
-    try chain.appendSlice(std.testing.allocator, "UNWIND xs AS x RETURN count(*)");
+    defer chain.deinit(allocator);
+    try chain.appendSlice(allocator, "WITH [x IN range(1,10000)|toString(x)] AS xs,1 AS seed ");
+    for (0..16) |_| try chain.appendSlice(allocator, "WITH xs AS xs,seed AS seed ");
+    try chain.appendSlice(allocator, "UNWIND xs AS x RETURN count(*)");
     var diagnostic: c.Diagnostic = .{};
-    var compiled = try c.compile(std.testing.allocator, chain.items, .{}, &diagnostic);
+    var compiled = try c.compile(allocator, chain.items, .{}, &diagnostic);
     defer compiled.deinit();
     var fixture: Fixture = .{};
-    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 2 << 20, .intermediate_states = 100000 });
+    var result = try runtime.execute(allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 2 << 20, .intermediate_states = 100000 });
     defer result.deinit();
     try std.testing.expectEqual(@as(i64, 10000), result.rows[0][0].integer);
     // A source without a replay proof still streams once when no intervening
     // sibling/transform needs its eager result. It must not acquire a closure.
-    var once_query = try c.compile(std.testing.allocator, "WITH [x IN range(1,10000)|EXISTS { RETURN 1 }] AS xs UNWIND xs AS x RETURN count(x)", .{}, &diagnostic);
+    var once_query = try c.compile(allocator, "WITH [x IN range(1,10000)|EXISTS { RETURN 1 }] AS xs UNWIND xs AS x RETURN count(x)", .{}, &diagnostic);
     defer once_query.deinit();
-    var once = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &once_query, &.{}, .{ .memory_bytes = 256 << 10 });
+    var once = try runtime.execute(allocator, fixture.backend(), graph, &once_query, &.{}, .{ .memory_bytes = 256 << 10 });
     defer once.deinit();
     try std.testing.expectEqual(@as(i64, 10000), once.rows[0][0].integer);
-    var direct_query = try c.compile(std.testing.allocator, "UNWIND [x IN range(1,10000)|EXISTS { RETURN 1 }] AS x RETURN count(x)", .{}, &diagnostic);
+    var direct_query = try c.compile(allocator, "UNWIND [x IN range(1,10000)|EXISTS { RETURN 1 }] AS x RETURN count(x)", .{}, &diagnostic);
     defer direct_query.deinit();
-    var direct = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &direct_query, &.{}, .{ .memory_bytes = 256 << 10 });
+    var direct = try runtime.execute(allocator, fixture.backend(), graph, &direct_query, &.{}, .{ .memory_bytes = 256 << 10 });
     defer direct.deinit();
     try std.testing.expect(once.stats.intermediate_states <= direct.stats.intermediate_states + 20100);
     try check("WITH 2 AS n WITH range(1,n) AS xs,5 AS n WITH (xs+range(n,n+1)) AS ys,n+1 AS n UNWIND (ys+range(n,n+1)) AS x RETURN collect(x)", "[[[1,2,5,6,6,7]]]");
@@ -4781,9 +4787,9 @@ test "lexical source DAGs share validation and keep added producer frames" {
         "WITH range(1,3) AS xs UNWIND (xs+[x IN [0]|1/x]) AS x RETURN x LIMIT 1",
         "WITH range(1,3) AS xs WITH (xs+[x IN [0]|1/x]) AS ys,1 AS seed UNWIND ys AS x RETURN x LIMIT 1",
     }) |text| {
-        var bad = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        var bad = try c.compile(allocator, text, .{}, &diagnostic);
         defer bad.deinit();
-        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &bad, &.{}, .{}));
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(allocator, fixture.backend(), graph, &bad, &.{}, .{}));
     }
 }
 

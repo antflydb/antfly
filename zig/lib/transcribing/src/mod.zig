@@ -32,45 +32,7 @@ pub const Segment = audio.TranscriptSegment;
 pub const WordTimestamp = audio.WordTimestamp;
 pub const Speaker = audio.Speaker;
 
-pub const Provider = enum {
-    antfly,
-    openai,
-    cloudflare,
-    vertex,
-    apple,
-
-    /// These adapters consume an already acquired recording through
-    /// RemoteOptions.resolved_audio. Antfly's local callback remains URL-based.
-    pub fn supportsResolvedAudio(self: @This()) bool {
-        return switch (self) {
-            .openai, .vertex, .cloudflare, .apple => true,
-            .antfly => false,
-        };
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.write(switch (self) {
-            .antfly => "antfly",
-            .cloudflare => "cloudflare",
-            .openai => "openai",
-            .vertex => "vertex",
-            .apple => "apple",
-        });
-    }
-
-    pub fn jsonParse(_: Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const raw = switch (try source.next()) {
-            .string => |value| value,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, raw, "antfly")) return .antfly;
-        if (std.mem.eql(u8, raw, "cloudflare")) return .cloudflare;
-        if (std.mem.eql(u8, raw, "openai")) return .openai;
-        if (std.mem.eql(u8, raw, "vertex")) return .vertex;
-        if (std.mem.eql(u8, raw, "apple")) return .apple;
-        return error.UnexpectedToken;
-    }
-};
+pub const Provider = @import("types.zig").Provider;
 
 pub const Config = struct {
     account_id: ?[]const u8 = null,

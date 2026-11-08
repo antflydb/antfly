@@ -321,6 +321,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     b.step("lib-sql-parser-bench", "Build and install lib-sql-parser-bench").dependOn(&b.addInstallArtifact(yacc_steps.benchmark, .{}).step);
     const cypher_mod = @import("../../lib/cypher/build_support.zig").addSteps(b, .{
         .root = b.path("lib/cypher"),
+        .filters = selectTestFilters(b, &.{}),
         .target = target,
         .optimize = optimize,
         .codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), b.graph.host, .safe),

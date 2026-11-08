@@ -231,6 +231,7 @@ def _wait_covered(api_url: str, table: str, expected: int) -> dict:
 
 
 @pytest.mark.parametrize("storage_engine", ["local", "lite"])
+@pytest.mark.e2e_resource("antfly_process")
 def test_default_inference_api_key_authenticates_background_enrichment(
     tmp_path, shared_inference, storage_engine
 ):
@@ -465,6 +466,7 @@ BACKGROUND_TASKS = {"chunk", "read"}
 
 
 @pytest.mark.parametrize("storage_engine", ["local", "lite"])
+@pytest.mark.e2e_resource("antfly_process")
 def test_default_inference_api_key_reaches_remote_tasks_only_at_default_endpoint(
     tmp_path, storage_engine
 ):

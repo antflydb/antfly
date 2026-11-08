@@ -3711,6 +3711,7 @@ fn compactSelfCacheRows(
 // Slice all active page prefixes in one device operation. Repeated pairwise
 // concatenation otherwise copies the growing prefix once for every page.
 fn compactSelfCacheRowsDevice(cb: *const ComputeBackend, slab: CT, batch: usize, capacity: usize, active_len: usize, d_model: usize) !CT {
+    if (comptime !build_options.enable_cuda) return error.UnsupportedBackend;
     if (batch == 0 or batch > 64 or capacity == 0 or active_len == 0 or active_len > capacity or d_model == 0)
         return error.InvalidInputShape;
     return @import("../ops/cuda/cuda_compute.zig").CudaCompute.compactFlorenceSelfCache(cb, slab, batch, capacity, active_len, d_model);

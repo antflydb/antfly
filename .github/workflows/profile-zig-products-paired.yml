@@ -31,7 +31,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -41,6 +40,9 @@ env:
 
 jobs:
   qualify:
+    permissions:
+      contents: read
+      id-token: write
     runs-on: arc-antfly-heavy
     timeout-minutes: 360
     steps:
@@ -52,12 +54,12 @@ jobs:
           submodules: true
       - uses: ./.github/actions/load-toolchain-policy
         id: toolchain
+      - name: Install measurement and archive tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential llvm pkg-config time xz-utils
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
-      - name: Install measurement tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential llvm pkg-config time
       - uses: ./.github/actions/prepare-zig-dependencies
         with:
           mirror-only: 'true'
