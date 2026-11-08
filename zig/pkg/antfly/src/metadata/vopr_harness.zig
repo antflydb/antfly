@@ -6977,6 +6977,7 @@ pub const MetadataAdminVoprSource = struct {
                 break :blk try std.json.Stringify.valueAlloc(alloc, value.value, .{});
             },
             .export_snapshot => try store.exportSystemCatalog(alloc, group_id),
+            .graph_authority => |request| try std.json.Stringify.valueAlloc(alloc, try store.graphAuthority(alloc, group_id, request), .{}),
             .read => |request| try store.systemCatalogRead(alloc, group_id, request),
             .list_tables => |request| try store.listSystemCatalogTables(alloc, group_id, request),
             .table_status => |request| try store.listSystemCatalogTables(alloc, group_id, request.listing()),
