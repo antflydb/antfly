@@ -70,8 +70,8 @@ pub const Budget = struct {
     // Turn-owned CAS proofs avoid fetching every completion marker twice.
     proofs: ?*CompletionProofs = null,
     proof_category: ?usize = null,
-    fn completion(self: *Budget, revision: ?Revision, retained: bool, completed_at: u64) !void {
-        if (!self.retiring() or retained or completed_at < self.retire_after_ms) return;
+    fn completion(self: *Budget, revision: ?Revision, retained: bool, swept_after: u64) !void {
+        if (!self.retiring() or retained or swept_after <= self.retire_after_ms) return;
         const proofs = self.proofs orelse return;
         const category = self.proof_category orelse return;
         const next: CompletionProofs.Proof = if (revision) |value| .{ .revision = try value.clone(proofs.allocator) } else .absent;
@@ -205,7 +205,7 @@ const ScopeProgress = struct {
     continuation: ?[]const u8 = null,
     retained: bool = false,
     resume_after_ms: ?u64 = null,
-    completed_at_ms: ?u64 = null,
+    sweep_started_ms: ?u64 = null,
 };
 const ScopePage = struct { result: Result, progress: ScopeProgress };
 
@@ -270,6 +270,7 @@ fn scanScopes(a: A, target: *artifacts.ArtifactStore, domain: [32]u8, previous: 
         .after_suffix = if (visitor.suffix) |suffix| try a.dupe(u8, &suffix) else previous.after_suffix,
         .continuation = visitor.continuation,
         .retained = visitor.result.retained,
+        .sweep_started_ms = previous.sweep_started_ms,
     } };
 }
 
@@ -289,12 +290,15 @@ fn collectScopes(a: A, store: *Store, table: u64, domain: [32]u8, now: u64, budg
     defer if (previous) |*value| value.deinit(client.allocator);
     var progress: ScopeProgress = if (previous) |value| std.json.parseFromSliceLeaky(ScopeProgress, scratch, value.body, .{ .ignore_unknown_fields = true }) catch .{} else .{};
     if (progress.version != 1 or (if (progress.after_suffix) |suffix| suffix.len != 97 else false)) progress = .{};
+    // A retirement proof must cover a sweep admitted after the writer horizon.
+    // Legacy progress has no admission timestamp and replays conservatively.
+    if (progress.sweep_started_ms == null or (budget.retiring() and progress.sweep_started_ms.? <= budget.retire_after_ms)) progress = .{ .sweep_started_ms = now };
     if (progress.resume_after_ms) |retry_after| {
-        if (retry_after > now and retry_after <= now +| budget.sweep_interval_ms and (!budget.retiring() or (progress.completed_at_ms orelse 0) >= budget.retire_after_ms)) {
-            try budget.completion(previous.?.metadata.writeRevision() orelse return error.MissingObjectRevision, progress.retained, progress.completed_at_ms orelse 0);
+        if (retry_after > now and retry_after <= now +| budget.sweep_interval_ms and (!budget.retiring() or (progress.sweep_started_ms orelse 0) > budget.retire_after_ms)) {
+            try budget.completion(previous.?.metadata.writeRevision() orelse return error.MissingObjectRevision, progress.retained, progress.sweep_started_ms orelse 0);
             return .{ .retained = progress.retained };
         }
-        progress = .{};
+        progress = .{ .sweep_started_ms = now };
     }
     var target = store.artifactStore();
     var page = try scanScopes(scratch, &target, domain, progress, now, budget);
@@ -303,7 +307,7 @@ fn collectScopes(a: A, store: *Store, table: u64, domain: [32]u8, now: u64, budg
         // A completed category rests while other categories drain. Persist
         // retained evidence too, so another process cannot consume ownership
         // while this category is waiting for its next ordinary sweep.
-        page.progress = .{ .retained = page.result.retained, .resume_after_ms = now +| budget.sweep_interval_ms, .completed_at_ms = now };
+        page.progress = .{ .retained = page.result.retained, .resume_after_ms = now +| budget.sweep_interval_ms, .sweep_started_ms = progress.sweep_started_ms };
     }
     if (budget.retiring() and previous == null and !page.result.more and !page.result.progressed and !page.result.retained) {
         try budget.completion(null, false, now);
@@ -317,11 +321,12 @@ fn collectScopes(a: A, store: *Store, table: u64, domain: [32]u8, now: u64, budg
             else => return err,
         };
         defer written.deinit(client.allocator);
-        if (!page.result.more) try budget.completion(written.writeRevision() orelse return error.MissingObjectRevision, page.result.retained, now);
+        if (!page.result.more) try budget.completion(written.writeRevision() orelse return error.MissingObjectRevision, page.result.retained, progress.sweep_started_ms.?);
     }
     return page.result;
 }
-const Progress = struct { version: u16 = 2, cursor: ?[]const u8 = null, after_key: ?[]const u8 = null, retained: bool = false, resume_after_ms: ?u64 = null, completed_at_ms: ?u64 = null };
+pub const RecordProgress = struct { version: u16 = 2, cursor: ?[]const u8 = null, after_key: ?[]const u8 = null, retained: bool = false, resume_after_ms: ?u64 = null, sweep_started_ms: ?u64 = null };
+const Progress = RecordProgress;
 fn readObject(source: anytype, bucket: []const u8, key: []const u8, limit: usize, budget: *Budget) !@import("objectstore").GetResult {
     var client = source;
     try budget.check();
@@ -362,12 +367,15 @@ pub fn collectRecords(a: A, store: *Store, table: u64, kind: []const u8, now: u6
     const scratch = arena.allocator();
     var progress: Progress = if (previous) |v| std.json.parseFromSliceLeaky(Progress, scratch, v.body, .{ .ignore_unknown_fields = true }) catch .{} else .{};
     if (progress.version != 2 or (progress.cursor != null and progress.after_key != null) or (if (progress.after_key) |key| !std.mem.startsWith(u8, key, prefix) or key.len > 4096 else false)) progress = .{};
+    // A retirement proof must cover a sweep admitted after the writer horizon.
+    // Legacy progress has no admission timestamp and replays conservatively.
+    if (progress.sweep_started_ms == null or (budget.retiring() and progress.sweep_started_ms.? <= budget.retire_after_ms)) progress = .{ .sweep_started_ms = now };
     if (progress.resume_after_ms) |retry_after| {
-        if (retry_after > now and retry_after <= now +| budget.sweep_interval_ms and (!budget.retiring() or (progress.completed_at_ms orelse 0) >= budget.retire_after_ms)) {
-            try budget.completion(previous.?.metadata.writeRevision() orelse return error.MissingObjectRevision, progress.retained, progress.completed_at_ms orelse 0);
+        if (retry_after > now and retry_after <= now +| budget.sweep_interval_ms and (!budget.retiring() or (progress.sweep_started_ms orelse 0) > budget.retire_after_ms)) {
+            try budget.completion(previous.?.metadata.writeRevision() orelse return error.MissingObjectRevision, progress.retained, progress.sweep_started_ms orelse 0);
             return .{ .retained = progress.retained };
         }
-        progress = .{};
+        progress = .{ .sweep_started_ms = now };
     }
     var page = try client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 128, .continuation_token = progress.cursor, .start_after = progress.after_key, .cancellation = .{ .ptr = budget, .is_cancelled_fn = Budget.canceled } });
     defer page.deinit(client.allocator);
@@ -397,7 +405,7 @@ pub fn collectRecords(a: A, store: *Store, table: u64, kind: []const u8, now: u6
     budget.deadline_ns = deadline;
     result.progressed = processed != 0;
     result.more = processed != page.entries.len or page.next_continuation_token != null;
-    const saved: Progress = .{ .cursor = if (processed == page.entries.len) page.next_continuation_token else null, .after_key = if (processed == page.entries.len) null else last, .retained = result.retained, .resume_after_ms = if (result.more) null else now +| budget.sweep_interval_ms, .completed_at_ms = if (result.more) null else now };
+    const saved: Progress = .{ .cursor = if (processed == page.entries.len) page.next_continuation_token else null, .after_key = if (processed == page.entries.len) null else last, .retained = result.retained, .resume_after_ms = if (result.more) null else now +| budget.sweep_interval_ms, .sweep_started_ms = progress.sweep_started_ms };
     if (budget.retiring() and previous == null and page.entries.len == 0) {
         try budget.completion(null, false, now);
         return result;
@@ -405,7 +413,7 @@ pub fn collectRecords(a: A, store: *Store, table: u64, kind: []const u8, now: u6
     const bytes = try std.json.Stringify.valueAlloc(a, saved, .{ .emit_null_optional_fields = false });
     defer a.free(bytes);
     if (previous) |v| if (std.mem.eql(u8, bytes, v.body)) {
-        if (!result.more) try budget.completion(v.metadata.writeRevision() orelse return error.MissingObjectRevision, result.retained, now);
+        if (!result.more) try budget.completion(v.metadata.writeRevision() orelse return error.MissingObjectRevision, result.retained, progress.sweep_started_ms.?);
         return result;
     };
     // This bounded progress write is part of the same deadline. A failed CAS
@@ -415,7 +423,7 @@ pub fn collectRecords(a: A, store: *Store, table: u64, kind: []const u8, now: u6
         else => return err,
     };
     defer written.deinit(client.allocator);
-    if (!result.more) try budget.completion(written.writeRevision() orelse return error.MissingObjectRevision, result.retained, now);
+    if (!result.more) try budget.completion(written.writeRevision() orelse return error.MissingObjectRevision, result.retained, progress.sweep_started_ms.?);
     return result;
 }
 fn record(client: anytype, bucket: []const u8, key: []const u8, now: u64, budget: *Budget) !void {
@@ -848,7 +856,9 @@ test "external lake query cleanup retirement reuses read proofs and fences concu
     const key = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/7/scope-{s}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", std.fmt.bytesToHex(&(try scopeDomain(a, &store, 7, 0)), .lower) });
     defer a.free(key);
     var client = store.opened.client;
-    var changed = try client.putObject(store.opened.bucket, key, "{\"version\":1,\"retained\":true}", .{});
+    const held_bytes = try std.json.Stringify.valueAlloc(a, ScopeProgress{ .retained = true, .resume_after_ms = now + 30001, .sweep_started_ms = now + 1 }, .{ .emit_null_optional_fields = false });
+    defer a.free(held_bytes);
+    var changed = try client.putObject(store.opened.bucket, key, held_bytes, .{});
     changed.deinit(client.allocator);
     try std.testing.expectError(error.QueryGcRetainedProgress, retireCompleted(a, &store, 7, &proofs, &budget));
     // A complete sweep after the retained completion's rest interval clears
@@ -863,4 +873,39 @@ test "external lake query cleanup retirement reuses read proofs and fences concu
     try retireCompleted(a, &store, 7, &proofs, &next);
     try std.testing.expectEqual(before, next.reads);
     try std.testing.expectEqual(@as(usize, 123), next.deletes);
+}
+
+test "external lake query cleanup retirement restarts sweeps admitted before the writer horizon" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("query-retirement-admission");
+    defer directory.cleanup();
+    var config = try local.common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+    defer store.deinit();
+    const domain = try scopeDomain(a, &store, 7, 0);
+    const earlier = try artifacts.UploadScope.forPublication(domain, 1, std.testing.io);
+    const later = try artifacts.UploadScope.forPublication(domain, 2, std.testing.io);
+    var target = store.artifactStore();
+    var first = try target.putScoped(earlier, "early scope", .none);
+    defer first.deinit(a);
+    for (0..20) |i| {
+        var text: [32]u8 = undefined;
+        var value = try target.putScoped(later, try std.fmt.bufPrint(&text, "later-{d}", .{i}), .none);
+        value.deinit(a);
+    }
+    // Advance beyond the first scope before the writer horizon passes.
+    for (0..2) |_| {
+        var budget: Budget = .{ .deletes = 1, .reads = 16384, .work = 1, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s };
+        const result = try collectScopes(a, &store, 7, domain, 100000, &budget);
+        try std.testing.expect(result.more);
+    }
+    var late = try target.putScoped(earlier, "late orphan behind the cursor", .none);
+    defer late.deinit(a);
+    var budget: Budget = .{ .deletes = 128, .reads = 16384, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s, .retire_after_ms = 120000 };
+    const result = try collectScopes(a, &store, 7, domain, 150000, &budget);
+    try std.testing.expect(!result.more and !result.retained and !result.failed);
+    const remaining: ?[]u8 = target.getAlloc(late.artifact_id) catch null;
+    defer if (remaining) |bytes| a.free(bytes);
+    try std.testing.expect(remaining == null);
 }
