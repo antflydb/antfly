@@ -24,7 +24,13 @@ const scalar = local.sql_scalar;
 const Adapter = @import("sql_execution.zig").Adapter;
 const A = std.mem.Allocator;
 fn check(root: *Adapter, a: A, columns: []const scalar.Column, expression: *const ast.Scalar, expected: ?scalar.Type, assignment: bool) !void {
-    _ = try scalar.inferTypedParametersExpected(a, expression, columns, &.{}, expected, .{ .routines = @import("sql_routine_execution.zig").persistedResolver(root), .assignment = assignment });
+    try checkWithLimits(a, columns, expression, expected, .{ .routines = @import("sql_routine_execution.zig").persistedResolver(root), .assignment = assignment });
+}
+fn checkWithLimits(a: A, columns: []const scalar.Column, expression: *const ast.Scalar, expected: ?scalar.Type, limits: scalar.BindLimits) !void {
+    // Apply the same unknown-literal assignment context as ordinary writes
+    // before resolving stored casts. Explicit text keeps its declared domain.
+    const contextual = if (limits.assignment and expected != null) try scalar.assignmentExpression(a, expression, expected.?) else expression;
+    _ = try scalar.inferTypedParametersExpected(a, contextual, columns, &.{}, expected, limits);
 }
 fn column(root: *Adapter, a: A, columns: []const scalar.Column, value: ast.Column) !void {
     const target: scalar.Type = .{ .kind = value.type, .element_type = value.element_type, .numeric_modifier = value.numeric_modifier, .enum_view = value.enum_view };
@@ -116,4 +122,24 @@ test "SQL persisted index validation binds the owning table and skips column-onl
         try std.testing.expectEqualStrings("public", target.namespace.?);
         try std.testing.expectEqual(input.expressions, hasExpressions(ddl.schema_change.?));
     }
+}
+
+test "SQL persisted assignment validation contextualizes unknown range and UUID defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]struct { sql: []const u8, kind: ast.ColumnType }{
+        .{ .sql = "'[5,15)'", .kind = .numrange },
+        .{ .sql = "'[2026-01-01,2026-01-04)'", .kind = .daterange },
+        .{ .sql = "'empty'", .kind = .tsrange },
+        .{ .sql = "'empty'", .kind = .tstzrange },
+        .{ .sql = "'A0EEBC999C0B4EF8BB6D6BB9BD380A11'", .kind = .uuid },
+    }) |case| {
+        var parsed = try local.sql_compiler.compileScalar(a, case.sql, .{});
+        defer parsed.deinit();
+        try checkWithLimits(a, &.{}, parsed.expression, .{ .kind = case.kind }, .{ .assignment = true });
+    }
+    var typed = try local.sql_compiler.compileScalar(a, "'[5,15)'::text", .{});
+    defer typed.deinit();
+    try std.testing.expectError(error.SqlAssignmentTypeMismatch, checkWithLimits(a, &.{}, typed.expression, .{ .kind = .numrange }, .{ .assignment = true }));
 }

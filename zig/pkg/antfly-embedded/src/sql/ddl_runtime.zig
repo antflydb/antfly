@@ -1922,3 +1922,18 @@ test "SQL extension response classification precedes every backend effect" {
         try std.testing.expectEqualStrings(example.tag, try commandTag(compiled.statement));
     }
 }
+
+test "SQL CREATE TABLE contextual range defaults retain temporal constraint domains" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var compiled = try @import("compiler.zig").compile(a, "CREATE TABLE prices(id UUID PRIMARY KEY,sku TEXT NOT NULL,valid_from NUMERIC NOT NULL,valid_to NUMERIC NOT NULL,price NUMERIC,valid_time NUMRANGE NOT NULL DEFAULT '[5,15)',CONSTRAINT prices_sku_time_key UNIQUE(sku,valid_time WITHOUT OVERLAPS))", .{});
+    defer compiled.deinit();
+    const encoded = try createSchemaAlloc(a, compiled.statement.create_table);
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{});
+    const defaults = schema.object.get("column_defaults").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), defaults.len);
+    const expression = defaults[0].object.get("expression").?;
+    try std.testing.expectEqualStrings("numrange", expression.object.get("type").?.string);
+    try std.testing.expectEqualStrings("[5,15)", expression.object.get("value").?.string);
+}

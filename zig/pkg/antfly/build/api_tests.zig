@@ -2297,7 +2297,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_owner_lifecycle_test_mod.addImport("usermgr_storage", sql_owner_usermgr_storage);
     const graph_trigger_public_filters: []const []const u8 = &.{ "mounted PostgreSQL original trigger attachment replacement and retirement preserve default statement semantics across native cold restart", "mounted PostgreSQL original ordinary trigger supersessions preserve events predicates arguments and cold activation", "mounted ordinary single owner graph transforms remain available without trigger state or preparation grants across cold restart", "mounted raw trigger transforms FK cascades and graph effects share RLS constraints one atomic decision and cold no refire", "mounted coordinated graph rows use genuine trigger absence RLS atomicity lost replies and cold prepared image replay", "mounted default dynamic document graph transactions coalesce once enforce credential filters and recover exact cold images", "mounted trigger logical relation identity survives TRUNCATE cold restart and fresh same-name CREATE gets a new identity", "mounted SQL original canonical MATCH", "mounted SQL graph joined hits" };
     const native_explicit_pk_filters: []const []const u8 = &.{ "mounted native explicit primary key command stages unique admission after real activation and preserves rollback and cold commit", "SQL relation lifetime native frozen lock delivery reaches the receiving owner before ABORT fallback" };
-    const extension_original_filters: []const []const u8 = &.{ "SQL extension native adapter preserves control rejection identities and owned cold receipts", "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart", "SQL WASM statement shares actual immutable modules across exports and retains one bounded reservation", "SQL WASM typed callable JSON preserves null exact numbers arrays temporal and range domains", "wasmtime SQL statement retains verified compiled pure module and rejects artifact import and type substitutions" };
+    const extension_original_filters: []const []const u8 = &.{ "postgres executor registration map failure preserves caller ownership and frees allocated wrapper", "API owned foreign registry publishes one complete lazy factory and releases every failed allocation", "API concurrent foreign registry initialization shares one process owner", "SQL extension native adapter preserves control rejection identities and owned cold receipts", "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart", "SQL WASM statement shares actual immutable modules across exports and retains one bounded reservation", "SQL WASM typed callable JSON preserves null exact numbers arrays temporal and range domains", "wasmtime SQL statement retains verified compiled pure module and rejects artifact import and type substitutions" };
     // Compile the expensive linked-control owner once; each gate selects its
     // own runtime campaign and independently requires no skips.
     const sql_owner_lifecycle_tests = b.addTest(.{
@@ -2482,6 +2482,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "SQL view filters",
             "mounted SQL range values preserve native bytes typed results and cold owners",
             "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+            "mounted SQL original temporal conflict upsert preserves typed rejection and cold rows",
             "api http client temporal probes use bounded bodies and preserve constraint rejection",
             "httpx temporal probes require service authority unambiguous controls and bounded bodies",
             "SQL mutation classification preserves wrapped definite conflicts and constraints",
@@ -2554,7 +2555,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const implicit_abort_tests = b.addTest(.{
         .root_module = options.api_http_runtime_test_mod,
-        .filters = &.{ "SQL implicit abort rejoins exact owned terminal abort", "SQL implicit lock cleanup preserves uncertain receipts", "SQL native lock observation retains captured group", "SQL native lock lookup transports captured route", "SQL relation lifetime private lock read dispatch rejects mixed row selectors and route substitution" },
+        .filters = &.{ "SQL implicit abort rejoins exact owned terminal abort", "SQL native lock cleanup rejoins only the exact canonically retired enrollment", "SQL persisted assignment validation contextualizes unknown range and UUID defaults", "SQL implicit lock cleanup preserves uncertain receipts", "SQL implicit lock cleanup population read completion excludes demanded and retained transaction effects", "SQL command producer native population read cancellation retains the parent command through cold and lost replies", "SQL native lock observation retains captured group", "SQL native lock lookup transports captured route", "SQL relation lifetime private lock read dispatch rejects mixed row selectors and route substitution" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const implicit_abort_run = addFilteredTestRunArtifact(b, implicit_abort_tests);
@@ -2918,7 +2919,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_range_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-range-lifecycle-test", "Verify typed range storage, queries and cold catalog/session/data owners")
         .dependOn(&sql_range_run.step);
-    const sql_temporal_key_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original temporal keys enforce intervals and retain all cold owners", "api http client temporal probes use bounded bodies and preserve constraint rejection", "httpx temporal probes require service authority unambiguous controls and bounded bodies", "SQL mutation classification preserves wrapped definite conflicts and constraints" });
+    const sql_temporal_key_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original temporal keys enforce intervals and retain all cold owners", "mounted SQL original temporal conflict upsert preserves typed rejection and cold rows", "api http client temporal probes use bounded bodies and preserve constraint rejection", "httpx temporal probes require service authority unambiguous controls and bounded bodies", "SQL mutation classification preserves wrapped definite conflicts and constraints" });
     sql_temporal_key_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-temporal-key-lifecycle-test", "Verify original temporal keys through routed integrity commits and complete cold owner recovery")
         .dependOn(&sql_temporal_key_run.step);
@@ -3329,7 +3330,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_api_standalone_backup_restore_tests = addFilteredTestRunArtifact(b, lib_api_standalone_backup_restore_tests);
     const sql_population_recovery_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
-        .filters = &.{ "staged restore worker query population", "restore jobs compound staging persistence" },
+        .filters = &.{ "staged restore worker query population", "restore jobs compound staging persistence", "restore owner SQL population" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-sql-population-recovery-test", "Run query-produced relation job admission, recovery and native publication regressions").dependOn(&addFilteredTestRunArtifact(b, sql_population_recovery_tests).step);

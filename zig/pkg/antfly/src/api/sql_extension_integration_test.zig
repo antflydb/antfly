@@ -389,6 +389,7 @@ const Campaign = struct {
         self.crypto = try installed(ctx, "pgcrypto", "1.0.0", "pgcrypto_version_marker", 11);
         try self.original(ctx, "sql-0755", false);
         try std.testing.expectEqualDeep(self.crypto, try installed(ctx, "pgcrypto", "1.0.0", "pgcrypto_version_marker", 11));
+        try command(ctx, "COMMENT ON EXTENSION pgcrypto IS 'crypto package comment survives restart'");
         try rejected(ctx, "CREATE EXTENSION postgis VERSION '9.9.9'", "22023", false);
         try absent(ctx, "postgis");
         try self.original(ctx, "sql-0756", false);
@@ -499,6 +500,30 @@ const Campaign = struct {
         try absent(ctx, "spatial_tools");
         try std.testing.expectEqualDeep(self.vector, try installed(ctx, "vector", "1.0.0", "vector_version_marker", 11));
         try std.testing.expectEqualDeep(self.crypto, try installed(ctx, "pgcrypto", "1.0.0", "pgcrypto_version_marker", 11));
+        var crypto_comment = try snapshot(ctx, "pgcrypto");
+        defer crypto_comment.deinit();
+        try std.testing.expectEqualStrings("crypto package comment survives restart", crypto_comment.value.installed.?.description.?);
+        const old_member = crypto_comment.value.installed.?.record.members[0].id;
+        // The annotation belongs to the retired extension identity. A later
+        // package install at the same name must create fresh owned members
+        // and must not inherit that description from the former incarnation.
+        try command(ctx, "DROP EXTENSION pgcrypto");
+        try absent(ctx, "pgcrypto");
+        try command(ctx, "CREATE EXTENSION pgcrypto");
+        const replacement = try installed(ctx, "pgcrypto", "1.0.0", "pgcrypto_version_marker", 11);
+        try std.testing.expect(replacement.id != self.crypto.id);
+        var fresh_crypto = try snapshot(ctx, "pgcrypto");
+        defer fresh_crypto.deinit();
+        // As PostgreSQL's extension control comment does, the immutable
+        // package description initializes each fresh installation. It must
+        // replace the prior user's annotation, not be suppressed as NULL.
+        const declared_description = for (self.packages) |package| {
+            if (std.mem.eql(u8, package.name, "pgcrypto") and std.mem.eql(u8, package.version, "1.0.0")) break package.description;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(declared_description, fresh_crypto.value.installed.?.description.?);
+        try std.testing.expect(!std.mem.eql(u8, "crypto package comment survives restart", fresh_crypto.value.installed.?.description.?));
+        try std.testing.expect(old_member != fresh_crypto.value.installed.?.record.members[0].id);
+
         try std.testing.expectEqualDeep(self.uuid, try installed(ctx, "uuid-ossp", "1.0.0", "uuid_ossp_version_marker", 110));
         var state = try snapshot(ctx, "vector");
         defer state.deinit();

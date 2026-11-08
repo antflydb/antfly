@@ -61,6 +61,7 @@ pub fn bindIdentity(root: *execution.Adapter, a: std.mem.Allocator) !?i32 {
 }
 pub fn stage(raw: *anyopaque, a: std.mem.Allocator, command: local.sql_ast.notifications.Command) anyerror!void {
     const root: *execution.Adapter = @ptrCast(@alignCast(raw));
+    root.notePopulationTransactionalEffect();
     if (try bindIdentity(root, a) == null) return error.TableTopologyProtocolUpgradeRequired;
     const frame = try root.lockingFrame();
     if (command == .unlisten or command == .unlisten_all) {

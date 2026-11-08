@@ -548,9 +548,10 @@ pub const node_lifecycle_finalizing = "finalizing";
 /// native backup generation without discarding validated generated indexes.
 /// Persisting this per store lets metadata fence restore placement during a
 /// rolling data-plane upgrade instead of relying on the metadata codec level.
-/// Version 2 includes fixed native-empty identity projection on an already
-/// initialized private RestoreOwner.status lease; no artifact-repair claim.
-pub const native_generation_restore_protocol_version: u16 = 2;
+/// Version 3 adds validated-scope finalization that rejects live transaction
+/// debt while preserving completed scope-owned bookkeeping. Identity projection
+/// remains version2; published HBC retains its independent version1 minimum.
+pub const native_generation_restore_protocol_version: u16 = 3;
 /// Published HBC image restoration still requires only its original decoder.
 pub const native_generation_restore_base_protocol_version: u16 = 1;
 

@@ -6638,8 +6638,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (actual.value.batch_json != null) return error.RestoreValidationPending;
         const installed = actual.value.response.native_empty_commit orelse return error.RestoreValidationPending;
         if (!std.meta.eql(installed, expected)) return error.RestoreStagingScopeChanged;
-        const binding = try lease.owner().nativeRelationBinding(a, table);
-        if (binding.has_user_data or binding.has_transaction_state) return error.RestoreSourceProofMissing;
+        const finalization_opts: db_types.LookupOptions = .{ .relational_topology_json = @import("antfly_local_sources").storage_db_native_empty_origin.finalization_selector, .restore_staging_scope = input.scope.digest(), .restore_staging_plan_id = input.scope.plan_id, .execution_deadline_ns = normalized.deadline_ns, .execution_io = normalized.deadline_io, .cancellation = normalized.cancellation };
+        const finalization_request = try table_reads.encodeStorageKernelLookupRequest(a, "", finalization_opts);
+        defer a.free(finalization_request);
+        var finalization_response = try lease.owner().lookupJson(table, finalization_request);
+        defer finalization_response.deinit();
+        var finalization = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_native_empty_generation.Finalization, a, finalization_response.bytes(), .{});
+        defer finalization.deinit();
+        try finalization.value.require(input.scope.digest(), input.scope.plan_id, expected);
+        const binding = finalization.value.binding;
         const pin = try persistence.PhysicalPin.fromBinding(binding);
         if (captured.signing.native_pin == null or !captured.signing.native_pin.?.eql(pin) or
             !binding.descriptor.eql(descriptor.sql_persistence.?) or !std.mem.eql(u8, &binding.native_instance, &captured.boot.instance))
@@ -6746,9 +6753,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (prepared.value.batch_json != null) return error.RestoreStagingScopeChanged;
             // The same acquired owner must still be the initialized physical
             // image authenticated by the current canonical Boot observation.
-            const proof = identity_proof orelse return error.SqlRelationRecoveryIncomplete;
-            const actual = try lease.owner().nativeRelationBinding(alloc, table_name);
-            if (!native.eql(actual.descriptor) or !(proof.signing.native_pin orelse return error.SqlRelationOwnerChanged).eql(try @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin.fromBinding(actual)) or !std.mem.eql(u8, &actual.native_instance, &proof.boot.instance)) return error.SqlRelationOwnerChanged;
+            _ = identity_proof orelse return error.SqlRelationRecoveryIncomplete;
             const opts: db_types.LookupOptions = .{ .relational_topology_json = @import("antfly_local_sources").storage_db_native_empty_origin.identity_selector, .restore_staging_scope = input.scope.digest(), .restore_staging_plan_id = input.scope.plan_id, .execution_deadline_ns = request.deadline_ns, .execution_io = request.deadline_io, .cancellation = request.cancellation };
             const encoded = try table_reads.encodeStorageKernelLookupRequest(alloc, "", opts);
             defer alloc.free(encoded);
@@ -7090,15 +7095,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer lease.deinit();
         if (lease.entry.catalog_deferred and !controls.allow_deferred_catalog and !controls.historical_raft_apply)
             return error.StorageReadTemporarilyUnavailable;
-        if (controls.native_published_restore != null) {
-            const expected = controls.native_initialized orelse return error.SqlRelationRecoveryIncomplete;
-            const actual = try lease.owner().nativeRelationBinding(self.alloc, table_name);
-            const persistence = @import("antfly_local_sources").common_topology_records.RelationPersistence;
-            if (!actual.descriptor.eql(expected.descriptor) or !std.mem.eql(u8, &actual.native_instance, &expected.native_instance) or
-                !(try persistence.PhysicalPin.fromBinding(actual)).eql(try persistence.PhysicalPin.fromBinding(expected))) return error.SqlRelationOwnerChanged;
-        }
+        if (descriptor.sql_persistence != null and (controls.native_published_restore != null or descriptor.restore_bootstrap_json.len != 0) and controls.native_initialized != null)
+            try requireInitializedLeasePin(self.alloc, &lease, descriptor, controls.native_initialized.?);
         try controls.check();
         return lease;
+    }
+
+    fn requireInitializedLeasePin(alloc: std.mem.Allocator, lease: *Lease, descriptor: descriptor_contract.Descriptor, expected: @import("antfly_local_sources").common_topology_records.RelationPersistence.NativeBinding) !void {
+        const native = descriptor.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+        const actual = try lease.owner().nativeRelationBinding(alloc, lease.entry.table_name);
+        const persistence = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+        if (!native.eql(actual.descriptor) or !std.mem.eql(u8, &actual.native_instance, &expected.native_instance) or
+            !(try persistence.PhysicalPin.fromBinding(actual)).eql(try persistence.PhysicalPin.fromBinding(expected))) return error.SqlRelationOwnerChanged;
     }
 
     fn acquireDescriptorAfterTransition(
@@ -8569,10 +8577,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
         // Hidden reads certify UNIQUE/FK activation. Never use the ordinary
         // observational NotLeader -> stale fallback for those proofs.
-        try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareLookupWithConsistency(group_id, key, opts, .read_index);
+        const controls = try self.prepareDescriptorControls(descriptor.view(), ReadControls.from(opts));
+        // Native owners have no data-Raft read index. The fresh canonical
+        // Boot/initialized image above and actual lease Pin below provide this
+        // private scope's authority; public serving reads stay unchanged.
+        if (descriptor.view().sql_persistence == null)
+            try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareLookupWithConsistency(group_id, key, opts, .read_index);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer alloc.free(path);
-        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, ReadControls.from(opts));
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, controls);
         defer lease.deinit();
         const encoded = try table_reads.encodeStorageKernelLookupRequest(alloc, key, opts);
         defer alloc.free(encoded);
@@ -9490,6 +9503,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, req, .{});
     }
 
+    /// Existing private restore 2PC ingress; never a public native decision route.
+    pub fn applyRestoreTransactionGroupLocal(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, context: request_operation.RequestContext) !void {
+        if (req.transaction == null or req.restore_staging_scope == null or req.restore_staging_plan_id == null or nativeResolutionOwner(req) != null) return error.InvalidTxnRequest;
+        return self.applyTransactionGroupLocalRouted(alloc, group_id, table_name, req, context, null);
+    }
+
     fn applyTransactionGroupLocalWithContext(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
@@ -9827,15 +9846,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, req.restore_staging_plan_id, .resolve, context);
         defer descriptor.deinit(alloc);
         // A coordinator may recover a durable decision after publication or
-        // cancellation, but it must never turn an uncertain read into an abort.
-        try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareLookupWithConsistency(group_id, "", .{
-            .execution_deadline_ns = context.deadline_ns,
-            .execution_io = context.deadline_io,
-            .cancellation = context.cancellation,
-        }, .read_index);
+        // cancellation, but never infer abort from absence or readiness.
+        const controls = try self.prepareDescriptorControls(descriptor.view(), .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation });
+        if (descriptor.view().sql_persistence == null)
+            try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareLookupWithConsistency(group_id, "", .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation }, .read_index);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer alloc.free(path);
-        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation });
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, controls);
         defer lease.deinit();
         try context.ensureActive();
         return switch (try lease.owner().transactionStatus(table_name, req.txn_id)) {

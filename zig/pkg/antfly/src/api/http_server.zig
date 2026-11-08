@@ -4190,6 +4190,7 @@ pub const ApiHttpServer = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     owned_foreign_registry: ?*foreign_mod.Registry = null,
+    foreign_registry_mutex: std.Io.Mutex = .init,
     sql_connection_admission: @import("sql_connection_admission.zig").Pool = .{},
     sql_sequence_sessions: @import("sql_sequence_cache.zig").Pool = .{},
     txn_sessions: transactions_api.SessionRegistry = .{},
@@ -5099,11 +5100,19 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn setForeignRegistry(self: *ApiHttpServer, registry: *const foreign_mod.Registry) void {
+        const io = self.embedding_provider_runtime.io;
+        self.foreign_registry_mutex.lockUncancelable(io);
+        defer self.foreign_registry_mutex.unlock(io);
         self.foreign_registry = registry;
         self.cfg.foreign_registry = registry;
     }
 
-    fn ensureForeignRegistry(self: *ApiHttpServer) !*const foreign_mod.Registry {
+    /// The API owner retains this registry through joined request/job teardown.
+    /// Initializing it here never opens a provider connection.
+    pub fn ensureForeignRegistry(self: *ApiHttpServer) !*const foreign_mod.Registry {
+        const io = self.embedding_provider_runtime.io;
+        self.foreign_registry_mutex.lockUncancelable(io);
+        defer self.foreign_registry_mutex.unlock(io);
         if (self.foreign_registry) |registry| return registry;
         const registry = try self.owner_alloc.create(foreign_mod.Registry);
         errdefer self.owner_alloc.destroy(registry);
@@ -64461,4 +64470,70 @@ test "external lake query cleanup scheduler drains multiple query-only tables fa
     server.observeLakeQueryCollection(.{ .more = true });
     server.observeLakeQueryCollection(.{ .more = true, .progressed = true, .failed = true });
     try std.testing.expectEqual(@as(u64, 30000), server.lakeArtifactCollectionIntervalMs(30000));
+}
+
+const ForeignRegistryOwnershipFixture = struct {
+    fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+        return .{ .metadata_group_id = 1, .metrics = .{} };
+    }
+    fn source() StatusSource {
+        return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+    }
+    fn allocations(a: std.mem.Allocator) !void {
+        var server = ApiHttpServer.init(a, .{}, source(), null, null);
+        defer server.deinit();
+        const registry = server.ensureForeignRegistry() catch |err| {
+            try std.testing.expect(server.owned_foreign_registry == null and server.foreign_registry == null and server.cfg.foreign_registry == null);
+            return err;
+        };
+        try std.testing.expect(registry.factories.contains(.postgres));
+        try std.testing.expect(registry == try server.ensureForeignRegistry());
+        try std.testing.expect(server.owned_foreign_registry.? == registry);
+    }
+};
+test "API owned foreign registry publishes one complete lazy factory and releases every failed allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, ForeignRegistryOwnershipFixture.allocations, .{});
+}
+test "API concurrent foreign registry initialization shares one process owner" {
+    const a = std.testing.allocator;
+    var server = ApiHttpServer.init(a, .{}, ForeignRegistryOwnershipFixture.source(), null, null);
+    defer server.deinit();
+    const io = std.testing.io;
+    var ready: std.atomic.Value(usize) = .init(0);
+    var start: std.atomic.Value(bool) = .init(false);
+    var winner: std.atomic.Value(usize) = .init(0);
+    var failed: std.atomic.Value(bool) = .init(false);
+    const Worker = struct {
+        fn run(owner: *ApiHttpServer, ready_: *std.atomic.Value(usize), start_: *std.atomic.Value(bool), winner_: *std.atomic.Value(usize), failed_: *std.atomic.Value(bool)) void {
+            _ = ready_.fetchAdd(1, .acq_rel);
+            while (!start_.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {
+                failed_.store(true, .release);
+                return;
+            };
+            for (0..16) |_| {
+                const registry = owner.ensureForeignRegistry() catch {
+                    failed_.store(true, .release);
+                    return;
+                };
+                const pointer = @intFromPtr(registry);
+                if (winner_.cmpxchgStrong(0, pointer, .acq_rel, .acquire)) |previous| if (previous != pointer) failed_.store(true, .release);
+            }
+        }
+    };
+    var group: std.Io.Group = .init;
+    defer {
+        start.store(true, .release);
+        group.cancel(io);
+    }
+    for (0..8) |_| try group.concurrent(io, Worker.run, .{ &server, &ready, &start, &winner, &failed });
+    const deadline = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
+    while (ready.load(.acquire) != 8) {
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    start.store(true, .release);
+    try group.await(io);
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), server.owned_foreign_registry.?.factories.count());
+    try std.testing.expectEqual(winner.load(.acquire), @intFromPtr(server.owned_foreign_registry.?));
 }

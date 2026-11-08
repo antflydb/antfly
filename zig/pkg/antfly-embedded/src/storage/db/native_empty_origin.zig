@@ -89,8 +89,16 @@ test "native empty origins distinguish genuine loss from schema-only snapshot wi
 /// It cannot carry rows, policy authority, digests, or another control selector.
 pub const identity_selector = "{\"mode\":\"native_empty_identity\"}";
 pub const identity_protocol_version: u16 = 2;
+pub const finalization_protocol_version: u16 = 3;
+pub const finalization_selector = "{\"mode\":\"native_empty_finalization\"}";
 pub fn identityLookupMatches(key: []const u8, opts: anytype) bool {
-    if (key.len != 0 or !std.mem.eql(u8, opts.relational_topology_json, identity_selector) or opts.restore_staging_scope == null or opts.restore_staging_plan_id == null) return false;
+    return scopedLookupMatches(key, opts, identity_selector);
+}
+pub fn finalizationLookupMatches(key: []const u8, opts: anytype) bool {
+    return scopedLookupMatches(key, opts, finalization_selector);
+}
+fn scopedLookupMatches(key: []const u8, opts: anytype, selector: []const u8) bool {
+    if (key.len != 0 or !std.mem.eql(u8, opts.relational_topology_json, selector) or opts.restore_staging_scope == null or opts.restore_staging_plan_id == null) return false;
     const T = @TypeOf(opts);
     const defaults: T = .{};
     inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, F| {

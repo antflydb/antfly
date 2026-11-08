@@ -239,7 +239,10 @@ pub fn authorize(raw: *anyopaque, a: A, target: catalog.Table, mode: locks.Table
 }
 pub fn table(raw: *anyopaque, _: A, target: catalog.Table, mode: locks.TableMode, wait: ast.LockWait) !void {
     const root: *Root = @ptrCast(@alignCast(raw));
-    if (mode != .access_share) _ = try root.lockingTransaction();
+    if (mode != .access_share) {
+        root.notePopulationTransactionalEffect();
+        _ = try root.lockingTransaction();
+    }
     const owner = try Owner.init(root);
     const a = owner.arena.allocator();
     const bit = @as(u8, 1) << @as(u3, @intCast(@backingInt(mode)));
@@ -268,6 +271,7 @@ pub fn table(raw: *anyopaque, _: A, target: catalog.Table, mode: locks.TableMode
 
 pub fn row(raw: *anyopaque, a: A, target: catalog.Table, identity: local.sql_locking.Identity, captured: catalog.Row, mode: locks.RowMode, wait: ast.LockWait, fields: []const []const u8) !?catalog.Row {
     const root: *Root = @ptrCast(@alignCast(raw));
+    root.notePopulationTransactionalEffect();
     const owner = try Owner.init(root);
     const part = for (owner.participants.items) |item| {
         if (item.value.spec.route.table_id == target.id and item.range.contains(identity.key)) break item;

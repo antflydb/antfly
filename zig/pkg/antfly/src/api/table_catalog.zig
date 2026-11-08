@@ -196,6 +196,42 @@ pub const CatalogSource = struct {
         fence.native_participant = pin;
     }
 
+    /// Private restore transactions retain their existing scoped 2PC lane.
+    /// This observation can pin only the exact active scope exposed by an
+    /// authenticated restore catalog; it cannot admit a public serving read.
+    pub fn pinNativeRestoreParticipant(self: CatalogSource, alloc: std.mem.Allocator, table_name: []const u8, fence: *metadata_api.CatalogRouteFence, scope: [32]u8, plan: [16]u8, deadline_ns: ?u64) !void {
+        if (fence.route.execution != .native_local) return error.InvalidSqlRelationPersistence;
+        const actual_scope = (try self.restoreScopeForGroup(table_name, fence.route.group_id)) orelse return error.RestoreStagingScopeChanged;
+        const actual_plan = (try self.restorePlanForGroup(table_name, fence.route.group_id)) orelse return error.RestoreStagingScopeChanged;
+        if (!std.mem.eql(u8, &actual_scope, &scope) or !std.mem.eql(u8, &actual_plan, &plan)) return error.RestoreStagingScopeChanged;
+        try fence.validate();
+        const native = fence.route.execution.native_local;
+        const observed = try self.sqlRelationBinding(alloc, .{ .node = native.owner_node_id, .binding_table = fence.table_id }, deadline_ns);
+        const boot = observed.record orelse return error.SqlRelationOwnerUnavailable;
+        try boot.validate();
+        const proof = observed.initialized orelse return error.SqlRelationRecoveryIncomplete;
+        try proof.verify();
+        const incarnation = fence.metadata_incarnation orelse return error.SqlRelationOwnerChanged;
+        const ns = fence.route.identity_namespace;
+        const creation = proof.creation_scope orelse return error.RestoreStagingScopeChanged;
+        if (!observed.registration_current or !std.mem.eql(u8, &creation.plan_id, &plan) or
+            boot.identity.node_id != native.owner_node_id or boot.identity.store_id != native.owner_store_id or
+            !std.meta.eql(boot.identity, proof.identity) or proof.boot_generation != boot.generation or proof.reporter_incarnation != boot.reporter_incarnation or
+            !std.mem.eql(u8, &boot.instance, &proof.binding.native_instance) or !proof.binding.descriptor.eql(native) or
+            proof.binding.table_id != fence.table_id or proof.binding.shard_id != ns.shard_id or proof.binding.range_id != ns.range_id or
+            proof.metadata_group_id != fence.metadata_group_id or !std.mem.eql(u8, &proof.identity.metadata_incarnation, &incarnation)) return error.SqlRelationOwnerChanged;
+        if (boot.phase == .recovering) {
+            const empty = observed.empty_target orelse return error.SqlRelationRecoveryIncomplete;
+            try empty.validate();
+            if (empty.metadata_group_id != fence.metadata_group_id or !std.mem.eql(u8, &empty.scope_digest, &scope) or !std.meta.eql(empty.creation_scope, creation) or !empty.namespace.eql(.{ .table_id = ns.table_id, .shard_id = ns.shard_id, .range_id = ns.range_id }) or
+                !std.mem.eql(u8, &empty.descriptor_fingerprint, &try native.fingerprint()) or observed.attempt == null or
+                empty.attempt.number != observed.attempt.?.number or !std.mem.eql(u8, &empty.attempt.digest, &observed.attempt.?.digest)) return error.SqlRelationOwnerChanged;
+        } else if (boot.phase != .ready) return error.SqlRelationRecoveryIncomplete;
+        const pin = try @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin.fromBinding(proof.binding);
+        if (fence.native_participant) |before| if (!before.eql(pin)) return error.SqlRelationOwnerChanged;
+        fence.native_participant = pin;
+    }
+
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
         return try self.vtable.admin_snapshot(self.ptr);
     }

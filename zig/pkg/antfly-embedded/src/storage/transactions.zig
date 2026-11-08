@@ -2072,10 +2072,11 @@ pub const TxnManager = struct {
     }
 
     /// Preserve PostgreSQL UNLOGGED prepared transactions on a clean restart.
-    /// Every persisted effect must belong to an actual root-pinned external
+    /// Completed ordinary journals may remain; every persisted effect must
+    /// belong to an actual root-pinned external
     /// decision. This streams keys without materializing intents or history;
     /// orphan effects and unrelated pessimistic owners remain fail-closed.
-    pub fn requireCleanNativeRecoveryInView(read: anytype, pin: NativePhysicalPin) !void {
+    pub fn requireCleanNativeRecoveryInView(alloc: Allocator, read: anytype, pin: NativePhysicalPin) !void {
         try pin.validate();
         if (try readHasPrefix(read, hot_standby_batch_outbox_prefix) or try readHasPrefix(read, hot_standby_replay_outbox_prefix))
             return error.SqlRelationRecoveryIncomplete;
@@ -2114,6 +2115,19 @@ pub const TxnManager = struct {
                 const record = try decodeRecord(bytes);
                 if (comptime !std.mem.eql(u8, prefix, records_prefix)) {
                     if (record.intents_resolved_known and record.intents_resolved) return error.InvalidTxnRecord;
+                }
+                if (comptime std.mem.eql(u8, prefix, records_prefix)) {
+                    // Ordinary validation coordinators leave terminal journal
+                    // history. It is not an external prepared vote or a live
+                    // effect; the remaining prefix walks still reject every
+                    // orphan or resolved record with leftover effects.
+                    if (record.external_decision_owner == null and record.native_pin == null and
+                        record.status != .pending and record.intents_resolved_known and record.intents_resolved and
+                        !try hasUnresolvedParticipantsInRead(alloc, read, id))
+                    {
+                        next = try cursor.next();
+                        continue;
+                    }
                 }
                 const actual = record.native_pin orelse return error.SqlRelationRecoveryIncomplete;
                 const owner = record.external_decision_owner orelse return error.SqlRelationRecoveryIncomplete;
@@ -2175,34 +2189,40 @@ pub const TxnManager = struct {
                 }
 
                 const txn_id = record_entry.key[records_prefix.len..][0..16].*;
-                const participant_key = makeSidecarKey(participants_prefix, txn_id);
-                const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
-                const index_key = makeSidecarKey(participant_index_prefix, txn_id);
-                if (read.get(&index_key)) |raw_index| {
-                    const indexed = try ParticipantIndex.decode(raw_index);
-                    const legacy = read.get(&resolved_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
-                    if (legacy != null) {
-                        const members = try resolvedParticipantsInRead(alloc, read, txn_id);
-                        defer freeParticipantList(alloc, members);
-                        if (members.len > indexed.enlisted) return error.InvalidTxnRecord;
-                        if (members.len != indexed.enlisted) return true;
-                    } else if (indexed.resolved != indexed.enlisted) return true;
-                    entry = try cursor.next();
-                    continue;
-                } else |err| if (err != error.NotFound) return err;
-                const participant_count = try participantListCountInRead(read, &participant_key);
-                const resolved_count = try participantListCountInRead(read, &resolved_key);
-                if (resolved_count > participant_count) return TxnError.InvalidTxnRecord;
-                // markParticipantResolved only appends unique, enlisted members,
-                // so equal validated counts prove that the participant set is
-                // fully acknowledged without allocating or comparing strings.
-                if (resolved_count != participant_count) return true;
+                if (try hasUnresolvedParticipantsInRead(alloc, read, txn_id)) return true;
             }
             entry = try cursor.next();
         }
+        return false;
+    }
+
+    // Shared by lifetime-debt and native close checks. Retained terminal
+    // history is quiescent only after the actual enlisted roster is resolved.
+    fn hasUnresolvedParticipantsInRead(alloc: Allocator, read: anytype, txn_id: TxnId) !bool {
+        const participant_key = makeSidecarKey(participants_prefix, txn_id);
+        const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
+        const index_key = makeSidecarKey(participant_index_prefix, txn_id);
+        if (read.get(&index_key)) |raw_index| {
+            const indexed = try ParticipantIndex.decode(raw_index);
+            const legacy = read.get(&resolved_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (legacy != null) {
+                const members = try resolvedParticipantsInRead(alloc, read, txn_id);
+                defer freeParticipantList(alloc, members);
+                if (members.len > indexed.enlisted) return error.InvalidTxnRecord;
+                if (members.len != indexed.enlisted) return true;
+            } else if (indexed.resolved != indexed.enlisted) return true;
+            return false;
+        } else |err| if (err != error.NotFound) return err;
+        const participant_count = try participantListCountInRead(read, &participant_key);
+        const resolved_count = try participantListCountInRead(read, &resolved_key);
+        if (resolved_count > participant_count) return TxnError.InvalidTxnRecord;
+        // markParticipantResolved only appends unique, enlisted members,
+        // so equal validated counts prove that the participant set is
+        // fully acknowledged without allocating or comparing strings.
+        if (resolved_count != participant_count) return true;
         return false;
     }
 
@@ -7015,8 +7035,8 @@ test "SQL relation lifetime native participant records pin actual images across 
     {
         var pinned = try store.beginReadTxn();
         defer pinned.abort();
-        try TxnManager.requireCleanNativeRecoveryInView(&pinned, pin);
-        try std.testing.expectError(error.SqlRelationRecoveryIncomplete, TxnManager.requireCleanNativeRecoveryInView(&pinned, wrong));
+        try TxnManager.requireCleanNativeRecoveryInView(a, &pinned, pin);
+        try std.testing.expectError(error.SqlRelationRecoveryIncomplete, TxnManager.requireCleanNativeRecoveryInView(a, &pinned, wrong));
     }
     try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.writeIntentsExtraBatch(id, &.{}, &.{}, wrong_extra));
     try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.activateExternalDecision(id, owner, wrong_extra));
@@ -7121,5 +7141,82 @@ test "SQL relation lifetime native missing BEGIN retention snapshots preserve ex
         try std.testing.expect(global.coordinator and global.status == .aborted);
         try std.testing.expectEqual(@as(usize, 2), global.participants.len);
         if (pass == 1) try manager.markParticipantsResolvedExtraBatch(coordinator, &.{ "local", "remote" }, .{ .external_decision_owner = owner, .native_pin = pin });
+    }
+}
+
+test "SQL relation lifetime native completed ordinary close history" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "native-ordinary-close-history");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const pin: NativePhysicalPin = .{ .physical_root_incarnation = 17, .table_id = 7, .shard_id = 172, .range_id = 272, .data_generation = 2 };
+    const id: TxnId = @splat(91);
+    for (0..2) |pass| {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        store.native_relation_pin = pin;
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        if (pass == 0) {
+            try manager.initTransactionWithParticipantsCreatedAtAndRole(id, 10, 1, &.{ "self", "peer" }, true);
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectError(error.SqlRelationRecoveryIncomplete, TxnManager.requireCleanNativeRecoveryInView(a, &read, pin));
+            }
+            try manager.writeIntents(id, &.{.{ .key = "validation-control", .value = "{}" }}, &.{});
+            try manager.resolveIntents(id, .committed, 20);
+            try manager.markParticipantResolved(id, "self");
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectError(error.SqlRelationRecoveryIncomplete, TxnManager.requireCleanNativeRecoveryInView(a, &read, pin));
+            }
+            try manager.markParticipantResolved(id, "peer");
+        }
+        const record = try manager.loadTransactionRecord(id);
+        try std.testing.expect(record.status == .committed and record.intents_resolved_known and record.intents_resolved);
+        try std.testing.expect(record.external_decision_owner == null and record.native_pin == null);
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try TxnManager.requireCleanNativeRecoveryInView(a, &read, pin);
+        }
+        // A completed journal never licenses leftover effects, including the
+        // schema-lease family not covered by the generic lifetime-debt probe.
+        inline for (.{ intents_prefix, intent_locks_prefix, read_guards_prefix, read_members_prefix, schema_leases_prefix }) |prefix| {
+            const effect = if (comptime std.mem.eql(u8, prefix, intents_prefix)) prefix ++ @as([16]u8, @splat(91)) ++ ":row" else if (comptime std.mem.eql(u8, prefix, read_guards_prefix)) prefix ++ @as([4]u8, @splat(0)) ++ @as([16]u8, @splat(91)) else prefix ++ @as([16]u8, @splat(91));
+            try store.put(effect, if (comptime std.mem.eql(u8, prefix, intent_locks_prefix)) &id else "leftover");
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectError(error.InvalidTxnRecord, TxnManager.requireCleanNativeRecoveryInView(a, &read, pin));
+            }
+            try store.delete(effect);
+        }
+        const orphan = makeSidecarKey(schema_leases_prefix, @splat(92));
+        try store.put(&orphan, "orphan");
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.SqlRelationRecoveryIncomplete, TxnManager.requireCleanNativeRecoveryInView(a, &read, pin));
+        }
+        try store.delete(&orphan);
+        // Existing external admission custody remains root-bound even once
+        // terminal and locally resolved; ordinary-history rules cannot adopt it.
+        const external: TxnId = @splat(93);
+        const owner: ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 100 };
+        if (pass == 0) {
+            try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(external, 30, 1, &.{"self"}, true, true, .{ .external_decision_owner = owner, .native_pin = pin });
+            _ = try manager.resolveIntentsWithExtraBatch(external, .aborted, 40, .{ .external_decision_owner = owner, .native_pin = pin });
+        }
+        var wrong = pin;
+        wrong.data_generation += 1;
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try TxnManager.requireCleanNativeRecoveryInView(a, &read, pin);
+        try std.testing.expectError(error.SqlRelationRecoveryIncomplete, TxnManager.requireCleanNativeRecoveryInView(a, &read, wrong));
+        try std.testing.expect(try TxnManager.hasRelationLifetimeDebtInView(a, &read));
     }
 }

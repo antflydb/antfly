@@ -1314,7 +1314,16 @@ pub fn executeNativeAtomicBatch(a: std.mem.Allocator, catalog: table_catalog.Cat
     } else false;
     if (!has_native) return null;
     try cancellation.check();
-    var captured = try ExternalPreparation.init(a, catalog, tables);
+    var participants = try buildParticipantTxns(a, catalog, tables, true);
+    const scoped = for (participants.items) |participant| {
+        if (participant.restore_staging_scope != null) break true;
+    } else false;
+    if (scoped) {
+        for (participants.items) |*participant| participant.deinit(a);
+        participants.deinit(a);
+        return null;
+    }
+    var captured = try ExternalPreparation.fromParticipants(a, participants);
     defer captured.deinit(a);
     if (captured.participants.items.len != 1 or captured.manifest.len != 1 or captured.manifest[0].route.route.execution != .native_local) return null;
     const participant = captured.participants.items[0];
@@ -1345,7 +1354,11 @@ pub const ExternalPreparation = struct {
     participant_ids: [][]const u8,
 
     pub fn init(a: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest) !ExternalPreparation {
-        var participants = try buildParticipantTxns(a, catalog, tables, true);
+        return fromParticipants(a, try buildParticipantTxns(a, catalog, tables, true));
+    }
+
+    fn fromParticipants(a: std.mem.Allocator, captured: std.ArrayListUnmanaged(ParticipantTxn)) !ExternalPreparation {
+        var participants = captured;
         errdefer {
             for (participants.items) |*participant| participant.deinit(a);
             participants.deinit(a);
@@ -1884,7 +1897,10 @@ const ParticipantRouting = struct {
                 if (cut.ranges.len != 1) return error.TopologyChanged;
                 const selected = cut.resolveRouteForKey(cut.ranges[0].start_key) orelse return error.TopologyChanged;
                 var fence = cut.fenceForRoute(selected);
-                try catalog.pinNativeParticipant(a, &fence, null);
+                if (try catalog.restoreScopeForGroup(name, selected.group_id)) |scope| {
+                    const plan = (try catalog.restorePlanForGroup(name, selected.group_id)) orelse return error.RestoreStagingScopeChanged;
+                    try catalog.pinNativeRestoreParticipant(a, name, &fence, scope, plan, null);
+                } else try catalog.pinNativeParticipant(a, &fence, null);
                 native_pin = fence.native_participant;
             }
             return .{ .compact = cut, .native_pin = native_pin, .execution = cut.execution, .ranges = cut.ranges, .topology_epoch = cut.topology_epoch, .metadata_group_id = cut.snapshot.value.metadata_group_id, .metadata_incarnation = cut.snapshot.value.metadata_incarnation };
@@ -1920,7 +1936,14 @@ fn buildParticipantTxns(alloc: std.mem.Allocator, catalog: table_catalog.Catalog
             .raft => null,
             .native_local => |value| @as(?@import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor, value),
         };
-        if (!std.meta.eql(table.sql_persistence, captured_persistence)) return error.SqlRelationOwnerChanged;
+        if (!std.meta.eql(table.sql_persistence, captured_persistence)) {
+            // Internal restore activation requests carry no public native route.
+            // Only the authenticated private catalog may supply the descriptor:
+            // its exact scope/Plan and fresh initialized pin were checked above.
+            if (table.sql_persistence != null or captured_persistence == null or routing.native_pin == null or routing.ranges.len != 1 or
+                (try catalog.restoreScopeForGroup(table.table_name, routing.ranges[0].group_id)) == null or
+                (try catalog.restorePlanForGroup(table.table_name, routing.ranges[0].group_id)) == null) return error.SqlRelationOwnerChanged;
+        }
 
         try @import("antfly_local_sources").api_range_read_guards.validate(table.range_guards);
         for (table.range_guards) |owner| {
@@ -2051,7 +2074,10 @@ fn buildParticipantTxns(alloc: std.mem.Allocator, catalog: table_catalog.Catalog
                 if (!std.mem.eql(u8, &existing, &requested)) return error.RestoreStagingChanged;
             } else participant.restore_staging_plan_id = routed_restore_plan;
             try validateRestorePlan(participant.restore_staging_scope, participant.restore_staging_plan_id);
-            if (freeze_routes or table.trigger_receipts.len != 0 or routing.execution == .native_local) {
+            // Hidden restore activation uses its existing scoped transaction
+            // protocol. A public native route would require an external SQL
+            // decision owner and is deliberately incompatible with that scope.
+            if (participant.restore_staging_scope == null and (freeze_routes or table.trigger_receipts.len != 0 or routing.execution == .native_local)) {
                 const range = for (routing.ranges) |candidate| {
                     if (candidate.group_id == participant.group_id) break candidate;
                 } else return error.TopologyChanged;

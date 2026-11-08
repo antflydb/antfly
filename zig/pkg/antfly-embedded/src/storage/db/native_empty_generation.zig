@@ -206,3 +206,23 @@ test "native lost-image acceptance installs contain only fresh target generation
     const duplicated = [_]admission.Transition{ transition, transition };
     try std.testing.expectError(error.InvalidRestoreStagingCommand, (Install{ .scope = @splat(1), .origin = .{ .schema_only_snapshot = .{ .manifest_digest = @splat(2), .schema_digest = @splat(3), .source_table_id = 11 } }, .transitions = &duplicated }).validate());
 }
+
+/// Returned only by the private validated-scope projection after the existing
+/// semantic lifetime-debt check in the SAME owner read cut. Generic binding
+/// flags remain truthful: terminal history can still make has_transaction_state
+/// true. This never authorizes initialization, adoption, or a new transaction.
+pub const Finalization = struct {
+    plan_id: [16]u8,
+    binding: @import("../../common/relation_persistence.zig").NativeBinding,
+    installed: Receipt,
+
+    pub fn require(self: Finalization, scope: Digest, plan_id: [16]u8, expected: Receipt) !void {
+        try self.binding.validate();
+        _ = try self.installed.encode();
+        if (self.binding.descriptor.kind != .unlogged or self.binding.has_user_data or
+            !std.mem.eql(u8, &self.plan_id, &plan_id) or !std.mem.eql(u8, &self.installed.scope, &scope) or
+            !std.meta.eql(self.installed, expected) or self.binding.table_id != self.installed.position.namespace.table_id or
+            self.binding.shard_id != self.installed.position.namespace.shard_id or self.binding.range_id != self.installed.position.namespace.range_id)
+            return error.RestoreSourceProofMissing;
+    }
+};

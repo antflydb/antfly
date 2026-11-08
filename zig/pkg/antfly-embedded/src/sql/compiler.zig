@@ -2750,6 +2750,8 @@ const Parser = struct {
         if (!self.peek(.rparen)) {
             while (true) {
                 try self.node();
+                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos].isKeyword(.period) and self.tokens[self.pos + 1].isKeyword(.@"for"))
+                    return self.fail(error.InvalidSqlSyntax, "PostgreSQL does not accept PERIOD FOR; use a range column");
                 if (self.keyword(.like)) {
                     var copied: ast.LikeTable = .{ .source = try self.name(), .column_offset = columns.items.len };
                     while (true) {
@@ -7571,4 +7573,13 @@ test "compiler extension lifecycle retains database identity schema version and 
             return error.TestUnexpectedResult;
         } else |_| {}
     }
+}
+
+test "SQL original temporal conflict setup rejects PERIOD syntax before catalog access" {
+    const sql = "CREATE TABLE prices (id uuid PRIMARY KEY, sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), CONSTRAINT prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS));";
+    var diagnostic: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidSqlSyntax, compileDiagnostic(std.testing.allocator, sql, .{}, &diagnostic));
+    try std.testing.expectEqualStrings("PERIOD", sql[diagnostic.start..diagnostic.end]);
+    var valid = try compile(std.testing.allocator, "CREATE TABLE t(\"period\" numeric,valid_time numrange,UNIQUE(valid_time WITHOUT OVERLAPS))", .{});
+    defer valid.deinit();
 }

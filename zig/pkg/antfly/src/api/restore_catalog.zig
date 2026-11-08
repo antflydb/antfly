@@ -50,6 +50,7 @@ pub const Catalog = struct {
     plan_digest: [32]u8,
     authority: Authority,
     io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
+    native_boot_source: ?routing.CatalogSource = null,
 
     /// All snapshot/owner slices are immutable and borrowed for this Catalog's
     /// lifetime. The driver owns their arena through completion of a page/2PC.
@@ -78,6 +79,7 @@ pub const Catalog = struct {
             .admin_snapshot = adminSnapshot,
             .free_admin_snapshot = freeAdminSnapshot,
             .catalog_identity = catalogIdentity,
+            .sql_relation_boot = nativeBoot,
             .routing_snapshot = routingSnapshot,
             .linearizable_routing_snapshot = routingSnapshot,
             .free_routing_snapshot = freeRoutingSnapshot,
@@ -88,6 +90,46 @@ pub const Catalog = struct {
             .validate_table_publication = validateTablePublication,
         } };
     }
+    /// Closed participant observation for this immutable unpublished cohort.
+    /// No arbitrary Boot query, live name lookup or public serving grant crosses
+    /// the projection. Metadata independently rejoins the actual Job and image.
+    fn nativeBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+        const self = cast(ptr);
+        try self.source().budget(deadline).checkpoint();
+        try self.verify();
+        const table_id = query.binding_table orelse return error.RestoreStagingScopeChanged;
+        const node = query.node orelse return error.RestoreStagingScopeChanged;
+        const expected: @import("../metadata/sql_relation_boots.zig").Query = .{ .node = node, .binding_table = table_id };
+        if (!std.meta.eql(query, expected)) return error.RestoreStagingScopeChanged;
+        const table = for (self.snapshot.tables) |candidate| {
+            if (candidate.table_id == table_id) break candidate;
+        } else return error.RestoreStagingScopeChanged;
+        const native = table.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+        if (native.owner_node_id != node) return error.SqlRelationOwnerChanged;
+        const scope = for (self.owners) |owner| {
+            if (owner.scope.target_namespace.table_id == table_id) break owner.scope;
+        } else return error.RestoreStagingScopeChanged;
+        const backing = self.native_boot_source orelse return error.SqlRelationOwnerChanged;
+        const observed = try backing.sqlRelationBinding(alloc, .{ .node = node, .binding_table = table_id, .creation_scope = .{ .plan_id = self.plan_id, .plan_digest = self.plan_digest } }, deadline);
+        const boot = observed.record orelse return error.SqlRelationOwnerUnavailable;
+        try boot.validate();
+        const proof = observed.initialized orelse return error.SqlRelationRecoveryIncomplete;
+        try proof.verify();
+        if (proof.metadata_group_id != self.snapshot.status.metadata_group_id or self.snapshot.status.metadata_incarnation == null or
+            !std.mem.eql(u8, &proof.identity.metadata_incarnation, &self.snapshot.status.metadata_incarnation.?) or
+            !observed.registration_current or boot.identity.node_id != node or boot.identity.store_id != native.owner_store_id or
+            !std.meta.eql(boot.identity, proof.identity) or proof.boot_generation != boot.generation or proof.reporter_incarnation != boot.reporter_incarnation or
+            !std.mem.eql(u8, &boot.instance, &proof.binding.native_instance) or !proof.binding.descriptor.eql(native) or
+            proof.binding.table_id != scope.target_namespace.table_id or proof.binding.shard_id != scope.target_namespace.shard_id or proof.binding.range_id != scope.target_namespace.range_id or
+            !std.meta.eql(proof.creation_scope, @as(?@import("../metadata/sql_relation_attestation.zig").CreationScope, .{ .plan_id = self.plan_id, .plan_digest = self.plan_digest }))) return error.SqlRelationOwnerChanged;
+        if (boot.phase == .recovering) {
+            const empty = observed.empty_target orelse return error.SqlRelationRecoveryIncomplete;
+            try empty.require(scope, native, scope.target_namespace, observed.attempt);
+        } else if (boot.phase != .ready) return error.SqlRelationRecoveryIncomplete;
+        try self.verify();
+        return observed;
+    }
+
     fn cast(ptr: *anyopaque) *Catalog {
         return @ptrCast(@alignCast(ptr));
     }
@@ -149,6 +191,7 @@ pub const Sources = struct {
     reader: read_adapters.HostedProvisionedTableReadSource,
     writer: write_adapters.HostedProvisionedTableWriteSource,
     pub fn bind(self: *Sources, catalog: *Catalog, reader: read_adapters.HostedProvisionedTableReadSource, writer: write_adapters.HostedProvisionedTableWriteSource) void {
+        catalog.native_boot_source = reader.catalog;
         self.reader = reader;
         self.writer = writer;
         self.reader.catalog = catalog.source();
@@ -261,6 +304,7 @@ pub const ValidationPort = struct {
             const owned = try catalog.alloc.create(Owned);
             owned.* = .{ .alloc = catalog.alloc, .reader = reader.*, .writer = writer.* };
             catalog.io = reader.catalog.io;
+            catalog.native_boot_source = reader.catalog;
             owned.reader.catalog = catalog.source();
             owned.writer.catalog = catalog.source();
             return .{ .reader = owned.reader.source(), .writer = owned.writer.source(), .owner = owned, .release = Owned.release };

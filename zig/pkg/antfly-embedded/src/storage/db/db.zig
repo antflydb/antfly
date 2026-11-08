@@ -5632,7 +5632,7 @@ pub const DB = struct {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             if (self.sql_persistence.?.kind == .unlogged) {
-                try transactions_mod.TxnManager.requireCleanNativeRecoveryInView(&read, (try self.relationPhysicalPin()).?);
+                try transactions_mod.TxnManager.requireCleanNativeRecoveryInView(self.alloc, &read, (try self.relationPhysicalPin()).?);
             } else if (try transactions_mod.TxnManager.hasRelationLifetimeDebtInView(self.alloc, &read)) return error.SqlRelationRecoveryIncomplete;
         }
         var failure: ?anyerror = null;
@@ -22377,6 +22377,8 @@ pub const DB = struct {
             try @import("restore_staging.zig").requireScope(alloc, &staging_read, opts.restore_staging_scope, false);
         }
         if (opts.group_source_query_json.len != 0) return self.lookupGroupSource(alloc, opts.group_source_query_json);
+        if (std.mem.eql(u8, opts.relational_topology_json, @import("native_empty_origin.zig").finalization_selector) and
+            !@import("native_empty_origin.zig").finalizationLookupMatches(key, opts)) return error.RestoreStagingScopeChanged;
         if (opts.relational_topology_json.len != 0) return self.lookupRelationalTopology(alloc, opts.relational_topology_json, opts);
         if (opts.relational_index_status_json.len != 0) return self.lookupRelationalIndexStatus(alloc, opts.relational_index_status_json, opts);
         if (opts.relational_activation_json.len != 0) return self.lookupRelationalActivation(alloc, opts.relational_activation_json, opts);
@@ -29465,7 +29467,7 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, native_empty_identity, status, retirement_status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt, schema_owner, sql_relation_binding },
+            mode: enum { identity, native_empty_identity, native_empty_finalization, status, retirement_status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt, schema_owner, sql_relation_binding },
             scope: ?@import("online_source_contract.zig").Scope = null,
         }, alloc, request_json, .{});
         defer request.deinit();
@@ -29493,6 +29495,61 @@ pub const DB = struct {
                         !std.mem.eql(u8, &opts.restore_staging_plan_id.?, &bootstrap.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
                 }
                 try @import("relational_integrity_json.zig").write(try self.relationalTopologyIdentity(), &stream);
+            },
+            .native_empty_finalization => {
+                if (!@import("native_empty_origin.zig").finalizationLookupMatches("", opts)) return error.RestoreStagingScopeChanged;
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                const descriptor = self.core.table_catalog.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+                if (descriptor.kind != .unlogged or !std.meta.eql(self.sql_persistence, @as(?@import("../../common/relation_persistence.zig").Descriptor, descriptor))) return error.SqlRelationOwnerChanged;
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                const contract = @import("restore_staging_contract.zig");
+                var bootstrap = try contract.OwnerBootstrap.decode(alloc, read.get(contract.bootstrap_key) catch return error.RestoreStagingScopeChanged);
+                defer bootstrap.deinit();
+                try bootstrap.value.validate();
+                var progress = try contract.Progress.decode(alloc, (try @import("restore_staging.zig").optional(&read)) orelse return error.RestoreStagingScopeChanged);
+                defer progress.deinit();
+                // VALIDATED fences further scoped BEGIN/PREPARE/row admission.
+                // A published image has ordinary users and is not this proof.
+                if (progress.value.phase != .validated) return error.RestoreValidationPending;
+                if (bootstrap.value.scope.native_empty_origin == null or !bootstrap.value.scope.empty_generation or
+                    !bootstrap.value.scope.target_namespace.eql(self.core.identity_namespace) or
+                    !std.mem.eql(u8, &bootstrap.value.scope.digest(), &progress.value.scope.digest()) or
+                    !std.mem.eql(u8, &opts.restore_staging_scope.?, &bootstrap.value.scope.digest()) or
+                    !std.mem.eql(u8, &opts.restore_staging_plan_id.?, &bootstrap.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
+                const native = @import("native_empty_generation.zig");
+                const installed = (try native.load(&read)) orelse return error.RestoreSourceProofMissing;
+                const origin = bootstrap.value.native_empty_source orelse return error.RestoreSourceProofMissing;
+                if (!std.mem.eql(u8, &installed.scope, &bootstrap.value.scope.digest()) or installed.origin_kind != origin.origin.kind() or
+                    !std.mem.eql(u8, &installed.origin_digest, &try origin.origin.digest()) or
+                    !std.mem.eql(u8, &installed.install_digest, &origin.expected_install_digest)) return error.RestoreSourceProofMissing;
+                if (self.core.table_catalog.row_count != 0) return error.RestoreSourceProofMissing;
+                if (try transactions_mod.TxnManager.hasRelationLifetimeDebtInView(alloc, &read)) return error.RestoreValidationPending;
+                const encoded = try self.core.table_catalog.encodeDurable();
+                var fingerprint: [32]u8 = undefined;
+                std.crypto.hash.Blake3.hash(encoded.slice(), &fingerprint, .{});
+                const schema_bytes = read.get(@import("../schema.zig").schema_key) catch |err| switch (err) {
+                    error.NotFound => "",
+                    else => return err,
+                };
+                const binding: @import("../../common/relation_persistence.zig").NativeBinding = .{
+                    .descriptor = descriptor,
+                    .native_instance = self.sql_native_instance,
+                    .table_id = self.core.identity_namespace.table_id,
+                    .shard_id = self.core.identity_namespace.shard_id,
+                    .range_id = self.core.identity_namespace.range_id,
+                    .physical_root_incarnation = self.root_incarnation,
+                    .schema_version = self.core.table_catalog.active_schema_version,
+                    .schema_digest = contract.digest(schema_bytes),
+                    .catalog_generation = self.core.table_catalog.generation,
+                    .catalog_fingerprint = fingerprint,
+                    .has_user_data = self.core.table_catalog.row_count != 0,
+                    .has_transaction_state = try transactions_mod.hasAnyTransactionStateInView(&read),
+                };
+                const proof: native.Finalization = .{ .plan_id = bootstrap.value.scope.plan_id, .binding = binding, .installed = installed };
+                try proof.require(bootstrap.value.scope.digest(), bootstrap.value.scope.plan_id, installed);
+                try @import("relational_integrity_json.zig").write(proof, &stream);
             },
             .generation_handoff_identity => {
                 const scope = opts.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
@@ -153094,6 +153151,9 @@ fn qualifyNativeEmptyTarget(schema_only: bool) !void {
         .byte_range = .{ .start = "", .end = "" },
         .native_empty_source = .{ .origin = origin, .expected_install_digest = try command.digest() },
     };
+    const finalization_options: types.LookupOptions = .{ .relational_topology_json = @import("native_empty_origin.zig").finalization_selector, .restore_staging_scope = scope.digest(), .restore_staging_plan_id = scope.plan_id };
+    const validation_txn: types.TxnId = @splat(77);
+    const validation_owner: transactions_mod.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(78), .admission_digest = @splat(79), .expires_at_unix_ns = 10000 };
     var installed: loss.Receipt = undefined;
     var binding: persistence.NativeBinding = undefined;
     {
@@ -153106,6 +153166,13 @@ fn qualifyNativeEmptyTarget(schema_only: bool) !void {
         try target.reserveRestoreStagingScoped(a, scope);
         try target.installRestoreStagingBootstrap(a, bootstrap);
         try target.beginRestoreStaging(a, scope);
+        try std.testing.expectError(error.RestoreValidationPending, target.lookup(a, "", finalization_options));
+        {
+            // Real retained transaction state, not a fabricated counter or ACK.
+            var manager = try target.core.initTxnManager();
+            defer manager.deinit();
+            try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(validation_txn, 100, 1, &.{ "data:202", "data:203" }, false, true, .{ .external_decision_owner = validation_owner, .native_pin = (try target.relationPhysicalPin()).? });
+        }
         _ = try target.finishRestoreStaging(a, scope.digest(), .validated);
         try std.testing.expectError(error.RestoreSourceProofMissing, target.finishRestoreStaging(a, scope.digest(), .published));
         const request: types.BatchRequest = .{ .restore_staging = .{ .install_native_empty = command }, .restore_staging_scope = scope.digest(), .restore_staging_plan_id = scope.plan_id };
@@ -153126,15 +153193,47 @@ fn qualifyNativeEmptyTarget(schema_only: bool) !void {
             const owner = (try @import("../source_authority.zig").load(&read)).?;
             try std.testing.expectEqual(installed.position.sequence, owner.sequence);
         }
-        _ = try target.finishRestoreStaging(a, scope.digest(), .published);
+        // An actual live transaction and terminal-but-unresolved participant
+        // debt both forbid finalization even though the image has no user rows.
+        try std.testing.expectError(error.RestoreValidationPending, target.lookup(a, "", finalization_options));
+        {
+            var manager = try target.core.initTxnManager();
+            defer manager.deinit();
+            const extra: transactions_mod.MutationExtraBatch = .{ .external_decision_owner = validation_owner, .native_pin = (try target.relationPhysicalPin()).? };
+            _ = try manager.resolveIntentsWithExtraBatch(validation_txn, .aborted, 200, .{ .external_decision_owner = extra.external_decision_owner, .native_pin = extra.native_pin });
+            try std.testing.expectError(error.RestoreValidationPending, target.lookup(a, "", finalization_options));
+            try manager.markParticipantResolvedExtraBatch(validation_txn, "data:202", extra);
+            try std.testing.expectError(error.RestoreValidationPending, target.lookup(a, "", finalization_options));
+            try manager.markParticipantResolvedExtraBatch(validation_txn, "data:203", extra);
+        }
+        {
+            var observed_final = (try target.lookup(a, "", finalization_options)).?;
+            defer observed_final.deinit(a);
+            var proof = try std.json.parseFromSlice(loss.Finalization, a, observed_final.json, .{});
+            defer proof.deinit();
+            try proof.value.require(scope.digest(), scope.plan_id, installed);
+            try std.testing.expect(proof.value.binding.has_transaction_state);
+            var wrong = finalization_options;
+            wrong.restore_staging_scope = @splat(99);
+            try std.testing.expectError(error.RestoreStagingScopeChanged, target.lookup(a, "", wrong));
+            wrong = finalization_options;
+            wrong.restore_staging_plan_id = @splat(99);
+            try std.testing.expectError(error.RestoreStagingScopeChanged, target.lookup(a, "", wrong));
+            wrong = finalization_options;
+            wrong.include_primary_digest = true;
+            try std.testing.expectError(error.RestoreStagingScopeChanged, target.lookup(a, "", wrong));
+            try std.testing.expectError(error.RestoreStagingScopeChanged, target.lookup(a, "user-row", finalization_options));
+        }
         var observed = (try target.lookup(a, "", .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}" })) orelse return error.TestUnexpectedResult;
         defer observed.deinit(a);
         var decoded = try std.json.parseFromSlice(persistence.NativeBinding, a, observed.json, .{});
         defer decoded.deinit();
         binding = decoded.value;
-        try std.testing.expect(!binding.has_user_data);
+        try std.testing.expect(!binding.has_user_data and binding.has_transaction_state);
         try target.closeFallible();
     }
+    // Initial birth still refuses even fully resolved retained history.
+    try std.testing.expectError(error.SqlRelationRecoveryIncomplete, DB.open(a, path, options));
     options.persistence_boot = .{ .instance = @splat(1), .unclean_restart = true, .initialized = binding };
     var reopened = try DB.open(a, path, options);
     defer reopened.close();
@@ -153144,6 +153243,16 @@ fn qualifyNativeEmptyTarget(schema_only: bool) !void {
         try std.testing.expectEqualDeep(installed, (try loss.requireInstalled(&read, command)).?);
         try std.testing.expectEqual(@as(u64, 0), (try @import("table_catalog.zig").Catalog.decode(try read.get(@import("table_catalog.zig").key))).row_count);
     }
+    {
+        var observed_final = (try reopened.lookup(a, "", finalization_options)).?;
+        defer observed_final.deinit(a);
+        var proof = try std.json.parseFromSlice(loss.Finalization, a, observed_final.json, .{});
+        defer proof.deinit();
+        try proof.value.require(scope.digest(), scope.plan_id, installed);
+        try std.testing.expect(proof.value.binding.has_transaction_state);
+    }
+    _ = try reopened.finishRestoreStaging(a, scope.digest(), .published);
+    try std.testing.expectError(error.RestoreStagingScopeChanged, reopened.lookup(a, "", finalization_options));
     {
         var corrupt = try reopened.core.store.beginWriteTxn();
         defer corrupt.abort();
@@ -154315,5 +154424,56 @@ test "db native source retirement admits only exact captured close and resolved 
         try std.testing.expect(!try Helper.drained(&db, a));
         try manager.markParticipantResolvedExtraBatch(id, "data:719", .{ .external_decision_owner = owner, .native_pin = pin });
         try std.testing.expect(try Helper.drained(&db, a));
+    }
+}
+
+test "db control-only publication preserves empty catalog while real user mutations remain conservative across cold reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("control-row-presence");
+    defer directory.cleanup();
+    const options: OpenOptions = .{ .start_optional_runtimes = false };
+    const control = "\x00\x00__metadata__:control_row_presence";
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = control, .value = "one" }} });
+        try std.testing.expectEqual(@as(u64, 0), db.core.table_catalog.row_count);
+        try db.batch(.{ .writes = &.{.{ .key = control, .value = "two" }}, .deletes = &.{"absent-user-row"} });
+        try std.testing.expectEqual(@as(u64, 0), db.core.table_catalog.row_count);
+        try db.batch(.{ .deletes = &.{control} });
+        try std.testing.expectEqual(@as(u64, 0), db.core.table_catalog.row_count);
+    }
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try std.testing.expectEqual(@as(u64, 0), db.core.table_catalog.row_count);
+        // Metadata accompanying a genuine row write must not hide presence.
+        try db.batch(.{ .writes = &.{ .{ .key = control, .value = "three" }, .{ .key = "row", .value = "{\"id\":1}" } } });
+        try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_count);
+        // Model an older/unreconciled presence catalog over this actual row.
+        // A mixed control-write/user-delete must use the bounded primary probe,
+        // rather than equating the control write with a new document.
+        var older = db.core.table_catalog;
+        older.row_count = 0;
+        older.reconciled = false;
+        const bytes = try older.encodeDurable();
+        try db.core.store.put(table_catalog_mod.key, bytes.slice());
+        db.core.table_catalog = older;
+        // A pure control write on an unreconciled root must independently find
+        // the existing real row; control bytes themselves remain no evidence.
+        try db.batch(.{ .writes = &.{.{ .key = control, .value = "four" }} });
+        try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_count);
+        try db.core.store.put(table_catalog_mod.key, bytes.slice());
+        db.core.table_catalog = older;
+        try db.batch(.{ .writes = &.{.{ .key = control, .value = "five" }}, .deletes = &.{"another-absent-user-row"} });
+        try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_count);
+    }
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_count);
+        const row = (try db.get(a, "row")).?;
+        defer a.free(row);
+        try std.testing.expectEqualStrings("{\"id\":1}", row);
     }
 }

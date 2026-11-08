@@ -270,6 +270,7 @@ pub const Owner = struct {
 /// preparation nor an immutable plan can manufacture or retain that authority.
 pub fn invoke(raw: *anyopaque, a: A, function: effects.Function, args: []const scalar.Datum) anyerror!scalar.Datum {
     const root: *@import("sql_execution.zig").Adapter = @ptrCast(@alignCast(raw));
+    root.notePopulationTransactionalEffect();
     const fence = root.context.sql_command_fence orelse return error.AdvisoryProviderUnavailable;
     const connection = root.connection_id orelse return error.SqlConnectionNotFound;
     const store = root.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;

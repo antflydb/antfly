@@ -2580,11 +2580,21 @@ pub fn encodeStorageDatumTyped(arena: std.mem.Allocator, datum: Datum, column: c
         if (!column.nullable) return error.SqlNotNullViolation;
         return .null;
     }
+    // Untyped SQL range literals acquire their owned typed payload during
+    // assignment above. Serialize that payload, never its JSON-null carrier.
+    if (checked.range()) |range| {
+        var context: @import("range_value.zig").Context = .{ .alloc = arena, .max_output_bytes = retained_bytes };
+        return .{ .string = try @import("range_value.zig").formatLeaky(&context, range.*) };
+    }
     if (checked.array) |array| return @import("array_wire.zig").toJsonLeaky(arena, array.*, .{ .values = .{ .bytes = retained_bytes }, .wire_bytes = retained_bytes });
     if (checked.numeric) |value| {
         var context: @import("numeric_value.zig").Context = .{ .alloc = arena, .max_output_bytes = retained_bytes };
         return .{ .string = try @import("numeric_value.zig").format(&context, value.*) };
     }
+    // Unsupported physical domains (currently BYTEA/VOID) and any future
+    // extension must never fall through to their JSON carrier. Existing DDL
+    // admission remains unchanged; this boundary cannot manufacture support.
+    if (checked.extension_kind != .none) return error.UnsupportedRelationalValueType;
     // Scalar floating storage is currently finite-only. Never let JSON
     // serialization turn a valid SQL special value into a persisted SQL NULL.
     if (checked.value == .float and !std.math.isFinite(checked.value.float)) return error.SqlNonFiniteScalarStorage;
@@ -9436,4 +9446,50 @@ test "SQL protected ordinary zero-row triggers finish once and failed completion
         try std.testing.expectEqual(@as(usize, 0), provider.published);
         try std.testing.expect(!provider.active);
     }
+}
+
+test "SQL range literal physical assignment retains coerced payload instead of JSON null carrier" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Cases = struct { kind: ast.ColumnType, text: []const u8 };
+    for ([_]Cases{
+        .{ .kind = .numrange, .text = "[0,10)" },
+        .{ .kind = .daterange, .text = "[2026-01-01,2026-01-04)" },
+        .{ .kind = .tsrange, .text = "[\"2025-01-01 00:00:00\",\"2025-01-02 00:00:00\")" },
+        .{ .kind = .tstzrange, .text = "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")" },
+    }) |case| {
+        const column: catalog.Column = .{ .name = "period", .path = "period", .type = case.kind, .nullable = false };
+        // This is the actual plain INSERT literal path: semantic binding
+        // canonicalizes text; physical assignment constructs the typed value.
+        const literal = try describe.bindColumnLiteral(scratch, .{ .string = case.text }, column);
+        const encoded = try encodeStorageDatumTyped(scratch, Datum.json(literal), column, null, 4096);
+        try std.testing.expect(encoded == .string);
+        try std.testing.expectEqualStrings(case.text, encoded.string);
+        const typed = try describe.coerceDatum(scratch, Datum.json(literal), case.kind, null);
+        try std.testing.expect(typed.range() != null and typed.value == .null and !typed.sql_null);
+        const already_typed = try encodeStorageDatumTyped(scratch, typed, column, null, 4096);
+        try std.testing.expectEqualStrings(encoded.string, already_typed.string);
+        try std.testing.expectError(error.SqlNotNullViolation, encodeStorageDatumTyped(scratch, .{}, column, null, 4096));
+        var nullable = column;
+        nullable.nullable = true;
+        try std.testing.expect((try encodeStorageDatumTyped(scratch, .{}, nullable, null, 4096)) == .null);
+        try std.testing.expectError(error.SqlTypeMismatch, encodeStorageDatumTyped(scratch, Datum.json(.null), nullable, null, 4096));
+        var invalid_null = typed;
+        invalid_null.sql_null = true;
+        try std.testing.expectError(error.SqlTypeMismatch, encodeStorageDatumTyped(scratch, invalid_null, nullable, null, 4096));
+        var wrong = column;
+        wrong.type = if (case.kind == .numrange) .daterange else .numrange;
+        try std.testing.expectError(error.SqlTypeMismatch, encodeStorageDatumTyped(scratch, typed, wrong, null, 4096));
+    }
+}
+
+test "SQL physical assignment refuses unsupported typed carriers without creating storage NULL" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const bytes: @import("bytea_value.zig").Value = .{ .bytes = "payload" };
+    try std.testing.expectError(error.UnsupportedRelationalValueType, encodeStorageDatumTyped(arena.allocator(), Datum.typedBytes(&bytes), .{ .name = "bytes", .path = "bytes", .type = .bytea }, null, 4096));
+    try std.testing.expectError(error.UnsupportedRelationalValueType, encodeStorageDatumTyped(arena.allocator(), Datum.voidValue(), .{ .name = "nothing", .path = "nothing", .type = .void }, null, 4096));
 }

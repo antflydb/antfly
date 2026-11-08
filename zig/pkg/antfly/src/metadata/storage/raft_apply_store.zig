@@ -40065,7 +40065,7 @@ pub const RaftApplyStore = struct {
                     defer metadata_table_manager.freeStore(self.alloc, registered);
                     if (registered.node_id != descriptor.owner_node_id or registered.reporter_incarnation == 0 or
                         !metadata_table_manager.storeServesTableData(registered.role) or
-                        registered.native_generation_restore_version < @import("antfly_local_sources").storage_db_native_empty_origin.identity_protocol_version) return;
+                        registered.native_generation_restore_version < @import("antfly_local_sources").storage_db_native_empty_origin.finalization_protocol_version) return;
                 }
             }
             self.requireSqlRelationResetPlanTxn(catalog_arena.allocator(), txn, group_id, plan) catch |err| switch (err) {
@@ -75635,7 +75635,14 @@ test "SQL prepared transaction named lock participant survives bounded cold hand
                     }
                     continue;
                 }
-                if (mode == .reject_stale) try std.testing.expect(pass > 1);
+                if (mode == .reject_stale) {
+                    try std.testing.expect(pass > 1);
+                    // Unadmitted read retirement must not finish the parent
+                    // DDL command. Its independent release still has no decision.
+                    try std.testing.expectEqualDeep(identity.lock_scope.?.command, scope.command.?);
+                    try std.testing.expectEqual(identity.lock_scope.?.command.sequence, scope.next_command);
+                    try std.testing.expect(scope.released_transaction != null and scope.released_transaction.?.decision == null);
+                }
                 try Helper.scope(&store, a, identity, source, 210, .{ .fence = .close });
                 for (0..8) |i| {
                     if ((try Helper.scopeRead(&store, a, identity, source, null)).scope.?.state == .retired) break;

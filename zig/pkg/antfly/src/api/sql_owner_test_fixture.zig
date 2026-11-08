@@ -387,9 +387,15 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     defer alloc.free(reader_authorization);
     const reader_headers = [_]http.RequestHeader{.{ .name = "authorization", .value = reader_authorization }};
     var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var succeeded = false;
+    const preserve_failure = if (platform.env.getenv("ANTFLY_PRESERVE_SQL_OWNER_TEST_FAILURE")) |value| std.mem.eql(u8, value, "1") else false;
+    defer if (succeeded or !preserve_failure) tmp.cleanup() else {
+        tmp.dir.close(std.testing.io);
+        tmp.parent_dir.close(std.testing.io);
+    };
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(root);
+    errdefer if (preserve_failure) std.debug.print("SQL owner fixture retained failed root={s}\n", .{root});
     const meta_root = try std.fmt.allocPrint(alloc, "{s}/metadata", .{root});
     defer alloc.free(meta_root);
     const data_root = try std.fmt.allocPrint(alloc, "{s}/data", .{root});
@@ -606,4 +612,5 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     context.base = restarted_base;
     try campaign.afterRestart(&context);
     try context.checkDrivers();
+    succeeded = true;
 }

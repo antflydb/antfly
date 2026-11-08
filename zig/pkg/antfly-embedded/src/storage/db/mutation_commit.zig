@@ -1422,9 +1422,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             var pessimistic = try @import("pessimistic_access.zig").Guard.init(preparation_alloc, S.ownerField(self, "core").*, if (opts.transaction_resolution) |resolution| resolution.txn_id else null);
             defer pessimistic.deinit();
-            const user_changes = for (effective_req.writes) |write| {
+            const user_writes = for (effective_req.writes) |write| {
                 if (!isMetadataKey(write.key)) break true;
-            } else for (effective_req.deletes) |key| {
+            } else false;
+            const user_changes = user_writes or for (effective_req.deletes) |key| {
                 if (!isMetadataKey(key)) break true;
             } else false;
             if (user_changes) try pessimistic.table(.row_exclusive);
@@ -2669,7 +2670,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     table_catalog_value = try catalog.encodeDurable();
                     next_table_catalog = catalog;
                 }
-            } else if (S.ownerField(self, "core").*.table_catalog.row_count == 0 and (effective_req.writes.len != 0 or effective_req.deletes.len != 0)) {
+            } else if (S.ownerField(self, "core").*.table_catalog.row_count == 0 and
+                (user_changes or (!S.ownerField(self, "core").*.table_catalog.reconciled and (effective_req.writes.len != 0 or effective_req.deletes.len != 0))))
+            {
                 // An older/unreconciled owner can contain primary rows but lack a
                 // visibility summary. Absence of a counter is not an empty-table
                 // proof: a write proves presence, while a delete keeps it unknown
@@ -2677,7 +2680,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // empty. Never grant empty-table CHECK/rewrite admission from zero
                 // metadata on a populated root. A later explicit reconciliation
                 // may clear this conservative presence bit after delete-only work.
-                const has_user_data = effective_req.writes.len != 0 or try storeHasUserDataBounded(S.ownerField(self, "core").*.store);
+                // The same key classification used for row-lock admission
+                // distinguishes actual rows from internal activation/control
+                // writes. A metadata write cannot prove user-row presence.
+                // Older unreconciled roots still probe even for control-only
+                // work; mixed metadata-write/user-delete work also probes.
+                const has_user_data = user_writes or try storeHasUserDataBounded(S.ownerField(self, "core").*.store);
                 if (has_user_data) {
                     var catalog = S.ownerField(self, "core").*.table_catalog;
                     catalog.mode_initialized = true;

@@ -594,6 +594,24 @@ fn recoverEmptyCohort(source: *Registry, a: A, before: registry.Record, now_ns: 
 /// durable before native admission; every later error is reconciliation debt,
 /// never permission to run the ordinary commit coordinator under the same ID.
 pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdentity, context: local.api_operation.RequestContext, id: sql_session.Id, tables: []const distributed.TableCommitRequest, abort: bool) !sql_session.CommitResult {
+    return completeScoped(server, user, context, id, tables, abort, false);
+}
+
+/// Retire an effect-free producer's unused admission, not its parent command.
+/// Canonical cancellation fences the original sealed purpose permanently;
+/// release_unadmitted drains its native locks with decision=null and therefore
+/// retains the enclosing command fence until the DDL owner actually finishes.
+pub fn retirePopulationRead(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdentity, context: local.api_operation.RequestContext, id: sql_session.Id) !sql_session.CommitResult {
+    const lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
+    defer lease.release();
+    const durable = server.txn_sessions.durable orelse return error.SqlPreparedDurabilityUnavailable;
+    var state = (try durable.loadInto(server.alloc, id)) orelse return error.SqlTransactionNotActive;
+    defer state.deinit(server.alloc);
+    if (!try execution.Adapter.populationReadOnly(server.alloc, state)) return error.UnsupportedSqlExecution;
+    return completeScoped(server, user, context, id, &.{}, false, true);
+}
+
+fn completeScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdentity, context: local.api_operation.RequestContext, id: sql_session.Id, tables: []const distributed.TableCommitRequest, abort: bool, retire_read: bool) !sql_session.CommitResult {
     const frame = context.sql_command_fence orelse return error.InvalidLockScope;
     if (abort and tables.len != 0) return error.InvalidTxnRequest;
     if (server.txn_sessions.durable == null) return error.SqlPreparedDurabilityUnavailable;
@@ -661,6 +679,7 @@ pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdenti
     // same durable decision and release barriers, without requiring a fictitious
     // table participant or constructing a transport that will never be called.
     deliver: {
+        if (retire_read) break :deliver;
         var record = if (abort or cohort.manifest.len == 0)
             Registry.admit(&source, a, identity, cohort.manifest) catch |err| {
                 diagnoseScopedFailure(.admit, err, @errorReturnTrace());

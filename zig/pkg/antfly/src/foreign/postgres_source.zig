@@ -1096,6 +1096,9 @@ pub fn registerExecutor(
     executor: QueryExecutor,
 ) !void {
     const registration = try alloc.create(ExecutorRegistration);
+    // The caller still owns executor until the registry accepts its context.
+    // On map allocation failure, destroy only this untransferred wrapper.
+    errdefer alloc.destroy(registration);
     registration.* = .{
         .executor = executor,
     };
@@ -2432,4 +2435,34 @@ test "postgres source runtime executes stats and terms aggregations with transla
     try std.testing.expectEqualStrings("name_terms", result.results[1].name);
     try std.testing.expect(result.results[1].value == .array);
     try std.testing.expectEqual(@as(usize, 2), result.results[1].value.array.items.len);
+}
+
+test "postgres executor registration map failure preserves caller ownership and frees allocated wrapper" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        destroyed: usize = 0,
+        fn deinit(raw: *anyopaque, _: Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.destroyed += 1;
+        }
+        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: sql.PreparedQuery, _: ?u64, _: ?CancellationToken) !foreign_source.QueryResult {
+            return error.TestUnexpectedProviderAccess;
+        }
+        fn statistics(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !foreign_source.TableStatistics {
+            return error.TestUnexpectedProviderAccess;
+        }
+    };
+    var probe: Probe = .{};
+    var registry: foreign_source.Registry = .{};
+    defer registry.deinit(a);
+    // Allocation zero creates ExecutorRegistration. Allocation one is the
+    // first empty factory map growth, after the wrapper genuinely exists.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    const executor: QueryExecutor = .{ .ptr = &probe, .vtable = &.{ .deinit = Probe.deinit, .query = Probe.query, .statistics = Probe.statistics } };
+    try std.testing.expectError(error.OutOfMemory, registerExecutor(failing.allocator(), &registry, executor));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), registry.factories.count());
+    try std.testing.expectEqual(@as(usize, 0), probe.destroyed);
+    executor.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), probe.destroyed);
 }

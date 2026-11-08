@@ -2282,3 +2282,53 @@ test "SQL protected mutation admission resolves actual source before session sel
         }
     }
 }
+
+test "SQL temporal price literals bind UUID exact NUMERIC and NUMRANGE without parameters or effects" {
+    const Provider = struct {
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 7, .physical_name = "table:7", .schema_version = 0, .storage_mode = .relational, .columns = &.{
+                .{ .name = "id", .path = "id", .type = .uuid, .element_type = .uuid, .nullable = false },
+                .{ .name = "sku", .path = "sku", .type = .string, .element_type = .text, .nullable = false },
+                .{ .name = "valid_from", .path = "valid_from", .type = .number, .element_type = .numeric, .nullable = false },
+                .{ .name = "valid_to", .path = "valid_to", .type = .number, .element_type = .numeric, .nullable = false },
+                .{ .name = "price", .path = "price", .type = .number, .element_type = .numeric },
+                .{ .name = "valid_time", .path = "valid_time", .type = .numrange, .nullable = false, .defaulted = true },
+            } };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedRead;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn id(_: *anyopaque, _: std.mem.Allocator) ![]const u8 {
+            return error.UnexpectedEvaluation;
+        }
+    };
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    for ([_][]const u8{
+        "INSERT INTO prices(id,sku,valid_from,valid_to,price,valid_time) VALUES('00000000-0000-0000-0000-000000000001','sku:a',0,10,10,'[0,10)')",
+        "INSERT INTO prices(id,sku,valid_from,valid_to,price) VALUES('00000000-0000-0000-0000-000000000001','sku:a',0,10,10)",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(@as(u32, 0), compiled.parameter_count);
+        for ([_]bool{ false, true }) |has_invocation| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var backend: catalog.Backend = .{ .ptr = &dummy, .vtable = &.{ .resolve = Provider.resolve, .scan = Provider.scan, .mutate = Provider.mutate, .checkpoint = Provider.checkpoint, .generate_row_id = Provider.id } };
+            if (has_invocation) backend.parameter_invocation = try @import("parameter_binding.zig").Invocation.initLeaky(scratch, 0);
+            const bound = try bindInternal(scratch, backend, &compiled, &.{});
+            try std.testing.expectEqual(@as(usize, 0), bound.parameter_types.len);
+            try std.testing.expectEqual(@as(usize, 0), bound.parameter_descriptors.len);
+            if (has_invocation) {
+                var frame = try bound.scalars.prepareParameters(a, &.{}, .{});
+                defer frame.deinit();
+                try frame.validateDecisions(scratch, null);
+            }
+        }
+    }
+}

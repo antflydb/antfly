@@ -48,9 +48,11 @@ const Native = struct {
     calls: usize = 0,
     outcome_reads: usize = 0,
     scope_reads: usize = 0,
-    failure: ?enum { admit, prepare, commit, handoff, ack } = null,
+    failure: ?enum { admit, prepare, commit, handoff, ack, cancel } = null,
     fail_before: bool = false,
     block_cancel: bool = false,
+    cancel_on_block: ?*std.atomic.Value(bool) = null,
+    original_admissions: usize = 0,
     previous: ?[32]u8 = null,
     last: ?[32]u8 = null,
     fn nonce(self: *@This()) [16]u8 {
@@ -67,9 +69,14 @@ const Native = struct {
             .sql_prepared_read => |request| self.metadata.sqlPreparedRead(alloc, group, request, .{ .setting_admin = true }),
             .sql_prepared_outcome => |request| self.metadata.sqlPreparedOutcome(alloc, group, request),
             .sql_prepared_mutate => |request| blk: {
-                if (request.operation == .cancel_admission and self.block_cancel) return error.MetadataMutationOutcomeUnknown;
+                if (request.operation == .admit) self.original_admissions += 1;
+                if (request.operation == .cancel_admission and self.block_cancel) {
+                    if (self.cancel_on_block) |signal| signal.store(true, .release);
+                    return error.MetadataMutationOutcomeUnknown;
+                }
                 const point: @TypeOf(self.failure) = switch (request.operation) {
                     .admit => .admit,
+                    .cancel_admission => .cancel,
                     .acknowledge_receipt => .ack,
                     .advance => |change| switch (change.action) {
                         .prepare => .prepare,
@@ -77,7 +84,6 @@ const Native = struct {
                         .handoff => .handoff,
                         else => null,
                     },
-                    else => null,
                 };
                 const lose = point != null and point == self.failure;
                 if (lose) self.failure = null;
@@ -3131,4 +3137,117 @@ test "SQL command producer native shutdown drains only current issuer and retain
     try std.testing.expectEqual(producer.Phase.retired, retained.value.phase);
     try std.testing.expect(retained.value.recovery);
     try std.testing.expect(retained.value.temporaryRetirementComplete());
+}
+
+test "SQL command producer native population read cancellation retains the parent command through cold and lost replies" {
+    const Coordinator = @import("sql_session.zig").Coordinator;
+    const Adapter = @import("sql_session.zig").Adapter;
+    const prepared = @import("sql_prepared_coordinator.zig");
+    const Forward = struct {
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedStatusRead;
+        }
+        fn catalog(raw: *anyopaque, alloc: A, _: local.api_operation.RequestContext, input: Call) ![]u8 {
+            return Native.call(raw, alloc, input);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (0..3) |mode| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/read-retirement-{d}", .{ tmp.sub_path, mode });
+        defer a.free(path);
+        var transaction_id: [16]u8 = undefined;
+        var captured_fence: authority.scopes.CommandFence = undefined;
+        {
+            var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+            defer metadata.deinit();
+            var durable = transactions.DurableSessionStore.init(a, &metadata.store);
+            var native: Native = .{ .metadata = &metadata, .standalone = true, .expiry_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60000, .database = "default" };
+            try setup(&metadata, &durable, true, &native);
+            try native.until(&durable, .idle, 2);
+            const ticket = try begin(&native, &durable, 60);
+            captured_fence = try execute(&durable, ticket);
+            const fence = captured_fence;
+            var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+            defer runtime.deinit();
+            var server = @import("http_server.zig").ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &durable, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &native, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog } }, null, null);
+            defer server.deinit();
+            var user: ?@import("http_server.zig").AuthenticatedIdentity = null;
+            var canceled = std.atomic.Value(bool).init(false);
+            var coordinator: Coordinator = .{ .server = &server, .identity = &user, .context = .{ .sql_command_fence = &fence, .cancellation = local.api_operation.CancellationToken.fromAtomic(&canceled) } };
+            var adapter: Adapter = .{ .alloc = a, .registry = &server.txn_sessions, .node_id = 0, .commit_context = &coordinator, .commit_fn = Coordinator.commit, .rollback_fn = Coordinator.rollback, .connection_id = connection, .connection_revision = 1, .command_fence = &fence };
+            const scope: local.sql_session.Scope = .{ .principal = "alice", .database = "default", .namespace = "public" };
+            transaction_id = (try adapter.owner().vtable.begin(&adapter, scope, .{ .isolation = .read_committed })).id;
+            var source = (try producer.load(&durable, a, connection)).?;
+            defer source.deinit();
+            try native.submit(source.value, .{ .bind = .{ .command = ticket.command, .transaction = transaction_id } });
+            // This metadata component owns an effect-free bound read purpose.
+            // Physical ACCESS SHARE grants require the actual enrolled Data
+            // owner; the native lifetime/process gates qualify their release.
+            // Here cancellation must preserve the exact parent command fence,
+            // without manufacturing a data grant or substituting advisory work.
+            if (mode == 1) native.failure = .cancel;
+            if (mode == 2) {
+                native.block_cancel = true;
+                native.cancel_on_block = &canceled;
+            }
+            const result = try prepared.retirePopulationRead(&server, user, coordinator.context, transaction_id);
+            try std.testing.expectEqual(@as(usize, 0), native.original_admissions);
+            if (mode == 2) {
+                try std.testing.expectEqual(local.sql_session.CommitOutcome.unknown, result.outcome);
+                var pending = (try durable.load(transaction_id)).?;
+                defer pending.deinit(a);
+                try std.testing.expect(pending.external_preparation != null and !pending.terminal_abort and !pending.external_receipt_acknowledged);
+                canceled.store(false, .release);
+                native.block_cancel = false;
+                native.cancel_on_block = null;
+                for (0..32) |_| {
+                    var state = (try durable.load(transaction_id)).?;
+                    defer state.deinit(a);
+                    if (state.terminal_abort and state.external_receipt_acknowledged) break;
+                    prepared.recoverSession(&server, transaction_id, state.external_preparation.?, false, state.terminal_abort, false) catch |err| switch (err) {
+                        error.MetadataMutationOutcomeUnknown => {},
+                        else => return err,
+                    };
+                }
+            } else try std.testing.expectEqual(local.sql_session.CommitOutcome.aborted, result.outcome);
+            var terminal = (try durable.load(transaction_id)).?;
+            defer terminal.deinit(a);
+            try std.testing.expect(terminal.terminal_abort and terminal.external_receipt_acknowledged and terminal.external_decision == null);
+            try adapter.owner().vtable.rollback(&adapter, scope, transaction_id);
+            var attached = try connections.load(&durable, a, connection, "alice", 0, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+            defer attached.deinit();
+            try std.testing.expectEqual(.idle, attached.value.state);
+            try std.testing.expect(attached.value.active_txn == null);
+            var read = try metadata.store.beginReadTxn();
+            defer read.abort();
+            const ns: authority.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = fence.backend.incarnation };
+            const actual = (try authority.scopes.read(a, &read, ns, fence.backend)).?;
+            try std.testing.expect(actual.transaction == null and actual.released_transaction != null and actual.released_transaction.?.decision == null);
+            try std.testing.expectEqualDeep(fence.command, actual.command.?);
+            try std.testing.expectEqual(fence.command.sequence, actual.next_command);
+            var parent = (try producer.load(&durable, a, connection)).?;
+            defer parent.deinit();
+            try std.testing.expectEqual(.executing, parent.value.phase);
+            try std.testing.expectEqualDeep(ticket, parent.value.ticket.?);
+            try std.testing.expectEqual(@as(usize, 0), native.original_admissions);
+        }
+        // Cold custody retains the known read retirement AND still-live
+        // parent command. Only its real owner may finish that command later.
+        var reopened = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer reopened.deinit();
+        var durable = transactions.DurableSessionStore.init(a, &reopened.store);
+        var terminal = (try durable.load(transaction_id)).?;
+        defer terminal.deinit(a);
+        try std.testing.expect(terminal.terminal_abort and terminal.external_receipt_acknowledged and terminal.external_decision == null);
+        var read = try reopened.store.beginReadTxn();
+        defer read.abort();
+        const ns: authority.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = captured_fence.backend.incarnation };
+        const actual = (try authority.scopes.read(a, &read, ns, captured_fence.backend)).?;
+        try std.testing.expectEqualDeep(captured_fence.command, actual.command.?);
+        try std.testing.expectEqual(captured_fence.command.sequence, actual.next_command);
+        var parent = (try producer.load(&durable, a, connection)).?;
+        defer parent.deinit();
+        try std.testing.expectEqual(.executing, parent.value.phase);
+    }
 }

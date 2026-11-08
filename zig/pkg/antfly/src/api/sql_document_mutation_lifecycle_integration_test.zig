@@ -1772,3 +1772,137 @@ test "mounted SQL writable CTE PostgreSQL cohort preserves typed effects and col
     }
     try std.testing.expectEqual(@as(usize, 0), failures);
 }
+
+// sql-1457's historical setup uses non-PostgreSQL PERIOD FOR and invalid UUID
+// literals. Preserve that evidence; valid range/UUID witnesses independently
+// prove the temporal arbiter rule rather than crediting an input typo alone.
+test "mounted SQL original temporal conflict upsert preserves typed rejection and cold rows" {
+    const TemporalConflictCampaign = struct {
+        pub const native_sessions = true;
+        pub const native_auth = true;
+        pub const cold_catalog = true;
+        pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
+            const users = @import("../usermgr/mod.zig");
+            inline for (.{ users.ResourceType.database, users.ResourceType.namespace }) |kind| {
+                var permission = try users.Permission.initOwned(manager.alloc, kind, "*", .admin);
+                defer permission.deinit(manager.alloc);
+                try manager.addPermissionToUser("pk-rewriter", permission);
+            }
+        }
+        credentials: client.ApiKeyHeaders = .{},
+        const original = "INSERT INTO prices (id, sku, valid_from, valid_to, price) VALUES ('p2', 'sku:a', 5, 15, 12) ON CONFLICT ON CONSTRAINT prices_sku_time_key DO UPDATE SET price = excluded.price RETURNING id, price";
+        const original_setup = "CREATE TABLE prices (id uuid PRIMARY KEY, sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), CONSTRAINT prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS));";
+        const corrected = "INSERT INTO prices (id, sku, valid_from, valid_to, price) VALUES ('00000000-0000-0000-0000-000000000002', 'sku:a', 5, 15, 12) ON CONFLICT ON CONSTRAINT prices_sku_time_key DO UPDATE SET price = excluded.price RETURNING id, price";
+        fn reject(ctx: *fixture.Context, sql: []const u8, state: []const u8) !void {
+            var response = try client.execute(ctx, sql, .never);
+            defer response.deinit(ctx.alloc);
+            errdefer std.debug.print("temporal conflict sql={s} status={d} body={s}\n", .{ sql, response.status, response.body });
+            try std.testing.expectEqual(@as(u16, 400), response.status);
+            var parsed = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(state, parsed.value.code);
+            try std.testing.expect(!(parsed.value.retryable orelse false));
+            if (parsed.value.transaction_status) |actual| {
+                try std.testing.expectEqual(wire.SQLTransactionStatus.idle, actual);
+            } else {
+                // Parser rejection precedes connection transaction attachment.
+                // Runtime type/constraint failures still require explicit idle.
+                try std.testing.expectEqualStrings("42601", state);
+                try std.testing.expectEqualStrings(original_setup, sql);
+            }
+            try std.testing.expect(parsed.value.transaction_id == null);
+        }
+        fn observe(ctx: *fixture.Context) !void {
+            var response = try client.execute(ctx, "SELECT id,sku,valid_time,price FROM prices", .read);
+            defer response.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.rows.len);
+            try std.testing.expectEqualStrings("00000000-0000-0000-0000-000000000001", parsed.value.rows[0][0].string);
+            try std.testing.expectEqualStrings("sku:a", parsed.value.rows[0][1].string);
+            try std.testing.expectEqualStrings("[0,10)", parsed.value.rows[0][2].string);
+            try std.testing.expectEqualStrings("10", parsed.value.rows[0][3].string);
+        }
+        fn observeDefaults(ctx: *fixture.Context) !void {
+            var response = try client.execute(ctx, "SELECT id,valid_num,valid_date FROM temporal_defaults", .read);
+            defer response.deinit(ctx.alloc);
+            errdefer std.debug.print("temporal defaults status={d} body={s}\n", .{ response.status, response.body });
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.rows.len);
+            try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", parsed.value.rows[0][0].string);
+            try std.testing.expectEqualStrings("[5,15)", parsed.value.rows[0][1].string);
+            try std.testing.expectEqualStrings("[2026-01-01,2026-01-04)", parsed.value.rows[0][2].string);
+        }
+        fn checks(ctx: *fixture.Context) !void {
+            try observe(ctx);
+            try reject(ctx, original, "22P02");
+            try observe(ctx);
+            // Exact declared temporal constraint and genuine overlapping range,
+            // with only the invalid UUID corrected. This must be 42809, not a
+            // successful update, generic unsupported feature or scalar conflict.
+            try reject(ctx, corrected, "42809");
+            try observe(ctx);
+        }
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.credentials.activateWithCatalog(ctx, true);
+            ctx.headers = &self.credentials.admin;
+            var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+            defer corpus.deinit();
+            try std.testing.expectEqualStrings(original, (try corpus.get("sql-1457")).sql);
+            try reject(ctx, original_setup, "42601");
+            // PostgreSQL's range representation replaces unsupported PERIOD
+            // grammar. The default supplies the proposed [5,15) period while
+            // keeping the unchanged original INSERT column list and SQL bytes.
+            var created = try client.execute(ctx, "CREATE TABLE prices(id UUID PRIMARY KEY,sku TEXT NOT NULL,valid_from NUMERIC NOT NULL,valid_to NUMERIC NOT NULL,price NUMERIC,valid_time NUMRANGE NOT NULL DEFAULT '[5,15)',CONSTRAINT prices_sku_time_key UNIQUE(sku,valid_time WITHOUT OVERLAPS))", .write_admission);
+            defer created.deinit(ctx.alloc);
+            if (created.status != 200 and created.status != 202) std.debug.print("temporal conflict create {d} {s}\n", .{ created.status, created.body });
+            try std.testing.expect(created.status == 200 or created.status == 202);
+            const serving = try fixture.waitServingSchema(ctx, "prices", 0);
+            try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
+            try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "prices");
+            var seeded = try client.execute(ctx, "INSERT INTO prices(id,sku,valid_from,valid_to,price,valid_time) VALUES('00000000-0000-0000-0000-000000000001','sku:a',0,10,10,'[0,10)')", .write_admission);
+            defer seeded.deinit(ctx.alloc);
+            if (seeded.status != 200) std.debug.print("temporal conflict seed status={d} body={s}\n", .{ seeded.status, seeded.body });
+            try std.testing.expectEqual(@as(u16, 200), seeded.status);
+            var defaults = try client.execute(ctx, "CREATE TABLE temporal_defaults(id UUID DEFAULT 'A0EEBC999C0B4EF8BB6D6BB9BD380A11' PRIMARY KEY,valid_num NUMRANGE DEFAULT '[5,15)',valid_date DATERANGE DEFAULT '[2026-01-01,2026-01-04)')", .write_admission);
+            defer defaults.deinit(ctx.alloc);
+            try std.testing.expect(defaults.status == 200 or defaults.status == 202);
+            const defaults_serving = try fixture.waitServingSchema(ctx, "temporal_defaults", 0);
+            try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, defaults_serving.table_id);
+            try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "temporal_defaults");
+            var inserted_defaults = try client.execute(ctx, "INSERT INTO temporal_defaults DEFAULT VALUES", .write_admission);
+            defer inserted_defaults.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), inserted_defaults.status);
+            try observeDefaults(ctx);
+            try checks(ctx);
+            ctx.headers = &self.credentials.reader;
+            {
+                defer ctx.headers = &self.credentials.admin;
+                var denied = try client.execute(ctx, corrected, .never);
+                defer denied.deinit(ctx.alloc);
+                try std.testing.expectEqual(@as(u16, 403), denied.status);
+                var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, denied.body, .{});
+                defer diagnostic.deinit();
+                try std.testing.expectEqualStrings("42501", diagnostic.value.code);
+            }
+            try observe(ctx);
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            ctx.headers = &self.credentials.admin;
+            _ = try fixture.waitServingSchema(ctx, "prices", 0);
+            _ = try fixture.waitServingSchema(ctx, "temporal_defaults", 0);
+            try observeDefaults(ctx);
+            try checks(ctx);
+        }
+    };
+    var reference = try std.json.parseFromSlice(struct { original: []const u8, original_setup: []const u8, original_sqlstate: []const u8, valid_typed_sqlstate: []const u8 }, std.testing.allocator, @embedFile("fixtures/sql_temporal_conflict_reference.json"), .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    try std.testing.expectEqualStrings(TemporalConflictCampaign.original, reference.value.original);
+    try std.testing.expectEqualStrings(TemporalConflictCampaign.original_setup, reference.value.original_setup);
+    try std.testing.expectEqualStrings("22P02", reference.value.original_sqlstate);
+    try std.testing.expectEqualStrings("42809", reference.value.valid_typed_sqlstate);
+    try fixture.runWithState(TemporalConflictCampaign, .{});
+}

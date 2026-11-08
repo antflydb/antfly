@@ -15103,6 +15103,17 @@ pub const DataServer = struct {
         context: antfly.public_api.distributed_txn.PreDecisionContext,
     ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (req.transaction != null and req.restore_staging_scope != null) {
+            const plan = req.restore_staging_plan_id orelse return error.RestoreStagingScopeChanged;
+            var owned = try recoverRestoreDescriptor(self, alloc, group_id, table_name, req.restore_staging_scope.?, plan, antfly.public_api.ProvisionedKernelOwnerSource.restoreDescriptorUseForBatch(req), .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation });
+            defer owned.deinit(alloc);
+            if (owned.descriptor.sql_persistence != null) {
+                if (context.route_fence != null or context.external_decision_owner != null) return error.InvalidTxnRequest;
+                const native = try self.ensureKernelOwnerSource();
+                try native.applyRestoreTransactionGroupLocal(alloc, group_id, table_name, req, .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation });
+                return;
+            }
+        }
         if (context.route_fence) |fence| if (fence.route.execution == .native_local) {
             if (fence.route.group_id != group_id) return error.TopologyChanged;
             return localRaftBatchGroupRoutedWithCancellation(ptr, alloc, fence, table_name, req, context.cancellation);
@@ -38060,10 +38071,19 @@ fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
         test "data runtime native reset generation two births a real owner under the current recovering Boot" {
+            try qualifyNativeResetBirth(false);
+            try qualifyNativeResetBirth(true);
+        }
+
+        fn qualifyNativeResetBirth(comptime constrained: bool) !void {
             const a = std.testing.allocator;
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const scratch = arena.allocator();
+            const schema = if (constrained)
+                "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"unique_constraints\":[{\"name\":\"rows_pkey\",\"columns\":[\"id\"],\"primary\":true}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"required\":[\"id\"],\"additionalProperties\":false}}}}"
+            else
+                "{}";
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/reset-birth-data", .{tmp.sub_path});
@@ -38081,6 +38101,7 @@ fn consumerTests() type {
             try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(scratch, @import("../metadata/topology_protocol.zig").Activation{ .version = @import("../metadata/topology_protocol.zig").current_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
             const Provider = struct {
                 store: *antfly.metadata.RaftApplyStore,
+                scratch: std.mem.Allocator,
                 withhold_shutdown: bool = false,
                 fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
                     return .{ .metadata_group_id = group, .metadata_incarnation = incarnation, .metrics = .{} };
@@ -38088,8 +38109,15 @@ fn consumerTests() type {
                 fn identity(_: *anyopaque) !antfly.metadata_api.CatalogIdentity {
                     return .{ .metadata_group_id = group, .metadata_incarnation = incarnation };
                 }
-                fn noAdmin(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
-                    return error.UnexpectedUnscopedCatalogRead;
+                fn snapshot(raw: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const bytes = (try self.store.loadStandaloneCatalogSnapshot(self.scratch)) orelse return error.CatalogRoutingUnavailable;
+                    const value = try std.json.parseFromSliceLeaky(@import("../system_catalog/projection.zig").Export, self.scratch, bytes, .{});
+                    return .{ .status = .{ .metadata_group_id = group, .metadata_incarnation = incarnation, .metadata_epoch = value.epoch, .metrics = .{} }, .tables = value.tables, .ranges = value.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+                }
+                fn linearizable(raw: *anyopaque, context: antfly.public_api.operation.RequestContext) !?antfly.metadata_api.AdminSnapshot {
+                    try context.ensureActive();
+                    return try snapshot(raw);
                 }
                 fn freeAdmin(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
                 fn boot(raw: *anyopaque, alloc: std.mem.Allocator, query: boots.Query, _: ?u64) !boots.Observation {
@@ -38101,7 +38129,7 @@ fn consumerTests() type {
                     return parsed.value;
                 }
                 fn catalog(self: *@This()) antfly.public_api.table_catalog.CatalogSource {
-                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = noAdmin, .free_admin_snapshot = freeAdmin, .catalog_identity = identity, .sql_relation_boot = boot } };
+                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = freeAdmin, .catalog_identity = identity, .sql_relation_boot = boot } };
                 }
                 fn system(raw: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
                     const self: *@This() = @ptrCast(@alignCast(raw));
@@ -38130,8 +38158,17 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     return self.store.loadRestoreStagingProgress(alloc, group, id);
                 }
+                fn generation(raw: *anyopaque, _: ?u64, authoritative: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
+                    try std.testing.expect(authoritative);
+                    const current = try snapshot(raw);
+                    return antfly.public_api.table_catalog.RoutingGeneration.create(std.testing.allocator, .{ .metadata_group_id = group, .metadata_incarnation = incarnation, .catalog_revision = current.status.metadata_epoch, .tables = current.tables, .ranges = current.ranges }, .{});
+                }
+                fn noRoutingSnapshot(_: *anyopaque, _: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+                    return error.TestUnexpectedGenericCatalogRead;
+                }
+                fn freeRoutingSnapshot(_: *anyopaque, _: *antfly.metadata_api.CatalogRoutingSnapshot) void {}
                 fn source(self: *@This()) antfly.public_api.http_server.StatusSource {
-                    return .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = system, .get_restore_staging = job, .get_restore_staging_progress = progress } };
+                    return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = snapshot, .free_admin_snapshot = freeAdmin, .linearizable_snapshot = linearizable, .system_catalog = system, .get_restore_staging = job, .get_restore_staging_progress = progress }, .routing = .{ .acquire_generation = generation, .projection = .{ .ptr = self, .snapshot = noRoutingSnapshot, .free_snapshot = freeRoutingSnapshot }, .authority = .{ .ptr = self, .linearizable_snapshot = noRoutingSnapshot } } };
                 }
                 fn open(self: *@This(), alloc: std.mem.Allocator, path: []const u8) DataServer {
                     return DataServer.initFromLocalMetadataSources(alloc, .{ .replica_root_dir = path, .store_registration = .{ .node_id = 9, .store_id = 11, .role = "data" }, .api_server_cfg = .{ .deployment_mode = .standalone } }, self.catalog(), self.source());
@@ -38147,7 +38184,7 @@ fn consumerTests() type {
                     try self.store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = try std.json.Stringify.valueAlloc(alloc, try @import("../metadata/store_root_enrollment.zig").Request.sign(identity_value, root.seed), .{}) });
                 }
             };
-            var provider: Provider = .{ .store = &store };
+            var provider: Provider = .{ .store = &store, .scratch = scratch };
             var old_table: antfly.metadata.TableRecord = undefined;
             var before: @import("../metadata/sql_relation_attestation.zig").SignedBinding = undefined;
             var previous: boots.Record = undefined;
@@ -38170,12 +38207,12 @@ fn consumerTests() type {
                 const ready = try provider.submit(scratch, owner, signing_root, 1, .{ .advance = .{ .expected = claimed.record.?, .after = null } });
                 previous = try ready.requireReady();
                 const persistence: local.common_topology_records.RelationPersistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = instance, .data_generation = 1 };
-                old_table = .{ .table_id = 7, .name = "rows", .schema_json = "{}", .sql_persistence = persistence, .desired_replica_count = 1 };
+                old_table = .{ .table_id = 7, .name = "rows", .schema_json = schema, .sql_persistence = persistence, .desired_replica_count = 1 };
                 const resources = [_]domain.Resource{ .{ .kind = .database, .id = domain.default_database_id, .name = domain.default_database_name }, .{ .kind = .namespace, .id = domain.default_namespace_id, .parent_id = domain.default_database_id, .name = domain.default_namespace_name }, old_binding };
                 try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .tables = &.{old_table}, .ranges = &.{old_range}, .auxiliary_json = "{}", .import_catalog = .{ .revision = 1, .next_id = 42, .resources = &resources } });
                 try owner.admitRelationHost(.{ .node_id = 9, .store_id = 11, .execution_instance = instance, .generation_instance = instance, .data_generation = 1 }, previous.boot());
                 const path = try std.fmt.allocPrint(scratch, "{s}/group-42/table-db", .{replica_root});
-                const old_descriptor: kernel_owner_descriptor.Descriptor = .{ .lsm_root_generation = first.provisioned_storage.groupVisibleRootGenerationSource().visibleRootGenerationForGroup(42), .identity = .{ .table_id = 7, .shard_id = 42, .range_id = 42 }, .schema_json = "{}", .indexes_json = "{}", .table_storage = old_table.storage, .sql_persistence = persistence };
+                const old_descriptor: kernel_owner_descriptor.Descriptor = .{ .lsm_root_generation = first.provisioned_storage.groupVisibleRootGenerationSource().visibleRootGenerationForGroup(42), .identity = .{ .table_id = 7, .shard_id = 42, .range_id = 42 }, .schema_json = schema, .indexes_json = "{}", .table_storage = old_table.storage, .sql_persistence = persistence };
                 const before_initialized = try store.standaloneRevisionState();
                 try first.initializeNativeDescriptor(scratch, group, previous, 42, "rows", path, old_descriptor, null, .{});
                 const after_initialized = try store.standaloneRevisionState();
@@ -38183,7 +38220,7 @@ fn consumerTests() type {
                 try std.testing.expectEqual(before_initialized.projection_revision, after_initialized.projection_revision);
                 before = (try Provider.boot(&provider, scratch, .{ .node = 9, .binding_table = 7 }, null)).initialized.?;
                 try before.verify();
-                {
+                if (!constrained) {
                     // This is actual native-primary user data, committed only
                     // after the durable initialized-image proof was published.
                     var row_owner = try owner.leaseTransitionOwner(42, "rows", old_descriptor);
@@ -38221,7 +38258,7 @@ fn consumerTests() type {
             successor.data_generation = 2;
             successor.generation_instance = instance;
             const target_range: antfly.metadata.RangeRecord = .{ .table_id = 8, .group_id = 43, .range_id = 43, .doc_identity_shard_id = 43, .doc_identity_range_id = 43, .start_key = "" };
-            const target_table: antfly.metadata.TableRecord = .{ .table_id = 8, .name = "rows", .schema_json = "{}", .sql_persistence = successor, .desired_replica_count = 1 };
+            const target_table: antfly.metadata.TableRecord = .{ .table_id = 8, .name = "rows", .schema_json = schema, .sql_persistence = successor, .desired_replica_count = 1 };
             const guard: @import("../metadata/sql_relation_recovery.zig").Guard = .{ .before = before, .source_group_id = 42, .lost_boot_generation = boot.generation, .lost_native_instance = instance, .catalog_revision = (try store.systemCatalogMeta(scratch, group)).revision };
             const target: stages.Target = .{ .source_table_id = 7, .table = target_table, .ranges = &.{target_range}, .catalog_binding = try old_binding.withPhysicalRelationId(8), .empty_generation = true, .native_reset = guard, .replace = .{ .table = old_table, .ranges = &.{old_range} } };
             const plan: stages.Plan = .{ .id = @splat(5), .cohort_digest = @splat(6), .targets = &.{target} };
@@ -38275,8 +38312,100 @@ fn consumerTests() type {
                 defer row_owner.deinit();
                 // The owned status projection is not a user-row read grant.
                 try std.testing.expectError(error.RestoreStagingInProgress, row_owner.lease.entry.owner.lookupJson("rows", "{\"key\":\"old-row\"}"));
+                // Imported scope is still mutable; it cannot attest finalized
+                // emptiness before the real validation/installation sequence.
+                const finalization_lookup = try antfly.public_api.table_reads.encodeStorageKernelLookupRequest(scratch, "", .{ .relational_topology_json = "{\"mode\":\"native_empty_finalization\"}", .restore_staging_scope = scope.digest(), .restore_staging_plan_id = plan.id });
+                try std.testing.expectError(error.RestoreValidationPending, row_owner.lease.entry.owner.lookupJson("rows", finalization_lookup));
             }
+            // Empty-generation BEGIN actually completed import. Preserve its
+            // phase-specific physical receipt before validation changes it.
+            try std.testing.expectEqual(.imported, plain_status.phase);
+            try std.testing.expectEqual(@as(u64, 0), plain_status.rows);
+            const importing = (try store.loadRestoreStagingProgress(scratch, group, plan.id)).?;
+            try store.applyStandaloneCommand(group, .{ .apply_restore_staging = try std.json.Stringify.valueAlloc(scratch, stages.Command{ .id = plan.id, .expected_revision = importing.revision, .action = .imported, .receipt = .{ .group_id = 43, .range_id = 43, .plan_digest = digest, .completion_digest = plain_status.receipt } }, .{}) });
+            try std.testing.expectEqual(.validating, (try store.loadRestoreStagingProgress(scratch, group, plan.id)).?.state);
+            if (constrained) {
+                // The real PK activation uses the private Catalog, native image
+                // and ordinary scoped 2PC. No physical validation ACK is forged.
+                const validation = @import("../api/restore_catalog.zig").ValidationPort{
+                    .status = provider.source(),
+                    .factory = .local(&restarted.read_source, &restarted.write_source),
+                };
+                var actual_job = (try store.loadRestoreStaging(scratch, group, plan.id)).?;
+                defer actual_job.deinit();
+                const context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_s };
+                const session = try validation.prepare(scratch, actual_job.value, context);
+                defer session.deinit();
+                var cursor: @import("../api/restore_catalog.zig").ValidationCursor = .{};
+                var done = false;
+                for (0..32) |_| {
+                    if (try session.step(scratch, &cursor, context)) {
+                        done = true;
+                        break;
+                    }
+                }
+                try std.testing.expect(done);
+                try std.testing.expectEqual(.complete, cursor.phase);
+                try std.testing.expectEqual(.recovering, (try Provider.boot(&provider, scratch, .{ .node = 9 }, null)).record.?.phase);
+            }
+            // Validation's phase-specific physical receipt follows the actual
+            // imported receipt above; no fabricated completion digest/ACK.
+            const validated = try DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, .{ .scope = scope, .action = .validate }, .{ .deadline_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_s });
+            try std.testing.expectEqual(.validated, validated.phase);
+            try std.testing.expectEqual(@as(u64, 0), validated.rows);
+            inline for (.{ @FieldType(stages.Command, "action").validated, .begin_activation }) |action| {
+                const current = (try store.loadRestoreStagingProgress(scratch, group, plan.id)).?;
+                const command: stages.Command = .{
+                    .id = plan.id,
+                    .expected_revision = current.revision,
+                    .action = action,
+                    .receipt = if (action == .begin_activation) null else .{ .group_id = 43, .range_id = 43, .plan_digest = digest, .completion_digest = validated.receipt },
+                };
+                try store.applyStandaloneCommand(group, .{ .apply_restore_staging = try std.json.Stringify.valueAlloc(scratch, command, .{}) });
+            }
+            const activating = (try store.loadRestoreStagingProgress(scratch, group, plan.id)).?;
+            try std.testing.expectEqual(.activating, activating.state);
+            const install = try stages.nativeEmptyInstallForRangeAlloc(scratch, plan, digest, target, target_range);
+            const installed = try DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, .{ .scope = scope, .action = .install_native_empty, .native_execution = successor, .native_empty_install = install }, .{ .deadline_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_s });
+            try std.testing.expectEqualSlices(u8, &try install.digest(), &(installed.native_empty_receipt orelse return error.TestExpectedRealEmptyInstall));
+            const acceptance = installed.native_empty_acceptance orelse return error.TestExpectedRealNativeAcceptance;
+            try acceptance.requireLogical(43, digest, scope.digest(), install, successor, scope.target_namespace);
+            try std.testing.expectEqual(.recovering, (try Provider.boot(&provider, scratch, .{ .node = 9 }, null)).record.?.phase);
             try std.testing.expectEqualDeep(before, (try Provider.boot(&provider, scratch, .{ .node = 9, .binding_table = 7 }, null)).initialized.?);
+            if (constrained) {
+                var hidden = try DataServer.recoverRestoreDescriptor(&restarted, scratch, 43, "rows", scope.digest(), plan.id, .resolve, .{});
+                defer hidden.deinit(scratch);
+                var retained = try owner.leaseTransitionOwner(43, "rows", hidden.descriptor);
+                defer retained.deinit();
+                try std.testing.expect((try retained.lease.entry.owner.nativeRelationBinding(scratch, "rows")).has_transaction_state);
+            }
+            // Publish the actual acceptance, then finish the physical owner.
+            // PK validation leaves a real, resolved ordinary coordinator in
+            // this image; dropping the hidden bootstrap must close that owner
+            // and reopen the public generation rather than strand its cache.
+            inline for (.{ @FieldType(stages.Command, "action").target_admissions_activated, .publish }) |action| {
+                const current = (try store.loadRestoreStagingProgress(scratch, group, plan.id)).?;
+                try store.applyStandaloneCommand(group, .{ .apply_restore_staging = try std.json.Stringify.valueAlloc(scratch, stages.Command{
+                    .id = plan.id,
+                    .expected_revision = current.revision,
+                    .action = action,
+                    .receipt = if (action == .publish) null else .{ .group_id = 43, .range_id = 43, .plan_digest = digest, .completion_digest = try acceptance.digest(), .native_empty_acceptance = acceptance },
+                }, .{}) });
+            }
+            try std.testing.expectEqual(.published, (try store.loadRestoreStagingProgress(scratch, group, plan.id)).?.state);
+            const published = try DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, .{ .scope = scope, .action = .publish }, .{ .deadline_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_s });
+            try std.testing.expectEqual(.published, published.phase);
+            const ready = try provider.submit(scratch, owner, signing_root, 2, .{ .advance = .{ .expected = (try Provider.boot(&provider, scratch, .{ .node = 9 }, null)).record.?, .after = null } });
+            const ready_boot = try ready.requireReady();
+            try owner.admitRelationHost(.{ .node_id = 9, .store_id = 11, .execution_instance = instance, .generation_instance = instance, .data_generation = 2 }, ready_boot.boot());
+            _ = try owner.reconcileServingCatalogAtRoot(43, "rows", .{ .deadline_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_s });
+            const public_descriptor: kernel_owner_descriptor.Descriptor = .{ .lsm_root_generation = restarted.provisioned_storage.groupVisibleRootGenerationSource().visibleRootGenerationForGroup(43), .identity = .{ .table_id = 8, .shard_id = 43, .range_id = 43 }, .schema_json = schema, .indexes_json = "{}", .table_storage = target_table.storage, .sql_persistence = successor };
+            var public_owner = try owner.leaseTransitionOwner(43, "rows", public_descriptor);
+            defer public_owner.deinit();
+            const reopened = try public_owner.lease.entry.owner.nativeRelationBinding(scratch, "rows");
+            try std.testing.expect(reopened.descriptor.eql(successor));
+            try std.testing.expectEqual(initialized.binding.physical_root_incarnation, reopened.physical_root_incarnation);
+            try std.testing.expect(!reopened.has_user_data);
         }
 
         test "data runtime native restore phase two rejoins activating descriptor authority" {

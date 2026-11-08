@@ -336,6 +336,16 @@ pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, bin
         live_captured = captures;
     }
     if (live_normalized.len == 0) return live_normalized;
+    // As in PostgreSQL, an exclusion-backed WITHOUT OVERLAPS declaration
+    // cannot arbitrate DO UPDATE. Normalize proposed values first so input
+    // domain errors retain their ordinary precedence. Never scan interval
+    // owners or turn overlapping ranges into scalar-key update ownership.
+    if (clause.assignments.len != 0) if (clause.constraint_name) |name| {
+        for (table.constraints) |constraint| {
+            if (std.mem.eql(u8, constraint.name, name) and constraint.without_overlaps)
+                return error.WrongConflictConstraintKind;
+        }
+    };
     const owners = if (!physicalArbiter(table, clause)) try (context.backend.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, context.alloc, table, .{ .columns = clause.columns, .expressions = binding.arbiter_expressions, .conditions = binding.arbiter_conditions, .constraint_name = clause.constraint_name }, live_normalized) else null;
     if (owners) |items| if (items.len != live_normalized.len) return error.InvalidSqlBackendResponse;
     if (table.storage_mode == .relational and clause.constraint_name == null and clause.columns.len == 0 and clause.expressions.len == 0) {

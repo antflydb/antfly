@@ -37,6 +37,66 @@ pub const Destination = struct {
         return self.port.execute(a, self.table, self.group, captured, context);
     }
 };
+/// A synchronous producer owns its read completion before any destination seal.
+/// This decorator retains only request-owned callbacks; workers never receive it.
+/// Deferred TEMP and refresh producers use the same finish barrier as eager ones.
+pub const SourceCompletion = struct {
+    owner: *anyopaque,
+    complete: *const fn (*anyopaque) anyerror!void,
+    source: ?catalog.PopulationSource = null,
+    preparation: ?catalog.PopulationPreparation = null,
+    completed: bool = false,
+
+    pub fn bind(self: *@This(), input: @FieldType(catalog.Ddl, "populate")) !@FieldType(catalog.Ddl, "populate") {
+        var out = input;
+        if (input.source) |source| {
+            if (input.preparation != null) return error.InvalidSqlBackendResponse;
+            out.source = self.wrap(source);
+        } else {
+            self.preparation = input.preparation orelse return error.InvalidSqlBackendResponse;
+            out.preparation = .{ .ptr = self, .prepare = prepare, .release = release };
+        }
+        return out;
+    }
+    fn wrap(self: *@This(), source: catalog.PopulationSource) catalog.PopulationSource {
+        self.source = source;
+        var out = source;
+        out.ptr = self;
+        out.next = next;
+        out.finish = finish;
+        return out;
+    }
+    fn prepare(raw: *anyopaque, a: std.mem.Allocator, intent: local.sql_ast.RelationPopulation) !catalog.PopulationSource {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.source != null or self.completed) return error.InvalidSqlBackendResponse;
+        const factory = self.preparation orelse return error.InvalidSqlBackendResponse;
+        return self.wrap(try factory.prepare(factory.ptr, a, intent));
+    }
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.preparation) |factory| factory.release(factory.ptr);
+        self.preparation = null;
+        self.source = null;
+    }
+    fn next(raw: *anyopaque, count: u32) !?[]const contract.Row {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.completed) return error.SourceSnapshotIncomplete;
+        const source = self.source orelse return error.InvalidSqlBackendResponse;
+        return source.next(source.ptr, count);
+    }
+    fn finish(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.completed) return;
+        const source = self.source orelse return error.InvalidSqlBackendResponse;
+        // Original finish must close iterator/read leases before COMMIT. An
+        // unknown completion keeps its exact existing reconciliation custody;
+        // it never authorizes target seal or another producer evaluation.
+        try source.finish(source.ptr);
+        try self.complete(self.owner);
+        self.completed = true;
+    }
+};
+
 pub const Stats = struct { source_rows: u64 = 0, page_requests: u64 = 0, buffer_peak_bytes: usize = 0, seals_started: bool = false };
 pub const Options = struct { buffer_bytes: usize = 8 * 1024 * 1024, stats: ?*Stats = null };
 
@@ -253,6 +313,8 @@ const CohortFixture = struct {
     const count = 16;
     states: [count]struct { cursor: ?contract.Cursor = null, phase: local.storage_db_restore_staging.Phase = .reserved, lose_reply: bool = true } = @splat(.{}),
     destinations: [count]Destination = undefined,
+    completion_required: bool = false,
+    source_completed: bool = false,
     calls: usize = 0,
     producer_calls: usize = 0,
     source_limit: u64 = 4097,
@@ -321,6 +383,7 @@ const CohortFixture = struct {
                         return error.InjectedPopulationReplyLoss;
                     }
                 } else {
+                    if (self.completion_required) try std.testing.expect(self.source_completed);
                     state.cursor = try state.cursor.?.seal(request.population_complete.?);
                     state.phase = .imported;
                 }
@@ -377,4 +440,67 @@ test "restore owner SQL population cohort rejects partial recovery and incomplet
     fixture.ordinal = 0;
     try std.testing.expectError(error.SourceSnapshotIncomplete, deliverCohort(a, &fixture.destinations, fixture.source(), .{}, .{}));
     try std.testing.expectEqual(calls, fixture.producer_calls);
+}
+
+test "restore owner SQL population source completion precedes seals for eager deferred and refresh producers" {
+    const a = std.testing.allocator;
+    const Completion = struct {
+        fixture: *CohortFixture,
+        calls: usize = 0,
+        fail: bool = false,
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(self.fixture.source_limit, self.fixture.ordinal);
+            // Original finish has invalidated the source's borrowed row bytes.
+            try std.testing.expectEqual(@as(u8, 'X'), self.fixture.scratch[0]);
+            for (self.fixture.states) |state| try std.testing.expectEqual(.importing, state.phase);
+            if (self.fail) return error.MetadataMutationOutcomeUnknown;
+            self.fixture.source_completed = true;
+        }
+    };
+    const Factory = struct {
+        fixture: *CohortFixture,
+        calls: usize = 0,
+        releases: usize = 0,
+        fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: local.sql_ast.RelationPopulation) !catalog.PopulationSource {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return self.fixture.source();
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+    };
+    for (0..3) |mode| for ([_]bool{ false, true }) |fail| {
+        var fixture: CohortFixture = .{ .source_limit = 33, .completion_required = true };
+        fixture.init();
+        var completion: Completion = .{ .fixture = &fixture, .fail = fail };
+        var factory: Factory = .{ .fixture = &fixture };
+        var wrapper: SourceCompletion = .{ .owner = &completion, .complete = Completion.finish };
+        // Both delayed TEMP and refresh pass their actual selected intent to
+        // the same retained factory; no query is bound/evaluated twice.
+        const intent: local.sql_ast.RelationPopulation = .{ .operation = if (mode == 2) .refresh_materialized_view else .select_into, .name = .{ .table = "dst" }, .persistence = if (mode == 1) .temporary else .permanent };
+        const bound = try wrapper.bind(.{ .intent = intent, .source = if (mode == 0) fixture.source() else null, .preparation = if (mode != 0) .{ .ptr = &factory, .prepare = Factory.prepare, .release = Factory.release } else null });
+        const source = bound.source orelse try bound.preparation.?.prepare(bound.preparation.?.ptr, a, intent);
+        var stats: Stats = .{};
+        if (fail) {
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, deliverCohort(a, &fixture.destinations, source, .{}, .{ .stats = &stats }));
+            try std.testing.expect(!wrapper.completed and !stats.seals_started);
+            for (fixture.states) |state| try std.testing.expectEqual(.importing, state.phase);
+        } else {
+            const receipts = try deliverCohort(a, &fixture.destinations, source, .{}, .{});
+            a.free(receipts);
+            try std.testing.expect(wrapper.completed);
+            try source.finish(source.ptr);
+            try std.testing.expectEqual(@as(usize, 1), completion.calls);
+        }
+        if (bound.preparation) |prepared| {
+            prepared.release(prepared.ptr);
+            prepared.release(prepared.ptr);
+            try std.testing.expectEqual(@as(usize, 1), factory.calls);
+            try std.testing.expectEqual(@as(usize, 1), factory.releases);
+        }
+    };
 }

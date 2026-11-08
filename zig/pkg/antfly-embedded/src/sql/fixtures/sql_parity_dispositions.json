@@ -5114,6 +5114,27 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-temporal-conflict-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-temporal-key-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-temporal-conflict-postgres": {
+      "command": [
+        "python3",
+        "scripts/generate_sql_temporal_conflict_reference.py",
+        "--check",
+        "zig/pkg/antfly/src/api/fixtures/sql_temporal_conflict_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -32022,8 +32043,20 @@
     },
     {
       "id": "sql-1457",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The historical setup uses PERIOD FOR syntax rejected by PostgreSQL (42601), and the unchanged original mutation contains an invalid UUID (22P02). With a genuine range default and only the invalid UUID corrected, PostgreSQL rejects temporal WITHOUT OVERLAPS DO UPDATE (42809). The mounted native owner preserves that error precedence, authorization, exact row/schema postimages and cold recovery. This closes the original erroneous acceptance expectation; it does not claim temporal DO UPDATE support.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal conflict upsert preserves typed rejection and cold rows",
+          "gate": "sql-temporal-conflict-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal conflict upsert preserves typed rejection and cold rows",
+          "gate": "sql-temporal-conflict-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1458",

@@ -473,6 +473,8 @@ pub const Constraint = struct {
     name: []const u8,
     kind: enum { unique, check, foreign_key },
     deferrable: bool = false,
+    /// Temporal uniqueness is an exclusion arbiter, not a DO UPDATE key.
+    without_overlaps: bool = false,
 
     fn namedConstraint(definition: anytype) bool {
         if (comptime @hasField(@TypeOf(definition), "origin")) return (definition.origin orelse .constraint) != .index;
@@ -496,7 +498,7 @@ pub const Constraint = struct {
                 // distinct. Classify once in this immutable schema view, not
                 // by scanning access indexes or mutable labels per request.
                 if (!namedConstraint(definition)) continue;
-                output[initialized] = .{ .name = try alloc.dupe(u8, definition.name), .kind = kind, .deferrable = if (@hasField(@TypeOf(definition), "deferrable")) definition.deferrable orelse false else false };
+                output[initialized] = .{ .name = try alloc.dupe(u8, definition.name), .kind = kind, .deferrable = if (@hasField(@TypeOf(definition), "deferrable")) definition.deferrable orelse false else false, .without_overlaps = if (@hasField(@TypeOf(definition), "without_overlaps_column")) definition.without_overlaps_column != null else false };
                 initialized += 1;
             };
         }

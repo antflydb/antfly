@@ -345,7 +345,10 @@ pub fn beforeMetadataMutation(server: *Server, backing: A, context: operation.Re
                 return false;
             }
         }
-        const state = try observe(server, a, private, part.spec.table_name, .{ .admission = part.admission });
+        const state = observe(server, a, private, part.spec.table_name, .{ .admission = part.admission }) catch |err| {
+            if (err == error.LockOwnerChanged and try rejoinRetiredEnrollment(server, a, private, selection, scope, part)) return false;
+            return err;
+        };
         if (finishing) {
             if (state.scope == null) {
                 try submit(server, a, private, part.spec.table_name, .{ .admission = part.admission, .operation = .begin });
@@ -360,7 +363,10 @@ pub fn beforeMetadataMutation(server: *Server, backing: A, context: operation.Re
                 return false;
             }
         } else if (state.scope == null or state.scope.?.state != .retired) {
-            try submit(server, a, private, part.spec.table_name, .{ .admission = part.admission, .operation = .close });
+            submit(server, a, private, part.spec.table_name, .{ .admission = part.admission, .operation = .close }) catch |err| {
+                if (err == error.LockOwnerChanged and try rejoinRetiredEnrollment(server, a, private, selection, scope, part)) return false;
+                return err;
+            };
             return false;
         }
         var nonce: [16]u8 = undefined;
@@ -379,6 +385,64 @@ pub fn beforeMetadataMutation(server: *Server, backing: A, context: operation.Re
         return false;
     }
     return true;
+}
+
+/// Foreground cleanup may race the same supervisor's completed retirement.
+/// The retained enrollment body plus the monotone directory prove exactly
+/// which generation left; absence alone never authorizes an ACK or a replay.
+fn confirmsRetiredEnrollment(a: A, cut: authority.Snapshot, previous: authority.scopes.Record, part: authority.scopes.Data.Participant) !bool {
+    const admission = part.admission;
+    const source = admission.source;
+    if (cut.group != source.group or cut.standalone != source.standalone or
+        !std.mem.eql(u8, &cut.incarnation, &source.lease.backend.incarnation)) return false;
+    const current = cut.scope orelse return false;
+    const ns: authority.scopes.ledger.Namespace = .{ .home = .metadata, .group = source.group, .incarnation = cut.incarnation };
+    current.validate(ns) catch return false;
+    previous.validate(ns) catch return false;
+    const retained = cut.participant orelse return false;
+    retained.validate(ns, source.lease.backend) catch return false;
+    var original = source;
+    original.lease.expires_at_ms = previous.registration.lease.expires_at_ms;
+    if (!std.meta.eql(original, previous.registration)) return false;
+    original.lease.expires_at_ms = current.registration.lease.expires_at_ms;
+    if (!std.meta.eql(original, current.registration) or
+        current.registration.lease.expires_at_ms < previous.registration.lease.expires_at_ms) return false;
+    var expected = admission;
+    expected.source.lease.expires_at_ms = retained.admission.source.lease.expires_at_ms;
+    if (!std.meta.eql(expected, retained.admission)) return false;
+    // Enrollment permits an unrelated catalog revision to advance while its
+    // schema, namespace, physical route and native Pin remain unchanged.
+    var previous_spec = part.spec;
+    previous_spec.route.catalog_revision = retained.spec.route.catalog_revision;
+    const previous_bytes = try std.json.Stringify.valueAlloc(a, previous_spec, .{});
+    defer a.free(previous_bytes);
+    const current_bytes = try std.json.Stringify.valueAlloc(a, retained.spec, .{});
+    defer a.free(current_bytes);
+    if (!std.mem.eql(u8, previous_bytes, current_bytes)) return false;
+
+    const before = previous.data orelse return false;
+    const after = current.data orelse return false;
+    if (std.mem.indexOfScalar(u64, &before.slots, admission.generation) == null or
+        after.next_generation < before.next_generation or
+        std.mem.indexOfScalar(u64, &after.slots, admission.generation) != null) return false;
+    const same_command = current.next_command == previous.next_command and std.meta.eql(current.command, previous.command);
+    const next_sequence: ?u64 = std.math.add(u64, previous.next_command, 1) catch null;
+    const completed_command = if (next_sequence) |next|
+        previous.command != null and current.command == null and current.next_command == next and std.meta.eql(current.completed, previous.command)
+    else
+        false;
+    if (!same_command and !completed_command) return false;
+    const transaction = previous.transaction orelse return false;
+    if (!std.mem.eql(u8, &transaction.id, &admission.transaction)) return false;
+    return std.meta.eql(current.transaction, previous.transaction) or
+        (current.transaction == null and std.meta.eql(current.released_transaction, previous.transaction));
+}
+
+fn rejoinRetiredEnrollment(server: *Server, a: A, context: operation.RequestContext, query: authority.Query, previous: authority.scopes.Record, part: authority.scopes.Data.Participant) !bool {
+    const current = try metadataSnapshot(server, a, context, query);
+    // Pending causes the existing caller to reobserve its whole scope before
+    // completing it. This does not invent a native retirement acknowledgement.
+    return confirmsRetiredEnrollment(a, current, previous, part);
 }
 
 fn controlContext(context: operation.RequestContext) operation.RequestContext {
@@ -820,4 +884,88 @@ test "SQL relation lifetime native frozen lock delivery reaches the receiving ow
     try std.testing.expectError(error.TestUnexpectedMetadataAuthorization, authorize(&server, std.testing.allocator, .{}, 72, "rows", probe.expected));
     try std.testing.expectEqual(@as(usize, 1), probe.metadata_reads);
     try std.testing.expectEqual(@as(usize, 2), probe.deliveries);
+}
+
+test "SQL native lock cleanup rejoins only the exact canonically retired enrollment" {
+    const realm: [16]u8 = @splat(0xaa);
+    const registration: authority.scopes.Registration = .{ .group = 1, .lease = .{ .backend = .{ .incarnation = realm, .id = @splat(2), .fence = 1 }, .database = 4, .node = 9, .principal = @splat(6), .expires_at_ms = 60_000 }, .connection = @splat('a'), .nonce = @splat(8), .standalone = false };
+    const admission: @FieldType(native.Command, "admission") = .{
+        .purpose = .execution,
+        .binding = .{ .namespace = .{ .home = .data, .group = 72, .incarnation = realm }, .identity = .{ .table_id = 7, .shard_id = 172, .range_id = 272 } },
+        .source = registration,
+        .transaction = @splat(9),
+        .generation = 1,
+        .parent_command = .{ .sequence = 1, .nonce = @splat(10), .executor = @splat(11) },
+        .serial = 1,
+    };
+    const part: authority.scopes.Data.Participant = .{ .spec = .{ .table_name = "rows", .route = .{ .metadata_group_id = 1, .metadata_incarnation = std.fmt.bytesToHex(realm, .lower), .catalog_revision = 2, .table_id = 7, .topology_epoch = 3, .route = .{ .group_id = 72, .range_id = 272, .identity_namespace = .{ .table_id = 7, .shard_id = 172, .range_id = 272 } } } }, .admission = admission, .command_open = false };
+    var before: authority.scopes.Record = .{ .registration = registration, .data = .{ .next_generation = 2 }, .command = admission.parent_command, .transaction = .{ .id = admission.transaction }, .releasing = true };
+    before.data.?.slots[0] = 1;
+    var after = before;
+    after.data.?.slots[0] = 0;
+    after.transaction = null;
+    after.released_transaction = before.transaction;
+    after.releasing = false;
+    const completed: authority.Snapshot = .{ .group = 1, .incarnation = realm, .standalone = false, .head = 4, .scope = after, .owner = null, .next_work = null, .participant = part };
+    try std.testing.expect(try confirmsRetiredEnrollment(std.testing.allocator, completed, before, part));
+    var changed = completed;
+    changed.scope.?.data.?.slots[0] = 1;
+    try std.testing.expect(!try confirmsRetiredEnrollment(std.testing.allocator, changed, before, part));
+    changed = completed;
+    changed.participant = null;
+    try std.testing.expect(!try confirmsRetiredEnrollment(std.testing.allocator, changed, before, part));
+    changed = completed;
+    changed.participant.?.spec.schema_version = 99;
+    try std.testing.expect(!try confirmsRetiredEnrollment(std.testing.allocator, changed, before, part));
+    changed = completed;
+    changed.participant.?.spec.route.catalog_revision += 1;
+    try std.testing.expect(try confirmsRetiredEnrollment(std.testing.allocator, changed, before, part));
+    changed = completed;
+    changed.scope.?.registration.nonce[0] ^= 1;
+    try std.testing.expect(!try confirmsRetiredEnrollment(std.testing.allocator, changed, before, part));
+    changed = completed;
+    changed.scope.?.released_transaction.?.id[0] ^= 1;
+    try std.testing.expect(!try confirmsRetiredEnrollment(std.testing.allocator, changed, before, part));
+    changed = completed;
+    changed.scope.?.data.?.next_generation = 1;
+    try std.testing.expect(!try confirmsRetiredEnrollment(std.testing.allocator, changed, before, part));
+    changed = completed;
+    changed.incarnation[0] ^= 1;
+    try std.testing.expect(!try confirmsRetiredEnrollment(std.testing.allocator, changed, before, part));
+    changed = completed;
+    changed.scope.?.command = null;
+    changed.scope.?.completed = before.command;
+    changed.scope.?.next_command = 2;
+    try std.testing.expect(try confirmsRetiredEnrollment(std.testing.allocator, changed, before, part));
+    changed.scope.?.command = .{ .sequence = 2, .nonce = @splat(21), .executor = @splat(22) };
+    try std.testing.expect(!try confirmsRetiredEnrollment(std.testing.allocator, changed, before, part));
+
+    // The scheduler moves between directory selection and authorization.
+    // No native Data success or retirement ACK is fabricated: every attempted
+    // metadata mutation is rejected, and the function must return pending.
+    const Probe = struct {
+        before: authority.Snapshot,
+        after: authority.Snapshot,
+        reads: usize = 0,
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return error.TestUnexpectedStatus;
+        }
+        fn catalog(raw: *anyopaque, a: A, _: operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (input != .sql_lock_read) return error.TestUnexpectedMutation;
+            self.reads += 1;
+            var snapshot = if (self.reads <= 2) self.before else self.after;
+            if (input.sql_lock_read.participant == null) snapshot.participant = null;
+            return std.json.Stringify.valueAlloc(a, snapshot, .{});
+        }
+    };
+    var probe: Probe = .{ .before = .{ .group = 1, .incarnation = realm, .standalone = false, .head = 3, .scope = before, .owner = null, .next_work = null, .participant = part }, .after = completed };
+    var server: Server = undefined;
+    server.cfg = .{ .deployment_mode = .standalone };
+    server.source = .{ .ptr = &probe, .vtable = &.{ .status = Probe.status, .system_catalog = Probe.catalog } };
+    server.table_reads = null;
+    server.table_writes = null;
+    const request: authority.Request = .{ .admission = .{ .nonce = @splat(1), .head = 3 }, .incarnation = realm, .standalone = false, .database = 4, .actor = .{ .session_user = .bootstrap, .credential = "" }, .backend = registration.lease.backend, .operation = .close_step };
+    try std.testing.expect(!try beforeMetadataMutation(&server, std.testing.allocator, .{}, request));
+    try std.testing.expectEqual(@as(usize, 4), probe.reads);
 }

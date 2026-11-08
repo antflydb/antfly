@@ -316,7 +316,7 @@ const ImplicitTransaction = struct {
     }
 
     fn finish(self: *ImplicitTransaction) !void {
-        if (self.phase == .dormant) return;
+        if (self.phase == .dormant or self.phase == .done) return;
         std.debug.assert(self.phase == .active);
         try @import("sql_sequence_execution.zig").flush(self.root);
         // Once decision admission starts, errors retain its reconciliation ID.
@@ -351,6 +351,41 @@ const ImplicitTransaction = struct {
             },
             .unknown => return error.SqlTransactionOutcomeUnknown,
         }
+    }
+
+    fn retirePopulationRead(self: *ImplicitTransaction) !void {
+        if (self.phase == .dormant or self.phase == .done) return;
+        if (self.phase != .active or self.mutation) return error.SqlTransactionOutcomeUnknown;
+        const id = self.owned_transaction_id orelse return error.SqlTransactionOutcomeUnknown;
+        if (self.session.transaction_id == null or !std.mem.eql(u8, &self.session.transaction_id.?, &id)) return error.SqlTransactionOutcomeUnknown;
+        // Keep nontransactional sequence state at its existing explicit flush
+        // boundary, before detaching this read-only transaction attachment.
+        try @import("sql_sequence_execution.zig").flush(self.root);
+        const previous_outcome = self.root.outcome_transaction_id;
+        self.root.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
+        self.phase = .deciding;
+        const completed = @import("sql_prepared_coordinator.zig").retirePopulationRead(self.root.server, self.root.identity.*, self.coordinator.context, id) catch |err| {
+            var state = self.root.server.txn_sessions.getSqlState(self.root.server.alloc, id) catch return error.SqlTransactionOutcomeUnknown;
+            defer if (state) |*value| value.deinit(self.root.server.alloc);
+            if (state) |value| if (!value.execution_started and value.terminal == null and !value.terminal_prepare and !value.terminal_abort) {
+                self.phase = .active;
+            };
+            return err;
+        };
+        // Only canonical cancellation + complete native release can detach.
+        // A lost reply retains this exact read purpose and never seals output.
+        if (completed.outcome != .aborted) return error.SqlTransactionOutcomeUnknown;
+        try self.finishRetiredPopulationRead(id, previous_outcome);
+    }
+
+    fn finishRetiredPopulationRead(self: *ImplicitTransaction, id: [16]u8, previous_outcome: ?[32]u8) !void {
+        try rollbackOwnedSession(self.session, id);
+        self.session.transaction_id = null;
+        self.phase = .done;
+        self.completed_outcome = .aborted;
+        // This was internal read custody. The DDL receipt remains the public
+        // outcome; an unknown read above deliberately retains its own ID.
+        self.root.outcome_transaction_id = previous_outcome;
     }
 
     fn abort(self: *ImplicitTransaction) !void {
@@ -657,6 +692,7 @@ pub const Adapter = struct {
     /// Borrowed only while an autocommit read is executing. Bound routines,
     /// operators and casts reach the same provider as direct SQL calls.
     implicit_advisory: ?*ImplicitTransaction = null,
+    population_source_completion: ?*PopulationReadCompletion = null,
     data_lock_owner: ?*@import("sql_table_lock_execution.zig").Owner = null,
     lock_provider: @import("antfly_local_sources").sql_locking.Provider = .{
         .ptr = undefined,
@@ -1470,6 +1506,53 @@ pub const Adapter = struct {
         return if (generation) |version| .{ .generation_set = version, .commands = commands.items } else null;
     }
 
+    const PopulationReadCompletion = struct {
+        root: *Adapter,
+        scope: ?*ImplicitTransaction,
+        eligible: std.atomic.Value(bool),
+
+        fn complete(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const scope = self.scope orelse return;
+            if (self.root.implicit_advisory != scope) return error.SqlTransactionOutcomeUnknown;
+            if (!self.eligible.load(.acquire) or scope.mutation or self.root.active_transaction != null) return;
+            if (scope.phase == .dormant or scope.phase == .done) return;
+            if (scope.phase != .active) return; // existing sealed decision keeps its completion owner
+            const id = scope.owned_transaction_id orelse return error.SqlTransactionOutcomeUnknown;
+            if (scope.session.transaction_id == null or !std.mem.eql(u8, &scope.session.transaction_id.?, &id)) return error.SqlTransactionOutcomeUnknown;
+            const durable = self.root.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+            var state = (try durable.loadInto(self.root.server.alloc, id)) orelse return error.SqlTransactionNotActive;
+            defer state.deinit(self.root.server.alloc);
+            if (!std.mem.eql(u8, &state.txn_id, &id) or !std.meta.eql(state.connection_id, self.root.connection_id)) return error.SqlTransactionOutcomeUnknown;
+            // A lazy table-lock-only read has no row/effect capsule. Never
+            // commit unrelated staged effects early merely because it SELECTed.
+            if (!try populationReadOnly(self.root.server.alloc, state)) return;
+            try scope.retirePopulationRead();
+        }
+    };
+
+    pub fn populationReadOnly(a: std.mem.Allocator, state: @import("transactions.zig").Session) !bool {
+        if (state.staged != null or state.volatile_payload != null or !state.volatile_payload_available or state.commit_execution_started or
+            state.commit_body_digest != null or state.execution_plan != null or state.external_preparation != null or
+            state.external_preparation_prepared or state.terminal_abort or state.terminal_commit != null or state.savepoints.count() != 0) return false;
+        const metadata = state.sql orelse return false;
+        if (metadata.failed or metadata.notifications.commands.items.len != 0 or !std.meta.eql(metadata.search_path_active, metadata.search_path_committed)) return false;
+        // Existing connection baselines are allowed. Compare values, not their
+        // independently owned JSON string/slice addresses.
+        const active = try std.json.Stringify.valueAlloc(a, state.setting_active.items, .{});
+        defer a.free(active);
+        const committed = try std.json.Stringify.valueAlloc(a, state.setting_committed.items, .{});
+        defer a.free(committed);
+        return std.mem.eql(u8, active, committed);
+    }
+
+    /// Actual effect providers call this only when invoked (including through
+    /// routines and untaken syntax is irrelevant). Their original execution
+    /// and outer completion remain unchanged; only early read completion stops.
+    pub fn notePopulationTransactionalEffect(self: *Adapter) void {
+        if (self.population_source_completion) |completion| completion.eligible.store(false, .release);
+    }
+
     fn ddl(ptr: *anyopaque, allocators: catalog.DdlAllocators, input: catalog.Ddl) !catalog.DdlOutcome {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         // Catalog jobs are not transaction participants yet. Never commit
@@ -1483,8 +1566,19 @@ pub const Adapter = struct {
         if (input == .catalog_ddl and input.catalog_ddl.kind == .cast) return @import("sql_cast_ddl.zig").execute(self, allocators, input.catalog_ddl);
         if (input == .catalog_ddl and (input.catalog_ddl.kind == .function or input.catalog_ddl.kind == .procedure or input.catalog_ddl.kind == .operator or input.catalog_ddl.kind == .aggregate))
             return @import("sql_routine_ddl.zig").execute(self, allocators, input.catalog_ddl);
-        if (input == .populate and input.populate.intent.operation == .refresh_materialized_view)
-            return @import("sql_population.zig").executeRefresh(self, allocators, input.populate);
+        if (input == .populate) {
+            if (self.population_source_completion) |outer| outer.eligible.store(false, .release);
+            const scope = self.implicit_advisory;
+            var completion: PopulationReadCompletion = .{ .root = self, .scope = scope, .eligible = .init(self.population_source_completion == null and self.active_transaction == null and (scope == null or scope.?.phase == .dormant)) };
+            const prior = self.population_source_completion;
+            self.population_source_completion = &completion;
+            defer self.population_source_completion = prior;
+            var source: @import("sql_population_delivery.zig").SourceCompletion = .{ .owner = &completion, .complete = PopulationReadCompletion.complete };
+            const bound = try source.bind(input.populate);
+            if (bound.intent.operation == .refresh_materialized_view)
+                return @import("sql_population.zig").executeRefresh(self, allocators, bound);
+            return @import("sql_catalog.zig").executeWithAllocators(self.server, self.identity.*, self.context, self.database, self.namespace, allocators, .{ .populate = bound }, self.ddl_search_path);
+        }
         return @import("sql_catalog.zig").executeWithAllocators(self.server, self.identity.*, self.context, self.database, self.namespace, allocators, input, self.ddl_search_path);
     }
 
@@ -3298,6 +3392,7 @@ pub const Adapter = struct {
         if (table.materialized_view_id != null) return error.MaterializedViewReadOnly;
         if (table.read_authority != null) return error.Forbidden;
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        if (raw_input.len != 0) self.notePopulationTransactionalEffect();
         try self.verify(alloc, table);
         try self.requireUnprotectedMutation(alloc, table);
         // Normalize final images before enforcing ingress row filters, even
@@ -3767,14 +3862,16 @@ test "SQL implicit lock cleanup preserves uncertain receipts and never contradic
         failed_requests: usize = 0,
         failure: ?anyerror = null,
         rollback_failure: bool = false,
+        aborted_inspection: bool = false,
         outcome: sql.CommitOutcome = .committed,
         commits: usize = 0,
         rollbacks: usize = 0,
         fn begin(_: *anyopaque, _: sql.Scope, _: sql.Begin) !sql.Transaction {
             return error.TestUnexpectedAuthorityAccess;
         }
-        fn inspect(_: *anyopaque, _: sql.Scope, id: sql.Id) !sql.Transaction {
-            return .{ .id = id, .state = .active, .isolation = .read_committed, .mode = .read_write };
+        fn inspect(raw: *anyopaque, _: sql.Scope, id: sql.Id) !sql.Transaction {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .id = id, .state = if (self.aborted_inspection) .aborted else .active, .isolation = .read_committed, .mode = .read_write };
         }
         fn commit(raw: *anyopaque, _: sql.Scope, id: sql.Id) !sql.CommitResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -3850,6 +3947,9 @@ test "SQL implicit lock cleanup preserves uncertain receipts and never contradic
     try std.testing.expectEqual(@as(?sql.Id, null), session.transaction_id);
     try std.testing.expectEqual(@as(?[32]u8, null), root.outcome_transaction_id);
     try std.testing.expectEqual(.done, scope.phase);
+    const already_completed = fake.commits;
+    try scope.finish();
+    try std.testing.expectEqual(already_completed, fake.commits);
     try std.testing.expectEqual(@as(usize, 1), fake.rollbacks);
     fake.rollbacks = 0;
     coordinator.context = context;
@@ -3918,6 +4018,34 @@ test "SQL implicit lock cleanup preserves uncertain receipts and never contradic
     // A real sequence owner with dirty state and a missing native transaction
     // would fail its flush. Unknown outcomes must not call it or replace their
     // distinct receipt; known failures must still attempt sequence persistence.
+    // A canceled internal source is a known ABORT, not the DDL outcome.
+    // Detach its exact owned ID before suppressing it; never emit a second
+    // decision or clear the actual read ID after a failed detach reply.
+    coordinator.context = .{};
+    root.context = .{};
+    fake.rollback_failure = false;
+    fake.aborted_inspection = true;
+    const commits_before_read = fake.commits;
+    const parent_receipt = std.fmt.bytesToHex(@as(sql.Id, @splat(0x73)), .lower);
+    for ([_]?([32]u8){ null, parent_receipt }) |previous_outcome| {
+        session.transaction_id = id;
+        scope.phase = .deciding;
+        root.outcome_transaction_id = receipt;
+        try scope.finishRetiredPopulationRead(id, previous_outcome);
+        try std.testing.expectEqual(previous_outcome, root.outcome_transaction_id);
+        try std.testing.expect(session.transaction_id == null and scope.phase == .done);
+        try std.testing.expectEqual(sql.CommitOutcome.aborted, scope.completed_outcome.?);
+        try scope.finish();
+        try std.testing.expectEqual(commits_before_read, fake.commits);
+    }
+    fake.rollback_failure = true;
+    session.transaction_id = id;
+    scope.phase = .deciding;
+    root.outcome_transaction_id = receipt;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, scope.finishRetiredPopulationRead(id, null));
+    try std.testing.expectEqual(@as(?sql.Id, id), session.transaction_id);
+    try std.testing.expectEqual(.deciding, scope.phase);
+    try std.testing.expectEqualSlices(u8, &receipt, &root.outcome_transaction_id.?);
     var sequence_state: @import("antfly_local_sources").sql_sequence_session.State = .{ .dirty = true };
     defer sequence_state.deinit(std.testing.allocator);
     const sequence_owner = try std.testing.allocator.create(@import("sql_sequence_execution.zig").Owner);
@@ -6240,4 +6368,42 @@ test "privacy SQL effect target and typed preparation reject before preimages or
     try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.prepareMutationsWithVisibility(&adapter, a, table, &.{}, false));
     try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.prepareMutations(&adapter, a, table, &.{}));
     try std.testing.expectEqual(@as(usize, 3), fake.captures);
+}
+
+test "SQL implicit lock cleanup population read completion excludes demanded and retained transaction effects" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var state: @import("transactions.zig").Session = .{ .txn_id = @splat(1), .owner_node_id = 0, .begin_timestamp = 1, .last_touched_timestamp = 1, .sync_level = .write, .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } };
+    try std.testing.expect(try Adapter.populationReadOnly(a, state));
+    state.staged = .{};
+    try std.testing.expect(!try Adapter.populationReadOnly(a, state));
+    state.staged = null;
+    state.commit_execution_started = true;
+    try std.testing.expect(!try Adapter.populationReadOnly(a, state));
+    state.commit_execution_started = false;
+    state.external_preparation = @constCast("sealed-owner");
+    try std.testing.expect(!try Adapter.populationReadOnly(a, state));
+    state.external_preparation = null;
+    try state.sql.?.notifications.commands.append(scratch, .unlisten_all);
+    try std.testing.expect(!try Adapter.populationReadOnly(a, state));
+    state.sql.?.notifications.commands.clearRetainingCapacity();
+    const baseline: setting_catalog.OverlayEntry = .{ .identity = .{ .id = 7, .generation = 2 }, .value = .{ .string = "captured-value" } };
+    try state.setting_active.append(scratch, baseline);
+    var copied = baseline;
+    copied.value.string = try scratch.dupe(u8, baseline.value.string);
+    try state.setting_committed.append(scratch, copied);
+    try std.testing.expect(try Adapter.populationReadOnly(a, state));
+    state.setting_active.items[0].value.string = "changed";
+    try std.testing.expect(!try Adapter.populationReadOnly(a, state));
+    var root: Adapter = undefined;
+    root.population_source_completion = null;
+    // A requested effect outside population keeps all existing behavior.
+    root.notePopulationTransactionalEffect();
+    var owner: Adapter.PopulationReadCompletion = .{ .root = &root, .scope = null, .eligible = .init(true) };
+    root.population_source_completion = &owner;
+    try std.testing.expect(owner.eligible.load(.acquire));
+    root.notePopulationTransactionalEffect();
+    try std.testing.expect(!owner.eligible.load(.acquire));
 }

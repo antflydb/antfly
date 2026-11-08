@@ -833,11 +833,19 @@ pub fn lowerAssignmentWithLimits(alloc: std.mem.Allocator, schema: Json, express
         defer program.deinit();
         return finishAssignment(alloc, try lowerProgramPolicy(alloc, &program, columns, if (generated) .generation else .column_default, limits), column);
     }
-    if (expression.* == .literal) return @import("ddl_runtime.zig").defaultExpression(alloc, expression.literal, column.type, column.element_type);
-    const lowered = (if (generated)
-        lowerTypedPolicy(alloc, schema, expression, column.type, .generation, limits)
+    // Unknown SQL strings acquire their declared range/UUID input domain.
+    // The primitive JSON literal path loses the typed range Datum. Reuse the
+    // same contextual assignment cast and immutable lowering as row writes.
+    const contextual = if (expression.* == .literal and expression.literal == .string and
+        (column.type == .uuid or @import("range_value.zig").kindFromType(column.type) != null))
+        try scalar.assignmentExpression(alloc, expression, .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier })
     else
-        lowerColumnsPolicy(alloc, &.{}, expression, column.type, .column_default, limits)) catch |err| switch (err) {
+        expression;
+    if (contextual.* == .literal) return @import("ddl_runtime.zig").defaultExpression(alloc, contextual.literal, column.type, column.element_type);
+    const lowered = (if (generated)
+        lowerTypedPolicy(alloc, schema, contextual, column.type, .generation, limits)
+    else
+        lowerColumnsPolicy(alloc, &.{}, contextual, column.type, .column_default, limits)) catch |err| switch (err) {
         error.UnknownColumn => return error.UndefinedColumn,
         else => return err,
     };
@@ -1720,4 +1728,30 @@ test "SQL schema expression nullable catalog binding cleans up allocation faults
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL contextual range and UUID defaults retain their typed immutable input domains" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try json(a, .{});
+    for ([_]struct { input: []const u8, kind: ast.ColumnType, canonical: []const u8 }{
+        .{ .input = "[5,15)", .kind = .numrange, .canonical = "[5,15)" },
+        .{ .input = "[2026-01-01,2026-01-04)", .kind = .daterange, .canonical = "[2026-01-01,2026-01-04)" },
+        .{ .input = "empty", .kind = .tsrange, .canonical = "empty" },
+        .{ .input = "empty", .kind = .tstzrange, .canonical = "empty" },
+        .{ .input = "A0EEBC999C0B4EF8BB6D6BB9BD380A11", .kind = .uuid, .canonical = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" },
+    }) |entry| {
+        const expression: ast.Scalar = .{ .literal = .{ .string = entry.input } };
+        const lowered = try lowerAssignment(a, schema, &expression, .{ .name = "value", .type = entry.kind }, false);
+        try std.testing.expectEqualStrings("literal", lowered.object.get("op").?.string);
+        try std.testing.expectEqualStrings(if (entry.kind == .uuid) "string" else @tagName(entry.kind), lowered.object.get("type").?.string);
+        try std.testing.expectEqualStrings(entry.canonical, lowered.object.get("value").?.string);
+        // Durable bytes, not a borrowed Datum, own the admitted default.
+        const bytes = try std.json.Stringify.valueAlloc(a, lowered, .{});
+        const reopened = try std.json.parseFromSliceLeaky(Json, a, bytes, .{});
+        try std.testing.expectEqualStrings(entry.canonical, reopened.object.get("value").?.string);
+    }
+    const malformed: ast.Scalar = .{ .literal = .{ .string = "not-a-range" } };
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, lowerAssignment(a, schema, &malformed, .{ .name = "value", .type = .numrange }, false));
 }
