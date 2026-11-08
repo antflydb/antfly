@@ -49,6 +49,7 @@ pub fn CaptureSession(comptime Txn: type) type {
         request: @import("enrichment/enrichment_types.zig").GeneratedEnrichmentRequest,
         authority: publication.Authority,
         generation: u64,
+        effect_protocol: u16,
 
         pub fn capture(self: @This(), alloc: std.mem.Allocator, scope: []const u8) !Input {
             return captureMember(alloc, self.txn, self.request, self.authority, self.generation, scope);
@@ -75,7 +76,7 @@ pub fn captureSession(alloc: std.mem.Allocator, txn: anytype, request: @import("
         !std.mem.eql(u8, &binding.digest, &authority.catalog_digest) or
         !std.mem.eql(u8, &ordered.value.command.namespace, &authority.namespace) or
         !std.mem.eql(u8, &catalogs.digest(), &binding.digest) or !plan.matchesArtifactInventory(catalogs)) return error.ArtifactCatalogDrift;
-    return .{ .txn = txn, .request = request, .authority = authority, .generation = generation };
+    return .{ .txn = txn, .request = request, .authority = authority, .generation = generation, .effect_protocol = binding.effect_protocol };
 }
 
 fn captureMember(alloc: std.mem.Allocator, txn: anytype, request: @import("enrichment/enrichment_types.zig").GeneratedEnrichmentRequest, authority: publication.Authority, generation: u64, scope: []const u8) !Input {

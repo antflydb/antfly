@@ -79,6 +79,17 @@ pub const Context = struct {
         try self.ensure();
         try statusToError(abi.antfly_storage_context_configure_secrets(self.handle, store));
     }
+    /// Node-level default inference endpoint and unresolved credential
+    /// reference for storage-owned enrichment.
+    pub fn configureInferenceDefaults(self: *Context, api_url: ?[]const u8, api_key: ?[]const u8) !void {
+        try self.ensure();
+        try statusToError(abi.antfly_storage_context_configure_inference_defaults(
+            self.handle,
+            .fromSlice(api_url orelse ""),
+            .fromSlice(api_key orelse ""),
+        ));
+    }
+
     pub fn configureNativeQueries(self: *Context, setup: []const u8) !void {
         try self.ensure();
         try statusToError(abi.antfly_storage_context_configure_native_queries(self.handle, .fromSlice(setup)));

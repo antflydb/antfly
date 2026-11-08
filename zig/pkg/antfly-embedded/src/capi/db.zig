@@ -646,6 +646,7 @@ pub fn refreshLiteManagedEmbeddingRuntimeForDatabase(handle: *Handle, database: 
         provider,
         null,
         null,
+        null,
         "",
         null,
         null,

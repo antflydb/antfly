@@ -41,6 +41,7 @@ pub const OpenOptions = struct {
     pub fn open(self: OpenOptions, alloc: std.mem.Allocator, source: binding.Binding) !stores.OpenedObjectStore {
         try source.validateSupported();
         if (self.resolver) |resolver| return resolver.open_fn(resolver.ptr, alloc, source);
+        if (comptime @import("builtin").os.tag == .freestanding) return error.ExternalLakeCredentialRefNotFound;
         if (source.credential_ref != null) return error.ExternalLakeCredentialRefNotFound;
         return stores.OpenedObjectStore.initRemoteUriWithOptions(alloc, source.source_uri, self.file_bucket, .{ .ensure_bucket = false });
     }

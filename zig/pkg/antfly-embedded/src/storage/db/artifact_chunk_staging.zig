@@ -102,7 +102,7 @@ pub const Control = struct {
         // Collecting unselected private rows cannot change a sealed logical
         // source cut. Appends still obey the producer admission fence.
         if (self.command.mode != .prune_chunks) {
-            if (try @import("artifact_producer_obligations.zig").load(txn)) |obligations| if (obligations.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
+            if (try @import("artifact_producer_obligations.zig").loadMetadata(txn)) |obligations| if (obligations.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
         }
         if (self.command.mode == .append_chunks and self.append == null) {
             _ = try self.plan.begin(txn);

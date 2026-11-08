@@ -596,6 +596,10 @@ pub const ServingSource = struct {
     }
     fn openCachedMode(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache, lazy: bool, navigation: ?SnapshotNavigation) !ServingSource {
         try context.ensureActive();
+        // Native cache scopes bind credential identity below. Hosted callers
+        // keep decode state private and may cache immutable bytes in the host,
+        // where physical bucket bindings can be scoped explicitly.
+        if (comptime @import("builtin").os.tag == .freestanding) if (cache != null) return error.UnsupportedHostedLakeCache;
         const binding = (schema.external_base_source orelse return error.InvalidExternalTableBinding).binding;
         const identity_version = options.row_identity_version orelse binding.row_identity_version;
         var store = try options.open(alloc, binding);
@@ -1179,6 +1183,15 @@ pub const ServingSource = struct {
     }
 
     fn cacheScope(alloc: std.mem.Allocator, store: object_store_support.OpenedObjectStore, binding: @import("../external_source/catalog_binding.zig").Binding) ![32]u8 {
+        if (comptime @import("builtin").os.tag == .freestanding) {
+            // Hosted sources use invocation-private caches. The binding resolver
+            // admits the physical client; native credential SDKs are absent.
+            const bytes = try std.json.Stringify.valueAlloc(alloc, .{ binding, store.bucket, store.prefix }, .{});
+            defer alloc.free(bytes);
+            var scope: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &scope, .{});
+            return scope;
+        }
         const scope_bytes = try std.json.Stringify.valueAlloc(alloc, .{
             .credentials = binding.credential_ref,
             .source_id = binding.table_id,

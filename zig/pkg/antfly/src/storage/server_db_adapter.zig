@@ -48,7 +48,13 @@ pub fn applyOrdered(
     // admission, transform expansion, and derived-payload construction.
     // batchInternal repeats this check under the mutation lock, which is
     // the correctness fence if another caller advances the marker here.
-    if (try db.orderedMutationAlreadyApplied(identity)) {
+    const already_applied = db.orderedMutationAlreadyApplied(identity) catch |err| switch (err) {
+        // WriterLocked is the stable storage ABI identity. Normalize only at
+        // the Raft owner boundary, where the committed entry can be retried.
+        error.WriterLocked => return error.RaftApplyWriterUnavailable,
+        else => return err,
+    };
+    if (already_applied) {
         // Admission commits its write fence before sealing the immutable
         // pin. A crash in that window must repair the exact pending cut
         // before this outer replay fast path acknowledges the entry.
@@ -75,7 +81,7 @@ pub fn applyOrdered(
         try db.reconcileReplicatedArtifactAdmission(req, identity);
     };
     db.applyOrderedCommittedMutation(apply_req, identity, !mirror_scoped_restore) catch |err| switch (err) {
-        error.GraphMaintenanceInProgress => return error.RaftApplyWriterUnavailable,
+        error.GraphMaintenanceInProgress, error.WriterLocked => return error.RaftApplyWriterUnavailable,
         else => return err,
     };
 }

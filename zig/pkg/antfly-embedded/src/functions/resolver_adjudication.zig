@@ -21,8 +21,10 @@ const policy = @import("antfly_resolver").adjudication;
 pub fn validate(a: std.mem.Allocator, raw: []const u8) !void {
     const parsed = try policy.Config.parse(a, raw);
     defer parsed.deinit();
-    const specification = try parsed.value.producerSpecification(a);
-    defer a.free(specification);
+    // Generated and cascade specifications clone the decider while lowering.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const specification = try parsed.value.producerSpecification(arena.allocator());
     const validated = @import("materialization.zig").parse(a, specification) catch |err|
         return if (err == error.OutOfMemory) err else error.InvalidAdjudicationConfig;
     defer validated.deinit();
@@ -78,7 +80,7 @@ pub fn executeBatch(a: std.mem.Allocator, producer: @import("../storage/db/enric
     var scoped = context;
     const now = @import("antfly_platform").time.monotonicNs();
     for (inputs, requests, 0..) |*input, request, i| {
-        const deadline = now + @as(u64, request.timeout_ms) * std.time.ns_per_ms;
+        const deadline = try request.deadline(now);
         scoped.deadline_ns = if (scoped.deadline_ns) |caller| @min(caller, deadline) else deadline;
         input.* = .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint, .item_id = try std.fmt.allocPrint(a, "{d}", .{i}) };
     }
@@ -97,6 +99,59 @@ pub fn modelRevision(a: std.mem.Allocator, producer: @import("../storage/db/enri
     var scoped = context;
     const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, timeout_ms) * std.time.ns_per_ms;
     scoped.deadline_ns = if (context.deadline_ns) |caller| @min(caller, deadline) else deadline;
-    const capabilities = (try producer.withInvocationContext(scoped).capabilitiesForRequests(a, &.{.{ .producer_type = .decision, .config_json = specification, .source_text = "" }})) orelse return null;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    // Ordinary producer specs need no extra prompt/schema parse. Escaped keys
+    // still take the parsed path for the discovery-only envelope.
+    const envelope: std.json.Value = if (std.mem.indexOf(u8, specification, "decision_revision_probe") != null or std.mem.indexOfScalar(u8, specification, '\\') != null)
+        try std.json.parseFromSliceLeaky(std.json.Value, scratch, specification, .{})
+    else
+        .null;
+    var require_revision = false;
+    if (envelope == .object) if (envelope.object.get("decision_revision_probe")) |raw| {
+        _ = try policy.Config.parseRevisionRequest(scratch, raw);
+        // Keep the original Decisions route intact. The producer adapter owns
+        // linked-vs-HTTP routing, alias verification and credential scope.
+        require_revision = true;
+    };
+    const capabilities = (try producer.withInvocationContext(scoped).capabilitiesForRequests(a, &.{.{ .producer_type = .decision, .config_json = specification, .source_text = "" }})) orelse {
+        if (require_revision) return error.CapabilityDiscoveryUnavailable;
+        return null;
+    };
+    if (require_revision and capabilities.model_revision == null) return error.CapabilityDiscoveryUnavailable;
     return capabilities.model_revision;
+}
+
+test "resolver adjudication validates cascade deciders through the frozen decision contract" {
+    const a = std.testing.allocator;
+    const valid =
+        \\{"decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"jev"}},{"name":"strong","decider":{"provider":"antfly","model":"fixture"},"when":{"question":"same","choice":"same","probability_between":[0.3,0.9]}}]}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
+    ;
+    try validate(a, valid);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    // Stage configs are complete deciders; a missing model is rejected.
+    const invalid_stage = try std.mem.replaceOwned(u8, scratch, valid, "{\"provider\":\"antfly\",\"model\":\"fixture\"}", "{\"provider\":\"antfly\"}");
+    try std.testing.expectError(error.InvalidAdjudicationConfig, validate(a, invalid_stage));
+    // A cascade owns no transport of its own.
+    const transport = try std.mem.replaceOwned(u8, scratch, valid, "\"decision_method\":\"cascade\",", "\"decision_method\":\"cascade\",\"model\":\"m\",");
+    try std.testing.expectError(error.InvalidAdjudicationConfig, validate(a, transport));
+    // Provenance identity follows the cascade definition, not its credentials.
+    const materialization = @import("materialization.zig");
+    const hash = struct {
+        fn of(alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
+            const parsed = try policy.Config.parse(alloc, raw);
+            defer parsed.deinit();
+            const spec = try materialization.parse(alloc, try parsed.value.producerSpecification(alloc));
+            defer spec.deinit();
+            return (try materialization.provenance(alloc, spec.value, null)).object.get("specification_hash").?.string;
+        }
+    }.of;
+    const base = try hash(scratch, valid);
+    const rebanded = try hash(scratch, try std.mem.replaceOwned(u8, scratch, valid, "[0.3,0.9]", "[0.2,0.9]"));
+    const keyed = try hash(scratch, try std.mem.replaceOwned(u8, scratch, valid, "{\"provider\":\"jev\"}", "{\"provider\":\"jev\",\"api_key\":\"k\"}"));
+    try std.testing.expect(!std.mem.eql(u8, base, rebanded));
+    try std.testing.expectEqualStrings(base, keyed);
 }

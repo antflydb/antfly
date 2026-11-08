@@ -25,6 +25,10 @@ pub const State = struct {
     sequence: u64,
     complete: bool = false,
     next_ms: u64 = 0,
+    // A completed warm cut is an optional hint, not a reader lease. Its expiry
+    // does not justify recapturing unchanged content. The digest includes the
+    // owner epoch so a reopened writer warms again even at the same sequence.
+    source_digest: ?[32]u8 = null,
 };
 
 /// Local progress is an optional hint, never a retained-generation authority.

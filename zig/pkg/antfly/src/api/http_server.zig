@@ -1625,6 +1625,11 @@ test "session maintenance activation follows current range leadership without fo
 }
 
 pub const ApiHttpServerConfig = struct {
+    /// Optional query-role distributed SQL service; scoped by authenticated capabilities.
+    distributed_sql: ?@import("../serverless/sql/runtime.zig").Factory = null,
+    sql_deployment: ?@import("../serverless/sql/deployment.zig").Config = null,
+    distributed_sql_scope_seed: ?[64]u8 = null,
+    distributed_sql_join: ?@import("antfly_local_sources").sql_catalog.DistributedJoin = null,
     /// Node-local personal connection owner; never populated by distributed configuration.
     chatgpt: ?*@import("antfly_local_sources").chatgpt_manager.Manager = null,
     pgwire: ?common_config.Config.PgwireConfig = null,
@@ -1674,6 +1679,8 @@ pub const ApiHttpServerConfig = struct {
     /// grant. Distributed runtimes explicitly clear this when their distinct
     /// trusted authority is unconfigured; internal RPC identity is not a substitute.
     catalog_publication_authority_available: bool = true,
+    /// Only the metadata leader and standalone local authority advance scans.
+    privacy_scan_coordinator: bool = false,
     /// Dedicated node-to-node signing identity. Distributed runtimes validate
     /// both values before opening a listener; they must never share the public
     /// trusted-principal signing domain.
@@ -1720,6 +1727,9 @@ pub const ApiHttpServerConfig = struct {
     /// Loaded node config, used by /connections to enumerate configured
     /// providers and object stores. Must outlive the server.
     node_config: ?*const common_config.Config = null,
+    /// Lite storage cannot publish the directory snapshot behind a retained
+    /// native cut, so its ordered first pages read live state instead.
+    native_retained_cuts: bool = true,
     /// Borrowed engine-owned local durability root for standalone/embedded
     /// native lake artifacts. Distributed serving requires storage.artifacts.
     native_lake_artifact_base_dir: ?[]const u8 = null,
@@ -2032,6 +2042,10 @@ pub const StatusSource = struct {
         tracks_sql_submission: bool = false,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 = null,
 
+        privacy_mutation: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, ?[]const u8, bool, api_operation.RequestContext) anyerror!@import("privacy.zig").Response = null,
+        privacy_authority_term: ?*const fn (*anyopaque) anyerror!?u64 = null,
+        privacy_work: ?*const fn (*anyopaque, std.mem.Allocator, i64) anyerror!?metadata_table_manager.PrivacyWork = null,
+        table_record: ?*const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?metadata_table_manager.TableRecord = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         /// Complete catalog and store capabilities without detailed inventories.
@@ -2107,6 +2121,27 @@ pub const StatusSource = struct {
 
     /// The shared public data-admission boundary. Ownership is captured with
     /// catalog identity, so every HTTP/MCP/SQL resolver gets the same decision.
+    pub fn forwardPrivacyMutation(self: StatusSource, a: std.mem.Allocator, table: []const u8, body: []const u8, if_match: ?[]const u8, scan: bool, request: api_operation.RequestContext) !?@import("privacy.zig").Response {
+        const call = self.vtable.privacy_mutation orelse return null;
+        return try BoundaryAbi.call("privacy_mutation", self.boundary_dispatch, call, .{ self.ptr, a, table, body, if_match, scan, request });
+    }
+
+    pub fn privacyAuthorityTerm(self: StatusSource) !?u64 {
+        const call = self.vtable.privacy_authority_term orelse return null;
+        return BoundaryAbi.call("privacy_authority_term", self.boundary_dispatch, call, .{self.ptr});
+    }
+    pub fn nextPrivacyWork(self: StatusSource, a: std.mem.Allocator, now: i64) !?metadata_table_manager.PrivacyWork {
+        const call = self.vtable.privacy_work orelse return null;
+        return BoundaryAbi.call("privacy_work", self.boundary_dispatch, call, .{ self.ptr, a, now });
+    }
+    pub fn tableRecord(self: StatusSource, a: std.mem.Allocator, name: []const u8) !?metadata_table_manager.TableRecord {
+        if (self.vtable.table_record) |call| return BoundaryAbi.call("table_record", self.boundary_dispatch, call, .{ self.ptr, a, name });
+        var snapshot = (try self.adminSnapshot()) orelse return null;
+        defer self.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, name) orelse return null;
+        return try metadata_table_manager.cloneTable(a, table.*);
+    }
+
     pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         switch (input) {
             .native_memory_create => |request| {
@@ -2759,6 +2794,16 @@ pub const StatusSource = struct {
                 });
             }
 
+            fn privacyAuthorityTerm(ptr: *anyopaque) anyerror!?u64 {
+                return cast(ptr).privacyAuthorityTerm();
+            }
+            fn nextPrivacyWork(ptr: *anyopaque, a: std.mem.Allocator, now: i64) anyerror!?metadata_table_manager.PrivacyWork {
+                return cast(ptr).nextPrivacyWork(a, now);
+            }
+            fn tableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) anyerror!?metadata_table_manager.TableRecord {
+                return cast(ptr).tableRecord(a, name);
+            }
+
             fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) anyerror!void {
                 return try cast(ptr).waitForTableProjection(table_name, .{
                     .schema_json = schema_json,
@@ -2861,6 +2906,9 @@ pub const StatusSource = struct {
             .put_artifact_enrichment = Gen.putArtifactEnrichment,
             .delete_artifact_enrichment = Gen.deleteArtifactEnrichment,
             .wait_table_lifecycle = Gen.waitTableLifecycle,
+            .privacy_authority_term = if (@hasDecl(T, "privacyAuthorityTerm")) Gen.privacyAuthorityTerm else null,
+            .privacy_work = if (@hasDecl(T, "nextPrivacyWork")) Gen.nextPrivacyWork else null,
+            .table_record = if (@hasDecl(T, "tableRecord")) Gen.tableRecord else null,
             .wait_table_projection = Gen.waitTableProjection,
             .run_round = Gen.runRound,
             .get_join_shuffle_lease = Gen.getJoinShuffleLease,
@@ -3421,21 +3469,21 @@ fn replaceTableDefinitionOnService(
     expected: metadata_table_manager.TableRecord,
     replacement: metadata_table_manager.TableRecord,
 ) !void {
-    try validateTableDefinitionReplacementOnService(svc, expected, replacement);
+    const progress_only = try validateTableDefinitionReplacementOnService(svc, expected, replacement);
     try svc.replaceTableDefinition(expected, replacement);
-    runPostCommitMutationRound(svc, "replace_table_definition_legacy");
+    if (!progress_only) runPostCommitMutationRound(svc, "replace_table_definition_legacy");
 }
 
 fn validateTableDefinitionReplacementOnService(
     svc: anytype,
     expected: metadata_table_manager.TableRecord,
     replacement: metadata_table_manager.TableRecord,
-) !void {
+) !bool {
     try metadata_service.ensureCoordinatedDecoderWithContext(svc, .{ .compare_and_replace_table = .{ .expected = expected, .replacement = replacement } }, .{});
+    if (try metadata_service.admitPrivacyProgressOnService(svc, expected, replacement)) return true;
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
-    const current = tables_api.findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
-    if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+    try metadata_service.validateCurrentTableDefinitionOnService(svc, &snapshot, expected, replacement);
     try metadata_table_manager.validateObjectTableMutation(std.heap.page_allocator, expected, replacement);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(std.heap.page_allocator, replacement.indexes_json);
     try managed_embedder.validateEmbeddingProducerOwnershipJson(std.heap.page_allocator, replacement.indexes_json);
@@ -3445,6 +3493,7 @@ fn validateTableDefinitionReplacementOnService(
         expected,
         replacement,
     )) return error.ExtensionOwnedObject;
+    return false;
 }
 
 fn replaceTableDefinitionOnServiceStamped(
@@ -3452,9 +3501,9 @@ fn replaceTableDefinitionOnServiceStamped(
     expected: metadata_table_manager.TableRecord,
     replacement: metadata_table_manager.TableRecord,
 ) !metadata_api.CatalogMutationStamp {
-    try validateTableDefinitionReplacementOnService(svc, expected, replacement);
+    const progress_only = try validateTableDefinitionReplacementOnService(svc, expected, replacement);
     const stamp = try svc.replaceTableDefinitionStamped(expected, replacement);
-    runPostCommitMutationRound(svc, "replace_table_definition");
+    if (!progress_only) runPostCommitMutationRound(svc, "replace_table_definition");
     return stamp;
 }
 
@@ -4088,6 +4137,8 @@ pub const ApiHttpServer = struct {
     native_query_gc_after: ?[]u8 = null,
     native_query_gc_collection: ?*@import("native_query_repository.zig").Repository.CollectionState = null,
     native_query_gc_pending: std.atomic.Value(bool) = .init(false),
+    lake_query_gc_pending: std.atomic.Value(bool) = .init(false),
+    lake_query_gc_round_pending: bool = false,
     lake_gc_store_index: usize = 0,
     lake_gc_token: ?[16]u8 = null,
     lake_gc_token_table: u64 = 0,
@@ -4095,6 +4146,8 @@ pub const ApiHttpServer = struct {
     backup_maintenance_owner_id: u64 = 0,
     index_installation_owner_id: u64 = 0,
     index_installation_closing: std.atomic.Value(bool) = .init(false),
+    privacy_scan_in_flight: std.atomic.Value(bool) = .init(false),
+    privacy_checkpoint_gc: @import("privacy_checkpoints.zig").GC = .{},
     index_installation_worker_in_flight: std.atomic.Value(bool) = .init(false),
     index_installation_mutex: std.atomic.Mutex = .unlocked,
     index_installation_apply_mutex: std.atomic.Mutex = .unlocked,
@@ -4122,6 +4175,7 @@ pub const ApiHttpServer = struct {
     /// parameter state; every execution still binds against its own snapshot.
     sql_plan_cache: sql_plan_cache.Cache,
     sql_schema_cache: sql_schema_cache.Cache,
+    owned_sql_deployment: ?*@import("../serverless/sql/deployment.zig").Owned = null,
     lake_read_cache: @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache,
     // A persistent worker must not consume the last request executor slot or
     // inherit the single-threaded provider fallback. Allocate at a stable
@@ -4140,6 +4194,7 @@ pub const ApiHttpServer = struct {
     lake_search_metadata: @import("lake_index_search_metadata.zig").Cache = .{},
     lake_text_corpora: @import("lake_index_native_text_cache.zig").Cache = .{},
     lake_navigation_warming: @import("lake_index_navigation_warming.zig").Cache = .{},
+    lake_query_admission: @import("lake_query_gc.zig").AdmissionCache = .{},
     pgwire_listener: ?*@import("sql_pgwire.zig").Listener = null,
     embedding_provider_runtime: managed_embedder.ProviderRuntime,
     incoming_graph_routes: distributed_graph.IncomingSourceGroupCache,
@@ -4629,6 +4684,22 @@ pub const ApiHttpServer = struct {
             return error.ArtifactIndexSourcesTemporarilyUnavailable;
     }
 
+    pub fn ensurePrivacyAdmission(self: *ApiHttpServer, request: api_operation.RequestContext) !void {
+        const reads = self.table_reads orelse return error.PrivacyProtectiveInstallationRequired;
+        if (reads.vtable.privacy_policy_version == null or self.cfg.deployment_mode == .serverless) return error.PrivacyProtectiveInstallationRequired;
+        if (self.cfg.deployment_mode != .distributed) return;
+        if (self.cfg.internal_service_secret == null) return error.PrivacyInternalAuthRequired;
+        var snapshot = (try self.source.linearizableSnapshot(request)) orelse return error.PrivacyProtocolUpgradeRequired;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        var found = false;
+        for (snapshot.stores) |store| {
+            if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
+            found = true;
+            if (!metadata_table_manager.privacyProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return error.PrivacyProtocolUpgradeRequired;
+        }
+        if (!found) return error.PrivacyProtocolUpgradeRequired;
+    }
+
     fn loadClusterStatusWithSnapshot(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -4873,6 +4944,7 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.restore_job_store.attach(opened);
         }
+        try server.initializeDistributedSql();
         return server;
     }
 
@@ -4892,6 +4964,17 @@ pub const ApiHttpServer = struct {
         self.foreign_registry = registry;
         self.cfg.foreign_registry = registry;
         return registry;
+    }
+
+    /// Construct inside the API kernel after its config crosses the ABI. No
+    /// SQL planner callbacks or allocator vtables cross a codegen boundary.
+    pub fn initializeDistributedSql(self: *ApiHttpServer) !void {
+        if (self.owned_sql_deployment != null) return;
+        const config = self.cfg.sql_deployment orelse return;
+        try @import("internal_service_auth.zig").validateCredentialIsolation(config.authentication.secret, self.cfg.trusted_principal_secret);
+        const owned = try @import("../serverless/sql/deployment.zig").Owned.init(self.alloc, self.embedding_provider_runtime.io, config, .api_only, self.cfg.node_config, self.cfg.secret_store, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
+        self.owned_sql_deployment = owned;
+        owned.attachApi(self);
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
@@ -4970,6 +5053,7 @@ pub const ApiHttpServer = struct {
             state.deinit();
             self.alloc.destroy(state);
         }
+        if (self.owned_sql_deployment) |owned| owned.deinit();
         self.lake_search_metadata.deinit();
         self.lake_reader_leases.deinit(self.embedding_provider_runtime.io);
         self.lake_read_cache.deinit();
@@ -5540,6 +5624,9 @@ pub const ApiHttpServer = struct {
         // to retry admission.
         self.resumeNativeLakeIndexPublication() catch |err| {
             std.log.warn("failed to resume native lake index publication err={s}", .{@errorName(err)});
+        };
+        self.schedulePrivacyScans() catch |err| {
+            std.log.warn("privacy scan admission deferred err={s}", .{@errorName(err)});
         };
         self.ensurePendingIndexInstallationWorker() catch |err| {
             std.log.warn("failed to resume pending index installation reconciliation err={s}", .{@errorName(err)});
@@ -6532,6 +6619,25 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    fn lakeArtifactCollectionIntervalMs(self: *const ApiHttpServer, configured: u64) u64 {
+        return if (self.native_query_gc_pending.load(.acquire) or self.lake_query_gc_pending.load(.acquire)) @min(@as(u64, 50), configured) else configured;
+    }
+
+    fn observeLakeQueryCollection(self: *ApiHttpServer, result: @import("lake_query_gc.zig").Result) void {
+        // Carry productive debt across the whole metadata round. An empty
+        // neighbor must not slow a busy table, and failed/stalled I/O must not
+        // cause a hot retry loop. Every fast turn still advances other tables.
+        if (result.more and result.progressed and !result.failed) {
+            self.lake_query_gc_round_pending = true;
+            self.lake_query_gc_pending.store(true, .release);
+        }
+    }
+
+    fn finishLakeQueryCollectionRound(self: *ApiHttpServer) void {
+        self.lake_query_gc_pending.store(self.lake_query_gc_round_pending, .release);
+        self.lake_query_gc_round_pending = false;
+    }
+
     fn scheduleLakeArtifactCollection(self: *ApiHttpServer) !void {
         if (!self.cfg.lake_artifact_gc_enabled or self.lake_gc_closing.load(.acquire) or self.source.lakeIndexLifecycleAuthority(.{}) == null) return;
         const config = self.cfg.node_config orelse return;
@@ -6540,7 +6646,7 @@ pub const ApiHttpServer = struct {
         if (runtime.threaded_jobs == null or self.lake_gc_owner_id == 0) return;
         const now = platform_time.monotonicNs();
         const previous = self.lake_gc_last_schedule_ns.load(.acquire);
-        const interval_ms = if (self.native_query_gc_pending.load(.acquire)) @min(@as(u64, 50), config.lake_indexes.artifact_gc.interval_ms) else config.lake_indexes.artifact_gc.interval_ms;
+        const interval_ms = self.lakeArtifactCollectionIntervalMs(config.lake_indexes.artifact_gc.interval_ms);
         if (previous != 0 and now -| previous < interval_ms * std.time.ns_per_ms) return;
         if (self.lake_gc_last_schedule_ns.cmpxchgStrong(previous, now, .acq_rel, .acquire) != null) return;
         if (self.lake_gc_in_flight.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
@@ -6556,6 +6662,50 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    /// Register before any query artifact/job publication. The bounded memo
+    /// avoids a metadata read/write on the hot path for the next hour; the
+    /// durable horizon survives this process, the logical table, and rotation.
+    pub fn retainLakeQueryStore(self: *ApiHttpServer, a: std.mem.Allocator, store: *@import("lake_index_store.zig").Store, table: u64, request: api_operation.RequestContext) !void {
+        const gc = @import("lake_query_gc.zig");
+        const now = platform_time.realtimeNs() / std.time.ns_per_ms;
+        if (self.lake_query_admission.contains(table, store.identity, now)) return;
+        var context = request;
+        context.setting_admin = true;
+        const authority = self.source.lakeIndexLifecycleAuthority(context) orelse return error.ExternalLakeIndexUnavailable;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const state = try authority.readState(arena.allocator(), table);
+        const needed = now +| gc.horizon_ms;
+        var until: u64 = 0;
+        for (state.stores) |binding| if (std.mem.eql(u8, &binding.identity, &store.identity)) {
+            until = binding.query_until_ms;
+        };
+        if (until < now +| gc.horizon_ms - gc.renew_ms) {
+            try authority.apply(table, .{ .retain_query_store = .{ .binding = .{ .identity = store.identity, .locator = store.locator }, .until_ms = needed } });
+            until = needed;
+        }
+        self.lake_query_admission.remember(table, store.identity, @min(now +| gc.renew_ms, until -| gc.renew_ms));
+    }
+
+    fn queryGcBudget(self: *ApiHttpServer, request: api_operation.RequestContext) @import("lake_query_gc.zig").Budget {
+        const config = self.cfg.node_config.?;
+        const options = self.cfg.lake_artifact_gc_options;
+        return .{
+            .deletes = if (options) |v| v.max_deleted else config.lake_indexes.artifact_gc.max_deleted,
+            .reads = if (options) |v| v.max_read_bytes else config.lake_indexes.artifact_gc.max_read_bytes,
+            .work = if (options) |v| v.max_marked else config.lake_indexes.artifact_gc.max_marked,
+            .deadline_ns = @min(request.deadline_ns orelse std.math.maxInt(u64), platform_time.monotonicNs() +| 5 * std.time.ns_per_s),
+            .cancellation = request.cancellation,
+        };
+    }
+    fn collectExpiredLakeQueryArtifacts(self: *ApiHttpServer, a: std.mem.Allocator, store: *@import("lake_index_store.zig").Store, table: u64, now: u64, request: api_operation.RequestContext) !void {
+        const config = self.cfg.node_config orelse return;
+        if (config.lake_indexes.artifact_gc.dry_run or (if (self.cfg.lake_artifact_gc_options) |v| v.dry_run else false)) return;
+        var budget = self.queryGcBudget(request);
+        _ = @import("lake_query_gc.zig").collect(a, store, 0, 0, now, &budget);
+        if (table != 0) _ = @import("lake_query_gc.zig").collect(a, store, table, 0, now, &budget);
+    }
+
     /// Exactly one bounded metadata work item and artifact-store pass. DROP
     /// tombstones remain enumerable; collection never depends on live tables.
     /// The scheduling owner serializes this cursor and drains it on shutdown.
@@ -6563,6 +6713,8 @@ pub const ApiHttpServer = struct {
         if (!self.mutationBackgroundExecutionPermitted()) {
             if (self.native_query_gc_collection) |state| state.deinit();
             self.native_query_gc_pending.store(false, .release);
+            self.lake_query_gc_pending.store(false, .release);
+            self.lake_query_gc_round_pending = false;
             return;
         }
         const config = self.cfg.node_config orelse return;
@@ -6572,9 +6724,11 @@ pub const ApiHttpServer = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        if (config.lake_indexes.artifact_gc.dry_run) {
+        if (config.lake_indexes.artifact_gc.dry_run or (if (self.cfg.lake_artifact_gc_options) |v| v.dry_run else false)) {
             if (self.native_query_gc_collection) |state| state.deinit();
             self.native_query_gc_pending.store(false, .release);
+            self.lake_query_gc_pending.store(false, .release);
+            self.lake_query_gc_round_pending = false;
         } else {
             var repository = try @import("native_query_repository.zig").Repository.init(a, config, self.cfg.secret_store, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
             defer repository.deinit();
@@ -6589,13 +6743,14 @@ pub const ApiHttpServer = struct {
             }
             const state = self.native_query_gc_collection.?;
             defer self.native_query_gc_pending.store(state.hasPending(), .release);
-            const next = try repository.collectNextWithState(self.alloc, state, self.native_query_gc_after, platform_time.realtimeNs() / std.time.ns_per_ms, @min(128, config.lake_indexes.artifact_gc.max_deleted), control.token());
+            const next = try repository.collectNextWithState(self.alloc, state, self.native_query_gc_after, platform_time.realtimeNs() / std.time.ns_per_ms, @min(128, if (self.cfg.lake_artifact_gc_options) |v| v.max_deleted else config.lake_indexes.artifact_gc.max_deleted), control.token());
             if (self.native_query_gc_after) |value| self.alloc.free(value);
             self.native_query_gc_after = next;
         }
         const bytes = try self.source.systemCatalog(a, request, .{ .lake_index_lifecycle_work = self.lake_gc_after });
         const page = try std.json.parseFromSliceLeaky(@import("../metadata/lake_index_lifecycle.zig").WorkPage, a, bytes, .{ .allocate = .alloc_always });
         const item = page.item orelse {
+            self.finishLakeQueryCollectionRound();
             self.lake_gc_after = null;
             self.lake_gc_store_index = 0;
             return;
@@ -6606,8 +6761,8 @@ pub const ApiHttpServer = struct {
             self.lake_gc_store_index = 0;
             self.lake_gc_token = null;
         };
-        if (item.state.namespace == null or item.state.stores.len == 0) return;
-        const binding = if (item.state.collection) |collection| find: {
+        if (item.state.stores.len == 0) return;
+        var binding = if (item.state.collection) |collection| find: {
             for (item.state.stores) |store| if (std.mem.eql(u8, &store.identity, &collection.store)) break :find store;
             return error.LakeIndexCollectionStoreMismatch;
         } else item.state.stores[self.lake_gc_store_index % item.state.stores.len];
@@ -6624,9 +6779,52 @@ pub const ApiHttpServer = struct {
         }
         var store = try @import("lake_index_store.zig").Store.openRetainedNative(a, config, self.cfg.secret_store, binding.locator, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
         defer store.deinit();
-        if (!config.lake_indexes.artifact_gc.dry_run) {
-            var sql_artifacts = store.artifactStore();
-            _ = try @import("lake_sql_retained_cut.zig").collectBounded(&sql_artifacts, item.table_id, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), platform_time.realtimeNs() / std.time.ns_per_ms, @min(128, config.lake_indexes.artifact_gc.max_deleted), cancel);
+        var budget = self.queryGcBudget(request);
+        if (!config.lake_indexes.artifact_gc.dry_run and !(if (self.cfg.lake_artifact_gc_options) |v| v.dry_run else false)) {
+            const now = platform_time.realtimeNs() / std.time.ns_per_ms;
+            // Admit legacy stores before the first sweep, including ones with
+            // only future-expiry artifacts. The horizon replaces expensive
+            // live-prefix probes and is never renewed by cleanup itself.
+            if (binding.query_gc_receipt == null) {
+                if (item.table_id != 0) try self.retainLakeQueryStore(a, &store, 0, request);
+                if (binding.query_until_ms == 0) {
+                    binding.query_until_ms = now +| @import("lake_query_gc.zig").horizon_ms;
+                    try authority.apply(item.table_id, .{ .retain_query_store = .{ .binding = binding, .until_ms = binding.query_until_ms } });
+                }
+            }
+            const page_result: @import("lake_query_gc.zig").Result = if (binding.query_until_ms == 0)
+                .{}
+            else if (binding.query_gc_phase == 5 and item.state.namespace != null)
+                .{ .more = true, .progressed = true }
+            else
+                @import("lake_query_gc.zig").collect(a, &store, item.table_id, binding.query_gc_phase % 5, now, &budget);
+            self.observeLakeQueryCollection(page_result);
+            if (binding.query_until_ms != 0) {
+                const release = now > binding.query_until_ms and !page_result.more and !page_result.retained and !page_result.failed;
+                if (release or page_result.more or page_result.failed or binding.query_gc_receipt == null) {
+                    var receipt: [16]u8 = undefined;
+                    try self.embedding_provider_runtime.io.randomSecure(&receipt);
+                    try authority.apply(item.table_id, .{ .query_gc_progress = .{ .store = binding.identity, .observed_until_ms = binding.query_until_ms, .phase = (binding.query_gc_phase + 1) % 6, .release = release, .now_ms = now, .token = receipt } });
+                }
+            }
+            // Auxiliary corruption/provider failures never block index GC.
+            // The witness above keeps every failed category discoverable.
+        }
+        const current_state = try authority.readState(a, item.table_id);
+        if (item.state.namespace == null or budget.deletes == 0 or budget.work == 0 or budget.reads == 0) {
+            for (current_state.stores, 0..) |remaining, index| if (std.mem.eql(u8, &remaining.identity, &binding.identity)) {
+                self.lake_gc_store_index = index + 1;
+                break;
+            };
+            advance = self.lake_gc_store_index >= current_state.stores.len;
+            return;
+        }
+        const still_bound = for (current_state.stores) |current| {
+            if (std.mem.eql(u8, &current.identity, &binding.identity)) break true;
+        } else false;
+        if (!still_bound) {
+            advance = self.lake_gc_store_index >= current_state.stores.len;
+            return;
         }
         var collector: @import("lake_index_gc.zig").Collector = .{
             .a = a,
@@ -6635,13 +6833,13 @@ pub const ApiHttpServer = struct {
             .store = store.artifactStore(),
             .identity = binding.identity,
             .token = self.lake_gc_token.?,
-            .options = self.cfg.lake_artifact_gc_options orelse .{
-                .dry_run = config.lake_indexes.artifact_gc.dry_run,
-                .max_deleted = config.lake_indexes.artifact_gc.max_deleted,
-                .max_marked = config.lake_indexes.artifact_gc.max_marked,
-                .max_read_bytes = config.lake_indexes.artifact_gc.max_read_bytes,
+            .options = .{
+                .dry_run = config.lake_indexes.artifact_gc.dry_run or (if (self.cfg.lake_artifact_gc_options) |v| v.dry_run else false),
+                .max_deleted = budget.deletes,
+                .max_marked = budget.work,
+                .max_read_bytes = budget.reads,
             },
-            .context = .{ .io = self.embedding_provider_runtime.io, .deadline_ns = request.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(cancel.ptr, cancel.is_cancelled_fn) },
+            .context = .{ .io = self.embedding_provider_runtime.io, .deadline_ns = budget.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(cancel.ptr, cancel.is_cancelled_fn) },
         };
         const result = try collector.run();
         if (result.eligible != 0 or !result.complete) std.log.info("lake artifact collection table_id={d} dry_run={} marked={d} eligible={d} deleted={d} complete={}", .{ item.table_id, collector.options.dry_run, result.marked, result.eligible, result.deleted, result.complete });
@@ -10431,10 +10629,7 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) !?metadata_table_manager.TableRecord {
-        var snapshot = (try self.source.adminSnapshot()) orelse return null;
-        defer self.source.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-        return try metadata_table_manager.cloneTable(alloc, table.*);
+        return self.source.tableRecord(alloc, table_name);
     }
 
     pub fn docMatchesRowFilter(
@@ -13240,14 +13435,21 @@ pub const ApiHttpServer = struct {
         defer if (previous_definition) |definition| metadata_table_manager.freeTable(self.alloc, definition);
         var definition_publication: RestoreDefinitionPublication = undefined;
         var publication_hook: ?backups_api.RestorePublicationHook = null;
+        var replacement_indexes: ?[]u8 = null;
+        defer if (replacement_indexes) |value| self.alloc.free(value);
         if (replace_existing) {
             previous_definition = (try self.loadOwnedTableRecord(self.alloc, table_name)) orelse return error.TableNotFound;
-            if (!try tableDefinitionMatchesManifest(self.alloc, previous_definition.?, &manifest)) {
+            // Keep authenticated source bytes for storage validation. Only the
+            // destination definition loses source-owned operational checkpoints.
+            replacement_indexes = try @import("antfly_local_sources").privacy_catalog.prepareRestore(self.alloc, manifest.indexes_json);
+            var destination_manifest = manifest;
+            destination_manifest.indexes_json = replacement_indexes.?;
+            if (!try tableDefinitionMatchesManifest(self.alloc, previous_definition.?, &destination_manifest)) {
                 var replacement = previous_definition.?;
                 replacement.description = manifest.description;
                 replacement.schema_json = manifest.schema_json;
                 replacement.read_schema_json = "";
-                replacement.indexes_json = manifest.indexes_json;
+                replacement.indexes_json = replacement_indexes.?;
                 replacement.replication_sources_json = manifest.replication_sources_json;
                 replacement.restore_backup_id = "";
                 replacement.restore_location = "";
@@ -15852,7 +16054,9 @@ pub const ApiHttpServer = struct {
             const context: api_operation.RequestContext = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none };
             if (try self.queryTableDefinition(resolver.arena, resolver, table_name, context)) |table| {
                 const external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(resolver.arena, table.schema_json);
-                if (external == null and table.storage.engine != .object) {
+                if (external == null and table.storage.engine != .object and !self.cfg.native_retained_cuts) {
+                    query_req.req.response_live_read = true;
+                } else if (external == null and table.storage.engine != .object) {
                     var store = try @import("lake_index_store.zig").Store.openNative(resolver.arena, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
                     var capture = (try self.source.linearizableSnapshot(context)) orelse return error.CatalogGenerationChanged;
@@ -15913,7 +16117,7 @@ pub const ApiHttpServer = struct {
             // happen to be present.
             error.InvalidArgument => return error.InvalidQueryRequest,
             else => return err,
-        }) orelse error.TableNotFound;
+        }) orelse return error.TableNotFound;
     }
 
     const CatalogGraphReadContext = struct {
@@ -16989,6 +17193,34 @@ pub const ApiHttpServer = struct {
         }) catch |err| return err;
     }
 
+    pub fn schedulePrivacyScans(self: *ApiHttpServer) !void {
+        if (self.cfg.deployment_mode != .standalone and !self.cfg.privacy_scan_coordinator) return;
+        if (!self.cfg.catalog_publication_authority_available or self.index_installation_closing.load(.acquire)) return;
+        const runtime = self.cfg.backend_runtime orelse return;
+        if (runtime.threaded_jobs == null or self.index_installation_owner_id == 0) return;
+        if (self.privacy_scan_in_flight.swap(true, .acq_rel)) return;
+        errdefer self.privacy_scan_in_flight.store(false, .release);
+        const Work = struct {
+            server: *ApiHttpServer,
+            fn run(ptr: *anyopaque) !void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                defer work.server.privacy_scan_in_flight.store(false, .release);
+                if (work.server.index_installation_closing.load(.acquire)) return;
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer arena.deinit();
+                try @import("privacy.zig").advanceOnce(work.server, arena.allocator());
+            }
+            fn deinit(ptr: *anyopaque) void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                std.heap.page_allocator.destroy(work);
+            }
+        };
+        const work = try std.heap.page_allocator.create(Work);
+        errdefer std.heap.page_allocator.destroy(work);
+        work.* = .{ .server = self };
+        try runtime.durable_jobs.submit(.{ .owner_id = self.index_installation_owner_id, .class = .maintenance, .ptr = work, .run = Work.run, .deinit = Work.deinit });
+    }
+
     fn ensurePendingIndexInstallationWorker(self: *ApiHttpServer) !void {
         const runtime = self.cfg.backend_runtime orelse return;
         if (runtime.threaded_jobs == null or self.index_installation_owner_id == 0) return;
@@ -17289,6 +17521,7 @@ pub const ApiHttpServer = struct {
         };
         var store = try @import("lake_index_store.zig").Store.openNative(a, config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
         defer store.deinit();
+        try self.retainLakeQueryStore(a, &store, table.table_id, .{ .deadline_ns = context.deadline_ns, .cancellation = cancel });
         @import("lake_recent_vectors.zig").collect(&store, table.table_id, context) catch |err| {
             std.log.warn("native recent vector collection deferred table={s} err={s}", .{ table.name, @errorName(err) });
         };
@@ -18091,9 +18324,13 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecutePutArtifactEnrichmentError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
-        const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
+        const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=load_table table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            return metadataAccessFailure(err);
+        }) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
-        const enrichment_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch {
+        const enrichment_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=request table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
             return error.InvalidEnrichmentRequest;
         };
         defer alloc.free(enrichment_json);
@@ -18108,17 +18345,23 @@ pub const ApiHttpServer = struct {
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
             },
-        ) catch |err| switch (err) {
-            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
-            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
-            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
-            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
-            else => return error.InternalFailure,
+        ) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=producer table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+                error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+                error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+                error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+                else => return error.InternalFailure,
+            }
         };
 
-        const assembled_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| switch (err) {
-            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
-            else => return error.InternalFailure,
+        const assembled_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=assemble_table table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
+                else => return error.InternalFailure,
+            }
         };
         defer alloc.free(assembled_indexes_json);
         const expected_indexes_json = table_index_config.normalizeAdmittedManagedEmbeddingIndexDimensionsJsonWithOptions(
@@ -18132,18 +18375,22 @@ pub const ApiHttpServer = struct {
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
             },
-        ) catch |err| switch (err) {
-            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
-            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
-            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
-            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
-            error.ModelNotFound => return error.ModelNotFound,
-            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
-            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
-            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
-            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
-            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
-            else => return error.InvalidEnrichmentRequest,
+        ) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=normalize_table_embeddings table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+                error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+                error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+                error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+                error.ModelNotFound => return error.ModelNotFound,
+                error.AmbiguousModelIdentifier => return error.AmbiguousModelIdentifier,
+                error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+                error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+                error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+                error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+                error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+                else => return error.InvalidEnrichmentRequest,
+            }
         };
         defer alloc.free(expected_indexes_json);
         table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
@@ -18157,23 +18404,30 @@ pub const ApiHttpServer = struct {
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
             },
-        ) catch |err| switch (err) {
-            error.InvalidCreateTableRequest, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
-            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
-            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
-            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
-            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
-            error.ModelNotFound => return error.ModelNotFound,
-            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
-            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
-            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
-            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
-            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
-            else => return error.InternalFailure,
+        ) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=validate_table_runtime table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.InvalidCreateTableRequest, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+                error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+                error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+                error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+                error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+                error.ModelNotFound => return error.ModelNotFound,
+                error.AmbiguousModelIdentifier => return error.AmbiguousModelIdentifier,
+                error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+                error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+                error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+                error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+                error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+                else => return error.InternalFailure,
+            }
         };
-        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
-            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
-            else => return error.InternalFailure,
+        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=validate_table_artifacts table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+                else => return error.InternalFailure,
+            }
         };
 
         try ensureTableOperationActive(request);
@@ -18191,6 +18445,7 @@ pub const ApiHttpServer = struct {
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
+            error.AmbiguousModelIdentifier => return error.AmbiguousModelIdentifier,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
             error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
@@ -18198,19 +18453,19 @@ pub const ApiHttpServer = struct {
             error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-                std.log.err("public artifact enrichment metadata update failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                std.log.err("public artifact enrichment metadata update failed table={s} artifact={s} err={} request_id={s}", .{ table_name, artifact_name, err, request.request_id });
                 return error.InternalFailure;
             },
         };
         self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
             if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-            std.log.err("public artifact enrichment metadata projection wait failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+            std.log.err("public artifact enrichment metadata projection wait failed table={s} artifact={s} err={} request_id={s}", .{ table_name, artifact_name, err, request.request_id });
             return error.InternalFailure;
         };
         if (self.table_writes) |table_writes_source| {
             _ = table_writes_source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
                 else => {
-                    std.log.err("public artifact enrichment local apply failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                    std.log.err("public artifact enrichment local apply failed table={s} artifact={s} err={} request_id={s}", .{ table_name, artifact_name, err, request.request_id });
                     _ = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |reconcile_err| {
                         std.log.warn("public artifact enrichment structural reconcile enqueue failed table={s} artifact={s} err={}", .{ table_name, artifact_name, reconcile_err });
                     };
@@ -23073,6 +23328,7 @@ pub const ApiHttpServer = struct {
                     try checkpoint(raw);
                     var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
+                    try runner.server.retainLakeQueryStore(a, &store, 0, .{ .cancellation = if (runner.cancellation) |v| v.token() else .none });
                     var artifacts = store.artifactStore();
                     return @import("lake_retained_cut.zig").saveCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), runner.server.embedding_provider_runtime.io, bytes, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| cancel.token() else .none);
                 }
@@ -24609,6 +24865,9 @@ pub const ApiHttpServer = struct {
     /// not O(retained history). It retries transient dispatch failures without
     /// requiring another client request.
     pub fn pollRestoreJobsOnce(self: *ApiHttpServer) !void {
+        // The metadata supervisor invokes this only on its current leader.
+        // Data coordinators have privacy_scan_coordinator disabled.
+        try self.schedulePrivacyScans();
         if (self.cfg.restore_owner_progress_generation) |generation| {
             const current = generation.load(.acquire);
             if (self.observed_restore_owner_progress_generation.swap(current, .acq_rel) != current) {
@@ -60164,6 +60423,61 @@ test "resolver curation HTTP remote owner calls retain deadlines and cancellatio
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
 }
 
+test "external lake idle maintenance collects retained cursors and expired jobs without requests" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const retained = @import("lake_retained_cut.zig");
+    const envelope = @import("lake_generation_envelope.zig");
+    var directory = try TestDirectory.init("idle-lake-query-gc");
+    defer directory.cleanup();
+    var config = try common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    var store = try @import("lake_index_store.zig").Store.openNative(a, &config, null, false, .standalone, directory.path());
+    defer store.deinit();
+    var artifacts = store.artifactStore();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const now = platform_time.realtimeNs() / std.time.ns_per_ms;
+    const after_expiry = now + retained.max_ttl_ms + 30_001;
+    const identity = try @import("native_retained_cut.zig").storeIdentity(a, store.locator);
+    const old = try retained.saveCursor(scratch, &artifacts, identity, io, "{\"sources\":[]}", now, .none);
+    const fresh = try retained.saveCursor(scratch, &artifacts, identity, io, "{\"sources\":[]}", now + 60_000, .none);
+    const old_id = try envelope.artifactId("source2:", old);
+    const fresh_id = try envelope.artifactId("source2:", fresh);
+    var client = store.opened.client;
+    for ([_][]const u8{ "recent-search", "row-enrichment" }) |kind| {
+        const key = try std.fmt.allocPrint(scratch, "{s}{s}{s}/7/expired.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", kind });
+        var saved = try client.putObject(store.opened.bucket, key, "{\"expires_ms\":1}", .{});
+        saved.deinit(client.allocator);
+        const active_key = try std.fmt.allocPrint(scratch, "{s}{s}{s}/7/active.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", kind });
+        const active_bytes = try std.json.Stringify.valueAlloc(scratch, .{ .expires_ms = @as(u64, 1), .lease_until_ms = after_expiry + 60_000 }, .{});
+        var active = try client.putObject(store.opened.bucket, active_key, active_bytes, .{});
+        active.deinit(client.allocator);
+    }
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .deployment_mode = .standalone, .lake_artifact_gc_enabled = false }, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status } }, null, null);
+    defer server.deinit();
+    config.lake_indexes.artifact_gc.dry_run = true;
+    try server.collectExpiredLakeQueryArtifacts(scratch, &store, 7, after_expiry, .{});
+    a.free(try artifacts.getAlloc(old_id));
+    config.lake_indexes.artifact_gc.dry_run = false;
+    try server.collectExpiredLakeQueryArtifacts(scratch, &store, 7, after_expiry, .{});
+    try std.testing.expectError(error.FileNotFound, artifacts.getAlloc(old_id));
+    a.free(try artifacts.getAlloc(fresh_id));
+    for ([_][]const u8{ "recent-search", "row-enrichment" }) |kind| {
+        const key = try std.fmt.allocPrint(scratch, "{s}{s}{s}/7/expired.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", kind });
+        try std.testing.expectError(error.FileNotFound, client.getObject(store.opened.bucket, key, .{}));
+        const active_key = try std.fmt.allocPrint(scratch, "{s}{s}{s}/7/active.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", kind });
+        var active = try client.getObject(store.opened.bucket, active_key, .{});
+        active.deinit(client.allocator);
+    }
+}
+
 test "external lake native server resumes bounded collection across maintenance passes" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -62192,4 +62506,105 @@ test "public execution native query checkpoints preserve scoped deadline errors"
     try std.testing.expectError(error.DeadlineExceeded, ensureRequestActive(.{ .ptr = &state, .is_cancelled_fn = Check.probe, .check_fn = Check.expired }));
     var disconnected = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Cancelled, ensureRequestActive(CancellationToken.fromAtomic(&disconnected)));
+}
+
+test "external lake query cleanup scheduler drains multiple query-only tables fairly" {
+    const a = std.testing.allocator;
+    const lifecycle = @import("../metadata/lake_index_lifecycle.zig");
+    const Fixture = struct {
+        arena: std.heap.ArenaAllocator = .init(std.testing.allocator),
+        rows: [3]?[]const u8 = @splat(null),
+        visits: [3]usize = @splat(0),
+        calls: std.atomic.Value(usize) = .init(0),
+        const ids = [_]u64{ 0, 7, 8 };
+        fn slot(table: u64) !usize {
+            for (ids, 0..) |id, i| if (id == table) return i;
+            return error.TestUnexpectedResult;
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn read(raw: *anyopaque, alloc: std.mem.Allocator, table: u64, _: api_operation.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return alloc.dupe(u8, self.rows[try slot(table)] orelse "{}");
+        }
+        fn mutate(raw: *anyopaque, table: u64, revision: u64, mutation: lifecycle.Mutation, _: api_operation.RequestContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const scratch = self.arena.allocator();
+            const i = try slot(table);
+            const before = try lifecycle.parse(scratch, self.rows[i] orelse "{}");
+            if (before.revision != revision) return error.CatalogGenerationChanged;
+            self.rows[i] = try lifecycle.encode(scratch, try mutation.apply(scratch, before));
+        }
+        fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, _: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            if (call != .lake_index_lifecycle_work) return error.TestUnexpectedResult;
+            for (ids, 0..) |table, i| {
+                if (call.lake_index_lifecycle_work) |after| if (table <= after) continue;
+                if (self.rows[i]) |row| {
+                    self.visits[i] += 1;
+                    return std.json.Stringify.valueAlloc(alloc, lifecycle.WorkPage{ .item = .{ .table_id = table, .state = try lifecycle.parse(alloc, row) }, .after = table }, .{});
+                }
+            }
+            return std.json.Stringify.valueAlloc(alloc, lifecycle.WorkPage{}, .{});
+        }
+    };
+    var fixture: Fixture = .{};
+    defer fixture.arena.deinit();
+    var directory = try TestDirectory.init("query-gc-scheduled-rounds");
+    defer directory.cleanup();
+    var config = try common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    var store = try @import("lake_index_store.zig").Store.openNative(a, &config, null, false, .standalone, directory.path());
+    defer store.deinit();
+    var client = store.opened.client;
+    const now = platform_time.realtimeNs() / std.time.ns_per_ms;
+    for ([_]u64{ 7, 8 }) |table| {
+        const state = try (lifecycle.State{}).retainQueryStore(fixture.arena.allocator(), .{ .identity = store.identity, .locator = store.locator }, now + @import("lake_query_gc.zig").horizon_ms);
+        fixture.rows[try Fixture.slot(table)] = try lifecycle.encode(fixture.arena.allocator(), state);
+        for (0..if (table == 7) @as(usize, 20) else 1) |i| {
+            const key = try std.fmt.allocPrint(a, "{s}{s}recent-search/{d}/{d:0>4}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", table, i });
+            defer a.free(key);
+            var value = try client.putObject(store.opened.bucket, key, "{\"expires_ms\":1}", .{});
+            value.deinit(client.allocator);
+        }
+    }
+    var server = ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .node_config = &config, .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path(), .lake_artifact_gc_enabled = false }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.catalog, .get_lake_index_lifecycle = Fixture.read, .mutate_lake_index_lifecycle = Fixture.mutate } }, null, null);
+    defer server.deinit();
+    // Discover real debt without a private timer loop, then drive the actual
+    // scheduler at 100ms elapsed: eligible for fast continuation, not for the
+    // normal 30-second interval. No native query owner/debt exists here.
+    try server.runLakeArtifactCollectionOnce();
+    try std.testing.expect(server.lake_query_gc_pending.load(.acquire));
+    try std.testing.expect(!server.native_query_gc_pending.load(.acquire));
+    server.cfg.lake_artifact_gc_enabled = true;
+    var turns: usize = 0;
+    while (server.lake_query_gc_pending.load(.acquire)) : (turns += 1) {
+        try std.testing.expect(turns < 20);
+        try std.testing.expectEqual(@as(u64, 50), server.lakeArtifactCollectionIntervalMs(30000));
+        server.lake_gc_last_schedule_ns.store(platform_time.monotonicNs() -| 100 * std.time.ns_per_ms, .release);
+        const calls = fixture.calls.load(.acquire);
+        try server.scheduleLakeArtifactCollection();
+        const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (server.lake_gc_in_flight.load(.acquire)) {
+            if (platform_time.monotonicNs() >= deadline) return error.TestTimeout;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(fixture.calls.load(.acquire) > calls);
+    }
+    try std.testing.expect(fixture.visits[1] >= 2 and fixture.visits[2] >= 2);
+    for ([_]u64{ 7, 8 }) |table| {
+        const prefix = try std.fmt.allocPrint(a, "{s}{s}recent-search/{d}/", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", table });
+        defer a.free(prefix);
+        var remaining = try client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 128 });
+        defer remaining.deinit(client.allocator);
+        try std.testing.expectEqual(@as(usize, 0), remaining.entries.len);
+    }
+    // Stalled/error-only work uses the configured interval and cannot spin.
+    server.observeLakeQueryCollection(.{ .more = true });
+    server.observeLakeQueryCollection(.{ .more = true, .progressed = true, .failed = true });
+    try std.testing.expectEqual(@as(u64, 30000), server.lakeArtifactCollectionIntervalMs(30000));
 }

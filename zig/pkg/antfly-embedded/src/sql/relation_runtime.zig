@@ -1245,6 +1245,7 @@ fn Engine(comptime Context: type) type {
             pages: usize = 0,
             eof: bool = false,
             emitted: bool = false,
+            remote_join: ?catalog.RelationCursor = null,
             hash_join: ?*operators.HashJoin = null,
             membership_index: ?*operators.TupleMembership = null,
             borrowed_membership: bool = false,
@@ -1321,6 +1322,12 @@ fn Engine(comptime Context: type) type {
                 switch (node.operation) {
                     .materialized_ref => |source| self.cached_reader = try (try engine.staticRows(source)).openReader(),
                     .join => |join| {
+                        if (recursive_id == null and !apply_mode and !join.correlation and join.membership == null) {
+                            if (engine.context.backend.distributed_join) |remote| {
+                                self.remote_join = try remote.open(remote.ptr, alloc, node, engine.context.binding.relation.?.scans, engine.cursors, engine.context.parameters, engine.context.backend.distributed_context);
+                                if (self.remote_join != null) return self;
+                            }
+                        }
                         // Always probe the delta and build the invariant side.
                         // Keep output ordinals in the original SQL FROM order.
                         self.flipped_join = if (join.membership != null) false else if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else try engine.preferLeftBuild(join);
@@ -1339,6 +1346,7 @@ fn Engine(comptime Context: type) type {
                 return self;
             }
             pub fn deinit(self: *Iterator) void {
+                if (self.remote_join) |remote| remote.close(remote.ptr);
                 if (self.prepared_reader) |reader| reader.close();
                 if (self.cached_reader) |reader| reader.close();
                 if (self.result_cursor) |cursor| cursor.close();
@@ -1379,6 +1387,9 @@ fn Engine(comptime Context: type) type {
             }
             fn nextBatchMeasured(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
                 if (maximum == 0) return .{ .rows = &.{} };
+                try self.engine.checkpoint();
+                // Cost samples borrow the producer's page. Replay them before
+                // advancing any producer, including a distributed child join.
                 if (self.sampled) |sample| {
                     const count = @min(maximum, sample.len() - self.sampled_index);
                     if (count != 0) {
@@ -1386,15 +1397,16 @@ fn Engine(comptime Context: type) type {
                         source.* = sample;
                         const selection = try a.alloc(usize, count);
                         for (selection, 0..) |*index, i| index.* = self.sampled_index + i;
+                        const result = try source.select(a, selection);
                         self.sampled_index += count;
-                        return source.select(a, selection);
+                        return result;
                     }
                     self.sampled = null;
                 }
+                if (self.remote_join) |remote| return remote.next(remote.ptr, a, maximum);
                 const previous_demand = self.batch_demand;
                 self.batch_demand = if (previous_demand) |prior| @min(prior, maximum) else maximum;
                 defer self.batch_demand = previous_demand;
-                try self.engine.checkpoint();
                 if (self.cached_reader) |reader| return reader.nextBatch(a, maximum) catch |err| {
                     if (failure) |out| {
                         out.* = err;
@@ -1560,6 +1572,10 @@ fn Engine(comptime Context: type) type {
                         return row;
                     }
                     self.sampled = null;
+                }
+                if (self.remote_join) |remote| {
+                    const batch = try remote.next(remote.ptr, alloc, 1);
+                    return if (batch.len() == 0) null else try batch.row(alloc, 0);
                 }
                 if (self.cached_reader) |reader| return reader.next();
                 return switch (self.node.operation) {
@@ -3412,7 +3428,9 @@ fn Engine(comptime Context: type) type {
             }
             fn openAggregatePartials(ptr: *anyopaque, a: Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
-                if (self.opened or self.iterator.apply_mode or self.iterator.recursive_id != null or outerMask(self.iterator.node) != 0) return null;
+                // A distributed relation already owns its join. This shortcut may
+                // inspect local build/probe children only for local iterators.
+                if (self.opened or self.iterator.remote_join != null or self.iterator.apply_mode or self.iterator.recursive_id != null or outerMask(self.iterator.node) != 0) return null;
                 const plan = (try @import("join_aggregate.zig").Plan.prove(self.engine.context.arena, self.iterator.node, recipe)) orelse return null;
                 const fields = try self.engine.context.arena.alloc([]const u8, self.iterator.node.columns.len);
                 for (self.iterator.node.columns, fields) |column, *field| field.* = column.internal;
@@ -4893,4 +4911,73 @@ test "SQL scalar observer admission survives filtered identity frames" {
         try std.testing.expect(fixture.negotiated);
         for (result.output.rows[0], [_][]const u8{ "2", "1", "2" }) |actual, expected| try std.testing.expectEqualStrings(expected, actual.string);
     }
+}
+
+test "distributed SQL sampled remote children replay before batch and scalar pulls" {
+    const Runtime = @import("runtime.zig");
+    const Fixture = struct {
+        count: usize,
+        position: usize = 0,
+        pulls: usize = 0,
+        duplicate: bool,
+        cells: [256][2]Datum = undefined,
+        rows: [256][]const Datum = undefined,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn close(_: *anyopaque) void {}
+        fn next(raw: *anyopaque, _: Allocator, maximum: usize) !@import("execution_batch.zig").Batch {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pulls += 1;
+            const count = @min(maximum, self.count - self.position);
+            for (0..count) |index| {
+                const ordinal = self.position + index;
+                self.cells[index] = .{ Datum.json(.{ .integer = @intCast(if (self.duplicate) ordinal / 10 else ordinal) }), Datum.json(.{ .integer = @intCast(ordinal) }) };
+                self.rows[index] = &self.cells[index];
+            }
+            self.position += count;
+            return .{ .rows = self.rows[0..count] };
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]usize{ 0, 3, 300 }) |total| for ([_]bool{ false, true }) |duplicate| for ([_]bool{ false, true }) |scalar_pull| {
+        var fixture: Fixture = .{ .count = total, .duplicate = duplicate };
+        var source = std.heap.ArenaAllocator.init(a);
+        defer source.deinit();
+        const node: binding.Node = .{ .columns = &.{}, .operation = .{ .prepared_rows = &.{} } };
+        var engine: Engine(Runtime.Context) = .{ .context = .{ .alloc = a, .arena = source.allocator(), .backend = .{ .ptr = &fixture, .vtable = &.{ .checkpoint = Fixture.checkpoint, .resolve = undefined, .scan = undefined, .mutate = undefined } }, .binding = undefined, .parameters = &.{}, .limits = .{} }, .cursors = &.{}, .cache_arena = .init(a) };
+        defer engine.deinit();
+        const iterator = try Engine(Runtime.Context).Iterator.create(&engine, &node);
+        defer iterator.deinit();
+        iterator.remote_join = .{ .ptr = &fixture, .next = Fixture.next, .close = Fixture.close };
+        const reduced = try iterator.sampleReduction(&.{0});
+        try std.testing.expectEqual(total != 0 and duplicate, reduced);
+        const sample_count = @min(total, 128);
+        try std.testing.expectEqual(sample_count, fixture.position);
+        if (sample_count > 0 and !scalar_pull) {
+            for (0..3) |fail_index| {
+                var failed_work = std.heap.ArenaAllocator.init(a);
+                defer failed_work.deinit();
+                var failing = std.testing.FailingAllocator.init(failed_work.allocator(), .{ .fail_index = fail_index });
+                try std.testing.expectError(error.OutOfMemory, iterator.nextBatch(failing.allocator(), 7, null));
+                try std.testing.expectEqual(@as(usize, 0), iterator.sampled_index);
+                try std.testing.expectEqual(@as(usize, 1), fixture.pulls);
+            }
+        }
+        var index: usize = 0;
+        while (true) {
+            if (scalar_pull) {
+                const row = try iterator.next(source.allocator()) orelse break;
+                try std.testing.expectEqual(@as(i64, @intCast(index)), row[1].value.integer);
+                index += 1;
+            } else {
+                const batch = try iterator.nextBatch(source.allocator(), 7, null);
+                if (batch.len() == 0) break;
+                for (0..batch.len()) |row| {
+                    try std.testing.expectEqual(@as(i64, @intCast(index)), (try batch.cell(source.allocator(), row, 1)).value.integer);
+                    index += 1;
+                }
+            }
+            if (index <= sample_count) try std.testing.expectEqual(@as(usize, 1), fixture.pulls);
+        }
+        try std.testing.expectEqual(total, index);
+    };
 }

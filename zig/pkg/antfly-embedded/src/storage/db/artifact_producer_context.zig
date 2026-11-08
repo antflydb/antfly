@@ -30,6 +30,9 @@ pub const Token = struct {
     source: publication.Source,
     inherited_sources: std.ArrayList(publication.Source) = .empty,
     producer_scope_key: []const u8 = "",
+    execution_identity: ?publication.Digest = null,
+    /// Census readers accept any execution; producers explicitly bind even a null revision.
+    execution_bound: bool = false,
     reads: std.ArrayList(publication.ArtifactSource) = .empty,
     preconditions: std.ArrayList(publication.ArtifactSource) = .empty,
     read_key_bytes: usize = 0,
@@ -60,6 +63,7 @@ pub const Token = struct {
         var added: usize = 0;
         var added_bytes: usize = 0;
         for (incoming, 0..) |source, index| {
+            if (source.document_key.len > publication.max_cursor_bytes) return error.ResourceBudgetExceeded;
             if (index != 0 and std.mem.order(u8, incoming[index - 1].document_key, source.document_key) != .lt) return error.ArtifactCatalogCorrupt;
             while (cursor < previous.len and std.mem.order(u8, previous[cursor].document_key, source.document_key) == .lt) : (cursor += 1) {}
             if (cursor < previous.len and std.mem.eql(u8, previous[cursor].document_key, source.document_key)) {
@@ -72,7 +76,7 @@ pub const Token = struct {
             }
         }
         if (added == 0) return;
-        if (added > publication.max_source_documents - previous.len or self.read_key_bytes +| added_bytes > 1024 * 1024) return error.ResourceBudgetExceeded;
+        if (added > publication.max_source_documents - previous.len or self.read_key_bytes +| added_bytes > publication.max_identity_bytes) return error.ResourceBudgetExceeded;
         const merged = try owned.alloc(publication.Source, previous.len + added);
         const ordinals = try owned.alloc(u32, previous.len);
         var old_index: usize = 0;
@@ -133,10 +137,15 @@ pub const Token = struct {
     /// Returning ownership avoids resolving and decoding the same proof twice.
     pub fn acceptedProof(self: *Token, alloc: std.mem.Allocator, txn: anytype) !?@import("artifact_producer_provenance.zig").Accepted {
         const selector = try self.command(&.{});
-        return @import("artifact_producer_provenance.zig").readCurrentForSource(alloc, txn, selector, self.source) catch |err| switch (err) {
+        var current = (@import("artifact_producer_provenance.zig").readCurrentForSource(alloc, txn, selector, self.source) catch |err| switch (err) {
             error.EnrichmentSourceChanged => return null,
             else => return err,
-        };
+        }) orelse return null;
+        if (self.execution_bound and !std.meta.eql(self.execution_identity, current.owned.proof.execution_identity)) {
+            current.deinit();
+            return null;
+        }
+        return current;
     }
 
     /// Includes required absences (review overrides and sibling outputs).
@@ -174,8 +183,8 @@ pub const Token = struct {
                 return error.EnrichmentSourceChanged;
             return;
         }
-        if (self.reads.items.len + self.preconditions.items.len >= publication.max_source_documents or key.len > 1024 * 1024 or
-            self.read_key_bytes +| key.len > 1024 * 1024) return error.ResourceBudgetExceeded;
+        if (self.reads.items.len + self.preconditions.items.len >= publication.max_source_documents or key.len > publication.max_cursor_bytes or
+            self.read_key_bytes +| key.len > publication.max_identity_bytes) return error.ResourceBudgetExceeded;
         const owned = self.arena.allocator();
         try guards.insert(owned, insertion, .{ .key = try owned.dupe(u8, key), .content_digest = digest, .input_position = position, .source_index = source_index });
         self.read_key_bytes += key.len;
@@ -196,6 +205,7 @@ pub const Token = struct {
             .producer_generation = self.producer_generation,
             .producer_artifact_name = self.artifact_name,
             .producer_scope_key = self.producer_scope_key,
+            .execution_identity = self.execution_identity,
             .sources = self.sources(),
             .artifact_sources = self.reads.items,
             .mutation_preconditions = self.preconditions.items,
@@ -219,3 +229,27 @@ pub const Token = struct {
         try publication.validateArtifactSources(alloc, txn, self.namespace, self.sources(), self.reads.items);
     }
 };
+
+test "privacy producer capture admits large identities and retains changed-source fencing" {
+    const a = std.testing.allocator;
+    const document = try a.alloc(u8, 5 * 1024 * 1024);
+    defer a.free(document);
+    @memset(document, 'x');
+    var token: Token = .{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .namespace = @splat(1),
+        .epoch = 1,
+        .catalog_digest = @splat(2),
+        .producer_name = "assets",
+        .producer_kind = .enrichment,
+        .producer_generation = 1,
+        .artifact_name = "assets",
+        .source = .{ .document_key = document, .timestamp = 1, .content_digest = @splat(3), .input_position = null },
+        .read_key_bytes = document.len,
+    };
+    defer token.deinit();
+    try token.observe(document, "before", null);
+    try token.observe(document, "before", null);
+    try std.testing.expectEqual(@as(usize, 1), token.reads.items.len);
+    try std.testing.expectError(error.EnrichmentSourceChanged, token.observe(document, "after", null));
+}

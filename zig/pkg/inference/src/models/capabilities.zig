@@ -70,7 +70,7 @@ pub fn modelSupportsCapability(
 /// its projector decide. Other multimodal generators reject video.
 pub fn generatorAcceptsVideo(manifest: *const manifest_mod.ModelManifest) bool {
     return manifest.model_type == .generator and manifest.gguf_projector_path != null and
-        std.mem.eql(u8, manifest.config_model_arch, "gemma4");
+        (manifest.gguf_generator_gemma4 or std.mem.eql(u8, manifest.config_model_arch, "gemma4"));
 }
 
 pub fn modelAcceptsInput(manifest: *const manifest_mod.ModelManifest, input: []const u8) bool {

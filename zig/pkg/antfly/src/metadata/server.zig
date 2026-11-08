@@ -343,11 +343,13 @@ pub const MetadataServer = struct {
             // the restarted node has started its Raft transport.
             _ = public_write_source.withBackendRuntime(backend_runtime);
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
+            _ = public_write_source.withInferenceAPIKey(cfg.api_server_cfg.inference_api_key);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
             public_read_source.decision_registry = if (cfg.api_server_cfg.node_config) |node_config| &node_config.registry else null;
             _ = public_read_source.withBackendRuntime(backend_runtime);
             _ = public_read_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
+            _ = public_read_source.withInferenceAPIKey(cfg.api_server_cfg.inference_api_key);
             _ = public_read_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_read_source.withRemoteContent(cfg.api_server_cfg.remote_content);
             _ = public_read_source.withRemoteCapabilityCache(try public_write_source.remoteCapabilityCache());
@@ -375,6 +377,7 @@ pub const MetadataServer = struct {
                 if (api_server_cfg.session_owner_lease_ttl_ns == null) api_server_cfg.session_owner_lease_ttl_ns = 15 * std.time.ns_per_s;
             }
             api_server_cfg.restore_owner_progress_generation = &svc.restore_owner_progress_generation;
+            api_server_cfg.privacy_scan_coordinator = true;
             api_server_cfg.configureRemoteCatalogPublicationAuthority();
             // Restore-owner and durable-session RPCs share the same owned
             // data-bearing routes and transport as ordinary hosted reads and
@@ -746,6 +749,7 @@ fn metadataAdminHttpxConfig(
         .host = cfg.bind_host,
         .port = cfg.bind_port,
         .max_body_size = cfg.max_request_bytes,
+        .max_route_body_size = @max(cfg.max_request_bytes, @import("antfly_public_limits").max_route_body_bytes),
         .header_read_timeout_ms = cfg.header_read_timeout_ms,
         .body_read_timeout_ms = cfg.body_read_timeout_ms,
         .response_write_timeout_ms = cfg.header_read_timeout_ms,
@@ -2214,7 +2218,7 @@ fn metadataJobStateCas(ptr: *anyopaque, key: []const u8, expected: ?[]const u8, 
     }
     _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(.{ .compare_and_set_job_state = .{ .key = key, .expected_hash = expected orelse "", .value = value } }, term);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    const current = (try store.getJobState(svc.alloc, svc.metadata_group_id, key)) orelse return false;
+    const current = (try store.getJobState(svc.alloc, svc.metadata_group_id, key)) orelse return std.mem.startsWith(u8, key, "privacy/") and std.mem.eql(u8, value, "\x00");
     defer svc.alloc.free(current);
     return std.mem.eql(u8, current, value);
 }

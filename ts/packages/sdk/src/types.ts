@@ -814,3 +814,15 @@ export type ResolverWait = components["schemas"]["ResolverWait"];
 
 export type EntityConsumerProgressPage = components["schemas"]["EntityConsumerProgressPage"];
 export type EntityNamespaceOutcome = components["schemas"]["EntityNamespaceOutcome"];
+
+// Table privacy policies and inspection contracts.
+export type PrivacyProducer = components["schemas"]["PrivacyProducer"];
+export type PrivacyCategory = components["schemas"]["PrivacyCategory"];
+export type PrivacyPolicy = components["schemas"]["PrivacyPolicy"];
+export type PrivacyFinding = components["schemas"]["PrivacyFinding"];
+export type PrivacyStatus = components["schemas"]["PrivacyStatus"];
+export type PrivacyPreviewRequest = components["schemas"]["PrivacyPreviewRequest"];
+export type PrivacyPreview = components["schemas"]["PrivacyPreview"];
+export type PrivacyScanRequest = components["schemas"]["PrivacyScanRequest"];
+export type PrivacyScan = components["schemas"]["PrivacyScan"];
+export type PrivacyFindingsPage = components["schemas"]["PrivacyFindingsPage"];

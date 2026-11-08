@@ -5,6 +5,7 @@ const std = @import("std");
 const types = @import("antfly_public_openapi");
 const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
+const antfly_privacy_openapi = @import("antfly_privacy_openapi");
 const antfly_resolvers_openapi = @import("antfly_resolvers_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
 
@@ -791,6 +792,85 @@ pub const RetryNamespaceIndexPathParams = struct {
 pub fn parseRetryNamespaceIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexMaintenanceRequest) {
     return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
+
+/// Read table privacy policy and coverage
+pub const GetNamespaceTablePrivacyPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Apply table privacy policy
+pub const PutNamespaceTablePrivacyPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for putNamespaceTablePrivacy.
+pub fn parsePutNamespaceTablePrivacyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyPolicy) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyPolicy, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// List current privacy findings
+pub const ListNamespaceTablePrivacyFindingsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+pub const ListNamespaceTablePrivacyFindingsParams = struct {
+    cursor: ?[]const u8 = null,
+    document: ?[]const u8 = null,
+    field: ?[]const u8 = null,
+    category: ?[]const u8 = null,
+    policy_version: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+/// List current privacy findings with body filters
+pub const QueryNamespaceTablePrivacyFindingsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryNamespaceTablePrivacyFindings.
+pub fn parseQueryNamespaceTablePrivacyFindingsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyFindingsRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyFindingsRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Inspect a bounded sample without saving the policy
+pub const PreviewNamespaceTablePrivacyPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for previewNamespaceTablePrivacy.
+pub fn parsePreviewNamespaceTablePrivacyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyPreviewRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyPreviewRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Start a durable privacy rescan
+pub const StartNamespaceTablePrivacyScanPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for startNamespaceTablePrivacyScan.
+pub fn parseStartNamespaceTablePrivacyScanBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyScanRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyScanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read privacy scan progress
+pub const GetNamespaceTablePrivacyScanPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    scan_id: []const u8,
+};
 
 /// Query an explicit namespace table
 pub const QueryNamespaceTablePathParams = struct {
@@ -1783,6 +1863,71 @@ pub fn parseLinearMergeBody(allocator: std.mem.Allocator, body: []const u8) !std
     return std.json.parseFromSlice(types.LinearMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Read table privacy policy and coverage
+pub const GetTablePrivacyPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Apply table privacy policy
+pub const PutTablePrivacyPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for putTablePrivacy.
+pub fn parsePutTablePrivacyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyPolicy) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyPolicy, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// List current privacy findings
+pub const ListTablePrivacyFindingsPathParams = struct {
+    table_name: []const u8,
+};
+
+pub const ListTablePrivacyFindingsParams = struct {
+    cursor: ?[]const u8 = null,
+    document: ?[]const u8 = null,
+    field: ?[]const u8 = null,
+    category: ?[]const u8 = null,
+    policy_version: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+/// List current privacy findings with body filters
+pub const QueryTablePrivacyFindingsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryTablePrivacyFindings.
+pub fn parseQueryTablePrivacyFindingsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyFindingsRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyFindingsRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Inspect a bounded sample without saving the policy
+pub const PreviewTablePrivacyPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for previewTablePrivacy.
+pub fn parsePreviewTablePrivacyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyPreviewRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyPreviewRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Start a durable privacy rescan
+pub const StartTablePrivacyScanPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for startTablePrivacyScan.
+pub fn parseStartTablePrivacyScanBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyScanRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyScanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read privacy scan progress
+pub const GetTablePrivacyScanPathParams = struct {
+    table_name: []const u8,
+    scan_id: []const u8,
+};
+
 /// Query a specific table
 pub const QueryTablePathParams = struct {
     /// Name of the table to query
@@ -2302,6 +2447,13 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeNamespaceTableGraphMetricAction", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryNamespaceIndex", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy", .operation_id = "getNamespaceTablePrivacy", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy", .operation_id = "putNamespaceTablePrivacy", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/findings", .operation_id = "listNamespaceTablePrivacyFindings", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/findings", .operation_id = "queryNamespaceTablePrivacyFindings", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/preview", .operation_id = "previewNamespaceTablePrivacy", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans", .operation_id = "startNamespaceTablePrivacyScan", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans/{scanId}", .operation_id = "getNamespaceTablePrivacyScan", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename", .operation_id = "renameNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers", .operation_id = "namespaceListResolvers", .request_body = .none, .streaming_response = false },
@@ -2409,6 +2561,13 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/lake/commits/{commitId}", .operation_id = "getLakeCommitOutcome", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/lake/maintenance", .operation_id = "maintainLakeTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/privacy", .operation_id = "getTablePrivacy", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/tables/{tableName}/privacy", .operation_id = "putTablePrivacy", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/privacy/findings", .operation_id = "listTablePrivacyFindings", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/privacy/findings", .operation_id = "queryTablePrivacyFindings", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/privacy/preview", .operation_id = "previewTablePrivacy", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/privacy/scans", .operation_id = "startTablePrivacyScan", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/privacy/scans/{scanId}", .operation_id = "getTablePrivacyScan", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/control-jobs", .operation_id = "startTableRepairControlJob", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/issues", .operation_id = "listTableRepairIssues", .request_body = .buffered, .streaming_response = false },
@@ -2542,6 +2701,13 @@ pub const routes = [_]Route{
 //   fn executeNamespaceTableGraphMetricAction(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
 //   fn repairNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn retryNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn getNamespaceTablePrivacy(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn putNamespaceTablePrivacy(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn listNamespaceTablePrivacyFindings(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, params: ListNamespaceTablePrivacyFindingsParams) !httpx.Response
+//   fn queryNamespaceTablePrivacyFindings(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn previewNamespaceTablePrivacy(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn startNamespaceTablePrivacyScan(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn getNamespaceTablePrivacyScan(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, scan_id: []const u8) !httpx.Response
 //   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn renameNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn namespaceListResolvers(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
@@ -2649,6 +2815,13 @@ pub const routes = [_]Route{
 //   fn getLakeCommitOutcome(self: *Impl, ctx: *httpx.Context, table_name: []const u8, commit_id: []const u8, params: GetLakeCommitOutcomeParams) !httpx.Response
 //   fn maintainLakeTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getTablePrivacy(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn putTablePrivacy(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn listTablePrivacyFindings(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: ListTablePrivacyFindingsParams) !httpx.Response
+//   fn queryTablePrivacyFindings(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn previewTablePrivacy(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn startTablePrivacyScan(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getTablePrivacyScan(self: *Impl, ctx: *httpx.Context, table_name: []const u8, scan_id: []const u8) !httpx.Response
 //   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn startTableRepairControlJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listTableRepairIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

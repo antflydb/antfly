@@ -353,7 +353,10 @@ test "inline image framing rejects ambiguous unknown and truncated encodings" {
 test "inline image headers own allocations and framing remains cancellable" {
     const Check = struct {
         fn run(a: std.mem.Allocator) !void {
-            try expectFrame(a, "/W 1 /H 1 /F [/A85 /Fl] /DP [null << /Predictor 12 >>]", "z~>");
+            // Make allocation counts independent of whether the backing heap
+            // can grow a parser buffer in place on this particular attempt.
+            var moving = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+            try expectFrame(moving.allocator(), "/W 1 /H 1 /F [/A85 /Fl] /DP [null << /Predictor 12 >>]", "z~>");
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});

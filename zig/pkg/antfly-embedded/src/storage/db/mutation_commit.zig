@@ -933,7 +933,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or opts.group_source_command != null))
                 preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
             const apply_lock_wait_start_ns = monotonicTimeNs();
-            try self.lockApplyForPortableRuntime();
+            if (opts.ordered_apply_receipt != null) {
+                // A committed Raft entry must yield its progress mutex when
+                // apply is busy, including a reader arriving after preflight.
+                try tryLockApplyForPortableRuntime(self);
+            } else {
+                try self.lockApplyForPortableRuntime();
+            }
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
             if (S.ownerField(self, "local_execution").*.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
             var filtered_cleanup_edges: ?[]types.GraphEdgeDelete = null;
@@ -3748,6 +3754,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.mem.startsWith(u8, key, protection.writer_prefix) or
                 std.mem.startsWith(u8, key, protection.index_counter_prefix) or
                 std.mem.startsWith(u8, key, protection.index_writer_prefix);
+        }
+
+        pub fn tryLockApplyForPortableRuntime(self: anytype) !void {
+            try self.enforcePortableRuntimeGate();
+            if (!S.ownerField(self, "core").*.tryLockApplyExclusive()) return error.WriterLocked;
+            errdefer S.ownerField(self, "core").*.unlockApply();
+            try self.enforcePortableRuntimeGate();
         }
 
         pub fn lockApplyForPortableRuntime(self: anytype) !void {

@@ -181,9 +181,7 @@ before semantic/graph enrichment; a successful receipt measures extraction
 coverage, not OCR transcription accuracy, source authorization or public readiness.
 
 The showcase OCR profile uses revision-pinned LightOnOCR-3-4B on shared Antfly
-inference. The deployed Antfly v0.3.0-rc.6 shared L4 reader pool passed synthetic
-OCR and model-switching qualification for both 4B and 0.8B. Those checks establish
-runtime compatibility; corpus coverage and text quality still require a representative
+inference. Qualify both reader sizes on the deployed pool and run a representative
 PDF pilot before backfill. Its native `/read` contract uses
 an image-only prompt; the extraction producer sends no prompt to readers.
 The profile requests at most 2048 output tokens per page. A cached dense DOJ
@@ -227,8 +225,7 @@ The relation stage defaults to pinned `fastino/gliner2.5-base-v1`, with entity a
 relation schemas and bounded long-document windowing. Colony must deploy its
 GLiNER2.5 and LightOnOCR GPU routes before the hosted pipeline is qualified. CUDA
 kernels alone do not qualify the GLiNER2.5 serving policy: use a runtime with
-measured CUDA production profiles, then verify the deployed L4 path. RC.2 rejects
-GLiNER2.5 CUDA. Preserve the existing GLiNER2 route for other callers.
+measured CUDA production profiles, then verify the deployed L4 path. Preserve the existing GLiNER2 route for other callers.
 
 For semantic backfill, use `--embedder-config antfly-embedder.example.json` to select
 EmbeddingGemma 2 with 768 dimensions consistently across enrichment and the index.
@@ -257,10 +254,8 @@ Self-hosting uses the same canonical connection with ADC or a keystore-backed
 Google credential source. A bare `gs://` URL never enables ambient access.
 No HMAC keys or organization-policy exceptions are required.
 
-This native artifact transport is new in this PR and requires the next published
-Antfly release containing it; rc.6 has GCS external-I/O support but does not route
-artifact downloads through it. Keep the corpus private and staged until the
-released runtime passes generation, scope and real-PDF OCR qualification.
+Keep the corpus private until the deployed runtime passes generation, scope
+and real-PDF OCR checks for native artifact downloads.
 
 `load` defaults to full text only and resumes durable batches against the exact
 manifest, endpoint, table identity, and extraction configuration. Reuse the same
@@ -269,11 +264,8 @@ checkpoint. `wait` requires complete and queryable aggregate **and shard**
 readiness; successful submission alone is not success. `grep` and `graph` also
 check artifact generations and unit inventories before publishing derived data.
 
-The Cloud default `v0.2.5` runtime lacks the stable `table_id` required by resumable
-loading. The dedicated showcase was upgraded to digest-pinned `v0.3.0-rc.2` and
-its stable table identity was verified live. Live testing
-accepts the corrected combined table request, including the public schema's
-`simple` text analyzer. The server creates its system-owned default text index;
+Resumable loading requires a stable `table_id` and a table schema with the
+`simple` text analyzer. Verify both on the target instance. The server creates its system-owned default text index;
 the client declares only its named artifact index. Native PDF extraction works,
 but that is insufficient qualification of the complete load. Qualify the
 actual load, readiness, and artifact contracts before importing the corpus. Do
@@ -299,9 +291,8 @@ The stable Google model ID is not `gemini-embedding-002`. The native adapter use
 the model does not accept the older `task_type` request field. Binary media
 remains in raw storage; this stage embeds the selected PDFs' native text chunks.
 
-The exact `v0.3.0-rc.2` image predates this adapter correction. Keep semantic
-enrichment disabled until a reviewed runtime containing it is deployed and a
-live query/document embedding probe succeeds. Do not silently substitute the
+Enable semantic enrichment after query and document embedding probes succeed
+on the deployed runtime. Do not silently substitute the
 older `gemini-embedding-001` model. OCR has its separate native reader profile;
 both providers require the remote worker's scoped Vertex Workload Identity.
 The OCR profile explicitly pins its modern model and `global` location. Stored

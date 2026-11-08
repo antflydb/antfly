@@ -31,6 +31,13 @@ pub const Cut = struct {
         return initKinds(a, pending, &.{});
     }
     pub fn initForTable(a: A, pending: ingestion.Pending, table: catalog.Table) !Cut {
+        const normalized = try normalizeForTable(a, pending, table);
+        return initKinds(a, normalized.pending, normalized.kinds);
+    }
+    /// Publication needs normalized images and key kinds without a second
+    /// complete changed-key hash map.
+    pub const Normalized = struct { pending: ingestion.Pending, kinds: []const stable_key.Kind };
+    pub fn normalizeForTable(a: A, pending: ingestion.Pending, table: catalog.Table) !Normalized {
         const kinds = try a.alloc(stable_key.Kind, pending.key_fields.len);
         for (pending.key_fields, kinds) |key, *kind| kind.* = switch ((try table.column(key)).type) {
             .datetime => .timestamp,
@@ -49,7 +56,7 @@ pub const Cut = struct {
                 if (value.* != .null) value.* = try stable_key.normalize(a, value.*, .timestamp);
             };
         };
-        return initKinds(a, normalized, kinds);
+        return .{ .pending = normalized, .kinds = kinds };
     }
     fn initKinds(a: A, pending: ingestion.Pending, kinds: []const stable_key.Kind) !Cut {
         const normalized = try pending.materialized(a);
@@ -62,7 +69,7 @@ fn identity(a: A, keys: []const []const u8, row: V, kinds: []const stable_key.Ki
     return local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, row, kinds);
 }
 // Base SQL rows carry nanoseconds, whereas integer WAL keys carry micros.
-fn baseIdentity(a: A, keys: []const []const u8, row: V, kinds: []const stable_key.Kind) ![]const u8 {
+pub fn baseIdentity(a: A, keys: []const []const u8, row: V, kinds: []const stable_key.Kind) ![]const u8 {
     if (row != .object or (kinds.len != 0 and kinds.len != keys.len)) return error.InvalidLakeKey;
     var normalized: V = .{ .object = .empty };
     for (keys, 0..) |key, i| {
@@ -74,6 +81,17 @@ fn baseIdentity(a: A, keys: []const []const u8, row: V, kinds: []const stable_ke
         try normalized.object.put(a, key, value);
     }
     return identity(a, keys, normalized, kinds);
+}
+/// Shared by row and column scan adapters; all splits suppress the full cut.
+pub fn suppressesBase(a: A, cut: *const Cut, row: V) !bool {
+    if (cut.changed.count() == 0) return false;
+    return cut.changed.contains(try baseIdentity(a, cut.pending.key_fields, row, cut.kinds));
+}
+pub fn recentRow(a: A, cut: *const Cut, position: usize) !?catalog.Row {
+    const change = cut.pending.changes[position];
+    if (change.op == .delete) return null;
+    const key = try identity(a, cut.pending.key_fields, change.row, cut.kinds);
+    return .{ .id = try std.fmt.allocPrint(a, "wal1:{s}", .{local.serverless_external_source_mod.lake_catalog.types.digestHex(key)}), .version = cut.pending.lsn, .value = change.row };
 }
 pub fn physicalRequest(a: A, request: catalog.Scan, cut: Cut) !catalog.Scan {
     // Ordered/physical selections cannot be translated to the new logical cut.
@@ -106,6 +124,16 @@ pub fn wrap(a: A, child: catalog.Cursor, table: catalog.Table, request: catalog.
     owner.* = .{ .a = a, .child = child, .table = table, .request = request, .cut = cut, .context = context };
     return .{ .ptr = owner, .next = Cursor.next, .close = Cursor.close };
 }
+/// Every split suppresses the complete changed-key set. Recent images are
+/// assigned once by their stable position in the captured immutable WAL cut.
+pub fn wrapPartition(a: A, child: catalog.Cursor, table: catalog.Table, request: catalog.Scan, cut: *const Cut, context: local.api_operation.RequestContext, index: u32, count: u32) !catalog.Cursor {
+    if (count == 0 or index >= count) return error.InvalidSqlBackendResponse;
+    const result = try wrap(a, child, table, request, cut, context);
+    const owner: *Cursor = @ptrCast(@alignCast(result.ptr));
+    owner.partition = index;
+    owner.partitions = count;
+    return result;
+}
 const Cursor = struct {
     a: A,
     child: catalog.Cursor,
@@ -115,6 +143,8 @@ const Cursor = struct {
     context: local.api_operation.RequestContext,
     base_done: bool = false,
     change_at: usize = 0,
+    partition: u32 = 0,
+    partitions: u32 = 1,
     page_sequence: u64 = 0,
     fn next(raw: *anyopaque, a: A, maximum: u32) !catalog.Page {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -132,19 +162,17 @@ const Cursor = struct {
             self.base_done = page.after == null;
             for (page.rows) |row| {
                 try self.context.ensureActive();
-                const key = try baseIdentity(scratch, self.cut.pending.key_fields, row.value, self.cut.kinds);
-                if (self.cut.changed.contains(key)) continue;
+                if (try suppressesBase(scratch, self.cut, row.value)) continue;
                 if (!try matchesTyped(scratch, self.table, row, self.request.conditions)) continue;
                 try rows.append(scratch, try project(scratch, self.table, row, self.request.fields));
             }
         }
         if (self.base_done) while (self.change_at < self.cut.pending.changes.len and rows.items.len < maximum) {
             try self.context.ensureActive();
-            const change = self.cut.pending.changes[self.change_at];
+            const position = self.change_at;
             self.change_at += 1;
-            if (change.op == .delete) continue;
-            const key = try identity(scratch, self.cut.pending.key_fields, change.row, self.cut.kinds);
-            const row: catalog.Row = .{ .id = try std.fmt.allocPrint(scratch, "wal1:{s}", .{local.serverless_external_source_mod.lake_catalog.types.digestHex(key)}), .version = self.cut.pending.lsn, .value = change.row };
+            if (position % self.partitions != self.partition) continue;
+            const row = (try recentRow(scratch, self.cut, position)) orelse continue;
             if (try matchesTyped(scratch, self.table, row, self.request.conditions)) try rows.append(scratch, try project(scratch, self.table, row, self.request.fields));
         };
         try self.context.ensureActive();

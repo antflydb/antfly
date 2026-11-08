@@ -3357,6 +3357,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.order_by.len > 0) try appendQueryOrderByField(alloc, &out, &first, req.order_by);
     if (req.search_after.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_after", req.search_after);
     if (req.search_before.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_before", req.search_before);
+    if (req.privacy_policy_version) |version| try appendJsonFieldString(alloc, &out, &first, "_privacy_policy_version", if (std.mem.allEqual(u8, &version, 0)) "none" else &version);
     if (req.document_authority_mode != .none) {
         try appendJsonFieldName(alloc, &out, &first, "_document_authority");
         const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .mode = req.document_authority_mode, .group = req.document_authority_group, .defer_stored_projection = req.defer_stored_projection }, .{});
@@ -3370,6 +3371,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
         try out.appendSlice(alloc, encoded);
     }
     if (req.remote_snapshot) |snapshot| try appendJsonFieldString(alloc, &out, &first, "remote_snapshot", snapshot);
+    if (req.response_live_read) try appendJsonFieldBool(alloc, &out, &first, "_response_live_read", true);
     if (req.count_only) {
         try appendJsonFieldBool(alloc, &out, &first, "count", true);
     }
@@ -3548,6 +3550,8 @@ pub fn encodeStorageKernelQueryRequestForExecution(alloc: std.mem.Allocator, req
 }
 
 pub const StorageKernelLookupWireRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
+    privacy_original: bool = false,
     key: []const u8,
     cypher_prepare: bool = false,
     row_policy_principal_proof: []const u8 = "",
@@ -3572,6 +3576,8 @@ pub const StorageKernelLookupWireRequest = struct {
     pub fn options(self: StorageKernelLookupWireRequest) db_mod.types.LookupOptions {
         return .{
             .cypher_prepare = self.cypher_prepare,
+            .privacy_policy_version = self.privacy_policy_version,
+            .privacy_original = self.privacy_original,
             .row_policy_principal_proof = self.row_policy_principal_proof,
             .row_policy_database = self.row_policy_database,
             .row_policy_receipt = if (self.row_policy_receipt) |receipt| .{ .generation = receipt.generation, .phase = receipt.phase } else null,
@@ -3656,6 +3662,8 @@ pub fn encodeStorageKernelLookupRequest(
     opts: db_mod.types.LookupOptions,
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, StorageKernelLookupWireRequest{
+        .privacy_policy_version = opts.privacy_policy_version,
+        .privacy_original = opts.privacy_original,
         .key = key,
         .cypher_prepare = opts.cypher_prepare,
         .row_policy_principal_proof = opts.row_policy_principal_proof,
@@ -3731,6 +3739,10 @@ pub fn encodeStorageKernelDocumentArtifactManifestsResponse(
 }
 
 pub const StorageKernelScanWireRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
+    privacy_original: bool = false,
+    privacy_status: bool = false,
+    resume_from_key: bool = false,
     from_key: []const u8 = "",
     to_key: []const u8 = "",
     inclusive_from: bool = false,
@@ -3748,6 +3760,10 @@ pub const StorageKernelScanWireRequest = struct {
 
     pub fn options(self: StorageKernelScanWireRequest) db_mod.types.ScanOptions {
         return .{
+            .privacy_policy_version = self.privacy_policy_version,
+            .privacy_original = self.privacy_original,
+            .privacy_status = self.privacy_status,
+            .resume_from_key = self.resume_from_key,
             .inclusive_from = self.inclusive_from,
             .exclusive_to = self.exclusive_to,
             .include_documents = self.include_documents,
@@ -3782,6 +3798,10 @@ pub fn encodeStorageKernelScanRequest(
     opts: db_mod.types.ScanOptions,
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, StorageKernelScanWireRequest{
+        .privacy_policy_version = opts.privacy_policy_version,
+        .privacy_original = opts.privacy_original,
+        .privacy_status = opts.privacy_status,
+        .resume_from_key = opts.resume_from_key,
         .from_key = from_key,
         .to_key = to_key,
         .inclusive_from = opts.inclusive_from,

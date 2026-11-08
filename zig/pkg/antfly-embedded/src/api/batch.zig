@@ -1971,7 +1971,13 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     }
     if (req.artifact_publication) |control| {
         try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"artifact_publication_v1\"},\"_artifact_publication\":");
-        const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
+        const CompactPublication = struct {
+            command: @import("../storage/db/artifact_publication.zig").Command,
+            pub fn jsonStringify(self: @This(), stream: anytype) !void {
+                try @import("../storage/db/artifact_publication_wire.zig").writeCompact(self.command, stream);
+            }
+        };
+        const encoded = try std.json.Stringify.valueAlloc(alloc, CompactPublication{ .command = control }, .{});
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
     }

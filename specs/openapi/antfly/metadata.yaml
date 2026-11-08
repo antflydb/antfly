@@ -55,6 +55,9 @@ servers:
   - url: /db/v1
     description: Main API server
 tags:
+  - name: table_privacy
+    x-displayName: Table Privacy
+    description: Table policies, bounded previews, durable inspection scans and source-bound findings. Privacy inspection and configuration require table administration permission.
   - name: resolver_curation
     description: Durable resolver identity correction, suppression, review and replay.
   - name: getting_started
@@ -1251,6 +1254,28 @@ components:
       schema:
         type: string
   schemas:
+    PrivacyProducer:
+      $ref: "privacy.yaml#/components/schemas/PrivacyProducer"
+    PrivacyCategory:
+      $ref: "privacy.yaml#/components/schemas/PrivacyCategory"
+    PrivacyPolicy:
+      $ref: "privacy.yaml#/components/schemas/PrivacyPolicy"
+    PrivacyFinding:
+      $ref: "privacy.yaml#/components/schemas/PrivacyFinding"
+    PrivacyStatus:
+      $ref: "privacy.yaml#/components/schemas/PrivacyStatus"
+    PrivacyPreviewRequest:
+      $ref: "privacy.yaml#/components/schemas/PrivacyPreviewRequest"
+    PrivacyPreview:
+      $ref: "privacy.yaml#/components/schemas/PrivacyPreview"
+    PrivacyScanRequest:
+      $ref: "privacy.yaml#/components/schemas/PrivacyScanRequest"
+    PrivacyScan:
+      $ref: "privacy.yaml#/components/schemas/PrivacyScan"
+    PrivacyFindingsRequest:
+      $ref: "privacy.yaml#/components/schemas/PrivacyFindingsRequest"
+    PrivacyFindingsPage:
+      $ref: "privacy.yaml#/components/schemas/PrivacyFindingsPage"
     LakeCatalogCreateRequest:
       type: object
       additionalProperties: false
@@ -11752,6 +11777,9 @@ components:
         remote_snapshot:
           type: string
           description: Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
+        live_read:
+          type: boolean
+          description: True when an ordered query read live state because this deployment's storage (Lite) cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or search_before.
         evaluation:
           type: object
           additionalProperties: true
@@ -12636,6 +12664,522 @@ components:
               - $ref: "#/components/schemas/TableStorageUnreadableError"
 
 paths:
+  /tables/{tableName}/privacy:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [table_privacy]
+      operationId: getTablePrivacy
+      summary: Read table privacy policy and coverage
+      responses:
+        "200":
+          description: Read table privacy policy and coverage
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyStatus"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+    put:
+      tags: [table_privacy]
+      operationId: putTablePrivacy
+      summary: Apply table privacy policy
+      parameters:
+        - name: If-Match
+          in: header
+          schema: {type: string}
+          description: Required exact ETag when replacing an existing policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyPolicy"}
+      responses:
+        "202":
+          description: Apply table privacy policy
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyStatus"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+  /tables/{tableName}/privacy/preview:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: previewTablePrivacy
+      summary: Inspect a bounded sample without saving the policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyPreviewRequest"}
+      responses:
+        "200":
+          description: Inspect a bounded sample without saving the policy
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyPreview"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+  /tables/{tableName}/privacy/scans:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: startTablePrivacyScan
+      summary: Start a durable privacy rescan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyScanRequest"}
+      responses:
+        "202":
+          description: Start a durable privacy rescan
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyScan"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Sixteen scans are active; retry after one finishes. Active scans are never evicted to admit a later request.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+  /tables/{tableName}/privacy/scans/{scanId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: scanId
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [table_privacy]
+      operationId: getTablePrivacyScan
+      summary: Read privacy scan progress
+      responses:
+        "200":
+          description: Read privacy scan progress
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyScan"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+  /tables/{tableName}/privacy/findings:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [table_privacy]
+      operationId: listTablePrivacyFindings
+      summary: List current privacy findings
+      parameters:
+        - name: cursor
+          in: query
+          schema: {type: string}
+        - name: document
+          in: query
+          schema: {type: string}
+        - name: field
+          in: query
+          schema: {type: string}
+        - name: category
+          in: query
+          schema: {type: string}
+        - name: policy_version
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer}
+      responses:
+        "200":
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: queryTablePrivacyFindings
+      summary: List current privacy findings with body filters
+      description: Equivalent to GET findings, with filters and continuation in JSON so large document identifiers do not exceed URL limits.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsRequest"}
+      responses:
+        "200":
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
   /tables/{tableName}/lake/catalog:
     parameters:
       - name: tableName
@@ -21502,3 +22046,564 @@ paths:
           description: Revision or terminal decision conflict
         "500":
           $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [table_privacy]
+      operationId: getNamespaceTablePrivacy
+      summary: Read table privacy policy and coverage
+      responses:
+        "200":
+          description: Read table privacy policy and coverage
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyStatus"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+    put:
+      tags: [table_privacy]
+      operationId: putNamespaceTablePrivacy
+      summary: Apply table privacy policy
+      parameters:
+        - name: If-Match
+          in: header
+          schema: {type: string}
+          description: Required exact ETag when replacing an existing policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyPolicy"}
+      responses:
+        "202":
+          description: Apply table privacy policy
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyStatus"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/preview:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: previewNamespaceTablePrivacy
+      summary: Inspect a bounded sample without saving the policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyPreviewRequest"}
+      responses:
+        "200":
+          description: Inspect a bounded sample without saving the policy
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyPreview"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: startNamespaceTablePrivacyScan
+      summary: Start a durable privacy rescan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyScanRequest"}
+      responses:
+        "202":
+          description: Start a durable privacy rescan
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyScan"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Sixteen scans are active; retry after one finishes. Active scans are never evicted to admit a later request.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans/{scanId}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: scanId
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [table_privacy]
+      operationId: getNamespaceTablePrivacyScan
+      summary: Read privacy scan progress
+      responses:
+        "200":
+          description: Read privacy scan progress
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyScan"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/findings:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [table_privacy]
+      operationId: listNamespaceTablePrivacyFindings
+      summary: List current privacy findings
+      parameters:
+        - name: cursor
+          in: query
+          schema: {type: string}
+        - name: document
+          in: query
+          schema: {type: string}
+        - name: field
+          in: query
+          schema: {type: string}
+        - name: category
+          in: query
+          schema: {type: string}
+        - name: policy_version
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer}
+      responses:
+        "200":
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+    post:
+      tags: [table_privacy]
+      operationId: queryNamespaceTablePrivacyFindings
+      summary: List current privacy findings with body filters
+      description: Equivalent to GET findings, with filters and continuation in JSON so large document identifiers do not exceed URL limits.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsRequest"}
+      responses:
+        "200":
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "privacy.yaml#/components/schemas/PrivacyFindingsPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "403":
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "412":
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "422":
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+        "428":
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
