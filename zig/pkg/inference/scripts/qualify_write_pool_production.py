@@ -67,6 +67,31 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
 
 
+def recognition_equivalent(reference, candidate):
+    """Preserve JSON count/identity types; only real-valued scores may drift."""
+    if isinstance(reference, dict):
+        assert isinstance(candidate, dict) and reference.keys() == candidate.keys()
+        for key in reference:
+            recognition_equivalent(reference[key], candidate[key])
+    elif isinstance(reference, list):
+        assert isinstance(candidate, list) and len(reference) == len(candidate)
+        for left, right in zip(reference, candidate, strict=True):
+            recognition_equivalent(left, right)
+    elif type(reference) is int:
+        assert type(candidate) is int and candidate == reference, (reference, candidate)
+    elif type(reference) is float:
+        assert (
+            type(candidate) in (int, float)
+            and math.isfinite(candidate)
+            and abs(reference - candidate) <= 0.0005
+        ), (reference, candidate)
+    else:
+        assert type(reference) is type(candidate) and reference == candidate, (
+            reference,
+            candidate,
+        )
+
+
 def assert_equivalent(kind, reference, candidate):
     if kind == "embed":
         return embedding_equivalent(reference, candidate)
@@ -80,6 +105,19 @@ def assert_equivalent(kind, reference, candidate):
             attribution = response.get("execution")
             if attribution is not None:
                 assert isinstance(attribution, dict), "invalid execution attribution"
+                for field, count in attribution.items():
+                    if field in (
+                        "requested_items",
+                        "rejected_items",
+                        "native_batches",
+                        "native_items",
+                        "max_native_step_items",
+                        "serial_items",
+                        "fallback_items",
+                    ):
+                        assert type(count) is int and count >= 0, (
+                            "invalid execution count"
+                        )
                 for field in (
                     "native_batches",
                     "native_items",
@@ -89,8 +127,18 @@ def assert_equivalent(kind, reference, candidate):
                 ):
                     attribution.pop(field, None)
         try:
-            equivalent(left["usage"], right["usage"], tolerance=0)
-            equivalent(left, right, tolerance=0.0005)
+            for response in (left, right):
+                for item in response["data"]:
+                    if "index" in item:
+                        assert type(item["index"]) is int and item["index"] >= 0, (
+                            "invalid recognition item index"
+                        )
+                for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    count = response["usage"][field]
+                    assert type(count) is int and count >= 0, (
+                        "invalid recognition token count"
+                    )
+            recognition_equivalent(left, right)
         except (AttributeError, TypeError, KeyError) as error:
             raise AssertionError("recognition response contract changed") from error
         assert all(item.get("status") == "complete" for item in candidate["data"]), (
@@ -969,6 +1017,8 @@ def main():
         help="Allow a shorter soak; never promote this receipt as full qualification",
     )
     args = p.parse_args()
+    if not math.isfinite(args.soak_seconds) or args.soak_seconds < 0:
+        p.error("soak duration must be finite and nonnegative")
     if args.rounds < 3 or args.soak_rounds < 20:
         p.error(
             "qualification requires at least three controlled rounds and twenty turnover rounds"

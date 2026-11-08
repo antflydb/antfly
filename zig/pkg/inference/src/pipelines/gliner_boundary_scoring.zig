@@ -76,6 +76,16 @@ pub const ExplicitRequest = struct {
     capacity: usize,
     indices: []const head.SignedSpan, // [selected_queries, capacity]
     valid_mask: ?[]const bool = null,
+
+    pub fn validate(self: ExplicitRequest, limits: anytype) !void {
+        if (self.query_ids.len > limits.max_queries or self.capacity > limits.max_explicit_candidates) return error.ExtractionCandidateLimitExceeded;
+        if (comptime @hasField(@TypeOf(limits), "max_explicit_elements")) {
+            if (self.indices.len > limits.max_explicit_elements) return error.ExtractionCandidateLimitExceeded;
+        }
+        if (comptime @hasField(@TypeOf(limits), "max_intermediate_bytes")) {
+            if ((std.math.mul(usize, self.indices.len, @sizeOf(head.SignedSpan)) catch return error.ExtractionCandidateLimitExceeded) > limits.max_intermediate_bytes) return error.ExtractionCandidateLimitExceeded;
+        }
+    }
 };
 pub const ExplicitScores = struct {
     storage: Storage,
@@ -171,8 +181,7 @@ pub const Scorer = struct {
         return self.classify_fn(self.context, allocator, limits, control);
     }
     pub fn explicit(self: Scorer, allocator: Allocator, request: ExplicitRequest, limits: head.Limits, control: ?Control) !ExplicitScores {
-        if (request.query_ids.len > limits.max_queries or request.capacity > limits.max_explicit_candidates or
-            (std.math.mul(usize, request.indices.len, @sizeOf(head.SignedSpan)) catch return error.ExtractionCandidateLimitExceeded) > limits.max_intermediate_bytes) return error.ExtractionCandidateLimitExceeded;
+        try request.validate(limits);
         return self.explicit_fn(self.context, allocator, request, limits, control);
     }
     pub fn relations(self: Scorer, allocator: Allocator, request: RelationRequest, limits: tasks.Limits, control: ?Control) !RelationScores {
@@ -317,4 +326,15 @@ test "gliner microbatch record admission distinguishes row ceilings before score
     try std.testing.expectError(error.InvalidBoundaryScorerRouting, request.validate(2, DeviceLimits{}));
     request.anchor_field = 0;
     try request.validate(2, DeviceLimits{});
+}
+
+test "gliner microbatch explicit admission honors tighter device-only ceilings" {
+    const DeviceLimits = @import("../architectures/gliner/boundary_device_math.zig").Limits;
+    const request = ExplicitRequest{ .sample_index = 0, .query_ids = &.{0}, .capacity = 2, .indices = &.{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } } };
+    try request.validate(head.Limits{});
+    try request.validate(DeviceLimits{});
+    try std.testing.expectError(error.ExtractionCandidateLimitExceeded, request.validate(DeviceLimits{ .max_explicit_elements = 1 }));
+    try std.testing.expectError(error.ExtractionCandidateLimitExceeded, request.validate(DeviceLimits{ .max_explicit_candidates = 1 }));
+    try std.testing.expectError(error.ExtractionCandidateLimitExceeded, request.validate(DeviceLimits{ .max_queries = 0 }));
+    try std.testing.expectError(error.ExtractionCandidateLimitExceeded, request.validate(head.Limits{ .max_intermediate_bytes = @sizeOf(head.SignedSpan) }));
 }

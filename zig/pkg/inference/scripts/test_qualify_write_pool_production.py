@@ -16,6 +16,10 @@
 from qualify_write_pool_production import require_extraction_observations
 
 import copy
+import io
+from contextlib import redirect_stderr
+from unittest.mock import patch
+import qualify_write_pool_production as production
 import unittest
 
 import qualify_read_pool_40g as q
@@ -170,6 +174,70 @@ class QualificationTests(unittest.TestCase):
                     self.assertRaises(AssertionError),
                 ):
                     assert_equivalent(kind, reference, changed)
+
+    def test_recognition_rejects_boolean_and_fractional_counts(self):
+        reference = {
+            "model": "m",
+            "data": [{"index": 0, "text": "ok", "status": "complete"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "execution": {"requested_items": 1, "rejected_items": 0},
+        }
+        for kind in ("whisper", "ocr"):
+            for field, value in (
+                ("prompt_tokens", False),
+                ("prompt_tokens", 0.0),
+                ("index", 0.0001),
+                ("requested_items", 1.0001),
+                ("rejected_items", False),
+            ):
+                observed = copy.deepcopy(reference)
+                if field == "prompt_tokens":
+                    observed["usage"][field] = value
+                elif field == "index":
+                    observed["data"][0][field] = value
+                else:
+                    observed["execution"][field] = value
+                with (
+                    self.subTest(kind=kind, field=field, value=value),
+                    self.assertRaises(AssertionError),
+                ):
+                    assert_equivalent(kind, reference, observed)
+            for location, field in (
+                ("usage", "prompt_tokens"),
+                ("execution", "requested_items"),
+                ("execution", "rejected_items"),
+            ):
+                malformed = copy.deepcopy(reference)
+                malformed[location][field] = False
+                with self.assertRaises(AssertionError):
+                    assert_equivalent(kind, malformed, malformed)
+
+    def test_nonfinite_duration_cannot_bypass_full_qualification(self):
+        for duration in ("nan", "inf", "-inf", "-1"):
+            argv = [
+                "qualification",
+                "--binary",
+                "server",
+                "--config",
+                "config",
+                "--cgroup",
+                "cgroup",
+                "--speech-corpus",
+                "corpus",
+                "--output",
+                "unused",
+                "--soak-seconds=" + duration,
+            ]
+            stderr = io.StringIO()
+            with (
+                self.subTest(duration=duration),
+                patch.object(production.sys, "argv", argv),
+                redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                production.main()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("finite and nonnegative", stderr.getvalue())
 
     def test_regression_and_promotion_are_separate_gates(self):
         self.assertFalse(latency_gate(1, 1, [0.9])["promotion_10_percent_pass"])

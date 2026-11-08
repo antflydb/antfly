@@ -151,8 +151,9 @@ pub const Context = struct {
     fn explicit(raw: *anyopaque, allocator: Allocator, request: scoring.ExplicitRequest, limits: cpu_head.Limits, control: ?scoring.Control) !scoring.ExplicitScores {
         const self = get(raw);
         try self.sample(request.sample_index, control);
-        if (request.query_ids.len > limits.max_queries or request.capacity > limits.max_explicit_candidates or try mul(request.indices.len, 4) > limits.max_intermediate_bytes) return error.ExtractionCandidateLimitExceeded;
+        try request.validate(limits);
         const headed = self.head_result orelse return error.MissingBoundaryScores;
+        try request.validate(headed.context().limits);
         var result = try headed.scoreExplicitSubset(request.sample_index, request.query_ids, .{ .capacity = request.capacity, .indices = request.indices, .valid_mask = request.valid_mask });
         defer result.deinit();
         var storage = try scoring.Storage.init(allocator);
