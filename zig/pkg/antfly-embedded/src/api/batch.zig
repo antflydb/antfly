@@ -105,6 +105,7 @@ const private_fields = [_][]const u8{
     "_artifact_catalog",
     "_artifact_publication",
     "_artifact_publication_transport",
+    "_document_version_scheme",
     "_graph_deletes",
     "_graph_endpoint_cleanup",
     "_graph_endpoint_cleanup_guards",
