@@ -21106,7 +21106,7 @@ pub const DB = struct {
     /// statement cohort. Borrowing the supplied fences avoids reacquiring an
     /// exclusive admission lock or waiting for replay while replay is frozen.
     pub fn captureQueryCutAtStatementFence(self: *DB, request: @import("native_query_cut_contract.zig").Request, fence: *const StatementReadFence, cancellation: types.CancellationToken) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("captureQueryCutAtStatementFence", .{ self, request, fence.handle, cancellation });
+        if (comptime storage_engine.enabled) return storage_engine.call("captureQueryCutAtStatementFence", .{ self, request, (fence.handle orelse return error.InvalidArgument), cancellation });
         const cut = @import("native_query_cut.zig");
         try request.validate(cut.nowMs());
         if (!request.create or request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
@@ -28873,7 +28873,7 @@ pub const DB = struct {
         return self.graphEdgesForCypherPageInternal(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database, null);
     }
     pub fn graphEdgesForCypherCapturePageAuthorizedAt(self: *DB, fence: *const StatementReadFence, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8) !graph_mod.CypherEdgePage {
-        if (comptime storage_engine.enabled) return storage_engine.call("graphEdgesForCypherCapturePageAuthorizedAt", .{ self, fence.handle, alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database });
+        if (comptime storage_engine.enabled) return storage_engine.call("graphEdgesForCypherCapturePageAuthorizedAt", .{ self, (fence.handle orelse return error.InvalidArgument), alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database });
         if (fence.owner != @as(*const anyopaque, self)) return error.CypherSnapshotRequired;
         return self.graphEdgesForCypherPageInternal(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database, fence);
     }
@@ -28903,12 +28903,12 @@ pub const DB = struct {
     pub const CypherEdgeScanCursor = graph_mod.CypherEdgeScanCursor;
     pub const CypherEdgePage = graph_mod.CypherEdgePage;
     pub fn captureCypherPinnedSnapshot(self: *DB, alloc: Allocator, fence: *const StatementReadFence, graph: @import("cypher").catalog.Graph, table: []const u8) !CypherPinnedSnapshot {
-        if (comptime storage_engine.enabled) return storage_engine.call("captureCypherPinnedSnapshot", .{ self, alloc, fence.handle, graph, table });
+        if (comptime storage_engine.enabled) return storage_engine.call("captureCypherPinnedSnapshot", .{ self, alloc, (fence.handle orelse return error.InvalidArgument), graph, table });
         return @import("cypher_pinned_read.zig").capture(self, alloc, fence, graph, table);
     }
     /// Retain local immutable roots for a non-resumable graph statement.
     pub fn captureCypherSelectedSnapshot(self: *DB, alloc: Allocator, fence: *const StatementReadFence, names: []const []const u8, now: u64, cancellation: types.CancellationToken) !CypherPinnedSnapshot {
-        if (comptime storage_engine.enabled) return storage_engine.call("captureCypherSelectedSnapshot", .{ self, alloc, fence.handle, names, now, cancellation });
+        if (comptime storage_engine.enabled) return storage_engine.call("captureCypherSelectedSnapshot", .{ self, alloc, (fence.handle orelse return error.InvalidArgument), names, now, cancellation });
         if (fence.owner != @as(*const anyopaque, self) or !fence.primary.active or !fence.replay.active or fence.primary.admission != self.core.snapshot_admission or fence.replay.admission != self.core.snapshot_replay_admission) return error.CypherSnapshotRequired;
         try cancellation.check();
         try self.enforcePortableRuntimeGate();
@@ -28927,6 +28927,27 @@ pub const DB = struct {
         errdefer cut.deinit();
         try cancellation.check();
         return cut;
+    }
+    pub fn openCypherPinnedDocumentSession(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
+        if (comptime storage_engine.enabled) return DocumentReadSession.fromHandle(alloc, try storage_engine.call("openCypherPinnedDocumentSession", .{ self, alloc, cut, from, to, opts }));
+        var schema = self.core.acquireSchemaView();
+        defer if (schema) |*view| view.release();
+        if ((if (schema) |view| view.version() else 0) != cut.schema_version) return error.SchemaVersionChanged;
+        return DocumentReadSession.openSnapshot(alloc, self.core.store, try cut.primary.forkRead(), schema, cut.byte_range, from, to, opts, cut.now);
+    }
+    pub fn openCypherPinnedRelationalSession(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) !*RelationalReadSession {
+        if (comptime storage_engine.enabled) return RelationalReadSession.fromHandle(alloc, try storage_engine.call("openCypherPinnedRelationalSession", .{ self, alloc, cut, from, to, opts }));
+        var statement: RelationalStatementSnapshot = snapshot: {
+            var read = try cut.primary.forkRead();
+            errdefer read.abort();
+            const lease = try self.acquireCypherReadAuthority(alloc, opts.row_policy_principal_proof, opts.row_policy_database);
+            break :snapshot .{ .index_catalog_captured = true, .indexes = if (cut.indexes) |indexes| .{ .head = indexes.head, .plan = indexes.plan.clone() } else null, .read = read, .schema_version = cut.schema_version, .row_policy_lease = lease, .row_policy_phase = cut.row_policy_phase, .row_policy_generation = cut.row_policy_generation, .row_policy_catalog_epoch = cut.row_policy_catalog_epoch };
+        };
+        defer statement.deinit();
+        const session = try self.openRelationalReadSessionAtSnapshot(alloc, from, to, opts, &statement);
+        errdefer session.deinit();
+        try session.setReadTime(cut.now);
+        return session;
     }
     pub fn getCypherPinnedDocument(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         if (comptime storage_engine.enabled) return storage_engine.call("getCypherPinnedDocument", .{ self, alloc, cut, key, opts });

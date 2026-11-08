@@ -54,7 +54,7 @@ fn run(db: *DB, alloc: std.mem.Allocator, out: *contract.ProbeResult) !void {
     if (@import("builtin").is_test or !engine.enabled) return error.UnsupportedVersion;
     const descriptor = engine.descriptorForValidation();
     mark(out, "descriptor_version");
-    if (descriptor.version != 37) return error.UnsupportedVersion;
+    if (descriptor.version != 38) return error.UnsupportedVersion;
     inline for (@typeInfo(engine.Descriptor).@"struct".field_names, @typeInfo(engine.Descriptor).@"struct".field_types) |field, T| {
         if (comptime T == @TypeOf(engine.table_layout)) {
             const actual = @field(descriptor.*, field);
@@ -100,6 +100,33 @@ fn run(db: *DB, alloc: std.mem.Allocator, out: *contract.ProbeResult) !void {
             out.guarded += 1;
         }
     }
+    mark(out, "cypher_session_operations");
+    const bounded_session = try db.openRelationalReadSessionAtSnapshot(alloc, "", "", .{ .relational_query_json = "{\"fields\":[\"id\"],\"schema_version\":1}" }, &snapshot);
+    var bounded_open = true;
+    defer if (bounded_open) bounded_session.deinit();
+    if (bounded_session.schemaVersion() != snapshot.schema_version or bounded_session.indexName() != null) return error.InvalidArgument;
+    try bounded_session.setReadTime(100);
+    if (bounded_session.seekPrefix(&.{.{ .integer = 1 }}, null)) |_| return error.InvalidArgument else |err| {
+        if (err != error.InvalidRelationalRowsRequest) return err;
+    }
+    var bounded_page = try bounded_session.nextPage(alloc, null, .{ .rows = 1 });
+    defer bounded_page.deinit();
+    bounded_session.deinit();
+    bounded_open = false;
+    if (bounded_page.owner_release == null or bounded_page.rows.len != 1 or std.mem.indexOf(u8, bounded_page.rows[0].json, "1") == null) return error.InvalidArgument;
+    const visit_session = try db.openRelationalReadSessionAtSnapshot(alloc, "", "", .{ .relational_query_json = "{\"fields\":[\"id\"],\"schema_version\":1}" }, &snapshot);
+    defer visit_session.deinit();
+    const Sink = struct {
+        rows: usize = 0,
+        fn visit(raw: ?*anyopaque, entry: local.storage_db_types.ScanVisitEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!std.mem.eql(u8, entry.id, "a")) return error.InvalidArgument;
+            self.rows += 1;
+        }
+    };
+    var sink: Sink = .{};
+    try visit_session.visitCypherRows(alloc, 1, .{ .borrow_documents = true, .context = &sink, .visit = Sink.visit });
+    if (sink.rows != 1) return error.InvalidArgument;
     mark(out, "close_statement");
     snapshot.deinit();
     snapshot_open = false;

@@ -46,6 +46,10 @@ pub const PortableExportOptions = struct {
 };
 
 pub const VTable = struct {
+    hasPublicationReadLease: *const fn ([]const u8, ?native.IoBorrow) Outcome(bool),
+    acquirePublicationReadLease: *const fn (Allocator, []const u8, ?native.IoBorrow) Outcome(?@import("read_session_values.zig").PublicationReadLease),
+    openCypherPinnedRelationalSession: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, types.ScanOptions) Outcome(session_contract.Handle),
+    openCypherPinnedDocumentSession: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, types.ScanOptions) Outcome(session_contract.Handle),
     materializeRestoreSourceDecoder: *const fn (*const @import("db/generation_lifecycle.zig").StagedGeneration, Allocator, native.IoBorrow, []const u8, OpenOptions, @import("restore_decoder_contract.zig").Plan) Outcome(void),
     enqueueGeneratedArtifactCatalog: *const fn (*DB) Outcome(void),
     captureQueryCutAtStatementFence: *const fn (self: *DB, request: @import("db/native_query_cut_contract.zig").Request, fence: session_contract.Handle, cancellation: types.CancellationToken) Outcome(void),
@@ -553,7 +557,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 37,
+    version: u32 = 38,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -580,6 +584,7 @@ pub const Descriptor = extern struct {
     read_array_stored_validation_layout: native.TypeContract,
     read_session_handle_layout: native.TypeContract,
     retained_query_lease_layout: native.TypeContract,
+    publication_read_lease_layout: native.TypeContract,
     query_read_lease_handle_layout: native.TypeContract,
     query_read_lease_operations_layout: native.TypeContract,
     read_reader_request_layout: native.TypeContract,
@@ -728,7 +733,7 @@ pub fn descriptorForValidation() *const Descriptor {
     return antfly_storage_engine_get_descriptor_v29();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 37 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 38 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or
@@ -752,6 +757,7 @@ pub fn validateDescriptor(descriptor: *const Descriptor) !void {
         !descriptor.read_array_stored_validation_layout.matches(read_array_stored_validation_layout) or
         !descriptor.read_session_handle_layout.matches(read_session_handle_layout) or
         !descriptor.retained_query_lease_layout.matches(retained_query_lease_layout) or
+        !descriptor.publication_read_lease_layout.matches(publication_read_lease_layout) or
         !descriptor.query_read_lease_handle_layout.matches(query_read_lease_handle_layout) or
         !descriptor.query_read_lease_operations_layout.matches(query_read_lease_operations_layout) or
         !descriptor.read_reader_request_layout.matches(read_reader_request_layout) or
@@ -842,6 +848,7 @@ pub const read_reader_ordinal_view_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("read_reader_values.zig").OrdinalRowView);
 };
+pub const publication_read_lease_layout = native.TypeContract.of(@import("read_session_values.zig").PublicationReadLease);
 pub const retained_query_lease_layout = native.TypeContract.of(@import("db/native_query_cut_contract.zig").ReadLease);
 pub const read_session_handle_layout = blk: {
     @setEvalBranchQuota(100_000);

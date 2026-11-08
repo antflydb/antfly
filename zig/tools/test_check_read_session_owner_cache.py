@@ -125,6 +125,23 @@ class SessionCompilerAttribution(unittest.TestCase):
             self.assertEqual(state, "cached" if role.endswith("client") else "success")
         self.assertIn("capture_fence_state", cache.PROFILES["capture"])
 
+    def test_publication_profile_distinguishes_private_holder_and_shared_capability(
+        self,
+    ):
+        self.assertEqual(
+            set(cache.expected_states("shared_publication_lease").values()), {"success"}
+        )
+        for role, state in cache.expected_states("publication_lease_state").items():
+            self.assertEqual(state, "cached" if role.endswith("client") else "success")
+        self.assertEqual(
+            cache.PROFILES["publication"],
+            ("publication_lease_state", "shared_publication_lease"),
+        )
+        relative, _ = cache.EDITS["publication_lease_state"]
+        source = (cache.ZIG / relative).read_text()
+        modified = cache.field_probe("publication_lease_state", source)
+        self.assertIn("        cache_isolation_epoch: u64 = 0,", modified)
+
     def test_shared_reader_request_is_not_treated_as_private_state(self):
         self.assertEqual(
             set(cache.expected_states("shared_reader_request").values()), {"success"}

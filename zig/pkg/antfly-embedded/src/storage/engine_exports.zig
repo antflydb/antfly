@@ -55,6 +55,56 @@ fn close(self: *DB) engine.Outcome(void) {
 }
 
 const graph_mod = @import("../graph/graph.zig");
+fn hasPublicationReadLease(path: []const u8, io: ?native.IoBorrow) engine.Outcome(bool) {
+    const lifecycle = @import("db/generation_lifecycle.zig");
+    var receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (io) |borrow| borrow.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
+    return .{ .value = (if (receiver) |*value| lifecycle.hasPublishedGenerationReadWithIo(path, value.io()) else lifecycle.hasPublishedGenerationRead(path)) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn acquirePublicationReadLease(alloc: Allocator, path: []const u8, io: ?native.IoBorrow) engine.Outcome(?@import("read_session_values.zig").PublicationReadLease) {
+    const lifecycle = @import("db/generation_lifecycle.zig");
+    const Lease = @import("read_session_values.zig").PublicationReadLease;
+    const borrow = io orelse return .{ .value = lifecycle.acquirePublishedGenerationRead(alloc, path) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    // The receiver can outlive this acquisition call because the lease retains
+    // its file executor. Keep it at a stable address until the file closes.
+    const Owner = struct {
+        alloc: Allocator,
+        receiver: @import("antfly_runtime_abi").io_abi.Receiver,
+        lease: Lease,
+        fn close(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const allocator = self.alloc;
+            self.lease.deinit();
+            allocator.destroy(self);
+        }
+    };
+    const owner = alloc.create(Owner) catch |err| return .{ .failure = .init(@errorName(err)) };
+    owner.* = .{ .alloc = alloc, .receiver = borrow.receive() catch |err| {
+        alloc.destroy(owner);
+        return .{ .failure = .init(@errorName(err)) };
+    }, .lease = .{} };
+    const issued = lifecycle.acquirePublishedGenerationReadWithIo(alloc, path, owner.receiver.io()) catch |err| {
+        alloc.destroy(owner);
+        return .{ .failure = .init(@errorName(err)) };
+    };
+    if (issued) |lease| {
+        owner.lease = lease;
+        return .{ .value = Lease{ .context = owner, .close_fn = Owner.close } };
+    }
+    alloc.destroy(owner);
+    return .{ .value = null };
+}
+
+fn openCypherPinnedDocumentSession(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) engine.Outcome(session_contract.Handle) {
+    const session = self.openCypherPinnedDocumentSession(alloc, cut, from, to, opts) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = @import("read_session_provider.zig").retainDocument(session) };
+}
+
+fn openCypherPinnedRelationalSession(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) engine.Outcome(session_contract.Handle) {
+    const session = self.openCypherPinnedRelationalSession(alloc, cut, from, to, opts) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = @import("read_session_provider.zig").retainRelational(session) };
+}
+
 fn captureQueryCutAtStatementFence(self: *DB, request: @import("db/native_query_cut_contract.zig").Request, handle: session_contract.Handle, cancellation: types.CancellationToken) engine.Outcome(void) {
     const fence = @import("read_session_provider.zig").resolveFence(handle, self) catch |err| return .{ .failure = .init(@errorName(err)) };
     return .{ .value = self.captureQueryCutAtStatementFence(request, fence, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
@@ -2109,6 +2159,7 @@ const descriptor: engine.Descriptor = .{
     .read_array_stored_validation_layout = engine.read_array_stored_validation_layout,
     .read_session_handle_layout = engine.read_session_handle_layout,
     .retained_query_lease_layout = engine.retained_query_lease_layout,
+    .publication_read_lease_layout = engine.publication_read_lease_layout,
     .query_read_lease_handle_layout = engine.query_read_lease_handle_layout,
     .query_read_lease_operations_layout = engine.query_read_lease_operations_layout,
     .read_reader_request_layout = engine.read_reader_request_layout,

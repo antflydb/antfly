@@ -365,6 +365,10 @@ pub const Reader = struct {
         if (selected_index) |index| if (request.include_cursor) {
             cursor_identity = row_cursor_codec.orderedIdentity(active_view.version(), index.name, index.tuple.fingerprint, request.reverse);
         };
+        // Finish arena allocations before moving its state into the reader.
+        // A later chunk allocated through `owned` would be missing from a copy.
+        const presence = try clonePresence(owned, request.cypher_presence_fields);
+        const projection = try Source.cypher_projection.decode(owned, request.cypher_projection_json);
         return .{
             .alloc = alloc,
             .arena = arena,
@@ -379,8 +383,8 @@ pub const Reader = struct {
             .owned_lower = owned_lower,
             .owned_upper = owned_upper,
             .fields = fields,
-            .cypher_presence_fields = try clonePresence(owned, request.cypher_presence_fields),
-            .cypher_projection = try Source.cypher_projection.decode(owned, request.cypher_projection_json),
+            .cypher_presence_fields = presence,
+            .cypher_projection = projection,
             .now_ns = now_ns,
             .authenticated = authenticated,
             .include_primary_digest = request.include_primary_digest,

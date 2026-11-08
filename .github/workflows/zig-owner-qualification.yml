@@ -152,7 +152,7 @@ jobs:
         run: zig test --dep antfly_hash -Mroot=pkg/antfly-embedded/src/lake_avro_worker_test_root.zig -Mantfly_hash=lib/hash/src/mod.zig -lc --test-filter 'iceberg avro'
       - name: Compile the PDF consumer without scheduling its owner
         working-directory: zig
-        run: python3 tools/run_bounded_zig_build.py -- build opaque-pdf-consumer-compile -Dshared-image-operations=true -Doptimize=debug -Dstrip=false -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1
+        run: python3 tools/run_bounded_zig_build.py -- build opaque-pdf-consumer-compile -Dshared-image-operations=true -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1
 
   functional:
     name: Native owner equivalence / Linux x86_64
@@ -209,13 +209,24 @@ jobs:
           mkdir -p .benchmark-results/owner-qualification
           uname -a > .benchmark-results/owner-qualification/host.txt
           zig version > .benchmark-results/owner-qualification/zig.txt
+      # Behavioral checks omit debug information; the production archive job
+      # below retains symbols for ownership and trace diagnostics.
       - name: Source/native image, retained PDF, and lake equivalence
         working-directory: zig
         run: |
           set -euo pipefail
-          python3 tools/run_bounded_zig_build.py -- build compiled-image-native-test compiled-pdf-native-test lake-execution-abi-integration-test mutation-resource-frame-test runtime-io-abi-test -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=false -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1 2>&1 | tee ../.benchmark-results/owner-qualification/equivalence.log
+          python3 tools/run_bounded_zig_build.py -- build compiled-image-native-test compiled-pdf-native-test lake-execution-abi-integration-test mutation-resource-frame-test runtime-io-abi-test -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1 2>&1 | tee ../.benchmark-results/owner-qualification/equivalence.log
           python3 tools/check_image_owner_transport.py --build-log ../.benchmark-results/owner-qualification/equivalence.log --report ../.benchmark-results/owner-qualification/image-equivalence.json
-          python3 tools/run_bounded_zig_build.py -- build lake-integration-test '-Dtest-filter=external lake execution' -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=false -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1 2>&1 | tee ../.benchmark-results/owner-qualification/lake-source.log
+          python3 tools/run_bounded_zig_build.py -- build lake-integration-test '-Dtest-filter=external lake execution' -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1 2>&1 | tee ../.benchmark-results/owner-qualification/lake-source.log
+      - name: Qualify full and storage C library compositions
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          : > ../.benchmark-results/owner-qualification/libantfly-debug-stripped-sizes.tsv
+          for profile in full storage; do
+            python3 tools/run_bounded_zig_build.py -- build capi capi-smoke "-Dcapi-profile=$profile" -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1
+            printf '%s\t%s\n' "$profile" "$(stat -c '%s' zig-out/lib/libantfly.so)" >> ../.benchmark-results/owner-qualification/libantfly-debug-stripped-sizes.tsv
+          done
       - name: Whole lake operation runtime and allocation probe
         working-directory: zig
         run: python3 tools/check_lake_execution_runtime.py --report ../.benchmark-results/owner-qualification/lake-runtime.json --rows 1024 --rounds 4
@@ -354,6 +365,7 @@ jobs:
           python3 tools/check_public_mutation_cache.py --report ../.benchmark-results/production-owners/public-mutation-cache.json
           python3 tools/check_read_session_owner_cache.py --report ../.benchmark-results/production-owners/read-session-cache.json
           python3 tools/check_read_session_owner_cache.py --profile capture --report ../.benchmark-results/production-owners/statement-capture-cache.json
+          python3 tools/check_read_session_owner_cache.py --profile publication --strip --report ../.benchmark-results/production-owners/publication-lease-cache.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -403,7 +415,7 @@ jobs:
           test "$(sysctl -n hw.memsize)" -ge 38654705664
           mkdir -p ../.benchmark-results/owner-cache
           sw_vers > ../.benchmark-results/owner-cache/host.txt
-          python3 tools/run_bounded_zig_build.py -- build compiled-image-native-test compiled-pdf-native-test lake-execution-abi-integration-test opaque-read-session-test -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=false -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1
+          python3 tools/run_bounded_zig_build.py -- build compiled-image-native-test compiled-pdf-native-test lake-execution-abi-integration-test opaque-read-session-test -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=true -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1
           python3 tools/check_image_owner_cache.py --report ../.benchmark-results/owner-cache/image-macos.json --timeout 1800
           python3 tools/check_media_owner_cache.py --retained --optimize debug --report ../.benchmark-results/owner-cache/pdf-macos.json
           python3 tools/check_lake_execution_cache.py --report ../.benchmark-results/owner-cache/lake-macos.json --timeout 1800

@@ -79,6 +79,12 @@ pub fn openRelational(db: anytype, alloc: A, from: []const u8, to: []const u8, o
 pub fn openDocument(db: anytype, alloc: A, from: []const u8, to: []const u8, opts: types.ScanOptions) !contract.Handle {
     return issue(.document, try db.openDocumentReadSession(alloc, from, to, opts));
 }
+pub fn retainDocument(session: *Document) contract.Handle {
+    return issue(.document, session);
+}
+pub fn retainRelational(session: *Relational) contract.Handle {
+    return issue(.relational, session);
+}
 pub fn closeRelational(handle: contract.Handle) !void {
     (try handle.resolve(.relational, Relational)).deinit();
 }
@@ -215,11 +221,29 @@ fn issue(comptime kind: contract.Kind, value: anytype) contract.Handle {
 }
 const Outcome = @import("read_session_types").types.contract.NativeOutcome;
 const statement_ops: contract.Operations = .{ .close = Adapters.closeStatement };
-const relational_ops: contract.Operations = .{ .seek_prefix = Adapters.seekPrefix, .visit_cypher = Adapters.visitCypher, .close = Adapters.closeRelational, .checkpoint = Adapters.checkpoint, .range_proofs = Adapters.relationalProofs, .normalize = Adapters.normalizeRelational, .next_typed = Adapters.nextTyped, .next_view = Adapters.nextView };
+const relational_ops: contract.Operations = .{ .metadata = Adapters.metadata, .set_read_time = Adapters.setReadTime, .next_page = Adapters.relationalNextPage, .seek_prefix = Adapters.seekPrefix, .visit_cypher = Adapters.visitCypher, .close = Adapters.closeRelational, .checkpoint = Adapters.checkpoint, .range_proofs = Adapters.relationalProofs, .normalize = Adapters.normalizeRelational, .next_typed = Adapters.nextTyped, .next_view = Adapters.nextView };
 const reader_ops: contract.Operations = .{ .reader_seek_prefix = Adapters.readerSeekPrefix, .close = Adapters.closeReader, .next_page = Adapters.readerNextPage, .next_typed = Adapters.readerNextTyped, .lookup_batch = Adapters.readerLookupBatch, .lookup_one = Adapters.readerLookupOne };
 const document_ops: contract.Operations = .{ .close = Adapters.closeDocument, .range_proofs = Adapters.documentProofs, .normalize = Adapters.normalizeDocument, .next_view = Adapters.nextDocument };
 const provider = @This();
 const Adapters = struct {
+    fn metadata(h: contract.Handle) Outcome(Rows.RelationalMetadata) {
+        const session = h.resolve(.relational, Relational) catch |err| return failure(Rows.RelationalMetadata, err);
+        return .{ .value = session.readMetadata() };
+    }
+    fn setReadTime(h: contract.Handle, now: u64) Outcome(void) {
+        const session = h.resolve(.relational, Relational) catch |err| return failure(void, err);
+        session.setReadTime(now) catch |err| return failure(void, err);
+        return .{ .value = {} };
+    }
+    fn relationalNextPage(h: contract.Handle, alloc: A, io: ?contract.IoBorrow, budget: Rows.Budget) Outcome(Rows.Page) {
+        var receiver: ?contract.IoReceiver = if (io) |borrow| borrow.receive() catch |err| return failure(Rows.Page, err) else null;
+        const session = h.resolve(.relational, Relational) catch |err| return failure(Rows.Page, err);
+        var page = session.nextPage(alloc, if (receiver) |*value| value.io() else null, budget) catch |err| return failure(Rows.Page, err);
+        return .{ .value = ownPage(page, alloc) catch |err| {
+            page.deinit();
+            return failure(Rows.Page, err);
+        } };
+    }
     fn seekPrefix(h: contract.Handle, values: []const std.json.Value, after: ?[]const u8) Outcome(void) {
         const session = h.resolve(.relational, Relational) catch |err| return failure(void, err);
         session.seekPrefix(values, after) catch |err| return failure(void, err);

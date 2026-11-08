@@ -26,3 +26,7 @@ pub const DocumentRows = @import("db/document_read_rows.zig").For;
 pub const DocumentPrimaryReadWindow = @import("db/document_primary_read_window.zig").Implementation;
 
 pub const StatementReadFence = @import("db/statement_capture_fence.zig").Implementation;
+
+pub const PublicationReadLease = @import("read_session_types").types.values.PublicationReadLease;
+pub const issuePublicationReadLease = @import("db/publication_read_lease.zig").create;
+pub const installPublicationReadLeaseLock = @import("db/publication_read_lease.zig").install;

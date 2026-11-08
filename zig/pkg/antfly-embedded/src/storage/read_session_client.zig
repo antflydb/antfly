@@ -51,17 +51,33 @@ pub const Statement = struct {
 };
 pub const Relational = struct {
     handle: contract.Handle,
+    metadata: Types.values.RelationalMetadata,
     alloc: A,
     pub fn fromHandle(alloc: A, handle: contract.Handle) !*Relational {
         try handle.validate(.relational);
         errdefer contract.call("close", .relational, handle, .{handle}) catch @panic("incompatible read session owner");
+        const metadata = try contract.call("metadata", .relational, handle, .{handle});
         const self = try alloc.create(Relational);
-        self.* = .{ .alloc = alloc, .handle = handle };
+        self.* = .{ .alloc = alloc, .handle = handle, .metadata = metadata };
         return self;
     }
     pub fn deinit(self: *Relational) void {
         contract.call("close", .relational, self.handle, .{self.handle}) catch @panic("incompatible read session owner");
         self.alloc.destroy(self);
+    }
+    pub fn schemaVersion(self: *const Relational) u32 {
+        return self.metadata.schema_version;
+    }
+    pub fn indexName(self: *const Relational) ?[]const u8 {
+        return self.metadata.index_name;
+    }
+    pub fn setReadTime(self: *Relational, now: u64) !void {
+        return contract.call("set_read_time", .relational, self.handle, .{ self.handle, now });
+    }
+    pub fn nextPage(self: *Relational, alloc: A, io: ?std.Io, budget: Types.values.Budget) !Types.values.Page {
+        var retained_io = io;
+        const borrow: ?contract.IoBorrow = if (retained_io) |*value| .init(value) else null;
+        return contract.call("next_page", .relational, self.handle, .{ self.handle, alloc, borrow, budget });
     }
     pub fn seekPrefix(self: *Relational, values: []const std.json.Value, after: ?[]const u8) !void {
         return contract.call("seek_prefix", .relational, self.handle, .{ self.handle, values, after });
@@ -220,4 +236,12 @@ pub fn DocumentRows(comptime DB: type) type {
             self.* = undefined;
         }
     };
+}
+
+pub const PublicationReadLease = Types.values.PublicationReadLease;
+pub fn issuePublicationReadLease(_: std.mem.Allocator, _: anytype, _: []const u8, _: u64, _: ?std.Io.File, _: ?std.Io, comptime _: anytype) !PublicationReadLease {
+    @compileError("publication leases must be issued by the physical owner");
+}
+pub fn installPublicationReadLeaseLock(_: PublicationReadLease, _: anytype, comptime _: anytype, _: std.Io.File, _: ?std.Io) !void {
+    @compileError("publication locks must be installed by the physical owner");
 }

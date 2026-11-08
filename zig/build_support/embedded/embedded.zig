@@ -298,6 +298,10 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         if (options.server_integration_tests) "antfly-runtime-enrichment_compute" else "antfly-embedded-enrichment",
         @as(u64, if (antfly_imports.darwin_release_memory or antfly_imports.darwin_cross_release_memory) 3 else 8) * 1024 * 1024 * 1024,
     );
+    // Source-level embedded API consumers can use compiled media without a
+    // shared storage engine. Link that owner independently of storage discovery.
+    if (antfly_imports.image_native_contract != null or antfly_imports.pdf_native_contract != null)
+        embedded_api_mod.linkLibrary(native_enrichment);
     const native_storage = if (antfly_imports.storage_boundary.shared_core) blk: {
         const owner_options = b.addOptions();
         owner_options.addOption(bool, "shared_storage_core", true);

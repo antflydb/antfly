@@ -45,6 +45,14 @@ from cache_overlay import link_children, own
 ZIG = Path(__file__).resolve().parents[1]
 REPO = ZIG.parent
 EDITS = {
+    "publication_lease_state": (
+        "pkg/antfly-embedded/src/storage/db/publication_read_lease.zig",
+        "    return struct {\n",
+    ),
+    "shared_publication_lease": (
+        "pkg/antfly-embedded/src/storage/read_session_values.zig",
+        "pub const PublicationReadLease = extern struct {\n",
+    ),
     "relational_state": (
         "pkg/antfly-embedded/src/storage/db/relational_read_session.zig",
         "pub const Implementation = struct {\n",
@@ -87,6 +95,7 @@ EDITS = {
     ),
 }
 PROFILES = {
+    "publication": ("publication_lease_state", "shared_publication_lease"),
     "capture": ("capture_fence_state", "statement_state", "shared_handle"),
     "sessions": (
         "relational_state",
@@ -132,7 +141,8 @@ def field_probe(phase, original):
         raise RuntimeError(f"Session shape changed; update {phase} field probe")
     field = (
         "    " + FIELD
-        if phase in {"query_lease_state", "document_reader_state"}
+        if phase
+        in {"query_lease_state", "document_reader_state", "publication_lease_state"}
         else FIELD
     )
     return original.replace(marker, marker + field)

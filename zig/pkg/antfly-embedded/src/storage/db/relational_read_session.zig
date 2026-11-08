@@ -52,6 +52,28 @@ pub const Implementation = struct {
         if (session.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         if (session.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
     }
+    pub fn readMetadata(session: *const Implementation) Types.values.RelationalMetadata {
+        return .{ .schema_version = session.reader.active.version(), .index_name = if (session.reader.index) |index| index.name else null };
+    }
+    pub fn schemaVersion(session: *const Implementation) u32 {
+        return session.readMetadata().schema_version;
+    }
+    pub fn indexName(session: *const Implementation) ?[]const u8 {
+        return session.readMetadata().index_name;
+    }
+    pub fn setReadTime(session: *Implementation, now: u64) !void {
+        try session.checkpoint();
+        session.reader.now_ns = now;
+    }
+    pub fn nextPage(session: *Implementation, alloc: Allocator, io: ?std.Io, budget: RelationalRows.Budget) !RelationalRows.Page {
+        try session.checkpoint();
+        var bounded = budget;
+        bounded.target_bytes = @min(bounded.output_bytes, if (bounded.target_bytes == 0) session.page_bytes else @min(bounded.target_bytes, session.page_bytes));
+        var page = try session.reader.nextPage(alloc, io, bounded);
+        errdefer page.deinit();
+        try session.checkpoint();
+        return page;
+    }
     pub fn seekPrefix(session: *Implementation, values: []const std.json.Value, after: ?[]const u8) !void {
         try session.checkpoint();
         const index = session.reader.index orelse return error.InvalidRelationalRowsRequest;

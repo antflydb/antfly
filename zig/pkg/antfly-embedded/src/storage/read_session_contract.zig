@@ -27,9 +27,11 @@ const ReaderValues = @import("read_reader_values.zig");
 const View = @import("relational_read_view.zig").View;
 const Types = @import("db/types.zig");
 const Proof = @import("range_protection.zig").Proof;
-pub const abi_version: u32 = 3;
+pub const abi_version: u32 = 4;
 pub const Kind = enum(u32) { statement = 1, relational = 2, document = 3, reader = 4, document_reader = 5, statement_fence = 6, _ };
 pub const Operations = struct {
+    metadata: ?*const fn (Handle) Outcome(Values.RelationalMetadata) = null,
+    set_read_time: ?*const fn (Handle, u64) Outcome(void) = null,
     seek_prefix: ?*const fn (Handle, []const std.json.Value, ?[]const u8) Outcome(void) = null,
     reader_seek_prefix: ?*const fn (Handle, []const ReaderValues.Value, ?[]const u8) Outcome(void) = null,
     visit_cypher: ?*const fn (Handle, std.mem.Allocator, usize, Types.ScanVisitor) Outcome(void) = null,

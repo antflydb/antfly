@@ -16,6 +16,32 @@
 //! Shared immutable read transport values; no physical session or reader.
 const std = @import("std");
 
+/// Move-only capability; publication locks and manager registrations stay in
+/// their creator. Installing a lock transfers it only after success.
+pub const PublicationReadLease = extern struct {
+    version: u32 = 1,
+    context: ?*anyopaque = null,
+    close_fn: ?*const fn (*anyopaque) callconv(.c) void = null,
+
+    pub fn validate(self: PublicationReadLease) !void {
+        if (self.version != 1) return error.UnsupportedVersion;
+        if (self.context == null or self.close_fn == null) return error.InvalidGenerationTransition;
+    }
+    pub fn release(self: *PublicationReadLease) !void {
+        if (self.context == null) return;
+        try self.validate();
+        const context = self.context.?;
+        const close = self.close_fn.?;
+        self.* = .{};
+        close(context);
+    }
+    pub fn deinit(self: *PublicationReadLease) void {
+        self.release() catch @panic("incompatible publication lease owner");
+    }
+};
+
+pub const RelationalMetadata = struct { schema_version: u32, index_name: ?[]const u8 };
+
 pub const Budget = struct {
     /// Retain native SQL Datums instead of public JSON projections.
     native_cells: bool = false,
@@ -68,3 +94,14 @@ pub const Page = struct {
         self.* = undefined;
     }
 };
+
+test "publication lease validates before touching owner pointers" {
+    var lease: PublicationReadLease = .{ .version = 0, .context = @ptrFromInt(1), .close_fn = @ptrFromInt(0x1000) };
+    try std.testing.expectError(error.UnsupportedVersion, lease.release());
+    lease.version = 1;
+    lease.close_fn = null;
+    try std.testing.expectError(error.InvalidGenerationTransition, lease.release());
+    lease = .{};
+    try lease.release();
+    try lease.release();
+}
