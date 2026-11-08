@@ -247,10 +247,16 @@ matching schemas/options into cohorts of up to eight rows and 4,096 padded
 tokens, with at most 512 prepared tokens per row. Length buckets bound grouping
 padding to 25% when the encoder declares attention masks. Windowed documents,
 larger rows and regex validation retain their existing exclusive execution.
+Short-row preparation is retained through qualification, cohort repacking and
+serial fallback; repacking repeats no tokenizer work.
 Cohorts that cannot admit their additional workspace return to the callers'
 existing serial paths before any model execution.
-Each caller retains its IDs, unpadded usage, output limits and cancellation;
-published responses retain a separate memory owner until all consumers rejoin.
+Each caller retains its IDs, unpadded usage, output limits and cancellation.
+Responses are serialized independently, so an oversized result rejects only
+its caller. Extraction phases, decoded counts and solver diagnostics remain
+caller-local. Published responses retain a separate memory owner until all
+consumers rejoin. Pre-forward planning and admission refusals subdivide the
+cohort or return to serial execution; failures after dispatch are never replayed.
 The configured public item ceiling also applies before schema-v2 extraction
 dispatch, independently of the internal cross-request cohort size.
 

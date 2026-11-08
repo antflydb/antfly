@@ -12071,6 +12071,7 @@ pub const Node = struct {
         const model_path = model_path_selection.path;
         const model_path_selection_control: ?InferenceExecutionControl = model_path_selection.bind(self.bindExecutionControl(null, control orelse .{}));
         defer scratch.free(model_path);
+        execution_options.control = model_path_selection_control;
         // Only architecture/configuration and capability are needed here.
         // Full tokenizer JSON materialization belongs to the admitted managed
         // loader; repeating it per request can exceed the request heap before
@@ -12135,7 +12136,7 @@ pub const Node = struct {
             }, &request, execution_options.pipeline, model_path_selection_control);
         }
         if (!test_qualification) {
-            if (try self.tryBoundaryRequestMicrobatch(scratch, io, loaded, &request, request_json, execution_options, working_bytes)) |json| return json;
+            if (try self.tryBoundaryRequestMicrobatch(scratch, io, loaded, &request, request_json, execution_options, working_bytes, budget)) |json| return json;
         }
         return self.executeBoundaryLoaded(scratch, loaded, &request, execution_options, budget, working_bytes, test_qualification);
     }
@@ -12148,7 +12149,7 @@ pub const Node = struct {
     };
     const BoundaryReply = gliner_microbatch.BoundaryReply;
 
-    fn tryBoundaryRequestMicrobatch(self: *Node, a: std.mem.Allocator, io: std.Io, loaded: *model_manager_mod.LoadedModel, request: *const extraction_v2.Request, request_json: []const u8, options: boundary_executor.Options, working_bytes: usize) !?[]u8 {
+    fn tryBoundaryRequestMicrobatch(self: *Node, a: std.mem.Allocator, io: std.Io, loaded: *model_manager_mod.LoadedModel, request: *const extraction_v2.Request, request_json: []const u8, options: boundary_executor.Options, working_bytes: usize, budget: *runtime.tier.memory.RunBudget) !?[]u8 {
         const caps = loaded.session.executionCapabilities();
         if (caps.boundary_batch_rows <= 1 or caps.boundary_batch_tokens == 0 or request.items.len != 1 or request.items[0].options.long_document.mode == .window) return null;
         const max_items = @min(@as(usize, 8), caps.boundary_batch_rows);
@@ -12159,15 +12160,17 @@ pub const Node = struct {
         const schema = (try gliner_microbatch.boundaryKey(a, request_json, options.pipeline.classification_multi_label_fallback)) orelse return null;
         defer a.free(schema);
         const config = try session_factory.getGlinerBoundaryConfig(loaded.session);
-        var preparations = boundary_executor.PreparationStore.init(a);
-        defer preparations.deinit();
-        var planning = options;
-        planning.preparations = &preparations;
-        try boundary_executor.validateQualifiedGeometry(.cuda, a, &config, loaded.getTokenizer(), request, planning);
-        const tokens = try boundary_executor.workspaceGeometry(a, &config, loaded.getTokenizer(), request, planning);
-        // Qualification remains per artifact/backend/feature/geometry. This
-        // short-window cohort does not grant long-document batch permission.
-        if (tokens > caps.boundary_batch_tokens) return null;
+        var prepared = try boundary_executor.prepareQualifiedShortRow(.cuda, a, &config, loaded.getTokenizer(), request, options);
+        defer prepared.deinit();
+        var prepared_options = options;
+        prepared_options.prepared_samples = prepared.samples;
+        if (options.failure) |failure| failure.* = .{ .stage = "model" };
+        if (options.observer) |observer| observer.emit(.{ .phase = .model });
+        const tokens = prepared.input_ids.len;
+        // Oversized rows keep their serial geometry and reuse the same
+        // immutable preparation instead of tokenizing again on fallback.
+        if (tokens > caps.boundary_batch_tokens)
+            return try self.executeBoundaryLoaded(a, loaded, request, prepared_options, budget, working_bytes, false);
         const bucket = @import("../pipelines/batch_execution.zig").maskedSequenceBucket(loaded.session, tokens, caps.boundary_batch_tokens);
         const control = self.bindExecutionControl(io, options.control orelse .{});
         const hard = control.hard_cancellation;
@@ -12189,7 +12192,7 @@ pub const Node = struct {
             }
         };
         const shared = std.heap.smp_allocator;
-        const results = try self.executorMicrobatchBroker().submitBatchControlled(BoundaryRequestTicket, BoundaryReply, io, shared, .{ .model = loaded.model_dir, .generation = @intFromPtr(loaded), .task = .extract, .schema = key, .transform = "gliner-boundary-short", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = max_items, .max_items = max_items, .max_tokens = caps.boundary_batch_padded_tokens, .max_bytes = requestMediaMaxBytes(self), .max_wait_us = self.config.executor_microbatch_max_wait_us orelse caps.boundary_batch_collection_wait_us }, &.{.{ .tokens = bucket, .geometry_key = bucket, .bytes = request_json.len }}, &.{.{}}, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, &.{.{ .model = loaded, .request = request, .options = options, .working_bytes = working_bytes }}, self, executeBoundaryRequestMicrobatch);
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(BoundaryRequestTicket, BoundaryReply, io, shared, .{ .model = loaded.model_dir, .generation = @intFromPtr(loaded), .task = .extract, .schema = key, .transform = "gliner-boundary-short", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = max_items, .max_items = max_items, .max_tokens = caps.boundary_batch_padded_tokens, .max_bytes = requestMediaMaxBytes(self), .max_wait_us = self.config.executor_microbatch_max_wait_us orelse caps.boundary_batch_collection_wait_us }, &.{.{ .tokens = bucket, .geometry_key = bucket, .bytes = request_json.len }}, &.{.{}}, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, &.{.{ .model = loaded, .request = request, .options = prepared_options, .working_bytes = working_bytes }}, self, executeBoundaryRequestMicrobatch);
         defer {
             for (results) |result| switch (result.result) {
                 .value => |value| gliner_microbatch.destroyBoundaryReply(shared, value),
@@ -12198,7 +12201,8 @@ pub const Node = struct {
             shared.free(results);
         }
         try control.check();
-        return gliner_microbatch.boundaryResult(a, results[0]);
+        if (try gliner_microbatch.boundaryResult(a, results[0])) |json| return json;
+        return try self.executeBoundaryLoaded(a, loaded, request, prepared_options, budget, working_bytes, false);
     }
 
     fn executeBoundaryRequestMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
@@ -12243,23 +12247,21 @@ pub const Node = struct {
         const a = bounded.allocator();
         var request_items: [8]extraction_v2.Item = undefined;
         var evidence: [8]boundary_executor.ItemExecution = undefined;
+        var prepared_samples: [8]@import("../pipelines/gliner_boundary_processor.zig").Sample = undefined;
         for (items, request_items[0..items.len]) |item, *row| row.* = item.payloadAs(BoundaryRequestTicket).request.items[0];
         const request = extraction_v2.Request{ .arena = undefined, .model = first.request.model, .items = request_items[0..items.len] };
         var failure = extraction_v2.FailureContext{};
         var options = first.options;
         options.preparations = null;
         options.failure = &failure;
-        options.observer = null;
         options.control = control;
         options.item_executions = evidence[0..items.len];
         options.pipeline.max_output_values = try std.math.mul(usize, first.options.pipeline.max_output_values, items.len);
-        options.max_response_bytes = @min(64 * 1024 * 1024, try std.math.mul(usize, first.options.max_response_bytes, items.len));
         options.brokered_request = true;
         // Published bytes can outlive this callback's heap and execution
         // reservation. Give them a separate owner retained by every result,
         // including results discarded by expired or disconnected callers.
-        const header_bytes = try std.math.add(usize, 1024, try std.math.mul(usize, 6, first.request.model.len));
-        const output_limit = try std.math.add(usize, options.max_response_bytes, try std.math.mul(usize, items.len, header_bytes));
+        const output_limit = try std.math.mul(usize, first.options.max_response_bytes, items.len);
         var output_lease = self.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = try std.math.add(usize, output_limit, @sizeOf(OutputOwner)) }) catch |err| {
             if (err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable) return error.BoundaryMicrobatchCapacity;
             return err;
@@ -12270,42 +12272,39 @@ pub const Node = struct {
         };
         output_owner.* = .{ .lease = output_lease, .remaining = .init(1) };
         defer output_owner.release();
+        var consumers: [8]gliner_microbatch.BoundaryConsumer = undefined;
+        for (items, consumers[0..items.len], prepared_samples[0..items.len]) |item, *consumer, *sample| {
+            const ticket = item.payloadAs(BoundaryRequestTicket);
+            sample.* = ticket.options.prepared_samples.?[0];
+            consumer.* = .{ .model = ticket.request.model, .slot = item.slot, .control = item.control, .observer = ticket.options.observer, .failure = ticket.options.failure, .max_output_values = ticket.options.pipeline.max_output_values, .max_response_bytes = ticket.options.max_response_bytes };
+        }
+        options.prepared_samples = prepared_samples[0..items.len];
+        var cohort = gliner_microbatch.BoundaryCohort{ .consumers = consumers[0..items.len], .evidence = evidence[0..items.len], .failure = &failure, .owner = output_owner, .output_limit = output_limit, .group_key = @intFromPtr(items.ptr) };
+        options.observer = .{ .context = &cohort, .emit_fn = gliner_microbatch.BoundaryCohort.observe };
+        options.row_sink = .{ .context = &cohort, .emit_fn = gliner_microbatch.BoundaryCohort.publish };
         var budget = runtime.tier.memory.RunBudget.init(limits);
         try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = first.working_bytes, .scratch_tier = .host });
-        const json = try self.executeBoundaryLoaded(a, first.model, &request, options, &budget, first.working_bytes, false);
+        const json = self.executeBoundaryLoaded(a, first.model, &request, options, &budget, first.working_bytes, false) catch |err| {
+            // Planning can update the wire failure context without emitting a
+            // phase. Preserve it for each still-pending caller on failure too.
+            if (metrics_mod.extraction.observation.Stage.fromFailure(failure.stage)) |phase|
+                gliner_microbatch.BoundaryCohort.observe(&cohort, .{ .phase = phase });
+            return err;
+        };
         defer a.free(json);
-        var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
-        defer parsed.deinit();
-        var output_bytes: usize = 0;
-        for (items, evidence[0..items.len], 0..) |item, observed, index| {
-            item.control.check() catch |err| {
-                item.slot.fail(err);
-                continue;
-            };
-            if (observed.output_values > item.payloadAs(BoundaryRequestTicket).options.pipeline.max_output_values) {
-                item.slot.fail(error.ExtractionOutputLimitExceeded);
-                continue;
-            }
-            const output = gliner_microbatch.boundaryRow(shared, parsed.value, index, observed.prompt_tokens, item.payloadAs(BoundaryRequestTicket).options.max_response_bytes) catch |err| {
-                item.slot.fail(err);
-                continue;
-            };
-            if (output.len > output_limit -| output_bytes) {
-                shared.free(output);
-                item.slot.fail(error.MemoryBudgetExceeded);
-                continue;
-            }
-            output_bytes += output.len;
-            _ = output_owner.remaining.fetchAdd(1, .monotonic);
-            item.slot.physical_group_key = @intFromPtr(items.ptr) + observed.group;
-            item.slot.setValue(BoundaryReply, .{ .bytes = output, .owner = output_owner }, if (observed.rows > 1) .native_batch else .serial);
-        }
         // Shrinking can retain the conservative reservation on any refusal;
         // ownership remains valid until the final consumer releases it.
-        output_owner.lease.retain(.{ .host_scratch_bytes = output_bytes + @sizeOf(OutputOwner) }) catch {};
+        output_owner.lease.retain(.{ .host_scratch_bytes = cohort.output_bytes + @sizeOf(OutputOwner) }) catch {};
     }
 
     fn executeBoundaryLoaded(self: *Node, scratch: std.mem.Allocator, loaded: *model_manager_mod.LoadedModel, request: *const extraction_v2.Request, supplied_options: boundary_executor.Options, budget: *runtime.tier.memory.RunBudget, working_bytes: usize, test_qualification: bool) ![]u8 {
+        var started = false;
+        return self.executeBoundaryLoadedImpl(scratch, loaded, request, supplied_options, budget, working_bytes, test_qualification, &started) catch |err| {
+            return gliner_microbatch.boundaryExecutionError(err, supplied_options.brokered_request, started);
+        };
+    }
+
+    fn executeBoundaryLoadedImpl(self: *Node, scratch: std.mem.Allocator, loaded: *model_manager_mod.LoadedModel, request: *const extraction_v2.Request, supplied_options: boundary_executor.Options, budget: *runtime.tier.memory.RunBudget, working_bytes: usize, test_qualification: bool, started: *bool) ![]u8 {
         var execution_options = supplied_options;
         const backend = loaded.session.backend();
         const config = try session_factory.getGlinerBoundaryConfig(loaded.session);
@@ -12338,14 +12337,14 @@ pub const Node = struct {
             break :bytes planned;
         } else null;
         const execution_mutex = loaded.targetInferenceExecutionMutex();
-        const effective = model_path_selection_control orelse InferenceExecutionControl{};
+        const effective = control orelse InferenceExecutionControl{};
         // A waiting GPU boundary request cannot use the session workspace
         // yet. Admit its device ceiling only when it reaches the front of the
         // model queue; otherwise concurrent waiters reserve duplicate device
         // capacity and fail before the already-serialized execution can drain.
         // This is distinct from the execution/provider lock: admission may
         // evict other models and must remain outside those locks.
-        const gliner_turn = if (backend == .cuda or backend == .metal) try loaded.gliner_execution_lane.acquire(model_path_selection_control orelse .{}) else null;
+        const gliner_turn = if (backend == .cuda or backend == .metal) try loaded.gliner_execution_lane.acquire(control orelse .{}) else null;
         defer if (gliner_turn) |turn| turn.release();
         const admission_mutex = if (backend == .cuda or backend == .metal) &loaded.gliner_boundary_admission_lock else null;
         if (admission_mutex) |mutex| try effective.lock(mutex);
@@ -12413,13 +12412,14 @@ pub const Node = struct {
             if (execution_mutex) |mutex| try effective.lock(mutex);
             defer if (execution_mutex) |mutex| mutex.unlock();
             var managed = if (workspace_plan) |plan|
-                session_factory.getManagedGlinerBoundaryComputeBackend(loaded.session, scratch, budget, model_path_selection_control, plan, if (workspace_permit) |*permit| permit else null) catch |err| {
+                session_factory.getManagedGlinerBoundaryComputeBackend(loaded.session, scratch, budget, control, plan, if (workspace_permit) |*permit| permit else null) catch |err| {
                     if (err == error.GlinerBoundaryWorkspacePlanChanged) continue;
                     return err;
                 }
             else
-                try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, model_path_selection_control);
+                try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, control);
             defer managed.deinit();
+            started.* = true;
             const json = if (test_qualification)
                 try boundary_executor.execute(&managed.backend, scratch, &config, loaded.getTokenizer(), request, request_options)
             else

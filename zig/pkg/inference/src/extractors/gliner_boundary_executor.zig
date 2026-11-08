@@ -46,6 +46,13 @@ pub const ItemExecution = struct {
 };
 
 pub const Options = struct {
+    /// Synchronous row consumer for independent broker callers. It owns
+    /// serialization failures locally; the executor never builds a combined
+    /// response when this sink is installed.
+    row_sink: ?RowSink = null,
+    /// Immutable rows prepared under this request's tokenizer and options.
+    /// Owners remain borrowed through synchronous planning and execution.
+    prepared_samples: ?[]const processor.Sample = null,
     item_executions: ?[]ItemExecution = null,
     brokered_request: bool = false,
     preparations: ?*PreparationStore = null,
@@ -65,6 +72,42 @@ pub const Options = struct {
     observer: ?observation.Observer = null,
 };
 
+pub const RowSink = struct {
+    context: *anyopaque,
+    emit_fn: *const fn (*anyopaque, usize, wire.Item, pipeline.Sample, usize) void,
+};
+
+test "gliner microbatch reuses prepared short rows through cohort planning and serial fallback" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"entities":["person"]},"inputs":[{"content":"Ada met Bob"},{"content":"Bob"}]}
+    , .{});
+    defer request.deinit();
+    const config = QualificationGeometryTest.config();
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var left = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items[0..1], .{});
+    defer left.deinit();
+    var right = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items[1..], .{});
+    defer right.deinit();
+    const calls = tokenizer.calls;
+    const samples = [_]processor.Sample{ left.samples[0], right.samples[0] };
+    const identity = artifact.Identity{ .backbone = config.backbone, .precision = .fp32, .weight = artifact.Digest.of("prepared row test"), .sidecars = @splat(artifact.Digest.of("prepared row test")) };
+    var options = Options{ .prepared_samples = &samples, .identity = identity };
+    var cohort = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, options);
+    defer cohort.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cohort.samples.len);
+    try std.testing.expectEqual(left.sequence_length, cohort.sequence_length);
+    _ = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options);
+    _ = try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, options);
+    options.prepared_samples = samples[1..];
+    var serial = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items[1..], options);
+    defer serial.deinit();
+    try std.testing.expectEqualSlices(i64, right.input_ids, serial.input_ids);
+    try std.testing.expectEqual(calls, tokenizer.calls);
+    options.prepared_samples = samples[0..1];
+    try std.testing.expectError(error.InvalidBoundaryPipelineRouting, prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items[1..], options));
+}
+
 /// Both device owners enforce these caps independently before allocating.
 /// Serial inputs/windows reuse this reservation; simultaneous encoder/head
 /// ownership requires their sum, including protected weights and upload
@@ -82,7 +125,7 @@ fn progress(options: Options, index: ?usize, stage: []const u8) !void {
     if (observation.Stage.fromFailure(stage)) |phase| observation.emit(options.observer, .{ .phase = phase });
 }
 
-fn observeSample(observer: ?observation.Observer, sample: pipeline.Sample, tokens: usize, values: usize) void {
+pub fn observeSample(observer: ?observation.Observer, sample: pipeline.Sample, tokens: usize, values: usize) void {
     const active = observer orelse return;
     var summary = observation.Sample{ .prompt_tokens = tokens, .output_values = values };
     for ([_]?pipeline.Diagnostics{ sample.classification_solver, sample.joint_solver, sample.record_solver }, &summary.solvers) |value, *out| if (value) |diagnostic| {
@@ -177,9 +220,10 @@ pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator,
     return executeChecked(cb, allocator, config, tokenizer, request, prepared_options, &gate);
 }
 
-/// Independent broker enrollment must reject an unsupported row before it can
-/// join healthy callers. This quiet pass executes no learned operations.
-pub fn validateQualifiedGeometry(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !void {
+/// Prepare and qualify a single short row once, before broker enrollment.
+/// The returned owner must outlive every repacked planning/execution view.
+pub fn prepareQualifiedShortRow(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !processor.PreparedBatch {
+    if (request.items.len != 1 or request.items[0].options.long_document.mode == .window) return error.InvalidExtractionRequest;
     const identity = options.identity orelse return error.UnsupportedGlinerBoundaryRuntime;
     if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
     var gate = try qualification.Admission.initResolved(identity, switch (backend) {
@@ -188,7 +232,12 @@ pub fn validateQualifiedGeometry(backend: compute.BackendKind, allocator: Alloca
         .native => .native,
         else => return error.UnsupportedGlinerBoundaryBackend,
     }, request, options.pipeline, options.control);
-    try planRequestGeometry(backend, allocator, config, tokenizer, request, options, &gate);
+    try preflight(request, options);
+    try progress(options, 0, "tokenizing");
+    var prepared = try prepareGroup(backend, allocator, config, tokenizer, request.items, options);
+    errdefer prepared.deinit();
+    try observeGroup(allocator, config, request.items, &prepared, options, &gate);
+    return prepared;
 }
 
 /// The receiver is a compile-time parameter for the quiet scalar observation
@@ -296,7 +345,14 @@ fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *con
         const inputs = try allocator.alloc(processor.Item, count);
         defer allocator.free(inputs);
         for (inputs, items[0..count]) |*input, *item| input.* = .{ .text = item.text, .schema = &item.compiled };
-        var prepared = processor.prepare(allocator, tokenizer, inputs, process_options) catch |err| {
+        const preparation = if (options.prepared_samples) |samples| repacked: {
+            if (samples.len < count) return error.InvalidBoundaryPipelineRouting;
+            for (samples[0..count], items[0..count]) |sample, item| {
+                if (!std.mem.eql(u8, sample.original_text, item.text) or !std.mem.eql(u8, &sample.schema_fingerprint, &item.compiled.fingerprint)) return error.InvalidBoundaryPipelineRouting;
+            }
+            break :repacked processor.packSamples(allocator, samples[0..count], process_options);
+        } else processor.prepare(allocator, tokenizer, inputs, process_options);
+        var prepared = preparation catch |err| {
             if (err == error.BoundaryBatchLimitExceeded and count > 1) {
                 count = (count + 1) / 2;
                 continue;
@@ -336,6 +392,7 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
     var quiet = options;
     quiet.observer = null;
     try preflight(request, quiet);
+    if (options.prepared_samples) |samples| if (samples.len != request.items.len) return error.InvalidBoundaryPipelineRouting;
     var remaining_tokens = options.long_document.max_total_encoded_tokens;
     var remaining_attention = try options.long_document.attentionWorkLimit(config, options.engine.limits);
     var remaining_windows = options.long_document.max_request_windows;
@@ -372,7 +429,9 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
             index += 1;
             continue;
         }
-        var prepared = try prepareGroup(backend, allocator, config, tokenizer, request.items[index..], quiet);
+        var group_options = quiet;
+        if (options.prepared_samples) |samples| group_options.prepared_samples = samples[index..];
+        var prepared = try prepareGroup(backend, allocator, config, tokenizer, request.items[index..], group_options);
         defer prepared.deinit();
         try observeGroup(allocator, config, request.items[index..], &prepared, quiet, gate);
         index += prepared.samples.len;
@@ -385,13 +444,14 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
     if (cb.kind() != .native and options.identity == null) return error.MissingGlinerBoundaryIdentity;
     if (options.identity) |identity| if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
     try preflight(request, options);
+    if (options.prepared_samples) |samples| if (samples.len != request.items.len) return error.InvalidBoundaryPipelineRouting;
     if (options.item_executions) |evidence| {
         if (evidence.len != request.items.len) return error.InvalidExtractionRequest;
         @memset(evidence, .{});
     }
     var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
     defer writer.deinit();
-    try writer.begin(request.model);
+    if (options.row_sink == null) try writer.begin(request.model);
     var prompt_tokens: usize = 0;
     var remaining_values = options.pipeline.max_output_values;
     var remaining_window_tokens = options.long_document.max_total_encoded_tokens;
@@ -444,13 +504,15 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             prompt_tokens = try std.math.add(usize, prompt_tokens, result.prompt_tokens);
             if (options.item_executions) |evidence| evidence[index] = .{ .prompt_tokens = result.prompt_tokens, .output_values = used, .rows = 1, .group = index };
             try progress(options, index, "serializing");
-            try writer.append(item, result.sample);
+            if (options.row_sink) |sink| sink.emit_fn(sink.context, index, item, result.sample, result.prompt_tokens) else try writer.append(item, result.sample);
             observeSample(options.observer, result.sample, result.prompt_tokens, used);
             index += 1;
             continue;
         }
         try progress(options, index, "tokenizing");
-        var prepared = try prepareGroup(cb.kind(), allocator, config, tokenizer, request.items[index..], options);
+        var group_options = options;
+        if (options.prepared_samples) |samples| group_options.prepared_samples = samples[index..];
+        var prepared = try prepareGroup(cb.kind(), allocator, config, tokenizer, request.items[index..], group_options);
         defer prepared.deinit();
         if (gate) |active| try observeGroup(allocator, config, request.items[index..], &prepared, options, active);
         const schemas = try allocator.alloc(*const @TypeOf(item.compiled), prepared.samples.len);
@@ -495,12 +557,13 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             if (used > remaining_values) return error.ExtractionOutputLimitExceeded;
             remaining_values -= used;
             try progress(options, index + row, "serializing");
-            try writer.append(source, sample);
+            if (options.row_sink) |sink| sink.emit_fn(sink.context, index + row, source, sample, input.input_ids.len) else try writer.append(source, sample);
             observeSample(options.observer, sample, input.input_ids.len, used);
         }
         index += prepared.samples.len;
     }
     try progress(options, null, "serializing");
+    if (options.row_sink != null) return allocator.alloc(u8, 0);
     return writer.finish(prompt_tokens);
 }
 
