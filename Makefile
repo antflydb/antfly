@@ -61,7 +61,7 @@ generate: graph-identifier-generate provider-matrix-generate apple-bridge-genera
 apple-bridge-check:
 	$(SCRIPTS_PY) scripts/packaging/apple_bridge.py verify --directory zig/lib/apple_native/prebuilt/arm64 --architecture arm64
 
- apple-bridge-generate: ## Refresh the committed ARM64 Apple bridge on Apple Silicon Macs.
+apple-bridge-generate: ## Refresh the committed ARM64 Apple bridge on Apple Silicon Macs.
 	@if [ "$$(uname -s)" = Darwin ] && [ "$$(uname -m)" = arm64 ]; then \
 		$(SCRIPTS_PY) scripts/packaging/apple_bridge.py build --directory zig/lib/apple_native/prebuilt/arm64 --architecture arm64; \
 	else \
