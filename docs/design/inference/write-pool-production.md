@@ -121,7 +121,12 @@ python3 zig/pkg/inference/scripts/qualify_write_pool_fixtures.py \
   --config .benchmark-results/write-pool-production/config.json
 ```
 
-The returned config uses local aliases for the canonical model names; downloads
+The returned config uses self-contained local directories for the canonical model
+names. Artifact files share immutable cache inodes when possible and copy across
+filesystem boundaries. LightOnOCR3 receives the canonical reader manifest and
+trained page template from the runtime import contract; its raw hub template and
+the verified cache remain unchanged. This preserves artifact-root confinement and
+canonical runtime inventory for every model. Downloads
 are shared under `~/.cache/antfly/conformance-fixtures`. The campaign additionally
 checks decoded items, returned items and prompt-token counters against each
 schema-sweep cohort's actual responses. These counters must be present and exact;

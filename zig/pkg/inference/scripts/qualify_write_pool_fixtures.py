@@ -21,6 +21,9 @@ from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
+import os
+import shutil
+import errno
 from pathlib import Path, PurePosixPath
 import urllib.request
 
@@ -131,6 +134,66 @@ def snapshot(cache, model):
     )
 
 
+def install_alias(models_dir, kind, alias, directory):
+    directory = directory.resolve()
+    link = models_dir.resolve() / kind / alias
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink():
+        if link.resolve() != directory:
+            raise ValueError(f"model alias points elsewhere: {link}")
+        link.unlink()
+    link.mkdir(exist_ok=True)
+    overrides = (
+        {
+            "model_manifest.json": "runtime_model_manifest.json",
+            "chat_template.jinja": "runtime_chat_template.jinja",
+        }
+        if alias == "lightonai/LightOnOCR-3-0.8B"
+        else {}
+    )
+
+    def materialize(source, destination):
+        for artifact in source.iterdir():
+            if source == directory and artifact.name in overrides:
+                continue
+            target = destination / artifact.name
+            if target.is_symlink():
+                if target.resolve() != artifact:
+                    raise ValueError(f"imported artifact points elsewhere: {target}")
+                target.unlink()
+            if artifact.is_dir():
+                target.mkdir(exist_ok=True)
+                materialize(artifact, target)
+                continue
+            if target.exists():
+                if target.samefile(artifact):
+                    continue
+                if (
+                    target.is_dir()
+                    or verify(target)["sha256"] != verify(artifact)["sha256"]
+                ):
+                    raise ValueError(f"imported artifact differs: {target}")
+                continue
+            # Artifact confinement requires real files under this root.
+            try:
+                os.link(artifact, target)
+            except OSError as error:
+                if error.errno not in (errno.EXDEV, errno.EPERM, errno.EACCES):
+                    raise
+                shutil.copyfile(artifact, target)
+
+    materialize(directory, link)
+    for name, fixture in overrides.items():
+        content = (
+            ROOT / "zig/pkg/inference/scripts/lightonocr3" / fixture
+        ).read_bytes()
+        target = link / name
+        if target.is_symlink() or (target.exists() and target.read_bytes() != content):
+            raise ValueError(f"reader import metadata differs: {target}")
+        if not target.exists():
+            target.write_bytes(content)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -143,8 +206,7 @@ def main():
         for kind, alias, directory, receipt in pool.map(
             lambda model: snapshot(args.cache.resolve(), model), MODELS
         ):
-            link = args.models_dir.resolve() / kind / alias
-            link.parent.mkdir(parents=True, exist_ok=True)
+            install_alias(args.models_dir, kind, alias, directory)
             receipt_path = (
                 args.models_dir.resolve().parent
                 / "acquisition"
@@ -153,13 +215,6 @@ def main():
             )
             receipt_path.parent.mkdir(parents=True, exist_ok=True)
             receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
-            if link.is_symlink():
-                if link.resolve() != directory:
-                    raise ValueError(f"model alias points elsewhere: {link}")
-            elif link.exists():
-                raise ValueError(f"model alias already exists: {link}")
-            else:
-                link.symlink_to(directory, target_is_directory=True)
     speech = args.cache.resolve() / "gemma4-transcription" / f"{CORPUS_SHA}.parquet"
     acquire(SPEECH_URL, speech, sha256=CORPUS_SHA)
     config = json.loads((ROOT / "configs/inference-write-pool-40g.json").read_text())

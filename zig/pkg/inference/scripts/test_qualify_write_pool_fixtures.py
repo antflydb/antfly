@@ -16,6 +16,7 @@
 import hashlib
 import io
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -25,6 +26,83 @@ import qualify_write_pool_fixtures as fixtures
 
 
 class FixtureAcquisitionTests(unittest.TestCase):
+    def test_lighton_import_preserves_cache_and_installs_canonical_reader_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / "config.json").write_text("{}")
+            (cache / "model.safetensors").write_bytes(b"pinned weights")
+            (cache / "chat_template.jinja").write_text("raw hub template")
+            models = root / "models"
+            alias = "lightonai/LightOnOCR-3-0.8B"
+            fixtures.install_alias(models, "readers", alias, cache)
+            fixtures.install_alias(models, "readers", alias, cache)
+            installed = models / "readers" / alias
+            self.assertFalse(installed.is_symlink())
+            self.assertFalse((installed / "model.safetensors").is_symlink())
+            self.assertEqual(
+                (installed / "model.safetensors").read_bytes(), b"pinned weights"
+            )
+            self.assertEqual(
+                (cache / "chat_template.jinja").read_text(), "raw hub template"
+            )
+            self.assertIn(
+                "lightonocr3",
+                json.loads((installed / "model_manifest.json").read_text())[
+                    "capabilities"
+                ],
+            )
+            self.assertNotEqual(
+                (installed / "chat_template.jinja").read_text(), "raw hub template"
+            )
+
+    def test_alias_materializes_existing_external_symlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / "config.json").write_text("{}")
+            (cache / "nested").mkdir()
+            (cache / "nested/config.json").write_text("{}")
+            models = root / "models"
+            link = models / "transcribers/openai/whisper-small"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(cache, target_is_directory=True)
+            with patch.object(
+                fixtures.os,
+                "link",
+                side_effect=OSError(fixtures.errno.EXDEV, "cross-device"),
+            ):
+                fixtures.install_alias(
+                    models, "transcribers", "openai/whisper-small", cache
+                )
+            self.assertFalse(link.is_symlink())
+            self.assertFalse((link / "config.json").is_symlink())
+            self.assertEqual((link / "config.json").read_text(), "{}")
+            fixtures.install_alias(
+                models, "transcribers", "openai/whisper-small", cache
+            )
+
+    def test_reader_import_fixtures_match_the_runtime_contract(self):
+        source = (
+            fixtures.ROOT / "zig/pkg/inference/src/readers/lightonocr3.zig"
+        ).read_text()
+        declared = re.search(r"pub const manifest_json =\s*\\\\([^\n]+)", source).group(
+            1
+        )
+        assets = fixtures.ROOT / "zig/pkg/inference/scripts/lightonocr3"
+        self.assertEqual(
+            json.loads(declared),
+            json.loads((assets / "runtime_model_manifest.json").read_text()),
+        )
+        section = source.split("pub const chat_template =", 1)[1].split(";", 1)[0]
+        strings = re.findall(r'"(?:[^"\\]|\\.)*"', section)
+        self.assertEqual(
+            "".join(json.loads(item) for item in strings),
+            (assets / "runtime_chat_template.jinja").read_text(),
+        )
+
     def test_verified_download_is_reused_without_network(self):
         data = b"pinned artifact"
         with tempfile.TemporaryDirectory() as temporary:
