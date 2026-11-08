@@ -36,7 +36,18 @@ const qualification = @import("gliner_boundary_qualification.zig");
 
 pub const PreparationStore = long_executor.PreparationStore;
 
+/// Physical forward evidence for one caller-owned row. Filled only after the
+/// corresponding encoder/head invocation succeeds; preparation is not execution.
+pub const ItemExecution = struct {
+    prompt_tokens: usize = 0,
+    output_values: usize = 0,
+    rows: usize = 0,
+    group: usize = 0,
+};
+
 pub const Options = struct {
+    item_executions: ?[]ItemExecution = null,
+    brokered_request: bool = false,
     preparations: ?*PreparationStore = null,
     max_response_bytes: usize = 64 * 1024 * 1024,
     processor: processor.Options = .{},
@@ -164,6 +175,20 @@ pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator,
     try qualifyRequestGeometry(cb, allocator, config, tokenizer, request, prepared_options, &gate);
     if (options.control) |control| try control.check();
     return executeChecked(cb, allocator, config, tokenizer, request, prepared_options, &gate);
+}
+
+/// Independent broker enrollment must reject an unsupported row before it can
+/// join healthy callers. This quiet pass executes no learned operations.
+pub fn validateQualifiedGeometry(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !void {
+    const identity = options.identity orelse return error.UnsupportedGlinerBoundaryRuntime;
+    if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
+    var gate = try qualification.Admission.initResolved(identity, switch (backend) {
+        .metal => .metal,
+        .cuda => .cuda,
+        .native => .native,
+        else => return error.UnsupportedGlinerBoundaryBackend,
+    }, request, options.pipeline, options.control);
+    try planRequestGeometry(backend, allocator, config, tokenizer, request, options, &gate);
 }
 
 /// The receiver is a compile-time parameter for the quiet scalar observation
@@ -360,6 +385,10 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
     if (cb.kind() != .native and options.identity == null) return error.MissingGlinerBoundaryIdentity;
     if (options.identity) |identity| if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
     try preflight(request, options);
+    if (options.item_executions) |evidence| {
+        if (evidence.len != request.items.len) return error.InvalidExtractionRequest;
+        @memset(evidence, .{});
+    }
     var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
     defer writer.deinit();
     try writer.begin(request.model);
@@ -413,6 +442,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             remaining_window_attention -= result.attention_work_items;
             remaining_windows -= result.window_count;
             prompt_tokens = try std.math.add(usize, prompt_tokens, result.prompt_tokens);
+            if (options.item_executions) |evidence| evidence[index] = .{ .prompt_tokens = result.prompt_tokens, .output_values = used, .rows = 1, .group = index };
             try progress(options, index, "serializing");
             try writer.append(item, result.sample);
             observeSample(options.observer, result.sample, result.prompt_tokens, used);
@@ -461,6 +491,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
         if (result.samples.len != prepared.samples.len) return error.InvalidExtractionOutput;
         for (result.samples, prepared.samples, request.items[index..][0..result.samples.len], 0..) |sample, input, source, row| {
             const used = try outputValues(sample);
+            if (options.item_executions) |evidence| evidence[index + row] = .{ .prompt_tokens = input.input_ids.len, .output_values = used, .rows = prepared.samples.len, .group = index };
             if (used > remaining_values) return error.ExtractionOutputLimitExceeded;
             remaining_values -= used;
             try progress(options, index + row, "serializing");
