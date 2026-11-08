@@ -428,6 +428,77 @@ pub fn loadAppliedSequence(alloc: Allocator, store: anytype, index_name: []const
     return if (record) |value| value.applied_sequence else 0;
 }
 
+/// WS5 (a): the owner's independent retirement clamp. Scans every
+/// progress-v2 record that currently exists in `store` -- not a cached or
+/// DB-layer-pushed cross-consumer minimum, which can go stale between a
+/// coalesced in-memory advance (WS6: `worker.applied_sequence`, or any
+/// other in-process "this is caught up" signal) and that consumer's own
+/// eventual persisted progress-v2 commit -- and returns the minimum
+/// `applied_sequence` across all of them, read fresh from this same
+/// store's current committed view.
+///
+/// `Store.serviceRetirement`/`DocStore.serviceRetirement` (the only two
+/// physical-delete entry points, see `replay_chunks.clampRetireTarget`'s
+/// doc comment) call this immediately before clamping `requestRetirement`'s
+/// *requested* ceiling: a caller that raises the watermark to its own
+/// just-applied sequence, or to the journal's raw tail, is never required
+/// to prove that is safe for every *other* registered consumer (or even
+/// for its own consumer's durably persisted record) -- this is where that
+/// gets proven, every single time, with no window where a pushed value can
+/// be absent or stale. Self-contained: it needs no DB-layer consumer
+/// registry (WS7's job, not yet built) because every consumer's identity
+/// lives in the key it already writes under this one shared prefix.
+///
+/// Returns an *exclusive* upper bound, in the same unit `requestRetirement`/
+/// `retireReplaySlice`'s `up_to_sequence` already uses (confirmed against
+/// `Store`'s own "WS5 serviceRetirement retires every lane in exactly one
+/// native commit" test: one journal entry at sequence 1, `requestRetirement(2)`,
+/// retires exactly that entry -- i.e. `up_to_sequence` deletes sequences
+/// strictly less than itself). A consumer whose `applied_sequence` is `N`
+/// has durably consumed entries `1..N` inclusive, so the safe exclusive
+/// ceiling this returns is `N + 1`, not `N` itself: returning `N` would
+/// never retire that consumer's own last-applied entry (overly
+/// conservative, not unsafe, but not what "durably applied through N"
+/// means here).
+///
+/// Returns `maxInt(u64)` ("no constraint observed") when no progress-v2
+/// record exists yet at all, matching `known_safe_retirement_watermark`'s
+/// default and preserving unclamped behavior for a store with no managed
+/// consumers.
+pub fn minAppliedSequenceAcrossAllConsumers(alloc: Allocator, store: anytype) !u64 {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginRead();
+    defer txn.abort();
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var upper_buf: [progress_prefix_v2.len]u8 = undefined;
+    @memcpy(&upper_buf, progress_prefix_v2);
+    // The smallest key strictly greater than every key with this prefix:
+    // increment the prefix's last byte (':', 0x3A -- nowhere near
+    // overflow). Every progress-v2 key is strictly longer than the bare
+    // prefix (it always has a non-empty consumer name appended), so this
+    // bound never excludes a real entry and never includes one outside
+    // the prefix.
+    upper_buf[upper_buf.len - 1] += 1;
+    cursor.setUpperBound(&upper_buf);
+    var min_applied: u64 = std.math.maxInt(u64);
+    var entry = try cursor.seekAtOrAfter(progress_prefix_v2);
+    while (entry) |kv| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, progress_prefix_v2)) break;
+        // A corrupt/foreign record must clamp to 0 (block retirement
+        // entirely this turn), never be skipped: skipping would silently
+        // drop exactly the consumer this check exists to protect.
+        const record = decodeProgressRecord(kv.value) catch {
+            min_applied = 0;
+            continue;
+        };
+        min_applied = @min(min_applied, record.applied_sequence);
+    }
+    if (min_applied == std.math.maxInt(u64)) return min_applied;
+    return min_applied + 1;
+}
+
 pub fn loadProjectionCheckpoint(alloc: Allocator, store: anytype, index_name: []const u8) !ProjectionCheckpoint {
     const record = try loadProgress(alloc, store, index_name);
     return if (record) |value| value.checkpoint() else .{};

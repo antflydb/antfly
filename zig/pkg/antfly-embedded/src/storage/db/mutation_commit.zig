@@ -5899,9 +5899,69 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
         }
 
+        /// WS5 (a): `DocStore.ExtraConsumerProgressFn` callback registered
+        /// onto `ctx.store` by `truncateReplayJournalIfSafeContext` below.
+        /// Reads every non-managed-index journal consumer kind fresh,
+        /// straight off the stable `AsyncContext` `ctx_ptr` points at --
+        /// enrichment (`enrichment_state.loadAppliedSequence`, ride-along
+        /// since perf/lwa-integration's enrichment/resolver bookkeeping
+        /// conversion) and resolution/promotion (`stats().applied_sequence`,
+        /// gated the same way `truncateReplayJournalIfSafeContext`'s own
+        /// walk gates them: `resolverReplayRetentionRequired`). Duplicates
+        /// that walk's enrichment/resolution/promotion arm deliberately:
+        /// this runs at `serviceRetirement`'s drain time, independent of
+        /// whenever `truncateReplayJournalIfSafeContext` last ran, which is
+        /// exactly the point -- see that function's own min_applied-vs-
+        /// `known_safe_retirement_watermark` staleness problem this sibling
+        /// mechanism (a fresh read, not a push) exists to avoid.
+        fn extraConsumerMinAppliedSequenceCallback(ctx_ptr: *anyopaque, alloc: Allocator) anyerror!u64 {
+            const async_ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
+            var min_applied: u64 = std.math.maxInt(u64);
+            if (async_ctx.index_manager.hasGeneratedEnrichmentTargets()) {
+                const enrichment_applied = try enrichment_state.loadAppliedSequence(
+                    alloc,
+                    async_ctx.store,
+                    enrichment_runtime_mod.scope_name,
+                );
+                min_applied = @min(min_applied, enrichment_applied);
+            }
+            if (async_ctx.resolution_runtime) |runtime| {
+                const stats = runtime.stats();
+                if (resolverReplayRetentionRequired(async_ctx.index_manager, stats)) {
+                    min_applied = @min(min_applied, stats.applied_sequence);
+                }
+            }
+            if (async_ctx.promotion_runtime) |runtime| {
+                const stats = runtime.stats();
+                if (resolverReplayRetentionRequired(async_ctx.index_manager, stats)) {
+                    min_applied = @min(min_applied, stats.applied_sequence);
+                }
+            }
+            // `ExtraConsumerProgressFn` returns the same exclusive-bound
+            // unit as `apply_state.minAppliedSequenceAcrossAllConsumers`
+            // (see its doc comment): a consumer whose applied_sequence is
+            // N has durably consumed 1..N inclusive, so the safe ceiling
+            // is N + 1.
+            if (min_applied == std.math.maxInt(u64)) return min_applied;
+            return min_applied + 1;
+        }
+
         pub fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
             if (ctx.repair_replay_mutex) |mutex| mutex.lockUncancelable(ctx.index_manager.checkpointIo());
             defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock(ctx.index_manager.checkpointIo());
+            // WS5 (a): register the consumer-generic clamp callback
+            // unconditionally, before either managed-index early return
+            // below -- an enrichment/resolution/promotion consumer with no
+            // managed index at all must still protect its own journal
+            // entries from `Store.serviceRetirement`/`DocStore.
+            // serviceRetirement`'s independent clamp. `ctx.async_context`
+            // is the DB's own stable, heap-owned context (outlives this
+            // short-lived `BatchExecutionContext`), so it is safe to hand
+            // to a callback the store retains past this call's return.
+            // Idempotent and cheap: safe to re-register on every call.
+            if (ctx.async_context) |async_ctx| {
+                ctx.store.setExtraConsumerProgressProvider(async_ctx, extraConsumerMinAppliedSequenceCallback);
+            }
             if (!ctx.index_manager.hasManagedIndexes()) return;
 
             const managed_indexes = try ctx.index_manager.managedIndexes(ctx.alloc);
@@ -5943,6 +6003,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             min_applied = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, min_applied);
             min_applied = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, min_applied);
+
+            // WS5 (a): diagnostic push only -- `DocStore.serviceRetirement`/
+            // `Store.serviceRetirement`'s actual safety clamp is
+            // `apply_state.minAppliedSequenceAcrossAllConsumers`, a fresh
+            // scan of every progress-v2 record read at drain time, not
+            // this pushed value. Kept so `known_safe_retirement_watermark`
+            // reflects the latest consumer walk for diagnostics/tests.
+            ctx.store.noteSafeRetirementWatermark(min_applied);
 
             // WS5: this same consumer walk is a minimal, catalog-derived
             // consumer registry for the hinted replay lanes. A durable,

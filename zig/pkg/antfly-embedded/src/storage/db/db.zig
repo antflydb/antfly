@@ -58625,6 +58625,11 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     }
     effective = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, effective);
     effective = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, effective);
+    // WS5 (a): diagnostic push only -- the actual safety clamp lives in
+    // `Store.serviceRetirement`/`DocStore.serviceRetirement`
+    // (`apply_state.minAppliedSequenceAcrossAllConsumers`, read fresh at
+    // drain time), not in anything pushed from here.
+    ctx.store.noteSafeRetirementWatermark(effective);
     // WS5: this runs as the derived executor's `truncate_fn`, reached from
     // the foreground `waitForAll`/`waitForIndexes` catch-up paths -- it only
     // raises the watermark now. Physical retirement is the owner-only
