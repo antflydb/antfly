@@ -92,6 +92,8 @@ def render(language):
     }[language]
     for name, schema in SCHEMAS.items():
         if "$ref" in schema:
+            if language == "py":
+                lines.append("")
             target = typ(schema, language)
             lines.append(
                 {
