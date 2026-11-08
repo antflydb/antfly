@@ -21,6 +21,16 @@ def write_generated_files(root: Path, signature_count: int) -> None:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join([NDJSON_HEADER, *([signature] * signature_count)]))
+    path = root / "api/default/dictate.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                'headers["Content-Type"] = "application/vnd.antfly.attachments.v1"',
+                *(["body: InferenceDictateRequest | File | Unset = UNSET"] * 5),
+            ]
+        )
+    )
     path = root / SCOPED_MERGE
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -67,6 +77,9 @@ def test_required_ndjson_body_is_not_made_optional(tmp_path: Path) -> None:
         source = (tmp_path / relative).read_text()
         assert source.count("body: StatefulQueryRequest | File") == 5
         assert "Unset = UNSET" not in source
+    dictate_source = (tmp_path / "api/default/dictate.py").read_text()
+    assert dictate_source.count("body: InferenceDictateRequest | File") == 5
+    assert "Unset = UNSET" not in dictate_source
     merge_source = (tmp_path / SCOPED_MERGE).read_text()
     assert merge_source.count("body: LinearMergeRequest | ScopedLinearMergeRequest") == 5
     assert "Unset = UNSET" not in merge_source
@@ -116,3 +129,13 @@ def test_scoped_merge_shape_drift_fails_before_any_writes(tmp_path: Path) -> Non
     with pytest.raises(RuntimeError, match="required scoped merge body"):
         fix_generated_client(tmp_path)
     assert {relative: (tmp_path / relative).read_bytes() for relative in files} == before
+
+
+def test_dictation_body_drift_fails_before_any_writes(tmp_path: Path) -> None:
+    write_generated_files(tmp_path, signature_count=5)
+    path = tmp_path / "api/default/dictate.py"
+    path.write_text(path.read_text().replace("InferenceDictateRequest", "ChangedRequest"))
+    before = {relative: (tmp_path / relative).read_bytes() for relative in FILES}
+    with pytest.raises(RuntimeError, match="required binary/JSON body"):
+        fix_generated_client(tmp_path)
+    assert {relative: (tmp_path / relative).read_bytes() for relative in FILES} == before
