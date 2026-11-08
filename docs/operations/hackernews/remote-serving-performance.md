@@ -889,3 +889,7 @@ not run. Initial construction encountered one provider timeout; retrying the
 existing fixture completed publication. Initial 10k readiness now has a bounded
 600-second setup allowance, separate from unchanged single-attempt query
 timings. The deployment qualifications described above still apply.
+
+Full-lake E2E now collects a native HN managed-overlay bridge, exercising the
+hierarchy/restart regression through the assembled artifacts. This additional
+local, credential-free bridge passed with the locked lake/Iceberg extras.
