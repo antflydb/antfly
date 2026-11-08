@@ -1251,3 +1251,64 @@ def test_retention_accepts_and_expires_signed_historical_readings(stateful_api, 
                 document, version = api.lookup_key_with_version(name, key)
                 assert document["observed_at"] == observed
                 assert version and int(version) > 0
+
+
+def test_ordered_series_repeated_first_pages_keep_their_captured_rows(stateful_api):
+    api = stateful_api
+    name = f"series_repeated_capture_{time.time_ns()}"
+    finish_create_table(
+        api,
+        name,
+        api._request("POST", f"/tables/{name}", {"num_shards": 2, "schema": _schema()}),
+    )
+    api.batch_write(
+        name,
+        inserts={
+            key: {
+                "observed_at": f"2026-11-06T12:0{index}:00Z",
+                "device_id": "sensor",
+                "temperature": index,
+            }
+            for index, key in enumerate(["a", "b", "c"], 1)
+        },
+        sync_level="full_index",
+    )
+    query = {
+        "limit": 1,
+        "profile": True,
+        "order_by": [{"field": "observed_at", "desc": True}],
+        "filter_query": {
+            "conjuncts": [
+                {"field": "device_id", "equals": "sensor"},
+                {
+                    "field": "observed_at",
+                    "start": "2026-11-06T12:00:00Z",
+                    "end": "2026-11-06T13:00:00Z",
+                    "inclusive_start": True,
+                    "inclusive_end": False,
+                },
+            ]
+        },
+    }
+    heads = []
+    for _ in range(3):
+        payload = api.query_table(name, query)
+        response = payload.get("responses", [payload])[0]
+        assert response.get("status", 200) == 200, payload
+        assert response["hits"]["hits"][0]["_id"] == "c", payload
+        heads.append(response)
+    api.batch_write(name, deletes=["b"], sync_level="full_index")
+    payload = api.query_table(name, dict(query, limit=3))
+    live = payload.get("responses", [payload])[0]
+    assert [hit["_id"] for hit in live["hits"]["hits"]] == ["c", "a"], payload
+    for head in heads:
+        payload = api.query_table(
+            name,
+            dict(
+                query,
+                remote_snapshot=head["remote_snapshot"],
+                search_after=head["hits"]["hits"][0]["_sort"],
+            ),
+        )
+        retained = payload.get("responses", [payload])[0]
+        assert retained["hits"]["hits"][0]["_id"] == "b", payload

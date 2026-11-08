@@ -21028,9 +21028,12 @@ pub const DB = struct {
     /// release mutation fences before repository I/O, then rebind exact extents.
     fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !bool {
         const repository = self.backend_runtime.query_cut_repository orelse return false;
-        if (repository.vtable.reuse == null) return false;
         const basis = self.local_execution.native_query_reuse orelse return false;
-        if (std.mem.eql(u8, &basis.id, request.id)) return false;
+        // Preflight and execution may bind the same generation with different
+        // transport deadlines. Its first publication wins even after writes.
+        if (std.mem.eql(u8, &basis.id, request.id))
+            return basis.table_id == request.table_id and basis.expires_ms == request.expires_ms;
+        if (repository.vtable.reuse == null) return false;
         const digest = (try self.nativeQueryReuseDigest(cancellation)) orelse return false;
         if (!basis.matches(digest, @import("native_query_cut.zig").nowMs())) return false;
         const proof = (try repository.reuse(io, basis.asRequest(), request, self.core.identity_namespace, basis.proof(), cancellation)) orelse return false;
@@ -21050,15 +21053,17 @@ pub const DB = struct {
         const control: @import("native_query_cut.zig").Control = .{ .parent = cancellation, .deadline_ns = deadline };
         const token = control.token();
         try token.check();
-        if (publish) if (self.backend_runtime.query_cut_repository) |repository| if (self.primary_lsm_storage) |storage| {
-            if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
-        };
         var profile = QueryCaptureProfile.init(benchQueryProfileEnabled(), "query_pin_lock");
         defer profile.finish();
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
         profile.next("reuse_and_admission");
         if (publish and try self.tryReuseNativeQueryCut(io, request, token)) return;
+        // A process-local hint is optional. Recover an already committed
+        // binding before considering a fresh capture of mutable live state.
+        if (publish) if (self.backend_runtime.query_cut_repository) |repository| if (self.primary_lsm_storage) |storage| {
+            if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
+        };
         try self.admitQueryCut(io, request.id, token);
         const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
         defer self.alloc.free(root);
