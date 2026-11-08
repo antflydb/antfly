@@ -24,6 +24,35 @@ const wal_client = @import("kernel_wal_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
 const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
+test "opaque owner policy receipt controls retain verifier configuration" {
+    const a = std.testing.allocator;
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    for ([_]bool{ false, true }) |configured| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(path);
+        var owner = try client.Owner.open(.{
+            .context = context.handle,
+            .path = .fromSlice(path),
+            .table_name = .fromSlice("rows"),
+            .group_id = 72,
+            .has_identity_namespace = 1,
+            .identity_table_id = 7,
+            .identity_shard_id = 72,
+            .identity_range_id = 272,
+            .row_policy_authority_secret = .fromSlice(if (configured) "01234567890123456789012345678901" else ""),
+            .row_policy_authority_issuer = .fromSlice(if (configured) "test-policy-owner" else ""),
+        });
+        defer owner.deinit();
+        try std.testing.expectError(if (configured) error.NotFound else error.RowPolicyAuthenticationRequired, owner.lookupJson("rows",
+            \\{"key":"","row_policy_receipt":{"generation":1,"phase":"pending_install"}}
+        ));
+    }
+}
+
 test "opaque owner retained relational read crosses checked archive boundary" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1560,9 +1589,15 @@ test "opaque storage owner preserves source-vector policy and status across reop
 test "opaque storage owner fences exact source targets before acknowledging writes" {
     const Observer = struct {
         calls: std.atomic.Value(usize) = .init(0),
+        status_changes: std.atomic.Value(usize) = .init(0),
         additive: std.atomic.Value(bool) = .init(false),
         reducing: std.atomic.Value(bool) = .init(false),
         invalid: std.atomic.Value(bool) = .init(false),
+        fn statusChanged(ptr: ?*anyopaque, table: abi.BorrowedBytes) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (!std.mem.eql(u8, table.slice(), "docs")) self.invalid.store(true, .release);
+            _ = self.status_changes.fetchAdd(1, .release);
+        }
         fn notify(ptr: ?*anyopaque, table: abi.BorrowedBytes, group: u64, sequence: u64, has_sequence: u8, json: abi.BorrowedBytes) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             if (!std.mem.eql(u8, table.slice(), "docs") or group != 7001 or has_sequence == 0 or sequence == 0) self.invalid.store(true, .release);
@@ -1589,7 +1624,7 @@ test "opaque storage owner fences exact source targets before acknowledging writ
         .table_name = .fromSlice("docs"),
         .group_id = 7001,
         .indexes_json = .fromSlice("{\"model\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}"),
-        .target_observer = .{ .ctx = &observer, .notify = Observer.notify },
+        .target_observer = .{ .ctx = &observer, .notify = Observer.notify, .status_changed = Observer.statusChanged },
     });
     defer owner.deinit();
     var inserted = try owner.batchJson("docs", "{\"inserts\":{\"a\":{\"_embeddings\":{\"model\":[1,0,0]}}},\"sync_level\":\"full_index\"}");
@@ -1599,6 +1634,11 @@ test "opaque storage owner fences exact source targets before acknowledging writ
     var deleted = try owner.batchJson("docs", "{\"deletes\":[\"a\"],\"sync_level\":\"full_index\"}");
     defer deleted.deinit();
     try std.testing.expect(observer.reducing.load(.acquire));
+    for (0..500) |_| {
+        if (observer.status_changes.load(.acquire) != 0) break;
+        try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+    }
+    try std.testing.expect(observer.status_changes.load(.acquire) > 0);
     try std.testing.expect(!observer.invalid.load(.acquire));
 }
 
@@ -3790,6 +3830,50 @@ test "opaque metadata snapshot retries retain later committed prefix across reop
     try std.testing.expectError(error.InvalidMetadataSnapshot, store.snapshotBuilder().installSnapshot(a, group, 12, snapshot));
     try std.testing.expectEqual(@as(u64, 12), (try store.latestCheckpoint(group)).?.commit_index);
 }
+test "opaque metadata session reads retain binary values and survive raft snapshots" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const target_path = try std.fmt.allocPrint(a, "{s}/restored", .{path});
+    defer a.free(target_path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    const records = @import("../metadata/transaction_session_record.zig");
+    const key = try records.keyAlloc(a, group, "receipt");
+    defer a.free(key);
+    const first = try records.encode(a, .{ .changes = &.{.{ .key = "receipt", .expected = null, .value = "\xff\x00" }} });
+    defer a.free(first);
+    try store.applyStandaloneCommand(group, .{ .apply_transaction_sessions = first });
+    var retained = try store.openSessionRead(a, group);
+    defer retained.abort();
+    try std.testing.expectEqualStrings("\xff\x00", try retained.get(key));
+    try std.testing.expectError(error.InvalidArgument, retained.get("outside-session-namespace"));
+    const next = try records.encode(a, .{ .changes = &.{.{ .key = "receipt", .expected = "\xff\x00", .value = "\x80committed" }} });
+    defer a.free(next);
+    try store.applyStandaloneCommand(group, .{ .apply_transaction_sessions = next });
+    try std.testing.expectEqualStrings("\xff\x00", try retained.get(key));
+    var current = try store.openSessionRead(a, group);
+    defer current.abort();
+    try std.testing.expectEqualStrings("\x80committed", try current.get(key));
+    var cursor = try current.openCursor();
+    {
+        defer cursor.close();
+        try std.testing.expectEqualStrings(key, (try cursor.last()).?.key);
+        try std.testing.expectEqualStrings("\x80committed", (try cursor.seekAtOrAfter(key)).?.value);
+        try std.testing.expect((try cursor.next()) == null);
+    }
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(snapshot);
+    var restored = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = target_path, .no_sync = true });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(a, group, 11, snapshot));
+    var recovered = try restored.openSessionRead(a, group);
+    defer recovered.abort();
+    try std.testing.expectEqualStrings("\x80committed", try recovered.get(key));
+}
 
 test "opaque metadata apply owner preserves semantic error identity" {
     const path = "/tmp/antfly-storage-kernel-metadata-errors";
@@ -4457,6 +4541,41 @@ fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.l
     var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
     for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
     return result;
+}
+
+test "opaque metadata job projections retain binary checkpoints and authoritative quotas" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    const jobs = @import("../metadata/job_state.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    try std.testing.expect((try store.getJobState(a, group, "documents/missing")) == null);
+    try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, group, "alice"));
+    const checkpoint = "\xff\x00\x80checkpoint";
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = "checkpoints/opaque", .expected_hash = "", .value = checkpoint } });
+    const binary = (try store.getJobState(a, group, "checkpoints/opaque")).?;
+    defer a.free(binary);
+    const queued = "{\"owner\":\"alice\",\"state\":\"queued\"}";
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = "documents/native", .expected_hash = "", .value = queued } });
+    try std.testing.expectEqual(@as(u64, 1), try store.getJobOwnerCount(a, group, "alice"));
+    const page_bytes = try store.scanJobState(a, group, null);
+    defer a.free(page_bytes);
+    var page = try std.json.parseFromSlice(jobs.Page, a, page_bytes, .{ .allocate = .alloc_always });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.value.rows.len);
+    try std.testing.expectEqualStrings("documents/native", page.value.rows[0].key);
+    try std.testing.expectEqualStrings(queued, page.value.rows[0].value);
+    try std.testing.expectEqualSlices(u8, checkpoint, binary);
+    const hash = jobs.digest(queued);
+    const finished = "{\"owner\":\"alice\",\"state\":\"succeeded\"}";
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = "documents/native", .expected_hash = &hash, .value = finished } });
+    try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, group, "alice"));
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, store.getJobState(a, group, "../outside"));
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, group, "../outside"));
 }
 
 test "opaque metadata durable job state reads preserve group cursor and ownership" {

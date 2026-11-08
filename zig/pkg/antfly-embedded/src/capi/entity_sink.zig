@@ -528,10 +528,13 @@ fn supportsCuration(_: *anyopaque) anyerror!bool {
     return true;
 }
 
-fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const callbacks.EntityUpsert) anyerror!void {
+pub fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const callbacks.EntityUpsert) anyerror!void {
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.ReadOnly;
     if (entries.len == 0) return;
+    // Detached computation never owns the live SQL coordinator journal.
+    // Publish the canonical merge and decision under the owner/path fence.
+    if (handle.maintenance_publication) |publication| return publication.publishPromotions(allocator, entries);
     const admission = if (handle.owned_lite_backend) |backend|
         if (backend.native_docstore) |store| store.writer_admission else null
     else
@@ -679,9 +682,7 @@ fn replaySequence(handle: *h.Handle) u128 {
 
 fn boundTable(ptr: *anyopaque, name: []const u8) anyerror!?[]const u8 {
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
-    _ = try tables.get(handle, name);
-    if (std.mem.eql(u8, name, "default")) return "embedded/tables/1";
-    return handle.embedded_tables.get(name).?.namespace;
+    return try tables.storageName(handle, name);
 }
 
 fn candidateGet(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, key: []const u8) anyerror!?[]u8 {

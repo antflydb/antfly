@@ -545,6 +545,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "text merge file provenance resolves deletion races",
         "capi path gate",
         "storage owner runtime status",
+        "capi storage owner candidate batches",
         "storage owner remote content source",
         "capi relational expression errors preserve public status semantics",
         "bounded Lite retirement admission is retryable while uncertain publication is not",
@@ -561,6 +562,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi concurrent calls and closes on one handle never touch freed memory",
         "capi text and dense searches succeed while writes commit",
         "capi execute graph queries honors identity read generation",
+        "capi embedded graph catalog and query retain table identities across reopen",
         "capi fact relationships preserve identities and filter before ranking",
         "capi fact path serialization and parsing release partial allocations",
         "capi fact algebraic paths retain provenance and respect frontier limits",
@@ -626,6 +628,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inline resolver ownership",
         "capi retired resolver identities",
         "capi query retry errors",
+        "capi Cypher authority",
         "capi resolver",
         "resolver import cross",
         "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
@@ -677,6 +680,23 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")
         .dependOn(&run_capi_models.step);
+    const maintenance_activity_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/capi/maintenance_activity.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) });
+    const run_maintenance_activity = b.addRunArtifact(maintenance_activity_tests);
+    run_capi_tests.step.dependOn(&run_maintenance_activity.step);
+    b.step("capi-maintenance-activity-test", "Verify manual drains yield admission to detached publishers")
+        .dependOn(&run_maintenance_activity.step);
+    const cypher_capi_tests = b.addTest(.{
+        .root_module = capi_root_mod,
+        .filters = &.{ "capi embedded graph", "capi Cypher authority" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("capi-cypher-test", "Qualify local graph catalog and retained Cypher queries")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_capi_tests).step);
     const lake_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/lake_test_root.zig"),
         .target = target,

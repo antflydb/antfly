@@ -82,6 +82,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addCuratedTestRunArtifact(b, producer_receipt_tests, &producer_receipt_filters).step);
     const relationship_identity_filters = [_][]const u8{
         "db graph endpoint cleanup pages",
+        "db graph endpoint cleanup transaction graph effects",
+        "db graph endpoint cleanup graph-only prepares reserve source ranges across reopen",
+        "db external lake rejects native mutations before and after cold reopen",
         "derived worker pause",
         "graph endpoint cleanup byte admission",
         "bulk append index",

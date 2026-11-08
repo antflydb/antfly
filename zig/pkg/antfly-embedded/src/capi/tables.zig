@@ -19,7 +19,7 @@ const h = @import("handles.zig");
 const api = @import("db.zig");
 const std = h.std;
 const catalog = @import("../storage/lite/embedded_catalog.zig");
-const catalog_key = catalog.key;
+pub const catalog_key = catalog.key;
 const Record = catalog.Record;
 const Catalog = catalog.Catalog;
 pub const Table = struct {
@@ -54,6 +54,7 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     if (handle.embedded_native_providers) options.enrichment = null;
     if (handle.owned_lite_backend) |*backend| try backend.configureDbOpenOptionsForNamespace(&options, namespace);
     table.* = .{ .name = owned_name, .id = id, .namespace = namespace, .db = try h.db_mod.DB.open(alloc, path, options) };
+    table.db.local_execution.row_policy_table_name = table.name;
     errdefer table.db.close();
     if (handle.lite_scheduling_owner) |owner|
         table.db.borrowed_group_source_state = try owner.groupSourceStateNamed(&table.db, table.name);
@@ -203,6 +204,15 @@ pub fn noteReaderVersion(handle: *h.Handle) !void {
 pub fn requireDatabase(handle: *h.Handle) !void {
     if (handle.parent_id != null) return error.InvalidArgument;
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return error.UnsupportedSqlExecution;
+}
+
+/// Borrow the physical namespace while the database/table handle is pinned.
+pub fn storageName(handle: *h.Handle, name: []const u8) ![]const u8 {
+    _ = try get(handle, name);
+    if (std.mem.eql(u8, name, "default")) return "embedded/tables/1";
+    handle.embedded_table_open_mutex.lockUncancelable(h.handleLockIo());
+    defer handle.embedded_table_open_mutex.unlock(h.handleLockIo());
+    return handle.embedded_tables.get(name).?.namespace;
 }
 
 /// Read schema declarations at the captured Lite root without constructing

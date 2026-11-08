@@ -16,6 +16,7 @@
 //! Public embedded DB C ABI.
 comptime {
     _ = @import("sql_describe.zig");
+    _ = @import("cypher.zig");
 }
 const handles = @import("handles.zig");
 pub const testMaintenanceCaptureAdmission = @import("lite_connection.zig").testMaintenanceCaptureAdmission;
@@ -808,6 +809,38 @@ pub const HandleGuard = struct {
     /// example after inference), not each admission separately. Null means
     /// the connection has no busy timeout.
     admission_budget_ns: ?i96 = null,
+    suspended_immutable_query: bool = false,
+    immutable_readonly: ?struct { store: bool, file: bool } = null,
+
+    pub fn suspendImmutableQuery(self: *HandleGuard) void {
+        const connection = self.connection orelse return;
+        std.debug.assert(self.connection_gate_held and self.entry_error == null);
+        const root = connection.current.?;
+        std.debug.assert(root.immutable_query_borrows == 0);
+        const store = root.owned_lite_backend.?.native_docstore.?;
+        self.immutable_readonly = .{ .store = store.read_only, .file = store.file.read_only };
+        // Read admission can inspect these flags. Freeze them before dropping
+        // the gate, rather than changing them concurrently during retirement.
+        store.read_only = true;
+        store.file.read_only = true;
+        root.immutable_query_borrows += 1;
+        self.suspended_immutable_query = true;
+        self.suspendQuery();
+    }
+
+    /// Caller holds the path gate and has finished all uses of the snapshot.
+    fn releaseImmutableQuery(self: *HandleGuard) void {
+        if (!self.suspended_immutable_query) return;
+        const root = self.suspended_query_root.?;
+        root.immutable_query_borrows -= 1;
+        if (self.connection.?.current == root) {
+            const store = root.owned_lite_backend.?.native_docstore.?;
+            store.read_only = self.immutable_readonly.?.store;
+            store.file.read_only = self.immutable_readonly.?.file;
+        }
+        self.immutable_readonly = null;
+        self.suspended_immutable_query = false;
+    }
 
     /// Named admission has acquired its own exact immutable inputs. End the
     /// predecessor bridge before document work or detached provider execution.
@@ -878,6 +911,15 @@ pub const HandleGuard = struct {
     }
     pub fn resumeAccess(self: *HandleGuard, ptr: ?*anyopaque, access: HandleAccess) bool {
         if (self.suspended_query_root == null) return true;
+        const connection = self.connection.?;
+        if (self.suspended_immutable_query) {
+            // The caller has finished using the snapshot. Keep the lifetime
+            // borrow until reentry, but permit refresh to reuse this root when
+            // no overlapping query required a replacement.
+            connection.gate.mutex.lockUncancelable(handleLockIo());
+            self.releaseImmutableQuery();
+            connection.gate.mutex.unlock(handleLockIo());
+        }
         // Original registry references keep the connection/owner alive.
         const entry = HandleEntry.capture(ptr) orelse return false;
         const next = if (self.connection_mutex_held)
@@ -920,6 +962,8 @@ pub const HandleGuard = struct {
             connection.gate.mutex.lockUncancelable(io);
             if (self.suspended_query_primary) |pin| releaseQueryPrimary(pin);
             root.query_borrows -= 1;
+            var owned = self;
+            owned.releaseImmutableQuery();
             connection.collectRetired();
             connection.gate.mutex.unlock(io);
             if (self.connection_mutex_held) connection.mutex.unlock(io);
@@ -1204,7 +1248,7 @@ fn enterCapturedHandleWithDeadlineMode(entry: HandleEntry, access: HandleAccess,
         // only contention waits consult the deadline. The retry loop checks
         // expiry before starting a new attempt after backoff.
         if (!pinned) {
-            guard.path_lease = connection.acquire() catch |err| {
+            guard.path_lease = (if (access == .maintain) connection.acquireForMaintenance() else connection.acquire()) catch |err| {
                 guard.entry_error = capi.mapError(err);
                 return guard;
             };
@@ -3304,6 +3348,7 @@ pub fn openLiteHandleAllocWithSharedInference(
         opts.start_optional_runtime_workers = false;
         opts.start_resolver_workers = false;
         opts.defer_index_backfill_on_open = true;
+        opts.defer_derived_replay_on_open = true;
     }
     try backend.configureDbOpenOptions(&opts);
 
@@ -7258,7 +7303,7 @@ fn executePreparedEmbeddedSqlWithHandoff(handle: *Handle, table_name: []const u8
         if (value.failed) return error.SqlTransactionAborted;
         if (value.active and (compiled.statement == .create_table or compiled.statement == .drop_table or compiled.statement == .catalog_ddl or compiled.statement == .policy_ddl)) return error.UnsupportedSqlExecution;
     }
-    var adapter = sql.Adapter(antfly){ .preparation_allocator = temporary, .preparation_handoff = handoff, .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
+    var adapter = sql.Adapter(antfly){ .graph_parameters = parsed.value.parameters, .preparation_allocator = temporary, .preparation_handoff = handoff, .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     defer adapter.deinitPreparation();
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {

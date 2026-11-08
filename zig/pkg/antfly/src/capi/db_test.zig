@@ -6736,7 +6736,9 @@ fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool, cursor: ?[
         if (!pending) break;
         try shared.handleLockIo().sleep(.fromMilliseconds(1), .awake);
     }
-    if (ttl_failure) try std.testing.expectEqual(@as(usize, 1), ttl_failures);
+    // A provider wait can span more than one TTL interval. Every TTL failure
+    // remains observable while independent replay must still settle below.
+    if (ttl_failure) try std.testing.expect(ttl_failures > 0);
     const guard = public.enterHandle(handle, .read).?;
     defer guard.leave();
     const stats = guard.handle.db.pendingWorkStats();
@@ -7621,6 +7623,71 @@ test "capi lite inference producer retry is visible in graph replacement status"
     try std.testing.expect(row.get("upstream_last_error").? == .null);
 }
 
+test "capi SQL detached index publication rejects a recreated table namespace" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-named-publication-fence");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE docs (body TEXT)");
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const table = &guard.handle.embedded_tables.get("docs").?.db;
+        try table.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+    }
+    const Probe = struct {
+        handle: ?*anyopaque,
+        failure: ?anyerror = null,
+        rejected: bool = false,
+        fn notify(ptr: *anyopaque, root: *shared.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.check(root) catch |err| {
+                self.failure = err;
+            };
+        }
+        fn check(self: *@This(), root: *shared.Handle) !void {
+            const table = &root.embedded_tables.get("docs").?.db;
+            const file = try std.fmt.allocPrint(std.testing.allocator, "{s}/body_text/prepared.bin", .{table.core.index_manager.base_path});
+            defer std.testing.allocator.free(file);
+            try sqlFkRecoveryStatement(self.handle, "DROP TABLE docs");
+            try sqlFkRecoveryStatement(self.handle, "CREATE TABLE docs (body TEXT)");
+            table.core.index_manager.text_lsm_storage.?.writeFileAbsolute(file, "old namespace") catch |err| {
+                try std.testing.expect(err == error.EnrichmentWaitCanceled);
+                self.rejected = true;
+                return;
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+    var probe: Probe = .{ .handle = handle };
+    owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_after_capture = null;
+    owner.maintenance_table_cursor = 1;
+    owner.maintenance_pending = true;
+    _ = try owner.maintenanceTurnForTest();
+    if (probe.failure) |err| return err;
+    try std.testing.expect(probe.rejected);
+}
+
 test "capi SQL visibility waits for physical graph indexes and normalized vector text filters" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |quarantined_default| {
@@ -8075,6 +8142,60 @@ test "storage owner remote content source refreshes policy and retains in-flight
     const recovered = try remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config);
     defer alloc.free(recovered);
     try std.testing.expect(std.mem.indexOf(u8, recovered, "image/png") != null);
+}
+
+test "capi storage owner candidate batches release native views through their owning adapter" {
+    const Fixture = struct {
+        source: db_mod.CandidateSource = undefined,
+        invalid: bool = false,
+        released: usize = 0,
+        reads: usize = 0,
+        fn legacyGet(_: ?*anyopaque, _: kernel_owner_abi.BorrowedBytes, _: kernel_owner_abi.BorrowedBytes, _: ?*anyopaque, _: kernel_owner_abi.ResolutionCandidateConsumeFn) callconv(.c) kernel_owner_abi.Status {
+            return .ok;
+        }
+        fn nativeGet(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return null;
+        }
+        fn release(ptr: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.released += 1;
+        }
+        fn begin(ptr: ?*anyopaque, _: ?[*]const kernel_owner_abi.BorrowedBytes, _: u64, output: *kernel_owner_abi.ResolutionCandidateConfig) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            const bytes = std.mem.asBytes(&self.source);
+            output.* = .{
+                .callback_ctx = self,
+                .native_view = .fromSlice(if (self.invalid) bytes[0..1] else bytes),
+                .native_view_contract = .fromSlice(db_mod.CandidateSource.nativeContractBytes()),
+                .release_fn = release,
+            };
+            return .ok;
+        }
+    };
+    for ([_]bool{ false, true }) |invalid| {
+        var fixture: Fixture = .{ .invalid = invalid };
+        fixture.source = .{ .ptr = &fixture, .vtable = &.{ .get = Fixture.nativeGet } };
+        var hooks: StorageOwnerRuntimeHooks = .{ .config = .{ .resolution_candidates = .{ .callback_ctx = &fixture, .get_fn = Fixture.legacyGet, .begin_batch_fn = Fixture.begin } }, .group_id = 1 };
+        const source = (try server_api.test_support.candidateSource(&hooks)).?;
+        if (invalid) {
+            try std.testing.expectError(error.InvalidAbiVersion, source.beginBatch(std.testing.allocator, &.{"entities"}));
+        } else {
+            const batch = try source.beginBatch(std.testing.allocator, &.{"entities"});
+            defer batch.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&fixture)), batch.source.ptr);
+            try std.testing.expect(batch.release_context.? != batch.source.ptr);
+            try std.testing.expectEqual(@as(?[]u8, null), try batch.source.get(std.testing.allocator, "entities", "key"));
+            try std.testing.expectEqual(@as(usize, 1), fixture.reads);
+        }
+        try std.testing.expectEqual(@as(usize, 1), fixture.released);
+    }
+    var fallback: StorageOwnerRuntimeHooks = .{ .config = .{ .resolution_candidates = .{ .get_fn = Fixture.legacyGet } }, .group_id = 1 };
+    const source = (try server_api.test_support.candidateSource(&fallback)).?;
+    const batch = try source.beginBatch(std.testing.allocator, &.{"entities"});
+    defer batch.deinit(std.testing.allocator);
+    try std.testing.expect(batch.release == null);
 }
 
 test "storage owner remote content source preserves scoped GCS connections and snapshot lifetime" {

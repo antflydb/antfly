@@ -112,8 +112,7 @@ pub const Catalog = struct {
         // replayed after a later re-enable at the same generation.
         if ((catalog.row_policy_generation == 0) != (catalog.row_policy_catalog_epoch == 0) or
             (catalog.row_policy_phase != .disabled and catalog.row_policy_generation == 0)) return error.InvalidTableCatalog;
-        if (catalog.row_policy_phase != .disabled and
-            (catalog.storage_mode != .relational or catalog.active_schema_version == 0)) return error.InvalidTableCatalog;
+        if (catalog.row_policy_phase != .disabled and catalog.storage_mode != .relational) return error.InvalidTableCatalog;
         if (version == format_version) for (data[49..56]) |reserved| {
             if (reserved != 0) return error.InvalidTableCatalog;
         };
@@ -311,6 +310,11 @@ test "table catalog has a stable canonical representation" {
     const preparing: Catalog = .{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 3, .row_policy_phase = .preparing, .row_policy_generation = 11, .row_policy_catalog_epoch = 19 };
     const preparing_bytes = preparing.encode();
     try std.testing.expectEqual(preparing, try Catalog.decode(&preparing_bytes));
+    var initial_schema = preparing;
+    initial_schema.active_schema_version = 0;
+    initial_schema.row_policy_phase = .active;
+    const initial_schema_bytes = initial_schema.encode();
+    try std.testing.expectEqual(initial_schema, try Catalog.decode(&initial_schema_bytes));
     var revoked = preparing;
     revoked.row_policy_phase = .disabled;
     revoked.row_policy_generation += 1;

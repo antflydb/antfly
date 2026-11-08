@@ -3211,7 +3211,18 @@ pub const ResolutionRuntime = struct {
         const prefer_backfill = self.resident_backfill_next;
         self.resident_backfill_next = !prefer_backfill;
         self.catchUpTurnLocked(replayNowNs() +| @import("derived/replay_budget.zig").Controller.quantum_ns, prefer_backfill) catch |err| {
-            std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
+            // Accepted queue admission is not a completed publication. These
+            // states keep the replay cursor pending and retry without turning
+            // normal Raft/catalog convergence into a warning on every poll.
+            switch (err) {
+                error.ArtifactPublicationPending,
+                error.ArtifactCatalogDrift,
+                error.EnrichmentSourceChanged,
+                error.Timeout,
+                error.DeadlineExceeded,
+                => {},
+                else => std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)}),
+            }
             return 50;
         };
         return 0;

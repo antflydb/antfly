@@ -22357,6 +22357,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len != 1) return null;
 
         const table_req = tables[0];
+        if (table_req.graph_writes.len != 0 or table_req.graph_deletes.len != 0) return null;
         if (table_req.range_guards.len != 0) return null;
         if (table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
         const has_mutations = table_req.writes.len != 0 or
@@ -22441,6 +22442,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len == 0) return .{ .committed = .{ .participant_count = 0 } };
         if (tables.len != 1) return null;
         const table_req = tables[0];
+        if (table_req.graph_writes.len != 0 or table_req.graph_deletes.len != 0) return null;
         if (table_req.range_guards.len != 0) return null;
         if (table_req.predicates.len != 0 or table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
         if (try tableCommitHasGraphProjectionTransform(table_req)) return null;
@@ -23445,9 +23447,12 @@ pub const ProvisionedTableWriteSource = struct {
                 .row_policy_principal_proof = req.row_policy_principal_proof,
                 .row_policy_database = req.row_policy_database,
                 .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+                .normalized_graph_rows = req.normalized_graph_rows,
                 .writes = transactionWritesAsBatchWrites(req.writes),
                 .deletes = req.deletes,
                 .transforms = req.transforms,
+                .graph_writes = req.graph_writes,
+                .graph_deletes = req.graph_deletes,
                 .predicates = req.predicates,
                 .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
                 .integrity = req.integrity,
@@ -23472,9 +23477,12 @@ pub const ProvisionedTableWriteSource = struct {
                 .row_policy_principal_proof = req.row_policy_principal_proof,
                 .row_policy_database = req.row_policy_database,
                 .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+                .normalized_graph_rows = req.normalized_graph_rows,
                 .writes = transactionWritesAsBatchWrites(req.writes),
                 .deletes = req.deletes,
                 .transforms = req.transforms,
+                .graph_writes = req.graph_writes,
+                .graph_deletes = req.graph_deletes,
                 .predicates = req.predicates,
                 .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
                 .integrity = req.integrity,
@@ -25642,6 +25650,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             .ptr = self,
             .vtable = &.{
                 .drop_table = dropTable,
+                .activate_range_tracking = activateRangeTrackingHosted,
                 .create_index = createIndex,
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
@@ -26091,6 +26100,31 @@ pub const HostedProvisionedTableWriteSource = struct {
         try control_plane.enqueueTableIndexStructuralReconcile(table_name, index_name);
         _ = alloc;
         return {};
+    }
+
+    fn activateRangeTrackingHosted(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(alloc, self.catalog, table, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }))) orelse return error.TableNotFound;
+        defer routing.deinit(alloc);
+        if (!routing.coversKeyspace() or routing.ranges.len > 256) return error.CatalogGenerationChanged;
+        const body = try encodeRemoteBatchRequest(alloc, .{ .activate_range_tracking = true, .sync_level = .write });
+        defer alloc.free(body);
+        for (routing.ranges) |range| {
+            try context.ensureActive();
+            const target = routing.resolveRouteForKey(range.start_key) orelse return error.CatalogGenerationChanged;
+            const fence = routing.fenceForRoute(target);
+            var owner = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, target.group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+            defer owner.deinit(alloc);
+            switch (owner) {
+                .local => _ = (try batchGroupLocalFencedWithPreDecisionContext(self, alloc, target.group_id, table, .{ .activate_range_tracking = true, .sync_level = .write }, fence.topology_epoch, .{ .route_fence = fence, .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation })) orelse return error.StorageKernelOwnerUnavailable,
+                .remote => |remote| {
+                    var response = try self.fetchRemoteGroupBatch(alloc, remote.base_uri, target.group_id, table, body, fence);
+                    response.deinit(alloc);
+                },
+            }
+            try context.ensureActive();
+        }
     }
 
     fn batch(
@@ -26822,9 +26856,12 @@ pub const HostedProvisionedTableWriteSource = struct {
             .row_policy_principal_proof = req.row_policy_principal_proof,
             .row_policy_database = req.row_policy_database,
             .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+            .normalized_graph_rows = req.normalized_graph_rows,
             .writes = transactionWritesAsBatchWrites(req.writes),
             .deletes = req.deletes,
             .transforms = req.transforms,
+            .graph_writes = req.graph_writes,
+            .graph_deletes = req.graph_deletes,
             .predicates = req.predicates,
             .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
             .integrity = req.integrity,
@@ -28229,6 +28266,7 @@ fn applyIndexCreateToCachedDb(
     source_table: []const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    destination_authorizer: ?stored_destination_authorization.Authorizer,
 ) !void {
     try reconfigureManagedDbEnrichmentRuntimePaused(
         alloc,
@@ -28248,6 +28286,9 @@ fn applyIndexCreateToCachedDb(
         std.log.warn("failed to resume enrichment after managed index activation error index={s} err={s}", .{ index_name, @errorName(err) });
     };
     _ = try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, db, indexes_json, index_name, .{
+        .drain_resolver_backfill = false,
+        .source_table = source_table,
+        .destination_authorizer = destination_authorizer,
         .embedding_options = .{
             .antfly_provider = antfly_provider,
             .inference_api_url = inference_api_url,
@@ -28341,7 +28382,7 @@ fn reconcileCachedLocalTableIndexCreate(
         defer if (cached_active) cached.deinit(alloc);
         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
 
-        applyIndexCreateToCachedDb(alloc, cached.db, metadata.indexes_json, index_name, self.backend_runtime, self.antfly_provider, self.remote_capability_cache, self.inference_api_url, self.inference_api_key, table_name, self.secret_store, self.remote_content) catch |err| {
+        applyIndexCreateToCachedDb(alloc, cached.db, metadata.indexes_json, index_name, self.backend_runtime, self.antfly_provider, self.remote_capability_cache, self.inference_api_url, self.inference_api_key, table_name, self.secret_store, self.remote_content, self.destination_authorizer) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
             cached_active = false;
             return err;
@@ -30241,6 +30282,7 @@ fn runtimeStatusNeedsAuthoritativeLifecycleRefresh(status: runtime_status.LocalT
         return true;
     }
     for (status.stats.indexes) |item| {
+        for (item.source_replay) |source| if (!source.producer_complete) return true;
         if (item.backfill_active or
             item.repair_degraded or
             item.repair_issue_count != 0 or

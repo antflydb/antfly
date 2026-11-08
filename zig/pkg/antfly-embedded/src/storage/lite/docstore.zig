@@ -3722,6 +3722,7 @@ pub const Txn = struct {
     read_pin: ?*ReadPin = null,
     native_publication: ?@import("../native_publication.zig").Participant = null,
     atomic_member: ?@import("../native_publication.zig").AtomicMember = null,
+    borrowed_read_generation: bool = false,
     checkpoint: native.CheckpointSlot = .{},
 
     pub fn decodedResultsNamespace(self: *const Txn) []const u8 {
@@ -3738,6 +3739,13 @@ pub const Txn = struct {
         return if (self.store) |store| store.readMetadataAllocator() else fallback;
     }
 
+    /// The erased read family retains the original owner until every fork and
+    /// cursor closes. Each fork owns scratch, while borrowing that owner's
+    /// immutable checkpoint and inode/reclamation pin.
+    pub fn forkBorrowedRead(self: *Txn) !Txn {
+        if (!self.read_only or self.pending_count != 0) return error.ReadSnapshotForkUnsupported;
+        return .{ .allocator = self.allocator, .store = self.store, .prefix = self.prefix, .checkpoint = self.checkpoint, .read_generation = self.read_generation, .borrowed_read_generation = true };
+    }
     pub fn openRead(store: *Store) !Txn {
         return try openReadWithPrefix(store, "");
     }
@@ -4716,6 +4724,10 @@ pub const Txn = struct {
     }
 
     fn releaseGenerationReadLock(self: *Txn) void {
+        if (self.borrowed_read_generation) {
+            self.read_generation = null;
+            return;
+        }
         const generation = self.read_generation orelse return;
         const store = self.store orelse return;
         self.read_generation = null;
@@ -12742,6 +12754,31 @@ test "lite reclamation cooperative shrink yields to an unannounced primary publi
     defer a.free(value);
     try std.testing.expectEqualStrings("new primary value", value);
     try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite erased read forks retain the original checkpoint through parent and cursor close" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "forked-statement.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    try store.file.putDocument("doc", "before");
+    var parent = try backend_erased.readTxnFrom(a, try store.beginRead());
+    var retained = try parent.forkRead();
+    parent.abort();
+    try store.file.putDocument("doc", "after");
+    for (0..128) |_| {
+        const next = try retained.forkRead();
+        retained.abort();
+        retained = next;
+    }
+    try std.testing.expectEqualStrings("before", try retained.get("doc"));
+    var cursor = try retained.openCursor();
+    retained.abort();
+    defer cursor.close();
+    try std.testing.expectEqualStrings("before", (try cursor.first()).?.value);
 }
 
 test "lite reclamation issue1431 canceled automatic rewrites retry without file growth" {

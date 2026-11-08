@@ -67,7 +67,7 @@ fn collect(a: std.mem.Allocator, bound: describe.BoundStatement, entries: *std.A
         for (entries.items) |entry| if (entry.plan == plan) return;
         if (entries.items.len >= 64 or plan.scans.len > 64 - scans.items.len) return error.SqlProgramLimitExceeded;
         try entries.append(a, .{ .plan = plan, .offset = scans.items.len });
-        try scans.appendSlice(a, plan.scans);
+        try scans.appendSlice(a, try @import("relation_runtime.zig").outerGraphScans(a, plan, bound.scalars.predicate));
     }
     if (bound.window) |window| try collect(a, window.input.*, entries, scans, depth + 1);
     if (bound.joined_mutation) |mutation| try collect(a, mutation.input.*, entries, scans, depth + 1);

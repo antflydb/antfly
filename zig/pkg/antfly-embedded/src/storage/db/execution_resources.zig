@@ -666,6 +666,7 @@ pub const ProfiledLock = struct {
 pub const BatchExecutionContext = struct {
     apply_exclusive_held: bool = false,
     alloc: Allocator,
+    ordered_artifact_publication_required: bool = false,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
@@ -1182,6 +1183,7 @@ pub const LocalExecutionState = struct {
     vector_migration_active: std.atomic.Value(bool) = .init(false),
     vector_migration_offline_candidate: bool = false,
     artifact_publication_dispatcher: ?ArtifactPublicationDispatcher = null,
+    producer_catalog_generation: AtomicU64 = .init(0),
     /// Planning and visibility observations have one shared owner.
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     visibility_runtime_stats: VisibilityRuntimeStats = .{},

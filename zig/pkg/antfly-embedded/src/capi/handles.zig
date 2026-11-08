@@ -149,6 +149,10 @@ pub const Handle = struct {
     /// Keep predecessor inputs alive only while an admitted API call opens
     /// its replacement namespaces. This borrows neither allocator nor queries.
     refresh_references: usize = 0,
+    /// Borrowers executing against this root's immutable catalog and indexes.
+    /// The path gate protects this count; refresh must replace rather than
+    /// mutate a root while any such borrower remains.
+    immutable_query_borrows: usize = 0,
 
     // Serialized threading mode (see CAPI.md "Thread Safety"): every export
     // enters through `enterHandle`, which takes `api_lock` shared for reads

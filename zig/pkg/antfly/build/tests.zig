@@ -365,6 +365,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
     const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
+    const cypher_metadata_frames = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"metadata durable job state and transaction sessions retain distinct command frames"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-metadata-frame-test", "Verify graph session and SQL completion command compatibility")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_metadata_frames).step);
     const metadata_sql_sessions = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[4],
         .filters = &.{ "metadata server can expose admin listener endpoints", "metadata SQL session routing" },
@@ -390,6 +397,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "initial self FK reserves one hidden child owner", "initial self FK resumes the second hidden range", "FK generation publication initial create reserves hidden identity", "generation lock freezes the table cut while initial support permits exact schema retirement", "native initial support finalization requires current bound root", "initial partial support begin survives restart", "initial MATCH PARTIAL publication pins parent witness support", "initial FK root generation", "canceled hidden reservation permits only exact tagged placement removal", "hosted initial FK retirement", "initial FK retirement ACK signature", "retirement ACK validates exact canceled work", "initial child root receipt", "initial child physical attestation", "store root enrollment proof" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const graph_resolver_activation_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[6],
+        .filters = &.{"target index reconciliation"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const graph_resolver_activation_run = addFilteredTestRunArtifact(b, graph_resolver_activation_tests);
+    b.step("antfly-graph-resolver-activation-test", "Verify targeted graph index resolver activation and sibling isolation").dependOn(&graph_resolver_activation_run.step);
     const initial_fk_admission_step = b.step("antfly-metadata-initial-fk-admission-test", "Run initial-FK preflight and stale-begin metadata fault regressions");
     initial_fk_admission_step.dependOn(&addFilteredTestRunArtifact(b, initial_fk_admission_tests).step);
     const initial_fk_placement_tests = b.addTest(.{
@@ -427,6 +441,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes", "standalone metadata" },
     });
+    const graph_authority_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{"system catalog graph authority probes"} });
+    b.step("antfly-graph-authority-probe-test", "Verify bounded graph binding authority across catalog replacement")
+        .dependOn(&b.addRunArtifact(graph_authority_tests).step);
+    const cypher_metadata_merge_filters = &.{
+        "metadata durable job state and transaction sessions retain distinct command frames",
+        "resolver curation namespace propagation snapshot registry retains document jobs and scheduling",
+        "metadata durable job state snapshot retains scheduling quotas and group isolation",
+    };
+    const cypher_metadata_merge_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = cypher_metadata_merge_filters });
+    b.step("cypher-metadata-merge-test", "Verify graph transaction frames coexist with resolver advancement and document job snapshots")
+        .dependOn(&b.addRunArtifact(cypher_metadata_merge_tests).step);
     const document_owner_simulation_tests = b.addTest(.{ .root_module = antfly_test_mod, .filters = &.{"VOPR durable document owner"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("antfly-document-owner-simulation-test", "Replay document owner failure schedules on the shared VOPR durable lane").dependOn(&addFilteredTestRunArtifact(b, document_owner_simulation_tests).step);
     const document_owner_metadata_tests = b.addTest(.{
@@ -1152,7 +1177,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = scan_sink_provider_mod,
     });
     antfly_imports.configureRuntimeContracts(scan_sink_provider.root_module);
-    antfly_imports.storage_boundary.configureSources(scan_sink_provider.root_module, false, false);
+    antfly_imports.storage_boundary.configureSources(scan_sink_provider.root_module, true, false);
     const scan_sink_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test.zig"),
         .target = target,
@@ -1160,7 +1185,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     antfly_imports.configureRuntimeContracts(scan_sink_provider.root_module);
     antfly_imports.configureRuntimeContracts(scan_sink_test_mod);
-    antfly_imports.storage_boundary.configureSources(scan_sink_test_mod, false, false);
+    antfly_imports.storage_boundary.configureSources(scan_sink_test_mod, true, false);
     scan_sink_test_mod.linkLibrary(scan_sink_provider);
     const scan_sink_tests = b.addTest(.{
         .root_module = scan_sink_test_mod,
@@ -1268,6 +1293,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = embedded_api_mod,
         .filters = &.{
             "embedded api round-trips batch lookup scan and search over memory-backed durable lsm",
+            "embedded api Cypher catalog and writes share portable retained graph values",
+            "embedded api Cypher relational counts account for rejected storage candidates",
             "embedded api hosted profile drains derived indexing without native runtimes",
             "embedded api hosted profile persists text index across reopen over storage",
             "embedded api createLite provisions default full text index",
@@ -1278,6 +1305,43 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const run_embedded_api_tests = addFilteredTestRunArtifact(b, embedded_api_tests);
+    const portable_cypher_tests = b.addTest(.{
+        .root_module = embedded_api_mod,
+        .filters = &.{ "embedded api Cypher catalog and writes", "embedded api Cypher relational counts", "embedded api Cypher document scans" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("embedded-cypher-test", "Qualify the portable single-source graph host")
+        .dependOn(&addFilteredTestRunArtifact(b, portable_cypher_tests).step);
+    const count_projection_mod = @import("../../../build_support/embedded/source_owner.zig").cloneModule(b, embedded_support_mod);
+    count_projection_mod.root_source_file = b.path("pkg/antfly-embedded/src/cypher_count_projection_test_root.zig");
+    count_projection_mod.addImport("antfly_source_root", count_projection_mod);
+    if (count_projection_mod.import_table.contains("antfly_storage_root"))
+        count_projection_mod.addImport("antfly_storage_root", count_projection_mod);
+    const count_projection_tests = b.addTest(.{
+        .root_module = count_projection_mod,
+        .filters = &.{"public graph metric borrowed wire owner COUNT validates"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-count-projection-test", "Verify borrowed COUNT projections and bounded validation scratch")
+        .dependOn(&addFilteredTestRunArtifact(b, count_projection_tests).step);
+    const document_predicate_mod = @import("../../../build_support/embedded/source_owner.zig").cloneModule(b, embedded_support_mod);
+    document_predicate_mod.root_source_file = b.path("pkg/antfly-embedded/src/cypher_document_predicate_test_root.zig");
+    document_predicate_mod.addImport("antfly_source_root", document_predicate_mod);
+    if (document_predicate_mod.import_table.contains("antfly_storage_root")) document_predicate_mod.addImport("antfly_storage_root", document_predicate_mod);
+    const document_predicate_tests = b.addTest(.{
+        .root_module = document_predicate_mod,
+        .filters = &.{ "prepared pattern filters", "Cypher demand projection" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-document-predicate-test", "Verify borrowed document predicate semantics, validation and allocation bounds")
+        .dependOn(&addFilteredTestRunArtifact(b, document_predicate_tests).step);
+    const edge_projection_tests = b.addTest(.{
+        .root_module = document_predicate_mod,
+        .filters = &.{"graph bounded adjacency pages"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-edge-projection-test", "Verify projected winner metadata preserves bounded ownership, TTL and continuations")
+        .dependOn(&addFilteredTestRunArtifact(b, edge_projection_tests).step);
     embedded_test_step.dependOn(&run_embedded_api_tests.step);
     // db.zig is also its own module (embedded_db_mod) rather than a file
     // reachable from embedded_mod's root, so its tests need the same
@@ -1821,7 +1885,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "k shortest paths preserve parallel typed edge identities",
         "k shortest paths share one cumulative work budget across spur searches",
         "conjunctive reverse expansion",
-        "conjunctive fixed edges preserve self loops while variable paths remain node simple",
+        "conjunctive fixed and variable edges preserve self loops without reusing relationships",
         "conjunctive match supports branches anti joins inequality and optional nulls",
         "conjunctive validation rejects disconnected and unused aliases",
         "conjunctive validation bounds total recursive pattern shape",
@@ -2173,6 +2237,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db graph search filters result nodes and hidden traversal intermediates",
         "internal transaction HTTP responses prove not-proposed only before decision",
         "internal transaction ingress establishes and validates pre-decision deadline",
+        "retained read ingress translates transport deadlines into the native owner clock",
         "internal read-index absence response requires typed native proof",
         "request admission bounds positive capacity and preserves unlimited mode",
         "request admission lease releases exactly once",
@@ -2332,7 +2397,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-native-query-repository-test", "Run native query checkpoint reuse, retention and executor ownership contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, native_query_repository_tests, native_query_repository_filters).step);
-    const execution_budget_filters = &.{ "internal transaction ingress establishes", "online merge ingress bounds", "public execution", "remote shard query phases propagate deadline and request cancellation", "remote scan fails closed without streaming and honors cancellation before transport", "table reads translate request deadlines into the routing clock" };
+    const execution_budget_filters = &.{ "internal transaction ingress establishes", "retained read ingress translates transport deadlines", "online merge ingress bounds", "public execution", "remote shard query phases propagate deadline and request cancellation", "remote scan fails closed without streaming and honors cancellation before transport", "table reads translate request deadlines into the routing clock" };
     const execution_budget_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = execution_budget_filters,
@@ -2406,6 +2471,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-catalog-authority-test", "Run configured remote catalog publication authority regression")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, catalog_authority_tests, &.{"unconfigured remote catalog authority skips background work without borrowing internal credentials"}).step);
+    const cypher_transport_filters = &.{ "retained read client scopes graph RPC", "graph admission batches", "sql graph overlay", "api http client preserves group query capability errors", "row policy publication Raft codec carries immutable owner-fetched bytes privately", "relational row query errors preserve exact remote reasons and HTTP classes", "relational row query remote transaction prepare preserves scalar validation failures", "distributed txn internal operations preserve every semantic participant rejection", "distributed shortest path", "graph privacy availability retains retryable HTTP outcomes" };
+    const cypher_transport_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = cypher_transport_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-cypher-transport-test", "Verify private graph capability errors survive owner transport")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, cypher_transport_tests, cypher_transport_filters).step);
     root_test_step.dependOn(&run_api_http_runtime_tests.step);
 
     const introducer_tests = b.addTest(.{
@@ -3189,6 +3262,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
+    const cypher_capture_tests = b.addTest(.{
+        .root_module = lake_integration_mod,
+        .filters = &.{ "external lake Cypher execution reads immutable native document and graph cuts", "statement cut cleanup protects readers and immediately frees admission", "lake SQL GRAPH_TABLE shared graph joins release every provider allocation", "graph statements bind privacy versions before capturing owners" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-native-capture-test", "Verify immutable materialization and native capture capabilities")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_capture_tests).step);
     const distributed_sql_filters = &.{ "distributed SQL", "internal service strict" };
     const distributed_sql_tests = b.addTest(.{
         .root_module = lake_integration_mod,
@@ -3401,6 +3481,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_metadata_service_test_step = b.step("antfly-metadata-service-test", "Run metadata service/control-loop integration tests");
     lib_metadata_service_test_step.dependOn(&run_lib_metadata_service_tests.step);
 
+    const cypher_status_protocol_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "metadata runtime status producer completion", "metadata service transition commands negotiate runtime status payload versions", "runtime status native authority cannot downgrade", "catalog projection capability counts", "metadata runtime store producer completion", "metadata runtime index source producer completion" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-status-protocol-test", "Verify graph publication and producer completion survive negotiated metadata transport")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_status_protocol_tests).step);
+
     const lib_metadata_logic_default_filters = [_][]const u8{
         "metadata reconciler",
         "transition state",
@@ -3524,6 +3612,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_hot_standby_tests = addFilteredTestRunArtifact(b, hot_standby_tests);
     const hot_standby_test_step = b.step("antfly-storage-hot-standby-test", "Run hot-standby storage tests");
     hot_standby_test_step.dependOn(&run_hot_standby_tests.step);
+
+    const policy_follower_filters = &.{"row-policy Raft apply persists fail-closed intent and finalizes after restart"};
+    const policy_follower_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = policy_follower_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-row-policy-follower-test", "Verify signed follower writes finalize committed policy installation")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, policy_follower_tests, policy_follower_filters).step);
 
     // cmd/standby.zig is owned by the distributed runtime unit. Keep its
     // focused parser root inside pkg/antfly/src so relative imports stay
@@ -6740,6 +6837,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-query-capture-test", "Verify retained query consistency, cancellation and enrichment independence")
         .dependOn(&addFilteredTestRunArtifact(b, query_capture_tests).step);
+    const authority_invalidation_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "authority cohorts", "schema authority cohorts", "row-policy gate" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-authority-invalidation-test", "Verify cohort invalidation across schema and policy publication")
+        .dependOn(&addFilteredTestRunArtifact(b, authority_invalidation_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const lite_external_dimension_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -6779,9 +6883,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const relational_index_lifecycle_step = b.step("antfly-relational-index-lifecycle-test", "Run relational index dependency and retirement admission tests");
     relational_index_lifecycle_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_lifecycle_tests).step);
 
+    const generated_vector_contract_filters = &.{ "ordered artifact inventory publication projects every shared consumer", "embedding input kind generated selectors" };
+    const generated_vector_contract_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = generated_vector_contract_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-generated-vector-contract-test", "Verify generated vector publication selectors and producer isolation")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, generated_vector_contract_tests, generated_vector_contract_filters).step);
+
     const graph_runtime_filters = [_][]const u8{
         "graph endpoint cleanup bulk retirement mask releases ownership on decoding failure",
         "db graph endpoint cleanup",
+        "db graph repair backfills field contributions",
         "db graph owner revival",
         "db graph qualified cleanup",
         "db graph fact",
@@ -6842,6 +6956,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     const graph_runtime_test_step = b.step("graph-runtime-test", "Run graph artifact replay, repair, and traversal integration tests");
     graph_runtime_test_step.dependOn(&run_graph_runtime_tests.step);
+    graph_runtime_test_step.dependOn(&graph_resolver_activation_run.step);
+    b.step("cypher-storage-write-test", "Run native graph transaction effect and recovery regressions").dependOn(&run_graph_runtime_tests.step);
+    const cypher_open_failure_filters = [_][]const u8{ "db corrupt table catalog open releases native reclaimers", "db protected transaction BEGIN admits metadata while PREPARE still requires authority" };
+    const cypher_open_failure_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &cypher_open_failure_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-native-open-failure-test", "Verify retained owner open failures release native resources")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, cypher_open_failure_tests, &cypher_open_failure_filters).step);
     // Ordered dispatch fixtures moved to the server owner in PR 958. Keep the
     // graph gate exercising them through that owner, not through the local DB.
     const graph_ordered_runtime_filters = [_][]const u8{
@@ -6849,13 +6973,26 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db replicated merge imports graph source asset",
         "db replicated merge keeps expired graph source",
         "server ordered graph cleanup",
+        "server Cypher producer catalog activation",
+        "server Cypher ordered publication",
+        "server Cypher ordered transaction resolution",
+        "server Cypher readonly status",
+        "producer catalog proposal validates",
+        "ordered artifact inventory semantic",
+        "producer dispatch preserves foreign named failures",
+        "ordered artifact inventory producer dispatch backpressure is not terminal inference failure",
+        "privacy publication callback carries stable backpressure statuses",
+        "ordered artifact inventory resolver authored review",
+        "DistributedCandidateSource",
     };
     const graph_ordered_runtime_tests = b.addTest(.{
         .root_module = server_db_test_mod,
         .filters = &graph_ordered_runtime_filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    graph_runtime_test_step.dependOn(&addCuratedTestRunArtifact(b, graph_ordered_runtime_tests, &graph_ordered_runtime_filters).step);
+    const graph_ordered_runtime_run = addCuratedTestRunArtifact(b, graph_ordered_runtime_tests, &graph_ordered_runtime_filters);
+    graph_runtime_test_step.dependOn(&graph_ordered_runtime_run.step);
+    b.step("cypher-producer-catalog-test", "Verify replicated producer catalog activation and ordered graph replay").dependOn(&graph_ordered_runtime_run.step);
 
     const resolver_candidate_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -7439,6 +7576,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.relational_integrity_generation_admission.",
             "storage.db.relational_initial_child_publication.",
             "storage.db.row_policy_gate.",
+            "storage.db.authority_invalidation.",
             "storage.db.row_policy_bundle.",
             "storage.db.restore_staging.",
             "storage.db.restore_staging_contract.",

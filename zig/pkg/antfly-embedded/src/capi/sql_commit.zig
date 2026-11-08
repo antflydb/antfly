@@ -24,6 +24,20 @@ const catalog = dependencies.sql_catalog;
 pub const key = @import("../storage/lite/replay_admission.zig").coordinator_key;
 const Record = struct { id: h.db_mod.types.TxnId, timestamp: u64, tables: []const []const u8 };
 
+pub fn hasAdmission(handle: *h.Handle, id: h.db_mod.types.TxnId) !bool {
+    const coordinator = acquire(handle);
+    defer coordinator.release();
+    var read = try handle.db.core.store.beginReadTxn();
+    defer read.abort();
+    const bytes = read.get(key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    const record = try std.json.parseFromSlice(Record, handle.alloc, bytes, .{});
+    defer record.deinit();
+    return std.mem.eql(u8, &record.value.id, &id);
+}
+
 /// Serializes recovery with live preparation/decision and promotion's
 /// canonical read/merge. Never retain this gate during provider computation or
 /// request visibility waits. Native path admission is acquired before this gate.
@@ -36,7 +50,7 @@ pub const Coordinator = struct {
         return recoverLocked(self.handle);
     }
     pub fn commit(self: Coordinator, requests: []const contract.TableCommitRequest, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
-        return commitLocked(self.handle, requests, out_id);
+        return commitLocked(self.handle, requests, &.{}, null, out_id, .sql);
     }
 };
 const TestHook = struct { ptr: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
@@ -133,6 +147,20 @@ fn recoverLocked(handle: *h.Handle) !void {
     handle.db.markTransactionParticipantsResolved(record.id, record.tables) catch return;
 }
 
+pub const GraphGuard = struct {
+    table_name: []const u8,
+    table_id: u64,
+    schema_version: u32,
+    proofs: []const @typeInfo(@FieldType(h.db_mod.types.TransactionIntentRequest, "range_guards")).pointer.child,
+};
+/// Local capture capabilities are validated against local native owners. They
+/// do not fabricate distributed route fences or data-Raft history.
+pub fn commitWithGraphGuards(handle: *h.Handle, requests: []const contract.TableCommitRequest, guards: []const GraphGuard, requested_id: ?h.db_mod.types.TxnId, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
+    const coordinator = acquire(handle);
+    defer coordinator.release();
+    return commitLocked(handle, requests, guards, requested_id, out_id, .graph);
+}
+
 /// Whether the native checkpoint publication is in its uncertain window, so a
 /// pending decision may nonetheless be durable. Non-native stores answer yes.
 fn publicationUncertain(handle: *h.Handle) bool {
@@ -153,7 +181,7 @@ fn publicationUncertain(handle: *h.Handle) bool {
 ///    receipt id left in `out_id`.
 /// 3. After a committed decision, failing to resolve participants is
 ///    committed-pending; recovery finishes it.
-fn commitLocked(handle: *h.Handle, requests: []const contract.TableCommitRequest, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
+fn commitLocked(handle: *h.Handle, requests: []const contract.TableCommitRequest, guards: []const GraphGuard, requested_id: ?h.db_mod.types.TxnId, out_id: *?h.db_mod.types.TxnId, language: enum { sql, graph }) !catalog.MutationOutcome {
     // Participants were admitted before preparing this decision. Replaying or
     // publishing it must not recursively start a namespace's DDL coordinator.
     const was_recovering = handle.sql_ddl_recovering;
@@ -162,7 +190,13 @@ fn commitLocked(handle: *h.Handle, requests: []const contract.TableCommitRequest
     if (requests.len == 0) return .committed;
     out_id.* = null;
     const outcomes = dependencies.sql_errors;
-    const id = prepareDecision(handle, requests) catch |err| return outcomes.notApplied(err);
+    const id = prepareDecision(handle, requests, guards, requested_id) catch |err| {
+        // Graph diagnostics carry domain identities (including a consumed
+        // request ID). Preserve them at the proven pre-decision boundary;
+        // SQL maps unclassified storage failures into its SQLSTATE contract.
+        if (language == .graph and !outcomes.isUnknownOutcome(err)) return err;
+        return outcomes.notApplied(err);
+    };
     out_id.* = id.id;
     handle.db.commitTransaction(id.id, id.now +| 1) catch |commit_err| {
         const status = handle.db.getTransactionStatus(id.id) catch {
@@ -201,12 +235,19 @@ const PreparedDecision = struct { id: h.db_mod.types.TxnId, now: u64 };
 
 /// Boundary 1 of `commitLocked`. On any error the prepared intents are
 /// abandoned through recovery, and nothing was applied.
-fn prepareDecision(handle: *h.Handle, requests: []const contract.TableCommitRequest) !PreparedDecision {
+fn prepareDecision(handle: *h.Handle, requests: []const contract.TableCommitRequest, guards: []const GraphGuard, requested_id: ?h.db_mod.types.TxnId) !PreparedDecision {
     try recoverLocked(handle);
     const io = handle.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
     const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
     var id: h.db_mod.types.TxnId = undefined;
-    std.Io.random(io, &id);
+    if (requested_id) |value| {
+        id = value;
+        const existing: ?h.transactions_mod.TxnStatus = handle.db.getTransactionStatus(id) catch |err| switch (err) {
+            error.TxnNotFound => null,
+            else => return err,
+        };
+        if (existing != null) return error.CypherWriteRequestAlreadyUsed;
+    } else try io.randomSecure(&id);
     const names = try handle.alloc.alloc([]const u8, requests.len);
     defer handle.alloc.free(names);
     for (requests, names) |request, *name| name.* = request.table_name;
@@ -226,6 +267,13 @@ fn prepareDecision(handle: *h.Handle, requests: []const contract.TableCommitRequ
     _ = try handle.db.beginTransactionScoped(id, now, now, names, true, true, null);
     for (requests) |request| {
         const db = try @import("tables.zig").get(handle, request.table_name);
+        const proofs = for (guards) |guard| {
+            if (!std.mem.eql(u8, guard.table_name, request.table_name)) continue;
+            if (guard.table_id != db.core.identity_namespace.table_id or
+                guard.schema_version != (if (db.core.schema) |schema| schema.version else 0) or
+                request.schema_version != (if (guard.schema_version == 0) @as(?u32, null) else guard.schema_version)) return error.CatalogGenerationChanged;
+            break guard.proofs;
+        } else if (guards.len != 0 and (request.normalized_graph_rows or request.graph_writes.len != 0 or request.graph_deletes.len != 0)) return error.CatalogGenerationChanged else &.{};
         if (db != &handle.db) _ = try db.beginTransactionScoped(id, now, now, names, false, true, null);
         try db.writeTransaction(id, .{
             .schema_version = request.schema_version,
@@ -234,6 +282,10 @@ fn prepareDecision(handle: *h.Handle, requests: []const contract.TableCommitRequ
             .relational_repair = request.relational_repair,
             .writes = request.writes,
             .deletes = request.deletes,
+            .normalized_graph_rows = request.normalized_graph_rows,
+            .graph_writes = request.graph_writes,
+            .graph_deletes = request.graph_deletes,
+            .range_guards = proofs,
             .predicates = request.predicates,
             .integrity_commands = request.integrity_commands,
             .relational_activation = request.relational_activation,
@@ -245,6 +297,14 @@ fn prepareDecision(handle: *h.Handle, requests: []const contract.TableCommitRequ
 }
 
 test "capi coordinator recovery waits for a live prepared decision" {
+    try testPreparedCoordinator(false);
+}
+
+test "capi graph commit serializes recovery with its prepared decision" {
+    try testPreparedCoordinator(true);
+}
+
+fn testPreparedCoordinator(graph: bool) !void {
     const api = @import("db.zig");
     const tables = @import("tables.zig");
     var tmp = try api.TestDirectory.init("coordinator-live-prepare");
@@ -290,7 +350,10 @@ test "capi coordinator recovery waits for a live prepared decision" {
         test_contended_acquire = null;
     }
     var transaction: ?h.db_mod.types.TxnId = null;
-    const outcome = try commit(root, &.{.{ .table_name = "entities", .writes = &.{.{ .key = "entity/ada", .value = "{\"name\":\"Ada\"}" }} }}, &transaction);
+    const requests: []const contract.TableCommitRequest = &.{.{ .table_name = "entities", .writes = &.{.{ .key = "entity/ada", .value = "{\"name\":\"Ada\"}" }} }};
+    var requested_id: h.db_mod.types.TxnId = undefined;
+    @memset(&requested_id, 7);
+    const outcome = if (graph) try commitWithGraphGuards(root, requests, &.{}, requested_id, &transaction) else try commit(root, requests, &transaction);
     try std.testing.expectEqual(catalog.MutationOutcome.committed, outcome);
     state.thread.?.join();
     state.thread = null;

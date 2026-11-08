@@ -89,6 +89,8 @@ export { Connection } from "./sql.js";
 export type { CommitOutcome, SqlColumn, SqlResult } from "./sql-types.js";
 
 export { SqlError } from "./sql-types.js";
+export { GraphError } from "./graph-types.js";
+export type { GraphDiagnostic } from "./graph-types.js";
 export type {
   Capabilities,
   CheckReport,

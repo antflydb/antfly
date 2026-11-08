@@ -816,6 +816,7 @@ def test_index_upgrade_and_retired_identity_management(tmp_path, storage, order)
         db.add_index(config)
         db.merge_resolver_keys("concepts", "entity/ada", "entity/canonical")
         db.run_until_idle()
+        # Producer ownership and replay handoffs require reader epoch 3.
         reader_version = db.capabilities()["minimum_reader_version"]
         # Durable curation requires epoch 6. Newer persisted features may
         # raise that fence; the observed fence must never weaken on upgrade.
@@ -1449,7 +1450,10 @@ def test_replacement_wait_observes_cancellation(tmp_path, storage):
 @pytest.mark.parametrize("finish", ["cancel", "swap"])
 def test_named_replacement_does_not_permanently_upgrade_root(tmp_path, storage, finish):
     path = tmp_path / ("named-fence.aflite" if storage == antfly_embedded.Storage.LITE else "named-fence")
-    options = antfly_embedded.OpenOptions(storage=storage)
+    # This test controls the pending/cancelled/swapped lifecycle explicitly.
+    # Native background turns can finish between child and root capability
+    # reads; dedicated native tests below qualify that asynchronous progress.
+    options = antfly_embedded.OpenOptions(storage=storage, profile=antfly_embedded.Profile.HOSTED)
     graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
     with _open_graph_test(path, options) as db:
         db.create_table("source", {})
