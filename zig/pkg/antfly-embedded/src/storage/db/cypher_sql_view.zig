@@ -31,15 +31,7 @@ pub fn open(comptime Snapshot: type, comptime DB: type, a: std.mem.Allocator, sn
             try self.snapshot.sqlCheckpoint();
             var result = switch (self.session) {
                 .document => |session| try session.next(alloc, limit),
-                .relational => |session| blk: {
-                    var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
-                    errdefer page.deinit();
-                    const owned = page.arena.allocator();
-                    const rows = try owned.alloc(View.Row, page.rows.len);
-                    for (page.rows, rows) |row, *out| out.* = .{ .id = row.key, .version = row.version, .schema_version = session.reader.active.version(), .value = row.typed orelse return error.InvalidResponse, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest };
-                    const after = if (page.more) try owned.dupe(u8, session.reader.after.items) else null;
-                    break :blk View.Page{ .arena = page.arena, .rows = rows, .after = after };
-                },
+                .relational => |session| try session.nextViewPage(alloc, limit),
             };
             errdefer result.deinit();
             try self.snapshot.sqlCheckpoint();

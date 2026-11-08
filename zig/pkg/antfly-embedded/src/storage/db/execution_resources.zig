@@ -1071,6 +1071,22 @@ pub const BatchVisibilityCursor = struct {
     }
 };
 
+/// One synchronous prepared attempt's irreversible disposition. It is separate
+/// from the caller's cumulative progress marker: optimistic preparation may
+/// retry, while a committed attempt must propagate every later error unchanged.
+pub const PreparedCommitDisposition = struct {
+    pub const State = enum(u8) { preparing, primary_committed };
+    state: State = .preparing,
+
+    pub fn markPrimaryCommitted(self: *@This()) void {
+        self.state = .primary_committed;
+    }
+
+    pub fn permitsPreparationRetry(self: @This(), err: anyerror) bool {
+        return self.state == .preparing and (err == error.PreparedGenerationChanged or err == error.PreparedReadSetChanged);
+    }
+};
+
 pub const BatchExecutionOptions = struct {
     /// Owned local constraint effects, validated under apply and committed with
     /// primary rows. Never accepted from public JSON or replicated ingress.
@@ -1103,6 +1119,9 @@ pub const BatchExecutionOptions = struct {
     /// Internal progress marker; set only after the primary store accepts the
     /// write. Visibility admission errors must not invite replay of transforms.
     primary_committed: ?*bool = null,
+    /// Attempt-local borrow installed by batchInternalWithPreparationAllocator. Never
+    /// retained by asynchronous publication or shared across retries.
+    prepared_commit_disposition: ?*PreparedCommitDisposition = null,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,

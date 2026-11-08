@@ -585,9 +585,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             });
         }
 
-        pub const appendGraphTransformDelete = @import("mutation_effects.zig").appendGraphTransformDelete;
+        pub const appendGraphTransformDelete = @import("mutation_plan.zig").appendGraphTransformDelete;
 
-        pub const appendGraphTransformWrite = @import("mutation_effects.zig").appendGraphTransformWrite;
+        pub const appendGraphTransformWrite = @import("mutation_plan.zig").appendGraphTransformWrite;
 
         pub fn applyDenseArtifactCounterDelta(
             alloc: Allocator,
@@ -679,9 +679,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
         }
 
-        pub const deinitOwnedGraphEdgeDelete = @import("mutation_effects.zig").deinitOwnedGraphEdgeDelete;
+        pub const deinitOwnedGraphEdgeDelete = @import("mutation_plan.zig").deinitOwnedGraphEdgeDelete;
 
-        pub const deinitOwnedGraphEdgeWrite = @import("mutation_effects.zig").deinitOwnedGraphEdgeWrite;
+        pub const deinitOwnedGraphEdgeWrite = @import("mutation_plan.zig").deinitOwnedGraphEdgeWrite;
 
         pub fn deleteDocumentArtifactChildRangeOutboxEntry(self: anytype, key: []const u8) !void {
             var replication_mutation = self.acquireReplicationMutationShared();
@@ -779,7 +779,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             std.mem.writeInt(i64, out[offset..][0..@sizeOf(i64)], value.delta, .little);
         }
 
-        pub const graphMutationIdentityEql = @import("mutation_effects.zig").graphMutationIdentityEql;
+        pub const graphMutationIdentityEql = @import("mutation_plan.zig").graphMutationIdentityEql;
 
         pub fn hasConfiguredResolvers(self: anytype) bool {
             return S.ownerField(self, "core").*.index_manager.resolvers.items.len > 0;

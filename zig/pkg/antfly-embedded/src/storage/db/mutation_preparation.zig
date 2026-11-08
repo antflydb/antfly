@@ -112,7 +112,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const splitShadowRequiresMaterializedDerivedBatch = S.splitShadowRequiresMaterializedDerivedBatch;
         const storedOrPendingEmbeddingSourceHash = S.storedOrPendingEmbeddingSourceHash;
         const validateDocumentExtractionInlineSourcesSnapshotParsed = S.validateDocumentExtractionInlineSourcesSnapshotParsed;
-        pub const CoalescedKeyValueRequest = @import("mutation_effects.zig").CoalescedKeyValueRequest;
+        pub fn CoalescedKeyValueRequest(comptime T: type) type {
+            if (T != types.BatchWrite) @compileError("mutation writes must use the canonical write type");
+            return @import("mutation_plan.zig").PreparedMutation;
+        }
 
         pub const GeneratedWriteReadSnapshot = struct {
             pub const revisions = @import("../document_mutation_revision.zig");
@@ -134,7 +137,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         };
 
-        pub const TransformReadSnapshot = @import("mutation_effects.zig").TransformReadSnapshot;
+        pub const TransformReadSnapshot = @import("mutation_plan.zig").ReadSnapshot;
 
         pub fn captureGeneratedWriteReadSnapshot(self: anytype, alloc: Allocator, writes: []const types.BatchWrite) !GeneratedWriteReadSnapshot {
             const revisions = GeneratedWriteReadSnapshot.revisions;
@@ -157,26 +160,34 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             deletes: []const []const u8,
             transforms: []const types.DocumentTransform,
         ) !TransformReadSnapshot {
-            var result = TransformReadSnapshot{};
-            errdefer result.deinit(alloc);
-            if (transforms.len == 0) return result;
+            if (transforms.len == 0) return .{};
 
             // Only transforms whose first base comes from storage need a read-set
             // predicate. Writes/deletes and an earlier transform establish an
             // entirely request-local base.
-            var request_keys = std.StringHashMapUnmanaged(void).empty;
-            defer request_keys.deinit(alloc);
-            for (writes) |write| try request_keys.put(alloc, write.key, {});
-            for (deletes) |key| try request_keys.put(alloc, key, {});
+            var plan: @import("transform_read_plan.zig").Plan = .{};
+            defer plan.deinit(alloc);
+            for (writes) |write| try plan.establish(alloc, write.key);
+            for (deletes) |key| try plan.establish(alloc, key);
+            for (transforms) |transform| try plan.transform(alloc, transform.key);
+            if (plan.durable_bases.items.len == 0) return .{};
 
-            var keys = std.ArrayListUnmanaged([]const u8).empty;
-            defer keys.deinit(alloc);
-            for (transforms) |transform| {
-                if (request_keys.contains(transform.key)) continue;
-                try request_keys.put(alloc, transform.key, {});
-                try keys.append(alloc, transform.key);
-            }
-            if (keys.items.len == 0) return result;
+            // Only request-key collection depends on the write/receiver type.
+            // Share MVCC reads and row reconstruction across DB, recovery and
+            // prepared receivers, just as the commit path shares its owner.
+            if (@TypeOf(self) == *S.PreparedBatchOwner)
+                return captureTransformReadSnapshotForKeys(self, alloc, plan.durable_bases.items);
+            var owner = S.PreparedBatchOwner.from(self);
+            return captureTransformReadSnapshotForKeys(&owner, alloc, plan.durable_bases.items);
+        }
+
+        noinline fn captureTransformReadSnapshotForKeys(
+            self: *S.PreparedBatchOwner,
+            alloc: Allocator,
+            keys: []const []const u8,
+        ) !TransformReadSnapshot {
+            var result = TransformReadSnapshot{};
+            errdefer result.deinit(alloc);
 
             // Read values and version timestamps from the same MVCC snapshot. This
             // replaces two point transactions per transform and allows transform
@@ -185,15 +196,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer read_txn.abort();
             var schema_view = S.ownerField(self, "core").*.acquireSchemaView();
             defer if (schema_view) |*view| view.release();
-            const entries = try alloc.alloc(TransformReadSnapshot.Entry, keys.items.len);
+            const entries = try alloc.alloc(TransformReadSnapshot.Entry, keys.len);
             var initialized: usize = 0;
             errdefer {
                 for (entries[0..initialized]) |entry| if (entry.value) |value| alloc.free(value);
                 alloc.free(entries);
             }
-            try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, keys.items.len) orelse
+            try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, keys.len) orelse
                 return error.InvalidBatchRequest);
-            for (keys.items, 0..) |key, index| {
+            for (keys, 0..) |key, index| {
                 const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
                 defer alloc.free(store_key);
                 const raw = read_txn.get(store_key) catch |err| switch (err) {
@@ -272,14 +283,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             transforms: []const types.DocumentTransform,
             transform_snapshot: ?*const TransformReadSnapshot,
         ) !CoalescedKeyValueRequest(T) {
-            const Lookup = struct {
-                owner: @TypeOf(self),
-                pub fn get(context: @This(), a: Allocator, key: []const u8) !?[]const u8 {
-                    if (S.isRecoveryExecution(context.owner)) return error.PreparedReadSetChanged;
-                    return context.owner.get(a, key);
-                }
-            };
-            return @import("mutation_effects.zig").coalesceKeyValueRequest(alloc, T, writes, deletes, transforms, transform_snapshot, Lookup{ .owner = self });
+            const planner = @import("mutation_plan.zig");
+            if (transform_snapshot) |snapshot| return planner.prepare(alloc, writes, deletes, transforms, snapshot);
+            if (transforms.len == 0) return planner.prepare(alloc, writes, deletes, transforms, &.{});
+            for (writes) |write| if (write.json_null_fields.len != 0) return error.UnsupportedTransformOperation;
+            // Recovery has no foreground lookup capability. A request-local
+            // base is sufficient; every durable base still requires a pin.
+            if (S.isRecoveryExecution(self)) {
+                var reads: @import("transform_read_plan.zig").Plan = .{};
+                defer reads.deinit(alloc);
+                for (writes) |write| try reads.establish(alloc, write.key);
+                for (deletes) |key| try reads.establish(alloc, key);
+                for (transforms) |transform| try reads.transform(alloc, transform.key);
+                if (reads.durable_bases.items.len != 0) return error.PreparedReadSetChanged;
+                return planner.prepare(alloc, writes, deletes, transforms, &.{});
+            }
+            var snapshot = try self.captureTransformReadSnapshot(alloc, T, writes, deletes, transforms);
+            defer snapshot.deinit(alloc);
+            return planner.prepare(alloc, writes, deletes, transforms, &snapshot);
         }
 
         pub fn generatedPrecomputeModeForSyncLevel(sync_level: types.SyncLevel) GeneratedPrecomputeMode {
@@ -405,12 +426,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // immediately before WAL append.
             return (payload_bytes *| 2) +| (operations *| 512);
         }
-
-        pub const resetCoalescedEntryToDelete = @import("mutation_effects.zig").resetCoalescedEntryToDelete;
-
-        pub const setCoalescedEntryToBorrowedWrite = @import("mutation_effects.zig").setCoalescedEntryToBorrowedWrite;
-
-        pub const setCoalescedEntryToOwnedWrite = @import("mutation_effects.zig").setCoalescedEntryToOwnedWrite;
 
         pub fn storedDocumentValuesEqual(alloc: Allocator, lhs: []const u8, rhs: []const u8) bool {
             if (std.mem.eql(u8, lhs, rhs)) return true;

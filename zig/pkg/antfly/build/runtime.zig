@@ -34,6 +34,7 @@ pub const runtime_library_link_order = [_]RuntimeLibraryUnit{
     .distributed,
     .api_kernel,
     .storage_kernel,
+    .local_query,
     .enrichment_compute,
     .inference,
 };
@@ -131,15 +132,18 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     });
 
     var runtime_library_artifacts: [@typeInfo(RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile = @splat(null);
+    // Experiment on the cold command entry module without changing the
+    // optimization of shared storage/search/inference dependencies or tests.
+    const cli_optimize = b.option(std.lang.Optimize, "cli-optimize", "Optimization of the CLI runtime entry module (defaults to product mode)") orelse optimize;
     inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
         // The server executable and focused server artifacts reuse their owning
         // runtime units. Public embedded products have independent owners.
         const role_mod = b.createModule(.{
-            .root_source_file = b.path(b.fmt("pkg/antfly/src/runtime_{s}_root.zig", .{@tagName(unit)})),
+            .root_source_file = if (production_antfly_imports.shared_lake_execution and (unit == .api_kernel or unit == .distributed)) b.path(b.fmt("pkg/antfly/src/runtime_{s}_native_lake_root.zig", .{@tagName(unit)})) else b.path(b.fmt("pkg/antfly/src/runtime_{s}_root.zig", .{@tagName(unit)})),
             .target = target,
-            .optimize = optimize,
+            .optimize = if (unit == .cli) cli_optimize else optimize,
             .sanitize_thread = sanitize_thread,
-            .pic = if (unit == .storage_kernel or unit == .enrichment_compute) true else null,
+            .pic = if (unit == .storage_kernel or unit == .local_query or unit == .enrichment_compute) true else null,
         });
         var role_imports = production_antfly_imports;
         role_imports.boundary_profile = switch (unit) {
@@ -147,18 +151,31 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .distributed, .api_kernel, .serverless => .owner,
             .enrichment_compute => .enrichment,
             .storage_kernel => .all,
+            .local_query => .common,
         };
         switch (unit) {
             .cli => role_imports.configureCli(role_mod, link_libc),
             .inference => role_imports.configureInference(b, role_mod, link_libc),
             .distributed, .storage_kernel => role_imports.configureStorage(b, role_mod, link_libc),
+            .local_query => {
+                role_mod.addImport("local_query_abi", role_imports.storage_boundary.query);
+                role_mod.addImport("kernel_error_identity", role_imports.storage_boundary.identity);
+                @import("../../../build_support/embedded/source_owner.zig").registerStorageIndependent(role_mod);
+                role_mod.link_libc = true;
+            },
             .enrichment_compute => role_imports.configureEnrichment(b, role_mod, link_libc),
             .api_kernel => role_imports.configureApi(role_mod, link_libc),
             .serverless => role_imports.configureServerless(b, role_mod, link_libc),
         }
+        if (unit == .local_query) {
+            const tests = b.addTest(.{ .name = "local-query-dispatch-tests", .root_module = role_mod, .filters = &.{"opaque query dispatcher"} });
+            const run = b.addRunArtifact(tests);
+            run.has_side_effects = true;
+            b.step("local-query-dispatch-test", "Verify opaque query capabilities without storage layouts").dependOn(&run.step);
+        }
         // Compute owns document/media processing, not a physical storage handle.
-        // Only the storage kernel may declare physical DB source inputs.
-        role_imports.storage_boundary.configureProfile(role_mod, unit != .storage_kernel, true, role_imports.boundary_profile);
+        // Storage and complete local query operations declare physical DB inputs.
+        if (unit != .local_query) role_imports.storage_boundary.configureProfile(role_mod, unit != .storage_kernel, true, role_imports.boundary_profile);
         if (unit == .inference) {
             const native_exports = b.createModule(.{
                 .root_source_file = b.path("pkg/inference/src/host/native_exports.zig"),
@@ -182,7 +199,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         addMacosSdkPaths(b, role_mod, target);
         if (unit == .cli or unit == .distributed or unit == .storage_kernel) role_mod.addImport("antfly-client", antfly_client_pkg_mod);
         if (unit == .storage_kernel) role_mod.addImport("antfly_storage_root", role_mod);
-        if (unit != .cli and unit != .inference and unit != .enrichment_compute) {
+        if (unit != .cli and unit != .inference and unit != .enrichment_compute and unit != .local_query) {
             const role_usermgr_storage_mod = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
                 .target = target,
@@ -199,7 +216,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         const compile_max_rss = if (unit == .inference and production_antfly_imports.shared_inference_core) 4 * 1024 * 1024 * 1024 else runtimeCompileMaxRss(unit, .{
             .host = b.graph.host.result,
             .target = target.result,
-            .optimize = optimize,
+            .optimize = if (unit == .cli) cli_optimize else optimize,
             .strip = strip,
             .cpu_inference = options.cpu_inference,
             .sanitize_thread = sanitize_thread,
@@ -254,6 +271,23 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         }
     }
 
+    // Install the exact production owners for emitted-code attribution. This
+    // reuses their compiler steps; it does not create a second build profile.
+    const archive_step = b.step("runtime-archives", "Install all production runtime and physical owner archives for attribution");
+    for (runtime_library_artifacts) |artifact| if (artifact) |owner|
+        archive_step.dependOn(&b.addInstallArtifact(owner, .{}).step);
+    if (options.native_storage) |owner| {
+        archive_step.dependOn(&b.addInstallArtifact(owner, .{}).step);
+        b.step("runtime-unit-storage-engine", "Compile only the shared physical storage engine").dependOn(&owner.step);
+    }
+    archive_step.dependOn(&b.addInstallArtifact(options.native_inference, .{}).step);
+    b.step("runtime-unit-inference-core", "Compile only the shared physical inference engine").dependOn(&options.native_inference.step);
+
+    const query_archives = b.step("query-owner-archives", "Install the independently compiled storage adapter and complete query owner archives");
+    inline for (.{ .storage_kernel, .local_query }) |unit| {
+        query_archives.dependOn(&b.addInstallArtifact(runtime_library_artifacts[@backingInt(@as(RuntimeLibraryUnit, unit))].?, .{}).step);
+    }
+
     if (options.native_storage) |owner| {
         // Exercise the server's production build/source options against the
         // independently compiled Apache owner, not just the embedded profile.
@@ -300,6 +334,11 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?,
     );
     if (production_antfly_imports.shared_inference_core) linked_inference_abi_integration_mod.linkLibrary(options.native_inference);
+    // Retained document operations execute in the separately compiled media
+    // owner. Keep the dependency at final composition so its edits leave the
+    // inference compiler output reusable.
+    if (production_antfly_imports.pdf_native_contract != null)
+        linked_inference_abi_integration_mod.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.enrichment_compute)].?);
     const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
 
     for (runtime_library_link_order) |unit| {
@@ -354,6 +393,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         }
         if (role != .inference) {
             role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.storage_kernel)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.local_query)].?);
             role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.enrichment_compute)].?);
             role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
         }

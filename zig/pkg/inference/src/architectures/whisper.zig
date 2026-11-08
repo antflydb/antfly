@@ -108,6 +108,28 @@ fn timeMajorHidden(
 /// on the host. On Metal the whole pass is one frame on one compute
 /// encoder: the conv stem, a device transpose, and pre-norm blocks whose
 /// residual adds are folded into the following layer norm.
+fn encoderPositionIds(allocator: std.mem.Allocator, batch: usize, sequence: usize, maximum: usize) ![]i64 {
+    if (batch == 0 or sequence == 0) return error.InvalidInputShape;
+    if (sequence > maximum) return error.SequenceTooLong;
+    const total = std.math.mul(usize, batch, sequence) catch return error.ResourceLimitExceeded;
+    const ids = try allocator.alloc(i64, total);
+    for (ids, 0..) |*id, index| id.* = @intCast(index % sequence);
+    return ids;
+}
+
+test "tensor microbatch Whisper full context rows retain independent position IDs beyond the old stack ceiling" {
+    const a = std.testing.allocator;
+    const one = try encoderPositionIds(a, 1, 1500, 1500);
+    defer a.free(one);
+    for ([_]usize{ 2, 3, 4, 8 }) |rows| {
+        const ids = try encoderPositionIds(a, rows, 1500, 1500);
+        defer a.free(ids);
+        for (0..rows) |row| try std.testing.expectEqualSlices(i64, one, ids[row * 1500 ..][0..1500]);
+    }
+    try std.testing.expectError(error.SequenceTooLong, encoderPositionIds(std.testing.failing_allocator, 4, 1501, 1500));
+    try std.testing.expectError(error.ResourceLimitExceeded, encoderPositionIds(std.testing.failing_allocator, std.math.maxInt(usize), 1500, 1500));
+}
+
 pub fn encoderForward(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -120,6 +142,12 @@ pub fn encoderForward(
     const num_heads = config.encoder_attention_heads;
     const head_dim = config.encoderHeadDim();
     const ffn_dim = config.encoder_ffn_dim;
+    // Context belongs to each audio row. A fixed buffer sized for flattened
+    // positions accidentally rejected three or four ordinary 30-second rows.
+    const enc_time = time_steps / 2 + time_steps % 2;
+    const pos_ids = try encoderPositionIds(allocator, batch, enc_time, config.max_source_positions);
+    defer allocator.free(pos_ids);
+    const total = pos_ids.len;
 
     var frame_active = try beginWhisperMetalFrame(cb, .prefill);
     errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
@@ -146,8 +174,6 @@ pub fn encoderForward(
     const conv1_b = try fetcher.fetch("model.encoder.conv1.bias");
     const conv2_w = try fetcher.fetch("model.encoder.conv2.weight");
     const conv2_b = try fetcher.fetch("model.encoder.conv2.bias");
-    const enc_time = (time_steps + 2 * 1 - 3) / 2 + 1;
-    const total = batch * enc_time;
     var hidden: CT = undefined;
     var hidden_live = false;
     if (try convViaIm2col(cb, conv1_w, conv1_b, mel, batch, config.num_mel_bins, d_model, time_steps, 3, 1, 1, false)) |conv1_out| {
@@ -190,10 +216,6 @@ pub fn encoderForward(
     }
     defer if (hidden_live) cb.free(hidden);
 
-    var pos_ids_buf: [4096]i64 = undefined;
-    if (total > pos_ids_buf.len) return error.SequenceTooLong;
-    const pos_ids = pos_ids_buf[0..total];
-    for (0..total) |i| pos_ids[i] = @intCast(i % enc_time);
     const pos_w = try fetcher.fetch("model.encoder.embed_positions.weight");
     const pos_emb = try cb.embeddingLookup(pos_w, pos_ids, total, d_model);
     defer cb.free(pos_emb);

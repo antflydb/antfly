@@ -517,6 +517,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             try context.ensureActive();
             break :blk bytes;
         },
+        .lake_source_owner_read => |table_id| @import("../metadata/lake_source_owner_view.zig").readOnService(svc, alloc, table_id, context),
         .lake_index_lifecycle_read => |table_id| @import("../metadata/lake_index_lifecycle.zig").readOnService(svc, alloc, table_id, context),
         .lake_index_lifecycle_work => |after| @import("../metadata/lake_index_lifecycle.zig").workOnService(svc, alloc, after, context),
         .lake_index_lifecycle_mutate => |write| blk: {

@@ -18,7 +18,7 @@
 //! supported outer filters have a codec end marker. Unframeable encodings fail
 //! closed so pixel bytes cannot become text, resources, or marked content.
 const std = @import("std");
-const syntax = @import("syntax.zig");
+const syntax = @import("pdf_syntax");
 
 fn space(byte: u8) bool {
     return byte == 0 or byte == 9 or byte == 10 or byte == 12 or byte == 13 or byte == 32;
