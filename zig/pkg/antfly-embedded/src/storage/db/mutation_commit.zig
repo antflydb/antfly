@@ -3882,7 +3882,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // the first time (success or failure).
                 primary_ticket = null;
                 var owned_ticket = ticket;
-                try owned_ticket.wait();
+                owned_ticket.wait() catch |err| {
+                    // `opts.primary_committed` was set true as soon as this
+                    // write was staged into the group (above), before this
+                    // wait -- the one place that actually confirms the
+                    // write's own durability -- could ever resolve. A
+                    // failure here (most notably a checkpoint publication
+                    // that left `checkpoint_publication_uncertain` set) means
+                    // that confirmation never happened: correct the flag
+                    // before it reaches any caller, so "primary committed"
+                    // continues to mean what its callers (`mutate`,
+                    // `trackedBatchWithWriterLaneHook`'s outcome-receipt
+                    // retirement, `batchFailureCode`) rely on it meaning --
+                    // this write's own durability is confirmed, not merely
+                    // that it was staged.
+                    if (opts.primary_committed) |committed| committed.* = false;
+                    return err;
+                };
             }
             // Relational/transactional surface counterpart: the hot-path
             // transaction-resolution commit (every ordinary commitTransaction/
@@ -3893,7 +3909,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (txn_ticket) |ticket| {
                 txn_ticket = null;
                 var owned_ticket = ticket;
-                try owned_ticket.wait();
+                owned_ticket.wait() catch |err| {
+                    // Same reasoning as `primary_ticket`'s wait, immediately above.
+                    if (opts.primary_committed) |committed| committed.* = false;
+                    return err;
+                };
             }
             // WS4 phase 2: the primary commit is durable now, and every
             // inline text publication's mutations rode in that SAME

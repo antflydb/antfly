@@ -3159,6 +3159,25 @@ pub const Owner = struct {
 
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
+        // `WriterLane.checkin` parks the kernel-level path lease
+        // (`native.PathWriterLock`, a `flock`-style advisory lock held open
+        // on its own file descriptor) between writers instead of releasing
+        // it, so a same-Store writer can reclaim it for free (see
+        // `WriterLane`'s doc comment). That is only ever safe while this
+        // Owner -- and so this lane -- stays alive to hand it off again.
+        // The last Connection closing means nobody ever will: leaving a
+        // parked (or, if a lane-managed call is somehow still mid-flight
+        // here, checked-out) lease open leaks the fd and keeps the kernel
+        // lease held past this process's own knowledge of it, so a later
+        // `open()` of the same path in this same process -- even from a
+        // brand new Owner -- can never acquire a fresh lease of its own:
+        // `flock` is per-descriptor, not per-process, so it just queues
+        // behind its own abandoned lock forever, eventually timing out
+        // with `FileBusy`/`WouldBlock` on every caller that needed it.
+        if (self.writer_lane.parked) |*lease| lease.close();
+        self.writer_lane.parked = null;
+        if (self.writer_lane.held_lease) |*lease| lease.close();
+        self.writer_lane.held_lease = null;
         self.certifyAllocatorOnClose() catch |err| {
             // Failure only loses the optimization; the previous checkpoint
             // remains recoverable and the next owner uses ordinary proof.
