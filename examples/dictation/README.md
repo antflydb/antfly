@@ -371,3 +371,7 @@ APP_OUTPUT_DIR="$PWD/.build/validation-app" ./build-app.sh
 
 Use a stable `SIGNING_IDENTITY` for repeated local installs if available. Replacing
 an ad hoc signed bundle can invalidate its existing macOS Accessibility grant.
+
+The macOS example workflow runs only for changes to this example’s build/test
+inputs or its workflow definition. Documentation-only and unrelated repository
+changes skip the dictation test and signed-app build job.
