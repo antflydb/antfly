@@ -1169,7 +1169,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "retained read RPC",
             "retained read client",
             "privacy source vtables retain static lifetime",
-            "certified graph point cohorts admit only selected owners before read index",
+            "certified graph point cohorts",
             "api http client preserves public batch retry safety classifications",
             "relational row query response budget",
             "relational statement retries unavailable capture and releases fences before pages or deadline",
@@ -1448,7 +1448,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const cypher_cohort_tests = @import("linked_tests.zig").add(b, .{
         .name = "cypher-cohort-domain-tests",
         .root_module = api_table_reads_docid_test_mod,
-        .filters = &.{"certified graph point cohorts admit only selected owners before read index"},
+        .filters = &.{"certified graph point cohorts"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("cypher-cohort-domain-test", "Verify certified graph routing before read-index admission").dependOn(&cypher_cohort_tests.run(b).step);

@@ -5853,12 +5853,20 @@ unbounded observation dominates that table's point domains.
 
 Proof construction uses invocation-owned parameters, a bounded analysis budget,
 and request cancellation checkpoints. Prepared SQL statements never cache bound
-keys. Unknown expressions, traversals, procedures, writes, transaction overlays,
-empty domains and keysets exceeding 4,096 entries retain full-table cohorts.
+keys. Unknown expressions, traversals, procedures, writes, staged graph overlays
+(including READ COMMITTED), empty domains and keysets exceeding 4,096 entries
+retain full-table cohorts and indexes. Empty overlays and staged writes to tables
+outside the referenced graphs preserve point pruning.
 These fallbacks preserve the runtime's error, empty-input and write semantics.
 
-The coordinator resolves the certified keys against the request's pinned routing
-generation **before** read-index admission and owner capture. The indexed routing
+Every statement attempt acquires one authoritative routing generation before
+selecting any table's key owners. It retains that generation through routing,
+range copying and initial owner capture, without replacing shared provider
+state. The coordinator resolves the certified keys against that generation
+**before** read-index admission and owner capture. Live catalog validation still
+checks topology; a changed topology discards the attempt and acquires a fresh
+generation. Routing budgets retain request cancellation through both indexed
+and compatibility key loops. The indexed routing
 session deduplicates owners; the legacy resolver still requires matching catalog
 and topology generations. Owner plans retain full immutable ranges for each
 selected owner and discard their selection keyset after routing. Whole-graph
@@ -5874,3 +5882,14 @@ existing hash format. This closes the gap where a megabyte of path identity
 bytes could consume a single work charge. Focused regressions cover a valid
 2,048-node chain, identity byte ceilings, cancellation during path traversal,
 and digest compatibility across chunk boundaries.
+
+Parameter-domain proofs build one invocation-owned, first-binding name index.
+Index construction and lookups charge the bounded analysis budget and check
+cancellation. Repeated references cost lookups rather than repeated scans of all
+supplied bindings; exhausted indexing declines pruning. Alias scopes also use
+budgeted name indexes, avoiding repeated alias scans. The expression walker
+visits semantic children without charging source spans and physical annotations
+as though they could introduce graph reads. Regression coverage includes 10,000
+bindings with 4,096 repeated references, bounded indexing refusal, cancellation,
+production generation acquisition before admission, and eager staged-overlay
+capture requirements.

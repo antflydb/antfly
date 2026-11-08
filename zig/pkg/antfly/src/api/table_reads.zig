@@ -4158,12 +4158,14 @@ pub const ProvisionedTableReadSource = struct {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             return openCypherStatementAttempt(ptr, alloc, input) catch |err| {
-                if ((err != error.NotLeader and err != error.ReadUnavailable and err != error.Backpressured) or attempt == 3) return err;
+                if ((err != error.NotLeader and err != error.ReadUnavailable and err != error.Backpressured and err != error.TopologyChanged) or attempt == 3) return err;
                 // A rejected owner has exposed no rows. Release the entire
                 // failed cohort, refresh routes, and acquire fresh capabilities.
                 // Never reuse or replay a cursor or a graph mutation.
                 try input.cancellation.check();
                 if (input.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+                // Rejected topology needs a fresh pinned generation.
+                if (err == error.TopologyChanged) continue;
                 const io = self.io_impl orelse return err;
                 try io.backend.sleep(.fromMilliseconds(250), .awake);
                 continue;
@@ -4175,6 +4177,14 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHotStandbyReadAllowed(.read_index);
         if (input.tables.len == 0 or input.tables.len > 64) return error.CypherOwnerBudgetExceeded;
+        const opts: db_mod.types.ScanOptions = .{ .execution_deadline_ns = input.deadline_ns, .cancellation = input.cancellation };
+        // One authoritative generation licenses every table/key selection in
+        // this attempt. Live topology validation still uses self.catalog.
+        var routing_budget = self.catalog.budget(provisionedConsistencyDeadline(self.catalog, .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }));
+        routing_budget.cancellation = input.cancellation;
+        var routing_session = try table_catalog.RoutingSession.initWithBudget(alloc, self.catalog, routing_budget);
+        defer routing_session.deinit();
+        const routing_catalog = routing_session.catalog();
         const factory = @import("graph_statement_source.zig");
         var plans: std.ArrayList(factory.Plan) = .empty;
         defer {
@@ -4196,16 +4206,15 @@ pub const ProvisionedTableReadSource = struct {
         defer alloc.free(prepared);
         var retained: usize = 0;
         defer for (prepared[0..retained]) |*value| value.deinit();
-        const opts: db_mod.types.ScanOptions = .{ .execution_deadline_ns = input.deadline_ns, .cancellation = input.cancellation };
         for (input.tables, prepared) |table, *owned| {
             try input.cancellation.check();
-            owned.* = try self.prepareRoutedDomainRead(alloc, table.name, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, .read_index, .general, table.keys);
+            owned.* = try self.prepareRoutedDomainReadInCatalog(alloc, table.name, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, .read_index, .general, table.keys, routing_catalog);
             retained += 1;
             if (owned.table_id != table.table_id) return error.CatalogGenerationChanged;
             try certifyDelayedOwnerCut(owned.group_ids.len);
             try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table.name, owned.group_ids.len);
             owned.releaseActivity();
-            var routing = (try table_catalog.observedTableRoutingSnapshot(alloc, self.catalog, table.name, input.deadline_ns)) orelse return error.CatalogGenerationChanged;
+            var routing = (try table_catalog.observedTableRoutingSnapshot(alloc, routing_catalog, table.name, routing_budget.deadline_ns)) orelse return error.CatalogGenerationChanged;
             defer routing.deinit(alloc);
             if (routing.table_id != owned.table_id or routing.topology_epoch != owned.topology_epoch or !routing.coversKeyspace()) return error.TopologyChanged;
             for (owned.group_ids, 0..) |group, i| {
@@ -4597,13 +4606,29 @@ pub const ProvisionedTableReadSource = struct {
         kind: ReadPreparation.Kind,
         keys: ?[]const []const u8,
     ) !PreparedSpanRead {
+        return self.prepareRoutedDomainReadInCatalog(alloc, table_name, from_key, to_key, request, consistency, kind, keys, null);
+    }
+
+    fn prepareRoutedDomainReadInCatalog(
+        self: *ProvisionedTableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        request: ProvisionedConsistencyRequest,
+        consistency: raft_mod.ReadConsistency,
+        kind: ReadPreparation.Kind,
+        keys: ?[]const []const u8,
+        pinned_catalog: ?table_catalog.CatalogSource,
+    ) !PreparedSpanRead {
         const deadline_ns = provisionedConsistencyDeadline(self.catalog, request);
+        const routing_catalog = pinned_catalog orelse self.catalog;
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             if (consistency == .stale) {
                 var activity = self.beginPreparedRead(table_name, kind);
                 errdefer if (activity) |*held| held.deinit();
-                const route = try requestRoutedDomainSnapshot(alloc, self.catalog, table_name, from_key, to_key, request, deadline_ns, keys);
+                const route = try requestRoutedDomainSnapshot(alloc, routing_catalog, table_name, from_key, to_key, request, deadline_ns, keys);
                 const routes = route.routes;
                 const group_ids = route.group_ids;
                 var route_owned = true;
@@ -4613,6 +4638,7 @@ pub const ProvisionedTableReadSource = struct {
                 };
                 if (activity == null) table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table_name, route.topology_epoch, deadline_ns) catch |err| switch (err) {
                     error.TopologyChanged => {
+                        if (pinned_catalog != null) return err;
                         if (activity) |*held| held.deinit();
                         activity = null;
                         if (attempt + 1 < topology_read_attempt_limit) continue;
@@ -4624,7 +4650,7 @@ pub const ProvisionedTableReadSource = struct {
                 return .{ .alloc = alloc, .routes = routes, .group_ids = group_ids, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = route.table_id, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
             }
 
-            const route = try requestRoutedDomainSnapshot(alloc, self.catalog, table_name, from_key, to_key, request, deadline_ns, keys);
+            const route = try requestRoutedDomainSnapshot(alloc, routing_catalog, table_name, from_key, to_key, request, deadline_ns, keys);
             const routes = route.routes;
             const group_ids = route.group_ids;
             var route_owned = true;
@@ -4637,6 +4663,7 @@ pub const ProvisionedTableReadSource = struct {
             errdefer if (activity) |*held| held.deinit();
             table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table_name, route.topology_epoch, deadline_ns) catch |err| switch (err) {
                 error.TopologyChanged => {
+                    if (pinned_catalog != null) return err;
                     if (activity) |*held| held.deinit();
                     activity = null;
                     if (attempt + 1 < topology_read_attempt_limit) continue;
@@ -11387,8 +11414,15 @@ fn isDocumentLookupBatch(req: db_mod.types.SearchRequest) bool {
 /// admission. RoutingSession provides indexed batched resolution; legacy
 /// catalogs retain exact generation checks in the shared keyset resolver.
 fn requestRoutedDomainSnapshot(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, table: []const u8, from: []const u8, to: []const u8, request: ProvisionedConsistencyRequest, deadline: ?u64, keys: ?[]const []const u8) !table_catalog.RoutedSpanSnapshot {
+    var budget = catalog.budget(deadline);
+    budget.cancellation = switch (request) {
+        .search => |input| input.cancellation orelse .none,
+        .lookup => |input| input.opts.cancellation orelse .none,
+        .scan => |input| input.opts.cancellation orelse .none,
+    };
+    try budget.checkpoint();
     if (keys) |selected| if (selected.len != 0 and selected.len <= @import("cypher").read_domains.max_keys) {
-        return table_catalog.routedDocumentKeysSnapshotUntil(alloc, catalog, table, selected, deadline);
+        return table_catalog.routedDocumentKeysSnapshotWithBudget(alloc, catalog, table, selected, budget);
     };
     return requestRoutedSpanSnapshot(alloc, catalog, table, from, to, request, deadline);
 }
@@ -17729,6 +17763,82 @@ fn consumerTests() type {
                     if (case.expected == 2) try std.testing.expectEqualSlices(u64, &.{ 32, 64 }, prepared.group_ids);
                 }
             }
+        }
+        test "certified graph point cohorts pin production generations and cancel key routing before admission" {
+            const a = std.testing.allocator;
+            const Fixture = struct {
+                generation: *table_catalog.RoutingGeneration,
+                acquisitions: usize = 0,
+                admissions: usize = 0,
+                fn acquire(raw: *anyopaque, _: ?u64, _: bool) !*table_catalog.RoutingGeneration {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.acquisitions += 1;
+                    self.generation.retain();
+                    return self.generation;
+                }
+                fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedAdminRead;
+                }
+                fn freeAdmin(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn wait(raw: *anyopaque, _: u64, _: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.admissions += 1;
+                    // Stop before physical capture: route selection must have
+                    // completed using one generation, with no fixture pinning.
+                    return error.ReadUnavailable;
+                }
+            };
+            var tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+            var ranges = [_]metadata_table_manager.RangeRecord{.{ .table_id = 7, .group_id = 32, .range_id = 32, .start_key = "" }};
+            const generation = try table_catalog.RoutingGeneration.create(a, .{
+                .catalog_revision = 7,
+                .tables = &tables,
+                .ranges = &ranges,
+            }, .{});
+            defer generation.release();
+            var fixture: Fixture = .{ .generation = generation };
+            const source: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.freeAdmin, .acquire_routing_generation = Fixture.acquire } };
+            var provider = ProvisionedTableReadSource.init("unused", source, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.wait } });
+            const keys = try a.alloc([]const u8, 4096);
+            defer a.free(keys);
+            @memset(keys, "a");
+            var input: @import("antfly_local_sources").storage_statement_read_fence.GraphStatement = .{
+                .catalog_json = "",
+                .tables = &.{.{ .name = "docs", .table_id = 7, .schema_version = 1, .keys = keys }},
+                .cut_id = @splat('a'),
+                .expires_ms = std.math.maxInt(u64),
+                .ttl_now_ns = 1,
+            };
+            try std.testing.expectError(error.ReadUnavailable, ProvisionedTableReadSource.openCypherStatement(&provider, a, input));
+            try std.testing.expectEqual(@as(usize, 1), fixture.acquisitions);
+            try std.testing.expectEqual(@as(usize, 1), fixture.admissions);
+            const Cancel = struct {
+                calls: usize = 0,
+                fn canceled(raw: *const anyopaque) bool {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                    self.calls += 1;
+                    return self.calls > 32;
+                }
+                fn token(self: *@This()) db_mod.types.CancellationToken {
+                    return .{ .ptr = self, .is_cancelled_fn = canceled };
+                }
+            };
+            var cancellation: Cancel = .{};
+            fixture.acquisitions = 0;
+            fixture.admissions = 0;
+            input.cancellation = cancellation.token();
+            try std.testing.expectError(error.Canceled, ProvisionedTableReadSource.openCypherStatement(&provider, a, input));
+            try std.testing.expectEqual(@as(usize, 1), fixture.acquisitions);
+            try std.testing.expectEqual(@as(usize, 0), fixture.admissions);
+            try std.testing.expectEqual(@as(usize, 33), cancellation.calls);
+            // The compatibility resolver also honors cancellation when a
+            // caller has not yet acquired a routing session.
+            cancellation.calls = 0;
+            fixture.acquisitions = 0;
+            var budget = source.budget(null);
+            budget.cancellation = cancellation.token();
+            try std.testing.expectError(error.Canceled, table_catalog.routedDocumentKeysSnapshotWithBudget(a, source, "docs", keys, budget));
+            try std.testing.expect(fixture.acquisitions < keys.len);
         }
         test "privacy source vtables retain static lifetime across capability selection" {
             const Fake = struct {

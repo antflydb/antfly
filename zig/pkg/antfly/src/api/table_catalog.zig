@@ -419,20 +419,22 @@ pub const RoutingSession = struct {
     range_refs: []const *const metadata_table_manager.RangeRecord = &.{},
     table_range_refs: std.AutoHashMapUnmanaged(u64, []const *const metadata_table_manager.RangeRecord) = .empty,
 
-    pub fn init(
-        alloc: std.mem.Allocator,
-        base: CatalogSource,
-        deadline_ns: ?u64,
-    ) !RoutingSession {
-        try base.budget(deadline_ns).checkpoint();
+    pub fn init(alloc: std.mem.Allocator, base: CatalogSource, deadline_ns: ?u64) !RoutingSession {
+        return initWithBudget(alloc, base, base.budget(deadline_ns));
+    }
+
+    /// The budget is in the catalog clock domain. Check cancellation around
+    /// generation acquisition and throughout CPU-side snapshot indexing.
+    pub fn initWithBudget(alloc: std.mem.Allocator, base: CatalogSource, budget: RoutingBudget) !RoutingSession {
+        try budget.checkpoint();
         if (base.vtable.acquire_routing_generation) |acquire| {
-            const generation = try acquire(base.ptr, deadline_ns, true);
+            const generation = try acquire(base.ptr, budget.deadline_ns, true);
             errdefer generation.release();
-            try base.budget(deadline_ns).checkpoint();
+            try budget.checkpoint();
             return generation.session(alloc, base, true);
         }
         const routing = try base.routingSource();
-        return try initOwned(alloc, base, try routing.linearizableSnapshot(deadline_ns), true, base.budget(deadline_ns));
+        return try initOwned(alloc, base, try routing.linearizableSnapshot(budget.deadline_ns), true, budget);
     }
 
     /// Use the cached/eventual projection for positive routes. Misses are
@@ -574,7 +576,10 @@ pub const RoutingSession = struct {
 
     pub const DocumentKeyRoutes = struct { span: RoutedSpanSnapshot, key_groups: []u64 };
     pub fn documentKeyRoutes(self: *RoutingSession, alloc: std.mem.Allocator, table_name: []const u8, keys: []const []const u8, deadline: ?u64) !DocumentKeyRoutes {
-        const budget = self.base.budget(deadline);
+        return self.documentKeyRoutesWithBudget(alloc, table_name, keys, self.base.budget(deadline));
+    }
+
+    pub fn documentKeyRoutesWithBudget(self: *RoutingSession, alloc: std.mem.Allocator, table_name: []const u8, keys: []const []const u8, budget: RoutingBudget) !DocumentKeyRoutes {
         try budget.checkpoint();
         const table_index = self.table_indexes.get(table_name) orelse return error.TableNotFound;
         const table = self.snapshot.value.tables[table_index];
@@ -2686,9 +2691,14 @@ pub fn validateCatalogRouteFenceUntil(
 /// session. No per-key metadata RPC is needed. Retain only owning groups, and
 /// fail closed if a caller supplies an unpinned source that changes mid-read.
 pub fn routedDocumentKeysSnapshotUntil(alloc: std.mem.Allocator, catalog: CatalogSource, table_name: []const u8, keys: []const []const u8, deadline_ns: ?u64) !RoutedSpanSnapshot {
+    return routedDocumentKeysSnapshotWithBudget(alloc, catalog, table_name, keys, catalog.budget(deadline_ns));
+}
+
+pub fn routedDocumentKeysSnapshotWithBudget(alloc: std.mem.Allocator, catalog: CatalogSource, table_name: []const u8, keys: []const []const u8, budget: RoutingBudget) !RoutedSpanSnapshot {
+    try budget.checkpoint();
     if (keys.len == 0) return error.InvalidQueryRequest;
     if (catalog.vtable == &RoutingSession.vtable) {
-        const result = try RoutingSession.cast(catalog.ptr).documentKeyRoutes(alloc, table_name, keys, deadline_ns);
+        const result = try RoutingSession.cast(catalog.ptr).documentKeyRoutesWithBudget(alloc, table_name, keys, budget);
         alloc.free(result.key_groups);
         return result.span;
     }
@@ -2700,8 +2710,9 @@ pub fn routedDocumentKeysSnapshotUntil(alloc: std.mem.Allocator, catalog: Catalo
     defer seen.deinit(alloc);
     var first: ?metadata_api.CatalogRouteFence = null;
     for (keys) |key| {
-        try catalog.budget(deadline_ns).checkpoint();
-        const routed = try routedGroupSnapshotUntil(alloc, catalog, table_name, key, deadline_ns);
+        try budget.checkpoint();
+        const routed = try routedGroupSnapshotUntil(alloc, catalog, table_name, key, budget.deadline_ns);
+        try budget.checkpoint();
         const fence = routed.fence() orelse return error.TopologyChanged;
         if (first) |previous| {
             if (previous.metadata_group_id != fence.metadata_group_id or !std.meta.eql(previous.metadata_incarnation, fence.metadata_incarnation) or previous.catalog_revision != fence.catalog_revision or previous.table_id != fence.table_id or previous.topology_epoch != fence.topology_epoch) return error.TopologyChanged;

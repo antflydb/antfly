@@ -3460,3 +3460,144 @@ def test_authenticated_cypher_certified_point_domains_across_owners(monkeypatch)
         assert "checks passed" in result.stdout, result.stdout
     finally:
         server.stop()
+
+
+def test_authenticated_cypher_point_cohorts_catalog_churn_and_overlays(monkeypatch):
+    import threading
+
+    monkeypatch.setenv(
+        "ANTFLY_TRUSTED_PRINCIPAL_SECRET", "cypher-cohort-churn-authority-secret-v1"
+    )
+    monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_ISSUER", "cypher-cohort-churn")
+    binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port(), pgwire=True)
+    session = requests.Session()
+    session.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+    table = "cypher_cohort_" + uuid.uuid4().hex
+    graph = table + "_g"
+    try:
+
+        def call(path, body, client=session):
+            response = client.post(
+                server.api_url.rstrip("/") + path, json=body, timeout=40
+            )
+            assert response.status_code in (200, 201, 202), (
+                path,
+                response.status_code,
+                response.text,
+                server.log_path.read_text()[-6000:],
+            )
+            return response.json()
+
+        call(
+            "/tables/" + table,
+            {
+                "num_shards": 8,
+                "schema": {
+                    "default_type": "D",
+                    "document_schemas": {
+                        "D": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"x": {"type": "integer"}},
+                            }
+                        }
+                    },
+                },
+            },
+        )
+        keys = [f"a{i:04}" for i in range(1000)]
+        call(
+            "/tables/" + table + "/batch",
+            {
+                "inserts": {
+                    **{key: {"x": i} for i, key in enumerate(keys)},
+                    "β": {"x": 9999},
+                },
+                "sync_level": "full_index",
+            },
+        )
+        call(
+            "/graphs/" + graph,
+            {"labels": [{"name": "D", "table": table}], "relationships": []},
+        )
+        count_sql = f"SELECT count(*) FROM GRAPH_TABLE({graph} MATCH(n IS D) WHERE antfly.documentKey(n) IN $1 COLUMNS(n.x AS x)) q"
+        start = threading.Barrier(2)
+        errors = []
+
+        def publish_unrelated_tables():
+            writer = requests.Session()
+            writer.auth = session.auth
+            try:
+                start.wait(timeout=30)
+                for i in range(30):
+                    call(
+                        "/tables/" + table + "_unrelated_" + str(i),
+                        {"num_shards": 1},
+                        writer,
+                    )
+                    time.sleep(0.001)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                writer.close()
+
+        publisher = threading.Thread(target=publish_unrelated_tables)
+        publisher.start()
+        try:
+            start.wait(timeout=30)
+            for _ in range(25):
+                result = call(
+                    "/graphs/" + graph + "/query",
+                    {
+                        "query": "MATCH(n:D) WHERE antfly.documentKey(n) IN $keys RETURN count(n)",
+                        "parameters": {"keys": keys},
+                    },
+                )
+                assert result["rows"] == [[{"type": "integer", "value": "1000"}]], (
+                    result
+                )
+                result = call("/sql", {"statement": count_sql, "parameters": [keys]})
+                assert result["rows"] == [["1000"]], result
+        finally:
+            publisher.join(timeout=60)
+        assert not publisher.is_alive()
+        assert not errors, errors
+        # A READ COMMITTED overlay has no range guards. Updated and newly
+        # inserted keys must remain visible while capture retains full cohorts.
+        transaction = call(
+            "/sql", {"statement": "BEGIN ISOLATION LEVEL READ COMMITTED"}
+        )["session_id"]
+        try:
+            call(
+                "/sql",
+                {
+                    "statement": f"UPDATE {table} SET x=77 WHERE _id='β'",
+                    "session_id": transaction,
+                },
+            )
+            call(
+                "/sql",
+                {
+                    "statement": f"INSERT INTO {table}(_id,x) VALUES('γ',88)",
+                    "session_id": transaction,
+                },
+            )
+            point_sql = f"SELECT q.x FROM GRAPH_TABLE({graph} MATCH(n IS D) WHERE antfly.documentKey(n)=$1 COLUMNS(n.x AS x)) q"
+            for key, expected in (("a0000", "0"), ("β", "77"), ("γ", "88")):
+                result = call(
+                    "/sql",
+                    {
+                        "statement": point_sql,
+                        "parameters": [key],
+                        "session_id": transaction,
+                    },
+                )
+                assert result["rows"] == [[expected]], result
+        finally:
+            call("/sql", {"statement": "ROLLBACK", "session_id": transaction})
+    finally:
+        session.close()
+        server.stop()

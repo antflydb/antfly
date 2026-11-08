@@ -2052,6 +2052,19 @@ pub const Adapter = struct {
         }
         return parameters;
     }
+    /// Staged graph postimages and effects are projected eagerly during bind.
+    /// Their reads are outside the AST key proof, including READ COMMITTED.
+    /// Empty overlays and writes to unrelated tables preserve point pruning.
+    fn hasStagedGraphWrites(self: *const Adapter, graph: @import("cypher").catalog.Graph) bool {
+        const staged = self.staged orelse return false;
+        for (staged.tables) |entry| {
+            const batch = entry.batch;
+            if (batch.writes.len == 0 and batch.deletes.len == 0 and batch.graph_writes.len == 0 and batch.graph_deletes.len == 0) continue;
+            const physical = staged.physicalName(entry.table_name);
+            for (graph.labels) |label| if (std.mem.eql(u8, label.table, physical)) return true;
+        }
+        return false;
+    }
     fn openGraphStatement(self: *Adapter, a: std.mem.Allocator, requests: []const catalog.StatementScan) !catalog.StatementRead {
         const cypher = @import("cypher");
         const port = @import("antfly_local_sources").storage_statement_read_fence;
@@ -2065,6 +2078,9 @@ pub const Adapter = struct {
             }
         }
         const graph = first orelse return error.InvalidSqlGraphTable;
+        const prune_cohort = self.range_reads == null and for (requests) |request| {
+            if (request.table.graph) |binding| if (self.hasStagedGraphWrites(binding.graph)) break false;
+        } else true;
         const owner = try a.create(GraphStatement);
         errdefer a.destroy(owner);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -2112,7 +2128,7 @@ pub const Adapter = struct {
             if (request.table.graph) |binding| {
                 try self.verify(owned, request.table);
                 parameters.* = try self.graphParametersForScan(owned, binding, request.request);
-                if (self.range_reads == null) domains.* = try @import("graph_execution.zig").readDomains(owned, binding.graph, binding.definition.query, parameters.*, self.context);
+                if (prune_cohort) domains.* = try @import("graph_execution.zig").readDomains(owned, binding.graph, binding.definition.query, parameters.*, self.context);
             }
         }
         const inputs = try owned.alloc(port.GraphTable, tables.items.len);
@@ -2133,8 +2149,8 @@ pub const Adapter = struct {
                 }
                 selected = unioned.items;
             }
-            input.indexes = if (self.range_reads != null) null else selected;
-            if (self.range_reads == null) {
+            input.indexes = if (prune_cohort) selected else null;
+            if (prune_cohort) {
                 var keys: std.StringHashMapUnmanaged(void) = .empty;
                 var full = false;
                 var observed = false;
@@ -4494,6 +4510,8 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
         const Self = @This();
         captures: usize = 0,
         points: bool = false,
+        expect_full_overlay: bool = false,
+        full_overlays: usize = 0,
         releases: usize = 0,
         catalog_reads: usize = 0,
         guard_batches: usize = 0,
@@ -4559,6 +4577,12 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
             try std.testing.expect(input.partial_graph);
             try std.testing.expectEqual(@as(usize, 1), input.tables.len);
             try std.testing.expectEqualStrings("docs", input.tables[0].name);
+            if (self.expect_full_overlay) {
+                try std.testing.expect(input.tables[0].keys == null);
+                try std.testing.expect(input.tables[0].indexes == null);
+                self.full_overlays += 1;
+                return error.CypherObservationsUnavailable;
+            }
             try std.testing.expect(input.tables[0].indexes != null);
             try std.testing.expectEqual(@as(usize, 0), input.tables[0].indexes.?.len);
             if (self.points) {
@@ -4612,6 +4636,29 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
         try std.testing.expectEqualStrings(second_key, points.output.rows[0][1].string);
     }
     try std.testing.expectEqual(@as(usize, 3), fake.captures);
+    try std.testing.expectEqual(fake.captures, fake.releases);
+    // READ COMMITTED has staged writes without range guards. Verify the
+    // descriptor presented to capture before eager overlay projection.
+    var deletes = [_][]const u8{"a"};
+    var staged_tables = [_]@import("transactions.zig").TableCommitRequest{.{ .table_name = @constCast("logical-docs"), .batch = .{ .deletes = &deletes } }};
+    var bindings = [_]@import("transactions.zig").CatalogBinding{.{ .logical = "logical-docs", .physical = "docs" }};
+    var staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{ .tables = &staged_tables, .catalog_bindings = .{ .items = &bindings, .capacity = bindings.len, .pointer_stability = .{} } };
+    adapter.staged = &staged;
+    adapter.range_reads = null;
+    fake.expect_full_overlay = true;
+    try std.testing.expectError(error.CypherObservationsUnavailable, adapter.execute(a, &point_query, &.{ .{ .string = "a" }, .{ .string = "b" } }, .{}, null));
+    try std.testing.expectEqual(@as(usize, 1), fake.full_overlays);
+    fake.expect_full_overlay = false;
+    for (0..2) |step| {
+        if (step == 0) staged_tables[0].table_name = @constCast("unrelated") else {
+            staged_tables[0].table_name = @constCast("logical-docs");
+            staged_tables[0].batch.deletes = &.{};
+        }
+        var unaffected = try adapter.execute(a, &point_query, &.{ .{ .string = "a" }, .{ .string = "b" } }, .{}, null);
+        defer unaffected.deinit();
+        try std.testing.expectEqual(@as(usize, 1), unaffected.output.rows.len);
+    }
+    try std.testing.expectEqual(@as(usize, 5), fake.captures);
     try std.testing.expectEqual(fake.captures, fake.releases);
 }
 

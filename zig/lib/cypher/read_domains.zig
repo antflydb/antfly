@@ -35,12 +35,15 @@ pub const Plan = struct {
         return null;
     }
 };
+const Aliases = std.StringHashMapUnmanaged(void);
 const Bound = struct { safe: bool = true, keys: ?[]const []const u8 = null };
 const Entry = struct { full: bool = false, keys: std.StringHashMapUnmanaged(void) = .empty };
 const Builder = struct {
     a: A,
     graph: catalog.Graph,
     parameters: []const v.Entry,
+    parameter_index: std.StringHashMapUnmanaged(v.Value) = .empty,
+    parameters_indexed: bool = false,
     tables: std.StringHashMapUnmanaged(Entry) = .empty,
     writes: bool = false,
     exhausted: bool = false,
@@ -82,9 +85,9 @@ const Builder = struct {
     fn all(self: *Builder) !void {
         for (self.graph.labels) |label| try self.add(label.table, null);
     }
-    fn node(self: *Builder, n: ast.Node, predicate: ?*const ast.Expr, aliases: []const []const u8) !void {
+    fn node(self: *Builder, n: ast.Node, predicate: ?*const ast.Expr, aliases: Aliases) !void {
         const literal_properties = for (n.properties) |property| {
-            if (!try self.spend(1) or self.constant(property.value) == null) break false;
+            if (!try self.spend(1) or (try self.constant(property.value)) == null) break false;
         } else true;
         const bound: Bound = if (n.alias != null and literal_properties and predicate != null)
             try self.predicateDomain(predicate.?, n.alias.?, aliases)
@@ -97,7 +100,7 @@ const Builder = struct {
             try self.add(label.table, keys);
         };
     }
-    fn path(self: *Builder, p: ast.Path, predicate: ?*const ast.Expr, aliases: []const []const u8) !void {
+    fn path(self: *Builder, p: ast.Path, predicate: ?*const ast.Expr, aliases: Aliases) !void {
         // Traversals can fetch unknown endpoints from either orientation.
         for (p.nodes) |n| {
             if (!try self.spend(1)) return;
@@ -123,14 +126,17 @@ const Builder = struct {
             if (!try self.spend(1)) return;
             switch (clause.operation) {
                 .match => |m| {
-                    var aliases: std.ArrayList([]const u8) = .empty;
+                    var aliases: Aliases = .empty;
                     for (m.paths) |p| {
                         for (p.nodes) |n| {
                             if (!try self.spend(1)) return;
-                            if (n.alias) |name| try aliases.append(self.a, name);
+                            if (n.alias) |name| {
+                                if (!try self.spend(1 + name.len / 64)) return;
+                                try aliases.put(self.a, name, {});
+                            }
                         }
                     }
-                    for (m.paths) |p| try self.path(p, m.predicate, aliases.items);
+                    for (m.paths) |p| try self.path(p, m.predicate, aliases);
                     try self.walk(m.predicate);
                 },
                 .project => |p| try self.walk(p.value),
@@ -155,16 +161,23 @@ const Builder = struct {
                     return;
                 },
                 .pattern_comprehension => |p| {
-                    var aliases: std.ArrayList([]const u8) = .empty;
+                    var aliases: Aliases = .empty;
                     for (p.path.nodes) |n| if (n.alias) |name| {
-                        try aliases.append(self.a, name);
+                        if (!try self.spend(1 + name.len / 64)) return;
+                        try aliases.put(self.a, name, {});
                     };
-                    try self.path(p.path, p.predicate, aliases.items);
+                    try self.path(p.path, p.predicate, aliases);
                     try self.walk(p.predicate);
                     try self.walk(p.projection);
                     return;
                 },
-                else => {},
+                .literal, .variable, .parameter => return,
+                else => {
+                    // Only semantic expression children can introduce reads.
+                    // Source spans and physical annotations need no traversal.
+                    try self.walk(value.value);
+                    return;
+                },
             }
         }
         switch (@typeInfo(T)) {
@@ -188,7 +201,8 @@ const Builder = struct {
             else => {},
         }
     }
-    fn constant(self: *Builder, expression: *const ast.Expr) ?v.Value {
+    fn constant(self: *Builder, expression: *const ast.Expr) !?v.Value {
+        if (!try self.spend(1)) return null;
         return switch (expression.value) {
             .literal => |lit| switch (lit) {
                 .string => |x| .{ .string = x },
@@ -198,32 +212,45 @@ const Builder = struct {
                 .number => |x| .{ .number = x },
             },
             .parameter => |name| blk: {
-                for (self.parameters) |parameter| if (std.mem.eql(u8, parameter.name, name)) break :blk parameter.value;
-                break :blk null;
+                if (!self.parameters_indexed) {
+                    // Preserve first-binding semantics. Index once in the
+                    // invocation arena, charging names before hashing them.
+                    for (self.parameters) |parameter| {
+                        if (!try self.spend(1 + (std.math.divCeil(usize, parameter.name.len, 64) catch unreachable))) break :blk null;
+                        const entry = try self.parameter_index.getOrPut(self.a, parameter.name);
+                        if (!entry.found_existing) entry.value_ptr.* = parameter.value;
+                    }
+                    self.parameters_indexed = true;
+                }
+                if (!try self.spend(1 + (std.math.divCeil(usize, name.len, 64) catch unreachable))) break :blk null;
+                break :blk self.parameter_index.get(name);
             },
             else => null,
         };
     }
-    fn keyAlias(expression: *const ast.Expr, aliases: []const []const u8) ?[]const u8 {
+    fn nodeAlias(self: *Builder, name: []const u8, aliases: Aliases) !bool {
+        if (!try self.spend(1 + name.len / 64)) return false;
+        return aliases.contains(name);
+    }
+    fn keyAlias(self: *Builder, expression: *const ast.Expr, aliases: Aliases) !?[]const u8 {
         if (expression.value != .call) return null;
         const call = expression.value.call;
         if (!std.ascii.eqlIgnoreCase(call.name, "antfly.documentKey") or call.args.len != 1 or call.args[0].value != .variable) return null;
         const name = call.args[0].value.variable;
-        for (aliases) |known| if (std.mem.eql(u8, known, name)) return name;
-        return null;
+        return if (try self.nodeAlias(name, aliases)) name else null;
     }
     fn constantKeys(self: *Builder, expression: *const ast.Expr, membership: bool) !?[]const []const u8 {
         var result: std.ArrayList([]const u8) = .empty;
         if (membership and expression.value == .list) {
             if (expression.value.list.len > max_keys) return null;
             for (expression.value.list) |item| {
-                const value = self.constant(item) orelse return null;
+                const value = (try self.constant(item)) orelse return null;
                 if (value == .null) continue;
                 if (value != .string) return null;
                 if (!try self.appendKey(&result, value.string)) return null;
             }
         } else {
-            const value = self.constant(expression) orelse return null;
+            const value = (try self.constant(expression)) orelse return null;
             if (value == .null) return &.{};
             if (!membership) {
                 if (value != .string) return null;
@@ -239,28 +266,27 @@ const Builder = struct {
         }
         return result.items;
     }
-    fn atom(self: *Builder, op: ast.Binary, left: *const ast.Expr, right: *const ast.Expr, alias: []const u8, aliases: []const []const u8) !Bound {
+    fn atom(self: *Builder, op: ast.Binary, left: *const ast.Expr, right: *const ast.Expr, alias: []const u8, aliases: Aliases) !Bound {
         if (op != .eq and op != .in) return .{ .safe = false };
-        const name = keyAlias(left, aliases) orelse if (op == .eq) keyAlias(right, aliases) else null;
-        const selected = name orelse return .{ .safe = false };
-        const rhs = if (keyAlias(left, aliases) != null) right else left;
+        const left_alias = try self.keyAlias(left, aliases);
+        const right_alias = if (op == .eq) try self.keyAlias(right, aliases) else null;
+        const selected = left_alias orelse right_alias orelse return .{ .safe = false };
+        const rhs = if (left_alias != null) right else left;
         const domain = (try self.constantKeys(rhs, op == .in)) orelse return .{ .safe = false };
         return .{ .keys = if (std.mem.eql(u8, selected, alias)) domain else null };
     }
-    fn simpleData(self: *Builder, e: *const ast.Expr, aliases: []const []const u8) anyerror!bool {
+    fn simpleData(self: *Builder, e: *const ast.Expr, aliases: Aliases) anyerror!bool {
         if (!try self.spend(1)) return false;
-        if (self.constant(e) != null) return true;
+        if (try self.constant(e) != null) return true;
         return switch (e.value) {
-            .property => |p| p.base.value == .variable and for (aliases) |name| {
-                if (std.mem.eql(u8, name, p.base.value.variable)) break true;
-            } else false,
-            .call => keyAlias(e, aliases) != null,
+            .property => |p| p.base.value == .variable and try self.nodeAlias(p.base.value.variable, aliases),
+            .call => (try self.keyAlias(e, aliases)) != null,
             else => false,
         };
     }
     // Only total predicates may accompany a key anchor. Unknown arithmetic,
     // calls and constructors could otherwise hide errors on a scan fallback.
-    fn totalTest(self: *Builder, e: *const ast.Expr, aliases: []const []const u8) anyerror!bool {
+    fn totalTest(self: *Builder, e: *const ast.Expr, aliases: Aliases) anyerror!bool {
         if (!try self.spend(1)) return false;
         return switch (e.value) {
             .literal => |lit| lit == .boolean or lit == .null,
@@ -285,7 +311,7 @@ const Builder = struct {
             else => false,
         };
     }
-    fn predicateDomain(self: *Builder, e: *const ast.Expr, alias: []const u8, aliases: []const []const u8) anyerror!Bound {
+    fn predicateDomain(self: *Builder, e: *const ast.Expr, alias: []const u8, aliases: Aliases) anyerror!Bound {
         if (!try self.spend(1)) return .{ .safe = false };
         switch (e.value) {
             .literal => |value| switch (value) {
@@ -294,12 +320,12 @@ const Builder = struct {
                 else => {},
             },
             .comparison => |c| if (c.operators.len == 1 and c.operands.len == 2) {
-                if ((c.operators[0] == .eq or c.operators[0] == .in) and (keyAlias(c.operands[0], aliases) != null or keyAlias(c.operands[1], aliases) != null))
+                if ((c.operators[0] == .eq or c.operators[0] == .in) and ((try self.keyAlias(c.operands[0], aliases)) != null or (try self.keyAlias(c.operands[1], aliases)) != null))
                     return self.atom(c.operators[0], c.operands[0], c.operands[1], alias, aliases);
             },
             .binary => |b| {
                 if (b.op != .@"and" and b.op != .@"or") {
-                    if ((b.op == .eq or b.op == .in) and (keyAlias(b.left, aliases) != null or keyAlias(b.right, aliases) != null)) return self.atom(b.op, b.left, b.right, alias, aliases);
+                    if ((b.op == .eq or b.op == .in) and ((try self.keyAlias(b.left, aliases)) != null or (try self.keyAlias(b.right, aliases)) != null)) return self.atom(b.op, b.left, b.right, alias, aliases);
                     return .{ .safe = try self.totalTest(e, aliases) };
                 }
                 const l = try self.predicateDomain(b.left, alias, aliases);
@@ -417,4 +443,55 @@ test "point domains bind parameters per invocation and bound planning work witho
     };
     var marker: u8 = 0;
     try std.testing.expectError(error.Canceled, plan(arena.allocator(), graph, compiled.query, &.{}, .{ .checkpoint = .{ .ptr = &marker, .call = Guard.canceled } }));
+}
+
+test "point parameter proofs index bindings once and meter indexing before lookup" {
+    const compiler = @import("compiler.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parameters = try a.alloc(v.Entry, 10000);
+    for (parameters, 0..) |*parameter, index| {
+        const name = try a.alloc(u8, 64);
+        @memset(name, 'x');
+        _ = try std.fmt.bufPrint(name[56..64], "{d:0>8}", .{index});
+        parameter.* = .{ .name = name, .value = .{ .string = "a" } };
+    }
+    const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} };
+    var source: std.ArrayList(u8) = .empty;
+    try source.appendSlice(a, "MATCH(n:D) WHERE antfly.documentKey(n) IN [");
+    for (0..4096) |index| {
+        if (index != 0) try source.append(a, ',');
+        try source.append(a, '$');
+        try source.appendSlice(a, parameters[9999].name);
+    }
+    try source.appendSlice(a, "] RETURN n");
+    var diagnostic: compiler.Diagnostic = .{};
+    var repeated = try compiler.compile(std.testing.allocator, source.items, .{}, &diagnostic);
+    defer repeated.deinit();
+    const result = try plan(a, graph, repeated.query, parameters, .{});
+    try std.testing.expectEqual(@as(usize, 1), result.table("docs").?.keys.?.len);
+    try std.testing.expectEqualStrings("a", result.table("docs").?.keys.?[0]);
+    const simple = try std.fmt.allocPrint(a, "MATCH(n:D) WHERE antfly.documentKey(n)=${s} RETURN n", .{parameters[9999].name});
+    var single = try compiler.compile(std.testing.allocator, simple, .{}, &diagnostic);
+    defer single.deinit();
+    // A tiny proof cannot scan thousands of irrelevant bindings for free.
+    const bounded = try plan(a, graph, single.query, parameters, .{ .max_work = 256 });
+    try std.testing.expect(bounded.table("docs").?.keys == null);
+    const Guard = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == 3) return error.Canceled;
+        }
+    };
+    var guard: Guard = .{};
+    try std.testing.expectError(error.Canceled, plan(a, graph, single.query, parameters, .{ .checkpoint = .{ .ptr = &guard, .call = Guard.check } }));
+    try std.testing.expectEqual(@as(usize, 3), guard.calls);
+    // Duplicate bindings retain the existing first-binding behavior.
+    parameters[0].name = parameters[9999].name;
+    parameters[0].value = .{ .string = "first" };
+    const duplicate = try plan(a, graph, single.query, parameters, .{});
+    try std.testing.expectEqualStrings("first", duplicate.table("docs").?.keys.?[0]);
 }
