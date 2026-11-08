@@ -7669,9 +7669,11 @@ test "capi SQL detached index publication rejects a recreated table namespace" {
     const Probe = struct {
         handle: ?*anyopaque,
         failure: ?anyerror = null,
+        entered: bool = false,
         rejected: bool = false,
         fn notify(ptr: *anyopaque, root: *shared.Handle) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered = true;
             self.check(root) catch |err| {
                 self.failure = err;
             };
@@ -7683,7 +7685,11 @@ test "capi SQL detached index publication rejects a recreated table namespace" {
             try sqlFkRecoveryStatement(self.handle, "DROP TABLE docs");
             try sqlFkRecoveryStatement(self.handle, "CREATE TABLE docs (body TEXT)");
             table.core.index_manager.text_lsm_storage.?.writeFileAbsolute(file, "old namespace") catch |err| {
-                try std.testing.expect(err == error.EnrichmentWaitCanceled);
+                try std.testing.expectEqual(@as(anyerror, error.EnrichmentSourceChanged), err);
+                const guard = public.enterHandle(self.handle, .exclusive).?;
+                defer guard.leave();
+                const storage = guard.handle.owned_lite_backend.?.native_index_storage.?.storage();
+                try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(std.testing.allocator, file, 64));
                 self.rejected = true;
                 return;
             };
@@ -7693,10 +7699,16 @@ test "capi SQL detached index publication rejects a recreated table namespace" {
     var probe: Probe = .{ .handle = handle };
     owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
     defer owner.test_after_capture = null;
-    owner.maintenance_table_cursor = 1;
     owner.maintenance_pending = true;
-    _ = try owner.maintenanceTurnForTest();
+    // Physical maintenance or allocator verification may consume a turn before
+    // this named runtime is captured. Require the actual detached handoff.
+    for (0..16) |_| {
+        owner.maintenance_table_cursor = 1;
+        _ = try owner.maintenanceTurnForTest();
+        if (probe.entered) break;
+    }
     if (probe.failure) |err| return err;
+    try std.testing.expect(probe.entered);
     try std.testing.expect(probe.rejected);
 }
 
