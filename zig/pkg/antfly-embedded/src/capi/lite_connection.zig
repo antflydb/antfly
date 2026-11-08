@@ -1200,6 +1200,39 @@ pub const WriterLane = struct {
         }
     }
 
+    /// Reclaim this lane's parked lease for a caller that does not go
+    /// through `checkout` at all -- a plain read, or a write on a
+    /// connection that `enterCapturedHandleWithDeadline` did not consider
+    /// lane-eligible -- instead of letting it attempt a fresh kernel
+    /// acquisition of the very same lease. `checkin`'s parked lease is a
+    /// `PathWriterLock` (a kernel-level `flock`-style advisory lock) held
+    /// open on its own file descriptor; `connection.gate.mutex.
+    /// takeRetained()` has no visibility into it (lane parking and gate
+    /// retention are deliberately separate so a warm lane checkout never
+    /// needs the gate mutex at all), so a caller that only ever checks
+    /// `takeRetained()` and otherwise acquires fresh sees this process as
+    /// just another contender for a lease this same process is already
+    /// holding. A second `flock` attempt through a different descriptor
+    /// does not recognize its own process as the holder and queues behind
+    /// itself -- normally resolved eventually (the owner's background
+    /// worker's own turns touch the same fair queue and can end up
+    /// releasing it), but with nothing else running to ever let it go
+    /// (for example a stopped/idle owner, or no managed indexes/
+    /// enrichment at all) the wait only ever ends at the caller's own
+    /// `busy_timeout_ms` as `error.FileBusy`. Only a lease still parked
+    /// for the *same* root (`last_root` -- a different root means a
+    /// generation moved on since; leave it alone and let the ordinary
+    /// path decide) is taken.
+    pub fn takeParkedForStore(self: *WriterLane, connection: *Connection) ?native.PathWriterLock {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const lease = self.parked orelse return null;
+        if (self.last_root == null or self.last_root != connection.owner.current) return null;
+        self.parked = null;
+        return lease;
+    }
+
     /// How long a lease must have been held before a *genuinely foreign*
     /// waiter (`PathWriterLock.othersWaitingAcrossProcesses`, never this
     /// process's own maintenance worker -- see that method's doc comment)
@@ -1237,6 +1270,14 @@ pub const WriterLane = struct {
         self.mutex.lockUncancelable(io);
         var lease = self.held_lease.?;
         self.held_lease = null;
+        // Mirror `QueuedMutex.retainForWaiter`'s own cleanup before parking:
+        // `withReadRegistrationBatch` (used by both `checkout`'s own cold
+        // start and, via `takeParkedForStore`, a non-lane caller that
+        // reclaims this parked lease) asserts no batch is already
+        // registered. This lease may carry one from whichever earlier
+        // `acquirePathLeaseAssumeLocked` call originally acquired it.
+        if (lease.reader_registration_batch) |batch| batch.end();
+        lease.reader_registration_batch = null;
         if (self.waiting != 0) {
             self.parked = lease;
             self.checked_out = false;
@@ -3215,6 +3256,17 @@ pub const Connection = struct {
         if (h.liteOpenModeCanWrite(self.options.open_mode)) {
             const stats = &self.owner.publication_stats.foreground_lease;
             if (self.gate.mutex.takeRetained()) |held| {
+                var lease = held;
+                stats.recordAcquired(.handoff, 0);
+                lease.startHold(stats);
+                return self.owner.withReadRegistrationBatch(lease);
+            }
+            // See `WriterLane.takeParkedForStore`'s doc comment: a lease
+            // the lane parked after a lane-managed write's `checkin` is
+            // invisible to `takeRetained()` above. Reclaim it here before
+            // ever attempting a fresh kernel acquisition that would
+            // contend with this same process's own already-held lock.
+            if (self.owner.writer_lane.takeParkedForStore(self)) |held| {
                 var lease = held;
                 stats.recordAcquired(.handoff, 0);
                 lease.startHold(stats);
