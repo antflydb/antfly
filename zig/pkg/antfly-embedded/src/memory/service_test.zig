@@ -8770,3 +8770,177 @@ test "completion additive verification metadata preserves unverified claim pin b
     const verified = try std.json.parseFromSliceLeaky(std.json.Value, a, try svc.execute(a, .get, "helm", "{}", ""), .{});
     try std.testing.expectEqual(@as(i64, 500), verified.object.get("last_verified_at").?.integer);
 }
+
+test "memory regression: usage must hide forgotten verification provenance" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", helm, "claim", 3);
+    const svc = store.service("alice", true, 500);
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"verification\",\"text\":\"Checked against current production\"}]}", "verification");
+    const original = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, "helm", "{}", ""), .{});
+    const correction: m.types.Correction = .{ .id = "helm", .expected_revision = original.revision, .lifecycle = .active, .stability = .settled, .reason = "Checked", .evidence = &.{.{ .id = "verification" }} };
+    _ = try svc.execute(a, .correct, "", try std.json.Stringify.valueAlloc(a, correction, .{}), "correct");
+    _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"verification\"]}", "forget");
+    const public = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, "helm", "{}", ""), .{});
+    const usage = try std.json.parseFromSliceLeaky(m.types.Usage, a, try svc.execute(a, .usage, "helm", "{}", ""), .{});
+    try std.testing.expectEqual(@as(?i64, null), public.last_verified_at);
+    try std.testing.expectEqual(public.last_verified_at, usage.last_verified_at);
+}
+
+test "memory regression: brief policy evaluation must fence pin changes" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", helm, "claim", 3);
+    const svc = store.service("alice", true, 500);
+    const case: m.types.evaluation.Case = .{ .id = "query", .task = .retrieval, .input = .null, .policy = .{ .retrieval = .brief }, .relevant_ids = &.{"helm"} };
+    _ = try svc.execute(a, .put_evaluation_dataset, "", try std.json.Stringify.valueAlloc(a, m.types.evaluation.DatasetRequest{ .id = "labels", .expected_revision = try SupersessionFixture.revision(svc, a), .cases = &.{case} }, .{}), "dataset");
+    const start = try EvaluationFixture.start(svc, a, .policy, null);
+    _ = try svc.execute(a, .pin, "", "{\"id\":\"helm\"}", "pin");
+    _ = try svc.execute(a, .advance, start.id, "{}", "advance");
+    const status = try std.json.parseFromSliceLeaky(m.types.evaluation.Status, a, try svc.execute(a, .evaluation_run, "run", "{}", ""), .{});
+    try std.testing.expectEqual(@as(@FieldType(m.types.evaluation.Run, "phase"), .cancelled), status.run.phase);
+}
+
+test "memory regression: cleanup must remove reverse bindings for specifically forgotten outcome inputs" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", layered_claims, "claims", 3);
+    const svc = store.service("alice", true, 10);
+    _ = try svc.execute(a, .outcome, "", "{\"id\":\"out\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[\"a-language\",\"z-ticket\"]}", "out");
+    _ = try svc.execute(a, .forget, "", "{\"assertion_ids\":[\"z-ticket\"]}", "forget");
+    for (0..64) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}));
+    try std.testing.expect(store.values.get("cleanup") == null);
+    var it = store.values.keyIterator();
+    var bindings: usize = 0;
+    while (it.next()) |path| if (std.mem.startsWith(u8, path.*, "outcome-use/")) {
+        bindings += 1;
+    };
+    std.debug.print("THIRD REVIEW remaining outcome bindings={d}\n", .{bindings});
+    try std.testing.expectEqual(@as(usize, 0), bindings);
+}
+
+test "memory regression: measure brief materialization of long procedural payloads" {
+    var baseline: usize = 0;
+    for ([_]usize{ 0, 32 * 1024 }) |payload_len| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try setup(&store);
+        const payload = try a.alloc(u8, payload_len);
+        @memset(payload, 'x');
+        const svc = store.service("alice", true, 10);
+        for (0..32) |i| {
+            const id = try std.fmt.allocPrint(a, "claim-{d}", .{i});
+            const claim: m.types.Assertion = .{ .id = id, .subject = "s", .predicate = "p", .value = id, .statement = "Short useful note", .kind = .procedural, .steps = &.{payload}, .evidence = &.{.{ .id = "e1" }} };
+            _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{claim} }, .{}), id);
+        }
+        const storage = try std.testing.allocator.alloc(u8, 64 * 1024 * 1024);
+        defer std.testing.allocator.free(storage);
+        var buffer = std.heap.FixedBufferAllocator.init(storage);
+        const response = try svc.execute(buffer.allocator(), .brief, "", "{}", "");
+        if (payload_len == 0) baseline = buffer.end_index else try std.testing.expect(buffer.end_index < baseline + 1024 * 1024);
+        std.debug.print("THIRD REVIEW BRIEF payload_bytes={d} response_bytes={d} allocator_bytes={d}\n", .{ payload_len * 32, response.len, buffer.end_index });
+    }
+}
+
+test "memory regression: generated consolidation proposals must permit the authoritative replacement" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 10);
+    const config: m.types.Config = .{ .features = .{ .reconciliation = .deterministic }, .predicates = &.{.{ .name = "deploys_with", .cardinality = .one }}, .source_rules = &.{.{ .source_id = "strong", .authority = 10, .principal = "alice" }} };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"strong\",\"source_id\":\"strong\",\"text\":\"Authoritative runbook\"},{\"id\":\"weak\",\"text\":\"Tentative note\"}],\"assertions\":[{\"id\":\"a-weak\",\"subject\":\"production\",\"predicate\":\"deploys_with\",\"value\":\"Helm\",\"statement\":\"Use Helm\",\"evidence\":[{\"id\":\"weak\"}]},{\"id\":\"z-strong\",\"subject\":\"production\",\"predicate\":\"deploys_with\",\"value\":\"Terraform\",\"statement\":\"Use Terraform\",\"evidence\":[{\"id\":\"strong\"}]}]}", "observe");
+    const operation = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .prepare_consolidation, "", "{}", "prepare"), .{});
+    try std.testing.expectEqual(@as(usize, 1), operation.proposal_ids.len);
+    const detail = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalDetail, a, try svc.execute(a, .supersession_proposal, operation.proposal_ids[0], "{}", ""), .{});
+    const verdict: m.types.SupersessionVerdict = .{ .expected_revision = try SupersessionFixture.revision(svc, a), .verdict = .supersedes, .reason = "Prefer authoritative source" };
+    try std.testing.expectEqualStrings("z-strong", detail.proposal.incoming.id);
+    _ = try svc.execute(a, .review_supersession, operation.proposal_ids[0], try std.json.Stringify.valueAlloc(a, verdict, .{}), "accept-generated-direction");
+    const winner = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, "z-strong", "{}", ""), .{});
+    try std.testing.expectEqual(m.types.Lifecycle.active, winner.lifecycle);
+}
+
+test "memory regression: managed observation receipts must expose duplicate signals after generation" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = modelService(&store, 10);
+    const config: m.types.Config = .{ .processing = .hybrid, .features = .{ .assertion_distillation = true }, .models = .{ .generator = fake_model } };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    const pending = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"text\":\"Production uses Helm\",\"managed\":true}]}", "managed-note"), .{});
+    const operation_id = pending.id;
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"other-note\",\"text\":\"Production uses Helm\"}]}", "other-note");
+    const prior: m.types.Assertion = .{ .id = "prior", .subject = "production", .predicate = "deploys_with", .value = "Helm", .statement = "Production uses Helm", .evidence = &.{.{ .id = "other-note" }} };
+    _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{prior} }, .{}), "existing");
+    for (0..4) |i| {
+        const progress = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .advance, operation_id, "{}", try std.fmt.allocPrint(a, "generate-{d}", .{i})), .{});
+        try std.testing.expect(progress.duplicate_ids.len > 0);
+    }
+    const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .operation, operation_id, "{}", ""), .{});
+    try std.testing.expectEqual(m.types.Stage.succeeded, receipt.phase);
+    const report = try std.json.parseFromSliceLeaky(m.types.Consolidation, a, try svc.execute(a, .consolidate, "", "{}", ""), .{});
+    var has_duplicate = false;
+    for (report.findings) |finding| if (finding.kind == .duplicate) {
+        has_duplicate = true;
+    };
+    try std.testing.expect(has_duplicate);
+    std.debug.print("THIRD REVIEW managed receipt duplicates={d}, consolidation detects duplicate\n", .{receipt.duplicate_ids.len});
+    try std.testing.expect(receipt.duplicate_ids.len > 0);
+}
+
+test "memory streaming brief preserves the final resource payload fence" {
+    const ChangeAtFinish = struct {
+        fn finish(ptr: *anyopaque) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.resource_json = "{\"message\":\"Changed without a revision or digest update\"}";
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    store.resource_digest = @splat(3);
+    var svc = store.service("alice", true, 10);
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"external\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"assertions\":[{\"id\":\"fact\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"Approved production policy\",\"evidence\":[{\"id\":\"external\"}]}]}", "external");
+    svc.context.final_check_ptr = &store;
+    svc.context.final_check_fn = ChangeAtFinish.finish;
+    try std.testing.expectError(error.MemoryResourceChanged, svc.execute(a, .brief, "", "{}", ""));
+}
+
+test "memory streaming brief handles one large record and bounds total hydrated bytes" {
+    for ([_]usize{ 1, 128 }) |count| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try setup(&store);
+        const svc = store.service("alice", true, 10);
+        const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        var config = state.config;
+        config.max_input_bytes = 2 * 1024 * 1024;
+        _ = try svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = state.revision, .config = config }, .{}), "config");
+        const payload = try a.alloc(u8, 64 * 1024);
+        @memset(payload, 'x');
+        for (0..count) |i| {
+            const id = try std.fmt.allocPrint(a, "procedure-{d}", .{i});
+            const steps: []const []const u8 = if (count == 1) &.{ payload, payload, payload, payload, payload, payload, payload, payload, payload, payload, payload, payload } else &.{payload};
+            const claim: m.types.Assertion = .{ .id = id, .subject = "s", .predicate = "p", .value = id, .statement = "A useful procedure", .kind = .procedural, .steps = steps, .evidence = &.{.{ .id = "e1" }} };
+            _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{claim} }, .{}), id);
+        }
+        const result = try std.json.parseFromSliceLeaky(m.types.Brief, a, try svc.execute(a, .brief, "", "{}", ""), .{});
+        try std.testing.expect(result.items.len > 0);
+        try std.testing.expect(result.token_upper_bound <= 1024);
+        if (count == 1) {
+            try std.testing.expectEqualStrings("procedure-0", result.items[0].id);
+        } else {
+            try std.testing.expect(!result.complete);
+            try std.testing.expect(result.scanned < count);
+        }
+    }
+}

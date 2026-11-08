@@ -20283,6 +20283,46 @@ test "native memory brief, consolidation, pins and the agent MCP profile" {
     defer observed.deinit();
     try std.testing.expectEqual(@as(u16, 200), observed.status.code);
 
+    // Storage adapters must project the policy metadata before transporting a
+    // brief page; ordinary record reads still return the full procedure.
+    const procedure_payload = try a.alloc(u8, 16 * 1024);
+    defer a.free(procedure_payload);
+    @memset(procedure_payload, 'x');
+    const procedure_body = try std.json.Stringify.valueAlloc(a, module.memory.types.ObservationRequest{
+        .evidence = &.{.{ .id = "procedure-note", .text = "Deployment procedure" }},
+        .assertions = &.{.{ .id = "procedure", .subject = "deploys", .predicate = "procedure", .value = "release", .statement = "A bounded deployment procedure", .kind = .procedural, .steps = &.{procedure_payload}, .evidence = &.{.{ .id = "procedure-note" }} }},
+    }, .{});
+    defer a.free(procedure_body);
+    var procedure = try requestWithRetry(&client, threaded.io(), .POST, observe_url, procedure_body, &.{ .{ "content-type", "application/json" }, .{ "idempotency-key", "procedure" } }, 20);
+    defer procedure.deinit();
+    try std.testing.expectEqual(@as(u16, 200), procedure.status.code);
+    {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const backend = native.backend();
+        const projected = try backend.scan_brief.?(backend.ptr, scratch, "assertion/", null, 16);
+        var found_procedure = false;
+        for (projected.rows) |row| {
+            const record = try std.json.parseFromSliceLeaky(module.memory.types.StoredAssertion, scratch, row.json, .{});
+            try std.testing.expectEqual(@as(usize, 0), record.assertion.steps.len);
+            if (std.mem.eql(u8, record.assertion.id, "procedure")) {
+                found_procedure = true;
+                try std.testing.expect(row.json.len < procedure_payload.len);
+                const one = (try backend.get_brief.?(backend.ptr, scratch, row.key)).?;
+                const single = try std.json.parseFromSliceLeaky(module.memory.types.StoredAssertion, scratch, one.json, .{});
+                try std.testing.expectEqual(@as(usize, 0), single.assertion.steps.len);
+                const hydrated = try backend.get_many_brief.?(backend.ptr, scratch, &.{row.key});
+                const selected = try std.json.parseFromSliceLeaky(module.memory.types.StoredAssertion, scratch, hydrated[0].?.json, .{});
+                try std.testing.expectEqual(@as(usize, 0), selected.assertion.steps.len);
+            }
+        }
+        try std.testing.expect(found_procedure);
+        const full_json = try (module.memory.Service{ .backend = backend, .context = context }).execute(scratch, .get, "procedure", "{}", "");
+        const full = try std.json.parseFromSliceLeaky(module.memory.types.StoredAssertion, scratch, full_json, .{});
+        try std.testing.expectEqual(@as(usize, 1), full.assertion.steps.len);
+    }
+
     const brief_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/brief?limit=4&token_budget=2048", .{base});
     defer a.free(brief_url);
     var brief = try requestWithRetry(&client, threaded.io(), .GET, brief_url, "", &.{}, 20);
