@@ -94,6 +94,39 @@ fn resumeMetadataRaftQuarantineForAdmin(
     try svc.resumeRaftQuarantineForAdmin(group_id, options);
 }
 
+const MetadataSessions = struct {
+    adapter: @import("transaction_session_store.zig").Store,
+    store: @import("antfly_local_sources").storage_backend_erased.Store,
+    durable: @import("../api/transactions.zig").DurableSessionStore,
+
+    fn create(alloc: std.mem.Allocator, svc: *service.MetadataHttpService) !*@This() {
+        const self = try alloc.create(@This());
+        errdefer alloc.destroy(self);
+        self.adapter = .{ .host = .{ .ptr = svc, .read = read, .term = term, .propose = propose }, .group = svc.metadata_group_id };
+        self.store = self.adapter.runtime(alloc);
+        self.durable = @import("../api/transactions.zig").DurableSessionStore.initRuntime(alloc, &self.store);
+        return self;
+    }
+    fn destroy(self: *@This(), alloc: std.mem.Allocator) void {
+        self.store.deinit();
+        alloc.destroy(self);
+    }
+    fn read(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_backend_erased.ReadTxn {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableReadWithContext(.{});
+        const projected = svc.projectedStore() orelse return error.MissingMetadataStore;
+        return projected.openSessionRead(alloc, svc.metadata_group_id);
+    }
+    fn term(ptr: *anyopaque) ?u64 {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return svc.localMetadataLeadershipTerm();
+    }
+    fn propose(ptr: *anyopaque, bytes: []const u8, expected_term: u64) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(.{ .apply_transaction_sessions = bytes }, expected_term);
+    }
+};
+
 pub const MetadataServer = struct {
     alloc: std.mem.Allocator,
     svc: *service.MetadataHttpService,
@@ -107,7 +140,7 @@ pub const MetadataServer = struct {
     owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
     owned_kernel_owner_source: ?*MetadataKernelOwnerSource = null,
     owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null,
-    owned_public_session_path: ?[]u8 = null,
+    owned_sessions: ?*MetadataSessions = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
     http_observer_lease: ?@import("antfly_local_sources").storage_background_runtime.BackendRuntime.WorkerLease = null,
     owned_http_runtime: ?*httpx.HttpRuntime = null,
@@ -210,8 +243,9 @@ pub const MetadataServer = struct {
             }
         };
         errdefer if (owned_public_write_source) |write_source| alloc.destroy(write_source);
-        var owned_public_session_path: ?[]u8 = null;
-        errdefer if (owned_public_session_path) |path| alloc.free(path);
+        var owned_sessions: ?*MetadataSessions = null;
+        errdefer if (owned_sessions) |sessions| sessions.destroy(alloc);
+
         var owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null;
         errdefer if (owned_public_http_server) |public_http_server| {
             public_http_server.deinit();
@@ -278,6 +312,10 @@ pub const MetadataServer = struct {
             );
             const backend_runtime = try svc.ensureBackendRuntime();
             const reranker_io = backend_runtime.io() orelse return error.QueryRuntimeUnavailable;
+            // Retained distributed reads need a stable server-owned clock for
+            // connection nonces and lease deadlines, including executor
+            // facades which do not export their own clock capability.
+            _ = public_read_source.withIoInterface(reranker_io, .limited(8));
             const reranker_runtime = try alloc.create(reranking.Runtime);
             reranker_runtime.* = reranking.Runtime.init(alloc, reranker_io);
             _ = public_read_source.withRerankerRuntime(reranker_runtime);
@@ -298,9 +336,12 @@ pub const MetadataServer = struct {
                 _ = public_read_source.withLocalReadSource(owner_source.readSource());
                 _ = public_write_source.withLocalWriteSource(owner_source.writeSource());
                 _ = owner_source.withDocumentChildRangeDispatchSource(public_write_source.source());
-            } else {
-                _ = public_write_source.withBackendRuntime(backend_runtime);
             }
+            // The hosted cleanup owner also needs the process scheduler when
+            // physical storage is behind the compiled kernel. Without it,
+            // source publication synchronously waits for metadata reads before
+            // the restarted node has started its Raft transport.
+            _ = public_write_source.withBackendRuntime(backend_runtime);
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withInferenceAPIKey(cfg.api_server_cfg.inference_api_key);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
@@ -326,14 +367,14 @@ pub const MetadataServer = struct {
             var api_server_cfg = cfg.api_server_cfg;
             api_server_cfg.session_maintenance_local_only = true;
             api_server_cfg.session_store_path_only = true;
-            // Each metadata API issuer owns its sessions and completion outbox
-            // on its persistent volume, independently of replaceable Raft data.
-            if (api_server_cfg.session_store == null and api_server_cfg.session_store_path == null) {
-                if (svc.replica_root_dir) |root| if (root.len != 0) {
-                    owned_public_session_path = try std.fmt.allocPrint(alloc, "{s}/api-transaction-sessions", .{root});
-                    api_server_cfg.session_store_path = owned_public_session_path;
-                    api_server_cfg.session_store_scope = .node_local;
-                };
+            // Graph request IDs need one durable authority across issuers. The
+            // completion store namespaces producer outboxes by issuer; shared
+            // session mutations are serialized by the metadata transaction store.
+            if (api_server_cfg.session_store == null and api_server_cfg.session_store_path == null and replica_root_dir.len != 0) {
+                owned_sessions = try MetadataSessions.create(alloc, svc);
+                api_server_cfg.session_store = &owned_sessions.?.durable;
+                api_server_cfg.session_store_scope = .cluster_shared;
+                if (api_server_cfg.session_owner_lease_ttl_ns == null) api_server_cfg.session_owner_lease_ttl_ns = 15 * std.time.ns_per_s;
             }
             api_server_cfg.restore_owner_progress_generation = &svc.restore_owner_progress_generation;
             api_server_cfg.privacy_scan_coordinator = true;
@@ -415,7 +456,7 @@ pub const MetadataServer = struct {
             .owned_public_write_source = owned_public_write_source,
             .owned_kernel_owner_source = owned_kernel_owner_source,
             .owned_public_http_server = owned_public_http_server,
-            .owned_public_session_path = owned_public_session_path,
+            .owned_sessions = owned_sessions,
             .owned_admin_mux = owned_admin_mux,
             .http_observer_lease = http_observer_lease,
             .owned_http_runtime = owned_http_runtime,
@@ -455,8 +496,7 @@ pub const MetadataServer = struct {
             public_http_server.deinit();
             self.alloc.destroy(public_http_server);
         }
-        if (self.owned_public_session_path) |path| self.alloc.free(path);
-        self.owned_public_session_path = null;
+        if (self.owned_sessions) |sessions| sessions.destroy(self.alloc);
         if (self.owned_public_write_source) |write_source| {
             self.alloc.destroy(write_source);
         }
@@ -550,6 +590,14 @@ pub const MetadataServer = struct {
             if (self.owned_admin_mux) |mux| {
                 if (mux.ensureRestoreLeadershipIfLocalLeader()) |local_leader| {
                     if (local_leader) {
+                        // Metadata owns the replicated API session keyspace.
+                        // Its independent supervisor must renew leases and
+                        // recover sealed writes even when no data runtime is
+                        // hosted here and no client sends another request.
+                        mux.public_api.scheduleSessionMaintenance() catch |err| {
+                            if (!metadata_authority.isRetryableError(err))
+                                std.log.warn("metadata session maintenance schedule deferred err={s}", .{@errorName(err)});
+                        };
                         if (mux.public_api.pollRestoreJobsOnce()) |_| {
                             last_unexpected_error = null;
                         } else |err| {
@@ -1790,15 +1838,9 @@ test "metadata server can expose admin listener endpoints" {
     const public_cfg = server.owned_public_http_server.?.cfg;
     try std.testing.expect(public_cfg.session_store != null);
     try std.testing.expectEqual(@as(u64, 1), public_cfg.session_router.?.localNodeId());
-    try std.testing.expect(public_cfg.session_store_path != null);
+    try std.testing.expect(public_cfg.session_store_path == null);
     try std.testing.expect(public_cfg.session_maintenance_local_only);
-    try std.testing.expect(public_cfg.session_store_scope == .node_local);
-    const api = server.owned_public_http_server.?;
-    const durable_session = try api.txn_sessions.begin(std.heap.page_allocator, .{}, public_cfg.session_router.?.localNodeId());
-    var persisted = (try api.txn_sessions.durable.?.load(durable_session.txn_id)).?;
-    persisted.deinit(std.heap.page_allocator);
-    // Retire the fixture record after proving the default store is durable.
-    try std.testing.expect(api.txn_sessions.removeBeforeExecution(std.heap.page_allocator, durable_session.txn_id));
+    try std.testing.expect(public_cfg.session_store_scope == .cluster_shared);
     try std.testing.expect(public_cfg.session_executor != null);
     try std.testing.expect(public_cfg.session_executor.?.ptr == server.svc.raft.host.http_host.request_executor.ptr);
     try std.testing.expect(public_cfg.session_router != null);
@@ -1813,6 +1855,13 @@ test "metadata server can expose admin listener endpoints" {
     });
     try server.svc.campaignMetadataGroup();
     try server.runRound();
+    const api = server.owned_public_http_server.?;
+    const durable_session = try api.txn_sessions.begin(std.heap.page_allocator, .{}, public_cfg.session_router.?.localNodeId());
+    var persisted = (try api.txn_sessions.durable.?.load(durable_session.txn_id)).?;
+    persisted.deinit(std.heap.page_allocator);
+    // Retire the fixture record after proving the default store is durable.
+    try std.testing.expect(api.txn_sessions.removeBeforeExecution(std.heap.page_allocator, durable_session.txn_id));
+
     try server.svc.upsertTable(.{ .table_id = 77, .name = "docs" });
 
     var rounds: usize = 0;

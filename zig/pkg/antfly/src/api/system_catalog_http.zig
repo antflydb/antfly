@@ -57,10 +57,22 @@ pub fn execute(source: anytype, alloc: std.mem.Allocator, request: operation.Req
     if (action) |mutation_action| {
         var mutation: domain.Mutation = .{ .action = mutation_action, .kind = route.kind, .name = route.name orelse return failure(alloc, error.InvalidCatalogName), .database = route.database, .namespace = route.namespace };
         switch (mutation_action) {
+            .set_definition => {
+                if (route.kind != .graph) return failure(alloc, error.InvalidCatalogMutation);
+                const Input = struct { expected_revision: []const u8, definition: @import("cypher").catalog.Definition };
+                const input = std.json.parseFromSliceLeaky(Input, a, body, .{}) catch return failure(alloc, error.InvalidCatalogMutation);
+                if (input.expected_revision.len == 0 or input.expected_revision[0] < '1' or input.expected_revision[0] > '9') return failure(alloc, error.InvalidCatalogMutation);
+                for (input.expected_revision) |digit| if (digit < '0' or digit > '9') return failure(alloc, error.InvalidCatalogMutation);
+                mutation.expected_graph_revision = std.fmt.parseInt(u64, input.expected_revision, 10) catch return failure(alloc, error.InvalidCatalogMutation);
+                mutation.source_json = try std.json.Stringify.valueAlloc(a, input.definition, .{ .emit_null_optional_fields = false });
+            },
             .create => if (route.kind == .query_source) {
                 const Input = struct { source: std.json.Value };
                 const input = std.json.parseFromSliceLeaky(Input, a, body, .{}) catch return failure(alloc, error.InvalidCatalogMutation);
                 mutation.source_json = try std.json.Stringify.valueAlloc(a, input.source, .{});
+            } else if (route.kind == .graph) {
+                _ = @import("cypher").catalog.parseDefinition(a, mutation.name, 1, 1, body) catch return failure(alloc, error.InvalidCatalogMutation);
+                mutation.source_json = body;
             } else if (route.kind == .tablespace and body.len > 0) {
                 const Create = struct { location_json: ?[]const u8 = null, placement_policy_json: ?[]const u8 = null };
                 const input = std.json.parseFromSliceLeaky(Create, a, body, .{}) catch return failure(alloc, error.InvalidCatalogMutation);
@@ -105,6 +117,7 @@ fn projectMutation(alloc: std.mem.Allocator, a: std.mem.Allocator, kind: domain.
         .namespace => response(alloc, status, Namespace{ .namespace_id = resource.id, .database_id = resource.parent_id, .database_name = result.database_name orelse return error.InvalidCatalogRecord, .name = resource.name, .tablespace_name = result.tablespace_name }),
         .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
         .query_source => response(alloc, status, try sourceValue(a, resource)),
+        .graph => response(alloc, status, try graphValue(a, null, resource)),
         .table => error.InvalidCatalogMutation,
     };
 }
@@ -133,6 +146,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             .namespace => response(alloc, status, try namespaceValue(&index, resource)),
             .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
             .query_source => response(alloc, status, try sourceValue(a, resource)),
+            .graph => response(alloc, status, try graphValue(a, state, resource)),
             .table => failure(alloc, error.InvalidCatalogMutation),
         };
     }
@@ -172,6 +186,11 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             for (state.resources) |r| if (r.kind == .query_source) try out.append(a, try sourceValue(a, r));
             return response(alloc, status, out.items);
         },
+        .graph => {
+            var out: std.ArrayList(std.json.Value) = .empty;
+            for (state.resources) |r| if (r.kind == .graph) try out.append(a, try graphValue(a, state, r));
+            return response(alloc, status, out.items);
+        },
         .table => return failure(alloc, error.InvalidCatalogMutation),
     }
 }
@@ -188,6 +207,25 @@ fn namespaceValue(state: *const domain.StateIndex, resource: domain.Resource) !N
 }
 fn tablespaceValue(alloc: std.mem.Allocator, resource: domain.Resource) !Tablespace {
     return .{ .tablespace_id = resource.id, .name = resource.name, .location_json = resource.location_json, .placement_policy_json = try std.json.Stringify.valueAlloc(alloc, resource.placement_policy, .{ .emit_null_optional_fields = false }) };
+}
+
+fn graphValue(a: std.mem.Allocator, state: ?domain.State, resource: domain.Resource) !std.json.Value {
+    var definition = try std.json.parseFromSliceLeaky(std.json.Value, a, resource.source_json, .{});
+    if (state) |current| {
+        const graph = try @import("cypher").catalog.parseDefinition(a, resource.name, resource.id, resource.graph_revision, resource.source_json);
+        const labels = definition.object.getPtr("labels") orelse return error.InvalidCatalogRecord;
+        if (resource.graph_tables.len == graph.labels.len) for (graph.labels, resource.graph_tables, labels.array.items) |fallback, binding, *label| {
+            const target = try domain.graphLabelTarget(current, binding, fallback);
+            const value: std.json.Value = if (std.mem.eql(u8, target.database, domain.default_database_name) and std.mem.eql(u8, target.namespace, domain.default_namespace_name)) .{ .string = target.table } else try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, target, .{}), .{});
+            try label.object.put(a, "table", value);
+        };
+    }
+    var object: std.json.ObjectMap = .empty;
+    try object.put(a, "graph_id", .{ .string = try std.fmt.allocPrint(a, "{d}", .{resource.id}) });
+    try object.put(a, "revision", .{ .string = try std.fmt.allocPrint(a, "{d}", .{resource.graph_revision}) });
+    try object.put(a, "name", .{ .string = resource.name });
+    try object.put(a, "definition", definition);
+    return .{ .object = object };
 }
 
 test "system catalog committed mutations retain success when projection fails" {

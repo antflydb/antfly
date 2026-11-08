@@ -2404,6 +2404,10 @@ const LocalStandaloneMetadata = struct {
             const table = self.owner.manager.tables.get(id) orelse return null;
             return .{ .id = table.table_id, .name = try self.alloc.dupe(u8, table.name) };
         }
+        pub fn graphIndexIdentity(self: @This(), id: u64, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
+            const table = self.owner.manager.tables.get(id) orelse return null;
+            return @import("../system_catalog/graph_bindings.zig").indexIdentity(self.alloc, table.indexes_json, name);
+        }
     };
     fn planCatalogLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, command: system_catalog.Mutation) !system_catalog.Delta {
         return self.planCatalogTopologyLocked(alloc, command, false);
@@ -3128,6 +3132,10 @@ const LocalStandaloneMetadata = struct {
                     .extension_members = self.extension_catalog.members.items,
                     .extension_dependencies = self.extension_catalog.dependencies.items,
                 }, .{});
+            },
+            .graph_authority => |request| {
+                const record = if (self.system_catalog_state) |*state| state.index.find(.graph, 0, request.name) else null;
+                return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").GraphAuthorityResult{ .present = record != null and record.?.id == request.graph_id }, .{});
             },
             .read => |request| {
                 var empty = try system_catalog.StateIndex.init(alloc, .{});
@@ -5393,6 +5401,7 @@ pub fn runFromIterator(
     defer if (trusted_principal_secret) |value| alloc.free(value);
     const trusted_principal_issuer = try resolveRuntimeSecretValue(alloc, &secret_store, "antfly.trusted_principal.issuer");
     defer if (trusted_principal_issuer) |value| alloc.free(value);
+    if ((trusted_principal_secret == null) != (trusted_principal_issuer == null)) return error.InvalidConfig;
     // A hosted verifier secures public requests without creating a local
     // password authority. Local user-store bootstrap still follows auth_enabled.
     const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;

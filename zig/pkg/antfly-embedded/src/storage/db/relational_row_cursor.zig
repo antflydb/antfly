@@ -33,6 +33,12 @@ pub fn identity(schema_version: u32, index_name: []const u8, fingerprint: [32]u8
     return result;
 }
 
+pub fn orderedIdentity(schema_version: u32, index_name: []const u8, fingerprint: [32]u8, reverse: bool) [identity_len]u8 {
+    var result = identity(schema_version, index_name, fingerprint);
+    if (reverse) result[15] = 'R';
+    return result;
+}
+
 pub fn encode(alloc: std.mem.Allocator, header: [identity_len]u8, key: []const u8) ![]u8 {
     if (key.len == 0 or key.len > max_key_bytes) return error.RelationalRowsOutputBudgetExceeded;
     const result = try alloc.alloc(u8, (identity_len + key.len) * 2);

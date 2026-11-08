@@ -70,6 +70,13 @@ pub const Client = struct {
         defer response.deinit(alloc);
     }
 
+    pub fn admitGraph(alloc: std.mem.Allocator, executor: http.RequestExecutor, base_uri: []const u8, table: []const u8, route: metadata.CatalogRouteFence, schema_version: u32, deadline_ns: ?u64) !void {
+        const self = try create(alloc, executor, base_uri, table, route, schema_version, deadline_ns);
+        defer self.destroy();
+        var response = try self.call(.{ .operation = .admit_graph, .schema_version = schema_version, .lease_ms = rpc.max_lease_ms });
+        defer response.deinit(alloc);
+    }
+
     pub fn capture(alloc: std.mem.Allocator, executor: http.RequestExecutor, base_uri: []const u8, table: []const u8, route: metadata.CatalogRouteFence, schema_version: u32, deadline_ns: ?u64) !?reads.StatementReadFence {
         const self = try create(alloc, executor, base_uri, table, route, schema_version, deadline_ns);
         errdefer self.destroy();
@@ -83,17 +90,21 @@ pub const Client = struct {
             return null;
         }
         self.token = parsed.value.token orelse return error.InvalidRetainedReadResponse;
-        return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .capture_snapshot = captureSnapshot, .release = close } };
+        return .{ .graph_finalizes_validation = true, .ptr = self, .vtable = &.{ .validate = validate, .open = open, .capture_snapshot = captureSnapshot, .capture_graph = captureGraph, .release = close } };
     }
 
     fn call(self: *Client, request: rpc.Request) !http.HttpResponse {
+        return self.callAlloc(self.alloc, request);
+    }
+
+    fn callAlloc(self: *Client, a: std.mem.Allocator, request: rpc.Request) !http.HttpResponse {
         const cleanup = request.operation == .close or request.operation == .cancel;
         if (self.poisoned and !cleanup) return error.RetainedReadRestartRequired;
         const now = time.monotonicNs();
         if (now >= self.deadline_ns and !cleanup) return error.DeadlineExceeded;
         const timeout: u32 = if (cleanup) 100 else @intCast(@max(1, @min(5000, (self.deadline_ns -| now) / std.time.ns_per_ms)));
-        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
-        defer self.alloc.free(body);
+        const body = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(body);
         if (body.len > rpc.max_request_bytes) return error.InvalidRetainedReadQuery;
         var timeout_buffer: [16]u8 = undefined;
         const headers = [_]http.RequestHeader{
@@ -103,11 +114,11 @@ pub const Client = struct {
         };
         // NEVER retry: capture/open may have allocated a capability; next may
         // already have advanced. Unknown handles are bounded by owner expiry.
-        var response = self.executor.execute(self.alloc, .{ .method = .POST, .uri = self.uri, .headers = &headers, .content_type = "application/json", .body = body, .timeout_ms = timeout, .max_response_bytes = rpc.max_response_bytes }) catch |err| {
+        var response = self.executor.execute(a, .{ .method = .POST, .uri = self.uri, .headers = &headers, .content_type = "application/json", .body = body, .timeout_ms = timeout, .max_response_bytes = rpc.max_response_bytes }) catch |err| {
             self.poisoned = true;
             return err;
         };
-        errdefer response.deinit(self.alloc);
+        errdefer response.deinit(a);
         // This negative capability response is safe to classify without a
         // success acknowledgement. It authorizes no cursor/page reuse: the
         // caller must release captures and explicitly activate via Raft.
@@ -115,7 +126,24 @@ pub const Client = struct {
             self.poisoned = true;
             return error.SqlRangeTrackingRequired;
         }
+        if (response.status == 503 and std.mem.eql(u8, response.body, "NotLeader")) {
+            self.poisoned = true;
+            return error.NotLeader;
+        }
+        if (response.status == 503 and std.mem.eql(u8, response.body, "ReadUnavailable")) {
+            self.poisoned = true;
+            return error.ReadUnavailable;
+        }
+        if (response.status != 200) if (rpc.graph_errors.get(response.body)) |err| {
+            self.poisoned = true;
+            return err;
+        };
         if (response.status != 200 or !std.mem.eql(u8, response.header(metadata.catalog_route_fence_ack_header) orelse "", metadata.catalog_route_fence_ack_value)) {
+            const reason = if (response.status != 200 and response.body.len <= 96) known_error: {
+                for (response.body) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') break :known_error "unclassified";
+                break :known_error response.body;
+            } else "unclassified";
+            std.log.warn("retained read rejected operation={s} status={} catalog_ack={} reason={s}", .{ @tagName(request.operation), response.status, std.mem.eql(u8, response.header(metadata.catalog_route_fence_ack_header) orelse "", metadata.catalog_route_fence_ack_value), reason });
             self.poisoned = true;
             return error.RetainedReadRestartRequired;
         }
@@ -155,17 +183,51 @@ pub const Client = struct {
         return .{ .ptr = snapshot, .vtable = &.{ .open = openSnapshot, .release = close } };
     }
 
+    fn captureGraph(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").storage_statement_read_fence.GraphInput) !@import("antfly_local_sources").storage_statement_read_fence.GraphRead {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        errdefer self.cancelUnknown();
+        var response = try self.call(.{ .operation = .graph_snapshot, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = rpc.max_lease_ms, .graph = input });
+        defer response.deinit(self.alloc);
+        var parsed = try std.json.parseFromSlice(rpc.Response, alloc, response.body, .{});
+        defer parsed.deinit();
+        const token = parsed.value.token orelse return error.InvalidRetainedReadResponse;
+        const snapshot = try alloc.create(Client);
+        errdefer alloc.destroy(snapshot);
+        const uri = try alloc.dupe(u8, self.uri);
+        errdefer alloc.free(uri);
+        const route = try alloc.dupe(u8, self.route);
+        errdefer alloc.free(route);
+        snapshot.* = .{ .alloc = alloc, .executor = self.executor, .uri = uri, .route = route, .schema_version = self.schema_version, .deadline_ns = self.deadline_ns, .token = token, .connection = self.connection };
+        return .{ .ptr = snapshot, .vtable = &.{ .invoke = invokeGraph, .release = close, .open_sql = openGraphSql } };
+    }
+    fn invokeGraph(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        var response = try self.callAlloc(alloc, .{ .operation = .graph_invoke, .schema_version = self.schema_version, .token = self.token, .graph_body = body });
+        defer response.deinit(alloc);
+        const owner = response.owner_allocator orelse alloc;
+        if (owner.ptr == alloc.ptr and owner.vtable == alloc.vtable) {
+            const bytes = response.body;
+            response.body = &.{};
+            return bytes;
+        }
+        return alloc.dupe(u8, response.body);
+    }
+
+    fn openGraphSql(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.openKind(alloc, from, to, opts, .graph_open, table);
+    }
     fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        return self.openKind(alloc, from, to, opts, false);
+        return self.openKind(alloc, from, to, opts, .open, "");
     }
 
     fn openSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        return self.openKind(alloc, from, to, opts, true);
+        return self.openKind(alloc, from, to, opts, .open_snapshot, "");
     }
 
-    fn openKind(self: *Client, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions, delayed: bool) !reads.RelationalReadView {
+    fn openKind(self: *Client, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions, kind: @FieldType(rpc.Request, "operation"), table: []const u8) !reads.RelationalReadView {
         var parsed_query: ?std.json.Parsed(types.RelationalRowQuery) = null;
         defer if (parsed_query) |*parsed| parsed.deinit();
         const query = opts.relational_query orelse blk: {
@@ -180,7 +242,7 @@ pub const Client = struct {
         const route = try alloc.dupe(u8, self.route);
         errdefer alloc.free(route);
         errdefer self.cancelUnknown();
-        var response = try self.call(.{ .operation = if (delayed) .open_snapshot else .open, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = rpc.max_lease_ms, .from = from, .to = to, .query = query, .filter_query_json = opts.filter_query_json, .inclusive_from = opts.inclusive_from, .exclusive_to = opts.exclusive_to, .sql_document_preimage = opts.sql_document_preimage, .include_content_hashes = opts.include_content_hashes, .include_range_proofs = opts.include_range_proofs, .row_policy_principal_proof = opts.row_policy_principal_proof, .row_policy_database = opts.row_policy_database, .privacy_policy_version = opts.privacy_policy_version });
+        var response = try self.call(.{ .operation = kind, .graph_table = table, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = rpc.max_lease_ms, .from = from, .to = to, .query = query, .filter_query_json = opts.filter_query_json, .inclusive_from = opts.inclusive_from, .exclusive_to = opts.exclusive_to, .sql_document_preimage = opts.sql_document_preimage, .include_content_hashes = opts.include_content_hashes, .include_range_proofs = opts.include_range_proofs, .row_policy_principal_proof = opts.row_policy_principal_proof, .row_policy_database = opts.row_policy_database, .privacy_policy_version = opts.privacy_policy_version });
         defer response.deinit(self.alloc);
         var parsed = try std.json.parseFromSlice(rpc.Response, alloc, response.body, .{});
         defer parsed.deinit();
@@ -288,6 +350,67 @@ fn consumerTests() type {
             try std.testing.expectError(error.ConnectionResetByPeer, Client.next(client, alloc, 1));
             try std.testing.expectError(error.RetainedReadRestartRequired, Client.next(client, alloc, 1));
             try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        }
+
+        test "retained read client preserves graph owner diagnostics and retry failures" {
+            const Fixture = struct {
+                calls: usize = 0,
+                failure: anyerror,
+                fn execute(raw: *anyopaque, a: std.mem.Allocator, _: http.HttpRequest) !http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    return .{ .status = rpc.errorStatus(self.failure), .body = try a.dupe(u8, @errorName(self.failure)), .headers = &.{} };
+                }
+            };
+            for (rpc.graph_errors.values()) |failure| {
+                var fixture: Fixture = .{ .failure = failure };
+                const a = std.testing.allocator;
+                const client = try Client.create(a, .{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "rows", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
+                defer client.destroy();
+                try std.testing.expectError(failure, client.call(.{ .operation = .admit_graph, .schema_version = 5 }));
+                try std.testing.expectError(error.RetainedReadRestartRequired, client.call(.{ .operation = .admit_graph, .schema_version = 5 }));
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            }
+            try std.testing.expectEqual(@as(u16, 400), rpc.errorStatus(error.CypherTypeMismatch));
+            try std.testing.expectEqual(@as(u16, 503), rpc.errorStatus(error.EnrichmentRetryInProgress));
+        }
+
+        test "retained read client scopes graph RPC allocations to the worker" {
+            const Fixture = struct {
+                expected: std.mem.Allocator,
+                independent: bool = false,
+                fail: bool = false,
+                body_address: usize = 0,
+                fn execute(ptr: *anyopaque, a: std.mem.Allocator, _: http.HttpRequest) !http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(a.ptr == self.expected.ptr and a.vtable == self.expected.vtable);
+                    if (self.fail) return error.ConnectionResetByPeer;
+                    const owner = if (self.independent) std.testing.allocator else a;
+                    const headers = try owner.alloc(http.Header, 1);
+                    headers[0] = .{ .name = try owner.dupe(u8, metadata.catalog_route_fence_ack_header), .value = try owner.dupe(u8, metadata.catalog_route_fence_ack_value) };
+                    const body = try owner.dupe(u8, "graph-response");
+                    self.body_address = @intFromPtr(body.ptr);
+                    return .{ .status = 200, .owner_allocator = owner, .headers = headers, .body = body };
+                }
+            };
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var fixture: Fixture = .{ .expected = a };
+            const client = try Client.create(std.testing.allocator, .{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "rows", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
+            defer client.destroy();
+            client.token = .{ .incarnation = 1, .sequence = 1, .slot = 0 };
+            for ([_]bool{ false, true }) |independent| {
+                fixture.independent = independent;
+                const bytes = try Client.invokeGraph(client, a, "{}");
+                try std.testing.expectEqualStrings("graph-response", bytes);
+                try std.testing.expectEqual(!independent, @intFromPtr(bytes.ptr) == fixture.body_address);
+                try std.testing.expect(client.alloc.ptr == std.testing.allocator.ptr);
+            }
+            fixture.fail = true;
+            try std.testing.expectError(error.ConnectionResetByPeer, Client.invokeGraph(client, a, "{}"));
+            try std.testing.expect(client.alloc.ptr == std.testing.allocator.ptr);
+            try std.testing.expect(client.poisoned);
         }
 
         test "retained read client round trips owned snapshots and exact typed pages" {

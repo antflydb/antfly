@@ -287,4 +287,3 @@ the final control's enrichment ANN index failed cold restart with
 available. It reduced reported source write bytes by 26%, but mixed query and
 write throughput fell 25%/32%. The scale summary retains `qualified: false`;
 the ANN restart and readiness failures prevent 1M qualification or promotion.
-

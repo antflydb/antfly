@@ -258,9 +258,12 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
             .schema_version = schema.version,
             .schema_digest = schema_digest,
             .name = "visible",
-            .commands = .{ .select = true },
+            .commands = .{ .select = true, .insert = true },
             .roles = &.{"PUBLIC"},
             .using = .{ .instructions = &.{
+                .{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } },
+            }, .root = 0 },
+            .with_check = .{ .instructions = &.{
                 .{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } },
             }, .root = 0 },
         };
@@ -379,9 +382,43 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
     try std.testing.expectError(error.NotFound, follower.loadRowPolicyReceipt(1, .pending_install));
     try std.testing.expectError(error.RowPolicyAuthenticationRequired, follower.get(alloc, "row:unseen"));
     try std.testing.expectError(error.RowPolicyReadersActive, follower.loadRowPolicyReceipt(1, .serving_install));
+    try std.testing.expect((try follower.applyReplicatedRowPolicyPublication(follower_serving_bytes, pending_request, .{ .term = 3, .index = 13 })) == null);
+    try std.testing.expect((try follower.applyReplicatedRowPolicyPublication(follower_serving_bytes, pending_request, .{ .term = 3, .index = 12 })) == null);
+    const authority_secret = "row-policy-follower-test-authority-secret";
+    follower.local_execution.row_policy_authority_secret = authority_secret;
+    follower.local_execution.row_policy_authority_issuer = "test";
+    follower.local_execution.row_policy_table_name = "rows";
+    const proof = try row_policy_authority_mod.sign(alloc, authority_secret, "test", .{
+        .principal = "reader",
+        .roles = &.{"PUBLIC"},
+        .auth_revision = 1,
+    }, .{
+        .table_id = namespace.table_id,
+        .table = "rows",
+        .database = "antfly",
+        .policy_generation = 1,
+        .catalog_epoch = 2,
+        .access = .write,
+    }, 100);
+    defer alloc.free(proof);
+    const signed_write: types.BatchRequest = .{
+        .writes = &.{.{ .key = "row:allowed", .value = "{\"id\":\"allowed\"}" }},
+        .row_policy_principal_proof = proof,
+        .row_policy_database = "antfly",
+        .row_policy_admitted_at_seconds = 100,
+    };
+    try std.testing.expectError(error.RowPolicyReadersActive, follower.applyOrderedCommittedMutation(signed_write, .{ .term = 3, .index = 14 }, false));
     follower_reader.release();
+    // The next committed user mutation finalizes serving without a receipt
+    // probe. Its replay remains idempotent and uses the admitted proof time.
+    try follower.applyOrderedCommittedMutation(signed_write, .{ .term = 3, .index = 14 }, false);
+    try follower.applyOrderedCommittedMutation(signed_write, .{ .term = 3, .index = 14 }, false);
+    const stored_key = try internal_keys.relationalRowKeyAlloc(alloc, "row:allowed");
+    defer alloc.free(stored_key);
+    const stored_row = try follower.core.store.get(alloc, stored_key);
+    defer alloc.free(stored_row);
     const follower_receipt = try follower.loadRowPolicyReceipt(1, .serving_install);
-    try std.testing.expectEqual(@as(u64, 12), follower_receipt.applied_index);
+    try std.testing.expectEqual(@as(u64, 13), follower_receipt.applied_index);
     try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, follower.local_execution.row_policy_gate.currentPhase());
 
     var next_bundle = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_policies.InstallSnapshot, alloc, bundle_bytes, .{});
@@ -441,6 +478,14 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
         try std.testing.expect((try db.applyReplicatedRowPolicyPublication(disabled_bytes, candidate_request, .{ .term = 3, .index = 15 })) == null);
         _ = try db.loadRowPolicyReceipt(2, .disabled);
         try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.disabled, db.local_execution.row_policy_gate.currentPhase());
+        const duplicate = (try db.applyReplicatedRowPolicyPublication(disabled_bytes, candidate_request, .{ .term = 3, .index = 16 })).?;
+        try std.testing.expectEqual(@as(u64, 16), duplicate.applied_index);
+        try std.testing.expectEqualDeep(duplicate, (try db.applyReplicatedRowPolicyPublication(disabled_bytes, candidate_request, .{ .term = 3, .index = 15 })).?);
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.disabled, db.local_execution.row_policy_gate.currentPhase());
+        next_bundle.value.settings = &.{.{ .identity = .{ .id = 1, .generation = 1 }, .name = "app.changed", .kind = .string, .default = .{ .string = "value" } }};
+        const changed_bytes = try std.json.Stringify.valueAlloc(alloc, next_bundle.value, .{});
+        defer alloc.free(changed_bytes);
+        try std.testing.expectError(error.RowPolicyCatalogChanged, db.applyReplicatedRowPolicyPublication(changed_bytes, candidate_request, .{ .term = 3, .index = 17 }));
         var raw = try db.local_execution.row_policy_gate.enterRawRead();
         raw.release();
     }

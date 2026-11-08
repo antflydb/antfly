@@ -51,6 +51,28 @@ pub const Session = struct {
         if (session.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         if (session.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
     }
+    pub fn seekPrefix(session: *Session, values: []const std.json.Value, after: ?[]const u8) !void {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionSeekPrefix", .{ session, values, after });
+        try session.checkpoint();
+        const index = session.reader.index orelse return error.InvalidRelationalRowsRequest;
+        if (values.len == 0 or values.len > index.tuple.keys.len) return error.InvalidRelationalIndexBound;
+        var scratch = std.heap.ArenaAllocator.init(session.alloc);
+        defer scratch.deinit();
+        const parsed = try scratch.allocator().alloc(RelationalRows.Value, values.len);
+        for (values, parsed, index.tuple.keys[0..values.len]) |value, *out, key| out.* = try @import("../../schema/relational_checks.zig").valueFromJson(scratch.allocator(), key.column_type, value, true);
+        try session.reader.seekPrefix(parsed, after);
+        try session.checkpoint();
+    }
+
+    /// Consume the selected index domain through borrowed projections. Policy
+    /// and cancellation leases remain owned by this admitted read session.
+    pub fn visitCypherRows(session: *Session, alloc: Allocator, limit: usize, visitor: types.ScanVisitor) !void {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionVisitCypherRows", .{ session, alloc, limit, visitor });
+        try session.checkpoint();
+        try RelationalRows.visitCypherRows(&session.reader, alloc, null, limit, visitor);
+        try session.checkpoint();
+    }
+
     pub fn rangeProofs(session: *Session, alloc: Allocator) ![]@import("../range_protection.zig").Proof {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionRangeProofs", .{ session, alloc });
         try session.checkpoint();

@@ -1,0 +1,48 @@
+name: Dictation example
+
+on:
+  # Keep macOS runs scoped to example build/test inputs; documentation-only
+  # and unrelated repository changes do not need this runner.
+  pull_request:
+    paths:
+      - 'examples/dictation/Sources/**'
+      - 'examples/dictation/Tests/**'
+      - 'examples/dictation/Assets/**'
+      - 'examples/dictation/presets/**'
+      - 'examples/dictation/*.swift'
+      - 'examples/dictation/*.sh'
+      - 'examples/dictation/Package.resolved'
+      - 'examples/dictation/Info.plist'
+      - 'examples/dictation/antfly.yaml'
+      - '.github/workflows/dictation-example.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'examples/dictation/Sources/**'
+      - 'examples/dictation/Tests/**'
+      - 'examples/dictation/Assets/**'
+      - 'examples/dictation/presets/**'
+      - 'examples/dictation/*.swift'
+      - 'examples/dictation/*.sh'
+      - 'examples/dictation/Package.resolved'
+      - 'examples/dictation/Info.plist'
+      - 'examples/dictation/antfly.yaml'
+      - '.github/workflows/dictation-example.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dictation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test configuration, streaming, and persistence clients
+        run: examples/dictation/test.sh
+      - name: Build signed application bundle
+        run: examples/dictation/build-app.sh

@@ -356,7 +356,7 @@ pub fn requiredReaderVersion(alloc: Allocator, cfg: @import("../catalog/enrichme
     } else if (producer.type == .decision) {
         const spec = try @import("../../../functions/materialization.zig").parse(alloc, producer.config_json);
         defer spec.deinit();
-        if (spec.value.decider.decision_method == .cascade) return @max(baseline, catalog.decider_cascade_reader_version);
+        if (spec.value.decider.decision_method == .cascade) return @max(baseline, if (@import("antfly_decisions").cascade.requiresAgreement(spec.value.decider.cascade.?)) catalog.cascade_agreement_reader_version else catalog.decider_cascade_reader_version);
         if (spec.value.decider.decision_method == .generated) return @max(baseline, catalog.generated_producers_reader_version);
     }
     return baseline;

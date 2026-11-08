@@ -27,10 +27,12 @@ class DeciderConfig:
     """
     Attributes:
         provider (DeciderConfigProvider | Unset):
-        decision_method (DeciderConfigDecisionMethod | Unset): Explicit result contract. embedding_similarity is
-            available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests
-            and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate
-            questions only. Default: DeciderConfigDecisionMethod.TYPED.
+        decision_method (DeciderConfigDecisionMethod | Unset): Execution contract. With provider antfly, typed invokes
+            the Decisions endpoint; remote named deciders may return validated typed or generated answers, including
+            upstream cascade outcomes. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and
+            multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs
+            the stages in `cascade` and accepts choice and predicate questions only. Default:
+            DeciderConfigDecisionMethod.TYPED.
         cascade (DeciderCascade | Unset): Required with decision_method=cascade, which allows no transport, model or
             rate-limit fields of its own. The first stage answers every input. Each later stage runs only for inputs whose
             previous answer falls inside its probability band, and all escalating inputs share one call. The final answer is

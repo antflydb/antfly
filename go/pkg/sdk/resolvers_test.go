@@ -223,3 +223,31 @@ func TestEntityResolverProgressPagingAndNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestResolverAdjudicationBaseBindingRoundTrip(t *testing.T) {
+	for _, binding := range []string{"", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"} {
+		wire := `{"extraction":{},"resolution":{"config_generation":1,"entities":[]`
+		if binding != "" {
+			wire += `,"adjudication_execution_hash":"` + binding + `"`
+		}
+		wire += `}}`
+		var response oapi.ResolverResolveResponse
+		if err := json.Unmarshal([]byte(wire), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Resolution.AdjudicationExecutionHash != binding {
+			t.Fatalf("unexpected base binding: %q", response.Resolution.AdjudicationExecutionHash)
+		}
+		encoded, err := json.Marshal(response)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var replay oapi.ResolverResolveResponse
+		if err := json.Unmarshal(encoded, &replay); err != nil {
+			t.Fatal(err)
+		}
+		if replay.Resolution.AdjudicationExecutionHash != binding {
+			t.Fatalf("lost base binding: %s", encoded)
+		}
+	}
+}

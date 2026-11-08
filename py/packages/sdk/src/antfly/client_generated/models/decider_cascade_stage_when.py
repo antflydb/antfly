@@ -15,8 +15,9 @@ class DeciderCascadeStageWhen:
     """Required on every stage except the first, which must omit it. Inclusive band on the previous stage's answer.
 
     Attributes:
-        probability_between (list[float]): Lower and upper bound, lower strictly below upper. The previous stage must
-            not be verdict_only.
+        probability_between (list[float]): Lower and upper bound, lower strictly below upper. Inputs must have measured
+            probabilities. The previous stage must not be verdict_only; a dynamically returned proxy verdict fails its
+            producing stage under on_failure instead of driving the band.
         question (str | Unset): Measure this question only. Omitted, any question in the band escalates.
         choice (str | Unset): For choice questions, measure this value's probability. Omitted, the selected value's
             probability.

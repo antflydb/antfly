@@ -19,13 +19,24 @@
 const std = @import("std");
 const named = @import("named_callback.zig");
 const native_writer = @import("native_writer.zig");
-const Methods = struct { write_fields: *const fn (?*anyopaque, native_writer.Borrow) anyerror!void };
+const Methods = struct {
+    write_fields: *const fn (?*anyopaque, native_writer.Borrow) anyerror!void,
+    count_projection: *const fn (?*anyopaque, std.mem.Allocator, []const []const u8) anyerror!?std.json.Value,
+};
 const Boundary = named.Boundary(Methods);
 pub const Borrowed = struct {
     pub const WriterBorrow = native_writer.Borrow;
     context: ?*anyopaque,
     write_fields_fn: @FieldType(Methods, "write_fields"),
+    count_projection_fn: ?@FieldType(Methods, "count_projection") = null,
     callback_dispatch: named.Dispatch = Boundary.local_dispatch,
+    /// Trusted owner COUNT only: selected count-only properties become true or
+    /// null after value validation. Other fields retain their actual values.
+    /// No returned scalar or container may escape the enclosing scan callback.
+    pub fn countProjection(self: Borrowed, a: std.mem.Allocator, presence: []const []const u8) !?std.json.Value {
+        const callback = self.count_projection_fn orelse return null;
+        return Boundary.call("count_projection", self.callback_dispatch, callback, .{ self.context, a, presence });
+    }
     /// Emit comma-prefixed root fields, excluding the transport-owned _id.
     pub fn writeFields(self: Borrowed, writer: *std.Io.Writer) !void {
         try Boundary.call("write_fields", self.callback_dispatch, self.write_fields_fn, .{ self.context, native_writer.Borrow.init(writer) });

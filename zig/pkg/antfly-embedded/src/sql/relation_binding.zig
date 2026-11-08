@@ -303,6 +303,7 @@ const Builder = struct {
     alloc: Allocator,
     backend: catalog.Backend,
     parameters: []?ast.ColumnType,
+    graph_parameter_slots: std.ArrayList(usize) = .empty,
     prepared_scope: ?[]const Column = null,
     prepared_demands: std.StringHashMapUnmanaged(void) = .empty,
     scans: std.ArrayList(catalog.StatementScan) = .empty,
@@ -585,7 +586,16 @@ const Builder = struct {
                 else
                     try scalar.inferParameters(self.alloc, constraint.expression, self.shape_columns.items, self.parameters, constraint.expected, .{ .invocation = self.backend.parameter_invocation }) or changed;
             }
-            if (!changed) return;
+            if (!changed) {
+                // Ordinary SQL constraints get first choice. Only a slot used
+                // exclusively as graph data defaults to JSON; its runtime
+                // payload is interpreted using Cypher value semantics.
+                for (self.graph_parameter_slots.items) |slot| if (self.parameters[slot] == null) {
+                    const expression_ = try self.scalarNode(.{ .literal = .{ .parameter = @intCast(slot + 1) } });
+                    _ = try scalar.inferParameters(self.alloc, expression_, self.shape_columns.items, self.parameters, .json, .{ .invocation = self.backend.parameter_invocation });
+                };
+                return;
+            }
         }
         return error.SqlProgramLimitExceeded;
     }
@@ -1382,7 +1392,7 @@ const Builder = struct {
                     }
                     break :blk try self.node(columns, .{ .prepared_rows = names });
                 }
-                if (reference.search == null and !reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
+                if (reference.graph == null and reference.search == null and !reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
                     var i = scope.len;
                     while (i != 0) {
                         i -= 1;
@@ -1413,10 +1423,25 @@ const Builder = struct {
                         }
                     }
                 }
-                const identity = try std.fmt.allocPrint(self.alloc, "{s}\x00{s}\x00{s}", .{ reference.name.database orelse "", reference.name.namespace orelse "", reference.name.table });
+                if (reference.graph != null and (reference.mutation_target or reference.mutation_document or reference.mutation_presence)) return error.ReadOnlyGraphRelation;
+                // Two GRAPH_TABLE references to one graph can have different
+                // patterns and projections. Cache the complete descriptor,
+                // rather than accidentally reusing the first relation shape.
+                const identity = if (reference.graph) |graph|
+                    try std.fmt.allocPrint(self.alloc, "graph:{s}", .{try std.json.Stringify.valueAlloc(self.alloc, graph.*, .{})})
+                else
+                    try std.fmt.allocPrint(self.alloc, "{s}\x00{s}\x00{s}", .{ reference.name.database orelse "", reference.name.namespace orelse "", reference.name.table });
                 const entry = try self.identities.getOrPut(self.alloc, identity);
-                if (!entry.found_existing) entry.value_ptr.* = try self.backend.vtable.resolve(self.backend.ptr, self.alloc, reference.name, .read);
+                if (!entry.found_existing) entry.value_ptr.* = if (reference.graph) |graph|
+                    try (self.backend.vtable.resolve_graph orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.alloc, graph.*)
+                else
+                    try self.backend.vtable.resolve(self.backend.ptr, self.alloc, reference.name, .read);
                 var table = entry.value_ptr.*;
+                if (reference.graph) |graph| for (graph.parameters) |name| {
+                    const index = std.fmt.parseUnsigned(usize, name, 10) catch return error.InvalidSqlParameters;
+                    if (index == 0 or index > self.parameters.len) return error.InvalidSqlParameters;
+                    try self.graph_parameter_slots.append(self.alloc, index - 1);
+                };
                 if (reference.search) |search| {
                     if (!self.backend.supports_search_relations) return error.UnsupportedSqlExecution;
                     if (reference.mutation_target) return error.UnsupportedSqlShape;
@@ -1474,7 +1499,7 @@ const Builder = struct {
                     request.* = .{ .expression = search.* };
                     break :search_request request;
                 } else null;
-                try self.scans.append(self.alloc, .{ .table = table, .request = .{ .search = search_request, .fields = fields, .limit = 256, .include_primary_digest = reference.mutation_target, .include_document = reference.mutation_document and table.storage_mode == .document } });
+                try self.scans.append(self.alloc, .{ .table = table, .request = .{ .search = search_request, .fields = fields, .graph_parameter_types = if (reference.graph != null) self.parameters else &.{}, .limit = 256, .include_primary_digest = reference.mutation_target, .include_document = reference.mutation_document and table.storage_mode == .document } });
                 break :blk try self.node(columns, .{ .scan = .{ .index = index, .source_columns = source_columns } });
             },
             .derived => |query| blk: {
@@ -1772,6 +1797,175 @@ fn markSelect(alloc: Allocator, needed: *std.StringHashMapUnmanaged(void), state
         try needed.put(alloc, order.field, {});
     };
 }
+fn constantScanOperand(program: scalar.Program, index: u32, depth: usize) bool {
+    if (depth >= 128 or index >= program.instructions.len) return false;
+    return switch (program.instructions[index].operation) {
+        .literal, .parameter => true,
+        .cast => |part| constantScanOperand(program, part.operand, depth + 1),
+        .unary => |part| (part.op == .positive or part.op == .negative) and constantScanOperand(program, part.operand, depth + 1),
+        else => false,
+    };
+}
+fn graphScanConditions(alloc: Allocator, root: *const Node, source: *const Node, program: scalar.Program, index: u32, output: *std.ArrayList(catalog.Scan.GraphCondition), predicates: *std.ArrayList(catalog.Scan.GraphPredicate), depth: usize) anyerror!void {
+    // Optimization quotas must never become statement validity limits. Any
+    // omitted conjunct remains in the authoritative SQL residual predicate.
+    if (depth >= 128 or output.items.len + predicates.items.len >= 256) return;
+    if (index >= program.instructions.len) return error.InvalidSqlProgram;
+    const instruction = program.instructions[index];
+    if (instruction.operation == .unary or instruction.operation == .in_list or (instruction.operation == .binary and instruction.operation.binary.op == .@"or")) {
+        var remaining: usize = 256;
+        if (try graphBoolean(alloc, root, source, program, index, &remaining)) |predicate| try predicates.append(alloc, predicate);
+        return;
+    }
+    if (instruction.operation != .binary) return;
+    const binary = instruction.operation.binary;
+    if (binary.op == .@"and") {
+        try graphScanConditions(alloc, root, source, program, binary.left, output, predicates, depth + 1);
+        return graphScanConditions(alloc, root, source, program, binary.right, output, predicates, depth + 1);
+    }
+    if (try graphScalarCondition(root, source, program, binary.op, binary.left, binary.right)) |condition| try output.append(alloc, condition);
+}
+fn graphScalarCondition(root: *const Node, source: *const Node, program: scalar.Program, binary_op: ast.Scalar.Binary, left: u32, right: u32) !?catalog.Scan.GraphCondition {
+    var op: @FieldType(catalog.Condition, "op") = switch (binary_op) {
+        .eq => .eq,
+        .neq => .neq,
+        .lt => .lt,
+        .lte => .lte,
+        .gt => .gt,
+        .gte => .gte,
+        else => return null,
+    };
+    var column_index = left;
+    var value_index = right;
+    if (program.instructions[column_index].operation != .column) {
+        column_index = right;
+        value_index = left;
+        op = switch (op) {
+            .lt => .gt,
+            .lte => .gte,
+            .gt => .lt,
+            .gte => .lte,
+            else => op,
+        };
+    }
+    if (program.instructions[column_index].operation != .column or !constantScanOperand(program, value_index, 0)) return null;
+    const name = (try graphScalarColumn(root, source, program, column_index)) orelse return null;
+    var operand = program;
+    operand.root = value_index;
+    return .{ .column = name, .op = op, .operand = operand };
+}
+fn graphScalarColumn(root: *const Node, source: *const Node, program: scalar.Program, column_index: u32) !?[]const u8 {
+    if (program.instructions[column_index].operation != .column) return null;
+    const scan = source.operation.scan;
+    const ordinal = program.instructions[column_index].operation.column;
+    if (ordinal >= root.columns.len) return error.InvalidSqlProgram;
+    const local = for (source.columns, 0..) |column, local| {
+        if (std.mem.eql(u8, root.columns[ordinal].internal, column.internal)) break local;
+    } else return null;
+    const column = source.columns[local];
+    if (column.element_type == .numeric or (column.type != .integer and column.type != .number and column.type != .string and column.type != .boolean)) return null;
+    const name = scan.source_columns[local];
+    if (std.mem.eql(u8, name, "_id")) return null;
+    return name;
+}
+// OR/IN are atomic optimization candidates: dropping an unsupported arm
+// would remove valid rows. The SQL program remains the authoritative residual.
+fn graphBoolean(alloc: Allocator, root: *const Node, source: *const Node, program: scalar.Program, index: u32, remaining: *usize) anyerror!?catalog.Scan.GraphPredicate {
+    if (remaining.* == 0) return null;
+    remaining.* -= 1;
+    const operation = program.instructions[index].operation;
+    if (operation == .binary and (operation.binary.op == .@"and" or operation.binary.op == .@"or")) {
+        const left = (try graphBoolean(alloc, root, source, program, operation.binary.left, remaining)) orelse return null;
+        const right = (try graphBoolean(alloc, root, source, program, operation.binary.right, remaining)) orelse return null;
+        const children = try alloc.dupe(catalog.Scan.GraphPredicate, &.{ left, right });
+        return if (operation.binary.op == .@"and") .{ .all = children } else .{ .any = children };
+    }
+    if (operation == .in_list) {
+        const list = operation.in_list;
+        if (list.values.len > remaining.*) return null;
+        const children = try alloc.alloc(catalog.Scan.GraphPredicate, list.values.len);
+        // Lower membership into typed comparisons without inventing SQL/Cypher
+        // coercions. NULL arms retain UNKNOWN, including for NOT IN.
+        remaining.* -= list.values.len;
+        for (list.values, children) |value, *child| {
+            child.* = .{ .comparison = (try graphScalarCondition(root, source, program, if (list.negated) .neq else .eq, list.operand, value)) orelse return null };
+        }
+        return if (list.negated) .{ .all = children } else .{ .any = children };
+    }
+    if (operation == .unary) {
+        const unary = operation.unary;
+        if (unary.op != .is_null and unary.op != .is_not_null) return null;
+        const name = (try graphScalarColumn(root, source, program, unary.operand)) orelse return null;
+        // A NULL test has no RHS. Give the invocation binder a closed NULL
+        // program, independent of the row, decimal plan and expression caches.
+        const instructions = try alloc.alloc(scalar.Instruction, 1);
+        instructions[0] = .{ .type = program.instructions[unary.operand].type, .operation = .{ .literal = .null } };
+        const operand: scalar.Program = .{
+            .arena = program.arena,
+            .instructions = instructions,
+            .root = 0,
+            .output_type = program.instructions[unary.operand].type,
+            .parameter_types = &.{},
+            .parameter_descriptors = &.{},
+            .required_columns = &.{},
+        };
+        return .{ .comparison = .{ .column = name, .op = if (unary.op == .is_null) .is_null else .is_not_null, .operand = operand } };
+    }
+    if (operation != .binary) return null;
+    const binary = operation.binary;
+    return .{ .comparison = (try graphScalarCondition(root, source, program, binary.op, binary.left, binary.right)) orelse return null };
+}
+/// Route row-local conjuncts by bound column identity. Only joins with
+/// preserved filtering semantics and direct derived column forwarding are
+/// transparent. Apply, materialization and set operators retain their boundaries.
+pub fn attachGraphConditions(alloc: Allocator, root: *const Node, program: scalar.Program, scans: []catalog.StatementScan) !void {
+    const has_graph = for (scans) |scan| {
+        if (scan.table.graph != null and !scan.request.graph_source_ordinals) break true;
+    } else false;
+    if (!has_graph) return;
+    try attachGraphConditionsAt(alloc, root, root, program, scans);
+}
+fn attachGraphConditionsAt(alloc: Allocator, root: *const Node, node: *const Node, program: scalar.Program, scans: []catalog.StatementScan) anyerror!void {
+    switch (node.operation) {
+        .scan => |scan| {
+            const source = &scans[scan.index];
+            if (source.table.graph == null or source.request.graph_source_ordinals) return;
+            var conditions: std.ArrayList(catalog.Scan.GraphCondition) = .empty;
+            try conditions.appendSlice(alloc, source.request.graph_conditions);
+            var predicates: std.ArrayList(catalog.Scan.GraphPredicate) = .empty;
+            try predicates.appendSlice(alloc, source.request.graph_predicates);
+            try graphScanConditions(alloc, root, node, program, program.root, &conditions, &predicates, 0);
+            source.request.graph_conditions = try conditions.toOwnedSlice(alloc);
+            source.request.graph_predicates = try predicates.toOwnedSlice(alloc);
+        },
+        .join => |join| {
+            if (join.kind == .inner or join.kind == .cross or join.kind == .left) try attachGraphConditionsAt(alloc, root, join.left, program, scans);
+            if (join.kind == .inner or join.kind == .cross or join.kind == .right) try attachGraphConditionsAt(alloc, root, join.right, program, scans);
+        },
+        .query => |query| {
+            if (query.binding.aggregate != null or query.binding.window != null or query.statement.count_all or query.statement.limit != null or query.statement.offset != null or query.statement.scalar_cardinality_limit or query.statement.group_by.len != 0 or query.statement.having != null) return;
+            const columns = try alloc.dupe(Column, root.columns);
+            if (!query.preserve_scope) for (node.columns, 0..) |output, index| {
+                if (index >= query.statement.columns.len) return;
+                const projection = query.statement.columns[index];
+                const name = if (projection.expression == null) projection.field else direct: {
+                    if (index >= query.binding.scalars.projections.len) return;
+                    const expression = query.binding.scalars.projections[index] orelse return;
+                    const instruction = expression.instructions[expression.root].operation;
+                    if (instruction != .column) return;
+                    break :direct query.source.columns[instruction.column].internal;
+                };
+                for (columns) |*column| if (std.mem.eql(u8, column.internal, output.internal)) {
+                    column.internal = name;
+                };
+            };
+            var mapped = root.*;
+            mapped.columns = columns;
+            try attachGraphConditionsAt(alloc, &mapped, query.source, program, scans);
+        },
+        else => {},
+    }
+}
 fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMapUnmanaged(void)) anyerror!void {
     switch (node.operation) {
         .singleton, .recursive_ref, .outer_ref, .literal_rows => {},
@@ -1798,6 +1992,15 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
         .scan => |scan| {
             var fields: std.ArrayList([]const u8) = .empty;
             const request = &builder.scans.items[scan.index];
+            // Graph row IDs are source ordinals. An observable ID must keep
+            // the unfiltered stream, even when another WHERE term is seekable.
+            for (node.columns, scan.source_columns) |column, name| {
+                if (needed.contains(column.internal) and std.mem.eql(u8, name, "_id")) {
+                    request.request.graph_conditions = &.{};
+                    request.request.graph_predicates = &.{};
+                    request.request.graph_source_ordinals = true;
+                }
+            }
             for (node.columns, scan.source_columns) |column, name| {
                 if (!needed.contains(column.internal) or std.mem.eql(u8, name, "_id") or @import("joined_mutation.zig").isMetadata(name)) continue;
                 try fields.append(builder.alloc, (try request.table.column(name)).path);
@@ -1818,6 +2021,7 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
             try projectScans(builder, apply.left, needed);
         },
         .query => |query| {
+            if (query.binding.scalars.predicate) |program| try attachGraphConditions(builder.alloc, query.source, program, builder.scans.items);
             var required = query.statement;
             const decisions = @import("decision_eval.zig");
             const prunable = blk: {
@@ -2008,6 +2212,40 @@ pub fn scanColumn(node_: *const Node, position_: usize) ?ScanColumn {
         }
     }
     return null;
+}
+
+/// Exact row-preserving identity lineage. Selection and every cardinality,
+/// effect, or invocation boundary decline the finite-prefix capability.
+pub fn rowPreservingScan(original: *const Node) ?usize {
+    var node = original;
+    for (0..32) |_| switch (node.operation) {
+        .scan => |scan| return scan.index,
+        .query => |query| {
+            if (query.statement.predicate != null or query.binding.scalars.predicate != null or query.statement.limit != null or query.statement.offset != null or query.statement.scalar_cardinality_limit or query.binding.aggregate != null or query.binding.window != null or query.binding.order_keys.len != 0 or query.constant_refs.len != 0) return null;
+            for (query.binding.scalars.projections) |program| if (program) |value| if (JoinPlanning.identity(value) == null) return null;
+            node = query.source;
+        },
+        else => return null,
+    };
+    return null;
+}
+
+/// Certify the entire outer predicate across row-preserving identity frames.
+/// Partial conjunct hints never grant a finite-prefix license.
+pub fn orderedGraphPredicate(a: Allocator, root: *const Node, program: scalar.Program, scan_index: usize) !?catalog.Scan.GraphPredicate {
+    if (rowPreservingScan(root) != scan_index) return null;
+    var source = root;
+    while (source.operation == .query) source = source.operation.query.source;
+    if (source.operation != .scan or source.operation.scan.index != scan_index) return null;
+    var mapped = program;
+    mapped.instructions = try a.dupe(scalar.Instruction, program.instructions);
+    for (@constCast(mapped.instructions)) |*instruction| if (instruction.operation == .column) {
+        const origin = scanColumn(root, instruction.operation.column) orelse return null;
+        if (origin.scan_index != scan_index) return null;
+        instruction.operation.column = @intCast(origin.position);
+    };
+    var remaining: usize = 128;
+    return graphBoolean(a, source, source, mapped, mapped.root, &remaining);
 }
 
 /// Snapshot-local estimates guide bounded left-deep enumeration. Unknown

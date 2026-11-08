@@ -29,6 +29,12 @@ logical replication managed by Antfly.
 | [grepstein](grepstein/) | Go | Public-records showcase: PDF reading and OCR, full-text, semantic, and graph enrichment, and grep over a GCS-backed corpus on Antfly Cloud |
 | [hackernews](hackernews/) | Python | Historical Hacker News search over GCS Parquet with Antfly index artifacts, including deployment tooling; qualification records are in [`docs/operations/hackernews/history`](../docs/operations/hackernews/history/) |
 
+## Desktop applications
+
+| Example | Language | What it shows |
+|---|---|---|
+| [dictation](dictation/) | Swift | Global push-to-talk with Apple Speech or Whisper, shared cleanup, presets, dictionary, Antfly settings snapshots, and searchable history |
+
 ## Embedded (Antfly Lite)
 
 | Example | Language | What it shows |

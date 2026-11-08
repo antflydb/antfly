@@ -52,6 +52,8 @@ export {
   type RestoreOptions,
   type SchemaMutationOptions,
   SQLExecutionError,
+  GraphExecutionError,
+  type GraphDiagnostic,
   StorageReadTemporarilyUnavailableError,
   StorageResourceExhaustedError,
 } from "./client.js";
@@ -551,6 +553,15 @@ export type {
   ChatGPTOutcome,
   CreateTablespaceRequest,
   DatabaseCatalogRecord,
+  GraphCatalogEntry,
+  GraphQueryRequest,
+  GraphQueryResult,
+  GraphWriteReceipt,
+  GraphWriteStatus,
+  GraphQueryStats,
+  GraphDefinition,
+  GraphLabelMapping,
+  GraphRelationshipMapping,
   NamespaceCatalogRecord,
   PrivacyCategory,
   PrivacyFinding,
@@ -565,3 +576,6 @@ export type {
   RenameCatalogResourceRequest,
   TablespaceCatalogRecord,
 } from "./types.js";
+
+export { encodeGraphParameter, decodeGraphValue } from "./graph-wire.js";
+export type { GraphValue, GraphIdentity, GraphData, GraphDecoded } from "./graph-wire.js";

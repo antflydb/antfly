@@ -500,6 +500,7 @@ pub fn create(config: Config) Graph {
     const media_mod = inference_audio_mod.import_table.get("antfly_media").?;
     inference_mod.addImport("antfly_media", media_mod);
     @import("antfly_video").support.attach(b, inference_mod, b.path(pathJoin(b, paths.shared_lib_root, "lib/video")), .{ .media = media_mod, .image = image_mod });
+    inference_mod.addImport("antfly_generating", generating_mod);
     inference_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     inference_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     inference_mod.addImport("antfly_extracting", extracting_mod);
