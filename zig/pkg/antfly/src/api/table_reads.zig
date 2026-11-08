@@ -17770,6 +17770,7 @@ fn consumerTests() type {
                 generation: *table_catalog.RoutingGeneration,
                 acquisitions: usize = 0,
                 admissions: usize = 0,
+                resolutions: usize = 0,
                 fn acquire(raw: *anyopaque, _: ?u64, _: bool) !*table_catalog.RoutingGeneration {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.acquisitions += 1;
@@ -17780,6 +17781,14 @@ fn consumerTests() type {
                     return error.UnexpectedAdminRead;
                 }
                 fn freeAdmin(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn resolve(raw: *anyopaque, allocator: std.mem.Allocator, _: []const u8, query: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expect(query == .key);
+                    self.resolutions += 1;
+                    const groups = try allocator.alloc(table_catalog.CatalogGroupRoute, 1);
+                    groups[0] = .{ .group_id = 32, .range_id = 32, .identity_namespace = .{ .table_id = 7, .shard_id = 32, .range_id = 32 } };
+                    return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 7, .table_id = 7, .topology_epoch = 1, .groups = groups } };
+                }
                 fn wait(raw: *anyopaque, _: u64, _: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.admissions += 1;
@@ -17797,7 +17806,7 @@ fn consumerTests() type {
             }, .{});
             defer generation.release();
             var fixture: Fixture = .{ .generation = generation };
-            const source: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.freeAdmin, .acquire_routing_generation = Fixture.acquire } };
+            const source: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.freeAdmin, .acquire_routing_generation = Fixture.acquire, .resolve_route = Fixture.resolve } };
             var provider = ProvisionedTableReadSource.init("unused", source, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.wait } });
             const keys = try a.alloc([]const u8, 4096);
             defer a.free(keys);
@@ -17838,7 +17847,8 @@ fn consumerTests() type {
             var budget = source.budget(null);
             budget.cancellation = cancellation.token();
             try std.testing.expectError(error.Canceled, table_catalog.routedDocumentKeysSnapshotWithBudget(a, source, "docs", keys, budget));
-            try std.testing.expect(fixture.acquisitions < keys.len);
+            try std.testing.expect(fixture.resolutions > 0 and fixture.resolutions < keys.len);
+            try std.testing.expectEqual(@as(usize, 0), fixture.acquisitions);
         }
         test "privacy source vtables retain static lifetime across capability selection" {
             const Fake = struct {
