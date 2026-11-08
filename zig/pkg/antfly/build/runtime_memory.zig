@@ -131,14 +131,13 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
             const quantum: usize = 128 * 1024 * 1024;
             return (std.math.divCeil(usize, peak + peak / 10, quantum) catch unreachable) * quantum;
         }
-        // Native LLVM Debug, run 38693574492: API peaked at 12,089,720,832
-        // bytes, exceeding the old 10 GiB claim and forcing a retry. 15 GiB
-        // retains >=25% headroom. Distributed/CLI summaries rounded to 8G/2G;
+        // Native LLVM Debug, run 38693574492: distributed/CLI summaries
+        // rounded to 8G/2G;
         // bound rounding with another GiB before adding 25%. Keep the other
         // units' conservative claims; cross-host measurements are not native
         // Linux evidence and must not lower admission reservations.
         const gib: usize = switch (unit) {
-            .api_kernel => 15,
+            .api_kernel => unreachable, // Qualified above against the newer peak.
             .distributed => 12,
             .local_query => unreachable,
             .storage_kernel => 20,
@@ -434,7 +433,8 @@ test "measured release reservations admit storage with inference and preserve un
     var conservative = measured;
     conservative.cpu_inference = false;
     try std.testing.expect(runtimeCompileMaxRss(.storage_kernel, conservative) + runtimeCompileMaxRss(.inference, conservative) > budget);
-    inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
+    // The local-query owner has no qualified reduction yet.
+    inline for (.{ RuntimeLibraryUnit.api_kernel, .distributed, .storage_kernel, .enrichment_compute, .serverless, .inference, .cli }) |unit| {
         try std.testing.expect(runtimeCompileMaxRss(unit, measured) < runtimeCompileMaxRss(unit, conservative));
         var profile = measured;
         profile.host = macos;
@@ -472,7 +472,9 @@ test "measured ReleaseSafe CPU archives overlap within the E2E runner budget" {
     // Zig's summary rounds MaxRSS. Add a whole GiB to each reported peak
     // before requiring headroom, rather than treating 8G as an exact sample.
     const peak_upper_bounds = [_]usize{ 5, 6, 9, 2, 4, 6, 2 };
-    for (std.meta.tags(RuntimeLibraryUnit), peak_upper_bounds) |unit, upper| {
+    // These measurements predate the independent local-query owner.
+    const units = [_]RuntimeLibraryUnit{ .api_kernel, .distributed, .storage_kernel, .enrichment_compute, .serverless, .inference, .cli };
+    for (units, peak_upper_bounds) |unit, upper| {
         try std.testing.expect(runtimeCompileMaxRss(unit, measured) > upper * gib);
         var fallback = measured;
         fallback.cpu_inference = false;
@@ -519,7 +521,9 @@ test "Linux cross Darwin release claims cover peaks and preserve useful overlap"
     const profile: CompileMemoryProfile = .{ .host = linux, .target = macos, .optimize = .fast, .strip = true, .cpu_inference = false, .linux_macos_sdk26_release = true };
     const gib = 1024 * 1024 * 1024;
     const upper_bounds = [_]usize{ 15, 9, 10, 2, 5, 2, 3 };
-    for (std.meta.tags(RuntimeLibraryUnit), upper_bounds) |unit, upper| {
+    // These measurements predate the independent local-query owner.
+    const units = [_]RuntimeLibraryUnit{ .api_kernel, .distributed, .storage_kernel, .enrichment_compute, .serverless, .inference, .cli };
+    for (units, upper_bounds) |unit, upper| {
         const claim = runtimeCompileMaxRss(unit, profile);
         try std.testing.expect(claim >= upper * gib + upper * gib / 10);
         var fallback = profile;

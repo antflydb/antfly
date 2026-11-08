@@ -119,6 +119,13 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      - name: Install Zig archive extractor
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v xz >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y xz-utils
+          fi
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -174,6 +181,13 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      - name: Install Zig archive extractor
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v xz >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y xz-utils
+          fi
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -266,6 +280,13 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      - name: Install Zig archive extractor
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v xz >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y xz-utils
+          fi
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -323,6 +344,13 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      - name: Install Zig archive extractor
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v xz >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y xz-utils
+          fi
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -387,6 +415,13 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      - name: Install Zig archive extractor
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v xz >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y xz-utils
+          fi
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
