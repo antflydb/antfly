@@ -176,14 +176,21 @@ class McpSchemaFragmentTests(unittest.TestCase):
         child_mode_rejection = next(
             branch
             for branch in query_schema["not"]["anyOf"]
-            if branch.get("description", "").startswith(
-                "Relevance, filtering, backward/offset pagination"
+            if any(
+                part.get("properties", {}).get("hierarchy", {}).get("required")
+                == ["children"]
+                for part in branch.get("allOf", [])
+            )
+            and any(
+                {"required": ["query"]} in part.get("anyOf", [])
+                for part in branch.get("allOf", [])
             )
         )
         rejected_child_fields = {
             item["required"][0] for item in child_mode_rejection["allOf"][1]["anyOf"]
         }
         allowed_child_fields = {
+            "filter_query",
             "table",
             "table_target",
             "fields",
