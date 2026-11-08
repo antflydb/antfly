@@ -31,7 +31,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -41,6 +40,9 @@ env:
 
 jobs:
   qualify:
+    permissions:
+      contents: read
+      id-token: write
     runs-on: arc-antfly-heavy
     timeout-minutes: 360
     steps:
