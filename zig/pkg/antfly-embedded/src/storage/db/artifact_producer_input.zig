@@ -168,7 +168,16 @@ pub const Token = struct {
         if (try self.authoredAccepted(txn)) return true;
         // Receipts survive output replacement. Only current causal/output
         // provenance can suppress execution for a generated result.
-        var generated = (try @import("artifact_producer_provenance.zig").readCurrentForSource(self.alloc, txn, self.command(&.{}), self.source)) orelse return false;
+        var generated = (@import("artifact_producer_provenance.zig").readCurrentForSource(self.alloc, txn, self.command(&.{}), self.source) catch |err| switch (err) {
+            error.EnrichmentSourceChanged => {
+                // A receipt for an older input is a miss for this producer.
+                // Revalidate the captured input before allowing fresh work:
+                // an already-stale token still has to retry its capture.
+                try publication.validateSources(self.alloc, txn, self.namespace, (&self.source)[0..1]);
+                return false;
+            },
+            else => return err,
+        }) orelse return false;
         defer generated.deinit();
         return std.meta.eql(self.execution_identity, generated.owned.proof.execution_identity);
     }
@@ -323,6 +332,72 @@ test "ordered artifact inventory producer template binds every inference field" 
     request = template;
     request.expected_dims = 4;
     try std.testing.expect(!sameDefinition(template, request));
+}
+
+test "privacy base vector source updates replace accepted absence without crediting stale input" {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const adapter = @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/privacy-source-update", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"vectors\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"vectors\"}}" });
+    var catalog = try db.artifactInventoryCommand(alloc);
+    defer catalog.catalogs.deinit(alloc);
+    catalog.binding.effect_protocol = 15;
+    try adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
+    var activate: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activate.publication_digest = activate.digest();
+    try adapter.applyOrdered(&db, .{ .artifact_publication = activate }, .{ .term = 1, .index = 2 });
+    try adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":null}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
+    var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    var request = for (pin.plan().generated_templates) |template| {
+        if (template.kind == .dense_embedding) break template;
+    } else return error.TestExpectedVectorProducer;
+    request.doc_key = "doc";
+    const stored = try keys.documentKeyAlloc(alloc, "doc");
+    defer alloc.free(stored);
+    const output = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "vectors");
+    defer alloc.free(output);
+    var before = blk: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        break :blk (try capture(alloc, &read, 1, request, pin.plan(), stored, try read.get(stored), null)).?;
+    };
+    defer before.deinit();
+    const absence = before.command(&.{.{ .family = .base_vector, .key = output, .value = null, .source_index = 0 }});
+    try adapter.applyOrdered(&db, .{ .artifact_publication = absence }, .{ .term = 1, .index = 4 });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try before.accepted(&read));
+    }
+    try adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 200 }, .{ .term = 1, .index = 5 });
+    var current = blk: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.EnrichmentSourceChanged, before.accepted(&read));
+        var token = (try capture(alloc, &read, 1, request, pin.plan(), stored, try read.get(stored), null)).?;
+        errdefer token.deinit();
+        try std.testing.expect(!try token.accepted(&read));
+        break :blk token;
+    };
+    defer current.deinit();
+    const payload = try @import("enrichment/artifact_codec.zig").encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+    defer alloc.free(payload);
+    const produced = current.command(&.{.{ .family = .base_vector, .key = output, .value = payload, .source_index = 0 }});
+    try adapter.applyOrdered(&db, .{ .artifact_publication = produced }, .{ .term = 1, .index = 6 });
+    // A delayed old result must leave the new accepted value/provenance intact.
+    try adapter.applyOrdered(&db, .{ .artifact_publication = absence }, .{ .term = 1, .index = 7 });
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(try current.accepted(&read));
+    try std.testing.expectEqualSlices(u8, payload, try read.get(output));
 }
 
 test "ordered artifact inventory resolved execution refreshes vectors and fences late results" {

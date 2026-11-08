@@ -80,7 +80,18 @@ pub const EnrichmentConfig = struct {
 };
 
 pub fn serializeCatalog(alloc: Allocator, enrichments: []const EnrichmentConfig) ![]u8 {
-    return try std.json.Stringify.valueAlloc(alloc, enrichments, .{ .emit_null_optional_fields = false });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var normalized: ?[]EnrichmentConfig = null;
+    for (enrichments, 0..) |cfg, i| {
+        if (cfg.kind != .asset) continue;
+        if (try @import("antfly_decisions").cascade.normalizeDisabledAgreementJson(a, cfg.producer_json, &.{ "config", "decider" })) |producer| {
+            if (normalized == null) normalized = try a.dupe(EnrichmentConfig, enrichments);
+            normalized.?[i].producer_json = producer;
+        }
+    }
+    return try std.json.Stringify.valueAlloc(alloc, normalized orelse enrichments, .{ .emit_null_optional_fields = false });
 }
 
 pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]EnrichmentConfig {
@@ -183,4 +194,25 @@ test "enrichment catalog round trip without source_template" {
     try std.testing.expectEqual(@as(usize, 1), decoded.len);
     try std.testing.expectEqualStrings("body", decoded[0].source_field);
     try std.testing.expectEqual(@as(usize, 0), decoded[0].source_template.len);
+}
+
+test "decision provider enrichment catalog writes disabled cascade guards in the epoch-30 format" {
+    const a = std.testing.allocator;
+    const producer =
+        \\{"type":"decision","config":{"version":"v1","decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"model":"fast"}},{"name":"strong","decider":{"model":"strong"},"when":{"probability_between":[0.3,0.9]}}]}},"questions":[]}}
+    ;
+    const baseline = try serializeCatalog(a, &.{.{ .name = "c", .kind = .asset, .source_field = "text", .producer_json = producer }});
+    defer a.free(baseline);
+    const disabled = try std.mem.replaceOwned(u8, a, producer, "\"when\":", "\"require_agreement\":false,\"when\":");
+    defer a.free(disabled);
+    const encoded = try serializeCatalog(a, &.{.{ .name = "c", .kind = .asset, .source_field = "text", .producer_json = disabled }});
+    defer a.free(encoded);
+    try std.testing.expectEqualStrings(baseline, encoded);
+    // Serialization borrows its input; caller-owned config remains unchanged.
+    try std.testing.expect(std.mem.indexOf(u8, disabled, "require_agreement") != null);
+    const enabled = try std.mem.replaceOwned(u8, a, disabled, "false", "true");
+    defer a.free(enabled);
+    const guarded = try serializeCatalog(a, &.{.{ .name = "c", .kind = .asset, .source_field = "text", .producer_json = enabled }});
+    defer a.free(guarded);
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "require_agreement") != null);
 }

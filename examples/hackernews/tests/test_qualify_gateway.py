@@ -69,3 +69,72 @@ def test_capture_resume_and_failed_transport_retain_evidence(tmp_path, monkeypat
     evidence = json.loads(failed.read_text())
     assert not evidence["smoke_passed"]
     assert evidence["checks"][0]["transport_error"] == "TimeoutError"
+
+
+def test_search_first_keeps_slow_results_and_fails_latency_gate(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(qualify_gateway.time, "sleep", lambda _: None)
+
+    def response(base, route, payload, authorization=None):
+        calls.append(route)
+        if payload is None:
+            return {"ok": True}, {"status": 200, "seconds": 0.01}
+        return {"hits": {"hits": [{"_source": {"hn_id": 1}}]}, "cursor": "retained"}, {
+            "status": 200,
+            "seconds": 12,
+            "backend_seconds": 2,
+            "outside_backend_seconds": 10,
+        }
+
+    monkeypatch.setattr(qualify_gateway, "probe", response)
+    output = tmp_path / "slow.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "qualify_gateway.py",
+            "--gateway",
+            "http://127.0.0.1:8080",
+            "--runtime-image",
+            "image@sha256:" + "a" * 64,
+            "--output",
+            str(output),
+            "--search-first",
+            "--max-search-seconds",
+            "5",
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        qualify_gateway.main()
+    assert error.value.code == 1
+    record = json.loads(output.read_text())
+    assert record["smoke_passed"] and not record["latency_passed"]
+    assert not record["archive_qualified"]
+    assert calls == ["/api/search"] * 3 + ["/health", "/ready"]
+    assert record["checks"][0]["ids"] == ["1"]
+    assert record["checks"][0]["outside_backend_seconds"] == 10
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "",
+        "secret",
+        "antfly_upstream;dur=NaN",
+        "antfly_upstream;dur=-1",
+        "antfly_upstream;dur=999999",
+        "antfly_upstream;dur=1;desc=private",
+    ],
+)
+def test_timing_ignores_invalid_or_unrelated_headers(header):
+    assert qualify_gateway.timing_evidence({"Server-Timing": header}, 2) == {}
+
+
+def test_timing_separates_upstream_from_end_to_end_duration():
+    assert qualify_gateway.timing_evidence(None, 12) == {}
+    assert qualify_gateway.timing_evidence(
+        {"Server-Timing": "antfly_upstream;dur=2000.000"}, 12
+    ) == {
+        "backend_seconds": 2,
+        "outside_backend_seconds": 10,
+    }

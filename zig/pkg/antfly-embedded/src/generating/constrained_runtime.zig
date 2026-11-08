@@ -52,6 +52,12 @@ pub const Runtime = struct {
     limits: constrained.Limits = .{},
     capability_snapshot: ?constrained.Capabilities = null,
     require_execution_lease: bool = false,
+    /// Invocation-local allowance checked before each window/repair call.
+    input_token_limit: ?u64 = null,
+    invocation_usage: ?struct {
+        ptr: *anyopaque,
+        record: *const fn (*anyopaque, []const constrained.Item, constrained.Usage) void,
+    } = null,
     semantic_validation: ?struct {
         ptr: *anyopaque,
         validate: *const fn (*anyopaque, Allocator, usize, Json, ?constrained.TokenEvidence) anyerror!void,
@@ -161,9 +167,12 @@ pub const Runtime = struct {
     const Backend = struct {
         runtime: *Runtime,
         cfg: generating.GeneratorConfig,
+        input_tokens: u64 = 0,
         fn checkpoint(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.runtime.options.execution.check(@import("antfly_platform").time.monotonicNs());
             if (self.runtime.options.request_context) |context| try context.check();
+            if (self.runtime.input_token_limit) |limit| if (self.input_tokens >= limit) return error.DecisionLimitExceeded;
         }
         fn validateItem(ptr: *anyopaque, a: Allocator, id: usize, value: Json, proof: ?constrained.TokenEvidence) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -176,6 +185,10 @@ pub const Runtime = struct {
         fn invoke(ptr: *anyopaque, a: Allocator, request: constrained.Invocation) !constrained.Reply {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try checkpoint(ptr);
+            defer if (request.usage) |usage| {
+                self.input_tokens +|= usage.input_tokens;
+                if (self.runtime.invocation_usage) |sink| sink.record(sink.ptr, request.items, usage.*);
+            };
             var cfg = self.cfg;
             try self.runtime.bindExecutionLease(a, &cfg);
             const wire_schema = try constrained.providerSchema(a, cfg, request.mode, request.schema);
@@ -234,6 +247,12 @@ pub const Runtime = struct {
                 break generated;
             };
             defer result.deinit();
+            // Some adapters supply usage only in the returned result. Record
+            // that fallback before parsing can fail, without double charging
+            // adapters whose observer already recorded every provider attempt.
+            if (request.usage) |usage| if (!usage.observed) if (result.usage) |reported| {
+                usage.record(reported.input_tokens, reported.output_tokens);
+            };
             const raw = if (request.mode == .tool_call) blk: {
                 if (result.tool_calls.len != 1 or result.tool_calls_synthesized or !std.mem.eql(u8, result.tool_calls[0].name, "antfly_output"))
                     return emptyReply(a, result.usage);

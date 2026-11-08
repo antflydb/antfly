@@ -327,6 +327,12 @@ pub const ObjectStore = struct {
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
 
+        // Keep local registration and physical publication on the same side
+        // of retirement. Shared barriers preserve parallel upload throughput.
+        var publication_io: ?std.Io.Threaded = if (scope != null and self.local_inventory != null) .init(self.alloc, .{}) else null;
+        defer if (publication_io) |*threaded| threaded.deinit();
+        var publication = if (scope) |upload| if (self.local_inventory) |*inventory| try inventory.publicationGuard(publication_io.?.io(), upload, .shared, cancellation) else null else null;
+        defer if (publication) |*guard| guard.deinit();
         if (scope) |upload| if (self.local_inventory) |*inventory| try inventory.registerScopedUpload(upload, checksum, cancellation);
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         _ = std.fmt.hexToBytes(&digest, checksum) catch unreachable;

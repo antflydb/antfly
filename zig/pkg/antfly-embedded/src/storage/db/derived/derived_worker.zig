@@ -716,6 +716,7 @@ const ReplayChunkBuilder = struct {
     }
 
     fn copyKey(self: *@This(), value: []const u8) ![]const u8 {
+        if (value.len == 0) return "";
         if (self.key_blocks == null or self.key_blocks.?.allocation_len - @sizeOf(KeyBlock) - self.key_blocks.?.used < value.len) {
             const minimum = std.math.add(usize, @sizeOf(KeyBlock), value.len) catch return error.OutOfMemory;
             const headroom = if (self.resource_manager) |manager| manager.availableAdmissionBytes(.derived_replay_window) else std.math.maxInt(u64);
@@ -736,7 +737,6 @@ const ReplayChunkBuilder = struct {
         seen: anytype,
         value: []const u8,
     ) !void {
-        if (value.len == 0) return;
         // Deletion slots remain allocated across cancellation/revival. Reuse
         // their owned keys and metadata so repeated toggles do not grow the
         // window or invalidate its pre-admission estimate.
@@ -788,7 +788,7 @@ const ReplayChunkBuilder = struct {
         if (self.minimal_key_blocks or list.items.len != 0 or seen.count() != 0 or keys.len < 16 or keys.len > 128) return;
         var new_count: usize = 0;
         for (keys) |key| {
-            if (key.len != 0 and artifactMatches(key, kind)) new_count += 1;
+            if (artifactMatches(key, kind)) new_count += 1;
         }
         if (new_count < 16) return;
         const desired_list = std.ArrayListUnmanaged([]const u8).growCapacity(try std.math.add(usize, list.items.len, new_count));
@@ -904,7 +904,7 @@ const ReplayChunkBuilder = struct {
         var count: u64 = 0;
         var bytes: u64 = 0;
         for (keys) |key| {
-            if (key.len == 0 or seen.contains(key)) continue;
+            if (seen.contains(key)) continue;
             if (!artifactMatches(key, artifact_kind)) continue;
             count +|= 1;
             bytes +|= descriptor_bytes;
@@ -988,8 +988,11 @@ const ReplayChunkBuilder = struct {
     fn finishBorrowed(self: *@This(), sequence: u64) !derived_types.DerivedBatch {
         const count = self.changed_doc_keys.items.len;
         var kept: usize = 0;
-        for (self.deleted_doc_keys.items) |key| {
-            if (key.len == 0) continue;
+        for (self.deleted_doc_keys.items, 0..) |key, slot| {
+            // Empty is a legal primary ID and also the cancellation sentinel
+            // for nonempty artifact tombstones. The existing slot index
+            // distinguishes them without another map or per-key allocation.
+            if (key.len == 0 and (self.seen_deleted_docs.get("") orelse std.math.maxInt(usize)) != slot) continue;
             self.deleted_doc_keys.items[kept] = key;
             kept += 1;
         }
@@ -2878,5 +2881,21 @@ test "catchUpIndex delivers root-only asset repair metadata to serving consumers
         try std.testing.expectEqual(@as(usize, 0), capture.applied_documents);
         try std.testing.expectEqual(@as(usize, 1), capture.applied_changed_artifact_keys);
         try std.testing.expectEqualStrings(root, capture.last_batch.?.changed_artifact_keys[0]);
+    }
+}
+
+test "privacy index replay preserves empty changed and deleted document IDs" {
+    const a = std.testing.allocator;
+    for ([_]db_types.IndexKind{ .full_text, .algebraic, .dense_vector, .sparse_vector, .graph }) |kind| {
+        var builder = ReplayChunkBuilder.init(a, .{ .name = "projection", .kind = kind }, null, 0);
+        defer builder.deinit();
+        try builder.appendRecord(.{ .changed_doc_keys = &.{""}, .deleted_doc_keys = &.{""} });
+        const batch = try builder.finishBorrowed(1);
+        try std.testing.expectEqual(@as(usize, 1), batch.deleted_keys.len);
+        try std.testing.expectEqualStrings("", batch.deleted_keys[0]);
+        if (kind != .graph) {
+            try std.testing.expectEqual(@as(usize, 1), batch.documents.len);
+            try std.testing.expectEqualStrings("", batch.documents[0].key);
+        }
     }
 }

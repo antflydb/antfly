@@ -242,6 +242,15 @@ pub const NamespaceListEntityResolverProgressParams = struct {
     cursor: ?[]const u8 = null,
 };
 
+pub const ListNamespaceTablePrivacyFindingsParams = struct {
+    cursor: ?[]const u8 = null,
+    document: ?[]const u8 = null,
+    field: ?[]const u8 = null,
+    category: ?[]const u8 = null,
+    policy_version: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
 pub const NamespaceUnmergeResolverKeyParams = struct {
     pin_distinct: ?[]const u8 = null,
 };
@@ -359,6 +368,42 @@ pub const ClearDatabaseTablespaceResponse = union(enum) {
     }
 };
 
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const CreateGraphResponse = union(enum) {
+    status_201: types.GraphCatalogEntry,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            201 => .{ .status_201 = try std.json.parseFromSliceLeaky(types.GraphCatalogEntry, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const UpdateGraphResponse = union(enum) {
+    status_200: types.GraphCatalogEntry,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.GraphCatalogEntry, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
 pub const ListRestoreJobsParams = struct {
     limit: ?[]const u8 = null,
     /// Opaque cursor returned by the preceding page.
@@ -445,6 +490,15 @@ pub const ListEntityResolverProgressParams = struct {
 
 pub const GetLakeCommitOutcomeParams = struct {
     request_hash: []const u8,
+};
+
+pub const ListTablePrivacyFindingsParams = struct {
+    cursor: ?[]const u8 = null,
+    document: ?[]const u8 = null,
+    field: ?[]const u8 = null,
+    category: ?[]const u8 = null,
+    policy_version: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
 };
 
 pub const UnmergeResolverKeyParams = struct {
@@ -2683,6 +2737,181 @@ pub const Client = struct {
         return ApiResponse(types.IndexMaintenanceResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Read table privacy policy and coverage
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy
+    pub fn getNamespaceTablePrivacy(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse(types.PrivacyStatus) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/privacy", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// Apply table privacy policy
+    /// PUT /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy
+    pub fn putNamespaceTablePrivacy(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.PrivacyPolicy, if_match: ?[]const u8) !ApiResponse(types.PrivacyStatus) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/privacy", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (if_match) |value| try request_headers.append(self.allocator, .{ "If-Match", value });
+        var resp = try self.http.put(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.PrivacyStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// List current privacy findings
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/findings
+    pub fn listNamespaceTablePrivacyFindings(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, params: ListNamespaceTablePrivacyFindingsParams) !ApiResponse(types.PrivacyFindingsPage) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/privacy/findings", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.document) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "document=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.field) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "field=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.category) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "category=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.policy_version) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "policy_version=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyFindingsPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// List current privacy findings with body filters
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/findings
+    pub fn queryNamespaceTablePrivacyFindings(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.PrivacyFindingsRequest) !ApiResponse(types.PrivacyFindingsPage) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/privacy/findings", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyFindingsPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// Inspect a bounded sample without saving the policy
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/preview
+    pub fn previewNamespaceTablePrivacy(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.PrivacyPreviewRequest) !ApiResponse(types.PrivacyPreview) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/privacy/preview", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyPreview).fromResponse(self.allocator, &resp);
+    }
+
+    /// Start a durable privacy rescan
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans
+    pub fn startNamespaceTablePrivacyScan(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.PrivacyScanRequest) !ApiResponse(types.PrivacyScan) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/privacy/scans", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyScan).fromResponse(self.allocator, &resp);
+    }
+
+    /// Read privacy scan progress
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans/{scanId}
+    pub fn getNamespaceTablePrivacyScan(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, scan_id: []const u8) !ApiResponse(types.PrivacyScan) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_scan_id = try httpx.PercentEncoding.encode(self.allocator, scan_id);
+        defer self.allocator.free(encoded_scan_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/privacy/scans/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_scan_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyScan).fromResponse(self.allocator, &resp);
+    }
+
     /// Query an explicit namespace table
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query
     pub fn queryNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.StatefulQueryRequest) !ApiResponse(types.QueryResponses) {
@@ -3225,6 +3454,76 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.EvalResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// List graphs
+    /// GET /db/v1/graphs
+    pub fn listGraphs(self: *@This()) !ApiResponse([]const types.GraphCatalogEntry) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/graphs", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse([]const types.GraphCatalogEntry).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get graph
+    /// GET /db/v1/graphs/{graphName}
+    pub fn getGraph(self: *@This(), graph_name: []const u8) !ApiResponse(types.GraphCatalogEntry) {
+        const encoded_graph_name = try httpx.PercentEncoding.encode(self.allocator, graph_name);
+        defer self.allocator.free(encoded_graph_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/graphs/{s}", .{ self.base_url, encoded_graph_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.GraphCatalogEntry).fromResponse(self.allocator, &resp);
+    }
+
+    /// Create graph
+    /// POST /db/v1/graphs/{graphName}
+    pub fn createGraph(self: *@This(), graph_name: []const u8, body: types.GraphDefinition) !ApiResponse(CreateGraphResponse) {
+        const encoded_graph_name = try httpx.PercentEncoding.encode(self.allocator, graph_name);
+        defer self.allocator.free(encoded_graph_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/graphs/{s}", .{ self.base_url, encoded_graph_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(CreateGraphResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Update graph definition
+    /// PUT /db/v1/graphs/{graphName}
+    pub fn updateGraph(self: *@This(), graph_name: []const u8, body: types.GraphDefinitionUpdate) !ApiResponse(UpdateGraphResponse) {
+        const encoded_graph_name = try httpx.PercentEncoding.encode(self.allocator, graph_name);
+        defer self.allocator.free(encoded_graph_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/graphs/{s}", .{ self.base_url, encoded_graph_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(UpdateGraphResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Drop graph
+    /// DELETE /db/v1/graphs/{graphName}
+    pub fn dropGraph(self: *@This(), graph_name: []const u8) !ApiResponse(std.json.Value) {
+        const encoded_graph_name = try httpx.PercentEncoding.encode(self.allocator, graph_name);
+        defer self.allocator.free(encoded_graph_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/graphs/{s}", .{ self.base_url, encoded_graph_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// Execute Cypher against a named graph
+    /// POST /db/v1/graphs/{graphName}/query
+    pub fn executeGraphQuery(self: *@This(), graph_name: []const u8, body: types.GraphQueryRequest) !ApiResponse(types.GraphQueryResult) {
+        const encoded_graph_name = try httpx.PercentEncoding.encode(self.allocator, graph_name);
+        defer self.allocator.free(encoded_graph_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/graphs/{s}/query", .{ self.base_url, encoded_graph_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.GraphQueryResult).fromResponse(self.allocator, &resp);
     }
 
     /// Perform a global query
@@ -4372,6 +4671,153 @@ pub const Client = struct {
         return ApiResponse(types.LinearMergeResult).fromResponse(self.allocator, &resp);
     }
 
+    /// Read table privacy policy and coverage
+    /// GET /db/v1/tables/{tableName}/privacy
+    pub fn getTablePrivacy(self: *@This(), table_name: []const u8) !ApiResponse(types.PrivacyStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/privacy", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// Apply table privacy policy
+    /// PUT /db/v1/tables/{tableName}/privacy
+    pub fn putTablePrivacy(self: *@This(), table_name: []const u8, body: types.PrivacyPolicy, if_match: ?[]const u8) !ApiResponse(types.PrivacyStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/privacy", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (if_match) |value| try request_headers.append(self.allocator, .{ "If-Match", value });
+        var resp = try self.http.put(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.PrivacyStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// List current privacy findings
+    /// GET /db/v1/tables/{tableName}/privacy/findings
+    pub fn listTablePrivacyFindings(self: *@This(), table_name: []const u8, params: ListTablePrivacyFindingsParams) !ApiResponse(types.PrivacyFindingsPage) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/privacy/findings", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.document) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "document=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.field) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "field=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.category) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "category=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.policy_version) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "policy_version=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyFindingsPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// List current privacy findings with body filters
+    /// POST /db/v1/tables/{tableName}/privacy/findings
+    pub fn queryTablePrivacyFindings(self: *@This(), table_name: []const u8, body: types.PrivacyFindingsRequest) !ApiResponse(types.PrivacyFindingsPage) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/privacy/findings", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyFindingsPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// Inspect a bounded sample without saving the policy
+    /// POST /db/v1/tables/{tableName}/privacy/preview
+    pub fn previewTablePrivacy(self: *@This(), table_name: []const u8, body: types.PrivacyPreviewRequest) !ApiResponse(types.PrivacyPreview) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/privacy/preview", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyPreview).fromResponse(self.allocator, &resp);
+    }
+
+    /// Start a durable privacy rescan
+    /// POST /db/v1/tables/{tableName}/privacy/scans
+    pub fn startTablePrivacyScan(self: *@This(), table_name: []const u8, body: types.PrivacyScanRequest) !ApiResponse(types.PrivacyScan) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/privacy/scans", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyScan).fromResponse(self.allocator, &resp);
+    }
+
+    /// Read privacy scan progress
+    /// GET /db/v1/tables/{tableName}/privacy/scans/{scanId}
+    pub fn getTablePrivacyScan(self: *@This(), table_name: []const u8, scan_id: []const u8) !ApiResponse(types.PrivacyScan) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_scan_id = try httpx.PercentEncoding.encode(self.allocator, scan_id);
+        defer self.allocator.free(encoded_scan_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/privacy/scans/{s}", .{ self.base_url, encoded_table_name, encoded_scan_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.PrivacyScan).fromResponse(self.allocator, &resp);
+    }
+
     /// Query a specific table
     /// POST /db/v1/tables/{tableName}/query
     pub fn queryTable(self: *@This(), table_name: []const u8, body: types.StatefulQueryRequest) !ApiResponse(types.StatefulQueryResponses) {
@@ -5104,6 +5550,17 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.TransactionStatusResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Inspect your transaction receipt
+    /// GET /db/v1/transactions/{transaction_id}/status
+    pub fn getTransactionStatus(self: *@This(), transaction_id: []const u8) !ApiResponse(types.TransactionSessionStatus) {
+        const encoded_transaction_id = try httpx.PercentEncoding.encode(self.allocator, transaction_id);
+        defer self.allocator.free(encoded_transaction_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/status", .{ self.base_url, encoded_transaction_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TransactionSessionStatus).fromResponse(self.allocator, &resp);
     }
 
     /// Stage a transaction write

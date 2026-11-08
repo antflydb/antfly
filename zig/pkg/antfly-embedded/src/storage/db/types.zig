@@ -348,6 +348,7 @@ pub const BatchRequest = struct {
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    normalized_graph_rows: bool = false,
     /// Exact metadata read-index snapshot fetched and validated by the owner
     /// leader before proposal. Followers consume these committed bytes locally;
     /// they must never perform metadata IO from deterministic Raft apply.
@@ -1437,6 +1438,17 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Private compiler-certified nullness projection; authorization uses original rows.
+    cypher_presence_fields: []const []const u8 = &.{},
+    cypher_projection_json: []const u8 = "",
+    /// Private read-index preparation for a later fenced graph snapshot.
+    /// Public lookup decoders never populate this maintenance-only flag.
+    cypher_prepare: bool = false,
+    /// Private authoritative metadata assertion. Zero means no active masking;
+    /// a nonzero value must match the installed policy before reading data.
+    privacy_policy_version: ?[64]u8 = null,
+    /// Private table-admin privacy inspection. Never accepted by public parsers.
+    privacy_original: bool = false,
     /// Local output allocation policy; never parsed from public requests.
     /// Raw copies and flat native projections already allocate exact bodies.
     output_exact: bool = false,
@@ -1552,6 +1564,9 @@ pub const RelationalRowQuery = struct {
     };
     /// Retained typed readers bound bytes as well as rows. Transported with
     /// the query so every owner uses the same requested page envelope.
+    /// Private compiler-certified nullness projection; authorization uses original rows.
+    cypher_presence_fields: []const []const u8 = &.{},
+    cypher_projection_json: []const u8 = "",
     page_bytes: usize = 16 * 1024 * 1024,
     fields: []const []const u8,
     index: ?[]const u8 = null,
@@ -1559,6 +1574,7 @@ pub const RelationalRowQuery = struct {
     /// pinned catalog snapshot. This is deliberately a hint: no usable index
     /// is a correct primary-key fallback.
     auto_index: bool = false,
+    reverse: bool = false,
     after: ?[]const u8 = null,
     lower: ?Bound = null,
     upper: ?Bound = null,
@@ -1567,6 +1583,16 @@ pub const RelationalRowQuery = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Private compiler-certified nullness projection; authorization uses original rows.
+    cypher_presence_fields: []const []const u8 = &.{},
+    cypher_projection_json: []const u8 = "",
+    /// Private authoritative metadata assertion. Zero means no active masking;
+    /// a nonzero value must match the installed policy before reading data.
+    privacy_policy_version: ?[64]u8 = null,
+    /// Private table-admin privacy inspection. Never accepted by public parsers.
+    privacy_original: bool = false,
+    /// Private administration census; emits value-free inspection status.
+    privacy_status: bool = false,
     /// Retain the full document only for a version-fenced SQL mutation.
     sql_document_preimage: bool = false,
     /// Collect durable logical range guards only for explicitly guarded SQL.
@@ -1594,6 +1620,9 @@ pub const ScanOptions = struct {
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     filter_query_json: []const u8 = "",
+    /// Internal Cypher visitation only. Reserved document identities consume
+    /// progress but must not be decoded by a user row filter. Never serialized.
+    cypher_node_keys_only: bool = false,
     /// Internal-only response mode used by linear merge. Public scans leave
     /// this false and retain their existing NDJSON shape.
     include_content_hashes: bool = false,
@@ -1603,6 +1632,10 @@ pub const ScanOptions = struct {
     /// scan lifetime.
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+
+    /// Private maintenance continuation: exclude from_key even when empty.
+    /// Only trusted internal transports preserve this marker.
+    resume_from_key: bool = false,
 
     pub fn isRelational(self: ScanOptions) bool {
         return self.relational_query != null or self.relational_query_json.len != 0;
@@ -1657,11 +1690,21 @@ pub const ScanVisitor = struct {
     borrow_documents: bool = false,
     context: ?*anyopaque,
     visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
+    /// Optional physical-candidate accounting, before visibility/predicate work.
+    /// Owner count readers report rejected candidates as well as emitted rows.
+    progress: ?*const fn (context: ?*anyopaque, examined: usize) anyerror!void = null,
     callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
 
-    const NativeCallbacks = struct { visit: @FieldType(ScanVisitor, "visit") };
+    const NativeCallbacks = struct {
+        visit: @FieldType(ScanVisitor, "visit"),
+        progress: @typeInfo(@FieldType(ScanVisitor, "progress")).optional.child,
+    };
     const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
 
+    pub fn reportProgress(self: ScanVisitor, examined: usize) anyerror!void {
+        const callback = self.progress orelse return;
+        return NativeBoundary.call("progress", self.callback_dispatch, callback, .{ self.context, examined });
+    }
     pub fn visitEntry(self: ScanVisitor, entry: ScanVisitEntry) anyerror!void {
         return NativeBoundary.call("visit", self.callback_dispatch, self.visit, .{ self.context, entry });
     }
@@ -1691,6 +1734,23 @@ pub const DocumentArtifactTableReprocessRequest = struct {
     to_key: []const u8 = "",
     limit: u32 = 100,
     shard_cursors: []const DocumentArtifactReprocessShardResume = &.{},
+    /// Private continuation marker: from_key is the last admitted identifier,
+    /// even when empty. Keep the identifier in one place on the owner wire.
+    resume_from_key: bool = false,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        // Preserve the legacy initial-request envelope. Only actual resumes
+        // add the marker; an empty cursor remains distinct from an open bound.
+        inline for (comptime std.meta.fieldNames(@This())) |name| {
+            const emit = if (comptime std.mem.eql(u8, name, "resume_from_key")) self.resume_from_key else true;
+            if (emit) {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const DocumentArtifactReprocessFailure = struct {
@@ -1777,6 +1837,7 @@ pub const TransactionIntentRequest = struct {
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    normalized_graph_rows: bool = false,
     range_guards: []const @import("../range_protection.zig").Proof = &.{},
     schema_version: ?u32 = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
@@ -1790,6 +1851,8 @@ pub const TransactionIntentRequest = struct {
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
+    graph_writes: []const GraphEdgeWrite = &.{},
+    graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
     integrity: []const TransactionIntegrityOperation = &.{},
     integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
@@ -1952,6 +2015,9 @@ pub const SearchRequest = struct {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Private authoritative metadata assertion. Zero means no active masking;
+    /// a nonzero value must match the installed policy before reading data.
+    privacy_policy_version: ?[64]u8 = null,
     /// Trusted graph admission workspace; never part of the public wire DSL.
     graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
     /// Trusted request-local preparation, never decoded from public input.
@@ -1996,6 +2062,8 @@ pub const SearchRequest = struct {
     document_lookup_groups: []const u64 = &.{},
     /// Borrowed coordinator label; routing and storage continue using immutable identities.
     response_table_name: ?[]const u8 = null,
+    /// Trusted coordinator response annotation. Never accepted from public JSON.
+    response_live_read: bool = false,
     /// Borrowed physical name of the queried table, set by the API read
     /// source together with `graph_index_complete_snapshot`. Graph executors
     /// canonicalize a `target_table` tag naming this table to the local
@@ -2172,6 +2240,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "privacy_policy_version",
     "graph_work_budget",
     // Conditional delivery runs after child authorization and retrieval.
     "field_projection_json",
@@ -2186,6 +2255,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "document_output_exact",
     "document_projection_plan",
     "response_table_name",
+    "response_live_read",
     "prepared_read_table_id",
     "native_query_cut",
     // The public retained capability accompanies the authenticated physical cut.

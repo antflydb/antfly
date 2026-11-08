@@ -57,6 +57,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     GenerationTransitionActive,
     HierarchyCursorStale,
     DocumentArtifactPublicationFailed,
+    ArtifactPublicationPending,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
     ReadIndexTimeout,
@@ -77,6 +78,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     EnrichmentWorkerFailed,
     RepairCanceled,
     InvalidRepairCancelToken,
+    UnsupportedQueryRequest,
 };
 
 /// A rejected primary mutation can be retried after retention catches up.
@@ -478,7 +480,7 @@ pub const Operations = struct {
             error.EnrichmentWaitTimeout => return error.EnrichmentWaitTimeout,
             error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
-            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
+            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable, error.Unavailable => return error.GroupLeaderUnavailable,
             else => {
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
@@ -667,7 +669,7 @@ pub const Operations = struct {
             error.EnrichmentWaitTimeout => return error.EnrichmentWaitTimeout,
             error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
-            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
+            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable, error.Unavailable => return error.GroupLeaderUnavailable,
             else => {
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
@@ -968,6 +970,7 @@ pub const Operations = struct {
             input,
         ) catch |err| switch (err) {
             error.InvalidBatchRequest, error.InvalidArgument => return error.InvalidArgument,
+            error.ArtifactPublicationPending => return error.ArtifactPublicationPending,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
@@ -1136,9 +1139,9 @@ pub const Operations = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
     ) Error!db_mod.types.DocumentArtifactManifest {
-        try request.ensureActive();
+        const control = try request.platformDeadline();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .read_index) catch |err| {
+        return (reads.documentArtifactManifestGroupLocalControlled(alloc, group_id, table_name, doc_key, artifact_name, .read_index, .{ .execution_deadline_ns = control.deadline_ns, .cancellation = control.cancellation }) catch |err| {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
                 error.UnknownGroup, error.TableNotFound, error.NotFound => error.NotFound,
@@ -1221,7 +1224,8 @@ pub const Operations = struct {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
                 error.HierarchyCursorStale => error.HierarchyCursorStale,
-                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => error.InvalidArgument,
+                error.UnsupportedQueryRequest => error.UnsupportedQueryRequest,
+                error.InvalidQueryRequest, error.InvalidArgument, error.IndexNotFound => error.InvalidArgument,
                 error.UnknownGroup, error.TableNotFound => error.NotFound,
                 else => error.Internal,
             };
@@ -1527,8 +1531,9 @@ fn consumerTests() type {
                 source.failure = @field(errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
-            inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
-                source.failure = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
+            const execution_errors = @import("antfly_local_sources").schema_relational_expression_errors.Error || @import("relational_row_errors.zig").PolicyError;
+            inline for (@typeInfo(execution_errors).error_set.error_names.?) |field| {
+                source.failure = @field(execution_errors, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
         }
@@ -2123,6 +2128,10 @@ fn consumerTests() type {
                 .{},
                 forwarding,
             ));
+            for ([_]anyerror{ error.Unavailable, error.MetadataSnapshotUnavailable }) |failure| {
+                state.visibility_error = failure;
+                try std.testing.expectError(error.GroupLeaderUnavailable, operations.routedBatch(std.testing.allocator, request, 17, "documents", .{}, forwarding));
+            }
         }
 
         test "typed internal query workers preserve identity generation validation" {
@@ -2175,7 +2184,7 @@ fn consumerTests() type {
                 .shard_db_adapter = null,
             };
 
-            try std.testing.expectError(error.InvalidArgument, operations.query(
+            try std.testing.expectError(error.UnsupportedQueryRequest, operations.query(
                 std.testing.allocator,
                 .{},
                 17,

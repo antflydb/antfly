@@ -43,6 +43,7 @@ export {
   type IndexMutationTemporarilyUnavailableCode,
   IndexMutationTemporarilyUnavailableError,
   type IndexOperations,
+  type PrivacyTableTarget,
   QUERY_TEMPORARILY_UNAVAILABLE_CODES,
   type QueryExecutionOptions,
   type QueryTemporarilyUnavailableCode,
@@ -51,6 +52,8 @@ export {
   type RestoreOptions,
   type SchemaMutationOptions,
   SQLExecutionError,
+  GraphExecutionError,
+  type GraphDiagnostic,
   StorageReadTemporarilyUnavailableError,
   StorageResourceExhaustedError,
 } from "./client.js";
@@ -88,6 +91,7 @@ export {
   InferenceAPIError,
   InferenceCapacityError,
   InferenceClient,
+  InferenceTransportError,
 } from "./inference-client.js";
 export {
   decodeNumericDenseFrame,
@@ -538,6 +542,7 @@ export type {
 } from "./client.js";
 export { ChatGPTConnectionError } from "./client.js";
 export { AntflyHTTPError, AntflyResponseError } from "./errors.js";
+export type { AudioReadMetadata, AudioReadOptions, AudioReadSegment } from "./inference-types.js";
 export type { MemoryNumbers, MemoryPaths, MemorySchemas } from "./memory.js";
 export { parseMemoryJSON, stringifyMemoryJSON } from "./memory.js";
 export * from "./models.js";
@@ -548,9 +553,29 @@ export type {
   ChatGPTOutcome,
   CreateTablespaceRequest,
   DatabaseCatalogRecord,
+  GraphCatalogEntry,
+  GraphQueryRequest,
+  GraphQueryResult,
+  GraphWriteReceipt,
+  GraphWriteStatus,
+  GraphQueryStats,
+  GraphDefinition,
+  GraphLabelMapping,
+  GraphRelationshipMapping,
   NamespaceCatalogRecord,
+  PrivacyCategory,
+  PrivacyFinding,
+  PrivacyFindingsPage,
+  PrivacyPolicy,
+  PrivacyPreview,
+  PrivacyPreviewRequest,
+  PrivacyProducer,
+  PrivacyScan,
+  PrivacyScanRequest,
+  PrivacyStatus,
   RenameCatalogResourceRequest,
   TablespaceCatalogRecord,
 } from "./types.js";
 
-export type { AudioReadOptions, AudioReadMetadata, AudioReadSegment } from "./inference-types.js";
+export { encodeGraphParameter, decodeGraphValue } from "./graph-wire.js";
+export type { GraphValue, GraphIdentity, GraphData, GraphDecoded } from "./graph-wire.js";

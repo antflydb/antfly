@@ -96,6 +96,8 @@ pub const CatalogCursor = struct {
 /// Replacement/import is reserved for bootstrap; normal DDL sends touched rows.
 pub const StandaloneCatalogUpdate = struct {
     pub const TableReplacement = struct {
+        /// A compact exact-CAS proof avoids duplicating large legacy indexes.
+        expected_indexes_digest: ?[32]u8 = null,
         expected: metadata.TableRecord,
         replacement: metadata.TableRecord,
     };
@@ -266,13 +268,19 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
 
 const store_report_update = @import("../store_report_update.zig");
 pub const CatalogProjectionRequest = union(enum) {
+    job_state_get: []const u8,
+    job_state_scan: ?[]const u8,
+    job_owner_count: []const u8,
     read_store: struct { store_id: u64, reports: bool },
     read_store_group_facts: u64,
     read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },
+    catalog_graph_authority: @import("../../system_catalog/server_call.zig").GraphAuthority,
     catalog_read: system_catalog.Read,
     catalog_export: void,
     catalog_export_standalone_portable: void,
     catalog_list_tables: system_catalog.TableList,
+    privacy_due_table: i64,
+    table_by_name: []const u8,
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,
     catalog_prepare: SystemCatalogCommand,

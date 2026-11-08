@@ -300,6 +300,11 @@ pub const Options = struct {
     secret_store: ?*common_secrets.FileStore = null,
     capability_cache: ?*remote_capabilities.Cache = null,
     execution: execution_context.Context = .{},
+    /// Node-level credential for `execution.default_endpoint`, normally an
+    /// unresolved `${secret:...}` reference. It is sent only when a request
+    /// resolves to that default endpoint and the reranker names no `api_key`
+    /// of its own; it resolves through `secret_store` per request.
+    inference_api_key: ?[]const u8 = null,
     runtime: ?*Runtime = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     execution_context: ?inference_request_context.RequestContext = null,
@@ -476,7 +481,12 @@ pub fn rerankContentWithOptions(
                 return scores;
             }
             const endpoint = resolved_endpoint orelse cfg.defaultedUrl();
-            var auth = try RequestAuthentication.init(alloc, cfg, options.secret_store);
+            // The node default credential belongs to the node default
+            // endpoint only: any other reranker URL never receives it.
+            var auth_cfg = cfg;
+            if (auth_cfg.api_key == null and execution_context.isDefaultEndpoint(endpoint, options.execution.default_endpoint))
+                auth_cfg.api_key = options.inference_api_key;
+            var auth = try RequestAuthentication.init(alloc, auth_cfg, options.secret_store);
             defer auth.deinit(alloc);
             const api_key = auth.token;
             var quota = try acquireQuotaForEndpoint(cfg, options, endpoint, auth.identity(cfg), "", "", policy);
@@ -756,6 +766,7 @@ fn rerankCohere(
     defer alloc.free(authorization);
     const headers = [_][2][]const u8{.{ "Authorization", authorization }};
     var response = try http.post(url, .{
+        .follow_redirects = false,
         .attempt_observer = observer,
         .json = body,
         .headers = &headers,

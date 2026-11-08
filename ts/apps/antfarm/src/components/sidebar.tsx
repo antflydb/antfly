@@ -216,6 +216,16 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                       <span>SQL workbench</span>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isPath("/graphs")}
+                      tooltip="Graphs"
+                      onClick={() => navigate("/graphs")}
+                    >
+                      <Network className="size-4" />
+                      <span>Graphs</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
                 </SidebarMenu>
 
                 <div className="px-2 pt-2 pb-1 group-data-[collapsible=icon]:hidden">
@@ -336,6 +346,18 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                     >
                       <FileInput className="size-4" />
                       <span>Manual Entry</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isTableSection("privacy")}
+                      tooltip="Privacy"
+                      disabled={!selectedTable}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateTableSection("privacy")}
+                    >
+                      <Shield className="size-4" />
+                      <span>Privacy</span>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                   <SidebarMenuItem>

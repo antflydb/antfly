@@ -23,6 +23,11 @@ const keys = @import("../internal_keys.zig");
 pub const max_mutations = 4096;
 pub const max_source_documents = 4096;
 pub const max_payload_bytes = 64 * 1024 * 1024;
+/// A public JSON document can devote almost its complete budget to its ID.
+/// Owner cursors additionally carry namespace/name bytes. Identity accounting
+/// is independent of the unchanged producer-value allowance.
+pub const max_cursor_bytes = @import("antfly_public_limits").max_request_body_bytes + 1024 * 1024;
+pub const max_identity_bytes = 4 * max_cursor_bytes + 4 * 1024 * 1024;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
 pub const Position = @import("receipt_position.zig").Position;
@@ -119,15 +124,15 @@ pub const BaselinePage = struct {
 
     pub fn validate(self: BaselinePage) !void {
         if (self.observed_term == 0 or self.observed_index == 0 or self.row_keys.len > 128 or
-            self.expected_cursor.len > 1024 * 1024 or self.next_cursor.len > 1024 * 1024 or self.upper_bound.len > 1024 * 1024 or
+            self.expected_cursor.len > max_cursor_bytes or self.next_cursor.len > max_cursor_bytes or self.upper_bound.len > max_cursor_bytes or
             std.mem.order(u8, self.next_cursor, self.upper_bound) == .gt)
             return error.InvalidBatchRequest;
         const order = std.mem.order(u8, self.next_cursor, self.expected_cursor);
         if (order == .lt or (!self.at_end and order != .gt)) return error.InvalidBatchRequest;
         var previous = self.expected_cursor;
-        var remaining: usize = 2 * 1024 * 1024;
+        var remaining: usize = if (self.row_keys.len == 1) @max(2 * 1024 * 1024, self.row_keys[0].len) else 2 * 1024 * 1024;
         for (self.row_keys) |key| {
-            if (!keys.isStoredSourceRowKey(key) or std.mem.order(u8, key, previous) != .gt or
+            if (key.len > max_cursor_bytes or !keys.isStoredSourceRowKey(key) or std.mem.order(u8, key, previous) != .gt or
                 std.mem.order(u8, key, self.next_cursor) == .gt) return error.InvalidBatchRequest;
             remaining = std.math.sub(usize, remaining, key.len) catch return error.InvalidBatchRequest;
             previous = key;
@@ -144,11 +149,14 @@ pub const ValidationPage = struct {
     repair_documents: []const []const u8,
 
     pub fn validate(self: ValidationPage) !void {
-        if (self.expected_cursor.len > 1024 * 1024 or self.next_cursor.len > 1024 * 1024 or self.repair_documents.len > 128) return error.InvalidBatchRequest;
+        if (self.expected_cursor.len > max_cursor_bytes or self.next_cursor.len > max_cursor_bytes or self.repair_documents.len > 128) return error.InvalidBatchRequest;
         const order = std.mem.order(u8, self.next_cursor, self.expected_cursor);
         if (order == .lt or (!self.at_end and order != .gt)) return error.InvalidBatchRequest;
-        var remaining: usize = 2 * 1024 * 1024;
-        for (self.repair_documents) |document| remaining = std.math.sub(usize, remaining, document.len) catch return error.InvalidBatchRequest;
+        var remaining: usize = if (self.repair_documents.len == 1) @max(2 * 1024 * 1024, self.repair_documents[0].len) else 2 * 1024 * 1024;
+        for (self.repair_documents) |document| {
+            if (document.len > max_cursor_bytes) return error.InvalidBatchRequest;
+            remaining = std.math.sub(usize, remaining, document.len) catch return error.InvalidBatchRequest;
+        }
     }
 };
 pub const CensusPage = struct {
@@ -159,7 +167,7 @@ pub const CensusPage = struct {
     before: Digest,
     after: Digest,
     pub fn validate(self: CensusPage) !void {
-        if (self.document_key.len == 0 or self.document_key.len > 1024 * 1024 or self.chunk_name.len == 0 or self.chunk_name.len > 1024 * 1024 or
+        if (self.document_key.len > max_cursor_bytes or self.chunk_name.len == 0 or self.chunk_name.len > 1024 * 1024 or
             self.visits == 0 or self.visits > 128 or self.bytes == 0 or self.bytes > 64 * 1024 or std.mem.eql(u8, &self.before, &self.after)) return error.InvalidBatchRequest;
     }
 };
@@ -175,7 +183,7 @@ pub const CompletionPage = struct {
     after: Digest,
     pub fn validate(self: CompletionPage) !void {
         if (self.group_producers and !@import("group_source_identity.zig").isAnchor(self.document_key)) return error.InvalidBatchRequest;
-        if (self.document_key.len == 0 or self.document_key.len > 1024 * 1024 or
+        if (self.document_key.len > max_cursor_bytes or
             self.visits == 0 or self.visits > 128 or self.bytes == 0 or self.bytes > 64 * 1024 or
             std.mem.eql(u8, &self.before, &self.after)) return error.InvalidBatchRequest;
     }
@@ -368,9 +376,9 @@ pub const Command = struct {
     /// codecs and catalog consumer authorization are checked by the owner too.
     pub fn validate(self: Command, alloc: std.mem.Allocator) !void {
         if (self.execution_identity != null) {
-            if (self.mode != .publish or self.producer_kind != .index or self.producer_scope_key.len != 0 or
-                self.sources.len != 1 or self.mutation_preconditions.len != 1 or self.mutations.len != 1 or
-                self.mutations[0].family != .base_vector or !std.mem.eql(u8, self.mutations[0].key, self.mutation_preconditions[0].key)) return error.InvalidBatchRequest;
+            if (self.mode != .publish or self.producer_kind != .index or
+                (self.producer_scope_key.len == 0 and self.sources.len != 1) or self.mutation_preconditions.len != 1 or self.mutations.len != 1 or
+                self.mutations[0].family != (if (self.producer_scope_key.len == 0) @as(@FieldType(Mutation, "family"), .base_vector) else @as(@FieldType(Mutation, "family"), .derived_vector)) or !std.mem.eql(u8, self.mutations[0].key, self.mutation_preconditions[0].key)) return error.InvalidBatchRequest;
         }
         if (self.authority_epoch == 0 or std.mem.allEqual(u8, &self.namespace, 0) or
             std.mem.allEqual(u8, &self.catalog_digest, 0)) return error.InvalidBatchRequest;
@@ -389,7 +397,7 @@ pub const Command = struct {
             if ((self.producer_kind != .index and self.producer_kind != .enrichment) or self.producer_generation == 0 or
                 self.producer_name.len == 0 or self.producer_name.len > 1024 * 1024 or
                 self.producer_artifact_name.len == 0 or self.producer_artifact_name.len > 1024 * 1024 or
-                self.producer_scope_key.len > 1024 * 1024 or self.sources.len != 0 or self.artifact_sources.len != 0 or
+                self.producer_scope_key.len > max_cursor_bytes or self.sources.len != 0 or self.artifact_sources.len != 0 or
                 self.mutation_preconditions.len != 0 or self.mutations.len != 0 or
                 !std.mem.eql(u8, &self.publication_digest, &self.digest())) return error.InvalidBatchRequest;
             if (self.producer_kind == .index) {
@@ -426,20 +434,21 @@ pub const Command = struct {
             std.mem.allEqual(u8, &self.namespace, 0) or
             std.mem.allEqual(u8, &self.catalog_digest, 0)) return error.InvalidBatchRequest;
         var remaining: usize = max_payload_bytes;
-        try consume(&remaining, self.producer_name.len);
-        try consume(&remaining, self.producer_artifact_name.len);
-        try consume(&remaining, self.producer_scope_key.len);
+        var identities: usize = max_identity_bytes;
+        try consume(&identities, self.producer_name.len);
+        try consume(&identities, self.producer_artifact_name.len);
+        try consume(&identities, self.producer_scope_key.len);
         try validateScopeGuard(alloc, self.producer_scope_key, self.artifact_sources);
         var documents: std.StringHashMapUnmanaged(void) = .empty;
         defer documents.deinit(alloc);
         for (self.sources, 0..) |source, source_order| {
-            if (source.document_key.len == 0) return error.InvalidBatchRequest;
+            if (source.document_key.len > max_cursor_bytes) return error.InvalidBatchRequest;
             if (source.exists) {
                 if (source.timestamp == 0) return error.InvalidBatchRequest;
             } else if (source.timestamp != 0 or !std.mem.allEqual(u8, &source.content_digest, 0) or source.input_position == null) return error.InvalidBatchRequest;
             if (source_order != 0 and std.mem.order(u8, self.sources[source_order - 1].document_key, source.document_key) != .lt) return error.InvalidBatchRequest;
             if (source.input_position) |position| position.requireNamespace(namespaceFromBytes(self.namespace)) catch return error.InvalidBatchRequest;
-            try consume(&remaining, source.document_key.len);
+            try consume(&identities, source.document_key.len);
             if ((try documents.getOrPut(alloc, source.document_key)).found_existing) return error.InvalidBatchRequest;
         }
         var mutations: std.StringHashMapUnmanaged(void) = .empty;
@@ -449,7 +458,7 @@ pub const Command = struct {
             for (guards, 0..) |source, source_order| {
                 if (source.source_index >= self.sources.len or !guardedArtifactKey(source.key)) return error.InvalidBatchRequest;
                 if (source_order != 0 and std.mem.order(u8, guards[source_order - 1].key, source.key) != .lt) return error.InvalidBatchRequest;
-                try consume(&remaining, source.key.len);
+                try consume(&identities, source.key.len);
                 if (source.input_position) |position| position.requireNamespace(namespaceFromBytes(self.namespace)) catch return error.InvalidBatchRequest;
                 if ((try mutations.getOrPut(alloc, source.key)).found_existing) return error.InvalidBatchRequest;
                 const document = try @import("artifact_publication_owner.zig").documentAlloc(alloc, source.key);
@@ -460,7 +469,7 @@ pub const Command = struct {
         mutations.clearRetainingCapacity();
         for (self.mutations) |mutation| {
             if (mutation.source_index >= self.sources.len or mutation.key.len == 0) return error.InvalidBatchRequest;
-            try consume(&remaining, mutation.key.len);
+            try consume(&identities, mutation.key.len);
             if (mutation.value) |value| try consume(&remaining, value.len);
             if ((try mutations.getOrPut(alloc, mutation.key)).found_existing) return error.InvalidBatchRequest;
             const document = try @import("artifact_publication_owner.zig").documentAlloc(alloc, mutation.key);
@@ -973,20 +982,53 @@ pub const UploadRecovery = struct {
 };
 
 pub const Dispatcher = struct {
+    const named = @import("../named_callback.zig");
+    const native = @import("antfly_runtime_abi").native_abi;
+    const RecoveryInvocation = struct {
+        io: native.IoBorrow,
+        now_ns: u64,
+        inventory: @FieldType(UploadRecoveryInvocation, "inventory"),
+        trigger: @FieldType(UploadRecoveryInvocation, "trigger"),
+    };
+    const RecoveryReceiver = *const fn (*anyopaque, @FieldType(UploadRecovery, "recover"), RecoveryInvocation) anyerror!bool;
+    const EnqueueCallback = *const fn (*anyopaque, Namespace, []const u8) anyerror!void;
+    const NativeCallbacks = struct { enqueue: EnqueueCallback, recover: RecoveryReceiver };
+    const NativeBoundary = named.Boundary(NativeCallbacks);
+    callback_dispatch: named.Dispatch = NativeBoundary.local_dispatch,
+    recovery_receiver: RecoveryReceiver = receiveRecovery,
+
     ptr: *anyopaque,
     /// Borrowed synchronous owner capability. Storage releases its snapshot
     /// before recovery; absence leaves external publication recovery inert.
     upload_recovery: ?UploadRecovery = null,
     /// No storage/apply lock may be held here. Success means bounded queue
     /// admission only; output remains pending until the local durable receipt.
-    enqueue: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,
+    enqueue: ?*const fn (*anyopaque, Namespace, []const u8) anyerror!void = null,
+    /// Compiled owner callbacks must transport stable semantic statuses.
+    /// Zig's process-local error integers cannot cross compilation units.
+    enqueue_status: ?*const fn (*anyopaque, *const Namespace, [*]const u8, usize) callconv(.c) @import("kernel_error_identity").Status = null,
 
+    pub fn enqueueCommand(self: Dispatcher, namespace: Namespace, command: []const u8) !void {
+        if (self.enqueue_status) |enqueue|
+            return @import("kernel_error_identity").statusToError(enqueue(self.ptr, &namespace, command.ptr, command.len));
+        const enqueue = self.enqueue orelse return error.ArtifactCatalogDrift;
+        return NativeBoundary.call("enqueue", self.callback_dispatch, enqueue, .{ self.ptr, namespace, command });
+    }
+
+    fn receiveRecovery(ptr: *anyopaque, callback: @FieldType(UploadRecovery, "recover"), invocation: RecoveryInvocation) !bool {
+        var receiver = try invocation.io.receive();
+        return callback(ptr, .{ .io = receiver.io(), .now_ns = invocation.now_ns, .inventory = invocation.inventory, .trigger = invocation.trigger });
+    }
+    pub fn recoverUploads(self: Dispatcher, invocation: UploadRecoveryInvocation) !bool {
+        const recovery = self.upload_recovery orelse return false;
+        return NativeBoundary.call("recover", self.callback_dispatch, self.recovery_receiver, .{ self.ptr, recovery.recover, RecoveryInvocation{ .io = native.IoBorrow.init(&invocation.io), .now_ns = invocation.now_ns, .inventory = invocation.inventory, .trigger = invocation.trigger } });
+    }
     /// Submit an already validated, bounded producer command. Queue/resource
     /// admission and leadership are transient control state, never evidence
     /// that inference failed or that this stream completed. Keep that boundary
     /// shared across asset, vector, graph and resolver callbacks.
     pub fn submit(self: Dispatcher, namespace: Namespace, command: []const u8) !void {
-        self.enqueue(self.ptr, namespace, command) catch |err| switch (err) {
+        self.enqueueCommand(namespace, command) catch |err| switch (err) {
             error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable, error.NotLeader => return error.ArtifactPublicationPending,
             error.Canceled => return error.EnrichmentRetryAborted,
             else => return err,
@@ -1014,6 +1056,30 @@ test "ordered artifact inventory producer dispatch backpressure is not terminal 
     try std.testing.expectError(error.OutOfMemory, dispatcher.submit(@splat(1), "bounded command"));
     harness.failure = error.InvalidBatchRequest;
     try std.testing.expectError(error.InvalidBatchRequest, dispatcher.submit(@splat(1), "bounded command"));
+}
+
+test "privacy publication callback carries stable backpressure statuses" {
+    const Identity = @import("kernel_error_identity");
+    const Capture = struct {
+        status: Identity.Status = .resource_limit_exceeded,
+        fn raw(_: *anyopaque, _: Namespace, _: []const u8) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+        fn stable(ptr: *anyopaque, _: *const Namespace, _: [*]const u8, _: usize) callconv(.c) Identity.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.status;
+        }
+    };
+    var capture: Capture = .{};
+    const dispatcher: Dispatcher = .{ .ptr = &capture, .enqueue = Capture.raw, .enqueue_status = Capture.stable };
+    try std.testing.expectError(error.ResourceLimitExceeded, dispatcher.enqueueCommand(@splat(1), "bounded"));
+    try std.testing.expectError(error.ArtifactPublicationPending, dispatcher.submit(@splat(1), "bounded"));
+    capture.status = .not_leader;
+    try std.testing.expectError(error.ArtifactPublicationPending, dispatcher.submit(@splat(1), "bounded"));
+    capture.status = .canceled;
+    try std.testing.expectError(error.EnrichmentRetryAborted, dispatcher.submit(@splat(1), "bounded"));
+    capture.status = .ok;
+    try dispatcher.submit(@splat(1), "bounded");
 }
 
 pub const PreparedEffects = struct {
@@ -1350,17 +1416,18 @@ test "ordered artifact inventory graph tombstones retain only exact empty owners
     try std.testing.expectError(error.InvalidBatchRequest, command.validate(alloc));
 }
 
-test "ordered artifact inventory publication projects every shared consumer and rejects another producer stream" {
+test "ordered artifact inventory publication projects every shared consumer and rejects another producer stream including privacy base vectors" {
     const alloc = std.testing.allocator;
     const Config = @import("types.zig").IndexConfig;
     const configs = [_]Config{
-        .{ .name = "first", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}", .coverage_generation = 7 },
+        .{ .name = "first", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}", .coverage_generation = 7 },
         .{ .name = "second", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}", .coverage_generation = 9 },
         .{ .name = "other", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"other-model\"}", .coverage_generation = 11 },
+        .{ .name = "legacy", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"legacy\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"legacy\"}}", .coverage_generation = 13 },
     };
     var catalog: std.ArrayList(u8) = .empty;
     defer catalog.deinit(alloc);
-    try catalog.appendSlice(alloc, "AIDX\x02\x00\x00\x00\x03\x00\x00\x00");
+    try catalog.appendSlice(alloc, "AIDX\x02\x00\x00\x00\x04\x00\x00\x00");
     for (configs) |config| {
         var length: [4]u8 = undefined;
         std.mem.writeInt(u32, &length, @intCast(config.name.len), .little);
@@ -1378,6 +1445,12 @@ test "ordered artifact inventory publication projects every shared consumer and 
         .indexes = catalog.items,
         .enrichments = "[{\"name\":\"model\",\"kind\":\"embedding\",\"source_field\":\"body\",\"expected_dims\":2},{\"name\":\"other-model\",\"kind\":\"embedding\",\"source_field\":\"other\",\"expected_dims\":2}]",
     };
+    // The public managed dense translator names its own output both on the
+    // index and its generator. That redundant name is not an external source;
+    // a genuinely different name must still fail admission.
+    var conflicting = configs[0];
+    conflicting.config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"other-model\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}";
+    try std.testing.expect(!try @import("catalog/index_manager.zig").onlineBaseGeneratedVectorConfig(alloc, conflicting, &.{}));
     const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
     defer alloc.free(key);
     const payload = try @import("enrichment/artifact_codec.zig").encodeDenseEmbeddingAlloc(alloc, 3, &.{ 1, 2 });
@@ -1394,6 +1467,17 @@ test "ordered artifact inventory publication projects every shared consumer and 
     command.producer_artifact_name = "other-model";
     command.publication_digest = command.digest();
     try std.testing.expectError(error.InvalidBatchRequest, prepareBaseVectors(alloc, command, catalogs));
+    const legacy_key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "legacy");
+    defer alloc.free(legacy_key);
+    command.producer_name = "legacy";
+    command.producer_generation = 13;
+    command.producer_artifact_name = "legacy";
+    command.mutations = &.{.{ .family = .base_vector, .key = legacy_key, .value = payload, .source_index = 0 }};
+    command.publication_digest = command.digest();
+    var legacy = try prepareBaseVectors(alloc, command, catalogs);
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(usize, 1), legacy.batch.dense_embeddings.len);
+    try std.testing.expectEqualStrings("legacy", legacy.batch.dense_embeddings[0].index_name);
 }
 
 test "ordered artifact inventory final materialization observes activation in its write snapshot" {
@@ -1524,4 +1608,44 @@ test "ordered artifact inventory publication coverage is point bounded idempoten
     try stageRejection(&txn, changed, 9, .stale_source);
     try stageReceipts(&txn, command, 10);
     try std.testing.expect((try rejected(&txn, changed)) != null);
+}
+
+test "ordered artifact inventory producer dispatch preserves foreign named failures" {
+    const Harness = struct {
+        fn enqueue(_: *anyopaque, _: Namespace, _: []const u8) !void {
+            return error.NotLeader;
+        }
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: *anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return Dispatcher.NativeBoundary.local_dispatch(contract, callback, args, output);
+        }
+    };
+    var context: u8 = 0;
+    const dispatcher: Dispatcher = .{ .ptr = &context, .enqueue = Harness.enqueue, .callback_dispatch = Harness.dispatch };
+    try std.testing.expectError(error.NotLeader, dispatcher.enqueueCommand(@splat(1), "control"));
+    try std.testing.expectError(error.ArtifactPublicationPending, dispatcher.submit(@splat(1), "output"));
+}
+
+test "privacy publication control pages admit one large key within bounded identity budgets" {
+    const a = std.testing.allocator;
+    const document = try a.alloc(u8, 5 * 1024 * 1024);
+    defer a.free(document);
+    @memset(document, 'x');
+    const physical = try keys.documentKeyAlloc(a, document);
+    defer a.free(physical);
+    const page = BaselinePage{ .observed_term = 1, .observed_index = 1, .expected_cursor = "", .next_cursor = physical, .upper_bound = physical, .row_keys = &.{physical}, .at_end = true };
+    try page.validate();
+    var too_many = page;
+    const second = try std.mem.concat(a, u8, &.{ physical, "z" });
+    defer a.free(second);
+    too_many.next_cursor = second;
+    too_many.upper_bound = second;
+    too_many.row_keys = &.{ physical, second };
+    try std.testing.expectError(error.InvalidBatchRequest, too_many.validate());
+    try (ValidationPage{ .mutation_epoch = 1, .expected_cursor = "", .next_cursor = "x", .at_end = true, .repair_documents = &.{document} }).validate();
+    try (CompletionPage{ .document_key = document, .visits = 1, .bytes = 1024, .before = @splat(1), .after = @splat(2) }).validate();
+    try (CensusPage{ .document_key = document, .chunk_name = "chunk", .visits = 1, .bytes = 1024, .before = @splat(1), .after = @splat(2) }).validate();
+    try (CompletionPage{ .document_key = "", .visits = 1, .bytes = 1024, .before = @splat(1), .after = @splat(2) }).validate();
+    try (CensusPage{ .document_key = "", .chunk_name = "chunk", .visits = 1, .bytes = 1024, .before = @splat(1), .after = @splat(2) }).validate();
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), max_payload_bytes);
+    try std.testing.expect(max_identity_bytes >= 4 * physical.len);
 }

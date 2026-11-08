@@ -287,12 +287,23 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .database_catalog_record import DatabaseCatalogRecord
 from .date_range_string_query import DateRangeStringQuery
+from .decider_cascade import DeciderCascade
+from .decider_cascade_budget import DeciderCascadeBudget
+from .decider_cascade_stage import DeciderCascadeStage
+from .decider_cascade_stage_on_failure import DeciderCascadeStageOnFailure
+from .decider_cascade_stage_when import DeciderCascadeStageWhen
 from .decider_config import DeciderConfig
 from .decider_config_decision_method import DeciderConfigDecisionMethod
 from .decider_config_embedding_options import DeciderConfigEmbeddingOptions
 from .decider_config_embedding_options_task_type import DeciderConfigEmbeddingOptionsTaskType
 from .decider_config_provider import DeciderConfigProvider
 from .decision_batch_item import DecisionBatchItem
+from .decision_cascade_agreement_status import DecisionCascadeAgreementStatus
+from .decision_cascade_stage_trace import DecisionCascadeStageTrace
+from .decision_cascade_stage_trace_decision_method import DecisionCascadeStageTraceDecisionMethod
+from .decision_cascade_stage_trace_provenance import DecisionCascadeStageTraceProvenance
+from .decision_cascade_trace import DecisionCascadeTrace
+from .decision_cascade_upstream_agreement import DecisionCascadeUpstreamAgreement
 from .decision_choice import DecisionChoice
 from .decision_choice_probability import DecisionChoiceProbability
 from .decision_evidence_image import DecisionEvidenceImage
@@ -309,6 +320,8 @@ from .decision_evidence_text_type import DecisionEvidenceTextType
 from .decision_input import DecisionInput
 from .decision_level import DecisionLevel
 from .decision_level_probability import DecisionLevelProbability
+from .decision_revision_dependency import DecisionRevisionDependency
+from .decision_revision_dependency_kind import DecisionRevisionDependencyKind
 from .decision_similarity import DecisionSimilarity
 from .decision_table_source import DecisionTableSource
 from .decision_table_source_filter_query import DecisionTableSourceFilterQuery
@@ -350,6 +363,7 @@ from .document_artifact_table_reprocess_response_reprocess_status import (
     DocumentArtifactTableReprocessResponseReprocessStatus,
 )
 from .document_extraction_config import DocumentExtractionConfig
+from .document_extraction_config_checksum_algorithm import DocumentExtractionConfigChecksumAlgorithm
 from .document_extraction_config_route_preset import DocumentExtractionConfigRoutePreset
 from .document_extraction_native_text_config import DocumentExtractionNativeTextConfig
 from .document_extraction_native_text_config_policy import DocumentExtractionNativeTextConfigPolicy
@@ -493,6 +507,7 @@ from .extraction_classification_schema import ExtractionClassificationSchema
 from .extraction_classification_schema_activation import ExtractionClassificationSchemaActivation
 from .extraction_classification_schema_label_definitions import ExtractionClassificationSchemaLabelDefinitions
 from .extraction_classification_schema_mode import ExtractionClassificationSchemaMode
+from .extraction_config import ExtractionConfig
 from .extraction_constraint_and import ExtractionConstraintAnd
 from .extraction_constraint_and_type import ExtractionConstraintAndType
 from .extraction_constraint_any_other_selected import ExtractionConstraintAnyOtherSelected
@@ -586,6 +601,7 @@ from .extraction_offset_unit import ExtractionOffsetUnit
 from .extraction_options import ExtractionOptions
 from .extraction_options_overlap import ExtractionOptionsOverlap
 from .extraction_options_word_splitter import ExtractionOptionsWordSplitter
+from .extraction_provider import ExtractionProvider
 from .extraction_reader_options import ExtractionReaderOptions
 from .extraction_record_metadata import ExtractionRecordMetadata
 from .extraction_record_metadata_anchor import ExtractionRecordMetadataAnchor
@@ -697,6 +713,22 @@ from .geo_shape_query import GeoShapeQuery
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
+from .get_namespace_table_privacy_response_403 import GetNamespaceTablePrivacyResponse403
+from .get_namespace_table_privacy_response_412 import GetNamespaceTablePrivacyResponse412
+from .get_namespace_table_privacy_response_422 import GetNamespaceTablePrivacyResponse422
+from .get_namespace_table_privacy_response_428 import GetNamespaceTablePrivacyResponse428
+from .get_namespace_table_privacy_scan_response_403 import GetNamespaceTablePrivacyScanResponse403
+from .get_namespace_table_privacy_scan_response_412 import GetNamespaceTablePrivacyScanResponse412
+from .get_namespace_table_privacy_scan_response_422 import GetNamespaceTablePrivacyScanResponse422
+from .get_namespace_table_privacy_scan_response_428 import GetNamespaceTablePrivacyScanResponse428
+from .get_table_privacy_response_403 import GetTablePrivacyResponse403
+from .get_table_privacy_response_412 import GetTablePrivacyResponse412
+from .get_table_privacy_response_422 import GetTablePrivacyResponse422
+from .get_table_privacy_response_428 import GetTablePrivacyResponse428
+from .get_table_privacy_scan_response_403 import GetTablePrivacyScanResponse403
+from .get_table_privacy_scan_response_412 import GetTablePrivacyScanResponse412
+from .get_table_privacy_scan_response_422 import GetTablePrivacyScanResponse422
+from .get_table_privacy_scan_response_428 import GetTablePrivacyScanResponse428
 from .get_table_storage_migration_response_200 import GetTableStorageMigrationResponse200
 from .global_stateful_query_request import GlobalStatefulQueryRequest
 from .global_stateful_query_request_source_ranking import GlobalStatefulQueryRequestSourceRanking
@@ -738,6 +770,9 @@ from .graph_bindings_result_kind import GraphBindingsResultKind
 from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
+from .graph_catalog_entry import GraphCatalogEntry
+from .graph_definition import GraphDefinition
+from .graph_definition_update import GraphDefinitionUpdate
 from .graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
 from .graph_distinct_budget_exceeded_error_dimension import GraphDistinctBudgetExceededErrorDimension
 from .graph_distinct_budget_exceeded_error_error import GraphDistinctBudgetExceededErrorError
@@ -782,6 +817,8 @@ from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 from .graph_k_shortest_paths import GraphKShortestPaths
 from .graph_k_shortest_paths_query import GraphKShortestPathsQuery
 from .graph_key_node_selector import GraphKeyNodeSelector
+from .graph_label_mapping import GraphLabelMapping
+from .graph_label_mapping_where import GraphLabelMappingWhere
 from .graph_match import GraphMatch
 from .graph_match_edge import GraphMatchEdge
 from .graph_match_node import GraphMatchNode
@@ -842,15 +879,23 @@ from .graph_path_weight_domain_error_violation import GraphPathWeightDomainError
 from .graph_paths_result import GraphPathsResult
 from .graph_paths_result_kind import GraphPathsResultKind
 from .graph_queries import GraphQueries
+from .graph_query_limits import GraphQueryLimits
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
+from .graph_query_request import GraphQueryRequest
+from .graph_query_request_parameters import GraphQueryRequestParameters
+from .graph_query_result import GraphQueryResult
+from .graph_query_result_plan_item import GraphQueryResultPlanItem
+from .graph_query_result_wire_version import GraphQueryResultWireVersion
 from .graph_query_results import GraphQueryResults
+from .graph_query_stats import GraphQueryStats
 from .graph_query_type import GraphQueryType
 from .graph_query_unsupported_error import GraphQueryUnsupportedError
 from .graph_query_unsupported_error_error import GraphQueryUnsupportedErrorError
 from .graph_query_unsupported_error_reason import GraphQueryUnsupportedErrorReason
 from .graph_query_unsupported_error_status import GraphQueryUnsupportedErrorStatus
 from .graph_relationship_filter import GraphRelationshipFilter
+from .graph_relationship_mapping import GraphRelationshipMapping
 from .graph_relationship_property_predicate import GraphRelationshipPropertyPredicate
 from .graph_relationship_property_predicate_op import GraphRelationshipPropertyPredicateOp
 from .graph_relationship_property_predicate_value_type import GraphRelationshipPropertyPredicateValueType
@@ -887,10 +932,15 @@ from .graph_ttl_config import GraphTtlConfig
 from .graph_where_and import GraphWhereAnd
 from .graph_where_not_equal import GraphWhereNotEqual
 from .graph_where_not_exists import GraphWhereNotExists
+from .graph_wire_value import GraphWireValue
+from .graph_wire_value_type import GraphWireValueType
 from .graph_work_budget_exceeded_error import GraphWorkBudgetExceededError
 from .graph_work_budget_exceeded_error_dimension import GraphWorkBudgetExceededErrorDimension
 from .graph_work_budget_exceeded_error_error import GraphWorkBudgetExceededErrorError
 from .graph_work_budget_exceeded_error_status import GraphWorkBudgetExceededErrorStatus
+from .graph_write_receipt import GraphWriteReceipt
+from .graph_write_receipt_outcome_type_0 import GraphWriteReceiptOutcomeType0
+from .graph_write_receipt_status import GraphWriteReceiptStatus
 from .ground_truth import GroundTruth
 from .grouped_artifact_source import GroupedArtifactSource
 from .grouped_artifact_source_filter import GroupedArtifactSourceFilter
@@ -1243,8 +1293,16 @@ from .linkup_search_config_output_type import LinkupSearchConfigOutputType
 from .linkup_search_config_provider import LinkupSearchConfigProvider
 from .list_chat_gpt_models_response_200 import ListChatGPTModelsResponse200
 from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
+from .list_namespace_table_privacy_findings_response_403 import ListNamespaceTablePrivacyFindingsResponse403
+from .list_namespace_table_privacy_findings_response_412 import ListNamespaceTablePrivacyFindingsResponse412
+from .list_namespace_table_privacy_findings_response_422 import ListNamespaceTablePrivacyFindingsResponse422
+from .list_namespace_table_privacy_findings_response_428 import ListNamespaceTablePrivacyFindingsResponse428
 from .list_restore_jobs_phase import ListRestoreJobsPhase
 from .list_restore_jobs_scope import ListRestoreJobsScope
+from .list_table_privacy_findings_response_403 import ListTablePrivacyFindingsResponse403
+from .list_table_privacy_findings_response_412 import ListTablePrivacyFindingsResponse412
+from .list_table_privacy_findings_response_422 import ListTablePrivacyFindingsResponse422
+from .list_table_privacy_findings_response_428 import ListTablePrivacyFindingsResponse428
 from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_consistency import LookupKeyConsistency
 from .lookup_key_response_200 import LookupKeyResponse200
@@ -1977,7 +2035,41 @@ from .predicate_decision_question import PredicateDecisionQuestion
 from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
 from .prepare_native_kv_checkpoint_x_antfly_kv_encoding import PrepareNativeKvCheckpointXAntflyKVEncoding
+from .preview_namespace_table_privacy_response_403 import PreviewNamespaceTablePrivacyResponse403
+from .preview_namespace_table_privacy_response_412 import PreviewNamespaceTablePrivacyResponse412
+from .preview_namespace_table_privacy_response_422 import PreviewNamespaceTablePrivacyResponse422
+from .preview_namespace_table_privacy_response_428 import PreviewNamespaceTablePrivacyResponse428
+from .preview_table_privacy_response_403 import PreviewTablePrivacyResponse403
+from .preview_table_privacy_response_412 import PreviewTablePrivacyResponse412
+from .preview_table_privacy_response_422 import PreviewTablePrivacyResponse422
+from .preview_table_privacy_response_428 import PreviewTablePrivacyResponse428
 from .prior_artifact_context import PriorArtifactContext
+from .privacy_category import PrivacyCategory
+from .privacy_finding import PrivacyFinding
+from .privacy_findings_page import PrivacyFindingsPage
+from .privacy_findings_request import PrivacyFindingsRequest
+from .privacy_policy import PrivacyPolicy
+from .privacy_policy_category_groups_item import PrivacyPolicyCategoryGroupsItem
+from .privacy_policy_execution import PrivacyPolicyExecution
+from .privacy_policy_mode import PrivacyPolicyMode
+from .privacy_policy_replacement import PrivacyPolicyReplacement
+from .privacy_policy_sensitivity import PrivacyPolicySensitivity
+from .privacy_preview import PrivacyPreview
+from .privacy_preview_documents_item import PrivacyPreviewDocumentsItem
+from .privacy_preview_documents_item_fields_item import PrivacyPreviewDocumentsItemFieldsItem
+from .privacy_preview_request import PrivacyPreviewRequest
+from .privacy_preview_request_sample import PrivacyPreviewRequestSample
+from .privacy_producer import PrivacyProducer
+from .privacy_producer_type import PrivacyProducerType
+from .privacy_scan import PrivacyScan
+from .privacy_scan_failures_type_0_item import PrivacyScanFailuresType0Item
+from .privacy_scan_phase import PrivacyScanPhase
+from .privacy_scan_request import PrivacyScanRequest
+from .privacy_status import PrivacyStatus
+from .privacy_status_coverage import PrivacyStatusCoverage
+from .privacy_status_coverage_categories import PrivacyStatusCoverageCategories
+from .privacy_status_coverage_failures_item import PrivacyStatusCoverageFailuresItem
+from .privacy_status_coverage_fields import PrivacyStatusCoverageFields
 from .projection_expression import ProjectionExpression
 from .projection_expression_case_item import ProjectionExpressionCaseItem
 from .projection_expression_cast import ProjectionExpressionCast
@@ -2030,6 +2122,14 @@ from .provenance_origin_trace_type_0_kind import ProvenanceOriginTraceType0Kind
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
+from .put_namespace_table_privacy_response_403 import PutNamespaceTablePrivacyResponse403
+from .put_namespace_table_privacy_response_412 import PutNamespaceTablePrivacyResponse412
+from .put_namespace_table_privacy_response_422 import PutNamespaceTablePrivacyResponse422
+from .put_namespace_table_privacy_response_428 import PutNamespaceTablePrivacyResponse428
+from .put_table_privacy_response_403 import PutTablePrivacyResponse403
+from .put_table_privacy_response_412 import PutTablePrivacyResponse412
+from .put_table_privacy_response_422 import PutTablePrivacyResponse422
+from .put_table_privacy_response_428 import PutTablePrivacyResponse428
 from .quantization_refine import QuantizationRefine
 from .query_admission_config import QueryAdmissionConfig
 from .query_builder_request import QueryBuilderRequest
@@ -2073,6 +2173,10 @@ from .query_hit_source import QueryHitSource
 from .query_hits import QueryHits
 from .query_hits_total import QueryHitsTotal
 from .query_hits_total_relation import QueryHitsTotalRelation
+from .query_namespace_table_privacy_findings_response_403 import QueryNamespaceTablePrivacyFindingsResponse403
+from .query_namespace_table_privacy_findings_response_412 import QueryNamespaceTablePrivacyFindingsResponse412
+from .query_namespace_table_privacy_findings_response_422 import QueryNamespaceTablePrivacyFindingsResponse422
+from .query_namespace_table_privacy_findings_response_428 import QueryNamespaceTablePrivacyFindingsResponse428
 from .query_profile import QueryProfile
 from .query_profile_value_verification import QueryProfileValueVerification
 from .query_profile_value_verification_plans_item import QueryProfileValueVerificationPlansItem
@@ -2096,6 +2200,10 @@ from .query_result_base_source_ranking import QueryResultBaseSourceRanking
 from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
+from .query_table_privacy_findings_response_403 import QueryTablePrivacyFindingsResponse403
+from .query_table_privacy_findings_response_412 import QueryTablePrivacyFindingsResponse412
+from .query_table_privacy_findings_response_422 import QueryTablePrivacyFindingsResponse422
+from .query_table_privacy_findings_response_428 import QueryTablePrivacyFindingsResponse428
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
 from .query_temporarily_unavailable_error_code import QueryTemporarilyUnavailableErrorCode
 from .rate_limit_config import RateLimitConfig
@@ -2357,6 +2465,16 @@ from .sse_step_progress import SSEStepProgress
 from .sse_step_started import SSEStepStarted
 from .sse_tool_mode import SSEToolMode
 from .sse_tool_mode_mode import SSEToolModeMode
+from .start_namespace_table_privacy_scan_response_403 import StartNamespaceTablePrivacyScanResponse403
+from .start_namespace_table_privacy_scan_response_409 import StartNamespaceTablePrivacyScanResponse409
+from .start_namespace_table_privacy_scan_response_412 import StartNamespaceTablePrivacyScanResponse412
+from .start_namespace_table_privacy_scan_response_422 import StartNamespaceTablePrivacyScanResponse422
+from .start_namespace_table_privacy_scan_response_428 import StartNamespaceTablePrivacyScanResponse428
+from .start_table_privacy_scan_response_403 import StartTablePrivacyScanResponse403
+from .start_table_privacy_scan_response_409 import StartTablePrivacyScanResponse409
+from .start_table_privacy_scan_response_412 import StartTablePrivacyScanResponse412
+from .start_table_privacy_scan_response_422 import StartTablePrivacyScanResponse422
+from .start_table_privacy_scan_response_428 import StartTablePrivacyScanResponse428
 from .stateful_graph_query_results import StatefulGraphQueryResults
 from .stateful_query_request import StatefulQueryRequest
 from .stateful_query_request_expand_strategy import StatefulQueryRequestExpandStrategy
@@ -2833,12 +2951,23 @@ __all__ = (
     "DataShapeDecl",
     "DataShapeKind",
     "DateRangeStringQuery",
+    "DeciderCascade",
+    "DeciderCascadeBudget",
+    "DeciderCascadeStage",
+    "DeciderCascadeStageOnFailure",
+    "DeciderCascadeStageWhen",
     "DeciderConfig",
     "DeciderConfigDecisionMethod",
     "DeciderConfigEmbeddingOptions",
     "DeciderConfigEmbeddingOptionsTaskType",
     "DeciderConfigProvider",
     "DecisionBatchItem",
+    "DecisionCascadeAgreementStatus",
+    "DecisionCascadeStageTrace",
+    "DecisionCascadeStageTraceDecisionMethod",
+    "DecisionCascadeStageTraceProvenance",
+    "DecisionCascadeTrace",
+    "DecisionCascadeUpstreamAgreement",
     "DecisionChoice",
     "DecisionChoiceProbability",
     "DecisionEvidenceImage",
@@ -2855,6 +2984,8 @@ __all__ = (
     "DecisionInput",
     "DecisionLevel",
     "DecisionLevelProbability",
+    "DecisionRevisionDependency",
+    "DecisionRevisionDependencyKind",
     "DecisionSimilarity",
     "DecisionTableSource",
     "DecisionTableSourceFilterQuery",
@@ -2894,6 +3025,7 @@ __all__ = (
     "DocumentArtifactTableReprocessResponseReprocess",
     "DocumentArtifactTableReprocessResponseReprocessStatus",
     "DocumentExtractionConfig",
+    "DocumentExtractionConfigChecksumAlgorithm",
     "DocumentExtractionConfigRoutePreset",
     "DocumentExtractionNativeTextConfig",
     "DocumentExtractionNativeTextConfigPolicy",
@@ -3037,6 +3169,7 @@ __all__ = (
     "ExtractionClassificationSchemaActivation",
     "ExtractionClassificationSchemaLabelDefinitions",
     "ExtractionClassificationSchemaMode",
+    "ExtractionConfig",
     "ExtractionConstraintAnd",
     "ExtractionConstraintAndType",
     "ExtractionConstraintAnyOtherSelected",
@@ -3124,6 +3257,7 @@ __all__ = (
     "ExtractionOptions",
     "ExtractionOptionsOverlap",
     "ExtractionOptionsWordSplitter",
+    "ExtractionProvider",
     "ExtractionReaderOptions",
     "ExtractionRecordMetadata",
     "ExtractionRecordMetadataAnchor",
@@ -3235,6 +3369,22 @@ __all__ = (
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
     "GetDocumentArtifactManifestDetail",
+    "GetNamespaceTablePrivacyResponse403",
+    "GetNamespaceTablePrivacyResponse412",
+    "GetNamespaceTablePrivacyResponse422",
+    "GetNamespaceTablePrivacyResponse428",
+    "GetNamespaceTablePrivacyScanResponse403",
+    "GetNamespaceTablePrivacyScanResponse412",
+    "GetNamespaceTablePrivacyScanResponse422",
+    "GetNamespaceTablePrivacyScanResponse428",
+    "GetTablePrivacyResponse403",
+    "GetTablePrivacyResponse412",
+    "GetTablePrivacyResponse422",
+    "GetTablePrivacyResponse428",
+    "GetTablePrivacyScanResponse403",
+    "GetTablePrivacyScanResponse412",
+    "GetTablePrivacyScanResponse422",
+    "GetTablePrivacyScanResponse428",
     "GetTableStorageMigrationResponse200",
     "GlobalStatefulQueryRequest",
     "GlobalStatefulQueryRequestSourceRanking",
@@ -3276,6 +3426,9 @@ __all__ = (
     "GraphBindingsReturn",
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
+    "GraphCatalogEntry",
+    "GraphDefinition",
+    "GraphDefinitionUpdate",
     "GraphDistinctBudgetExceededError",
     "GraphDistinctBudgetExceededErrorDimension",
     "GraphDistinctBudgetExceededErrorError",
@@ -3320,6 +3473,8 @@ __all__ = (
     "GraphKeyNodeSelector",
     "GraphKShortestPaths",
     "GraphKShortestPathsQuery",
+    "GraphLabelMapping",
+    "GraphLabelMappingWhere",
     "GraphMatch",
     "GraphMatchEdge",
     "GraphMatchNode",
@@ -3380,15 +3535,23 @@ __all__ = (
     "GraphPathWeightDomainErrorStatus",
     "GraphPathWeightDomainErrorViolation",
     "GraphQueries",
+    "GraphQueryLimits",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",
+    "GraphQueryRequest",
+    "GraphQueryRequestParameters",
+    "GraphQueryResult",
+    "GraphQueryResultPlanItem",
     "GraphQueryResults",
+    "GraphQueryResultWireVersion",
+    "GraphQueryStats",
     "GraphQueryType",
     "GraphQueryUnsupportedError",
     "GraphQueryUnsupportedErrorError",
     "GraphQueryUnsupportedErrorReason",
     "GraphQueryUnsupportedErrorStatus",
     "GraphRelationshipFilter",
+    "GraphRelationshipMapping",
     "GraphRelationshipPropertyPredicate",
     "GraphRelationshipPropertyPredicateOp",
     "GraphRelationshipPropertyPredicateValueType",
@@ -3425,10 +3588,15 @@ __all__ = (
     "GraphWhereAnd",
     "GraphWhereNotEqual",
     "GraphWhereNotExists",
+    "GraphWireValue",
+    "GraphWireValueType",
     "GraphWorkBudgetExceededError",
     "GraphWorkBudgetExceededErrorDimension",
     "GraphWorkBudgetExceededErrorError",
     "GraphWorkBudgetExceededErrorStatus",
+    "GraphWriteReceipt",
+    "GraphWriteReceiptOutcomeType0",
+    "GraphWriteReceiptStatus",
     "GroundTruth",
     "GroupedArtifactSource",
     "GroupedArtifactSourceFilter",
@@ -3781,8 +3949,16 @@ __all__ = (
     "LinkupSearchConfigProvider",
     "ListChatGPTModelsResponse200",
     "ListDocumentArtifactManifestsDetail",
+    "ListNamespaceTablePrivacyFindingsResponse403",
+    "ListNamespaceTablePrivacyFindingsResponse412",
+    "ListNamespaceTablePrivacyFindingsResponse422",
+    "ListNamespaceTablePrivacyFindingsResponse428",
     "ListRestoreJobsPhase",
     "ListRestoreJobsScope",
+    "ListTablePrivacyFindingsResponse403",
+    "ListTablePrivacyFindingsResponse412",
+    "ListTablePrivacyFindingsResponse422",
+    "ListTablePrivacyFindingsResponse428",
     "ListUsersResponse200Item",
     "LookupKeyConsistency",
     "LookupKeyResponse200",
@@ -4301,7 +4477,41 @@ __all__ = (
     "PredicateDecisionQuestionType",
     "PrefixQuery",
     "PrepareNativeKvCheckpointXAntflyKVEncoding",
+    "PreviewNamespaceTablePrivacyResponse403",
+    "PreviewNamespaceTablePrivacyResponse412",
+    "PreviewNamespaceTablePrivacyResponse422",
+    "PreviewNamespaceTablePrivacyResponse428",
+    "PreviewTablePrivacyResponse403",
+    "PreviewTablePrivacyResponse412",
+    "PreviewTablePrivacyResponse422",
+    "PreviewTablePrivacyResponse428",
     "PriorArtifactContext",
+    "PrivacyCategory",
+    "PrivacyFinding",
+    "PrivacyFindingsPage",
+    "PrivacyFindingsRequest",
+    "PrivacyPolicy",
+    "PrivacyPolicyCategoryGroupsItem",
+    "PrivacyPolicyExecution",
+    "PrivacyPolicyMode",
+    "PrivacyPolicyReplacement",
+    "PrivacyPolicySensitivity",
+    "PrivacyPreview",
+    "PrivacyPreviewDocumentsItem",
+    "PrivacyPreviewDocumentsItemFieldsItem",
+    "PrivacyPreviewRequest",
+    "PrivacyPreviewRequestSample",
+    "PrivacyProducer",
+    "PrivacyProducerType",
+    "PrivacyScan",
+    "PrivacyScanFailuresType0Item",
+    "PrivacyScanPhase",
+    "PrivacyScanRequest",
+    "PrivacyStatus",
+    "PrivacyStatusCoverage",
+    "PrivacyStatusCoverageCategories",
+    "PrivacyStatusCoverageFailuresItem",
+    "PrivacyStatusCoverageFields",
     "ProjectionExpression",
     "ProjectionExpressionCaseItem",
     "ProjectionExpressionCast",
@@ -4352,6 +4562,14 @@ __all__ = (
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",
+    "PutNamespaceTablePrivacyResponse403",
+    "PutNamespaceTablePrivacyResponse412",
+    "PutNamespaceTablePrivacyResponse422",
+    "PutNamespaceTablePrivacyResponse428",
+    "PutTablePrivacyResponse403",
+    "PutTablePrivacyResponse412",
+    "PutTablePrivacyResponse422",
+    "PutTablePrivacyResponse428",
     "QuantizationRefine",
     "QueryAdmissionConfig",
     "QueryBuilderRequest",
@@ -4395,6 +4613,10 @@ __all__ = (
     "QueryHitSource",
     "QueryHitsTotal",
     "QueryHitsTotalRelation",
+    "QueryNamespaceTablePrivacyFindingsResponse403",
+    "QueryNamespaceTablePrivacyFindingsResponse412",
+    "QueryNamespaceTablePrivacyFindingsResponse422",
+    "QueryNamespaceTablePrivacyFindingsResponse428",
     "QueryProfile",
     "QueryProfileValueVerification",
     "QueryProfileValueVerificationPlansItem",
@@ -4418,6 +4640,10 @@ __all__ = (
     "QueryScoreDetails",
     "QueryStrategy",
     "QueryStringQuery",
+    "QueryTablePrivacyFindingsResponse403",
+    "QueryTablePrivacyFindingsResponse412",
+    "QueryTablePrivacyFindingsResponse422",
+    "QueryTablePrivacyFindingsResponse428",
     "QueryTemporarilyUnavailableError",
     "QueryTemporarilyUnavailableErrorCode",
     "RateLimitConfig",
@@ -4679,6 +4905,16 @@ __all__ = (
     "SSEStepStarted",
     "SSEToolMode",
     "SSEToolModeMode",
+    "StartNamespaceTablePrivacyScanResponse403",
+    "StartNamespaceTablePrivacyScanResponse409",
+    "StartNamespaceTablePrivacyScanResponse412",
+    "StartNamespaceTablePrivacyScanResponse422",
+    "StartNamespaceTablePrivacyScanResponse428",
+    "StartTablePrivacyScanResponse403",
+    "StartTablePrivacyScanResponse409",
+    "StartTablePrivacyScanResponse412",
+    "StartTablePrivacyScanResponse422",
+    "StartTablePrivacyScanResponse428",
     "StatefulGraphQueryResults",
     "StatefulQueryRequest",
     "StatefulQueryRequestExpandStrategy",

@@ -474,7 +474,7 @@ pub const Replay = struct {
             };
             var vector = column;
             // JSON source columns are serialized bytes in the replay contract.
-            if (vector.values == .json) vector.values = .{ .bytes = vector.values.json };
+            if (column.values == .json) vector.values = .{ .bytes = column.values.json };
             return .{ .vector = vector, .range = .{ .count = column.rowCount() }, .kind = kind, .element = if (kind == .number) .float64 else null };
         }
         pub fn identity(raw: *anyopaque, row: usize, ordinal: usize) !?u64 {

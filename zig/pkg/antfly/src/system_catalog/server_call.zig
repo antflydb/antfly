@@ -53,6 +53,10 @@ pub const RelationSchemaMutation = struct {
     }
 };
 
+/// An authoritative binding check for a graph already admitted by ingress.
+/// Each call observes a fresh catalog cut, including projection replacement.
+pub const GraphAuthority = struct { name: []const u8, graph_id: u64 };
+pub const GraphAuthorityResult = struct { present: bool };
 pub const Call = union(enum) {
     resolver_authority_mutate: @import("../metadata/resolver_authority.zig").Write,
     lake_index_lifecycle_read: u64,
@@ -102,12 +106,16 @@ pub const Call = union(enum) {
     list_tables: TableList,
     export_snapshot: void,
     read: Read,
+    graph_authority: GraphAuthority,
     snapshot: void,
     resolve: Target,
     resolve_many: ResolveMany,
     relation_replace: RelationReplacement,
     relation_schema_mutate: RelationSchemaMutation,
     query_definition: []const u8,
+    /// Current physical definition, including runtime progress. This private
+    /// point read is deliberately independent of semantic catalog caches.
+    table_record_read: []const u8,
     /// Private body-bound native service provisioning. Old metadata peers
     /// reject this tag before any table or private source is published.
     native_memory_create: Request,
@@ -253,4 +261,10 @@ test "SQL pgwire native completion mutations require administrative grant and mu
     const read: Call = .{ .sql_completion_reference = @splat(1) };
     try std.testing.expect(read.requiresSettingAuthorityReadGrant());
     try std.testing.expect(!read.isMutation());
+}
+
+test "privacy table record transport is a service read without mutation authority" {
+    const read: Call = .{ .table_record_read = "private" };
+    try std.testing.expect(!read.isMutation());
+    try std.testing.expect(!read.requiresAdministrativeGrant());
 }

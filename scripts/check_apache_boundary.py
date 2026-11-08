@@ -78,6 +78,8 @@ SOURCE_MODULES = {
     "engine_errors": ("zig/pkg/inference/src/host/engine_errors.zig",),
     "engine_memory": ("zig/lib/runtime/src/runtime_memory_abi.zig",),
     "sql_parser": ("zig/lib/sql/root.zig",),
+    "cypher": ("zig/lib/cypher/root.zig",),
+    "cypher_regex_capture": ("zig/lib/regex/src/captures.zig",),
     "antfly_public_server_openapi": (
         "zig/pkg/antfly-server-api/src/openapi/generated/antfly_public_server_openapi/root.zig",
     ),
@@ -173,7 +175,6 @@ SOURCE_MODULES = {
     "antfly_decision_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig",
     ),
-    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_document_runs": ("zig/lib/readers/src/document_runs.zig",),
     "antfly_embeddings_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_embeddings_openapi/root.zig",
@@ -244,6 +245,9 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_logging_openapi/root.zig",
     ),
     "antfly_matcher": ("zig/pkg/antfly-embedded/matcher/src/mod.zig",),
+    "antfly_privacy_openapi": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_privacy_openapi/root.zig",
+    ),
     "antfly_metadata_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_metadata_openapi/root.zig",
     ),
@@ -251,7 +255,6 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_middleware_openapi/root.zig",
     ),
     "antfly_pdf": ("zig/lib/pdf/src/mod.zig",),
-    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_platform": ("zig/lib/platform/src/root.zig",),
     "antfly_provider_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_provider_openapi/root.zig",
@@ -262,7 +265,6 @@ SOURCE_MODULES = {
     "antfly_query_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_query_openapi/root.zig",
     ),
-    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_reader_config": ("zig/lib/readers/src/config.zig",),
     "antfly_readers": ("zig/lib/readers/src/mod.zig",),
     "antfly_regex": ("zig/lib/regex/src/mod.zig",),

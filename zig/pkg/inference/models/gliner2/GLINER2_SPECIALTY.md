@@ -76,8 +76,12 @@ Final moderation verdict aggregation remains caller-owned.
 ## Limits and execution
 
 - At most 512 prepared tokens per item, including schema and special tokens.
-- Oversized items, automatic task splitting, and long-document windowing are
-  rejected for these profiles. Empty or whitespace-only content is invalid.
+- Oversized items are rejected unless PII explicitly requests
+  `options.long_document.mode: "window"`. That route bounds each document to
+  64 windows, admits the exact composed tokens for every window, and rebases
+  entity spans into the original source. Compatible windows use GPU batches
+  of up to eight; CPU remains serial. GLiGuard rejects long-document windowing.
+  Empty or whitespace-only content is invalid.
 - GLiGuard uses Metal physical batches of up to eight rows; larger admitted
   requests are chunked while preserving item and task order.
 - Entity-only PII uses physical Metal batches of up to eight rows, with padded

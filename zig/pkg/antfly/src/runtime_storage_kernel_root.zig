@@ -84,6 +84,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageContextAttachInferenceProvider, "antfly_storage_context_attach_inference_provider");
     exportInternal(&storage_kernel_exports.storageOwnerContextConfigureSecrets, "antfly_storage_context_configure_secrets");
     exportInternal(&storage_kernel_exports.storageOwnerContextConfigureNativeQueries, "antfly_storage_context_configure_native_queries");
+    exportInternal(&storage_kernel_exports.storageOwnerContextConfigureInferenceDefaults, "antfly_storage_context_configure_inference_defaults");
     exportInternal(&storage_kernel_exports.storageOwnerContextConfigureRemoteContentSource, "antfly_storage_context_configure_remote_content_source");
     exportInternal(&storage_kernel_exports.storageOwnerContextConfigureRemoteContentSecurity, "antfly_storage_context_configure_remote_content_security");
     exportInternal(&storage_kernel_exports.storageOwnerContextMetrics, "antfly_storage_context_metrics");
@@ -123,6 +124,9 @@ comptime {
     exportInternal(&storage_kernel_exports.metadataApplyPreparedSnapshotCancel, "antfly_metadata_apply_prepared_snapshot_cancel");
     exportInternal(&storage_kernel_exports.metadataApplyPreparedSnapshotDestroy, "antfly_metadata_apply_prepared_snapshot_destroy");
     exportInternal(&storage_kernel_exports.metadataApplyStoreProjection, "antfly_metadata_apply_store_projection");
+    exportInternal(&storage_kernel_exports.metadataSessionReadOpen, "antfly_metadata_session_read_open");
+    exportInternal(&storage_kernel_exports.metadataSessionReadInvoke, "antfly_metadata_session_read_invoke");
+    exportInternal(&storage_kernel_exports.metadataSessionReadClose, "antfly_metadata_session_read_close");
     exportInternal(&storage_kernel_exports.metadataApplyStoreBindHotStandby, "antfly_metadata_apply_store_bind_ha");
     exportInternal(&storage_kernel_exports.metadataApplyStoreAddListeners, "antfly_metadata_apply_store_add_listeners");
     exportInternal(&storage_kernel_exports.metadataApplyStoreRemoveListeners, "antfly_metadata_apply_store_remove_listeners");

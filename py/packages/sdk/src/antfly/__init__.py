@@ -8,6 +8,7 @@ from .client import (
     CreateIndexRequest,
     EmbedderConfig,
     EmbedderProvider,
+    GraphExecutionError,
     GraphQueriesInput,
     GraphQueryInput,
     IndexEmbedderConfig,
@@ -45,6 +46,16 @@ from .client_generated.models import (
     CurationProposalState,
     DerivedCoveragePolicy,
     DistanceMetric,
+    GraphCatalogEntry,
+    GraphDefinition,
+    GraphLabelMapping,
+    GraphQueryLimits,
+    GraphQueryRequest,
+    GraphQueryResult,
+    GraphQueryStats,
+    GraphRelationshipMapping,
+    GraphWireValue,
+    GraphWriteReceipt,
     EntityDistinctRequest,
     EntitySuppressRequest,
     EntitySuppressRequestAbsorbed,
@@ -143,6 +154,20 @@ __version__ = "0.2.1"
 from .read_requirements import read_after_write
 
 __all__ = [
+    "GraphCatalogEntry",
+    "GraphDefinition",
+    "GraphLabelMapping",
+    "GraphRelationshipMapping",
+    "GraphQueryRequest",
+    "GraphQueryResult",
+    "GraphQueryLimits",
+    "GraphQueryStats",
+    "GraphWireValue",
+    "GraphWriteReceipt",
+    "GraphExecutionError",
+    "GraphOperations",
+    "encode_graph_parameter",
+    "decode_graph_value",
     "NativeKvCheckpoint",
     "CurationOriginOrigin",
     "CurationProposalAction",
@@ -270,6 +295,7 @@ __all__ = [
     "__version__",
 ]
 
+from .cypher import GraphOperations, decode_graph_value, encode_graph_parameter
 from .client_generated.models import (
     EntityConsumerProgressPage,
     EntityCurationResult,

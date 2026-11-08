@@ -7,6 +7,7 @@ const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_generating_api_openapi = @import("antfly_generating_api_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
+const antfly_privacy_openapi = @import("antfly_privacy_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
 const antfly_sort_openapi = @import("antfly_sort_openapi");
@@ -4862,6 +4863,50 @@ pub const GraphAnchorFilterRequiresIndexError = struct {
     retryable: bool,
 };
 
+pub const GraphCatalogEntry = struct {
+    /// Opaque decimal catalog identity
+    graph_id: []const u8,
+    /// Lossless decimal definition revision used for conditional updates
+    revision: []const u8,
+    name: []const u8,
+    definition: GraphDefinition,
+};
+
+pub const GraphDefinition = struct {
+    labels: []const GraphLabelMapping,
+    relationships: ?[]const GraphRelationshipMapping = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "labels", "labels", false },
+        .{ "relationships", "relationships", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("labels");
+        try jw.write(self.labels);
+        if (self.relationships) |value| {
+            try jw.objectField("relationships");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphDefinitionUpdate = struct {
+    expected_revision: []const u8,
+    definition: GraphDefinition,
+};
+
 pub const GraphDistinctBudgetExceededError = struct {
     status: i32,
     @"error": []const u8,
@@ -4875,6 +4920,42 @@ pub const GraphDistinctBudgetExceededError = struct {
     maximum: u64,
     /// Stable user-facing guidance for reducing exact distinct state.
     remediation: []const u8,
+};
+
+pub const GraphLabelMapping = struct {
+    name: []const u8,
+    /// A literal default.public table name or an explicitly scoped table target. Bindings retain the physical table incarnation through renames.
+    table: std.json.Value,
+    /// Equality predicates defining this label over stored document properties.
+    where: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "table", "table", false },
+        .{ "where", "where", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("table");
+        try jw.write(self.table);
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphMatchOperationLimitExceededError = struct {
@@ -5075,6 +5156,246 @@ pub const GraphPathWeightDomainError = struct {
     }
 };
 
+pub const GraphQueryLimits = struct {
+    memory_bytes: ?i64 = null,
+    scanned_anchors: ?i64 = null,
+    explored_edges: ?i64 = null,
+    intermediate_states: ?i64 = null,
+    path_depth: ?i64 = null,
+    recursion_depth: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "memory_bytes", "memory_bytes", true },
+        .{ "scanned_anchors", "scanned_anchors", true },
+        .{ "explored_edges", "explored_edges", true },
+        .{ "intermediate_states", "intermediate_states", true },
+        .{ "path_depth", "path_depth", true },
+        .{ "recursion_depth", "recursion_depth", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.memory_bytes) |value| {
+            try jw.objectField("memory_bytes");
+            try jw.write(value);
+        }
+        if (self.scanned_anchors) |value| {
+            try jw.objectField("scanned_anchors");
+            try jw.write(value);
+        }
+        if (self.explored_edges) |value| {
+            try jw.objectField("explored_edges");
+            try jw.write(value);
+        }
+        if (self.intermediate_states) |value| {
+            try jw.objectField("intermediate_states");
+            try jw.write(value);
+        }
+        if (self.path_depth) |value| {
+            try jw.objectField("path_depth");
+            try jw.write(value);
+        }
+        if (self.recursion_depth) |value| {
+            try jw.objectField("recursion_depth");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphQueryRequest = struct {
+    query: []const u8,
+    /// Client-generated native transaction ID for write recovery after cancellation or a lost response. Reusing an admitted ID is rejected; inspect its transaction status instead of replaying the statement.
+    write_request_id: ?[]const u8 = null,
+    /// Ordinary JSON parameters. Mutually exclusive with typed_parameters.
+    parameters: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// A map GraphWireValue containing lossless data parameters; graph entity parameters are rejected. Mutually exclusive with parameters.
+    typed_parameters: ?GraphWireValue = null,
+    limits: ?GraphQueryLimits = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "query", "query", false },
+        .{ "write_request_id", "write_request_id", true },
+        .{ "parameters", "parameters", true },
+        .{ "typed_parameters", "typed_parameters", true },
+        .{ "limits", "limits", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("query");
+        try jw.write(self.query);
+        if (self.write_request_id) |value| {
+            try jw.objectField("write_request_id");
+            try jw.write(value);
+        }
+        if (self.parameters) |value| {
+            try jw.objectField("parameters");
+            try jw.write(value);
+        }
+        if (self.typed_parameters) |value| {
+            try jw.objectField("typed_parameters");
+            try jw.write(value);
+        }
+        if (self.limits) |value| {
+            try jw.objectField("limits");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphQueryResult = struct {
+    wire_version: i64,
+    columns: []const []const u8,
+    rows: []const []const GraphWireValue,
+    plan: []const std.json.ArrayHashMap(std.json.Value),
+    stats: GraphQueryStats,
+    commit: ?GraphWriteReceipt = null,
+    /// Whether the compiled statement has no mutation clauses; EXPLAIN also reports the underlying statement capability.
+    read_only: ?bool = null,
+    graph_incarnation: []const u8,
+    graph_revision: []const u8,
+    complete: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "wire_version", "wire_version", false },
+        .{ "columns", "columns", false },
+        .{ "rows", "rows", false },
+        .{ "plan", "plan", false },
+        .{ "stats", "stats", false },
+        .{ "commit", "commit", true },
+        .{ "read_only", "read_only", true },
+        .{ "graph_incarnation", "graph_incarnation", false },
+        .{ "graph_revision", "graph_revision", false },
+        .{ "complete", "complete", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("wire_version");
+        try jw.write(self.wire_version);
+        try jw.objectField("columns");
+        try jw.write(self.columns);
+        try jw.objectField("rows");
+        try jw.write(self.rows);
+        try jw.objectField("plan");
+        try jw.write(self.plan);
+        try jw.objectField("stats");
+        try jw.write(self.stats);
+        if (self.commit) |value| {
+            try jw.objectField("commit");
+            try jw.write(value);
+        }
+        if (self.read_only) |value| {
+            try jw.objectField("read_only");
+            try jw.write(value);
+        }
+        try jw.objectField("graph_incarnation");
+        try jw.write(self.graph_incarnation);
+        try jw.objectField("graph_revision");
+        try jw.write(self.graph_revision);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        try jw.endObject();
+    }
+};
+
+pub const GraphQueryStats = struct {
+    scanned_anchors: ?i64 = null,
+    explored_edges: ?i64 = null,
+    intermediate_states: ?i64 = null,
+    mutations: ?i64 = null,
+    memory_bytes: ?i64 = null,
+    search_calls: ?i64 = null,
+    search_candidates: ?i64 = null,
+    search_approximate: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "scanned_anchors", "scanned_anchors", true },
+        .{ "explored_edges", "explored_edges", true },
+        .{ "intermediate_states", "intermediate_states", true },
+        .{ "mutations", "mutations", true },
+        .{ "memory_bytes", "memory_bytes", true },
+        .{ "search_calls", "search_calls", true },
+        .{ "search_candidates", "search_candidates", true },
+        .{ "search_approximate", "search_approximate", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.scanned_anchors) |value| {
+            try jw.objectField("scanned_anchors");
+            try jw.write(value);
+        }
+        if (self.explored_edges) |value| {
+            try jw.objectField("explored_edges");
+            try jw.write(value);
+        }
+        if (self.intermediate_states) |value| {
+            try jw.objectField("intermediate_states");
+            try jw.write(value);
+        }
+        if (self.mutations) |value| {
+            try jw.objectField("mutations");
+            try jw.write(value);
+        }
+        if (self.memory_bytes) |value| {
+            try jw.objectField("memory_bytes");
+            try jw.write(value);
+        }
+        if (self.search_calls) |value| {
+            try jw.objectField("search_calls");
+            try jw.write(value);
+        }
+        if (self.search_candidates) |value| {
+            try jw.objectField("search_candidates");
+            try jw.write(value);
+        }
+        if (self.search_approximate) |value| {
+            try jw.objectField("search_approximate");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const GraphQueryUnprocessableError = union(enum) {
     graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
     graph_work_budget_exceeded_error: GraphWorkBudgetExceededError,
@@ -5182,6 +5503,21 @@ pub const GraphQueryUnsupportedError = struct {
     reason: []const u8,
 };
 
+pub const GraphRelationshipMapping = struct {
+    name: []const u8,
+    index: []const u8,
+    source_label: []const u8,
+    target_label: []const u8,
+    stored_type: []const u8,
+};
+
+/// Version 1 graph value. INTEGER payloads are signed decimal strings. Map payloads contain typed values, keeping user keys distinct from type tags. Entity identities are opaque table-qualified handles.
+pub const GraphWireValue = struct {
+    type: []const u8,
+    /// Type-specific payload; nested collections and entity properties contain GraphWireValue values.
+    value: std.json.Value,
+};
+
 pub const GraphWorkBudgetExceededError = struct {
     status: i32,
     @"error": []const u8,
@@ -5197,6 +5533,33 @@ pub const GraphWorkBudgetExceededError = struct {
     maximum: u64,
     /// Stable user-facing guidance for reducing graph work.
     remediation: []const u8,
+};
+
+pub const GraphWriteReceipt = struct {
+    /// Native durable transaction identity; never replay a statement after an ambiguous write response.
+    transaction_id: []const u8,
+    status: []const u8,
+    outcome: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("transaction_id");
+        try jw.write(self.transaction_id);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        switch (self.outcome) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("outcome");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("outcome");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyAncestor = struct {
@@ -7401,6 +7764,28 @@ pub const PathFindResult = antfly_indexes_openapi.PathFindResult;
 
 pub const PathFindWeightMode = antfly_indexes_openapi.PathFindWeightMode;
 
+pub const PrivacyCategory = antfly_privacy_openapi.PrivacyCategory;
+
+pub const PrivacyFinding = antfly_privacy_openapi.PrivacyFinding;
+
+pub const PrivacyFindingsPage = antfly_privacy_openapi.PrivacyFindingsPage;
+
+pub const PrivacyFindingsRequest = antfly_privacy_openapi.PrivacyFindingsRequest;
+
+pub const PrivacyPolicy = antfly_privacy_openapi.PrivacyPolicy;
+
+pub const PrivacyPreview = antfly_privacy_openapi.PrivacyPreview;
+
+pub const PrivacyPreviewRequest = antfly_privacy_openapi.PrivacyPreviewRequest;
+
+pub const PrivacyProducer = antfly_privacy_openapi.PrivacyProducer;
+
+pub const PrivacyScan = antfly_privacy_openapi.PrivacyScan;
+
+pub const PrivacyScanRequest = antfly_privacy_openapi.PrivacyScanRequest;
+
+pub const PrivacyStatus = antfly_privacy_openapi.PrivacyStatus;
+
 /// Exactly one expression node: literal, field, ref, param, call with args, case with optional else, cast, or a binary operator. Pure expressions lower to the same typed scalar IR as SQL SELECT and CASE. AI/provider calls remain in evaluate, never execute implicitly in select. value_identity(field) returns an opaque identity for a present logical value (including JSON null); missing has no identity. is_missing(field) distinguishes missing from present null. Identity reads require the same authorization and retained source revision as value reads. Metadata may accelerate them; unsupported/old metadata falls back to ordinary reads. Untaken CASE branches do not load fields or evaluate erroring calls. Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from, is_not_distinct_from, and, or, add, subtract, multiply, divide and concat. Expressions are limited to depth 64 including referenced aliases, and 8192 nodes per request. Alias dependencies are acyclic; each alias is a requested output and is evaluated once per row.
 pub const ProjectionExpression = std.json.Value;
 
@@ -8727,6 +9112,8 @@ pub const QueryResult = struct {
     next_source_cursor: ?[]const u8 = null,
     /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
+    /// True when an ordered query read live state because this deployment's storage (Lite) cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or search_before.
+    live_read: ?bool = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -8753,6 +9140,7 @@ pub const QueryResult = struct {
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
+        .{ "live_read", "live_read", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -8786,6 +9174,10 @@ pub const QueryResult = struct {
         }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
+        if (self.live_read) |value| {
+            try jw.objectField("live_read");
             try jw.write(value);
         }
         if (self.evaluation) |value| {
@@ -8843,6 +9235,8 @@ pub const QueryResultBase = struct {
     next_source_cursor: ?[]const u8 = null,
     /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
+    /// True when an ordered query read live state because this deployment's storage (Lite) cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or search_before.
+    live_read: ?bool = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -8868,6 +9262,7 @@ pub const QueryResultBase = struct {
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
+        .{ "live_read", "live_read", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -8900,6 +9295,10 @@ pub const QueryResultBase = struct {
         }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
+        if (self.live_read) |value| {
+            try jw.objectField("live_read");
             try jw.write(value);
         }
         if (self.evaluation) |value| {
@@ -14840,6 +15239,8 @@ pub const StatefulQueryResult = struct {
     next_source_cursor: ?[]const u8 = null,
     /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
+    /// True when an ordered query read live state because this deployment's storage (Lite) cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or search_before.
+    live_read: ?bool = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -14866,6 +15267,7 @@ pub const StatefulQueryResult = struct {
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
+        .{ "live_read", "live_read", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -14899,6 +15301,10 @@ pub const StatefulQueryResult = struct {
         }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
+        if (self.live_read) |value| {
+            try jw.objectField("live_read");
             try jw.write(value);
         }
         if (self.evaluation) |value| {

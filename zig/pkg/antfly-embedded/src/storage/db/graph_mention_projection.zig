@@ -44,11 +44,12 @@ pub fn writesAlloc(a: std.mem.Allocator, index: []const u8, document: []const u8
     var positions: std.StringHashMapUnmanaged(usize) = .empty;
     for (resolved.entities) |entity| {
         if ((entity.decision != .new and entity.decision != .match) or entity.doc_ref.key.len == 0) continue;
-        const identity = try std.json.Stringify.valueAlloc(scratch, .{ entity.doc_ref.table, entity.doc_ref.key }, .{});
+        const target_table = entity.doc_ref.storage_table orelse entity.doc_ref.table;
+        const identity = try std.json.Stringify.valueAlloc(scratch, .{ target_table, entity.doc_ref.key }, .{});
         const position = try positions.getOrPut(scratch, identity);
         if (!position.found_existing) {
             position.value_ptr.* = groups.items.len;
-            try groups.append(scratch, .{ .table = entity.doc_ref.table, .key = entity.doc_ref.key });
+            try groups.append(scratch, .{ .table = target_table, .key = entity.doc_ref.key });
         }
         const group = &groups.items[position.value_ptr.*];
         group.confidence = @max(group.confidence, confidence.get(entity.local_id) orelse entity.confidence);
@@ -99,4 +100,19 @@ test "mention projection preserves canonical targets confidence and evidence own
     };
     try Probe.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "mention projection preserves pinned physical targets across same-key logical references" {
+    const a = std.testing.allocator;
+    const config: catalog.ResolverConfig = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{text}}" };
+    const raw = "{\"config_generation\":1,\"entities\":[{\"local_id\":\"a\",\"doc_ref\":{\"table\":\"entities\",\"storage_table\":\"table:first\",\"key\":\"same\"},\"confidence\":0.4,\"decision\":\"match\"},{\"local_id\":\"b\",\"doc_ref\":{\"table\":\"entities\",\"storage_table\":\"table:second\",\"key\":\"same\"},\"confidence\":0.8,\"decision\":\"match\"}]}";
+    const writes = try writesAlloc(a, "knowledge", "note", raw, null, "mentions", &config, true);
+    defer a.free(writes);
+    defer for (writes) |*write| write.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), writes.len);
+    for (writes, [_][]const u8{ "table:first", "table:second" }) |write, table| {
+        var metadata = try std.json.parseFromSlice(std.json.Value, a, write.metadata_json, .{});
+        defer metadata.deinit();
+        try std.testing.expectEqualStrings(table, metadata.value.object.get("target_table").?.string);
+    }
 }

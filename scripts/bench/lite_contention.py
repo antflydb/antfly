@@ -202,8 +202,7 @@ def lease_delta(before: dict, after: dict) -> dict | None:
         row = {field: new[field] - old.get(field, 0) for field in LEASE_COUNTERS}
         for field in ("wait_log2_ns", "hold_log2_ns"):
             row[field] = [
-                b - a
-                for a, b in zip(old.get(field, [0] * 64), new[field], strict=True)
+                b - a for a, b in zip(old.get(field, [0] * 64), new[field], strict=True)
             ]
         # Lifetime maxima: exact only when the worker started from zero.
         for field in ("wait_max_ns", "hold_max_ns"):
@@ -278,25 +277,32 @@ def native_worker(config, index, ready, start, results, finish=None):
     completed_workload = None
     try:
         af = sdk(config["library"])
-        with af.open(
-            config["database"],
-            no_sync=config["no_sync"],
-            busy_timeout=config["timeout_ms"] / 1000,
-        ) as db, contextlib.ExitStack() as thread_handles:
+        with (
+            af.open(
+                config["database"],
+                no_sync=config["no_sync"],
+                busy_timeout=config["timeout_ms"] / 1000,
+            ) as db,
+            contextlib.ExitStack() as thread_handles,
+        ):
             threads = max(1, config.get("threads_per_worker", 1))
             # Each writer thread gets its own handle on the same database, so
             # threads contend at the process-wide path gate (where the lease
             # is handed off), not on one connection's mutex.
-            handles = [db] if threads == 1 else [
-                thread_handles.enter_context(
-                    af.open(
-                        config["database"],
-                        no_sync=config["no_sync"],
-                        busy_timeout=config["timeout_ms"] / 1000,
+            handles = (
+                [db]
+                if threads == 1
+                else [
+                    thread_handles.enter_context(
+                        af.open(
+                            config["database"],
+                            no_sync=config["no_sync"],
+                            busy_timeout=config["timeout_ms"] / 1000,
+                        )
                     )
-                )
-                for _ in range(threads)
-            ]
+                    for _ in range(threads)
+                ]
+            )
             initial_stats = measurement_stats(db)
             proof_observed_from = time.monotonic()
             ready.put({"index": index, "status": "ok"})
@@ -308,7 +314,9 @@ def native_worker(config, index, ready, start, results, finish=None):
             deadline = began + config["seconds"]
             success, busy = [], []
             window_seconds = config.get("progress_window_seconds", 60)
-            success_windows = [0] * max(1, math.ceil(config["seconds"] / window_seconds))
+            success_windows = [0] * max(
+                1, math.ceil(config["seconds"] / window_seconds)
+            )
             lock = threading.Lock()
             last_write = None
             latest_churn_writes = {}
@@ -326,7 +334,11 @@ def native_worker(config, index, ready, start, results, finish=None):
                 last_progress = 0.0
                 max_gap = 0.0
                 sequence = 0
-                prefix = f"worker-{index}" if threads == 1 else f"worker-{index}-t{thread_index}"
+                prefix = (
+                    f"worker-{index}"
+                    if threads == 1
+                    else f"worker-{index}-t{thread_index}"
+                )
                 try:
                     while time.monotonic() < deadline:
                         # Several documents per call make one large journal record,
@@ -338,7 +350,12 @@ def native_worker(config, index, ready, start, results, finish=None):
                             for j in range(batch_docs)
                         ]
                         key = keys[-1]
-                        payload = {"inserts": {k: {"text": "v" * 1024, "sequence": sequence} for k in keys}}
+                        payload = {
+                            "inserts": {
+                                k: {"text": "v" * 1024, "sequence": sequence}
+                                for k in keys
+                            }
+                        }
                         began_call = time.perf_counter_ns()
                         try:
                             handle.batch_json(payload)
@@ -347,14 +364,20 @@ def native_worker(config, index, ready, start, results, finish=None):
                             write = {"key": key, "sequence": sequence}
                             with lock:
                                 success.append(latency)
-                                window = min(len(success_windows) - 1, int(elapsed / window_seconds))
+                                window = min(
+                                    len(success_windows) - 1,
+                                    int(elapsed / window_seconds),
+                                )
                                 success_windows[window] += 1
                                 thread_windows[thread_index][window] += 1
                                 thread_successes[thread_index] += 1
                                 last_write = write
                                 if config["workload"] == "churn":
                                     for k in keys:
-                                        latest_churn_writes[k] = {"key": k, "sequence": sequence}
+                                        latest_churn_writes[k] = {
+                                            "key": k,
+                                            "sequence": sequence,
+                                        }
                             max_gap = max(max_gap, elapsed - last_progress)
                             last_progress = elapsed
                         except af.BusyError:
@@ -369,7 +392,10 @@ def native_worker(config, index, ready, start, results, finish=None):
             if threads == 1:
                 write_loop(0)
             else:
-                pool = [threading.Thread(target=write_loop, args=(t,)) for t in range(threads)]
+                pool = [
+                    threading.Thread(target=write_loop, args=(t,))
+                    for t in range(threads)
+                ]
                 for thread in pool:
                     thread.start()
                 for thread in pool:
@@ -616,8 +642,13 @@ def lease_summary(workers: list[dict]) -> dict | None:
             field: sum(row[group][field] for row in rows) for field in LEASE_COUNTERS
         }
         for field in ("wait_log2_ns", "hold_log2_ns"):
-            merged[field] = [sum(row[group][field][i] for row in rows) for i in range(64)]
-        for kind, histogram in (("wait", merged["wait_log2_ns"]), ("hold", merged["hold_log2_ns"])):
+            merged[field] = [
+                sum(row[group][field][i] for row in rows) for i in range(64)
+            ]
+        for kind, histogram in (
+            ("wait", merged["wait_log2_ns"]),
+            ("hold", merged["hold_log2_ns"]),
+        ):
             for percent in (50, 99):
                 lower, upper = histogram_percentile_bounds(histogram, percent)
                 merged[f"{kind}_p{percent}_lower_ns"] = lower
@@ -626,7 +657,8 @@ def lease_summary(workers: list[dict]) -> dict | None:
         merged["per_worker_busy"] = [row[group]["busy"] for row in rows]
         merged["per_worker_hold_ns"] = [row[group]["hold_ns"] for row in rows]
         merged["per_worker_wait_p99_upper_ns"] = [
-            histogram_percentile_bounds(row[group]["wait_log2_ns"], 99)[1] for row in rows
+            histogram_percentile_bounds(row[group]["wait_log2_ns"], 99)[1]
+            for row in rows
         ]
         summary[group] = merged
     summary["gate_wait_ns"] = sum(row["gate_wait_ns"] for row in rows)
@@ -638,8 +670,12 @@ def fairness(per_worker: list[int]) -> dict:
     total = sum(per_worker)
     squares = sum(value * value for value in per_worker)
     return {
-        "jain_index": (total * total) / (len(per_worker) * squares) if squares else None,
-        "min_max_ratio": (min(per_worker) / max(per_worker)) if max(per_worker, default=0) else None,
+        "jain_index": (total * total) / (len(per_worker) * squares)
+        if squares
+        else None,
+        "min_max_ratio": (min(per_worker) / max(per_worker))
+        if max(per_worker, default=0)
+        else None,
     }
 
 

@@ -415,7 +415,7 @@ const OpaqueHttpxHandler = struct {
         for (entries) |entry| {
             const path = entry.path.slice();
             const is_probe = std.mem.eql(u8, path, "/healthz") or std.mem.eql(u8, path, "/readyz");
-            const is_generated = isGeneratedPublicPath(path);
+            const is_generated = isMetadataApiPath(path);
             switch (selection) {
                 .all => {},
                 .all_without_probes => if (is_probe) continue,
@@ -442,6 +442,10 @@ const OpaqueHttpxHandler = struct {
                 try server.routeStreamingRawWithData(method, path, runtimeApiHttpHandler, route);
                 continue;
             }
+            if (method == .PUT) if (@import("http_routes.zig").privacyMutationBodyLimit(path)) |limit| {
+                try server.routeWithDataAndBodyLimit(method, path, runtimeApiHttpHandler, route, limit);
+                continue;
+            };
             if (method == .POST) {
                 if (@import("http_routes.zig").publicPostBodyLimit(path)) |limit| {
                     try server.routeWithDataAndBodyLimit(method, path, runtimeApiHttpHandler, route, limit);
@@ -792,6 +796,21 @@ test "linked transport admits a streaming body before the kernel pulls it" {
     try std.testing.expect(FakeKernel.saw_streaming_source);
     try std.testing.expect(FakeKernel.saw_body);
     try std.testing.expectEqual(@as(usize, 1), body_state.calls);
+}
+
+/// The metadata listener exposes public APIs and these two authenticated
+/// control routes, while continuing to exclude data-node and group protocols.
+pub fn isMetadataApiPath(path: []const u8) bool {
+    const routes = @import("http_routes.zig").Routes;
+    return isGeneratedPublicPath(path) or std.mem.eql(u8, path, routes.privacy_control_pattern) or std.mem.eql(u8, path, routes.privacy_scan_control_pattern);
+}
+
+test "privacy control routes survive compiled metadata registrar filtering" {
+    const routes = @import("http_routes.zig").Routes;
+    try std.testing.expect(isMetadataApiPath(routes.privacy_control_pattern));
+    try std.testing.expect(isMetadataApiPath(routes.privacy_scan_control_pattern));
+    try std.testing.expect(!isMetadataApiPath("/internal/v1/groups/:group_id/tables/:table_name/document-read"));
+    try std.testing.expect(!isMetadataApiPath("/internal/v1/tables/:table_name/unrelated"));
 }
 
 fn isGeneratedPublicPath(path: []const u8) bool {

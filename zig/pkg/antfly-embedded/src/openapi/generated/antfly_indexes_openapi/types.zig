@@ -2945,6 +2945,8 @@ pub const DocumentExtractionConfig = struct {
     etag: ?[]const u8 = null,
     /// Static checksum recorded as source version metadata.
     checksum: ?[]const u8 = null,
+    /// Declares that `checksum` (or the row value named by `source.checksum_field`) is a digest of the original bytes, computed with this algorithm. When set and the row carries a well-formed digest, extraction identifies the row by that digest instead of by its location (URL, ETag, version, last-modified), so copying, re-hosting, or renaming a source does not force re-extraction as long as the bytes are unchanged. The downloaded bytes are verified against the declared digest; a mismatch fails extraction instead of keeping stale output alive. A present but malformed digest is also an error, never a silent fall back to location-based identity. Leaving this unset preserves prior behavior byte for byte, including for rows that only set `checksum_field`.
+    checksum_algorithm: ?[]const u8 = null,
     /// Static source version. Together with the other metadata it lets extraction skip unchanged sources.
     version: ?[]const u8 = null,
     /// Static last-modified timestamp recorded as source version metadata.
@@ -2968,6 +2970,7 @@ pub const DocumentExtractionConfig = struct {
         .{ "content_type", "content_type", true },
         .{ "etag", "etag", true },
         .{ "checksum", "checksum", true },
+        .{ "checksum_algorithm", "checksum_algorithm", true },
         .{ "version", "version", true },
         .{ "last_modified", "last_modified", true },
         .{ "credentials", "credentials", true },
@@ -3007,6 +3010,10 @@ pub const DocumentExtractionConfig = struct {
         }
         if (self.checksum) |value| {
             try jw.objectField("checksum");
+            try jw.write(value);
+        }
+        if (self.checksum_algorithm) |value| {
+            try jw.objectField("checksum_algorithm");
             try jw.write(value);
         }
         if (self.version) |value| {
@@ -3432,7 +3439,7 @@ pub const DocumentExtractionSourceConfig = struct {
     content_type_field: ?[]const u8 = null,
     /// Row field holding the source ETag.
     etag_field: ?[]const u8 = null,
-    /// Row field holding the source checksum.
+    /// Row field holding the source checksum. May name a dotted path (e.g. `metadata.sha256`) to reach a value nested under another row field.
     checksum_field: ?[]const u8 = null,
     /// Row field holding the source version.
     version_field: ?[]const u8 = null,
@@ -7275,7 +7282,7 @@ pub const GraphMatch = struct {
     }
 };
 
-/// Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
+/// Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses Cypher relationship-simple trails: nodes may repeat, but the same physical relationship cannot be reused anywhere within one MATCH group. Each optional group has its own relationship scope. Parallel relationship IDs remain distinct. A zero-hop path binds both endpoints to the same node identity without reading an edge. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
 pub const GraphMatchEdge = struct {
     edge_filter: ?GraphRelationshipFilter = null,
     from: antfly_graph_identifier_openapi.GraphIdentifier,
@@ -9023,7 +9030,7 @@ pub const GraphResolverAdjudicationAcceptance = struct {
 
 /// Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges.
 pub const GraphResolverAdjudicationConfig = struct {
-    /// Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one.
+    /// Frozen typed, generated or cascade decider configuration. Standalone generated verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds to probabilistic stages and require categorical zero-or-one terminal verdicts. A cascade answer is validated against the stage that produced it, and the receipt keeps the response's stage trace.
     decider: antfly_common_openapi.DeciderConfig,
     /// Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions.
     template: []const u8,

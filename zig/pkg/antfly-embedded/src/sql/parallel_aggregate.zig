@@ -210,7 +210,7 @@ const Work = struct {
         return result;
     }
 };
-fn compatible(program: @import("scalar.zig").Program) bool {
+pub fn compatible(program: @import("scalar.zig").Program) bool {
     for (program.instructions) |instruction| switch (instruction.operation) {
         .column, .literal, .parameter, .unary, .cast => {},
         .binary => |binary| switch (binary.op) {

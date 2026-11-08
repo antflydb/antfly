@@ -3026,13 +3026,17 @@ pub fn parseQueryRequestWithDeadline(
     // generated public contract strips private shard fields. Public admission
     // rejects this control before entering the shared parser. Escaped member
     // names still receive semantic parsing rather than bypassing retention.
-    if (std.mem.indexOf(u8, body, "_native_cut") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
+    if (std.mem.indexOf(u8, body, "_native_cut") != null or std.mem.indexOf(u8, body, "_response_live_read") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
         var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
         defer raw.deinit();
         if (raw.value == .object) if (raw.value.object.get("_native_cut")) |value| {
             owned.native_cut = try std.json.parseFromValue(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child, alloc, value, .{ .allocate = .alloc_always });
             try owned.native_cut.?.value.validate(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
             owned.req.native_query_cut = owned.native_cut.?.value;
+        };
+        if (raw.value == .object) if (raw.value.object.get("_response_live_read")) |value| {
+            if (value != .bool) return error.InvalidQueryRequest;
+            owned.req.response_live_read = value.bool;
         };
     }
     if (std.mem.indexOf(u8, body, "_document_authority") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
@@ -3046,6 +3050,20 @@ pub fn parseQueryRequestWithDeadline(
             owned.req.document_authority_mode = control.value.mode;
             owned.req.document_authority_group = control.value.group;
             owned.req.defer_stored_projection = control.value.defer_stored_projection;
+        };
+    }
+    if (std.mem.indexOf(u8, body, "_privacy_policy_version") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer raw.deinit();
+        if (raw.value == .object) if (raw.value.object.get("_privacy_policy_version")) |value| {
+            if (value != .string) return error.InvalidQueryRequest;
+            var version: [64]u8 = @splat(0);
+            if (!std.mem.eql(u8, value.string, "none")) {
+                if (value.string.len != 64) return error.InvalidQueryRequest;
+                for (value.string) |byte| if (!std.ascii.isHex(byte)) return error.InvalidQueryRequest;
+                @memcpy(&version, value.string);
+            }
+            owned.req.privacy_policy_version = version;
         };
     }
     return owned;
@@ -3279,6 +3297,60 @@ test "api query contract storage public consumers reject evaluation before execu
     }) |body| try std.testing.expectError(error.UnsupportedQueryRequest, validateStoragePublicQueryRequest(alloc, body));
     try validateStoragePublicQueryRequest(alloc, "{\"evaluate\":null}");
     try validateStoragePublicQueryRequest(alloc, "{\"full_text_search\":{\"match_all\":{}}}");
+}
+
+test "api query contract live read annotation is trusted and survives worker transport" {
+    const a = std.testing.allocator;
+    var parsed = try parsePublicQueryRequest(a, null, "docs", "{}");
+    defer parsed.deinit(a);
+    try std.testing.expect(!parsed.req.response_live_read);
+    parsed.req.response_live_read = true;
+    const wire = try @import("query_execution_contract.zig").encodeQueryRequest(a, parsed.req);
+    defer a.free(wire);
+    var worker = try parseQueryRequest(a, null, "docs", wire);
+    defer worker.deinit(a);
+    try std.testing.expect(worker.req.response_live_read);
+    for ([_][]const u8{ "{\"_response_live_read\":true}", "{\"_response_liv\\u0065_read\":true}" }) |body| {
+        try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(a, null, "docs", body));
+    }
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs", "{\"_response_live_read\":1}"));
+}
+
+fn liveReadEncodingScenario(a: std.mem.Allocator) !void {
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
+    for ([_]bool{ false, true }) |live| {
+        const req: db_mod.types.SearchRequest = .{ .response_live_read = live };
+        var response = try encodeQueryResponses(a, "docs", req, .{}, result);
+        defer response.deinit(a);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.json, .{});
+        defer parsed.deinit();
+        const value = parsed.value.object.get("responses").?.array.items[0].object.get("live_read");
+        if (live) try std.testing.expect(value.?.bool) else try std.testing.expect(value == null);
+    }
+    const Sink = struct {
+        called: bool = false,
+        fn start(_: *anyopaque, _: usize) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn write(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn consume(raw: *anyopaque, view: @import("query_response.zig").ResultView) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(?bool, true), view.result.live_read);
+            self.called = true;
+        }
+    };
+    var sink: Sink = .{};
+    var delivered = try encodeQueryResponsesWithDelivery(a, "docs", .{ .response_live_read = true }, .{}, result, .{ .ptr = &sink, .start_fn = Sink.start, .write_fn = Sink.write, .typed_result = .{ .ptr = &sink, .consume = Sink.consume } });
+    defer delivered.deinit(a);
+    try std.testing.expect(sink.called);
+    try std.testing.expectEqual(@as(?usize, 0), delivered.delivered_bytes);
+}
+
+test "api query contract live read encoding owns failures and annotates typed delivery" {
+    try liveReadEncodingScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, liveReadEncodingScenario, .{});
 }
 
 test "api query contract hierarchy worker wire preserves explicit deferred projection" {
@@ -4525,6 +4597,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
+                .live_read = if (req.response_live_read) true else null,
             };
             if (graph_results == null and typed_delivery) if (delivery) |sink| if (sink.typed_result) |target| {
                 if (sink.hydrator != null) return error.InvalidArgument;
@@ -4564,6 +4637,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
+                .live_read = if (req.response_live_read) true else null,
             };
             break :blk if (hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered, projection) else try std.json.Stringify.valueAlloc(
                 alloc,
@@ -10552,9 +10626,7 @@ fn parseLegacyPatternSteps(
                 .edge_filter = edge_filter,
             } else .{ .types = edge_types },
         };
-        if (step.edge != null and (steps[i].edge.min_hops == 0 or
-            steps[i].edge.max_hops == 0 or
-            steps[i].edge.min_hops > steps[i].edge.max_hops or
+        if (step.edge != null and (steps[i].edge.min_hops > steps[i].edge.max_hops or
             steps[i].edge.max_hops > graph_pattern_mod.max_pattern_hops))
             return error.InvalidQueryRequest;
         initialized += 1;
@@ -10937,8 +11009,8 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
                 .types = types,
                 .edge_filter = edge_filter,
                 .direction = parseGraphDirection(edge.direction),
-                .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
-                .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
+                .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 0, graph_pattern_mod.max_pattern_hops),
+                .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 0, graph_pattern_mod.max_pattern_hops),
                 .min_weight = weight_bounds.min,
                 .max_weight = weight_bounds.max,
             },
@@ -12640,7 +12712,9 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_response_live_read",
         "_document_authority",
+        "_privacy_policy_version",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
@@ -13019,7 +13093,9 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_response_live_read",
         "_document_authority",
+        "_privacy_policy_version",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",

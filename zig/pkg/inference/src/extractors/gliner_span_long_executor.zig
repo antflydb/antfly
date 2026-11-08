@@ -127,24 +127,66 @@ pub fn classificationLogits(cb: *const compute.ComputeBackend, a: A, config: exe
 }
 
 pub fn extract(cb: *const compute.ComputeBackend, allocator: A, config: @import("../architectures/modern_bert.zig").Config, item: *const wire.Item, prepared: *const executor.PreparedItem, options: pipeline.Options) !pipeline.Result {
+    return extractEncoder(cb, allocator, .{ .modern_bert = config }, item, prepared, options, .{}, 1);
+}
+
+/// Shared long-document path: exact tokenizer/schema admission happens in
+/// prepare; the selected encoder/head retains the checkpoint's native contract.
+pub fn extractEncoder(cb: *const compute.ComputeBackend, allocator: A, config: executor.EncoderConfig, item: *const wire.Item, prepared: *const executor.PreparedItem, options: pipeline.Options, head_options: @import("gliner_span_extraction.zig").HeadOptions, batch_items: usize) !pipeline.Result {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
     const planned = prepared.document.?;
     const mentions = try a.alloc(document.WindowMentions, prepared.batches.len);
     const relations = try a.alloc(long_relations.Window, prepared.batches.len);
-    for (prepared.batches, mentions, relations, 0..) |batch, *mention_window, *relation_window, i| {
+    var offset: usize = 0;
+    while (offset < prepared.batches.len) {
+        if (options.control) |control| try control.check();
+        const width = if (config == .deberta and (cb.kind() == .metal or cb.kind() == .cuda)) @min(@min(batch_items, 8), prepared.batches.len - offset) else 1;
         var local_options = options;
         local_options.overlap = .allow;
-        var result = try @import("gliner_span_extraction.zig").run(cb, allocator, config, batch.samples[0], &item.compiled, local_options);
+        var window_head = head_options;
+        window_head.legacy_greedy_overlap = false;
+        var result = try extractWindows(cb, allocator, config, item, prepared.batches[offset..][0..width], local_options, window_head);
         defer result.deinit();
-        var candidates: std.ArrayList(document.MentionCandidate) = .empty;
-        for (result.samples[0].entities, 0..) |entity, kind| for (entity.values) |value| {
-            try candidates.append(a, .{ .entity_type = kind, .source = value.source.?, .probability = value.confidence });
-        };
-        mention_window.* = .{ .identity = try planned.identity(i), .pre_overlap_candidates = candidates.items };
-        relation_window.* = .{ .identity = try planned.identity(i), .relations = try copyRelations(a, result.samples[0].relations) };
+        for (result.samples, 0..) |sample, row| {
+            const i = offset + row;
+            var candidates: std.ArrayList(document.MentionCandidate) = .empty;
+            for (sample.entities, 0..) |entity, kind| for (entity.values) |value| {
+                try candidates.append(a, .{ .entity_type = kind, .source = value.source.?, .probability = value.confidence });
+            };
+            mentions[i] = .{ .identity = try planned.identity(i), .pre_overlap_candidates = candidates.items };
+            relations[i] = .{ .identity = try planned.identity(i), .relations = try copyRelations(a, sample.relations) };
+        }
+        offset += width;
     }
+    const samples = try a.alloc(pipeline.Sample, 1);
+    samples[0] = try presentWindows(cb, allocator, a, config, item, prepared, options, head_options, mentions, relations);
+    return .{ .arena = arena, .samples = samples };
+}
+
+/// A batched encoder row still passes through the ordinary window merger, so
+/// offsets, dtype selection, overlap policy and completion receipts stay equal
+/// to the serial window path. Only the encoder/head execution is shared.
+pub fn presentSingleWindow(cb: *const compute.ComputeBackend, allocator: A, config: executor.EncoderConfig, item: *const wire.Item, prepared: *const executor.PreparedItem, sample: pipeline.Sample, options: pipeline.Options, head_options: @import("gliner_span_extraction.zig").HeadOptions) !pipeline.Result {
+    if (prepared.batches.len != 1 or prepared.document == null) return error.InvalidExtractionInput;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    var candidates: std.ArrayList(document.MentionCandidate) = .empty;
+    for (sample.entities, 0..) |entity, kind| for (entity.values) |value| {
+        try candidates.append(a, .{ .entity_type = kind, .source = value.source.?, .probability = value.confidence });
+    };
+    const identity = try prepared.document.?.identity(0);
+    const mentions = [_]document.WindowMentions{.{ .identity = identity, .pre_overlap_candidates = candidates.items }};
+    const relations = [_]long_relations.Window{.{ .identity = identity, .relations = sample.relations }};
+    const samples = try a.alloc(pipeline.Sample, 1);
+    samples[0] = try presentWindows(cb, allocator, a, config, item, prepared, options, head_options, &mentions, &relations);
+    return .{ .arena = arena, .samples = samples };
+}
+
+fn presentWindows(cb: *const compute.ComputeBackend, allocator: A, a: A, config: executor.EncoderConfig, item: *const wire.Item, prepared: *const executor.PreparedItem, options: pipeline.Options, head_options: @import("gliner_span_extraction.zig").HeadOptions, mentions: []const document.WindowMentions, relations: []const long_relations.Window) !pipeline.Sample {
+    const planned = prepared.document.?;
     var merged = try document.mergeMentions(allocator, planned, &item.compiled, mentions, options.overlap, options.offset_unit, .{ .control = options.control });
     defer merged.deinit();
     const groups = try a.alloc(pipeline.EntityGroup, item.compiled.schema.entities.len);
@@ -165,6 +207,20 @@ pub fn extract(cb: *const compute.ComputeBackend, allocator: A, config: @import(
             }
         };
         std.mem.sort(pipeline.Value, values.items, {}, Order.less);
+        if (head_options.legacy_greedy_overlap) {
+            var count: usize = 0;
+            for (values.items) |candidate| {
+                const source = candidate.source.?;
+                const overlaps = for (values.items[0..count]) |prior| {
+                    if (source.byte_start < prior.source.?.byte_end and prior.source.?.byte_start < source.byte_end) break true;
+                } else false;
+                if (!overlaps) {
+                    values.items[count] = candidate;
+                    count += 1;
+                }
+            }
+            values.shrinkRetainingCapacity(count);
+        }
         group.* = .{ .name = entity.name, .dtype = entity.dtype, .values = values.items };
     }
     var edges = try long_relations.merge(allocator, planned, &item.compiled, relations, .{ .output_unit = options.offset_unit, .merge = .{ .control = options.control } });
@@ -172,7 +228,7 @@ pub fn extract(cb: *const compute.ComputeBackend, allocator: A, config: @import(
     const copied_edges = try copyRelations(a, edges.relations);
     var classes: []const pipeline.Classification = &.{};
     if (item.compiled.schema.classifications.len != 0) {
-        var logits = try classificationLogits(cb, allocator, .{ .modern_bert = config }, item, prepared);
+        var logits = try classificationLogits(cb, allocator, config, item, prepared);
         defer logits.deinit(allocator);
         const rows = try a.alloc([]const f64, logits.rows.len);
         for (rows, logits.rows) |*out, row| out.* = row;
@@ -186,9 +242,39 @@ pub fn extract(cb: *const compute.ComputeBackend, allocator: A, config: @import(
     for (groups) |group| output_values = try std.math.add(usize, output_values, group.values.len);
     for (classes) |task| output_values = try std.math.add(usize, output_values, task.labels.len);
     if (output_values > options.max_output_values) return error.ExtractionOutputLimitExceeded;
-    const samples = try a.alloc(pipeline.Sample, 1);
-    samples[0] = .{ .entities = groups, .relations = copied_edges, .classifications = classes };
-    return .{ .arena = arena, .samples = samples };
+    return .{ .entities = groups, .relations = copied_edges, .classifications = classes, .long_document = .{ .window_count = prepared.batches.len, .other_record_identity = .occurrence } };
+}
+
+fn extractWindows(cb: *const compute.ComputeBackend, a: A, config: executor.EncoderConfig, item: *const wire.Item, batches: []const processor.PreparedBatch, options: pipeline.Options, head_options: @import("gliner_span_extraction.zig").HeadOptions) !pipeline.Result {
+    const core = @import("gliner_span_extraction.zig");
+    if (batches.len == 1) {
+        const hidden = try executor.encodeSample(cb, a, config, batches[0].samples[0]);
+        defer cb.free(hidden);
+        return core.runFromHidden(cb, a, hidden, config.hiddenSize(), batches[0].samples[0], &item.compiled, options, head_options);
+    }
+    if (config != .deberta or batches.len == 0 or batches.len > 8) return error.InvalidExtractionInput;
+    var sequence_length: usize = 0;
+    for (batches) |batch| sequence_length = @max(sequence_length, batch.samples[0].input_ids.len);
+    if (sequence_length == 0 or sequence_length > 512) return error.InvalidExtractionInput;
+    const tokens = try std.math.mul(usize, sequence_length, batches.len);
+    const ids = try a.alloc(i64, tokens);
+    defer a.free(ids);
+    const mask = try a.alloc(i64, tokens);
+    defer a.free(mask);
+    @memset(ids, 0);
+    @memset(mask, 0);
+    const items = try a.alloc(core.BatchItem, batches.len);
+    defer a.free(items);
+    for (batches, items, 0..) |batch, *out, row| {
+        const sample = batch.samples[0];
+        @memcpy(ids[row * sequence_length ..][0..sample.input_ids.len], sample.input_ids);
+        @memset(mask[row * sequence_length ..][0..sample.input_ids.len], 1);
+        out.* = .{ .sample = sample, .compiled = &item.compiled, .options = options, .head_options = head_options };
+    }
+    cb.preferEagerQuantMirrors(true);
+    const hidden = try @import("../architectures/deberta.zig").forwardCtProfiled(cb, a, config.deberta, ids, mask, batches.len, sequence_length, @import("../models/deberta.zig").glinerPrefersWeightMirrors(config.deberta), null);
+    defer cb.free(hidden);
+    return core.runBatchFromHidden(cb, a, hidden, config.hiddenSize(), sequence_length, items);
 }
 
 // A merged result must own every string after both intermediate arenas close.
