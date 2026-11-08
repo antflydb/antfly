@@ -1674,12 +1674,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         const logical = try std.json.parseFromSliceLeaky(std.json.Value, group_alloc, cleaned, .{});
                         group_changes[i] = try plan.prepareRow(group_alloc, write.key, logical);
                     };
+                    const restored_source = if (opts.restore_ttl_sources) |sources| sources.get(write.key) else null;
                     const restored_version = if (opts.restore_timestamps) |timestamps| timestamps.get(write.key) else null;
                     const resolved_write_timestamp_ns: ?i128 = if (!use_preprepared_rows and shouldWriteTimestamp(write.key))
                         if (prepared_relational) |*prepared|
                             if (restored_version) |version| @as(i128, version) else try resolveWriteTimestampFromValue(self, batch_timestamp_ns, prepared.parsedValue())
-                        else
-                            try resolveWriteTimestampNs(self, restored_version orelse batch_timestamp_ns, write.value)
+                        else if (restored_source) |source| source else try resolveWriteTimestampNs(self, restored_version orelse batch_timestamp_ns, write.value)
                     else
                         null;
                     if (!use_preprepared_rows) if (prepared_relational) |*prepared|

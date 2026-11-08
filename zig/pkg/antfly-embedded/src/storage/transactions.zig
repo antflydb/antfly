@@ -2666,8 +2666,7 @@ pub const TxnManager = struct {
             else => return err,
         };
         defer self.alloc.free(val);
-        if (val.len < 8) return null;
-        return std.mem.readInt(u64, val[0..8], .little);
+        return @import("ttl.zig").writeVersion(val);
     }
 };
 

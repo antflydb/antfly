@@ -16714,7 +16714,7 @@ fn computeTemporalMaterializedAggregation(a: Allocator, index: *algebraic_mod.in
     defer plan.deinit(a);
     const names = try temporalNamesOwnedAlloc(a, plan);
     defer freeAlgebraicDistributedMaterializations(a, names);
-    for (names) |name| if (try algebraicMaterializationExceedsScanBudget(index, store, name)) return null;
+    // The bounded scanner enforces configured and request-wide limits in one pass.
     var local_scan_budget = algebraic_mod.index.TemporalScanBudget{ .control = ctx.control };
     const scan_budget = ctx.temporal_scan_budget orelse &local_scan_budget;
     const materialized = (index.scanMaterializedExpressionRowsBounded(store, names, scan_budget) catch |err| switch (err) {
@@ -16834,6 +16834,22 @@ test "time series grouped materializations merge globally and reduce extra dimen
     try std.testing.expect((try temporalMaterializationsAlloc(a, &left, duplicate_axes, &constraints)) == null);
     const names = (try temporalMaterializationsAlloc(a, &left, request, &constraints)) orelse return error.MissingTemporalPlan;
     defer freeAlgebraicDistributedMaterializations(a, names);
+    var timed_out = algebraic_mod.index.TemporalScanBudget{ .control = .{ .deadline_ns = 0 } };
+    try std.testing.expectError(error.Timeout, left.scanMaterializedExpressionRowsBounded(&left_store, names, &timed_out));
+    try std.testing.expectEqual(@as(usize, 1_000_000), timed_out.remaining_cells);
+    left.parsed.value.max_planner_scan_rows = 5;
+    var exact_budget = algebraic_mod.index.TemporalScanBudget{};
+    const exact = (try left.scanMaterializedExpressionRowsBounded(&left_store, names, &exact_budget)).?;
+    defer {
+        for (exact) |*row| row.deinit(a);
+        a.free(exact);
+    }
+    try std.testing.expectEqual(@as(usize, 5), exact.len);
+    left.parsed.value.max_planner_scan_rows = 4;
+    var capped_budget = algebraic_mod.index.TemporalScanBudget{};
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, left.scanMaterializedExpressionRowsBounded(&left_store, names, &capped_budget));
+    try std.testing.expectEqual(@as(usize, 1_000_000 - 12), capped_budget.remaining_cells);
+    left.parsed.value.max_planner_scan_rows = null;
     var no_cells = algebraic_mod.index.TemporalScanBudget{ .remaining_cells = 0 };
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, left.scanMaterializedExpressionRowsBounded(&left_store, names, &no_cells));
     try std.testing.expect((try computeTemporalMaterializedAggregation(a, &left, &left_store, request, &constraints, .{ .temporal_scan_budget = &no_cells })) == null);
@@ -16921,7 +16937,7 @@ pub fn temporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, st
     defer plan.deinit(a);
     const names = try temporalNamesOwnedAlloc(a, plan);
     defer freeAlgebraicDistributedMaterializations(a, names);
-    for (names) |name| if (try algebraicMaterializationExceedsScanBudget(index, store, name)) return null;
+    // The bounded scanner enforces configured and request-wide limits in one pass.
     var local_scan_budget = algebraic_mod.index.TemporalScanBudget{ .control = ctx.control };
     const scan_budget = ctx.temporal_scan_budget orelse &local_scan_budget;
     const rows = (index.scanMaterializedExpressionRowsBounded(store, names, scan_budget) catch |err| switch (err) {

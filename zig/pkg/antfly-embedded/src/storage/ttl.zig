@@ -16,7 +16,7 @@
 //! Document-level TTL with query-time filtering and background cleanup.
 //!
 //! Matches Go antfly's TTL system:
-//!   - Timestamp stored as a structured internal TTL key (8-byte u64 LE, unix nanoseconds)
+//!   - Timestamp metadata stores a u64 write version plus an optional signed i128 TTL source
 //!   - Query-time filtering: isExpired() for immediate skip
 //!   - Background cleanup: cleanupExpired() with grace period for replication safety
 //!
@@ -48,12 +48,22 @@ pub const TtlConfig = struct {
 /// Legacy records contain an unsigned write version. Extended records preserve
 /// that version in the first eight bytes and append the signed TTL source instant.
 /// Keeping the two separate avoids turning historical event time into version zero.
+pub const TimestampMetadata = struct { version: u64, source: i128 };
+
+/// The only decoder for primary timestamp sidecars. Version fences must use
+/// `version`; expiration must use `source`, including epoch and negative instants.
+pub fn decodeTimestamp(value: []const u8) ?TimestampMetadata {
+    if (value.len != 8 and value.len != 24) return null;
+    const version = std.mem.readInt(u64, value[0..8], .little);
+    return .{ .version = version, .source = if (value.len == 24) std.mem.readInt(i128, value[8..24], .little) else @as(i128, version) };
+}
+
+pub fn writeVersion(value: []const u8) ?u64 {
+    return (decodeTimestamp(value) orelse return null).version;
+}
+
 pub fn sourceTimestamp(value: []const u8) ?i128 {
-    return switch (value.len) {
-        8 => @as(i128, std.mem.readInt(u64, value[0..8], .little)),
-        24 => std.mem.readInt(i128, value[8..24], .little),
-        else => null,
-    };
+    return (decodeTimestamp(value) orelse return null).source;
 }
 
 pub fn encodeTimestampAlloc(alloc: Allocator, version: u64, source: i128) ![]u8 {
@@ -107,8 +117,7 @@ pub fn readTimestamp(store: *DocStore, alloc: Allocator, key: []const u8) !?u64 
         else => return err,
     };
     defer alloc.free(val);
-    if (val.len < 8) return null;
-    return std.mem.readInt(u64, val[0..8], .little);
+    return writeVersion(val);
 }
 
 // ============================================================================
@@ -382,6 +391,8 @@ test "time series TTL signed source records retain versions and legacy compatibi
     try std.testing.expectEqual(@as(usize, 24), historical.len);
     try std.testing.expectEqual(@as(u64, 456), std.mem.readInt(u64, historical[0..8], .little));
     try std.testing.expectEqual(@as(?i128, -1_000_000_000), sourceTimestamp(historical));
+    try std.testing.expectEqual(@as(?u64, 456), writeVersion(historical));
+    for ([_]usize{ 0, 7, 9, 16, 23 }) |length| try std.testing.expect(decodeTimestamp(historical[0..length]) == null);
     try std.testing.expect(!isExpired(-1_000_000_000, 2_000_000_000, 1_000_000_000));
     try std.testing.expect(isExpired(-1_000_000_000, 2_000_000_000, 1_000_000_001));
     try std.testing.expect(!isExpiredWithGrace(-1_000_000_000, 2_000_000_000, 5, 1_000_000_005));

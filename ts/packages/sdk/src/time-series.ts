@@ -326,6 +326,22 @@ export function timeSeriesTable(options: {
   };
 }
 
+function ownFieldPath(document: unknown, path: string): unknown {
+  let value = document;
+  for (const segment of path.split(".")) {
+    if (
+      !segment ||
+      !value ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      !Object.prototype.hasOwnProperty.call(value, segment)
+    )
+      return undefined;
+    value = (value as Record<string, unknown>)[segment];
+  }
+  return value;
+}
+
 /** Explicit IDs are mandatory: equal timestamps need not identify equal events.
  * This builds ordinary upserts. Use version-conditional writes for corrections
  * that must be protected from an older producer retry.
@@ -342,14 +358,15 @@ export function seriesBatch(
     const { id, document } = reading;
     if (typeof id !== "string" || !id || id in inserts)
       throw new TypeError("Reading IDs must be nonempty and unique within the batch");
+    const observedAt = ownFieldPath(document, timestamp);
     if (
       !document ||
       typeof document !== "object" ||
       Array.isArray(document) ||
-      typeof document[timestamp] !== "string"
+      typeof observedAt !== "string"
     )
       throw new TypeError("Readings require an RFC3339 timestamp");
-    instant(document[timestamp]);
+    instant(observedAt);
     inserts[id] = document;
   }
   return { inserts };

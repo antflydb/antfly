@@ -8993,6 +8993,8 @@ pub const DB = struct {
         defer proof_witness_arena.deinit();
         var page_timestamps: std.StringHashMapUnmanaged(u64) = .empty;
         defer page_timestamps.deinit(self.alloc);
+        var page_ttl_sources: std.StringHashMapUnmanaged(i128) = .empty;
+        defer page_ttl_sources.deinit(self.alloc);
         var apply_opts = opts;
         var apply_req = req;
         var chunk_prepared: ?@import("merge_page_chunks.zig").Prepared = null;
@@ -9037,9 +9039,15 @@ pub const DB = struct {
         };
         if (apply_req.merge_page) |page| if (page.phase == .rows or page.phase == .tail) {
             if (page.chunk) |chunk| {
-                if (apply_req.writes.len != 0) try page_timestamps.put(self.alloc, chunk.row_key, chunk.timestamp);
+                if (apply_req.writes.len != 0) {
+                    try page_timestamps.put(self.alloc, chunk.row_key, chunk.timestamp);
+                    if (chunk.ttl_source) |source| try page_ttl_sources.put(self.alloc, chunk.row_key, std.mem.readInt(i128, &source, .little));
+                }
             } else for (apply_req.writes, page.timestamps) |row, timestamp| try page_timestamps.put(self.alloc, row.key, timestamp);
+            for (page.ttl_sources, 0..) |source, i| if (source) |value| try page_ttl_sources.put(self.alloc, apply_req.writes[i].key, std.mem.readInt(i128, &value, .little));
+            if (relationalColumns(self) != null and page_ttl_sources.count() != 0) return error.InvalidMergePage;
             apply_opts.restore_timestamps = &page_timestamps;
+            apply_opts.restore_ttl_sources = &page_ttl_sources;
             apply_opts.preserve_logical_values = true;
         };
         apply_opts.row_policy_principal = policy_opts.row_policy_principal;
@@ -19850,8 +19858,7 @@ pub const DB = struct {
             else => return err,
         };
         const bytes = timestamp orelse return 0;
-        if (bytes.len != 8 and bytes.len != 24) return error.InvalidTimestamp;
-        return std.mem.readInt(u64, bytes[0..8], .little);
+        return ttl_mod.writeVersion(bytes) orelse error.InvalidTimestamp;
     }
 
     fn lookupRelationalRetirement(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
@@ -148649,7 +148656,15 @@ test "time series historical TTL sources preserve write versions and signed visi
     try std.testing.expectEqual(@as(u64, 12345), try db.getTimestamp(a, "historical_restored"));
     try std.testing.expectEqual(@as(?i128, -1_000_000_000), try ttl_mod.readSourceTimestamp(db.core.store, a, "historical_restored"));
     try std.testing.expectEqual(@as(?i128, 12347), try ttl_mod.readSourceTimestamp(db.core.store, a, "fallback_restored"));
-    try db.setSchema(.{ .version = 2, .ttl_field = "observed_at", .ttl_duration_ns = std.time.ns_per_day });
+    // Receiver schema changes must not replace the snapshot's source instant.
+    try db.setSchema(.{ .version = 2 });
+    var sources: std.StringHashMapUnmanaged(i128) = .empty;
+    defer sources.deinit(a);
+    try sources.put(a, "historical_restored", -2_000_000_000);
+    try db.batchInternal(.{ .writes = &.{.{ .key = "historical_restored", .value = "{}" }} }, null, .{ .restore_timestamps = &restored_versions, .restore_ttl_sources = &sources, .preserve_logical_values = true });
+    try std.testing.expectEqual(@as(u64, 12345), try db.getTimestamp(a, "historical_restored"));
+    try std.testing.expectEqual(@as(?i128, -2_000_000_000), try ttl_mod.readSourceTimestamp(db.core.store, a, "historical_restored"));
+    try db.setSchema(.{ .version = 3, .ttl_field = "observed_at", .ttl_duration_ns = std.time.ns_per_day });
     try db.batch(.{
         .timestamp_ns = 12346,
         .writes = &.{.{ .key = "epoch", .value = "{\"observed_at\":\"1970-01-01T00:00:00Z\",\"v\":2}" }},

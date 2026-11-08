@@ -182,6 +182,8 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     const owned = arena.allocator();
     var writes: std.ArrayList(types.BatchWrite) = .empty;
     var timestamps: std.ArrayList(u64) = .empty;
+    var ttl_sources: std.ArrayList(?[16]u8) = .empty;
+    var has_ttl_sources = false;
     var integrity: std.ArrayList(pages.IntegrityEffect) = .empty;
     var vectors: std.ArrayList(pages.IntegrityEffect) = .empty;
     var proofs: std.ArrayList(pages.IntegrityEffect) = .empty;
@@ -366,11 +368,13 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
         const key_offset = try std.math.add(u64, position.offset, 4);
         const flags_offset = try std.math.add(u64, key_offset, key_len);
         const flags = try number(u8, &reader, position.object, flags_offset);
-        if (flags != 0 and flags != 2) return error.SourceSnapshotCorrupt;
+        const codec = @import("../backup_codec.zig");
+        if (flags != 0 and flags != codec.doc_value_flag_relational_row and flags != codec.doc_value_flag_ttl_source) return error.SourceSnapshotCorrupt;
+        const source_size: u64 = if (flags & codec.doc_value_flag_ttl_source != 0) 16 else 0;
         const value_len = try number(u32, &reader, position.object, flags_offset + 1);
         if (writes.items.len != 0 and @as(usize, key_len) +| value_len > pages.max_bytes -| bytes) break;
         const value_offset = try std.math.add(u64, flags_offset, 5);
-        const end = try std.math.add(u64, value_offset, @as(u64, value_len) + 8);
+        const end = try std.math.add(u64, value_offset, @as(u64, value_len) + 8 + source_size);
         if (end > object.size) return error.SourceSnapshotCorrupt;
         const key = try owned.alloc(u8, key_len);
         try exact(&reader, position.object, key_offset, key);
@@ -379,7 +383,12 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
         const raw = try owned.alloc(u8, value_len);
         try exact(&reader, position.object, value_offset, raw);
         const timestamp = try number(u64, &reader, position.object, value_offset + value_len);
-        const value = if (flags == 2) decoded: {
+        const ttl_source: ?[16]u8 = if (source_size != 0) signed: {
+            var source_bytes: [16]u8 = undefined;
+            try exact(&reader, position.object, value_offset + value_len + 8, &source_bytes);
+            break :signed source_bytes;
+        } else null;
+        const value = if (flags == codec.doc_value_flag_relational_row) decoded: {
             const version = try @import("relational_store.zig").rowSchemaVersion(raw);
             var view = (try db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
             defer view.release();
@@ -390,6 +399,8 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
         if (writes.items.len != 0 and key.len +| value.len > pages.max_bytes -| bytes) break;
         try writes.append(owned, .{ .key = key, .value = value });
         try timestamps.append(owned, timestamp);
+        try ttl_sources.append(owned, ttl_source);
+        has_ttl_sources = has_ttl_sources or ttl_source != null;
         bytes +|= key.len +| value.len;
         position.offset = end;
         position.remaining -= 1;
@@ -406,7 +417,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     var request: types.BatchRequest = .{
         .merge_replication = .{ .transition_id = scope.fence.transition_id, .donor_group_id = scope.fence.owner_group_id, .receiver_group_id = scope.fence.peer_group_id, .identity_namespace = scope.receiver_namespace, .copy_attempt = scope.copy_attempt },
         .writes = writes.items,
-        .merge_page = .{ .source = receipt.source, .sequence = try std.math.add(u64, receipt.sequence, 1), .phase = receipt.phase, .after = try owned.dupe(u8, receipt.cursor), .next = last, .exhausted = writes.items.len == 0 and integrity.items.len == 0 and vectors.items.len == 0 and proofs.items.len == 0, .digest = @splat(0), .timestamps = timestamps.items, .next_snapshot_position = last_row_position, .integrity = integrity.items, .artifact_effects = vectors.items, .provenance_effects = proofs.items },
+        .merge_page = .{ .source = receipt.source, .sequence = try std.math.add(u64, receipt.sequence, 1), .phase = receipt.phase, .after = try owned.dupe(u8, receipt.cursor), .next = last, .exhausted = writes.items.len == 0 and integrity.items.len == 0 and vectors.items.len == 0 and proofs.items.len == 0, .digest = @splat(0), .timestamps = timestamps.items, .ttl_sources = if (has_ttl_sources) ttl_sources.items else &.{}, .next_snapshot_position = last_row_position, .integrity = integrity.items, .artifact_effects = vectors.items, .provenance_effects = proofs.items },
     };
     // Artifact phase is permitted only by the row-derived schema capability
     // admission guard; authoritative graph/vector artifacts are not discarded.
@@ -789,7 +800,7 @@ fn expectSparseSourceHits(db: *DB, stage: []const u8, expected: usize) !void {
     try std.testing.expectEqual(expected, result.hits.len);
 }
 
-test "relational index system online snapshot locator resumes immutable rows and chunk receipts after owner reopen" {
+test "relational index system online snapshot locator resumes immutable rows and chunk receipts after owner reopen including time series" {
     const alloc = std.testing.allocator;
     for ([_]bool{ false, true }) |relational| {
         var tmp = std.testing.tmpDir(.{});
@@ -800,7 +811,9 @@ test "relational index system online snapshot locator resumes immutable rows and
         var large = try alloc.alloc(u8, 2 * pages.max_bytes + 16);
         defer alloc.free(large);
         @memset(large, 'x');
-        @memcpy(large[0..6], "{\"v\":\"");
+        const prefix = if (relational) "{\"v\":\"" else "{\"observed_at\":\"1969-12-31T23:59:59Z\",\"v\":\"";
+        @memcpy(large[0..prefix.len], prefix);
+        const small_value = if (relational) "{\"v\":\"second\"}" else "{\"observed_at\":\"1969-12-31T23:59:59Z\",\"v\":\"second\"}";
         @memcpy(large[large.len - 2 ..], "\"}");
         var scope: source.Scope = undefined;
         var certificate: Certificate = undefined;
@@ -810,7 +823,8 @@ test "relational index system online snapshot locator resumes immutable rows and
             if (relational) try db.setSchemaJson(alloc,
                 \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"v":{"type":"string"}},"additionalProperties":false}}}}
             );
-            try server_test_adapter.applyOrdered(&db, .{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = large }, .{ .key = "b", .value = "{\"v\":\"second\"}" } } }, .{ .term = 1, .index = 1 });
+            if (!relational) try db.setSchema(.{ .version = 1, .ttl_field = "observed_at", .ttl_duration_ns = std.math.maxInt(u64) });
+            try server_test_adapter.applyOrdered(&db, .{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = large }, .{ .key = "b", .value = small_value } } }, .{ .term = 1, .index = 1 });
             const identity = try db.relationalTopologyIdentity();
             scope = .{ .fence = .{ .role = .merge_source, .transition_id = 77, .attempt = 1, .admission_epoch = identity.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
             try server_test_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
@@ -839,11 +853,13 @@ test "relational index system online snapshot locator resumes immutable rows and
                 try std.testing.expectEqualStrings("a", chunk.row_key);
                 try std.testing.expectEqual(@as(u64, 111), chunk.timestamp);
                 try std.testing.expectEqualSlices(u8, large[@intCast(chunk.offset)..][0..chunk.data.len], chunk.data);
+                if (!relational) try std.testing.expectEqual(@as(i128, -1_000_000_000), std.mem.readInt(i128, &chunk.ttl_source.?, .little));
                 chunks += 1;
             } else {
+                if (!relational and request.writes.len != 0) try std.testing.expectEqual(@as(i128, -1_000_000_000), std.mem.readInt(i128, &request.merge_page.?.ttl_sources[0].?, .little));
                 for (request.writes) |row| {
                     try std.testing.expectEqualStrings("b", row.key);
-                    try std.testing.expectEqualStrings("{\"v\":\"second\"}", row.value);
+                    try std.testing.expectEqualStrings(small_value, row.value);
                     rows += 1;
                 }
             }

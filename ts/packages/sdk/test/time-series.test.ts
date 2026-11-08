@@ -606,3 +606,33 @@ it("shares the executable nested SQL/JSON fixture with native API tests", () => 
   expect(JSON.parse(JSON.stringify(seriesQuery(fixture.options)))).toEqual(fixture.query);
   expect(seriesSQL(fixture.options)).toEqual(fixture.sql);
 });
+
+it("ingests nested timestamp paths using only own object properties", () => {
+  const document = { attrs: { ts: options.start } };
+  expect(seriesBatch([{ id: "event", document }], "attrs.ts").inserts?.event).toBe(document);
+  for (const invalid of [
+    Object.create(document),
+    { attrs: Object.create(document.attrs) },
+    { attrs: { ts: 123 } },
+    { attrs: [options.start] },
+    {},
+  ]) {
+    expect(() => seriesBatch([{ id: "event", document: invalid }], "attrs.ts")).toThrow();
+  }
+});
+
+it.each([
+  undefined,
+  { status: 422 },
+  { error: "invalid_aggregation" },
+])("rejects latest-series response failures and stops queued requests: %j", async (response) => {
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  const query = vi.spyOn(client, "query").mockResolvedValue(response);
+  await expect(
+    client.latestSeries({
+      ...options,
+      series: Array.from({ length: 20 }, (_, i) => ({ device_id: String(i) })),
+    })
+  ).rejects.toThrow();
+  expect(query).toHaveBeenCalledTimes(4);
+});

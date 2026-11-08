@@ -28,6 +28,7 @@ const WireChunk = struct {
     payload: pages.ChunkPayload = .row,
     row_key: []const u8,
     timestamp: u64,
+    ttl_source: ?[16]u8 = null,
     total_bytes: u64,
     row_digest: pages.Digest,
     offset: u64,
@@ -45,6 +46,7 @@ const WireCommand = struct {
     exhausted: bool,
     digest: pages.Digest,
     timestamps: []const u64 = &.{},
+    ttl_sources: []const ?[16]u8 = &.{},
     tail: ?pages.Tail = null,
     chunk: ?WireChunk = null,
     integrity: []const pages.IntegrityEffect = &.{},
@@ -91,6 +93,13 @@ pub fn write(command: pages.Command, stream: anytype) @TypeOf(stream.*).Error!vo
             }
             continue;
         }
+        if (comptime std.mem.eql(u8, reflected_name, "ttl_sources")) {
+            if (command.ttl_sources.len != 0) {
+                try stream.objectField(reflected_name);
+                try binary.write(command.ttl_sources, stream);
+            }
+            continue;
+        }
         if (comptime std.mem.eql(u8, reflected_name, "next_snapshot_position")) {
             if (command.next_snapshot_position) |position| {
                 try stream.objectField(reflected_name);
@@ -103,6 +112,13 @@ pub fn write(command: pages.Command, stream: anytype) @TypeOf(stream.*).Error!vo
                 try stream.objectField("chunk");
                 try stream.beginObject();
                 inline for (comptime std.meta.fieldNames(pages.Chunk)) |chunk_field_name| {
+                    if (comptime std.mem.eql(u8, chunk_field_name, "ttl_source")) {
+                        if (chunk.ttl_source) |source| {
+                            try stream.objectField(chunk_field_name);
+                            try binary.write(source, stream);
+                        }
+                        continue;
+                    }
                     if (comptime std.mem.eql(u8, chunk_field_name, "payload")) {
                         if (chunk.payload != .row) {
                             try stream.objectField(chunk_field_name);
@@ -213,6 +229,7 @@ fn fromWire(alloc: Allocator, wire: WireCommand) std.json.ParseFromValueError!pa
             .payload = chunk.payload,
             .row_key = chunk.row_key,
             .timestamp = chunk.timestamp,
+            .ttl_source = chunk.ttl_source,
             .total_bytes = chunk.total_bytes,
             .row_digest = chunk.row_digest,
             .offset = chunk.offset,
@@ -301,4 +318,43 @@ test "merge page chunk wire preserves arbitrary bytes with bounded expansion" {
     const field = value.value.object.getPtr("chunk").?.object.getPtr("data_base64").?;
     field.* = .{ .string = "!!!!" };
     try std.testing.expectError(error.UnexpectedToken, parseFromValue(alloc, value.value));
+}
+
+test "time series merge wire preserves exact signed sources and legacy omission" {
+    const a = std.testing.allocator;
+    var source: [16]u8 = undefined;
+    std.mem.writeInt(i128, &source, -(@as(i128, 1) << 100), .little);
+    var command: pages.Command = .{
+        .source = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .pin_digest = @splat(1), .applied_index = 4 },
+        .sequence = 1,
+        .phase = .rows,
+        .exhausted = false,
+        .digest = @splat(2),
+        .timestamps = &.{17},
+    };
+    const legacy = try encodeAlloc(a, command);
+    defer a.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "ttl_source") == null);
+    command.ttl_sources = &.{ source, null };
+    const encoded = try encodeAlloc(a, command);
+    defer a.free(encoded);
+    var tree = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+    defer tree.deinit();
+    var decoded = try parseFromValue(a, tree.value);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(command.ttl_sources, decoded.value.ttl_sources);
+    command.ttl_sources = &.{};
+    command.timestamps = &.{};
+    command.chunk = .{ .row_key = "event", .timestamp = 17, .ttl_source = source, .total_bytes = 1, .row_digest = @splat(3), .offset = 0, .data = "x", .chunk_digest = @splat(4) };
+    const chunk_encoded = try encodeAlloc(a, command);
+    defer a.free(chunk_encoded);
+    var chunk_tree = try std.json.parseFromSlice(std.json.Value, a, chunk_encoded, .{});
+    defer chunk_tree.deinit();
+    var chunk_decoded = try parseFromValue(a, chunk_tree.value);
+    defer chunk_decoded.deinit();
+    try std.testing.expectEqualDeep(command.chunk.?.ttl_source, chunk_decoded.value.chunk.?.ttl_source);
+    const Request = @import("types.zig").BatchRequest;
+    const original = pages.commandDigest(Request{ .merge_page = command });
+    command.chunk.?.ttl_source = null;
+    try std.testing.expect(!std.mem.eql(u8, &original, &pages.commandDigest(Request{ .merge_page = command })));
 }

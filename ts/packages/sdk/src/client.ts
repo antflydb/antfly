@@ -1500,7 +1500,7 @@ export class AntflyClient {
     if (request.series.length > 100) throw new RangeError("Select at most 100 series");
     // Validate the complete selection before starting any network work.
     const requests = request.series.map((dimensions) => seriesRead({ ...request, dimensions }));
-    const results: (QueryResult | undefined)[] = new Array(requests.length);
+    const results: QueryResult[] = new Array(requests.length);
     const stop = new AbortController();
     const signal = options?.signal ? AbortSignal.any([options.signal, stop.signal]) : stop.signal;
     signal.throwIfAborted();
@@ -1515,7 +1515,9 @@ export class AntflyClient {
           try {
             signal.throwIfAborted();
             const index = next++;
-            results[index] = await this.query(requests[index]!, { ...options, signal });
+            results[index] = this.requireSeriesResult(
+              await this.query(requests[index]!, { ...options, signal })
+            );
           } catch (cause) {
             if (!failed) {
               failed = true;
@@ -1533,13 +1535,17 @@ export class AntflyClient {
 
   /** Query bucketed series using the ordinary JSON query and aggregation API. */
   async series(request: SeriesQueryOptions, options?: QueryExecutionOptions) {
-    const result = await this.query(seriesQuery(request), options);
+    const result = this.requireSeriesResult(await this.query(seriesQuery(request), options));
+    return { series: seriesResults(result, request.fill), result };
+  }
+
+  private requireSeriesResult(result: QueryResult | undefined): QueryResult {
     if (!result) throw new Error("Time-series query returned no result");
     if (result.error || (result.status !== undefined && result.status >= 400))
       throw new AntflyResponseError(
         `Time-series query failed (${result.status ?? "unknown"}): ${result.error ?? "unsuccessful query result"}`
       );
-    return { series: seriesResults(result, request.fill), result };
+    return result;
   }
 
   /**

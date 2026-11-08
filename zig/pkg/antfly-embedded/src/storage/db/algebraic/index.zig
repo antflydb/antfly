@@ -12626,11 +12626,16 @@ pub const Index = struct {
         var cursor = try txn.openCursor();
         defer cursor.close();
         var entry_opt = try cursor.seekAtOrAfter(prefix);
+        var scanned: usize = 0;
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             if (budget) |limit| {
                 try limit.control.check();
-                if (materializations.len > limit.remaining_cells) return error.QueryCandidateBudgetExceeded;
+                if (scanned >= (self.config().max_planner_scan_rows orelse std.math.maxInt(usize)) or materializations.len > limit.remaining_cells) return error.QueryCandidateBudgetExceeded;
+                // Charge every visited row, even if decoding or predicates later
+                // discard it. Admission and execution share this one scan.
+                limit.remaining_cells -= materializations.len;
+                scanned += 1;
             }
             const values = try self.alloc.alloc(?[]u8, materializations.len);
             errdefer {
@@ -12708,7 +12713,6 @@ pub const Index = struct {
                     if (value) |raw| bytes = std.math.add(usize, bytes, raw.len) catch return error.QueryCandidateBudgetExceeded;
                 }
                 if (bytes > limit.remaining_bytes) return error.QueryCandidateBudgetExceeded;
-                limit.remaining_cells -= materializations.len;
                 limit.remaining_bytes -= bytes;
             }
             try out.append(self.alloc, .{
