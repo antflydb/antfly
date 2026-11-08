@@ -1,21 +1,21 @@
 {
-  "source_commit": "335d8fd4841dcd1363d71214edcb997197c85de6",
-  "measurement_scope": "relational write surface (secondary index, unique constraint, foreign key, SQL INSERT/UPDATE via C API, 2-document SQL transaction), 1 and 8 writers, AFTER staging the opts.transaction_resolution commit path (TxnManager.resolveIntentsWithExtraBatchStaged / DBCore.resolveTransactionIntentsWithExtraBatchStaged): the apply lock and capi writer lane now release before this commit waits for durability, mirroring the primary write path (lite-single-commit-write-path.md section 3.2).",
+  "source_commit": "40c7383e3870ca850843e14a1aeda5d407d16a65",
+  "measurement_scope": "relational write surface (secondary index, unique constraint, foreign key, SQL INSERT/UPDATE via C API, 2-document SQL transaction), 1 and 8 writers, after collapsing the single-store coordinated-write path -- see lite-single-commit-write-path.md section 3.3c: sql.zig mutate()/sql_session.zig commit() now route a coordinated write through commitCoordinated (begin/writeTransaction/commitTransaction against the ONE table, no cross-database decision record) whenever the prepared plan touches exactly one table on a Lite single-file store, instead of always taking the full cross-database two-phase commit protocol in sql_commit.zig. A write whose prepared plan spans more than one physical table (foreign_key: child + parent inbound-reference bookkeeping) still takes the full cross-database protocol and is unchanged by this pass.",
   "known_limitations": [
-    "This fix removes the apply-lock-held-across-fsync defect on the transaction-resolution path (every SQL write through a table with a unique/FK constraint, and every explicit multi-document transaction). It does NOT reduce the number of distinct native commits a single writer pays for a coordinated-constraint or multi-statement write: durable_commits_per_write for unique-constraint/foreign-key/transaction modes is essentially unchanged from the before baseline (~11-16 commits/write vs ~2 for a plain/secondary-index SQL write). Folding the two-phase intent protocol (begin/writeIntents) and whatever else contributes the remaining ~10 commits into the SAME native transaction as the final resolve is follow-up work (a WS3/WS4-sized effort), not completed in this change.",
-    "Per-site stage tags for relational/integrity/transaction-resolution commits were not added, so the breakdown by concern is still not available in this report (same limitation as the before baseline).",
-    "mean_primary_group_size still reads 0.000 for every relational mode for the same reason as the before baseline."
+    "relational_txn_begin/relational_intent_write/relational_intent_resolve/relational_coordinator_hint stage tags were added this pass (write_amplification_trace.zig); durable_commits_per_write and syncs/update were already accurate before this pass, now the stage breakdown is attributed too.",
+    "foreign_key (2 participants: child + parent inbound-FK bookkeeping) and the explicit multi-statement transaction case are unaffected when they span more than one table; only the single-table coordinated/session-commit case was collapsed this pass.",
+    "mean_primary_group_size still reads 0.000 for every relational mode: group-commit bundling cannot be read off this field for relational writes (unchanged from before)."
   ],
   "report": {
     "updates": 128,
     "secondary_index": {
       "updates": 128,
-      "calling_thread_syncs_per_update": 2.234375,
-      "background_syncs_per_update": 1.171875,
-      "fsyncs_per_write_overall": 3.40625,
-      "durable_commits_per_write": 1.7734375,
+      "calling_thread_syncs_per_update": 2.1796875,
+      "background_syncs_per_update": 1.0234375,
+      "fsyncs_per_write_overall": 3.203125,
+      "durable_commits_per_write": 1.640625,
       "mean_primary_group_size": 0,
-      "indicative_writes_per_second_debug": 4.1706959805337,
+      "indicative_writes_per_second_debug": 4.949556949577939,
       "stages": {
         "primary_commit": {
           "sync_calling_thread": 0,
@@ -237,15 +237,55 @@
           "commits_calling_thread": 0,
           "commits_background": 0
         },
+        "relational_txn_begin": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
+        "relational_intent_write": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
+        "relational_intent_resolve": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
+        "relational_coordinator_hint": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
         "other": {
-          "sync_calling_thread": 286,
-          "sync_background": 150,
-          "write_calls_calling_thread": 1803,
-          "write_calls_background": 1082,
-          "write_bytes_calling_thread": 10248192,
-          "write_bytes_background": 4583424,
-          "commits_calling_thread": 152,
-          "commits_background": 75
+          "sync_calling_thread": 279,
+          "sync_background": 131,
+          "write_calls_calling_thread": 1700,
+          "write_calls_background": 989,
+          "write_bytes_calling_thread": 9928704,
+          "write_bytes_background": 4231168,
+          "commits_calling_thread": 143,
+          "commits_background": 67
         }
       },
       "background_ops": {
@@ -257,12 +297,12 @@
     },
     "secondary_index_8_writers": {
       "updates": 128,
-      "calling_thread_syncs_per_update": 2.265625,
-      "background_syncs_per_update": 0.875,
-      "fsyncs_per_write_overall": 3.140625,
-      "durable_commits_per_write": 1.6171875,
+      "calling_thread_syncs_per_update": 2.296875,
+      "background_syncs_per_update": 0.859375,
+      "fsyncs_per_write_overall": 3.15625,
+      "durable_commits_per_write": 1.6328125,
       "mean_primary_group_size": 0,
-      "indicative_writes_per_second_debug": 4.705848983800634,
+      "indicative_writes_per_second_debug": 4.189902948467848,
       "stages": {
         "primary_commit": {
           "sync_calling_thread": 0,
@@ -484,14 +524,54 @@
           "commits_calling_thread": 0,
           "commits_background": 0
         },
+        "relational_txn_begin": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
+        "relational_intent_write": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
+        "relational_intent_resolve": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
+        "relational_coordinator_hint": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
         "other": {
-          "sync_calling_thread": 290,
-          "sync_background": 112,
-          "write_calls_calling_thread": 1875,
-          "write_calls_background": 915,
-          "write_bytes_calling_thread": 10334208,
-          "write_bytes_background": 3842048,
-          "commits_calling_thread": 151,
+          "sync_calling_thread": 294,
+          "sync_background": 110,
+          "write_calls_calling_thread": 1879,
+          "write_calls_background": 932,
+          "write_bytes_calling_thread": 10457088,
+          "write_bytes_background": 3911680,
+          "commits_calling_thread": 153,
           "commits_background": 56
         }
       },
@@ -504,12 +584,12 @@
     },
     "unique_index": {
       "updates": 128,
-      "calling_thread_syncs_per_update": 20,
-      "background_syncs_per_update": 2.578125,
-      "fsyncs_per_write_overall": 22.578125,
-      "durable_commits_per_write": 11.515625,
+      "calling_thread_syncs_per_update": 6.3359375,
+      "background_syncs_per_update": 2.21875,
+      "fsyncs_per_write_overall": 8.5546875,
+      "durable_commits_per_write": 4.3203125,
       "mean_primary_group_size": 0,
-      "indicative_writes_per_second_debug": 1.5447932621657434,
+      "indicative_writes_per_second_debug": 2.49461425007992,
       "stages": {
         "primary_commit": {
           "sync_calling_thread": 0,
@@ -731,15 +811,55 @@
           "commits_calling_thread": 0,
           "commits_background": 0
         },
+        "relational_txn_begin": {
+          "sync_calling_thread": 256,
+          "sync_background": 0,
+          "write_calls_calling_thread": 842,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 3665920,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 128,
+          "commits_background": 0
+        },
+        "relational_intent_write": {
+          "sync_calling_thread": 289,
+          "sync_background": 0,
+          "write_calls_calling_thread": 1093,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 4788224,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 148,
+          "commits_background": 0
+        },
+        "relational_intent_resolve": {
+          "sync_calling_thread": 264,
+          "sync_background": 0,
+          "write_calls_calling_thread": 2255,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 11358208,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 133,
+          "commits_background": 0
+        },
+        "relational_coordinator_hint": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
         "other": {
-          "sync_calling_thread": 2560,
-          "sync_background": 330,
-          "write_calls_calling_thread": 10080,
-          "write_calls_background": 4767,
-          "write_bytes_calling_thread": 45674496,
-          "write_bytes_background": 19759104,
-          "commits_calling_thread": 1301,
-          "commits_background": 173
+          "sync_calling_thread": 2,
+          "sync_background": 284,
+          "write_calls_calling_thread": 6,
+          "write_calls_background": 2334,
+          "write_bytes_calling_thread": 24576,
+          "write_bytes_background": 9748480,
+          "commits_calling_thread": 1,
+          "commits_background": 143
         }
       },
       "background_ops": {
@@ -751,12 +871,12 @@
     },
     "unique_index_8_writers": {
       "updates": 128,
-      "calling_thread_syncs_per_update": 19.96875,
-      "background_syncs_per_update": 2.6953125,
-      "fsyncs_per_write_overall": 22.6640625,
-      "durable_commits_per_write": 11.5390625,
+      "calling_thread_syncs_per_update": 6.2578125,
+      "background_syncs_per_update": 2.28125,
+      "fsyncs_per_write_overall": 8.5390625,
+      "durable_commits_per_write": 4.34375,
       "mean_primary_group_size": 0,
-      "indicative_writes_per_second_debug": 1.4126554357772692,
+      "indicative_writes_per_second_debug": 2.2538493286888865,
       "stages": {
         "primary_commit": {
           "sync_calling_thread": 0,
@@ -978,15 +1098,55 @@
           "commits_calling_thread": 0,
           "commits_background": 0
         },
+        "relational_txn_begin": {
+          "sync_calling_thread": 256,
+          "sync_background": 0,
+          "write_calls_calling_thread": 840,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 3678208,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 128,
+          "commits_background": 0
+        },
+        "relational_intent_write": {
+          "sync_calling_thread": 281,
+          "sync_background": 0,
+          "write_calls_calling_thread": 1134,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 5054464,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 144,
+          "commits_background": 0
+        },
+        "relational_intent_resolve": {
+          "sync_calling_thread": 262,
+          "sync_background": 0,
+          "write_calls_calling_thread": 2370,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 11685888,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 136,
+          "commits_background": 0
+        },
+        "relational_coordinator_hint": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
         "other": {
-          "sync_calling_thread": 2556,
-          "sync_background": 345,
-          "write_calls_calling_thread": 9995,
-          "write_calls_background": 4844,
-          "write_bytes_calling_thread": 45740032,
-          "write_bytes_background": 20156416,
-          "commits_calling_thread": 1296,
-          "commits_background": 181
+          "sync_calling_thread": 2,
+          "sync_background": 292,
+          "write_calls_calling_thread": 6,
+          "write_calls_background": 2338,
+          "write_bytes_calling_thread": 24576,
+          "write_bytes_background": 9740288,
+          "commits_calling_thread": 1,
+          "commits_background": 147
         }
       },
       "background_ops": {
@@ -998,12 +1158,12 @@
     },
     "foreign_key": {
       "updates": 128,
-      "calling_thread_syncs_per_update": 29.7421875,
-      "background_syncs_per_update": 2.109375,
-      "fsyncs_per_write_overall": 31.8515625,
-      "durable_commits_per_write": 16.140625,
+      "calling_thread_syncs_per_update": 29.921875,
+      "background_syncs_per_update": 2.2109375,
+      "fsyncs_per_write_overall": 32.1328125,
+      "durable_commits_per_write": 16.2734375,
       "mean_primary_group_size": 0,
-      "indicative_writes_per_second_debug": 1.232027682377172,
+      "indicative_writes_per_second_debug": 1.1819800965890248,
       "stages": {
         "primary_commit": {
           "sync_calling_thread": 0,
@@ -1225,15 +1385,55 @@
           "commits_calling_thread": 0,
           "commits_background": 0
         },
+        "relational_txn_begin": {
+          "sync_calling_thread": 774,
+          "sync_background": 0,
+          "write_calls_calling_thread": 2751,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 12132352,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 391,
+          "commits_background": 0
+        },
+        "relational_intent_write": {
+          "sync_calling_thread": 510,
+          "sync_background": 0,
+          "write_calls_calling_thread": 1918,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 8298496,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 256,
+          "commits_background": 0
+        },
+        "relational_intent_resolve": {
+          "sync_calling_thread": 774,
+          "sync_background": 0,
+          "write_calls_calling_thread": 3316,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 14835712,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 392,
+          "commits_background": 0
+        },
+        "relational_coordinator_hint": {
+          "sync_calling_thread": 496,
+          "sync_background": 0,
+          "write_calls_calling_thread": 1528,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 6746112,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 252,
+          "commits_background": 0
+        },
         "other": {
-          "sync_calling_thread": 3807,
-          "sync_background": 270,
-          "write_calls_calling_thread": 13177,
-          "write_calls_background": 5929,
-          "write_bytes_calling_thread": 58204160,
-          "write_bytes_background": 24571904,
-          "commits_calling_thread": 1918,
-          "commits_background": 148
+          "sync_calling_thread": 1276,
+          "sync_background": 283,
+          "write_calls_calling_thread": 4154,
+          "write_calls_background": 6067,
+          "write_bytes_calling_thread": 18993152,
+          "write_bytes_background": 25128960,
+          "commits_calling_thread": 641,
+          "commits_background": 151
         }
       },
       "background_ops": {
@@ -1245,12 +1445,12 @@
     },
     "foreign_key_8_writers": {
       "updates": 128,
-      "calling_thread_syncs_per_update": 29.984375,
-      "background_syncs_per_update": 1.84375,
-      "fsyncs_per_write_overall": 31.828125,
-      "durable_commits_per_write": 16.1875,
+      "calling_thread_syncs_per_update": 30.265625,
+      "background_syncs_per_update": 1.5390625,
+      "fsyncs_per_write_overall": 31.8046875,
+      "durable_commits_per_write": 16.078125,
       "mean_primary_group_size": 0,
-      "indicative_writes_per_second_debug": 0.8265779452466695,
+      "indicative_writes_per_second_debug": 1.2154361699301415,
       "stages": {
         "primary_commit": {
           "sync_calling_thread": 0,
@@ -1472,15 +1672,55 @@
           "commits_calling_thread": 0,
           "commits_background": 0
         },
+        "relational_txn_begin": {
+          "sync_calling_thread": 773,
+          "sync_background": 0,
+          "write_calls_calling_thread": 2784,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 12681216,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 391,
+          "commits_background": 0
+        },
+        "relational_intent_write": {
+          "sync_calling_thread": 513,
+          "sync_background": 0,
+          "write_calls_calling_thread": 1969,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 8585216,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 257,
+          "commits_background": 0
+        },
+        "relational_intent_resolve": {
+          "sync_calling_thread": 809,
+          "sync_background": 0,
+          "write_calls_calling_thread": 4423,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 20676608,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 414,
+          "commits_background": 0
+        },
+        "relational_coordinator_hint": {
+          "sync_calling_thread": 492,
+          "sync_background": 0,
+          "write_calls_calling_thread": 1524,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 7073792,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 248,
+          "commits_background": 0
+        },
         "other": {
-          "sync_calling_thread": 3838,
-          "sync_background": 236,
-          "write_calls_calling_thread": 14406,
-          "write_calls_background": 5975,
-          "write_bytes_calling_thread": 65851392,
-          "write_bytes_background": 24723456,
-          "commits_calling_thread": 1945,
-          "commits_background": 127
+          "sync_calling_thread": 1287,
+          "sync_background": 197,
+          "write_calls_calling_thread": 4284,
+          "write_calls_background": 5966,
+          "write_bytes_calling_thread": 20205568,
+          "write_bytes_background": 24735744,
+          "commits_calling_thread": 644,
+          "commits_background": 104
         }
       },
       "background_ops": {
@@ -1492,12 +1732,12 @@
     },
     "sql_insert_update": {
       "updates": 128,
-      "calling_thread_syncs_per_update": 2.15625,
-      "background_syncs_per_update": 1.578125,
-      "fsyncs_per_write_overall": 3.734375,
-      "durable_commits_per_write": 1.8984375,
+      "calling_thread_syncs_per_update": 2.2421875,
+      "background_syncs_per_update": 1.125,
+      "fsyncs_per_write_overall": 3.3671875,
+      "durable_commits_per_write": 1.7578125,
       "mean_primary_group_size": 0,
-      "indicative_writes_per_second_debug": 4.0512351265965485,
+      "indicative_writes_per_second_debug": 5.818158148856622,
       "stages": {
         "primary_commit": {
           "sync_calling_thread": 0,
@@ -1719,15 +1959,55 @@
           "commits_calling_thread": 0,
           "commits_background": 0
         },
+        "relational_txn_begin": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
+        "relational_intent_write": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
+        "relational_intent_resolve": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
+        "relational_coordinator_hint": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
         "other": {
-          "sync_calling_thread": 276,
-          "sync_background": 202,
-          "write_calls_calling_thread": 1754,
-          "write_calls_background": 1274,
-          "write_bytes_calling_thread": 9375744,
-          "write_bytes_background": 5472256,
-          "commits_calling_thread": 142,
-          "commits_background": 101
+          "sync_calling_thread": 287,
+          "sync_background": 144,
+          "write_calls_calling_thread": 1794,
+          "write_calls_background": 1037,
+          "write_bytes_calling_thread": 10014720,
+          "write_bytes_background": 4435968,
+          "commits_calling_thread": 152,
+          "commits_background": 73
         }
       },
       "background_ops": {
@@ -1739,12 +2019,12 @@
     },
     "sql_insert_update_8_writers": {
       "updates": 128,
-      "calling_thread_syncs_per_update": 2.171875,
-      "background_syncs_per_update": 1.2890625,
-      "fsyncs_per_write_overall": 3.4609375,
-      "durable_commits_per_write": 1.7890625,
+      "calling_thread_syncs_per_update": 2.203125,
+      "background_syncs_per_update": 1,
+      "fsyncs_per_write_overall": 3.203125,
+      "durable_commits_per_write": 1.6875,
       "mean_primary_group_size": 0,
-      "indicative_writes_per_second_debug": 4.368978525873293,
+      "indicative_writes_per_second_debug": 5.915834703305465,
       "stages": {
         "primary_commit": {
           "sync_calling_thread": 0,
@@ -1966,15 +2246,55 @@
           "commits_calling_thread": 0,
           "commits_background": 0
         },
+        "relational_txn_begin": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
+        "relational_intent_write": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
+        "relational_intent_resolve": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
+        "relational_coordinator_hint": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
         "other": {
-          "sync_calling_thread": 278,
-          "sync_background": 165,
-          "write_calls_calling_thread": 1752,
-          "write_calls_background": 1154,
-          "write_bytes_calling_thread": 9560064,
-          "write_bytes_background": 4907008,
-          "commits_calling_thread": 145,
-          "commits_background": 84
+          "sync_calling_thread": 282,
+          "sync_background": 128,
+          "write_calls_calling_thread": 1781,
+          "write_calls_background": 968,
+          "write_bytes_calling_thread": 9809920,
+          "write_bytes_background": 4042752,
+          "commits_calling_thread": 152,
+          "commits_background": 64
         }
       },
       "background_ops": {
@@ -1986,12 +2306,12 @@
     },
     "transaction_2doc": {
       "updates": 128,
-      "calling_thread_syncs_per_update": 19.9296875,
-      "background_syncs_per_update": 2.03125,
-      "fsyncs_per_write_overall": 21.9609375,
-      "durable_commits_per_write": 11.1875,
+      "calling_thread_syncs_per_update": 6.296875,
+      "background_syncs_per_update": 1.96875,
+      "fsyncs_per_write_overall": 8.265625,
+      "durable_commits_per_write": 4.1875,
       "mean_primary_group_size": 0,
-      "indicative_writes_per_second_debug": 1.3182786829030357,
+      "indicative_writes_per_second_debug": 3.0363848394087785,
       "stages": {
         "primary_commit": {
           "sync_calling_thread": 0,
@@ -2213,15 +2533,55 @@
           "commits_calling_thread": 0,
           "commits_background": 0
         },
+        "relational_txn_begin": {
+          "sync_calling_thread": 256,
+          "sync_background": 0,
+          "write_calls_calling_thread": 857,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 3678208,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 128,
+          "commits_background": 0
+        },
+        "relational_intent_write": {
+          "sync_calling_thread": 276,
+          "sync_background": 0,
+          "write_calls_calling_thread": 1049,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 4669440,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 139,
+          "commits_background": 0
+        },
+        "relational_intent_resolve": {
+          "sync_calling_thread": 274,
+          "sync_background": 0,
+          "write_calls_calling_thread": 2296,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 11939840,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 143,
+          "commits_background": 0
+        },
+        "relational_coordinator_hint": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
         "other": {
-          "sync_calling_thread": 2551,
-          "sync_background": 260,
-          "write_calls_calling_thread": 10280,
-          "write_calls_background": 4428,
-          "write_bytes_calling_thread": 46514176,
-          "write_bytes_background": 18403328,
-          "commits_calling_thread": 1294,
-          "commits_background": 138
+          "sync_calling_thread": 0,
+          "sync_background": 252,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 2161,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 8994816,
+          "commits_calling_thread": 0,
+          "commits_background": 126
         }
       },
       "background_ops": {
@@ -2233,12 +2593,12 @@
     },
     "transaction_2doc_8_writers": {
       "updates": 128,
-      "calling_thread_syncs_per_update": 19.984375,
-      "background_syncs_per_update": 1.84375,
-      "fsyncs_per_write_overall": 21.828125,
-      "durable_commits_per_write": 11.0625,
+      "calling_thread_syncs_per_update": 6.2890625,
+      "background_syncs_per_update": 1.96875,
+      "fsyncs_per_write_overall": 8.2578125,
+      "durable_commits_per_write": 4.1953125,
       "mean_primary_group_size": 0,
-      "indicative_writes_per_second_debug": 1.3743521460839352,
+      "indicative_writes_per_second_debug": 2.9717938656784613,
       "stages": {
         "primary_commit": {
           "sync_calling_thread": 0,
@@ -2460,15 +2820,55 @@
           "commits_calling_thread": 0,
           "commits_background": 0
         },
+        "relational_txn_begin": {
+          "sync_calling_thread": 256,
+          "sync_background": 0,
+          "write_calls_calling_thread": 853,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 3674112,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 128,
+          "commits_background": 0
+        },
+        "relational_intent_write": {
+          "sync_calling_thread": 272,
+          "sync_background": 0,
+          "write_calls_calling_thread": 1066,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 4857856,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 140,
+          "commits_background": 0
+        },
+        "relational_intent_resolve": {
+          "sync_calling_thread": 277,
+          "sync_background": 0,
+          "write_calls_calling_thread": 2461,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 12578816,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 142,
+          "commits_background": 0
+        },
+        "relational_coordinator_hint": {
+          "sync_calling_thread": 0,
+          "sync_background": 0,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 0,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 0,
+          "commits_calling_thread": 0,
+          "commits_background": 0
+        },
         "other": {
-          "sync_calling_thread": 2558,
-          "sync_background": 236,
-          "write_calls_calling_thread": 10147,
-          "write_calls_background": 4361,
-          "write_bytes_calling_thread": 46268416,
-          "write_bytes_background": 18194432,
-          "commits_calling_thread": 1291,
-          "commits_background": 125
+          "sync_calling_thread": 0,
+          "sync_background": 252,
+          "write_calls_calling_thread": 0,
+          "write_calls_background": 2197,
+          "write_bytes_calling_thread": 0,
+          "write_bytes_background": 9183232,
+          "commits_calling_thread": 0,
+          "commits_background": 127
         }
       },
       "background_ops": {
