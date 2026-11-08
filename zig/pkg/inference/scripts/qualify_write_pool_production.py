@@ -310,6 +310,33 @@ def require_extraction_observations(before, after, responses):
     return observed
 
 
+def verify_mixed_recognition(requests):
+    """Check captured traffic against prior references for identical request bytes."""
+    references = {}
+    verified = {"whisper": 0, "ocr": 0}
+    for row in requests:
+        kind = row["kind"]
+        if kind not in verified:
+            continue
+        key = kind, row["request_sha256"]
+        if row["phase"] in ("warmup", kind + "-serialized"):
+            assert row["status"] == 200
+            references[key] = row["response"]
+        elif row["phase"] == "mixed-sustained-turnover":
+            assert row["status"] == 200
+            if key not in references:
+                raise q.EvidenceUnavailable(
+                    "mixed recognition lacks a prior identical-request reference"
+                )
+            assert_equivalent(kind, references[key], row["response"])
+            verified[kind] += 1
+    if not all(verified.values()):
+        raise q.EvidenceUnavailable(
+            "mixed traffic lacks OCR or Whisper parity evidence"
+        )
+    return verified
+
+
 class Campaign(w.WriteCampaign):
     def telemetry(self):
         code, raw, _ = q.http(self.args.url, "/metrics", text=True)
@@ -727,12 +754,14 @@ class Campaign(w.WriteCampaign):
             long_reference = self.call("extract", long_extract)["response"]
             warmed = self.idle()
             result["batching"] = {}
+            controlled_references = {}
             for kind, body in jobs:
                 self.set_phase(kind + "-serialized")
                 cohort = cohorts[kind]
                 individual = [
                     self.call(kind, request)["response"] for request in cohort
                 ]
+                controlled_references[kind] = individual
                 serial = []
                 for _ in range(self.args.rounds):
                     start = time.monotonic()
@@ -876,12 +905,16 @@ class Campaign(w.WriteCampaign):
                             )
                             expected["data"][0]["id"] = body["inputs"][0]["id"]
                             assert_equivalent(kind, expected, row["response"])
-                        elif kind == "embed":
+                        elif kind in ("embed", "whisper"):
                             assert_equivalent(kind, references[kind], row["response"])
                         elif kind == "ocr":
-                            for needle in self.ocr_cases[(turn + index // 4) % 4][
-                                "required"
-                            ]:
+                            layout = (turn + index // 4) % 4
+                            assert_equivalent(
+                                kind,
+                                controlled_references[kind][layout],
+                                row["response"],
+                            )
+                            for needle in self.ocr_cases[layout]["required"]:
                                 assert (
                                     needle.casefold()
                                     in row["response"]["data"][0]["text"].casefold()
@@ -894,6 +927,7 @@ class Campaign(w.WriteCampaign):
                 "requests": turn * 8,
                 "seconds": time.monotonic() - soak_started,
             }
+            result["mixed_recognition_parity"] = verify_mixed_recognition(self.rows)
             result["mixed_latency"] = {}
             for kind in self.task_kinds:
                 summary = q.summary(

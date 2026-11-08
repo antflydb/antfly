@@ -239,6 +239,53 @@ class QualificationTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 2)
             self.assertIn("finite and nonnegative", stderr.getvalue())
 
+    def test_mixed_recognition_requires_identical_request_reference_and_full_parity(
+        self,
+    ):
+        response = {
+            "model": "m",
+            "data": [{"index": 0, "text": "ok", "status": "complete"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+        rows = []
+        for kind in ("whisper", "ocr"):
+            for phase in ("warmup", "mixed-sustained-turnover"):
+                rows.append(
+                    {
+                        "kind": kind,
+                        "phase": phase,
+                        "status": 200,
+                        "request_sha256": kind,
+                        "response": copy.deepcopy(response),
+                    }
+                )
+        self.assertEqual(
+            production.verify_mixed_recognition(rows), {"whisper": 1, "ocr": 1}
+        )
+        for kind in ("whisper", "ocr"):
+            for field in ("text", "usage", "request", "status"):
+                changed = copy.deepcopy(rows)
+                row = next(
+                    r
+                    for r in changed
+                    if r["kind"] == kind and r["phase"] == "mixed-sustained-turnover"
+                )
+                if field == "text":
+                    row["response"]["data"][0]["text"] = "other"
+                elif field == "usage":
+                    row["response"]["usage"]["prompt_tokens"] = 1
+                elif field == "request":
+                    row["request_sha256"] = "unmatched"
+                else:
+                    row["status"] = 500
+                with (
+                    self.subTest(kind=kind, field=field),
+                    self.assertRaises((AssertionError, q.EvidenceUnavailable)),
+                ):
+                    production.verify_mixed_recognition(changed)
+        with self.assertRaises(q.EvidenceUnavailable):
+            production.verify_mixed_recognition(rows[:2])
+
     def test_regression_and_promotion_are_separate_gates(self):
         self.assertFalse(latency_gate(1, 1, [0.9])["promotion_10_percent_pass"])
         self.assertTrue(latency_gate(1, 0.8, [0.7])["promotion_10_percent_pass"])
