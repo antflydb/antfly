@@ -32,7 +32,7 @@ const rebuild_state_key_length_bytes = @sizeOf(u32);
 const rebuild_state_checksum_bytes = @sizeOf(u32);
 const rebuild_state_v1_header_bytes = rebuild_state_magic.len + @sizeOf(@TypeOf(rebuild_state_version)) + rebuild_state_key_length_bytes;
 const rebuild_state_header_bytes = rebuild_state_magic.len + @sizeOf(@TypeOf(rebuild_state_version)) + rebuild_state_owner_bytes + rebuild_state_flags_bytes + rebuild_state_key_length_bytes;
-const rebuild_state_max_key_bytes = 64 * 1024;
+const rebuild_state_max_key_bytes = @import("artifact_publication.zig").max_cursor_bytes;
 const rebuild_state_max_encoded_bytes = rebuild_state_header_bytes + rebuild_state_max_key_bytes + rebuild_state_checksum_bytes;
 const rebuild_state_max_read_bytes = rebuild_state_max_encoded_bytes + 1;
 const rebuild_state_temp_attempts = 16;
@@ -842,4 +842,18 @@ test "rebuild state estimates progress from resume key" {
     const progress = estimateProgressForKey("doc:a", "doc:z", "doc:m");
     try std.testing.expect(progress > 0.0);
     try std.testing.expect(progress < 1.0);
+}
+
+test "privacy rebuild cursor round trips an admitted large document identity" {
+    const a = std.testing.allocator;
+    const key = try a.alloc(u8, 1_100_000);
+    defer a.free(key);
+    @memset(key, 'x');
+    const encoded = try encodeState(a, 7, false, key);
+    defer a.free(encoded);
+    const restored = try decodeState(a, encoded);
+    defer a.free(restored.key);
+    try std.testing.expectEqual(@as(?u64, 7), restored.owner_generation);
+    try std.testing.expect(!restored.complete);
+    try std.testing.expectEqualSlices(u8, key, restored.key);
 }

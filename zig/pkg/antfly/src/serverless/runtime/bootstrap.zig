@@ -47,6 +47,8 @@ pub const BootstrapConfig = struct {
     pub const S3Options = object_store_support.S3Options;
     pub const GcsOptions = object_store_support.GcsOptions;
 
+    sql_execution_gc: ?@import("../sql/collector.zig").Collector = null,
+
     /// Borrowed capability-authorized client for tables hosted by a native process.
     native_location: ?struct { client: objectstore.Client, bucket: []const u8, prefix: []const u8 } = null,
     artifacts_uri: []const u8,
@@ -611,6 +613,7 @@ pub const OwnedStack = struct {
         errdefer if (status_owned) self.status.deinit(alloc);
         self.runtime = runtime_manager.ManagedRuntime.initWithIo(alloc, io, .{
             .tick_interval_ms = cfg.tick_interval_ms,
+            .sql_execution_gc = cfg.sql_execution_gc,
             .role = cfg.role,
             .publish_enabled = cfg.publish_enabled,
             .compaction_enabled = cfg.compaction_enabled,

@@ -127,6 +127,7 @@ const HttpxTransport = struct {
         if (content_type) |value| try request_headers.append(alloc, .{ "Content-Type", value });
 
         var response = try self.client.request(method.toHttpx(), url, .{
+            .follow_redirects = false,
             .headers = request_headers.items,
             .body = body,
             .timeout_ms = try control.remainingTimeoutMs(),

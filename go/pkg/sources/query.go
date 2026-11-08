@@ -15,6 +15,20 @@
 
 package sources
 
+// queryFreshness is how a query response says what it read from: a retained
+// snapshot, whose capture proves indexes caught up, or live state, because the
+// server's storage (Lite) can't retain one. Live reads show writes as soon as
+// the writer's sync level made them visible, not before. A response with
+// neither is not understood, so the source gates keep rejecting it.
+type queryFreshness struct {
+	Snapshot string `json:"remote_snapshot"`
+	LiveRead bool   `json:"live_read"`
+}
+
+// A live read can prove that a matching row is visible, but an empty live read
+// cannot prove absence: an acknowledged insert may still be awaiting indexing.
+func (f queryFreshness) readable() bool { return f.Snapshot != "" || f.LiveRead }
+
 // documentIDsQuery is the tagged native query representation, also valid inside
 // boolean clauses. Bare {"ids": ...} is not accepted by the rc.6 data plane.
 func documentIDsQuery(ids []string) map[string]any {

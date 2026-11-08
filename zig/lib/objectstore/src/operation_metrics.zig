@@ -21,14 +21,35 @@ const std = @import("std");
 pub const Operation = enum { bucket_probe, bucket_create, get, get_batch, put, put_batch, stat, attributes, list, list_versions, delete, conditional_put, conditional_delete, provider_time, retention, version_support };
 const count = @typeInfo(Operation).@"enum".field_names.len;
 pub const Snapshot = struct { calls: [count]u64, errors: [count]u64, nanoseconds: [count]u64, max_nanoseconds: [count]u64, input_bytes: [count]u64 = @splat(0), output_bytes: [count]u64 = @splat(0), retries: u64 };
+// A serialized WASM kernel has one execution thread; retain full 64-bit
+// diagnostics without requiring unsupported wasm32 64-bit atomic lowering.
+const Counter = if (@import("builtin").single_threaded) struct {
+    raw: u64,
+    fn init(value: u64) @This() {
+        return .{ .raw = value };
+    }
+    pub fn fetchAdd(self: *@This(), value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const old = self.raw;
+        self.raw +%= value;
+        return old;
+    }
+    fn fetchMax(self: *@This(), value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const old = self.raw;
+        self.raw = @max(old, value);
+        return old;
+    }
+    fn load(self: *const @This(), comptime _: std.builtin.AtomicOrder) u64 {
+        return self.raw;
+    }
+} else std.atomic.Value(u64);
 pub const Metrics = struct {
-    calls: [count]std.atomic.Value(u64) = @splat(.init(0)),
-    errors: [count]std.atomic.Value(u64) = @splat(.init(0)),
-    nanoseconds: [count]std.atomic.Value(u64) = @splat(.init(0)),
-    max_nanoseconds: [count]std.atomic.Value(u64) = @splat(.init(0)),
-    input_bytes: [count]std.atomic.Value(u64) = @splat(.init(0)),
-    output_bytes: [count]std.atomic.Value(u64) = @splat(.init(0)),
-    retries: std.atomic.Value(u64) = .init(0),
+    calls: [count]Counter = @splat(.init(0)),
+    errors: [count]Counter = @splat(.init(0)),
+    nanoseconds: [count]Counter = @splat(.init(0)),
+    max_nanoseconds: [count]Counter = @splat(.init(0)),
+    input_bytes: [count]Counter = @splat(.init(0)),
+    output_bytes: [count]Counter = @splat(.init(0)),
+    retries: Counter = .init(0),
     pub const Timer = struct {
         metrics: *Metrics,
         op: Operation,

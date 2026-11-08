@@ -23,6 +23,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const builtin = @import("builtin");
 const managed_receipt = @import("managed_receipt.zig");
+const publication_lease = @import("publication_lease.zig");
 const gliner_catalog = @import("gliner_catalog.zig");
 const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
@@ -1439,7 +1440,7 @@ fn unchangedPublishedInstall(allocator: std.mem.Allocator, io: std.Io, destinati
         // An absent legacy digest can be proven below. Conflicting declared
         // digests require publication so a re-pull repairs a bad old receipt.
         if (old.sha256) |old_digest| if (artifact.sha256) |new_digest| {
-            if (!std.mem.eql(u8, old_digest, new_digest)) return false;
+            if (!std.ascii.eqlIgnoreCase(old_digest, new_digest)) return false;
         };
         const old_stat = try cwd.statFile(io, old.canonical_path, .{});
         const new_stat = try cwd.statFile(io, artifact.canonical_path, .{});
@@ -1452,6 +1453,50 @@ fn unchangedPublishedInstall(allocator: std.mem.Allocator, io: std.Io, destinati
         };
     }
     return true;
+}
+
+/// Recover only published directory renames. The catalog lock owns this
+/// operation; it never touches private staging. A parent-directory lease also
+/// excludes pathname-based readers while recovery restores a prior generation.
+/// This lets an unrelated pull repair a killed publisher without lock inversion.
+pub fn recoverManagedPublication(allocator: std.mem.Allocator, io: std.Io, destination: []const u8) !void {
+    return recoverManagedPublicationJournaled(allocator, io, destination, null);
+}
+
+pub fn recoverManagedPublicationJournaled(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, journal: ?publication_lease.MutationJournal) !void {
+    const backup = try managedSiblingPath(allocator, destination, managed_download_backup_suffix);
+    defer allocator.free(backup);
+    if (!try pathExists(std.Io.Dir.cwd(), io, backup)) return;
+    var lease = try publication_lease.WriteLease.acquire(allocator, io, destination);
+    defer lease.deinit(io);
+    return recoverManagedPublicationWithLease(allocator, io, destination, &lease, journal);
+}
+
+pub fn recoverManagedPublicationWithLease(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, lease: *const publication_lease.WriteLease, journal: ?publication_lease.MutationJournal) !void {
+    try lease.requireDestination(io, destination);
+    const backup = try managedSiblingPath(allocator, destination, managed_download_backup_suffix);
+    defer allocator.free(backup);
+    const cwd = std.Io.Dir.cwd();
+    if (!try pathExists(cwd, io, backup)) return;
+    const destination_exists = try pathExists(cwd, io, destination);
+    var current = if (destination_exists) managed_receipt.loadValidated(allocator, io, destination) catch |err| switch (@as(anyerror, err)) {
+        error.InvalidManagedDownload, error.IncompleteManagedDownload, error.InvalidModelArtifactPath, error.InvalidModelArtifactKind, error.ModelArtifactOutsideRoot, error.FileNotFound, error.NotDir, error.IsDir, error.SymLinkLoop, error.StreamTooLong => null,
+        // Allocation/operational failure is not evidence to discard a directory.
+        else => return err,
+    } else null;
+    defer if (current) |*receipt| receipt.deinit();
+    if (current != null) {
+        try removeTreeIfExists(cwd, io, backup);
+    } else {
+        // Validate managed backups before restoring; an unmanaged legacy
+        // installation remains valid rollback state for its first managed pull.
+        var receipt = try managed_receipt.loadValidated(allocator, io, backup);
+        defer if (receipt) |*value| value.deinit();
+        if (journal) |active| try active.beforeMutation();
+        if (destination_exists) try removeTreeIfExists(cwd, io, destination);
+        try std.Io.Dir.rename(cwd, backup, cwd, destination, io);
+    }
+    try syncManagedDirectory(io, std.fs.path.dirname(destination) orelse ".");
 }
 
 /// A pull transaction built beside the published model directory.
@@ -1472,6 +1517,16 @@ pub const ManagedModelTransaction = struct {
         io: std.Io,
         destination: []const u8,
     ) !ManagedModelTransaction {
+        return beginPrepared(allocator, io, destination, null);
+    }
+
+    pub fn beginWithLease(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, lease: *const publication_lease.WriteLease) !ManagedModelTransaction {
+        try lease.requireDestination(io, destination);
+        return beginPrepared(allocator, io, destination, lease);
+    }
+
+    fn beginPrepared(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, lease: ?*const publication_lease.WriteLease) !ManagedModelTransaction {
+        try @import("publication_lease.zig").Lease.assertMutable(allocator, io, destination);
         const owned_destination = try allocator.dupe(u8, destination);
         errdefer allocator.free(owned_destination);
         const staging = try managedSiblingPath(allocator, destination, managed_download_staging_suffix);
@@ -1486,23 +1541,12 @@ pub const ManagedModelTransaction = struct {
         };
 
         const cwd = std.Io.Dir.cwd();
-        const destination_exists = try pathExists(cwd, io, transaction.destination);
-        const backup_exists = try pathExists(cwd, io, transaction.backup);
-        var recovered_publication = false;
-        if (backup_exists) {
-            if (!destination_exists) {
-                try std.Io.Dir.rename(cwd, transaction.backup, cwd, transaction.destination, io);
-            } else if (managedDownloadState(allocator, io, transaction.destination) == .complete) {
-                try removeTreeIfExists(cwd, io, transaction.backup);
-            } else {
-                try removeTreeIfExists(cwd, io, transaction.destination);
-                try std.Io.Dir.rename(cwd, transaction.backup, cwd, transaction.destination, io);
-            }
-            recovered_publication = true;
-        }
-        if (recovered_publication) {
-            try syncManagedDirectory(io, std.fs.path.dirname(transaction.destination) orelse ".");
-        }
+        if (lease) |active| {
+            // A catalog publisher recovers under its journal before preparing
+            // private staging. Do not permit a hidden namespace mutation here.
+            if (try pathExists(cwd, io, transaction.backup)) return error.ModelArtifactsChanging;
+            try active.requireDestination(io, destination);
+        } else try recoverManagedPublication(allocator, io, destination);
 
         if (!try pathExists(cwd, io, transaction.staging)) {
             try cwd.createDirPath(io, transaction.staging);
@@ -1514,19 +1558,50 @@ pub const ManagedModelTransaction = struct {
 
     pub fn commit(self: *ManagedModelTransaction, io: std.Io) !void {
         if (self.committed) return error.ManagedDownloadAlreadyCommitted;
+        {
+            var shared = try publication_lease.Lease.shared(self.allocator, io, self.destination);
+            defer shared.deinit(io);
+            if (try self.finishIfUnchanged(io)) return;
+        }
+        var lease = try publication_lease.WriteLease.acquire(self.allocator, io, self.destination);
+        defer lease.deinit(io);
+        return self.publishWithLease(io, &lease, null);
+    }
+
+    pub fn commitWithLease(self: *ManagedModelTransaction, io: std.Io, lease: *const publication_lease.WriteLease, journal: ?publication_lease.MutationJournal) !void {
+        try lease.requireDestination(io, self.destination);
+        if (try self.finishIfUnchanged(io)) return;
+        return self.publishWithLease(io, lease, journal);
+    }
+
+    /// The catalog publisher holds its writer lock and a shared destination
+    /// lease while comparing content. Readers may keep constructing from the
+    /// unchanged installation throughout this potentially large hash pass.
+    pub fn finishIfUnchanged(self: *ManagedModelTransaction, io: std.Io) !bool {
+        if (self.committed) return error.ManagedDownloadAlreadyCommitted;
         if (managedDownloadState(self.allocator, io, self.staging) != .complete) {
             return error.IncompleteManagedDownload;
         }
 
-        const cwd = std.Io.Dir.cwd();
         // Mutable refs still fetch and verify their selected revision. If its
         // complete executable contract is unchanged, preserve the published
         // directory and every hot runtime instead of swapping identical files.
         if (try unchangedPublishedInstall(self.allocator, io, self.destination, self.staging)) {
-            try removeTreeIfExists(cwd, io, self.staging);
+            try removeTreeIfExists(std.Io.Dir.cwd(), io, self.staging);
             self.committed = true;
-            return;
+            return true;
         }
+        return false;
+    }
+
+    /// Publish a changed installation without repeating the unchanged-content
+    /// hash pass under an exclusive lease. Staging is private to its publisher.
+    pub fn publishWithLease(self: *ManagedModelTransaction, io: std.Io, lease: *const publication_lease.WriteLease, journal: ?publication_lease.MutationJournal) !void {
+        try lease.requireDestination(io, self.destination);
+        if (self.committed) return error.ManagedDownloadAlreadyCommitted;
+        if (managedDownloadState(self.allocator, io, self.staging) != .complete) return error.IncompleteManagedDownload;
+        const cwd = std.Io.Dir.cwd();
+        if (journal) |active| try active.beforeMutation();
         try removeTreeIfExists(cwd, io, self.backup);
         const had_destination = try pathExists(cwd, io, self.destination);
         if (had_destination) {
@@ -1573,7 +1648,7 @@ pub const ManagedModelTransaction = struct {
     }
 };
 
-fn writeFileAtomically(
+pub fn writeFileAtomically(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
@@ -4509,6 +4584,21 @@ test "managed staging artifact replacement updates the publication receipt" {
     try std.testing.expect(managedDownloadMatchesSource(allocator, io, dest_dir, "owner", "model", "gguf:Q4_K_M"));
 }
 
+// Make contention deterministic in publication tests: a writer that would
+// block returns cancellation, allowing the test to inspect the untouched tree.
+const NonblockingPublicationTestIo = struct {
+    var original: @FieldType(std.Io.VTable, "fileTryLock") = undefined;
+    fn lock(raw: ?*anyopaque, file: std.Io.File, mode: std.Io.File.Lock) std.Io.File.LockError!void {
+        if (!try original(raw, file, mode)) return error.Canceled;
+    }
+    fn wrap(io: std.Io, table: *std.Io.VTable) std.Io {
+        table.* = io.vtable.*;
+        original = table.fileTryLock;
+        table.fileLock = lock;
+        return .{ .userdata = io.userdata, .vtable = table };
+    }
+};
+
 test "managed model transaction reuses artifacts and publishes completed repair" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -4553,6 +4643,17 @@ test "managed model transaction reuses artifacts and publishes completed repair"
         "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7},{\"path\":\"nested/mmproj-model-Q8_0.gguf\",\"size\":9}]}",
     );
     try completeManagedDownload(allocator, io, transaction.staging);
+    var reader_lease = try @import("publication_lease.zig").Lease.shared(allocator, io, dest_dir);
+    defer reader_lease.deinit(io);
+    var table: std.Io.VTable = undefined;
+    const contended_io = NonblockingPublicationTestIo.wrap(io, &table);
+    try std.testing.expectError(error.Canceled, transaction.commit(contended_io));
+    // Construction still sees the old complete tree, not the staged projector.
+    const published_projector = try std.fs.path.join(allocator, &.{ dest_dir, "nested/mmproj-model-Q8_0.gguf" });
+    defer allocator.free(published_projector);
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, published_projector, .{}));
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+    reader_lease.deinit(io);
     try transaction.commit(io);
 
     try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
@@ -4668,6 +4769,14 @@ test "managed model transaction recovers interrupted directory publication" {
     defer allocator.free(partial_path);
     try cwd.writeFile(io, .{ .sub_path = partial_path, .data = "partial" });
 
+    var reader_lease = try @import("publication_lease.zig").Lease.shared(allocator, io, dest_dir);
+    defer reader_lease.deinit(io);
+    var table: std.Io.VTable = undefined;
+    const contended_io = NonblockingPublicationTestIo.wrap(io, &table);
+    try std.testing.expectError(error.Canceled, recoverManagedPublication(allocator, contended_io, dest_dir));
+    try cwd.access(io, backup_path, .{});
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, dest_dir, .{}));
+    reader_lease.deinit(io);
     var transaction = try ManagedModelTransaction.begin(allocator, io, dest_dir);
     defer transaction.deinit(io);
     try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
@@ -5598,7 +5707,13 @@ test "managed model transaction preserves unchanged publication and replaces cha
     defer transaction.deinit(io);
     const plan = try managedPath(a, transaction.staging, managed_download_plan_filename);
     defer a.free(plan);
-    try writeFileAtomically(a, io, plan, receipt);
+    // Hex letter case changes neither digest identity nor executable bytes.
+    const alternate_case = try a.dupe(u8, receipt);
+    defer a.free(alternate_case);
+    const digest_tag = "\"sha256\":\"";
+    const digest_start = std.mem.indexOf(u8, alternate_case, digest_tag).? + digest_tag.len;
+    for (alternate_case[digest_start..][0..64]) |*byte| byte.* = std.ascii.toUpper(byte.*);
+    try writeFileAtomically(a, io, plan, alternate_case);
     try completeManagedDownload(a, io, transaction.staging);
     try transaction.commit(io);
     try std.testing.expectEqual(before.inode, (try std.Io.Dir.cwd().statFile(io, directory, .{})).inode);
@@ -5763,4 +5878,19 @@ test "Qwen3-VL safetensors generated descriptor preserves legacy and staged re-p
 
 test "Qwen3-VL reranker generated descriptor preserves legacy and staged re-pulls" {
     try testGeneratedBundlePublication(qwen3vl_catalog.reranker_bundle_manifest, "model.safetensors");
+}
+
+test "managed model transaction recovers an unmanaged legacy backup" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".legacy.antfly-download-backup");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".legacy.antfly-download-backup/model.gguf", .data = "legacy" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const destination = try std.fs.path.join(a, &.{ root, "legacy" });
+    defer a.free(destination);
+    try recoverManagedPublication(a, io, destination);
+    try tmp.dir.access(io, "legacy/model.gguf", .{});
 }

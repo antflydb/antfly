@@ -1,0 +1,68 @@
+{
+  "name": "@antfly/ai-sdk",
+  "version": "0.1.0",
+  "description": "Antfly provider, tools and chat history persistence for the Vercel AI SDK",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --maxWorkers=2",
+    "test:live": "ANTFLY_LIVE=1 vitest run test/live.test.ts --maxWorkers=1",
+    "lint": "biome check .",
+    "prepublishOnly": "pnpm typecheck && pnpm lint && pnpm build && pnpm test",
+    "test:package": "node scripts/verify-package.mjs"
+  },
+  "dependencies": {
+    "@antfly/sdk": "workspace:^",
+    "@ai-sdk/provider": "4.0.35",
+    "@ai-sdk/provider-utils": "5.0.74"
+  },
+  "peerDependencies": {
+    "ai": "^7.0.162",
+    "zod": "^4.1.8"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "ai": "7.0.162",
+    "tsup": "^8.5.1",
+    "tsx": "^4.22.4",
+    "vitest": "^4.1.9",
+    "zod": "^4.4.3"
+  },
+  "engines": {
+    "node": ">=24.0"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antflydb/antfly.git",
+    "directory": "ts/packages/ai-sdk"
+  },
+  "homepage": "https://github.com/antflydb/antfly/tree/main/ts/packages/ai-sdk#readme",
+  "bugs": {
+    "url": "https://github.com/antflydb/antfly/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

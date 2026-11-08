@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const byte_copy = @import("../common/byte_copy.zig");
 
 // Tag types (lower 2 bits of tag byte)
 const tag_literal: u8 = 0;
@@ -383,12 +384,7 @@ pub fn encodeInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), src: []con
             }
 
             // Extend match forward
-            var match_len: usize = 4;
-            while (s + match_len < src.len and
-                src[s + match_len] == src[candidate + match_len])
-            {
-                match_len += 1;
-            }
+            const match_len = 4 + byte_copy.commonPrefixBytes(src[s + 4 ..], src[candidate + 4 ..]);
 
             const offset = s - candidate;
             try emitCopy(alloc, out, offset, match_len);
@@ -449,7 +445,30 @@ fn emitLiteral(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), lit: []const 
 
 fn emitCopy(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), offset: usize, length: usize) !void {
     var remaining = length;
-    // Emit in chunks - copy elements can encode at most 64 bytes
+    // Full-width copies have identical tags. Fill their output geometrically,
+    // preserving the old bitstream without per-tag allocation/capacity checks.
+    const full_copies = remaining / 64;
+    if (full_copies != 0) {
+        const tag_len: usize = if (offset <= 65535) 3 else 5;
+        const encoded_len = std.math.mul(usize, full_copies, tag_len) catch return error.OutOfMemory;
+        const encoded = try out.addManyAsSlice(alloc, encoded_len);
+        encoded[0] = (63 << 2) | (if (offset <= 65535) tag_copy2 else tag_copy4);
+        encoded[1] = @truncate(offset);
+        encoded[2] = @truncate(offset >> 8);
+        if (tag_len == 5) {
+            encoded[3] = @truncate(offset >> 16);
+            encoded[4] = @truncate(offset >> 24);
+        }
+        var filled = tag_len;
+        while (filled < encoded.len) {
+            const count = @min(filled, encoded.len - filled);
+            @memcpy(encoded[filled..][0..count], encoded[0..count]);
+            filled += count;
+        }
+        remaining %= 64;
+    }
+    // Emit the final partial tag with the same Copy1/Copy2/Copy4 selection.
+    // Copy elements can encode at most 64 bytes.
     while (remaining > 0) {
         if (remaining >= 4 and remaining <= 11 and offset <= 2047) {
             // Copy1: 2-byte tag, length 4-11, offset 0-2047
@@ -481,10 +500,18 @@ fn emitCopy(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), offset: usize, l
 }
 
 fn copyOverlapping(dst: []u8, d: usize, offset: usize, length: usize) void {
-    var src_pos = d - offset;
-    for (0..length) |i| {
-        dst[d + i] = dst[src_pos];
-        src_pos += 1;
+    if (length == 0) return;
+    if (offset == 1) {
+        @memset(dst[d..][0..length], dst[d - 1]);
+        return;
+    }
+    // Each non-overlapping copy grows the available history. Short-period
+    // repeats no longer perform a checked load/store for every output byte.
+    var written: usize = 0;
+    while (written < length) {
+        const count = @min(offset + written, length - written);
+        @memcpy(dst[d + written ..][0..count], dst[d - offset ..][0..count]);
+        written += count;
     }
 }
 
@@ -675,4 +702,64 @@ test "SQL bounded native delivery Snappy exact span comparison validates literal
     try std.testing.expectError(error.CorruptInput, equalsFromReader(Input{ .bytes = &corrupt, .length = corrupt.len }, &.{"abcd"}));
     const trailing = [_]u8{ 1, 0, 'a', 0, 'b' };
     try std.testing.expectError(error.CorruptInput, equalsFromReader(Input{ .bytes = &trailing, .length = trailing.len }, &.{"a"}));
+}
+
+test "privacy repetitive Snappy history copies preserve overlap periods and boundaries" {
+    var bytes: [384]u8 = undefined;
+    for (1..65) |period| {
+        for ([_]usize{ 0, 1, 2, 3, 7, 15, 16, 31, 32, 63, 64, 65, 127, 257 }) |length| {
+            @memset(&bytes, 0xee);
+            for (0..period) |i| bytes[i] = @truncate(i * 37 + 11);
+            copyOverlapping(&bytes, period, period, length);
+            for (0..period + length) |i| try std.testing.expectEqual(@as(u8, @truncate((i % period) * 37 + 11)), bytes[i]);
+            for (bytes[period + length ..]) |byte| try std.testing.expectEqual(@as(u8, 0xee), byte);
+        }
+    }
+}
+
+test "privacy bulk Snappy copy tags remain byte identical to the scalar wire encoder" {
+    const Reference = struct {
+        fn emit(a: Allocator, out: *std.ArrayListUnmanaged(u8), offset: usize, length: usize) !void {
+            var remaining = length;
+            while (remaining > 0) {
+                if (remaining >= 4 and remaining <= 11 and offset <= 2047) {
+                    const len3: u8 = @intCast(remaining - 4);
+                    const off_hi: u8 = @truncate(offset >> 8);
+                    try out.append(a, (off_hi << 5) | (len3 << 2) | tag_copy1);
+                    try out.append(a, @truncate(offset));
+                    return;
+                } else if (offset <= 65535) {
+                    const chunk = @min(remaining, 64);
+                    const len6: u8 = @intCast(chunk - 1);
+                    try out.append(a, (len6 << 2) | tag_copy2);
+                    try out.append(a, @truncate(offset));
+                    try out.append(a, @truncate(offset >> 8));
+                    remaining -= chunk;
+                } else {
+                    const chunk = @min(remaining, 64);
+                    const len6: u8 = @intCast(chunk - 1);
+                    try out.append(a, (len6 << 2) | tag_copy4);
+                    try out.append(a, @truncate(offset));
+                    try out.append(a, @truncate(offset >> 8));
+                    try out.append(a, @truncate(offset >> 16));
+                    try out.append(a, @truncate(offset >> 24));
+                    remaining -= chunk;
+                }
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    var expected: std.ArrayListUnmanaged(u8) = .empty;
+    defer expected.deinit(a);
+    var actual: std.ArrayListUnmanaged(u8) = .empty;
+    defer actual.deinit(a);
+    for ([_]usize{ 1, 2047, 2048, 65535, 65536, 0xffffffff }) |offset| {
+        for ([_]usize{ 0, 1, 3, 4, 7, 11, 12, 63, 64, 65, 68, 75, 127, 128, 129, 257, 1_000_000 }) |length| {
+            expected.clearRetainingCapacity();
+            actual.clearRetainingCapacity();
+            try Reference.emit(a, &expected, offset, length);
+            try emitCopy(a, &actual, offset, length);
+            try std.testing.expectEqualSlices(u8, expected.items, actual.items);
+        }
+    }
 }

@@ -1791,6 +1791,102 @@ test "lite allocator v4 rollback and recovery retain the fallback root" {
     try std.testing.expect((try file.check()).valid);
 }
 
+// Regression for dc74b9a91c ("evict reused-page cache entries on
+// failed/rolled-back commits") plus this change's own extension of it to
+// `secondary_page_cache` (the read generation's independent `PageCache`,
+// see `Store.initializeReadGenerationAssumeLocked` in docstore.zig).
+//
+// Repro shape: a transaction writes (and, via `flushTransactionWrites`,
+// physically caches) a page id the free list is about to hand out again,
+// then fails *after* that flush but *before* `publishCheckpoint` --
+// `abortTransaction`/`discardTransactionTail` is the lowest-level stand-in
+// for every such failure (an ordinary `errdefer` in
+// `commitTransactionWithDurability`, a group member's own
+// `rollbackTransactionSavepoint`, or this direct call). An identical retry
+// then reuses the exact same page id (the free list the failed attempt drew
+// from is otherwise untouched) and must read its own fresh write back, not
+// the aborted attempt's abandoned content still sitting in either cache.
+test "lite native evicts both the writer and read-generation page cache for a reused page after an aborted commit" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reuse-abort-cache.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+
+    // Baseline: durable content for "doc", and pin down which page id its
+    // value occupies -- "doc" is small enough to pack inline, so force a
+    // dedicated page with a value that cannot be packed.
+    const stable: [32768]u8 = @splat('s');
+    for (0..3) |_| try file.putDocument("doc", &stable);
+    const stable_checkpoint = file.activeCheckpoint();
+
+    // Stand in for a secondary reader generation (docstore.zig's
+    // `initializeReadGenerationAssumeLocked` wires this identically:
+    // `self.file.secondary_page_cache = &generation.file.page_cache`) --
+    // a second, independent handle onto the same path with its own cache.
+    // Real callers always pass an explicit, separately-tracked checkpoint
+    // for reads through this handle (`Store.observeReadCheckpoint` keeps
+    // `ReadGeneration.checkpoint` current via `self.file.publication_observer`
+    // -- the reader's own `self.header` is never touched after open), so
+    // this test tracks `reader_checkpoint` the same way instead of relying
+    // on `reader.activeCheckpoint()`.
+    var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .no_sync = true });
+    defer reader.close();
+    file.secondary_page_cache = &reader.page_cache;
+    var reader_checkpoint = stable_checkpoint;
+
+    // Prime both caches on the page the next write will reuse: a read
+    // through each handle for the current (small) value.
+    {
+        const seen = (try file.getDocumentAlloc(a, "doc")).?;
+        a.free(seen);
+        const seen_via_reader = (try reader.getDocumentAtCheckpointAlloc(a, reader_checkpoint, "doc")).?;
+        a.free(seen_via_reader);
+    }
+
+    // Fails after flushTransactionWrites (which physically writes and
+    // caches the reused page) but before publishCheckpoint.
+    const discarded: [32768]u8 = @splat('d');
+    try file.beginTransaction();
+    try file.putDocument("doc", &discarded);
+    _ = try file.materializeTransactionCheckpoint();
+    file.abortTransaction();
+
+    try std.testing.expect(std.meta.eql(stable_checkpoint, file.activeCheckpoint()));
+    try std.testing.expect((try file.check()).valid);
+
+    // The aborted attempt's page is back under "doc"'s old, stable
+    // checkpoint, so re-reading it (through either handle) must prove no
+    // stale "discarded" bytes survive in either cache -- `getCopy` only
+    // ever returns a cache hit, never reads through to disk, so a bug here
+    // would read back "discarded", not merely slow down.
+    {
+        const after_abort = (try file.getDocumentAlloc(a, "doc")).?;
+        defer a.free(after_abort);
+        try std.testing.expectEqualStrings(&stable, after_abort);
+        const after_abort_via_reader = (try reader.getDocumentAtCheckpointAlloc(a, reader_checkpoint, "doc")).?;
+        defer a.free(after_abort_via_reader);
+        try std.testing.expectEqualStrings(&stable, after_abort_via_reader);
+    }
+
+    // The retry: an unrelated write that reuses the exact same page id the
+    // aborted attempt drew from (the free list was never touched by the
+    // abort). Its own fresh content must come back, not the abandoned one.
+    const retried: [32768]u8 = @splat('r');
+    try file.putDocument("doc", &retried);
+    reader_checkpoint = file.activeCheckpoint();
+    const after_retry = (try file.getDocumentAlloc(a, "doc")).?;
+    defer a.free(after_retry);
+    try std.testing.expectEqualStrings(&retried, after_retry);
+    const after_retry_via_reader = (try reader.getDocumentAtCheckpointAlloc(a, reader_checkpoint, "doc")).?;
+    defer a.free(after_retry_via_reader);
+    try std.testing.expectEqualStrings(&retried, after_retry_via_reader);
+    try std.testing.expect((try file.check()).valid);
+}
+
 test "lite allocator v4 rejects a durable free bit for a live page" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -12727,11 +12823,25 @@ pub const NativeFile = struct {
     /// reads-through-to-disk no-op (that commit's bytes are correct and
     /// durable-in-memory), never a correctness cost. Must run before the
     /// caller resets `manifest_builder` (neither caller does so beforehand).
+    ///
+    /// Also evicts `self.secondary_page_cache` (the read generation's own,
+    /// independent `PageCache` -- see `Store.initializeReadGenerationAssumeLocked`
+    /// in docstore.zig) for the same page ids. The normal, successful-allocation
+    /// path (`PageAllocator.allocate`) already evicts both caches the moment a
+    /// page is reused; this rollback path evicted only `self.page_cache` until
+    /// now, leaving the read generation's cache exactly as exposed to the
+    /// original stale-content bug (see this function's own doc comment above)
+    /// as `self.page_cache` was before dc74b9a91c -- a reader pinned to the
+    /// read generation could read a failed attempt's abandoned content back
+    /// for a page id a retry (or any later commit) then reuses.
     fn evictCacheForPagesReusedSince(self: *NativeFile, boundary_page_count: u64) void {
         if (!manifest_commits_enabled) return;
         var it = self.manifest_builder.entries.keyIterator();
         while (it.next()) |page_id| {
-            if (page_id.* < boundary_page_count) self.page_cache.remove(self.allocator, page_id.*);
+            if (page_id.* < boundary_page_count) {
+                self.page_cache.remove(self.allocator, page_id.*);
+                if (self.secondary_page_cache) |cache| cache.remove(self.allocator, page_id.*);
+            }
         }
     }
 

@@ -306,7 +306,9 @@ loss and portable backup. Recovery of the same source/execution reuses committed
 identity and evidence without candidate search, embedding, or model inference.
 The existing source transaction publishes the decision and downstream replay
 handoff atomically. A crash before publication may repeat inference; execution is
-not exactly-once. A committed failure is replay-stable too. Retry it by explicitly
+not exactly-once. A committed failure is replay-stable too, including a cascade
+failure or exhausted budget that produced no model response. Recovery reuses that
+receipt without model discovery, candidate search, or inference. Retry it by explicitly
 re-resolving, rather than relying on a later drain to flip identity.
 
 Policy changes participate in material config comparison, advance the effective
@@ -318,6 +320,26 @@ identity fields and selected description assets are rechecked after model execut
 concurrent changes return Busy for retry. Existing source/config/override read-set
 and ordered-publication checks fence stale publication. Databases using this policy
 require reader epoch 5; older readers must reject the database before parsing.
+
+**Cascades.** `decider` may be a cascade (`decision_method: cascade`; see
+[the decisions reference](../docs/reference/decisions.md#decider-cascades)): a
+cheap stage judges every REVIEW pair and only in-band pairs escalate. The
+policy hash covers the whole definition (credentials excluded), so editing
+stages or bands re-resolves like any policy change. `classify` checks the
+answer against the stage named in the response's `cascade.answered_by`, and
+requires the trace to list configured stages in order, ending on that stage.
+A response without the trace is invalid. The receipt keeps the normalized
+response, including the trace, under `response`; the `Evidence` layout is
+unchanged. Generated stages get the resolver's per-call batch bounds, and the
+receipt hash mixes in revisions reported by generated stages that actually
+answered. Reuse discovers only those dependencies; unreachable stages do not
+become availability dependencies. If an executed dependency cannot be verified,
+the previous committed verdict is preserved and the refresh fails. Explicit
+`keep_previous` outcomes remain replay-stable until inputs, policy, or a
+reported dependency changes.
+Probability thresholds apply to the probabilistic stages; a terminal
+verdict-only stage must provide a categorical 0/1 distribution. Catalogs with a cascade policy
+require reader epoch 30.
 
 **Description inputs.** Extraction mentions may supply `description` and a numeric
 `description_embedding`; candidate document fields supply the corresponding text
@@ -3195,3 +3217,10 @@ ordinary pin-maintenance scans match an identical qualified control namespace.
 Tests check processed byte counters against native row censuses, mutations on
 both sides of the cursor, header-only edits, legacy-work retirement, untracked
 cut restart and portable-row validation.
+
+Cascade adjudication prepares the resolver-bounded producer specification and
+compiled trace validator once per resolution batch. Classifying each response
+validates every executed stage without allocating or rebuilding the plan;
+revision-dependent specification hashes are reused within the batch. Both
+cascade adjudication and cascade decision enrichments fence readers below
+epoch 30, including grouped enrichment producers.

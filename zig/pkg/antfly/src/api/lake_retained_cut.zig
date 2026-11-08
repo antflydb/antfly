@@ -56,7 +56,7 @@ pub const Descriptor = struct {
     recent_cloud: ?catalog.CloudGenerations = null,
     recent_runs: []const @import("lake_recent_vectors.zig").Run = &.{},
 };
-fn domain(table: u64, store: catalog.Digest) catalog.Digest {
+pub fn domain(table: u64, store: catalog.Digest) catalog.Digest {
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("native-lake-retained-search-cuts-v1");
     hash.update(&store);

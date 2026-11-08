@@ -49,7 +49,7 @@ check(
     )
 )
 try:
-    options = (c.c_char_p * 1)(b"--gpu-architecture=compute_75")
+    options = (c.c_char_p * 2)(b"--gpu-architecture=compute_75", b"--fmad=false")
     check(lib.nvrtcCompileProgram(program, len(options), options))
     size = c.c_size_t()
     check(lib.nvrtcGetPTXSize(program, c.byref(size)))

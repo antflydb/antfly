@@ -35,9 +35,9 @@ Ordered generated text vectors bind their receipt input to the resolved model
 revision. A revision change replaces the old generated result only if the
 physical output still matches the pre-inference observation. Duplicate work for
 the same revision retains its canonical accepted output, and explicit authored
-vectors remain authoritative. Catalog effect protocol 17 and Raft batch protocol
-26 gate the new execution identity; older publication/proof bytes retain their
-existing digests and decoders.
+vectors remain authoritative. Base dense and sparse indexes both select catalog
+effect protocol 17; Raft batch protocol 26 gates the new execution identity. Older
+publication/proof bytes retain their existing digests and decoders.
 
 Grouped multimodal requests preserve ordered parts as one logical input across
 native and remote execution. Remote multipart requests use
@@ -260,3 +260,13 @@ inheriting the obsolete input's attempts or Retry-After. Source invalidation is
 paced like other coordinator progress waits, not a provider or pipeline failure;
 its replan does not exhaust the no-progress failure budget. Existing publication
 and durable ownership fences remain authoritative across subsequent races.
+
+Generated chunk vectors use catalog effect protocol 18 to bind each publication
+and semantic receipt to the actual dense or sparse model execution revision.
+Each replacement retains an exact output precondition, so late work from an old
+revision cannot overwrite a newer result. Receiver-local ASC5 stream checkpoints
+also retain that revision: accepted members are validated in bounded pages once
+per observation and model revision, then completed checks reuse the checkpoint.
+Legacy ASC4 checkpoints decode without an execution revision and are rescanned
+when the provider resolves a revision. Checkpoint keys stay stable across model
+updates, avoiding accumulated records for every deployed revision.

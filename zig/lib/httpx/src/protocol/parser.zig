@@ -80,6 +80,9 @@ pub const Parser = struct {
     max_header_size: usize = 8192,
     max_headers: usize = 100,
     max_body_size: usize = 100 * 1024 * 1024, // 100 MB
+    /// Separate hard ceiling for an explicit per-route buffered-body limit.
+    /// Unmatched routes continue to use max_body_size.
+    max_route_body_size: ?usize = null,
     request_body_limit_context: ?*anyopaque = null,
     /// Returns the final server-authorized limit for this route. A larger
     /// limit is usable only when its body streams instead of being buffered.
@@ -480,7 +483,7 @@ pub const Parser = struct {
                     if (self.method) |method| {
                         if (self.path) |path| {
                             if (resolve(context, method, path)) |route_limit| {
-                                self.message_body_size_limit = if (self.headers_only) route_limit else @min(self.max_body_size, route_limit);
+                                self.message_body_size_limit = if (self.headers_only) route_limit else @min(@max(self.max_body_size, self.max_route_body_size orelse self.max_body_size), route_limit);
                             }
                         }
                     }

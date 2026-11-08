@@ -14,7 +14,9 @@
     "test:mail-workerd": "node test/prepare-mail-worker.mjs && node --test test/mail-workerd.test.mjs",
     "dev:mail": "node dev-mail.mjs",
     "test:metadata-hints-workerd": "node --test test/metadata-hint-workerd.test.mjs",
-    "qualify": "node qualification/qualify.mjs"
+    "qualify": "node qualification/qualify.mjs",
+    "test:sql": "node test/sql.mjs",
+    "test:sql-workerd": "node test/sql.mjs --workerd"
   },
   "devDependencies": {
     "binaryen": "132.0.0",

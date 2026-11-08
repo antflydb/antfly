@@ -49,3 +49,27 @@ The offline fixture contract needs neither Python ML packages nor model files:
 ```sh
 python3 -m unittest scripts/gliner_specialty/test_fixture_contract.py -v
 ```
+
+### Privacy window qualification
+
+`qualify_privacy_windows.py` exercises short text, UTF-8 byte coordinates and a
+long source with an email beyond the first inspection window. It requires the
+selected backend and can compare all discrete entities and scores against a
+native reference. Use the pinned original PII model directory; model loading
+performs its normal byte qualification. This synthetic check does not measure
+customer-text recall.
+
+```sh
+python3 scripts/gliner_specialty/qualify_privacy_windows.py \
+  --server zig/zig-out/bin/antfly --models-dir "$PWD/.benchmark-results/privacy/models" \
+  --backend native --output .benchmark-results/privacy/native
+python3 scripts/gliner_specialty/qualify_privacy_windows.py \
+  --server zig/zig-out/bin/antfly --models-dir "$PWD/.benchmark-results/privacy/models" \
+  --backend metal --output .benchmark-results/privacy/metal \
+  --reference .benchmark-results/privacy/native/native.json
+```
+
+On CUDA use `--backend cuda` and the CUDA-built inference HTTP server (or the
+unified Antfly binary). Results, required-backend logs and comparison summaries
+are written under the requested output directory. Each invocation stops its own
+server after qualification.

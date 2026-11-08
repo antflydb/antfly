@@ -245,6 +245,9 @@ pub const TableReadSource = struct {
     route_fence: ?metadata_api.CatalogRouteFence = null,
 
     pub const VTable = struct {
+        /// First-party routing binds each read to a linearizable policy
+        /// observation. The fixed-size return owns its identity across hops.
+        privacy_policy_version: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, ?u64) anyerror![64]u8 = null,
         /// Optional owner-local dynamic read set. A distributed router must
         /// not implement this with independently captured shard snapshots.
         open_relational_statement_snapshot: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, u32, read_gate.ReadConsistency, ?CancellationToken, ?u64) anyerror!RelationalStatementSnapshot = null,
@@ -559,6 +562,15 @@ pub const TableReadSource = struct {
             artifact_name: []const u8,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?db_types.DocumentArtifactManifest = null,
+        document_artifact_manifest_controlled: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            consistency: read_gate.ReadConsistency,
+            opts: db_types.LookupOptions,
+        ) anyerror!?db_types.DocumentArtifactManifest = null,
         document_artifact_manifests: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -575,7 +587,18 @@ pub const TableReadSource = struct {
             artifact_name: []const u8,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?db_types.DocumentArtifactManifest = null,
+        document_artifact_manifest_group_local_controlled: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            consistency: read_gate.ReadConsistency,
+            opts: db_types.LookupOptions,
+        ) anyerror!?db_types.DocumentArtifactManifest = null,
         document_artifact_manifest_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, []const u8, read_gate.ReadConsistency) anyerror!?db_types.DocumentArtifactManifest = null,
+        document_artifact_manifest_group_local_routed_controlled: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, []const u8, read_gate.ReadConsistency, db_types.LookupOptions) anyerror!?db_types.DocumentArtifactManifest = null,
         document_artifact_manifests_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -592,33 +615,60 @@ pub const TableReadSource = struct {
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
+    pub fn privacyPolicyVersion(self: TableReadSource, a: std.mem.Allocator, table: []const u8, deadline: ?u64) ![64]u8 {
+        const capture = self.vtable.privacy_policy_version orelse return error.PrivacyReadFenceUnavailable;
+        return BoundaryAbi.call("privacy_policy_version", self.boundary_dispatch, capture, .{ self.ptr, a, table, deadline });
+    }
+
+    fn privacyFence(self: TableReadSource, a: std.mem.Allocator, table: []const u8, deadline: ?u64, expected: ?[64]u8) !?[64]u8 {
+        if (self.vtable.privacy_policy_version == null) return expected;
+        const current = try self.privacyPolicyVersion(a, table, deadline);
+        if (expected) |prior| if (!std.mem.allEqual(u8, &prior, 0) and !std.mem.eql(u8, &prior, &current)) return error.IndexRebuilding;
+        return current;
+    }
+
+    fn rejectProtectedOpaqueRead(self: TableReadSource, a: std.mem.Allocator, table: []const u8) !void {
+        if (try self.privacyFence(a, table, null, null)) |version| if (!std.mem.allEqual(u8, &version, 0)) return error.UnsupportedQueryRequest;
+    }
+
     pub fn openRelationalRead(self: TableReadSource, alloc: std.mem.Allocator, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !?RelationalReadView {
         // Group ingress must validate a routed fence. An unfenced callback
         // cannot be used to bypass that contract.
         if (self.route_fence != null) return null;
         const open = self.vtable.open_relational_read orelse return null;
-        return BoundaryAbi.call("open_relational_read", self.boundary_dispatch, open, .{ self.ptr, alloc, table_name, from_key, to_key, opts, consistency });
+        var fenced = opts;
+        fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
+        return BoundaryAbi.call("open_relational_read", self.boundary_dispatch, open, .{ self.ptr, alloc, table_name, from_key, to_key, fenced, consistency });
     }
 
     pub fn openRelationalStatement(self: TableReadSource, alloc: std.mem.Allocator, scans: []const RelationalStatementScan, consistency: read_gate.ReadConsistency) !RelationalStatementRead {
         if (self.route_fence != null) return error.SqlStatementSnapshotRequired;
+        const fenced = try alloc.dupe(RelationalStatementScan, scans);
+        defer alloc.free(fenced);
+        for (fenced) |*scan_request| scan_request.opts.privacy_policy_version = try self.privacyFence(alloc, scan_request.table, scan_request.opts.execution_deadline_ns, scan_request.opts.privacy_policy_version);
         const callback = self.vtable.open_relational_statement orelse return error.SqlStatementSnapshotRequired;
-        return BoundaryAbi.call("open_relational_statement", self.boundary_dispatch, callback, .{ self.ptr, alloc, scans, consistency });
+        return BoundaryAbi.call("open_relational_statement", self.boundary_dispatch, callback, .{ self.ptr, alloc, fenced, consistency });
     }
 
     pub fn openRelationalStatementSnapshot(self: TableReadSource, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: read_gate.ReadConsistency, cancellation: ?CancellationToken, deadline_ns: ?u64) !RelationalStatementSnapshot {
         if (self.route_fence != null) return error.SqlStatementSnapshotRequired;
+        if (self.vtable.privacy_policy_version != null) {
+            const version = try self.privacyPolicyVersion(alloc, table, deadline_ns);
+            if (!std.mem.allEqual(u8, &version, 0)) return error.UnsupportedSqlExecution;
+        }
         const callback = self.vtable.open_relational_statement_snapshot orelse return error.SqlStatementSnapshotRequired;
         return BoundaryAbi.call("open_relational_statement_snapshot", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, schema_version, consistency, cancellation, deadline_ns });
     }
 
     pub fn openRelationalStatementSnapshotGroupLocal(self: TableReadSource, alloc: std.mem.Allocator, group: u64, table: []const u8, consistency: read_gate.ReadConsistency, cancellation: ?CancellationToken, deadline_ns: ?u64) !RelationalStatementSnapshot {
+        try self.rejectProtectedOpaqueRead(alloc, table);
         const fence = self.route_fence orelse return error.CatalogRouteFenceRequired;
         const callback = self.vtable.open_relational_statement_snapshot_group_local_routed orelse return error.SqlStatementSnapshotRequired;
         return BoundaryAbi.call("open_relational_statement_snapshot_group_local_routed", self.boundary_dispatch, callback, .{ self.ptr, alloc, fence, group, table, consistency, cancellation, deadline_ns });
     }
 
     pub fn openRelationalReadGroupLocal(self: TableReadSource, alloc: std.mem.Allocator, group: u64, table: []const u8, from: []const u8, to: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !?RelationalReadView {
+        try self.rejectProtectedOpaqueRead(alloc, table);
         const fence = self.route_fence orelse return null;
         const open = self.vtable.open_relational_read_group_local_routed orelse return null;
         return BoundaryAbi.call("open_relational_read_group_local_routed", self.boundary_dispatch, open, .{ self.ptr, alloc, fence, group, table, from, to, opts, consistency });
@@ -632,9 +682,11 @@ pub const TableReadSource = struct {
     /// Null means temporarily busy, not an unsupported provider. Callers must
     /// release earlier owners before retrying acquisition on any participant.
     pub fn tryStatementReadFenceGroupLocal(self: TableReadSource, alloc: std.mem.Allocator, group: u64, table: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !?StatementReadFence {
+        var fenced = opts;
+        fenced.privacy_policy_version = try self.privacyFence(alloc, table, opts.execution_deadline_ns, opts.privacy_policy_version);
         const fence = self.route_fence orelse return error.CatalogRouteFenceRequired;
         const acquire = self.vtable.try_statement_read_fence_group_local_routed orelse return error.SqlStatementSnapshotRequired;
-        return BoundaryAbi.call("try_statement_read_fence_group_local_routed", self.boundary_dispatch, acquire, .{ self.ptr, alloc, fence, group, table, opts, consistency });
+        return BoundaryAbi.call("try_statement_read_fence_group_local_routed", self.boundary_dispatch, acquire, .{ self.ptr, alloc, fence, group, table, fenced, consistency });
     }
 
     pub fn bindCatalogRouteFenceJson(
@@ -664,7 +716,10 @@ pub const TableReadSource = struct {
         opts: db_types.LookupOptions,
         consistency: read_gate.ReadConsistency,
     ) !?LookupResponse {
-        return try BoundaryAbi.call("lookup", self.boundary_dispatch, self.vtable.lookup, .{ self.ptr, alloc, table_name, key, opts, consistency });
+        var fenced = opts;
+        if (!opts.privacy_original) fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
+
+        return try BoundaryAbi.call("lookup", self.boundary_dispatch, self.vtable.lookup, .{ self.ptr, alloc, table_name, key, fenced, consistency });
     }
 
     pub fn scan(
@@ -676,7 +731,10 @@ pub const TableReadSource = struct {
         opts: db_types.ScanOptions,
         consistency: read_gate.ReadConsistency,
     ) !?ScanResponse {
-        return try BoundaryAbi.call("scan", self.boundary_dispatch, self.vtable.scan, .{ self.ptr, alloc, table_name, from_key, to_key, opts, consistency });
+        var fenced = opts;
+        if (!opts.privacy_original) fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
+
+        return try BoundaryAbi.call("scan", self.boundary_dispatch, self.vtable.scan, .{ self.ptr, alloc, table_name, from_key, to_key, fenced, consistency });
     }
 
     pub fn scanStream(
@@ -689,9 +747,12 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
         sink: ScanStreamSink,
     ) !bool {
+        var fenced = opts;
+        if (!opts.privacy_original) fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
+
         if (self.vtable.scan_stream) |stream_fn|
-            return try BoundaryAbi.call("scan_stream", self.boundary_dispatch, stream_fn, .{ self.ptr, alloc, table_name, from_key, to_key, opts, consistency, sink });
-        var buffered = (try self.scan(alloc, table_name, from_key, to_key, opts, consistency)) orelse return false;
+            return try BoundaryAbi.call("scan_stream", self.boundary_dispatch, stream_fn, .{ self.ptr, alloc, table_name, from_key, to_key, fenced, consistency, sink });
+        var buffered = (try self.scan(alloc, table_name, from_key, to_key, fenced, consistency)) orelse return false;
         defer buffered.deinit(alloc);
         try sink.start();
         try sink.write(buffered.ndjson);
@@ -751,6 +812,40 @@ pub const TableReadSource = struct {
             });
         }
         return .{ .entries = try entries.toOwnedSlice(alloc) };
+    }
+
+    fn checkManifestControl(opts: db_types.LookupOptions) !void {
+        if (opts.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        if (opts.execution_deadline_ns) |deadline| if (opts.executionNowNs() >= deadline) return error.DeadlineExceeded;
+    }
+
+    pub fn documentArtifactManifestControlled(self: TableReadSource, alloc: std.mem.Allocator, table: []const u8, key: []const u8, artifact: []const u8, consistency: read_gate.ReadConsistency, opts: db_types.LookupOptions) !?db_types.DocumentArtifactManifest {
+        try checkManifestControl(opts);
+        const call = self.vtable.document_artifact_manifest_controlled orelse {
+            if (opts.execution_deadline_ns != null or opts.cancellation != null) return error.StorageReadTemporarilyUnavailable;
+            return self.documentArtifactManifest(alloc, table, key, artifact, consistency);
+        };
+        var result = try BoundaryAbi.call("document_artifact_manifest_controlled", self.boundary_dispatch, call, .{ self.ptr, alloc, table, key, artifact, consistency, opts });
+        errdefer if (result) |*value| value.deinit(alloc);
+        try checkManifestControl(opts);
+        return result;
+    }
+
+    pub fn documentArtifactManifestGroupLocalControlled(self: TableReadSource, alloc: std.mem.Allocator, group: u64, table: []const u8, key: []const u8, artifact: []const u8, consistency: read_gate.ReadConsistency, opts: db_types.LookupOptions) !?db_types.DocumentArtifactManifest {
+        try checkManifestControl(opts);
+        var result = if (self.route_fence) |fence| blk: {
+            const call = self.vtable.document_artifact_manifest_group_local_routed_controlled orelse return error.CatalogRouteFenceUnsupported;
+            break :blk try BoundaryAbi.call("document_artifact_manifest_group_local_routed_controlled", self.boundary_dispatch, call, .{ self.ptr, alloc, fence, group, table, key, artifact, consistency, opts });
+        } else blk: {
+            const call = self.vtable.document_artifact_manifest_group_local_controlled orelse {
+                if (opts.execution_deadline_ns != null or opts.cancellation != null) return error.StorageReadTemporarilyUnavailable;
+                return self.documentArtifactManifestGroupLocal(alloc, group, table, key, artifact, consistency);
+            };
+            break :blk try BoundaryAbi.call("document_artifact_manifest_group_local_controlled", self.boundary_dispatch, call, .{ self.ptr, alloc, group, table, key, artifact, consistency, opts });
+        };
+        errdefer if (result) |*value| value.deinit(alloc);
+        try checkManifestControl(opts);
+        return result;
     }
 
     pub fn documentArtifactManifest(
@@ -816,7 +911,11 @@ pub const TableReadSource = struct {
         req: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
     ) !?query_api.QueryResponse {
-        return try BoundaryAbi.call("query", self.boundary_dispatch, self.vtable.query, .{ self.ptr, alloc, table_name, req, consistency });
+        var fenced = req;
+        fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, req.execution_deadline_ns, req.privacy_policy_version);
+        if (req.remote_snapshot != null) if (fenced.privacy_policy_version) |version| if (!std.mem.allEqual(u8, &version, 0)) return error.UnsupportedQueryRequest;
+
+        return try BoundaryAbi.call("query", self.boundary_dispatch, self.vtable.query, .{ self.ptr, alloc, table_name, fenced, consistency });
     }
 
     /// Same admitted read and retry contract, with an optional synchronous
@@ -829,9 +928,13 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
         delivery: ?query_api.Delivery,
     ) !?query_api.QueryResponse {
+        var fenced = req;
+        fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, req.execution_deadline_ns, req.privacy_policy_version);
+        if (req.remote_snapshot != null) if (fenced.privacy_policy_version) |version| if (!std.mem.allEqual(u8, &version, 0)) return error.UnsupportedQueryRequest;
+
         if (delivery != null) if (self.vtable.query_with_delivery) |callback|
-            return try BoundaryAbi.call("query_with_delivery", self.boundary_dispatch, callback, .{ self.ptr, alloc, table_name, req, consistency, delivery });
-        return self.query(alloc, table_name, req, consistency);
+            return try BoundaryAbi.call("query_with_delivery", self.boundary_dispatch, callback, .{ self.ptr, alloc, table_name, fenced, consistency, delivery });
+        return self.query(alloc, table_name, fenced, consistency);
     }
 
     pub const HydratedDocuments = struct {
@@ -883,8 +986,12 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
         max_work: u32,
     ) !?runtime_preflight.RuntimePreflightSummary {
+        var fenced = req;
+        fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, req.execution_deadline_ns, req.privacy_policy_version);
+        if (req.remote_snapshot != null) if (fenced.privacy_policy_version) |version| if (!std.mem.allEqual(u8, &version, 0)) return error.UnsupportedQueryRequest;
+
         const fn_ptr = self.vtable.preflight_query orelse return null;
-        return try BoundaryAbi.call("preflight_query", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, req, consistency, max_work });
+        return try BoundaryAbi.call("preflight_query", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, fenced, consistency, max_work });
     }
 
     pub fn preflightQueryGroupLocal(
@@ -897,6 +1004,7 @@ pub const TableReadSource = struct {
         max_work: u32,
     ) !?runtime_preflight.RuntimePreflightSummary {
         var req = input;
+        req.privacy_policy_version = try self.privacyFence(alloc, table_name, req.execution_deadline_ns, req.privacy_policy_version);
         if (req.native_query_cut) |cut| if (cut.create) {
             req.native_query_cut = try cut.forGroup(group_id);
         };
@@ -917,12 +1025,14 @@ pub const TableReadSource = struct {
         opts: db_types.LookupOptions,
         consistency: read_gate.ReadConsistency,
     ) !?LookupResponse {
+        var fenced_opts = opts;
+        if (!opts.privacy_original) fenced_opts.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
         if (self.route_fence) |fence| {
             const routed = self.vtable.lookup_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
-            return try BoundaryAbi.call("lookup_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, key, opts, consistency });
+            return try BoundaryAbi.call("lookup_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, key, fenced_opts, consistency });
         }
         const fn_ptr = self.vtable.lookup_group_local orelse return null;
-        return try BoundaryAbi.call("lookup_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, key, opts, consistency });
+        return try BoundaryAbi.call("lookup_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, key, fenced_opts, consistency });
     }
 
     pub fn scanGroupLocal(
@@ -935,12 +1045,14 @@ pub const TableReadSource = struct {
         opts: db_types.ScanOptions,
         consistency: read_gate.ReadConsistency,
     ) !?ScanResponse {
+        var fenced_opts = opts;
+        if (!opts.privacy_original) fenced_opts.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
         if (self.route_fence) |fence| {
             const routed = self.vtable.scan_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
-            return try BoundaryAbi.call("scan_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, from_key, to_key, opts, consistency });
+            return try BoundaryAbi.call("scan_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, from_key, to_key, fenced_opts, consistency });
         }
         const fn_ptr = self.vtable.scan_group_local orelse return null;
-        return try BoundaryAbi.call("scan_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, from_key, to_key, opts, consistency });
+        return try BoundaryAbi.call("scan_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, from_key, to_key, fenced_opts, consistency });
     }
 
     pub fn scanGroupLocalStream(
@@ -954,13 +1066,15 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
         sink: ScanStreamSink,
     ) !bool {
+        var fenced_opts = opts;
+        if (!opts.privacy_original) fenced_opts.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
         if (self.route_fence) |fence| {
             if (self.vtable.scan_group_local_routed_stream) |stream_fn|
-                return try BoundaryAbi.call("scan_group_local_routed_stream", self.boundary_dispatch, stream_fn, .{ self.ptr, alloc, fence, group_id, table_name, from_key, to_key, opts, consistency, sink });
+                return try BoundaryAbi.call("scan_group_local_routed_stream", self.boundary_dispatch, stream_fn, .{ self.ptr, alloc, fence, group_id, table_name, from_key, to_key, fenced_opts, consistency, sink });
         } else if (self.vtable.scan_group_local_stream) |stream_fn| {
-            return try BoundaryAbi.call("scan_group_local_stream", self.boundary_dispatch, stream_fn, .{ self.ptr, alloc, group_id, table_name, from_key, to_key, opts, consistency, sink });
+            return try BoundaryAbi.call("scan_group_local_stream", self.boundary_dispatch, stream_fn, .{ self.ptr, alloc, group_id, table_name, from_key, to_key, fenced_opts, consistency, sink });
         }
-        var buffered = (try self.scanGroupLocal(alloc, group_id, table_name, from_key, to_key, opts, consistency)) orelse return false;
+        var buffered = (try self.scanGroupLocal(alloc, group_id, table_name, from_key, to_key, fenced_opts, consistency)) orelse return false;
         defer buffered.deinit(alloc);
         try sink.start();
         try sink.write(buffered.ndjson);
@@ -976,6 +1090,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?query_api.QueryResponse {
         var req = input;
+        req.privacy_policy_version = try self.privacyFence(alloc, table_name, req.execution_deadline_ns, req.privacy_policy_version);
         if (req.native_query_cut) |cut| if (cut.create) {
             req.native_query_cut = try cut.forGroup(group_id);
         };
@@ -996,6 +1111,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?db_types.SearchResult {
         var req = input;
+        req.privacy_policy_version = try self.privacyFence(alloc, table_name, req.execution_deadline_ns, req.privacy_policy_version);
         if (req.native_query_cut) |cut| if (cut.create) {
             req.native_query_cut = try cut.forGroup(group_id);
         };
@@ -1017,6 +1133,29 @@ pub const TableReadSource = struct {
         const bound = try @import("../storage/db/native_query_cut_contract.zig").bindBodyAlloc(alloc, input, group_id);
         defer if (bound) |bytes| alloc.free(bytes);
         const body = bound orelse input;
+        if (try self.privacyFence(alloc, table_name, null, null)) |version| if (!std.mem.allEqual(u8, &version, 0)) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidQueryRequest;
+            const value = parsed.value.object.get("query_request") orelse parsed.value;
+            if (value != .object) return error.InvalidQueryRequest;
+            if (value.object.get("_privacy_policy_version")) |asserted| {
+                if (asserted != .string or !std.mem.eql(u8, asserted.string, &version)) return error.IndexRebuilding;
+            } else if (value.object.contains("_native_cut")) return error.UnsupportedQueryRequest;
+            var request = db_types.SearchRequest{ .privacy_policy_version = version };
+            if (value.object.get("_native_cut")) |cut| {
+                const bytes = try std.json.Stringify.valueAlloc(alloc, cut, .{});
+                defer alloc.free(bytes);
+                const owned = try std.json.parseFromSlice(@import("../storage/db/native_query_cut_contract.zig").Request, alloc, bytes, .{});
+                defer owned.deinit();
+                request.native_query_cut = owned.value;
+                var summary = (try self.preflightQueryGroupLocal(alloc, group_id, table_name, request, .read_index, 1)) orelse return error.IndexRebuilding;
+                summary.deinit(alloc);
+            } else {
+                var summary = (try self.preflightQueryGroupLocal(alloc, group_id, table_name, request, .read_index, 1)) orelse return error.IndexRebuilding;
+                summary.deinit(alloc);
+            }
+        };
         if (self.route_fence) |fence| {
             const routed = self.vtable.text_stats_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("text_stats_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body });
@@ -1032,6 +1171,7 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         input: []const u8,
     ) !?query_api.QueryResponse {
+        try self.rejectProtectedOpaqueRead(alloc, table_name);
         const bound = try @import("../storage/db/native_query_cut_contract.zig").bindBodyAlloc(alloc, input, group_id);
         defer if (bound) |bytes| alloc.free(bytes);
         const body = bound orelse input;
@@ -1050,6 +1190,7 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
+        try self.rejectProtectedOpaqueRead(alloc, table_name);
         if (self.route_fence) |fence| {
             const routed = self.vtable.join_partition_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("join_partition_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, null });
@@ -1065,6 +1206,7 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
+        try self.rejectProtectedOpaqueRead(alloc, table_name);
         if (self.route_fence) |fence| {
             const routed = self.vtable.join_rows_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("join_rows_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, null });
@@ -1080,6 +1222,7 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
+        try self.rejectProtectedOpaqueRead(alloc, table_name);
         if (self.route_fence) |fence| {
             const routed = self.vtable.join_unmatched_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("join_unmatched_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, null });
@@ -1111,6 +1254,7 @@ pub const TableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        try self.rejectProtectedOpaqueRead(alloc, table_name);
         if (self.route_fence) |fence| {
             const routed = self.vtable.join_partition_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("join_partition_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, timeout_ms });
@@ -1130,6 +1274,7 @@ pub const TableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        try self.rejectProtectedOpaqueRead(alloc, table_name);
         if (self.route_fence) |fence| {
             const routed = self.vtable.join_rows_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("join_rows_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, timeout_ms });
@@ -1149,6 +1294,7 @@ pub const TableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        try self.rejectProtectedOpaqueRead(alloc, table_name);
         if (self.route_fence) |fence| {
             const routed = self.vtable.join_unmatched_group_local_routed_with_timeout orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("join_unmatched_group_local_routed_with_timeout", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, timeout_ms });

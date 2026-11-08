@@ -122,6 +122,7 @@ pub fn schemaFingerprint(a: A, table: metadata.TableRecord) ![32]u8 {
     var root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (table.indexes_json.len == 0) "{}" else table.indexes_json, .{});
     if (root != .object) return error.InvalidResolverCurationRequest;
     inline for (.{ marker, owners_key, "_resolver_namespaces", "_curation_proposals" }) |key| _ = root.object.swapRemove(key);
+    local.privacy_catalog.removeProgress(&root);
     const keys = try a.dupe([]const u8, root.object.keys());
     std.mem.sort([]const u8, keys, {}, struct {
         fn less(_: void, l: []const u8, r: []const u8) bool {
@@ -143,6 +144,7 @@ pub fn queryDefinitionFingerprint(a: A, table: metadata.TableRecord) ![32]u8 {
 pub fn sourceDefinitionFingerprint(a: A, indexes: []const u8) ![32]u8 {
     var root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (indexes.len == 0) "{}" else indexes, .{});
     inline for (.{ marker, owners_key, "_resolver_namespaces", "_curation_proposals", "_resolver_curation" }) |key| _ = root.object.swapRemove(key);
+    local.privacy_catalog.removeProgress(&root);
     const keys = try a.dupe([]const u8, root.object.keys());
     std.mem.sort([]const u8, keys, {}, struct {
         fn less(_: void, x: []const u8, y: []const u8) bool {
@@ -182,4 +184,32 @@ pub fn mutateOnService(svc: anytype, a: A, write: Write, context: local.api_oper
     const owned = try std.json.Stringify.valueAlloc(a, response, .{});
     a.free(bytes);
     return owned;
+}
+
+test "privacy progress preserves resolver authority fingerprints while authored changes fence them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var table: metadata.TableRecord = .{ .table_id = 7, .name = "entities", .indexes_json =
+        \\{"full_text_index_v0":{},"_privacy":{"resource_version":1,"policy_version":"v1","generation":1,"policy":{"mode":"monitor"},"coverage":{"cursor":"before"},"scans":[],"scan_id":"old","scan_sequence":0,"checkpoint_encoding":0}}
+    };
+    const schema = try schemaFingerprint(a, table);
+    const query = try queryDefinitionFingerprint(a, table);
+    const source = try sourceDefinitionFingerprint(a, table.indexes_json);
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, a, table.indexes_json, .{});
+    const privacy = root.object.getPtr("_privacy").?;
+    try privacy.object.put(a, "coverage", .{ .string = "next coverage page" });
+    try privacy.object.put(a, "scans", .{ .string = "next scan page" });
+    try privacy.object.put(a, "scan_id", .{ .string = "new scan" });
+    try privacy.object.put(a, "scan_sequence", .{ .integer = 10 });
+    try privacy.object.put(a, "checkpoint_encoding", .{ .integer = 1 });
+    table.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
+    try std.testing.expectEqual(schema, try schemaFingerprint(a, table));
+    try std.testing.expectEqual(query, try queryDefinitionFingerprint(a, table));
+    try std.testing.expectEqual(source, try sourceDefinitionFingerprint(a, table.indexes_json));
+    try privacy.object.put(a, "resource_version", .{ .integer = 2 });
+    table.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
+    try std.testing.expect(!std.mem.eql(u8, &schema, &try schemaFingerprint(a, table)));
+    try std.testing.expect(!std.mem.eql(u8, &query, &try queryDefinitionFingerprint(a, table)));
+    try std.testing.expect(!std.mem.eql(u8, &source, &try sourceDefinitionFingerprint(a, table.indexes_json)));
 }

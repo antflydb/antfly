@@ -33,7 +33,7 @@ pub fn prepare(templates: []const types.GeneratedEnrichmentRequest, first: u32, 
         const strings = document.len +| template.index_name.len +| template.artifact_name.len +| template.embedding_name.len;
         const cost = 512 +| strings *| 6;
         if (count != 0 and (count == max_items or bytes +| cost > target_bytes)) break;
-        if (cost > @import("artifact_publication.zig").max_payload_bytes) return error.ResourceBudgetExceeded;
+        if (document.len > @import("artifact_publication.zig").max_cursor_bytes or strings > @import("artifact_publication.zig").max_identity_bytes) return error.ResourceBudgetExceeded;
         buffer[count] = .{ .kind = template.kind, .index_name = template.index_name, .artifact_name = template.artifact_name, .embedding_name = template.embedding_name, .doc_key = document };
         bytes += cost;
         count += 1;

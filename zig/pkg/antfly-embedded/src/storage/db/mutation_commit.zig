@@ -156,6 +156,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const prepareInlineGraphPublication = S.prepareInlineGraphPublication;
         const InlineSparsePublication = S.InlineSparsePublication;
         const prepareInlineSparsePublication = S.prepareInlineSparsePublication;
+        const InlineDensePublication = S.InlineDensePublication;
+        const prepareInlineDensePublication = S.prepareInlineDensePublication;
         const attachPreparedUpsertDocumentProjections = S.attachPreparedUpsertDocumentProjections;
         const augmentExtractedWriteWithGraphFieldEdges = S.augmentExtractedWriteWithGraphFieldEdges;
         const augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed = S.augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed;
@@ -937,7 +939,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or opts.group_source_command != null))
                 preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
             const apply_lock_wait_start_ns = monotonicTimeNs();
-            try self.lockApplyForPortableRuntime();
+            if (opts.ordered_apply_receipt != null) {
+                // A committed Raft entry must yield its progress mutex when
+                // apply is busy, including a reader arriving after preflight.
+                try tryLockApplyForPortableRuntime(self);
+            } else {
+                try self.lockApplyForPortableRuntime();
+            }
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
             if (S.ownerField(self, "local_execution").*.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
             var filtered_cleanup_edges: ?[]types.GraphEdgeDelete = null;
@@ -3396,6 +3404,72 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     inline_sparse_handled_name = handled_name;
                 } else |_| {}
             }
+            // lite-single-commit-write-path.md §3.3a's dense extension of
+            // the fast path above, mirroring the sparse block immediately
+            // above it. Deliberately narrow -- exactly one dense embedding
+            // write and nothing else dense-related in this batch (no
+            // deletes, no overwritten docs, no changed artifacts) -- so
+            // every precondition `prepareInlineDensePublication`/
+            // `denseEmbeddingWriteEligibleForInlinePublication` cannot
+            // itself check (multiple embeddings in one batch, a document
+            // replacement needing the slow path's own delete-then-upsert
+            // ordering) is simply never attempted here; the caller falls
+            // back to the existing `applyDenseEmbeddingWritesByNameWith
+            // Options` path for all of those, same as before this change.
+            // Gated on `.full_index`, same reasoning as graph's and
+            // sparse's own gates: dense has no narrower sync level of its
+            // own.
+            var inline_dense_publication: ?*InlineDensePublication = null;
+            var inline_dense_handled_name: []const u8 = &.{};
+            defer if (inline_dense_publication) |prepared| prepared.abort();
+            defer if (inline_dense_handled_name.len != 0) S.ownerField(self, "alloc").*.free(@constCast(inline_dense_handled_name));
+            if (append_derived_replay and effective_req.sync_level == .full_index and
+                opts.transaction_resolution == null and materialized_derived_batch != null and
+                materialized_derived_batch.?.dense_embeddings.len == 1 and
+                materialized_derived_batch.?.deleted_keys.len == 0 and
+                materialized_derived_batch.?.overwritten_doc_keys.len == 0 and
+                materialized_derived_batch.?.changed_artifact_keys.len == 0)
+            {
+                var write = materialized_derived_batch.?.dense_embeddings[0];
+                // `buildDerivedBatch` deliberately zeroes `.vector` whenever
+                // `.artifact_key` is set (every caller-supplied-vector write
+                // reaches here with `artifact_key` already set --
+                // `appendEmbeddingArtifactWrite`'s own earlier, unconditional
+                // artifact write, well before this block runs), so the slow
+                // path's consumer knows to load the vector from the durable
+                // artifact. That artifact is not durable yet here -- it is
+                // only staged in `write_buffers.explicit_embedding_artifact_
+                // writes`, part of this SAME not-yet-committed primary write
+                // -- so resolve it from there instead of reading storage.
+                // `denseEmbeddingWriteEligibleForInlinePublication` requires
+                // a real inline vector; leaving `write.vector` zeroed here
+                // would always and incorrectly fall back to the slow path.
+                if (write.vector.len == 0) resolve: {
+                    const artifact_key = write.artifact_key orelse break :resolve;
+                    for (write_buffers.explicit_embedding_artifact_writes.items) |artifact_write| {
+                        if (!std.mem.eql(u8, artifact_write.key, artifact_key)) continue;
+                        const view = enrichment_artifact_codec.denseEmbeddingVectorView(artifact_write.value) catch break :resolve;
+                        write.vector = view orelse break :resolve;
+                        break;
+                    }
+                }
+                const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = write.index_name, .kind = .dense_vector };
+                if (prepareInlineDensePublication(
+                    S.ownerField(self, "alloc").*,
+                    S.ownerField(self, "core").*.store,
+                    S.ownerField(self, "core").*.index_manager,
+                    write,
+                    index_ref,
+                    sequence,
+                )) |prepared| {
+                    const handled_name = S.ownerField(self, "alloc").*.dupe(u8, write.index_name) catch |dup_err| {
+                        prepared.abort();
+                        return dup_err;
+                    };
+                    inline_dense_publication = prepared;
+                    inline_dense_handled_name = handled_name;
+                } else |_| {}
+            }
             var commit_participants: @import("../commit_participant.zig").List = .{};
             if (authored_acceptance.vectors.len != 0) try commit_participants.append(authored_acceptance.participant());
             for (inline_text_publications[0..inline_text_publication_count]) |maybe_prepared| {
@@ -3479,6 +3553,41 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // the commit-participant list happened to be full.
                     prepared.abort();
                     inline_sparse_publication = null;
+                }
+            }
+            if (inline_dense_publication) |prepared| {
+                if (commit_participants.append(prepared.participant())) {
+                    // Mirrors the graph/sparse blocks above: exclude this
+                    // write's dense index name from `sync_targets.all_indexes`
+                    // so the `.full_index` no-worker fallback further down
+                    // never re-applies an index this inline publication
+                    // already made durable.
+                    const filter_alloc = S.ownerField(self, "alloc").*;
+                    var kept_count: usize = 0;
+                    for (sync_targets.all_indexes) |name| {
+                        if (!std.mem.eql(u8, name, inline_dense_handled_name)) kept_count += 1;
+                    }
+                    if (kept_count != sync_targets.all_indexes.len) {
+                        const filtered = try filter_alloc.alloc([]const u8, kept_count);
+                        errdefer filter_alloc.free(filtered);
+                        var fill: usize = 0;
+                        for (sync_targets.all_indexes) |name| {
+                            if (std.mem.eql(u8, name, inline_dense_handled_name)) {
+                                filter_alloc.free(@constCast(name));
+                            } else {
+                                filtered[fill] = name;
+                                fill += 1;
+                            }
+                        }
+                        filter_alloc.free(@constCast(sync_targets.all_indexes));
+                        sync_targets.all_indexes = filtered;
+                    }
+                } else |_| {
+                    // Same reasoning as the graph/sparse blocks above: never
+                    // silently drop this write's dense effect because the
+                    // commit-participant list happened to be full.
+                    prepared.abort();
+                    inline_dense_publication = null;
                 }
             }
             const combined_commit_participant: ?@import("../commit_participant.zig").Participant =
@@ -3716,6 +3825,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_sparse_handled_name, sequence);
                 }
             }
+            if (inline_dense_publication) |prepared| {
+                prepared.install();
+                inline_dense_publication = null;
+                if (S.ownerField(self, "executor").*.hasWorkers()) {
+                    _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_dense_handled_name, sequence);
+                }
+            }
             snapshot_mutation.release();
             if (split_shadow_ticket) |ticket| {
                 const apply_shadow_start_ns = monotonicTimeNs();
@@ -3773,8 +3889,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         durable_outbox_deletes[durable_outbox_delete_count] = key;
                         durable_outbox_delete_count += 1;
                     }
+                    // The remote wait above already proved durability and
+                    // authority; this clear is bookkeeping that is safe to
+                    // lose on crash (the row is re-read and re-published,
+                    // tolerated by the at-least-once replication adapter),
+                    // so it rides along instead of forcing its own fsync
+                    // (lite-single-commit-write-path.md §3.2a).
                     if (durable_outbox_delete_count != 0)
-                        try S.ownerField(self, "core").*.store.putBatch(&.{}, durable_outbox_deletes[0..durable_outbox_delete_count]);
+                        try S.ownerField(self, "core").*.store.putBatchWithReplayWithOptions(null, &.{}, durable_outbox_deletes[0..durable_outbox_delete_count], null, .{ .durability = .ride_along });
                 }
             }
             if (opts.document_child_range_dispatcher) |dispatcher| {
@@ -4289,6 +4411,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.mem.startsWith(u8, key, protection.writer_prefix) or
                 std.mem.startsWith(u8, key, protection.index_counter_prefix) or
                 std.mem.startsWith(u8, key, protection.index_writer_prefix);
+        }
+
+        pub fn tryLockApplyForPortableRuntime(self: anytype) !void {
+            try self.enforcePortableRuntimeGate();
+            if (!S.ownerField(self, "core").*.tryLockApplyExclusive()) return error.WriterLocked;
+            errdefer S.ownerField(self, "core").*.unlockApply();
+            try self.enforcePortableRuntimeGate();
         }
 
         pub fn lockApplyForPortableRuntime(self: anytype) !void {

@@ -114,7 +114,7 @@ func TestSourceMediaArtifactIntegration(t *testing.T) {
 	require.NoError(t, err)
 	otherKey, err := RecordKey(otherID, otherItem.ID)
 	require.NoError(t, err)
-	otherRow, err := SourceRow(otherKey, otherID, other)
+	otherRow, err := SourceRow(otherKey, otherID, "", other)
 	require.NoError(t, err)
 	require.NoError(t, publisher.Batch(t.Context(), table, map[string]any{otherKey: otherRow}, nil))
 	key, err := RecordKey(source.ID, fixture.inventory.Objects[0].ID)

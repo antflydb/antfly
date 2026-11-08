@@ -293,7 +293,7 @@ pub const Lookup = struct {
         if (self.stream_containers.get(id)) |key| return key;
         const stream = try self.numberObject(raw);
         if (stream == .null) return null;
-        if (stream != .stream) return error.InvalidPdfStructure;
+        if (stream != .stream and stream != .stream_header) return error.InvalidPdfStructure;
         const parent = stream.get("StructParents") orelse return error.UnsupportedPdfStructureText;
         const key = try self.integerValue(parent);
         if (key < 0) return error.InvalidPdfStructure;

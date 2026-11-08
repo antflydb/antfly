@@ -871,7 +871,9 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .graph_edges_group_local_routed = graphEdgesGroupLocalRouted,
                 .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
+                .document_artifact_manifest_group_local_controlled = documentArtifactManifestGroupLocalControlled,
                 .document_artifact_manifest_group_local_routed = documentArtifactManifestGroupLocalRouted,
+                .document_artifact_manifest_group_local_routed_controlled = documentArtifactManifestGroupLocalRoutedControlled,
                 .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
                 .document_artifact_manifests_group_local_routed = documentArtifactManifestsGroupLocalRouted,
             },
@@ -4683,9 +4685,23 @@ pub const ProvisionedKernelOwnerSource = struct {
         artifact_name: []const u8,
         consistency: read_gate.ReadConsistency,
     ) !?db_types.DocumentArtifactManifest {
+        return documentArtifactManifestGroupLocalRoutedControlled(ptr, alloc, fence, group_id, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestGroupLocalRoutedControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: read_gate.ReadConsistency,
+        opts: db_types.LookupOptions,
+    ) !?db_types.DocumentArtifactManifest {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         try self.validateRoutedRead(alloc, fence, group_id, table_name);
-        return try documentArtifactManifestGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency);
+        return try documentArtifactManifestGroupLocalControlled(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency, opts);
     }
 
     fn documentArtifactManifestsGroupLocalRouted(
@@ -4975,8 +4991,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         artifact_name: []const u8,
         consistency: read_gate.ReadConsistency,
     ) !?db_types.DocumentArtifactManifest {
+        return documentArtifactManifestGroupLocalControlled(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: read_gate.ReadConsistency,
+        opts: db_types.LookupOptions,
+    ) !?db_types.DocumentArtifactManifest {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        try self.prepareLookupRead(group_id, doc_key, .{}, consistency);
+        try self.prepareLookupRead(group_id, doc_key, opts, consistency);
         const request_json = try table_reads.encodeStorageKernelDocumentArtifactManifestRequest(
             alloc,
             doc_key,

@@ -116,6 +116,12 @@ class SearchGatewayTest(unittest.TestCase):
 
             def do_POST(self):
                 query = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if query.get("full_text_search", {}).get("match") == "fail":
+                    self.send_response(500)
+                    self.send_header("Server-Timing", "private;desc=server-only")
+                    self.end_headers()
+                    self.wfile.write(b"server-only")
+                    return
                 pages.append((self.path, query))
                 # A table source at /query is deliberately unsupported.
                 valid = (
@@ -158,6 +164,10 @@ class SearchGatewayTest(unittest.TestCase):
                     ),
                     timeout=2,
                 ) as response:
+                    self.assertRegex(
+                        response.headers["Server-Timing"],
+                        r"^antfly_upstream;dur=\d+\.\d{3}$",
+                    )
                     return json.load(response)
 
             for view, table in (("history", "hn_archive"), ("recent", "hn_current")):
@@ -175,6 +185,17 @@ class SearchGatewayTest(unittest.TestCase):
             call({"q": "database", "cursor": first["cursor"]})
             self.assertEqual(pages[-1][0], "/db/v1/query")
             self.assertEqual(pages[-1][1]["source_cursor"], "composed-page")
+            from qualify_gateway import probe
+
+            result, evidence = probe(
+                f"http://127.0.0.1:{gateway.server_port}",
+                "/api/search",
+                {"q": "fail"},
+            )
+            self.assertIsNone(result)
+            self.assertEqual(evidence["status"], 503)
+            self.assertGreaterEqual(evidence["backend_seconds"], 0)
+            self.assertNotIn("server-only", json.dumps(evidence))
         finally:
             for server in (gateway, backend):
                 server.shutdown()

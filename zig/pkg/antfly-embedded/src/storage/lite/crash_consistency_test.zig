@@ -1524,6 +1524,183 @@ test "WS4-for-graph: a synchronous graph edge write lands in one native commit a
     }
 }
 
+test "WS4-for-dense: a synchronous dense vector write lands in one native commit and is queryable immediately" {
+    // Dense analog of the full_text/graph tests above (lite-single-
+    // commit-write-path.md §3.3a's dense extension): default Lite
+    // configuration (background index workers running), one caller-
+    // supplied vector write expressed through a document's `_embeddings`
+    // field on an `external: true` dense index, `sync_level = .full_index`
+    // (dense has no narrower sync level of its own -- see
+    // `types.SyncLevel`'s enum order). Proves `InlineDensePublication`
+    // engages for the simple single-vector insert case: the vector is
+    // queryable immediately after ack, and the background worker's later
+    // catch-up does not duplicate it.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+    defer handle.close();
+
+    try handle.db.addIndex(.{
+        .name = "dv_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"marker\":\"seed\"}" }}, .sync_level = .write });
+    try handle.db.runUntilIdle();
+
+    const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+    const before_sequence = store.file.activeCheckpoint().commit_sequence;
+
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker\",\"_embeddings\":{\"dv_idx\":[1.0,0.0]}}" },
+    }, .sync_level = .full_index });
+
+    const after_ack_sequence = store.file.activeCheckpoint().commit_sequence;
+    const commits_for_this_write = after_ack_sequence - before_sequence;
+    // Same bound as the full_text/graph tests above: the inline
+    // publication itself contributes no extra commit beyond the primary
+    // write's own (its HBC namespace mutations and the durable doc_key<->
+    // vector_id mapping both ride inside the SAME native transaction via
+    // `commit_participant.View.putIndexCatalog`/`.put`); a handful more
+    // land end to end from unrelated background bookkeeping (replication
+    // outbox staging, opportunistic maintenance ticks) WS7 owns driving to
+    // zero.
+    try std.testing.expect(commits_for_this_write <= 6);
+
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "dv_idx",
+            .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0 }, .k = 1 } },
+            .limit = 1,
+            .search_effort = 1.0,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("dv-doc", result.hits[0].id);
+    }
+
+    // Let the background worker observe this write. If it were not told
+    // the vector already landed inline (`Executor.
+    // advanceAppliedSequenceIfContiguous`), it would redundantly re-apply
+    // the same write from the journal -- for an exact-member upsert that
+    // would not duplicate the member, but it would mean the worker, not
+    // the inline path, is actually doing the work, defeating the point.
+    try handle.db.runUntilIdle();
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "dv_idx",
+            .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0 }, .k = 1 } },
+            .limit = 1,
+            .search_effort = 1.0,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    }
+}
+
+test "WS4-for-dense round 2: an update or a delete falls back and still lands correctly" {
+    // `prepareInlineDensePublication`'s own batch-level gate in
+    // `mutation_commit.zig` (`overwritten_doc_keys.len == 0`/
+    // `deleted_keys.len == 0`) excludes a document replacement or a
+    // delete from the inline fast path -- both must fall back to the
+    // existing `applyDenseEmbeddingWritesByNameWithOptions` path, which
+    // this proves still produces the correct final state (the replaced
+    // vector is gone, the new one is findable; a deleted vector is gone
+    // too) and costs strictly more than the single-commit insert case
+    // above, confirming the fallback -- not the inline path -- actually
+    // ran.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+    defer handle.close();
+
+    try handle.db.addIndex(.{
+        .name = "dv_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker-v1\",\"_embeddings\":{\"dv_idx\":[1.0,0.0]}}" },
+    }, .sync_level = .full_index });
+
+    // Update: a second write to the SAME key with a different vector.
+    // `overwritten_doc_keys` is non-empty for this write, so it must NOT
+    // take the one-commit inline path.
+    const before_update_sequence = store.file.activeCheckpoint().commit_sequence;
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker-v2\",\"_embeddings\":{\"dv_idx\":[0.0,1.0]}}" },
+    }, .sync_level = .full_index });
+    const after_update_sequence = store.file.activeCheckpoint().commit_sequence;
+    try std.testing.expect(after_update_sequence - before_update_sequence > 1);
+
+    // An exhaustive search (`search_effort: 1.0`) must prove the fallback's
+    // functional result too (old vector gone, new one findable): HBC's
+    // `CompleteCoverageTracker` used to trip over a stale `native_catalog_
+    // backend` mirror left by a PRIOR inline-published write into this same
+    // fresh index (`HBCIndex.installStagedWrite` never called
+    // `applyExternallyCommittedMutations`, so the mirror never learned about
+    // mutations that only ever landed through the primary write's own
+    // native commit) -- fixed directly in `installStagedWrite`.
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "dv_idx",
+            .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 1.0 }, .k = 1 } },
+            .limit = 1,
+            .search_effort = 1.0,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("dv-doc", result.hits[0].id);
+    }
+
+    // Delete: the dense-vector mapping and HBC posting entry must both be
+    // gone.
+    try handle.db.batch(.{ .deletes = &.{"dv-doc"}, .sync_level = .full_index });
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "dv_idx",
+            .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 1.0 }, .k = 1 } },
+            .limit = 1,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    }
+
+    // A fresh insert after the delete must still take the (now
+    // unobstructed) inline fast path and cost exactly one commit, proving
+    // the update/delete fallback above left the index in a state the
+    // inline path can resume from cleanly.
+    try handle.db.runUntilIdle();
+    const before_final_sequence = store.file.activeCheckpoint().commit_sequence;
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "dv-doc-2", .value = "{\"marker\":\"dv-doc-marker-v3\",\"_embeddings\":{\"dv_idx\":[0.5,0.5]}}" },
+    }, .sync_level = .full_index });
+    const after_final_sequence = store.file.activeCheckpoint().commit_sequence;
+    try std.testing.expect(after_final_sequence - before_final_sequence <= 6);
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "dv_idx",
+            .query = .{ .dense_knn = .{ .vector = &.{ 0.5, 0.5 }, .k = 1 } },
+            .limit = 1,
+            .search_effort = 1.0,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("dv-doc-2", result.hits[0].id);
+    }
+}
+
 test "WS4 phase 2 round 2: a worker-backlogged index falls back correctly instead of skipping the gap" {
     // Deliberately creates the one scenario the inline fast path must
     // refuse: a background worker still owes this index an earlier
@@ -2227,6 +2404,119 @@ test "a ride-along commit needs an explicit durability barrier before close, or 
         const recovered = try reopened.getDocumentAlloc(allocator, "ride-along-doc");
         defer if (recovered) |bytes| allocator.free(bytes);
         try std.testing.expectEqualStrings("ride-along-value", recovered orelse return error.TestExpectedEqual);
+    }
+}
+
+// WS "other write-path surfaces" (TTL, outboxes): the same durability-
+// barrier shape as the ride-along test directly above, but with the exact
+// key/value encodings `durable_outbox_store.clearPublished` (background
+// replication-outbox trimming) and `db.zig`'s `pruneStaleGraphTtlCandidateContext`
+// (background graph-TTL due-record cleanup) now write through
+// `beginWriteBatchWithOptions(.{ .durability = .ride_along })` /
+// `putBatchWithReplayWithOptions(..., .{ .durability = .ride_along })`
+// (lite-single-commit-write-path.md §3.2a). Both are pure bookkeeping: an
+// outbox row surviving a crash is simply re-published (idempotent,
+// at-least-once); a stale due-record surviving a crash is simply re-pruned
+// on the next sweep. Neither may force its own fsync, and losing either in
+// a crash must never corrupt the file or the other key written in the same
+// native transaction (`seed`, standing in for the primary row that always
+// accompanies this bookkeeping in production).
+test "TTL/outbox ride-along bookkeeping needs an explicit durability barrier before close, or the clear/prune is lost" {
+    const allocator = std.testing.allocator;
+    const outbox_mod = @import("../db/durable_outbox.zig");
+    const graph_ttl_mod = @import("../db/graph_edge_ttl_expiration.zig");
+    const internal_keys = @import("../internal_keys.zig");
+
+    const outbox_key = outbox_mod.replication_batch_outbox_key;
+    const outbox_value = try outbox_mod.encodeDurableReplicationOutboxAlloc(allocator, 7, "pending-batch-payload");
+    defer allocator.free(outbox_value);
+
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(allocator, "doc:a", "g", "links", "doc:b");
+    defer allocator.free(artifact_key);
+    const due_key = try graph_ttl_mod.directIndexKeyAlloc(allocator, 123, artifact_key);
+    defer allocator.free(due_key);
+    const due_value = try graph_ttl_mod.encodeDirectAlloc(allocator, .{
+        .index_name = "g",
+        .generation = 7,
+        .artifact_key = artifact_key,
+        .deadline_ns = 123,
+        .artifact_digest = @splat(5),
+    });
+    defer allocator.free(due_value);
+
+    // Scenario A: delete both bookkeeping rows with a ride-along (non-
+    // durable) commit, then close with NO later durability barrier. The
+    // deletes are structurally acknowledged (the call returned success)
+    // but, per §3.2a, not yet durable -- exactly the shape this whole
+    // conversion relies on being safe to lose.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/ttl-outbox-no-barrier.aflite", .{tmp.sub_path});
+        defer allocator.free(path);
+
+        var file = try native.NativeFile.createWithIo(allocator, std.testing.io, path, .{});
+        try file.putDocument("seed", "seed-value");
+        try file.putDocument(outbox_key, outbox_value);
+        try file.putDocument(due_key, due_value);
+
+        try file.beginTransaction();
+        try file.deleteDocument(outbox_key);
+        try file.deleteDocument(due_key);
+        try file.commitTransactionWithDurability(false, null);
+        try std.testing.expect(file.durable_header != null);
+        file.close();
+
+        var reopened = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+        defer reopened.close();
+        const seed = try reopened.getDocumentAlloc(allocator, "seed");
+        defer if (seed) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualStrings("seed-value", seed orelse return error.TestExpectedEqual);
+
+        const outbox_row = try reopened.getDocumentAlloc(allocator, outbox_key);
+        defer if (outbox_row) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualSlices(u8, outbox_value, outbox_row orelse return error.TestExpectedEqual);
+
+        const due_row = try reopened.getDocumentAlloc(allocator, due_key);
+        defer if (due_row) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualSlices(u8, due_value, due_row orelse return error.TestExpectedEqual);
+    }
+
+    // Scenario B: the identical ride-along deletes, but with an explicit
+    // `file.sync()` barrier before close -- both rows are durably cleared.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/ttl-outbox-with-barrier.aflite", .{tmp.sub_path});
+        defer allocator.free(path);
+
+        var file = try native.NativeFile.createWithIo(allocator, std.testing.io, path, .{});
+        try file.putDocument("seed", "seed-value");
+        try file.putDocument(outbox_key, outbox_value);
+        try file.putDocument(due_key, due_value);
+
+        try file.beginTransaction();
+        try file.deleteDocument(outbox_key);
+        try file.deleteDocument(due_key);
+        try file.commitTransactionWithDurability(false, null);
+        try std.testing.expect(file.durable_header != null);
+        try file.sync();
+        try std.testing.expect(file.durable_header == null);
+        file.close();
+
+        var reopened = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+        defer reopened.close();
+        const seed = try reopened.getDocumentAlloc(allocator, "seed");
+        defer if (seed) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualStrings("seed-value", seed orelse return error.TestExpectedEqual);
+
+        const outbox_row = try reopened.getDocumentAlloc(allocator, outbox_key);
+        defer if (outbox_row) |bytes| allocator.free(bytes);
+        try std.testing.expect(outbox_row == null);
+
+        const due_row = try reopened.getDocumentAlloc(allocator, due_key);
+        defer if (due_row) |bytes| allocator.free(bytes);
+        try std.testing.expect(due_row == null);
     }
 }
 
