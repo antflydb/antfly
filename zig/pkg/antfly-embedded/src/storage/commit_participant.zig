@@ -27,6 +27,30 @@
 /// here only so this file never needs to import a Lite-specific module.
 pub const IndexCatalogMutation = @import("native_catalog_backend.zig").Mutation;
 
+/// Key kinds a commit participant may write/delete through `View.putReplay`/
+/// `View.deleteReplay` -- derived-coverage outcome markers/counters
+/// (`setDerivedCoverageOutcomes`) and embedding-artifact repair-issue
+/// records (`clearPublishedArtifactRepairIssueContext`). Every one of these
+/// keys is `[internal_keys.replay_namespace, 0xff, <kind>]`-prefixed
+/// (`internal_keys.globalReplayPrefix`); allow-listing by kind byte keeps
+/// this an escape hatch for exactly those two mechanisms' own keys, not an
+/// unrestricted write into the replay namespace generally.
+const internal_keys = @import("internal_keys.zig");
+const allowed_replay_kinds = [_]u8{
+    internal_keys.derived_coverage_kind,
+    internal_keys.artifact_repair_issue_kind,
+    internal_keys.artifact_repair_kind_issue_kind,
+    internal_keys.artifact_repair_completion_kind,
+};
+
+fn isAllowedReplayKey(key: []const u8) bool {
+    if (key.len < 3 or key[0] != internal_keys.replay_namespace or key[1] != 0xff) return false;
+    for (allowed_replay_kinds) |kind| {
+        if (key[2] == kind) return true;
+    }
+    return false;
+}
+
 /// Unwraps every level of pointer indirection. `View.from`'s `txn:
 /// anytype` argument is sometimes a single pointer (`&concrete_txn`) and
 /// sometimes a pointer-to-a-copied-pointer (callers that themselves
@@ -53,6 +77,12 @@ pub const View = struct {
     /// exactly as `native_catalog_backend.Options.scope`/
     /// `native_catalog_sink.zig`'s `Sink.submit` already use.
     put_index_catalog_fn: ?*const fn (*anyopaque, scope: []const u8, mutations: []const IndexCatalogMutation) anyerror!void = null,
+    /// WS4 phase 2 (coverage/repair-issue ride-along): optional delete
+    /// capability into the primary keyspace, wired whenever the host
+    /// transaction supports it. `null` on a host with no such method
+    /// (every backend `View.from` sees today supports it, but `putReplay`/
+    /// `deleteReplay` only need the restriction, not the guarantee).
+    delete_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
 
     pub fn get(self: View, key: []const u8) ![]const u8 {
         return self.get_fn(self.ptr, key);
@@ -76,6 +106,28 @@ pub const View = struct {
         return put_index_catalog(self.ptr, scope, mutations);
     }
 
+    /// Writes one derived-coverage or repair-issue record (see
+    /// `allowed_replay_kinds`) into the primary keyspace, in the SAME
+    /// native transaction as the primary write. These keys are
+    /// `replay_namespace`-prefixed, not `\x00\x00`-prefixed, so `put`
+    /// itself would reject them; this is the narrow, allow-listed surface
+    /// `InlineDensePublication`/`InlineSparsePublication` use to keep
+    /// derived-coverage accounting and repair-issue clearing consistent
+    /// with the slow path without paying for a second durable commit.
+    pub fn putReplay(self: View, key: []const u8, value: []const u8) !void {
+        if (!isAllowedReplayKey(key)) return error.InvalidCommitMetadata;
+        return self.put_fn(self.ptr, key, value);
+    }
+
+    /// Deletes one derived-coverage or repair-issue record (see `putReplay`).
+    /// `error.ReplayDeleteUnsupported` when the host transaction has no
+    /// delete capability wired (see `delete_fn`).
+    pub fn deleteReplay(self: View, key: []const u8) !void {
+        if (!isAllowedReplayKey(key)) return error.InvalidCommitMetadata;
+        const delete = self.delete_fn orelse return error.ReplayDeleteUnsupported;
+        return delete(self.ptr, key);
+    }
+
     /// The view and every returned slice are borrowed only through callback
     /// return. It carries no allocation, ownership, or transaction lifecycle.
     pub fn from(txn: anytype) View {
@@ -93,12 +145,17 @@ pub const View = struct {
                 const typed: T = @ptrCast(@alignCast(ptr));
                 return typed.*.putIndexCatalogBatch(scope, mutations);
             }
+            fn delete(ptr: *anyopaque, key: []const u8) !void {
+                const typed: T = @ptrCast(@alignCast(ptr));
+                return typed.*.delete(key);
+            }
         };
         return .{
             .ptr = @ptrCast(txn),
             .get_fn = Bridge.get,
             .put_fn = Bridge.put,
             .put_index_catalog_fn = if (@hasDecl(BaseType(T), "putIndexCatalogBatch")) Bridge.putIndexCatalog else null,
+            .delete_fn = if (@hasDecl(BaseType(T), "delete")) Bridge.delete else null,
         };
     }
 };
@@ -186,10 +243,39 @@ const TestTxn = struct {
         try self.values.put(std.testing.allocator, key, value);
     }
 
+    pub fn delete(self: *TestTxn, key: []const u8) !void {
+        _ = self.values.remove(key);
+    }
+
     pub fn deinit(self: *TestTxn) void {
         self.values.deinit(std.testing.allocator);
     }
 };
+
+test "view putReplay/deleteReplay allow only the derived-coverage and repair-issue key kinds" {
+    var txn = TestTxn{};
+    defer txn.deinit();
+    const view = View.from(&txn);
+
+    const coverage_key = &[_]u8{ internal_keys.replay_namespace, 0xff, internal_keys.derived_coverage_kind, 1 };
+    try view.putReplay(coverage_key, "produced");
+    try std.testing.expectEqualStrings("produced", try txn.get(coverage_key));
+
+    const issue_key = &[_]u8{ internal_keys.replay_namespace, 0xff, internal_keys.artifact_repair_issue_kind, 2 };
+    try view.putReplay(issue_key, "issue-bytes");
+    try view.deleteReplay(issue_key);
+    try std.testing.expectError(error.NotFound, txn.get(issue_key));
+
+    // A replay-namespaced key OUTSIDE the allow-list (e.g. the generic
+    // next-sequence counter) is rejected, same as `put`'s own `\x00\x00`
+    // restriction rejects public keys.
+    const disallowed_key = &[_]u8{ internal_keys.replay_namespace, 0xff, @backingInt(internal_keys.GlobalReplayKind.next_sequence), 3 };
+    try std.testing.expectError(error.InvalidCommitMetadata, view.putReplay(disallowed_key, "x"));
+    try std.testing.expectError(error.InvalidCommitMetadata, view.deleteReplay(disallowed_key));
+
+    // `put`'s own `\x00\x00` surface still rejects a replay-namespaced key.
+    try std.testing.expectError(error.InvalidCommitMetadata, view.put(coverage_key, "nope"));
+}
 
 const RecordingParticipant = struct {
     stage_calls: usize = 0,

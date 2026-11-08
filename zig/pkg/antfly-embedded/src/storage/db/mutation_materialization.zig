@@ -3846,6 +3846,174 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return result;
         }
 
+        /// WS4 phase 2 (coverage ride-along, lite-single-commit-write-
+        /// path.md §3.3a): the exact derived-coverage marker+counter delta
+        /// `setDerivedCoverageOutcomes` would write for ONE doc_key's
+        /// `.produced` transition -- the only outcome an eligible inline
+        /// dense/sparse publication ever represents (external index,
+        /// caller-supplied vector/indices, never a delete; see
+        /// `accountDenseCoverageWithPlan`/`accountSparseCoverageWithPlan`'s
+        /// own `else` branch for generated/external indexes). Applied by
+        /// `InlineDensePublication`/`InlineSparsePublication.stage()` via
+        /// `commit_participant.View.putReplay`, inside the SAME native
+        /// transaction as the primary write, instead of
+        /// `setDerivedCoverageOutcomes`'s own separate `store.putBatch`.
+        const InlineCoveragePlan = struct {
+            marker_key: []u8,
+            produced_counter_key: []u8,
+            produced_counter_value: [8]u8,
+            previous_counter: ?struct { key: []u8, value: [8]u8 } = null,
+
+            fn deinit(self: *const InlineCoveragePlan, alloc: Allocator) void {
+                alloc.free(self.marker_key);
+                alloc.free(self.produced_counter_key);
+                if (self.previous_counter) |pc| alloc.free(pc.key);
+            }
+
+            fn stage(self: *const InlineCoveragePlan, view: commit_participant.View) !void {
+                try view.putReplay(self.marker_key, @tagName(DerivedCoverageOutcome.produced));
+                try view.putReplay(self.produced_counter_key, &self.produced_counter_value);
+                if (self.previous_counter) |pc| try view.putReplay(pc.key, &pc.value);
+            }
+        };
+
+        /// Prepare-time equivalent of `setDerivedCoverageOutcomes` for
+        /// exactly one write's `.produced` outcome transition. Reads
+        /// through `store` (point reads/legacy-scan fallback, identical to
+        /// `setDerivedCoverageOutcomes`'s own): the SAME per-index
+        /// `lockManagedIndexApply` guard an inline publication already
+        /// holds across prepare -> stage -> install excludes the slow
+        /// path's own concurrent accounting of this index (see
+        /// `applyDerivedBatchToIndexContextProfiled`'s own
+        /// `lockManagedIndexApplyWithPlan`), so this snapshot cannot go
+        /// stale before `stage()` applies it.
+        ///
+        /// Returns `null` for nothing to do: coverage tracking inactive
+        /// (`orderedCoverageActive`), no coverage generation configured for
+        /// this index, or the doc_key's marker is already `.produced` (an
+        /// idempotent re-publication, e.g. a worker replay racing an
+        /// already-applied inline write).
+        fn prepareInlineCoveragePlan(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *index_manager_mod.IndexManager,
+            index_name: []const u8,
+            doc_key: []const u8,
+        ) !?InlineCoveragePlan {
+            if (try orderedCoverageActive(store)) return null;
+            const generation = index_manager.coverageGenerationForIndex(index_name) orelse return null;
+
+            const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key);
+            errdefer alloc.free(marker_key);
+
+            var existing_outcome: ?DerivedCoverageOutcome = null;
+            {
+                var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
+                defer probe.abort();
+                const existing = probe.get(marker_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (existing) |value| {
+                    existing_outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
+                }
+            }
+            if (existing_outcome == DerivedCoverageOutcome.produced) {
+                alloc.free(marker_key);
+                return null;
+            }
+
+            const produced_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(DerivedCoverageOutcome.produced));
+            errdefer alloc.free(produced_key);
+            var previous_key: ?[]u8 = null;
+            errdefer if (previous_key) |k| alloc.free(k);
+            if (existing_outcome) |prev| {
+                previous_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(prev));
+            }
+
+            var produced_missing = false;
+            var produced_count: u64 = 0;
+            var previous_missing = false;
+            var previous_count: u64 = 0;
+            {
+                var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
+                defer probe.abort();
+                const raw_produced = probe.get(produced_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (raw_produced) |v| produced_count = try internal_keys.decodeDerivedCoverageOutcomeCount(v) else produced_missing = true;
+                if (previous_key) |pk| {
+                    const raw_prev = probe.get(pk) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (raw_prev) |v| previous_count = try internal_keys.decodeDerivedCoverageOutcomeCount(v) else previous_missing = true;
+                }
+            }
+            // Mirrors `setDerivedCoverageOutcomes`'s own ordering: the
+            // legacy-migration scan runs only after the point-read probe
+            // transaction above has closed (LMDB does not universally
+            // permit nested read transactions on one thread).
+            if (produced_missing) produced_count = try scanDerivedCoverageOutcomeFromStore(alloc, store, index_name, generation, @tagName(DerivedCoverageOutcome.produced));
+            if (previous_key != null and previous_missing) {
+                previous_count = try scanDerivedCoverageOutcomeFromStore(alloc, store, index_name, generation, @tagName(existing_outcome.?));
+            }
+
+            if (existing_outcome != null) {
+                if (previous_count == 0) return error.InvalidDerivedCoverageCounter;
+                previous_count -= 1;
+            }
+            produced_count +|= 1;
+
+            var plan: InlineCoveragePlan = .{
+                .marker_key = marker_key,
+                .produced_counter_key = produced_key,
+                .produced_counter_value = undefined,
+                .previous_counter = null,
+            };
+            _ = internal_keys.encodeDerivedCoverageOutcomeCount(&plan.produced_counter_value, produced_count);
+            if (previous_key) |pk| {
+                var previous_value: [8]u8 = undefined;
+                _ = internal_keys.encodeDerivedCoverageOutcomeCount(&previous_value, previous_count);
+                plan.previous_counter = .{ .key = pk, .value = previous_value };
+            }
+            return plan;
+        }
+
+        /// WS4 phase 2 (repair-issue ride-along): whether `artifact_key`
+        /// has an outstanding embedding-artifact repair issue recorded
+        /// against `index_name`. An inline write that supersedes such an
+        /// issue must clear it the way `clearPublishedEmbeddingArtifact
+        /// RepairIssuesContext` would -- that function's full logic (asset-
+        /// kind manifest validation, the `enrichment_failed`-reason branch
+        /// that depends on a just-settled derived-coverage marker,
+        /// terminal-failure-marker and repair-summary prefix scans) is not
+        /// expressible through `commit_participant.View`'s point get/put
+        /// surface without a much larger write surface, so an inline write
+        /// with an outstanding issue on its artifact_key simply is not
+        /// eligible: the caller falls back to the slow path, which clears
+        /// it correctly as it always has.
+        fn inlineWriteHasPendingEmbeddingRepairIssue(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_name: []const u8,
+            artifact_key: ?[]const u8,
+        ) !bool {
+            const key = artifact_key orelse return false;
+            const hex = try bytesToHexAlloc(alloc, key);
+            defer alloc.free(hex);
+            const issue_key = try internal_keys.artifactRepairIssueKeyAlloc(alloc, index_name, "embedding", hex);
+            defer alloc.free(issue_key);
+            var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
+            defer probe.abort();
+            _ = probe.get(issue_key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            return true;
+        }
+
         /// lite-single-commit-write-path.md §3.3a's sparse extension of
         /// WS4 phase 2: a prepared single-batch inline publication,
         /// mirroring `InlineGraphPublication` but wrapping
@@ -3863,6 +4031,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             publication: sparse_mod.SparseIndex.InlineSparsePublication,
             scope: []const u8,
             progress: apply_state.Progress,
+            coverage_plan: ?InlineCoveragePlan = null,
 
             fn reset(_: *anyopaque) void {}
             fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
@@ -3871,6 +4040,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const mutations = self.publication.pendingMutations();
                 if (mutations.len != 0) try view.putIndexCatalog(self.scope, mutations);
                 try apply_state.contributeProgressTxn(view, self.progress);
+                if (self.coverage_plan) |*plan| try plan.stage(view);
             }
 
             /// Call only once the host transaction's commit has actually
@@ -3885,6 +4055,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 self.entry.index.installInlineSparsePublication(&self.publication) catch |err| {
                     std.log.err("inline sparse publication install: mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
                 };
+                if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
                 self.apply_guard.unlock();
                 self.alloc.destroy(self);
             }
@@ -3892,6 +4063,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             pub fn abort(self: *InlineSparsePublication) void {
                 std.debug.assert(self.apply_guard.locked());
                 self.publication.abort();
+                if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
                 self.apply_guard.unlock();
                 self.alloc.destroy(self);
             }
@@ -3920,11 +4092,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (index_ref.kind != .sparse_vector) return error.InlineSparsePublicationUnsupported;
             const entry = index_manager.sparseIndex(index_ref.name) orelse return error.InlineSparsePublicationUnsupported;
             if (!index_manager.sparseEmbeddingWriteEligibleForInlinePublication(entry, write)) return error.InlineSparsePublicationUnsupported;
+            // An outstanding embedding-artifact repair issue for this exact
+            // artifact must be cleared the way the slow path would (see
+            // `inlineWriteHasPendingEmbeddingRepairIssue`'s own doc
+            // comment); fall back rather than leave it stuck open forever.
+            if (try inlineWriteHasPendingEmbeddingRepairIssue(alloc, store, index_ref.name, write.artifact_key)) return error.InlineSparsePublicationUnsupported;
 
             const scope = entry.index.nativeCatalogScope() orelse return error.InlineSparsePublicationUnsupported;
 
             var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
             errdefer apply_guard.unlock();
+
+            const coverage_plan = try prepareInlineCoveragePlan(alloc, store, index_manager, index_ref.name, write.doc_key);
+            errdefer if (coverage_plan) |plan| plan.deinit(alloc);
 
             // Mirrors `IndexManager.assignSparseWriteDocNumsFromIdentity`:
             // this index's eligibility (checked above) already guarantees
@@ -3957,6 +4137,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .apply_guard = apply_guard,
                 .publication = publication,
                 .scope = scope,
+                .coverage_plan = coverage_plan,
                 .progress = .{
                     .consumer = index_ref.name,
                     .sequence = sequence,
@@ -3998,14 +4179,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ///   where the capture lease would not already be a no-op.
         /// - Derived-coverage accounting (`accountDenseCoverageWithPlan`) and
         ///   embedding-artifact repair-issue bookkeeping
-        ///   (`clearPublishedEmbeddingArtifactRepairIssuesContext`) are
-        ///   skipped exactly as `InlineSparsePublication` already skips
-        ///   their sparse equivalents: both are recomputable bookkeeping
-        ///   under lite-single-commit-write-path.md §3.2a's ride-along
-        ///   model, not data this write's durability depends on, and their
-        ///   keys (`replay_namespace`-prefixed) are outside
-        ///   `commit_participant.View.put`'s `\x00\x00`-only write surface
-        ///   in any case.
+        ///   (`clearPublishedEmbeddingArtifactRepairIssuesContext`) now ride
+        ///   along in the SAME transaction too: `coverage_plan` (see
+        ///   `prepareInlineCoveragePlan`) replicates the marker+counter
+        ///   delta `setDerivedCoverageOutcomes` would have written for this
+        ///   write's `.produced` outcome, applied via `commit_participant.
+        ///   View.putReplay`; `prepareInlineDensePublication` falls back to
+        ///   the slow path instead of inlining whenever this write's
+        ///   artifact_key has an outstanding repair issue, so clearing it
+        ///   still happens exactly as it always has (see
+        ///   `inlineWriteHasPendingEmbeddingRepairIssue`'s own doc comment
+        ///   for why that one gap is not replicated inline).
         pub const InlineDensePublication = struct {
             alloc: Allocator,
             index_manager: *index_manager_mod.IndexManager,
@@ -4018,6 +4202,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             vector_id: u64,
             vector: []const f32,
             progress: apply_state.Progress,
+            coverage_plan: ?InlineCoveragePlan = null,
 
             fn reset(_: *anyopaque) void {}
             fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
@@ -4044,6 +4229,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 try self.index_manager.writeDenseVectorMappingForInlinePublicationTxn(view, self.index_name, self.doc_key, self.vector_id, self.vector);
                 try apply_state.contributeProgressTxn(view, self.progress);
+                if (self.coverage_plan) |*plan| try plan.stage(view);
             }
 
             /// Call only once the host transaction's commit has actually
@@ -4058,6 +4244,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 self.entry.index.installStagedWrite(&self.staged) catch |err| {
                     std.log.err("inline dense publication install: mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
                 };
+                if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
                 self.apply_guard.unlock();
                 self.alloc.destroy(self);
             }
@@ -4065,6 +4252,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             pub fn abort(self: *InlineDensePublication) void {
                 std.debug.assert(self.apply_guard.locked());
                 self.entry.index.abortStagedWrite(&self.staged);
+                if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
                 self.apply_guard.unlock();
                 self.alloc.destroy(self);
             }
@@ -4094,11 +4282,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (index_ref.kind != .dense_vector) return error.InlineDensePublicationUnsupported;
             const entry = index_manager.denseIndex(index_ref.name) orelse return error.InlineDensePublicationUnsupported;
             if (!index_manager.denseEmbeddingWriteEligibleForInlinePublication(entry, write)) return error.InlineDensePublicationUnsupported;
+            // An outstanding embedding-artifact repair issue for this exact
+            // artifact must be cleared the way the slow path would (see
+            // `inlineWriteHasPendingEmbeddingRepairIssue`'s own doc
+            // comment); fall back rather than leave it stuck open forever.
+            if (try inlineWriteHasPendingEmbeddingRepairIssue(alloc, store, index_ref.name, write.artifact_key)) return error.InlineDensePublicationUnsupported;
 
             const scope = entry.index.nativeCatalogScope() orelse return error.InlineDensePublicationUnsupported;
 
             var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
             errdefer apply_guard.unlock();
+
+            const coverage_plan = try prepareInlineCoveragePlan(alloc, store, index_manager, index_ref.name, write.doc_key);
+            errdefer if (coverage_plan) |plan| plan.deinit(alloc);
 
             // Mirrors `prepareInlineSparsePublication`'s own read-only probe
             // transaction: the deterministic, conflict-free branch of vector
@@ -4129,6 +4325,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .doc_key = write.doc_key,
                 .vector_id = assignment.vector_id,
                 .vector = write.vector,
+                .coverage_plan = coverage_plan,
                 .progress = .{
                     .consumer = index_ref.name,
                     .sequence = sequence,

@@ -1701,6 +1701,141 @@ test "WS4-for-dense round 2: an update or a delete falls back and still lands co
     }
 }
 
+fn getForTest(allocator: Allocator, store: anytype, key: []const u8) !?[]u8 {
+    var txn = try store.beginRead();
+    defer txn.abort();
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try allocator.dupe(u8, raw);
+}
+
+fn putForTest(store: anytype, key: []const u8, value: []const u8) !void {
+    var txn = try store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(key, value);
+    try txn.commit();
+}
+
+test "WS4-for-dense repair-issue ride-along: a pre-existing embedding-artifact repair issue is cleared by a write that would otherwise take the inline fast path" {
+    // lite-single-commit-write-path.md §3.3a's repair-issue follow-up:
+    // `prepareInlineDensePublication` now checks
+    // `inlineWriteHasPendingEmbeddingRepairIssue` before committing to the
+    // fast path, so a write whose artifact_key has an outstanding
+    // embedding-artifact repair issue falls back to the slow path, which
+    // clears the issue correctly, exactly as it always has -- instead of
+    // leaving a stale issue open forever because a later write happened to
+    // qualify for the fast path.
+    //
+    // Scope note: this does not (yet) assert inline-vs-slow-path derived-
+    // coverage COUNTER parity end to end. `InlineDensePublication`'s own
+    // `coverage_plan` (`prepareInlineCoveragePlan`) is applied inside
+    // `stage()`, through the SAME `commit_participant` mechanism every
+    // other inline publication (text/graph/sparse) uses to ride along in
+    // the primary write's transaction -- and that mechanism's outer
+    // wrapper, `ArtifactInputCapture.stage()`
+    // (storage/artifact_input_capture.zig:168-170), unconditionally
+    // returns before invoking the attached participant whenever
+    // `self.documents.count() == 0 and self.artifacts.count() == 0`, which
+    // is ALWAYS true for a standalone Lite database with no "online
+    // source" replication authority configured: `publication.authority`
+    // (artifact_publication.zig:41-47) returns null, and `Capture.touch`
+    // -- the only populator of those counts -- bails before registering
+    // anything once that's null. That means NONE of the commit-
+    // participant-mediated inline effects (not just `coverage_plan`, but
+    // every inline publication's own `view.putIndexCatalog`/
+    // `contributeProgressTxn` calls too) are ever durably committed for a
+    // plain standalone Lite database today. Confirmed empirically and
+    // independently of this change (reproduces identically with
+    // `coverage_plan` forced to `null`): an inline-published dense vector
+    // is searchable in-process (the HBC node cache and, since the
+    // `installStagedWrite` mirror-sync fix above, the native_catalog_
+    // backend mirror both reflect it already) but fails an exhaustive
+    // search with `error.IndexRebuilding` immediately after a close+
+    // reopen, which rebuilds those from what is actually durable. This is
+    // a separate, pre-existing bug, not introduced here, and it blocks
+    // verifying coverage-counter parity for the INLINE side until fixed --
+    // flagging for the agent already tracking the related
+    // commitRideAlong-vs-stageRideAlong issue.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+    defer handle.close();
+
+    try handle.db.addIndex(.{
+        .name = "dv_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"marker\":\"seed\"}" }}, .sync_level = .write });
+    try handle.db.runUntilIdle();
+
+    const internal_keys = @import("../internal_keys.zig");
+    const repair_types = @import("../db/types.zig");
+    const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+
+    // --- Seed a repair issue for a NOT-YET-WRITTEN doc's artifact, as a
+    // prior failed write (e.g. a missing artifact) would have recorded it
+    // (`recordEmbeddingArtifactRepairIssueContext`). A superseding write
+    // to that same doc_key, through the inline-ELIGIBLE path otherwise,
+    // must still notice the issue, fall back, and let the slow path clear
+    // it -- never leave it stuck open because the write took the fast
+    // path.
+    const issue_doc_key = "dv-issue-doc";
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(allocator, issue_doc_key, "dv_idx");
+    defer allocator.free(artifact_key);
+    // Matches `bytesToHexAlloc`'s own lowercase, unseparated encoding.
+    const artifact_key_hex = try allocator.alloc(u8, artifact_key.len * 2);
+    defer allocator.free(artifact_key_hex);
+    for (artifact_key, 0..) |byte, idx| {
+        artifact_key_hex[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        artifact_key_hex[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    const issue_key = try internal_keys.artifactRepairIssueKeyAlloc(allocator, "dv_idx", "embedding", artifact_key_hex);
+    defer allocator.free(issue_key);
+    {
+        const issue = repair_types.ArtifactRepairIssue{
+            .artifact_kind = .embedding,
+            .index_name = "dv_idx",
+            .doc_key = issue_doc_key,
+            .artifact_key = artifact_key,
+            .sequence = 1,
+            .reason = .missing_artifact,
+            .first_seen_ns = 1,
+            .last_seen_ns = 1,
+        };
+        const issue_json = try std.json.Stringify.valueAlloc(allocator, issue, .{ .emit_null_optional_fields = false });
+        defer allocator.free(issue_json);
+        try putForTest(store, issue_key, issue_json);
+    }
+
+    const before_issue_sequence = store.file.activeCheckpoint().commit_sequence;
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = issue_doc_key, .value = "{\"marker\":\"dv-issue-doc-marker\",\"_embeddings\":{\"dv_idx\":[0.3,0.3]}}" },
+    }, .sync_level = .full_index });
+    const after_issue_sequence = store.file.activeCheckpoint().commit_sequence;
+    // The outstanding issue makes this write ineligible for the inline
+    // fast path, so it costs strictly more than the single-commit inline
+    // case would -- confirming the fallback, not the inline path, ran.
+    try std.testing.expect(after_issue_sequence - before_issue_sequence > 1);
+    try std.testing.expectEqual(@as(?[]u8, null), try getForTest(allocator, store, issue_key));
+
+    // The cleared issue stays cleared across a reopen: the slow path's own
+    // `clearPublishedArtifactRepairIssueContext` writes directly through
+    // `store.putBatchWithReplayWithOptions`, not through
+    // `commit_participant`, so it is unaffected by the gap described above.
+    try handle.db.runUntilIdle();
+    handle.close();
+    handle = try openDbWithIo(allocator, path, std.testing.io, false);
+    const store2 = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+    try std.testing.expectEqual(@as(?[]u8, null), try getForTest(allocator, store2, issue_key));
+}
+
 test "WS4 phase 2 round 2: a worker-backlogged index falls back correctly instead of skipping the gap" {
     // Deliberately creates the one scenario the inline fast path must
     // refuse: a background worker still owes this index an earlier
