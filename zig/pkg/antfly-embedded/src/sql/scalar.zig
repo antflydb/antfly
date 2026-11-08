@@ -704,6 +704,7 @@ pub const Program = struct {
                 .replace,
                 .starts_with,
                 .date_part,
+                .date_bin,
                 .date_trunc,
                 .to_timestamp,
                 .current_setting,
@@ -7676,4 +7677,12 @@ test "SQL derived column reads share invocation work and byte admission with the
     try std.testing.expect(budget.output_bytes > 0);
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.readColumnValue(sa, value, descriptor, .identity, limits));
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(sa, &.{}, &.{}, limits));
+}
+
+test "time series date_bin is repeatable within a statement" {
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "date_bin('5m', '2026-11-06T12:07:30Z'::datetime, '1970-01-01T00:02:00Z'::datetime)", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expect(program.repeatable());
 }
