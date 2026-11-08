@@ -2033,6 +2033,7 @@ pub const StatusSource = struct {
 
     pub const VTable = struct {
         supports_query_definitions: bool = false,
+        supports_graph_authority_probe: bool = false,
         /// Hosting requires native existence, definition CAS and policy authority.
         supports_object_tables: bool = false,
         supports_resolver_catalog_read: bool = false,
@@ -2865,6 +2866,7 @@ pub const StatusSource = struct {
             .system_catalog = Gen.systemCatalog,
             .tracks_sql_submission = true,
             .supports_query_definitions = true,
+            .supports_graph_authority_probe = true,
             .supports_object_tables = true,
             .supports_resolver_catalog_read = true,
             .supports_resolver_authority = true,
@@ -7759,7 +7761,7 @@ pub const ApiHttpServer = struct {
             // the requested index until each configured source has at least
             // one authoritative observation.
             for (index.source_replay) |source| {
-                if (source.observation_count == 0) return true;
+                if (source.observation_count == 0 or !source.producer_complete) return true;
             }
             // Refresh only for an incomplete proof attached to the requested
             // index. Table-level degradation may belong to another index, and
@@ -13997,6 +13999,9 @@ pub const ApiHttpServer = struct {
     }
 
     fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
+        // A replicated receipt read has its own linearizable barrier. Its
+        // availability must not depend on the original execution owner's life.
+        if (req.method == .GET and self.txn_sessions.durableMissIsAuthoritative()) return null;
         const owner_node_id = (try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id)) orelse
             if (self.txn_sessions.durableMissIsAuthoritative())
                 return null
@@ -14209,7 +14214,7 @@ pub const ApiHttpServer = struct {
             const resource = resources.get(table.table_name) orelse table.table_name;
             if (resource.len == 0) return false;
             if (table.range_guards != null and !admittedTablePermissionAllowed(authenticated_identity, resource, .read)) return false;
-            if ((table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0) and
+            if ((table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0 or table.batch.graph_writes.len != 0 or table.batch.graph_deletes.len != 0) and
                 !admittedTablePermissionAllowed(authenticated_identity, resource, .write)) return false;
         }
         return true;
@@ -14475,7 +14480,7 @@ pub const ApiHttpServer = struct {
         var indices: std.ArrayList(usize) = .empty;
         var names: std.ArrayList([]const u8) = .empty;
         for (tables, 0..) |table, index| {
-            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0) continue;
+            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0 and table.graph_writes.len == 0 and table.graph_deletes.len == 0 and table.predicates.len == 0 and table.range_guards.len == 0 and table.integrity_commands.len == 0) continue;
             try indices.append(a, index);
             try names.append(a, table.table_name);
         }
@@ -14732,6 +14737,8 @@ pub const ApiHttpServer = struct {
             .writes = txn_writes,
             .deletes = req.deletes,
             .transforms = req.transforms,
+            .graph_writes = req.graph_writes,
+            .graph_deletes = req.graph_deletes,
             .predicates = req.predicates,
             .schema_version = req.schema_version,
             .relational_schema_version = req.relational_schema_version,
@@ -28923,6 +28930,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: Authorizat
         if (route.kind == .table and route.name == null and isReadMethod(method)) return null;
         const resource_type: usermgr.ResourceType = switch (route.kind) {
             .query_source => .table,
+            .graph => .graph,
             .database => .database,
             .namespace => .namespace,
             .table => .table,
@@ -28931,7 +28939,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: Authorizat
         const resolver_route = if (route.kind == .table) @import("resolvers.zig").matchSuffix(route.suffix) else null;
         const resolver_read = if (resolver_route) |r| @import("resolvers.zig").readOnly(r.op) else false;
         const resolver_write = if (resolver_route) |r| r.op != .namespace else false;
-        const permission: usermgr.PermissionType = if (isReadMethod(method) or resolver_read or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (resolver_write or (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate")))) .write else .admin;
+        const permission: usermgr.PermissionType = if (isReadMethod(method) or (route.kind == .graph and std.mem.eql(u8, route.suffix, "query")) or resolver_read or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (resolver_write or (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate")))) .write else .admin;
         return .{ .resource_type = resource_type, .resource = try system_catalog_routes.resourceNameAlloc(alloc, route), .permission_type = permission, .owns_resource = true };
     }
 
@@ -29529,18 +29537,40 @@ pub fn foreignKeyParentsAllowed(alloc: std.mem.Allocator, identity: ?Authenticat
     return true;
 }
 
-pub fn tablePermissionCurrentlyAllowed(
+pub const GraphPermissionCheck = usermgr.UserManager.PermissionCheck;
+pub fn resourcePermissionsCurrentlyAllowed(alloc: std.mem.Allocator, authenticated_identity: ?AuthenticatedIdentity, checks: []const usermgr.UserManager.PermissionCheck) !bool {
+    const identity = authenticated_identity orelse return true;
+    for (checks) |check| if (!permissionsAllow(identity.permissions, check.resource_type, check.resource, check.permission_type)) return false;
+    const manager = identity.live_user_manager orelse return true;
+    const logical = try alloc.dupe(usermgr.UserManager.PermissionCheck, checks);
+    for (logical) |*check| if (check.resource_type == .table) {
+        for (identity.catalog_aliases) |alias| if (std.mem.eql(u8, alias.physical, check.resource)) {
+            check.resource = alias.logical;
+            break;
+        };
+    };
+    return manager.permissionsCurrentlyAllowed(identity.username, identity.credential_principal, logical);
+}
+
+pub fn tablePermissionCurrentlyAllowed(identity: ?AuthenticatedIdentity, table_name: []const u8, permission_type: usermgr.PermissionType) !bool {
+    return resourcePermissionCurrentlyAllowed(identity, .table, table_name, permission_type);
+}
+
+pub fn resourcePermissionCurrentlyAllowed(
     authenticated_identity: ?AuthenticatedIdentity,
+    resource_type: usermgr.ResourceType,
     table_name: []const u8,
     permission_type: usermgr.PermissionType,
 ) !bool {
     const identity = authenticated_identity orelse return true;
-    if (!permissionsAllow(identity.permissions, .table, table_name, permission_type))
+    if (!permissionsAllow(identity.permissions, resource_type, table_name, permission_type))
         return false;
     const manager = identity.live_user_manager orelse return true;
     const logical_name = logical: {
-        for (identity.catalog_aliases) |alias| {
-            if (std.mem.eql(u8, alias.physical, table_name)) break :logical alias.logical;
+        if (resource_type == .table) {
+            for (identity.catalog_aliases) |alias| {
+                if (std.mem.eql(u8, alias.physical, table_name)) break :logical alias.logical;
+            }
         }
         break :logical table_name;
     };
@@ -29552,12 +29582,12 @@ pub fn tablePermissionCurrentlyAllowed(
             else => return err,
         };
         defer freePermissions(manager.alloc, current);
-        return permissionsAllow(current, .table, logical_name, permission_type);
+        return permissionsAllow(current, resource_type, logical_name, permission_type);
     }
 
     return try manager.permissionCurrentlyAllowed(
         identity.username,
-        .table,
+        resource_type,
         logical_name,
         permission_type,
     );
@@ -30810,6 +30840,7 @@ fn resourceTypeFromOpenApi(value: usermgr_openapi.ResourceType) usermgr.Resource
         .tablespace => .tablespace,
         .user => .user,
         .inference => .inference,
+        .graph => .graph,
         .@"*" => .@"*",
     };
 }
@@ -30831,6 +30862,7 @@ fn resourceTypeToOpenApi(value: usermgr.ResourceType) usermgr_openapi.ResourceTy
         .tablespace => .tablespace,
         .user => .user,
         .inference => .inference,
+        .graph => .graph,
         .@"*" => .@"*",
     };
 }
@@ -50032,7 +50064,7 @@ test "api index status refreshes synthetic configured index status from write so
     }};
     try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(structural_dense_statuses[0..]));
 
-    const incomplete_source_replay = [_]db_mod.types.IndexSourceReplayStatus{.{
+    var incomplete_source_replay = [_]db_mod.types.IndexSourceReplayStatus{.{
         .artifact_name = "chunk_embedding",
         .published_sequence = 3,
         .target_sequence = 3,
@@ -50059,6 +50091,14 @@ test "api index status refreshes synthetic configured index status from write so
         source_incomplete_status,
         .{ .name = "vec", .identity = null },
     ));
+    // Replay/source observation can be current before receiver-local producer
+    // completion. The detail path must refresh until that proof arrives, then
+    // return to its cache fast path without polling an already complete source.
+    incomplete_source_replay[0].observation_count = 1;
+    incomplete_source_replay[0].producer_complete = false;
+    try std.testing.expect(ApiHttpServer.runtimeStatusTargetNeedsOwnerSnapshot(source_incomplete_status, .{ .name = "vec", .identity = null }));
+    incomplete_source_replay[0].producer_complete = true;
+    try std.testing.expect(!ApiHttpServer.runtimeStatusTargetNeedsOwnerSnapshot(source_incomplete_status, .{ .name = "vec", .identity = null }));
 }
 
 test "api index status refreshes writer when read snapshot omits requested index" {

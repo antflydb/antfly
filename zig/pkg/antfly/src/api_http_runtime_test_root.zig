@@ -38,6 +38,10 @@ test {
     _ = @import("api/resolvers.zig");
     _ = @import("api/managed_sources.zig");
     _ = @import("api/protected_future.zig");
+    _ = @import("api/sql_graph_overlay_test.zig");
+    _ = @import("api/graph_execution.zig");
+    _ = @import("api/graph_statement_source.zig");
+    _ = @import("api/retained_read_client.zig").consumer_tests;
     _ = @import("api/sql_connection_record.zig");
     _ = @import("api/sql_connections.zig");
     _ = @import("api/kernel_owner_source.zig");
@@ -53,6 +57,8 @@ test {
     _ = @import("api/distributed_candidate_source.zig");
     _ = @import("api/distributed_entity_sink.zig");
     _ = @import("api/http_client.zig");
+    _ = @import("api/internal_group_operations.zig");
+    _ = @import("antfly_local_sources").api_batch;
     _ = @import("api/distributed_join.zig");
     _ = @import("api/distributed_graph.zig");
     _ = @import("antfly_inference_query_embedding_cache");
