@@ -1304,7 +1304,14 @@ class ThreeByThreeBackupCluster:
         )
 
         def ready(url):
-            return wait_for_server(url, timeout=30.0, processes=processes)
+            return wait_for_server(
+                url,
+                timeout=30.0,
+                processes=processes,
+                allow_unauthorized=bool(
+                    os.environ.get("ANTFLY_TRUSTED_PRINCIPAL_SECRET")
+                ),
+            )
 
         for url, live in zip(
             self.data_api_urls,
@@ -1570,7 +1577,9 @@ class ThreeByThreeBackupCluster:
                 f"cluster process exited: {', '.join(exited)}\n{self.debug_logs()}"
             )
 
-    def restart_crashed_node(self, *, metadata: bool, index: int) -> None:
+    def restart_crashed_node(
+        self, *, metadata: bool, index: int, startup_timeout_s: float = 30.0
+    ) -> None:
         """Reopen one killed process from its existing Raft/owner directories."""
         procs = self.metadata_procs if metadata else self.data_procs
         assert 0 <= index < len(procs)
@@ -1596,7 +1605,9 @@ class ThreeByThreeBackupCluster:
                 cwd=REPO_ROOT,
             ),
         )
-        assert wait_for_server(url, path=path, timeout=30.0), self.debug_logs()
+        assert wait_for_server(url, path=path, timeout=startup_timeout_s), (
+            self.debug_logs()
+        )
 
     def debug_logs(self) -> str:
         try:

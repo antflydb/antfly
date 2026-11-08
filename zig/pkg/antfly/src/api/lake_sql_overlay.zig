@@ -114,6 +114,8 @@ pub fn physicalRequest(a: A, request: catalog.Scan, cut: Cut) !catalog.Scan {
     result.order = &.{};
     result.primary_order = false;
     result.row_goal = null;
+    result.ordered_window = null;
+    result.exact_graph_filter = null;
     result.index_equality = null;
     return result;
 }

@@ -164,7 +164,11 @@ def _write_config(root: Path, api_url: str) -> Path:
                 },
                 "secrets": {
                     "sources": [
-                        {"name": "kubernetes", "type": "file", "path": str(secrets_path)}
+                        {
+                            "name": "kubernetes",
+                            "type": "file",
+                            "path": str(secrets_path),
+                        }
                     ]
                 },
             }
@@ -188,7 +192,8 @@ def _coverage(api_url: str, table: str) -> dict:
 
 def _insert(api_url: str, table: str, start: int) -> None:
     inserts = {
-        f"doc{n}": {"text": f"shared inference row {n}"} for n in range(start, start + 3)
+        f"doc{n}": {"text": f"shared inference row {n}"}
+        for n in range(start, start + 3)
     }
     response = requests.post(
         f"{api_url}/tables/{table}/batch", json={"inserts": inserts}, timeout=30
@@ -208,10 +213,12 @@ def _wait_covered(api_url: str, table: str, expected: int) -> dict:
         lambda: _coverage(api_url, table),
         timeout_s=60,
         interval_s=0.5,
-        ready_when=lambda s: s is not None
-        and (
-            (s["covered"] == expected and s["backfill_state"] == "ready")
-            or (s["failed"] or 0) > 0
+        ready_when=lambda s: (
+            s is not None
+            and (
+                (s["covered"] == expected and s["backfill_state"] == "ready")
+                or (s["failed"] or 0) > 0
+            )
         ),
     )
     assert status == {
@@ -371,7 +378,15 @@ class _TaskInferenceHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         task = self.path.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
-        if task not in ("embed", "chunk", "rerank", "read", "generate", "extract", "transcribe"):
+        if task not in (
+            "embed",
+            "chunk",
+            "rerank",
+            "read",
+            "generate",
+            "extract",
+            "transcribe",
+        ):
             self._reply(404, {"error": "not found"})
             return
         if not self._admit(task):
@@ -383,22 +398,53 @@ class _TaskInferenceHandler(BaseHTTPRequestHandler):
         if task == "embed":
             inputs = body.get("input")
             count = len(inputs) if isinstance(inputs, list) else 1
-            self._reply(200, {"data": [{"embedding": [0.5, 0.25, 0.125, 0.0625]}] * count})
+            self._reply(
+                200, {"data": [{"embedding": [0.5, 0.25, 0.125, 0.0625]}] * count}
+            )
         elif task == "chunk":
             text = str(body.get("input", ""))
-            self._reply(200, {"object": "list", "data": [
-                {"id": 0, "mime_type": "text/plain", "text": text, "start_char": 0, "end_char": len(text)}
-            ]})
+            self._reply(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": 0,
+                            "mime_type": "text/plain",
+                            "text": text,
+                            "start_char": 0,
+                            "end_char": len(text),
+                        }
+                    ],
+                },
+            )
         elif task == "rerank":
             count = len(body.get("documents") or body.get("prompts") or [])
             self._reply(200, {"scores": [1.0 - i / 100 for i in range(count)]})
         elif task == "read":
             count = max(1, len(body.get("images") or []))
-            self._reply(200, {"object": "list", "data": [
-                {"object": "read_result", "index": i, "text": "read text"} for i in range(count)
-            ]})
+            self._reply(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {"object": "read_result", "index": i, "text": "read text"}
+                        for i in range(count)
+                    ],
+                },
+            )
         elif task == "generate":
-            self._reply(200, {"choices": [{"message": {"role": "assistant", "content": "generated"}, "finish_reason": "stop"}]})
+            self._reply(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "generated"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+            )
         else:
             self._reply(200, {"text": "", "data": []})
 
@@ -471,13 +517,25 @@ def test_default_inference_api_key_reaches_remote_tasks_only_at_default_endpoint
         extraction = {
             "type": "document_extraction",
             "config": {
-                "source": {"filename_field": "filename", "content_type_field": "mime_type", "version_field": "version"},
-                "ocr": {"mode": "always", "reader": {"provider": "antfly", "model": TASK_MODELS["readers"]}},
+                "source": {
+                    "filename_field": "filename",
+                    "content_type_field": "mime_type",
+                    "version_field": "version",
+                },
+                "ocr": {
+                    "mode": "always",
+                    "reader": {"provider": "antfly", "model": TASK_MODELS["readers"]},
+                },
             },
         }
         response = requests.put(
             f"{api_url}/tables/{table}/artifacts/document_units/enrichment",
-            json={"kind": "asset", "field": "img", "content_type": "application/json", "producer_json": json.dumps(extraction)},
+            json={
+                "kind": "asset",
+                "field": "img",
+                "content_type": "application/json",
+                "producer_json": json.dumps(extraction),
+            },
             timeout=30,
         )
         assert response.status_code in (200, 201), response.text
@@ -486,17 +544,23 @@ def test_default_inference_api_key_reaches_remote_tasks_only_at_default_endpoint
             rows = {
                 f"doc{n}": {
                     "text": f"Ada Lovelace wrote shared inference row {n}",
-                    "img": _data_uri("image/jpeg", "testdata/image/jpeg/baseline/white-2x1.jpg"),
+                    "img": _data_uri(
+                        "image/jpeg", "testdata/image/jpeg/baseline/white-2x1.jpg"
+                    ),
                     "filename": f"page{n}.jpg",
                     "mime_type": "image/jpeg",
                     "version": "1",
                 }
                 for n in range(start, start + 2)
             }
-            response = requests.post(f"{api_url}/tables/{table}/batch", json={"inserts": rows}, timeout=30)
+            response = requests.post(
+                f"{api_url}/tables/{table}/batch", json={"inserts": rows}, timeout=30
+            )
             response.raise_for_status()
 
-        def background_reached(server_obj: _TaskInference, wanted: set[str], since: int = 0) -> None:
+        def background_reached(
+            server_obj: _TaskInference, wanted: set[str], since: int = 0
+        ) -> None:
             seen = wait_until(
                 lambda: {task for task, _ in server_obj.requests()[since:]},
                 timeout_s=60,
@@ -514,7 +578,11 @@ def test_default_inference_api_key_reaches_remote_tasks_only_at_default_endpoint
             json={
                 "full_text_search": {"query": "Lovelace"},
                 "limit": 2,
-                "reranker": {"provider": "antfly", "model": TASK_MODELS["rerankers"], "field": "text"},
+                "reranker": {
+                    "provider": "antfly",
+                    "model": TASK_MODELS["rerankers"],
+                    "field": "text",
+                },
             },
             timeout=30,
         )

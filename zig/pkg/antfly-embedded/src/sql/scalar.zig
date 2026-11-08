@@ -435,6 +435,339 @@ pub const Program = struct {
         self.concat_nodes = nodes;
     }
 
+    /// Only integer affine instruction trees may consume synthetic marginal
+    /// bins. Every intermediate remains affine, so the original evaluator at
+    /// the emitted extrema preserves checked arithmetic failures as well.
+    pub fn affineColumn(self: Program) ?u32 {
+        if (self.output_type.kind != .integer) return null;
+        const form = self.affineInstruction(self.root, 0, .distinct) orelse return null;
+        return if (form.field) |field| @intCast(field) else null;
+    }
+    /// Prove affinity in one candidate input. All other inputs are symbolic
+    /// invariants whose per-bag constancy must be certified by the producer.
+    pub fn affineRelativeTo(self: Program, column: u32) bool {
+        if (self.output_type.kind != .integer) return false;
+        const form = self.affineInstruction(self.root, 0, .{ .single = column }) orelse return false;
+        return form.field == column;
+    }
+    /// Treat all integer inputs as affine functions of one producer marginal.
+    /// The producer must prove that shared lineage before using representatives.
+    pub fn affineTogether(self: Program) bool {
+        if (self.output_type.kind != .integer) return false;
+        return self.affineInstruction(self.root, 0, .shared) != null;
+    }
+    /// Syntactic candidate only. The producer supplies bounded, typed lineage
+    /// before this can authorize representative rows.
+    pub fn numericLinearCandidate(self: Program) bool {
+        if (self.output_type.kind != .integer and self.output_type.kind != .number) return false;
+        for (self.instructions) |instruction| {
+            if (instruction.input_function or (instruction.type.kind != .integer and instruction.type.kind != .number)) return false;
+            switch (instruction.operation) {
+                .column, .literal, .parameter => {},
+                .cast => |c| if (c.type != .number or (c.element_type != null and c.element_type != .float64)) return false,
+                .unary => |u| if (u.op != .positive and u.op != .negative) return false,
+                .binary => |b| if (b.op != .add and b.op != .subtract and b.op != .multiply and b.op != .divide) return false,
+                else => return false,
+            }
+        }
+        return true;
+    }
+    pub fn statisticCandidate(self: Program) bool {
+        for (self.instructions) |instruction| {
+            if (instruction.input_function or instruction.type.kind != .integer) return false;
+            switch (instruction.operation) {
+                .column, .literal, .parameter => {},
+                .cast => |c| if (c.type != .integer) return false,
+                .unary => |u| if (u.op != .positive and u.op != .negative) return false,
+                .binary => |b| if (b.op != .add and b.op != .subtract and b.op != .multiply) return false,
+                else => return false,
+            }
+        }
+        return true;
+    }
+    pub fn statisticProof(self: Program, a: Allocator, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, integers: []const ?i64) !?@import("cypher").statistic.Form {
+        const n = for (fields) |field| {
+            if (field.polynomial) |f| break f.dimensions;
+        } else return null;
+        return self.statisticInstruction(a, self.root, 0, columns, fields, integers, n);
+    }
+    fn statisticInstruction(self: Program, a: Allocator, index: u32, depth: usize, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, integers: []const ?i64, n: usize) anyerror!?@import("cypher").statistic.Form {
+        const F = @import("cypher").statistic.Form;
+        if (depth > 128 or index >= self.instructions.len) return null;
+        const instruction = self.instructions[index];
+        if (instruction.input_function or instruction.type.kind != .integer) return null;
+        const result: ?F = switch (instruction.operation) {
+            .column => |column| blk: {
+                if (column >= columns.len) break :blk null;
+                for (fields) |field| if (std.mem.eql(u8, field.name, columns[column].name)) break :blk field.polynomial;
+                break :blk null;
+            },
+            .literal => |value| if (value == .integer) try F.literal(a, value.integer, n) else null,
+            .parameter => |slot| if (slot < integers.len) (if (integers[slot]) |value| try F.literal(a, value, n) else null) else null,
+            .unary => |u| blk: {
+                const operand = (try self.statisticInstruction(a, u.operand, depth + 1, columns, fields, integers, n)) orelse break :blk null;
+                break :blk switch (u.op) {
+                    .positive => operand,
+                    .negative => try operand.negative(a),
+                    else => null,
+                };
+            },
+            .binary => |b| blk: {
+                const op: @import("cypher").statistic.Op = switch (b.op) {
+                    .add => .add,
+                    .subtract => .subtract,
+                    .multiply => .multiply,
+                    else => break :blk null,
+                };
+                const l = (try self.statisticInstruction(a, b.left, depth + 1, columns, fields, integers, n)) orelse break :blk null;
+                const r = (try self.statisticInstruction(a, b.right, depth + 1, columns, fields, integers, n)) orelse break :blk null;
+                break :blk try F.combine(l, r, a, op);
+            },
+            .cast => |c| if (c.type == .integer) try self.statisticInstruction(a, c.operand, depth + 1, columns, fields, integers, n) else null,
+            else => null,
+        };
+        const proof = result orelse return null;
+        if (instruction.type.element_type) |kind| if (@import("builtin_cast.zig").integral(kind)) {
+            _ = @import("builtin_cast.zig").checkedInteger(proof.range.low, kind) catch return null;
+            _ = @import("builtin_cast.zig").checkedInteger(proof.range.high, kind) catch return null;
+        };
+        return proof;
+    }
+    pub fn numericProof(self: Program, a: Allocator, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, scalars: []const ?@import("cypher").linear_numeric.Lattice) !?@import("cypher").linear_numeric.Form {
+        return self.numericInstruction(a, self.root, 0, columns, fields, scalars);
+    }
+    fn numericInstruction(self: Program, a: Allocator, index: u32, depth: usize, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, scalars: []const ?@import("cypher").linear_numeric.Lattice) anyerror!?@import("cypher").linear_numeric.Form {
+        const N = @import("cypher").linear_numeric;
+        if (depth > 128 or index >= self.instructions.len) return null;
+        const instruction = self.instructions[index];
+        if (instruction.input_function or (instruction.type.kind != .integer and instruction.type.kind != .number) or instruction.type.element_type == .float32) return null;
+        return switch (instruction.operation) {
+            .column => |column| blk: {
+                if (column >= columns.len) break :blk null;
+                for (fields) |field| if (std.mem.eql(u8, field.name, columns[column].name)) break :blk field.numeric;
+                break :blk null;
+            },
+            .literal => |value| switch (value) {
+                .integer => |n| N.Form.literal(.integer(n)),
+                .float => |n| N.Form.literal(N.Lattice.number(n) orelse return null),
+                .number_string => |text| N.Form.literal(N.Lattice.decimal(text) orelse return null),
+                else => null,
+            },
+            .parameter => |slot| if (slot < scalars.len) (if (scalars[slot]) |value| N.Form.literal(value) else null) else null,
+            .unary => |u| blk: {
+                const operand = (try self.numericInstruction(a, u.operand, depth + 1, columns, fields, scalars)) orelse return null;
+                break :blk switch (u.op) {
+                    .positive => operand,
+                    .negative => try operand.negative(a),
+                    else => null,
+                };
+            },
+            .binary => |b| blk: {
+                const left = (try self.numericInstruction(a, b.left, depth + 1, columns, fields, scalars)) orelse return null;
+                const right = (try self.numericInstruction(a, b.right, depth + 1, columns, fields, scalars)) orelse return null;
+                const op: N.Op = switch (b.op) {
+                    .add => .add,
+                    .subtract => .subtract,
+                    .multiply => .multiply,
+                    .divide => .divide,
+                    else => return null,
+                };
+                const result = (try N.Form.combine(left, right, a, op)) orelse return null;
+                // NUMERIC division selects a display scale from each row's
+                // magnitude. Even an exact quotient can change the aggregate's
+                // retained scale when representatives omit an interior value.
+                // Binary64 division has no such observable decimal metadata.
+                if (op == .divide and instruction.type.element_type == .numeric and (!left.constant() or result.range.shift < -16)) return null;
+                break :blk result;
+            },
+            .cast => |c| blk: {
+                if (c.type != .number or (c.element_type != null and c.element_type != .float64)) return null;
+                var result = (try self.numericInstruction(a, c.operand, depth + 1, columns, fields, scalars)) orelse return null;
+                if (!result.range.exactFloat()) return null;
+                result.range.floating = true;
+                break :blk result;
+            },
+            else => null,
+        };
+    }
+    /// A request-local totality proof for linear consumers. Unknown parameter
+    /// or column bounds decline compression rather than speculating about an
+    /// error. Every intermediate instruction must fit the integer domain.
+    pub fn linearBounds(self: Program, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, integers: []const ?i64) ?@import("cypher").linear_bounds.Interval {
+        const proof = self.linearInstruction(self.root, 0, columns, fields, integers) orelse return null;
+        return proof.interval;
+    }
+    fn linearInstruction(self: Program, index: u32, depth: usize, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, integers: []const ?i64) ?@import("cypher").integer_affine.Form {
+        if (depth > 128 or index >= self.instructions.len) return null;
+        const Form = @import("cypher").integer_affine.Form;
+        const instruction = self.instructions[index];
+        if (instruction.input_function or instruction.type.kind != .integer) return null;
+        return switch (instruction.operation) {
+            .column => |column| blk: {
+                if (column >= columns.len) break :blk null;
+                for (fields) |field| if (std.mem.eql(u8, field.name, columns[column].name)) break :blk Form.column(column).bounded(field.bounds orelse return null);
+                break :blk null;
+            },
+            .literal => |value| if (value == .integer) Form.literal(value.integer) else null,
+            .parameter => |slot| if (slot < integers.len) (if (integers[slot]) |value| Form.literal(value) else null) else null,
+            .unary => |unary| blk: {
+                const operand = self.linearInstruction(unary.operand, depth + 1, columns, fields, integers) orelse return null;
+                break :blk switch (unary.op) {
+                    .positive => operand,
+                    .negative => operand.negative(),
+                    else => null,
+                };
+            },
+            .binary => |binary| blk: {
+                const left = self.linearInstruction(binary.left, depth + 1, columns, fields, integers) orelse return null;
+                const right = self.linearInstruction(binary.right, depth + 1, columns, fields, integers) orelse return null;
+                const result = switch (binary.op) {
+                    .add => Form.combineMarginals(left, right, .add),
+                    .subtract => Form.combineMarginals(left, right, .subtract),
+                    .multiply => Form.combineMarginals(left, right, .multiply),
+                    else => null,
+                } orelse return null;
+                if (result.interval == null) break :blk null;
+                break :blk result;
+            },
+            else => null,
+        };
+    }
+    const AffineInputs = union(enum) { distinct, single: u32, shared };
+    fn affineInstruction(self: Program, index: u32, depth: usize, inputs: AffineInputs) ?@import("cypher").integer_affine.Form {
+        if (depth > 128 or index >= self.instructions.len) return null;
+        const form = @import("cypher").integer_affine.Form;
+        const instruction = self.instructions[index];
+        if (instruction.input_function or instruction.type.kind != .integer) return null;
+        return switch (instruction.operation) {
+            .column => |column| switch (inputs) {
+                .distinct => form.column(column),
+                .single => |varying| if (column == varying) form.column(column) else form.invariant(),
+                .shared => form.column(0),
+            },
+            // Typed parameters are invocation invariants. This certificate is
+            // structural; ordinary evaluation of integer bins retains their
+            // actual coefficients, nulls and checked intermediate failures.
+            .parameter => form.invariant(),
+            .literal => |value| if (value == .integer) form.literal(value.integer) else null,
+            .unary => |u| blk: {
+                const operand = self.affineInstruction(u.operand, depth + 1, inputs) orelse return null;
+                break :blk switch (u.op) {
+                    .positive => operand,
+                    .negative => operand.negative(),
+                    else => null,
+                };
+            },
+            .binary => |b| blk: {
+                const left = self.affineInstruction(b.left, depth + 1, inputs) orelse return null;
+                const right = self.affineInstruction(b.right, depth + 1, inputs) orelse return null;
+                break :blk switch (b.op) {
+                    .add => form.combine(left, right, .add),
+                    .subtract => form.combine(left, right, .subtract),
+                    .multiply => form.combine(left, right, .multiply),
+                    else => null,
+                };
+            },
+            else => null,
+        };
+    }
+    /// Re-evaluating this program for the same input row has the same value
+    /// and no observable effects within one statement. CASE/Boolean laziness
+    /// stays in the ordinary evaluator; compression only changes multiplicity.
+    /// Decision calls and consumable pattern cursors require ordinary rows.
+    /// current_setting reads the invocation's pinned immutable settings view.
+    pub fn repeatable(self: Program) bool {
+        for (self.instructions) |instruction| switch (instruction.operation) {
+            .literal, .column, .parameter, .unary, .binary, .cast, .case_when, .in_list => {},
+            .call => |call| switch (call.function) {
+                .ai_decide, .ai_choice, .ai_score, .ai_probability, .@"$pattern_quantified" => return false,
+                .abs,
+                .lower,
+                .upper,
+                .length,
+                .octet_length,
+                .concat,
+                .coalesce,
+                .nullif,
+                .greatest,
+                .least,
+                .ceil,
+                .floor,
+                .round,
+                .sqrt,
+                .power,
+                .mod,
+                .substring,
+                .trim,
+                .ltrim,
+                .rtrim,
+                .replace,
+                .starts_with,
+                .date_part,
+                .date_trunc,
+                .to_timestamp,
+                .current_setting,
+                .@"$single",
+                .trunc,
+                .sign,
+                .to_jsonb,
+                .jsonb_build_object,
+                .jsonb_extract_path_text,
+                .concat_ws,
+                .bit_length,
+                .strpos,
+                .jsonb_typeof,
+                .lpad,
+                .rpad,
+                .repeat,
+                .reverse,
+                .left,
+                .right,
+                .split_part,
+                .translate,
+                .overlay,
+                .ascii,
+                .chr,
+                .@"$array",
+                .@"$array_quantified",
+                .cardinality,
+                .array_ndims,
+                .array_length,
+                .array_lower,
+                .array_upper,
+                .@"$array_pattern_quantified",
+                .@"$contains",
+                .@"$overlaps",
+                .array_to_string,
+                .jsonb_exists,
+                .string_to_array,
+                .@"$like_escape",
+                .jsonb_set,
+                .array_position,
+                .array_positions,
+                .array_remove,
+                .array_replace,
+                .array_append,
+                .array_prepend,
+                .array_cat,
+                .jsonb_exists_any,
+                .jsonb_exists_all,
+                .regexp_like,
+                .regexp_count,
+                .regexp_instr,
+                .regexp_substr,
+                .regexp_replace,
+                .jsonb_array_length,
+                .initcap,
+                .jsonb_extract_path,
+                .value_identity,
+                .is_missing,
+                => {},
+            },
+        };
+        return true;
+    }
+
     fn literalInstruction(self: *const Program, index: u32, earlier: []const bool) bool {
         return switch (self.instructions[index].operation) {
             .literal => true,
@@ -6246,6 +6579,21 @@ test "SQL strpos rejects invalid UTF8 and bounds adversarial substring work" {
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(alloc, &.{}, &.{ .{ .string = "aaaaaaaaaaaaab" }, .{ .string = "aaaaab" } }, .{ .pattern_steps = 24 }));
 }
 
+test "SQL scalar repeatability includes lazy pure programs and excludes external calls" {
+    for ([_][]const u8{
+        "CASE WHEN score>0 AND score IN (1,2,3) THEN abs(score) ELSE 1/(score-score) END",
+        "coalesce(nullif(score,0),7)",
+        "length(lower(concat('x',CAST(score AS TEXT))))",
+        "ai_score('refund','Severity','[\"low\",\"high\"]','local')",
+    }, [_]bool{ true, true, true, false }) |text, expected| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, text, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{.{ .name = "score", .type = .integer }}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(expected, program.repeatable());
+    }
+}
+
 test "SQL computed array scalar producers retain compact results under tight output budgets" {
     const a = std.testing.allocator;
     const repeated = try std.mem.join(a, ",", &@as([32][]const u8, @splat("n")));
@@ -7219,6 +7567,74 @@ test "SQL quantified JSONB compatibility inputs are logical while text casts sti
     defer arena.deinit();
     try std.testing.expect((try program.evaluate(arena.allocator(), &.{ .json(.{ .string = "\"alpha\"" }), .typedArray(&source) }, &.{}, .{})).value.bool);
     try std.testing.expectError(error.SqlInvalidTextRepresentation, program.evaluate(arena.allocator(), &.{ .json(.{ .string = "alpha" }), .typedArray(&source) }, &.{}, .{}));
+}
+
+test "SQL bounded linear certificates retain segment axes and exact numeric domains" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const N = @import("cypher").linear_numeric;
+    const columns = [_]Column{ .{ .name = "a", .type = .integer }, .{ .name = "b", .type = .integer } };
+    const fields = [_]@import("cypher").linear_bounds.Field{
+        .{ .name = "a", .bounds = .{ .low = 0, .high = 1024 }, .numeric = try N.Form.column(arena.allocator(), .{ .low = 0, .high = 1024 }, 2, 0) },
+        .{ .name = "b", .bounds = .{ .low = 0, .high = 1024 }, .numeric = try N.Form.column(arena.allocator(), .{ .low = 0, .high = 1024 }, 2, 1) },
+    };
+    const Case = struct { sql: []const u8, admitted: bool, total: bool = false };
+    for ([_]Case{
+        .{ .sql = "a+b", .admitted = true, .total = true },
+        .{ .sql = "a-b", .admitted = true },
+        .{ .sql = "2.0*a", .admitted = true },
+        .{ .sql = "(a+b)/2.0", .admitted = false },
+        .{ .sql = "CAST(a+b AS float8)/2.0", .admitted = true, .total = true },
+        .{ .sql = "CAST(a AS float8)*2", .admitted = true },
+        .{ .sql = "0.1*a", .admitted = false },
+        .{ .sql = "a/3.0", .admitted = false },
+        .{ .sql = "a/2", .admitted = false },
+        .{ .sql = "a/0.0", .admitted = false },
+        .{ .sql = "a/1152921504606846976.0", .admitted = false },
+        .{ .sql = "(a+9223372036854775807)-b", .admitted = false },
+        .{ .sql = "a*b", .admitted = false },
+    }) |entry| {
+        var compiled = try @import("compiler.zig").compileScalar(a, entry.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &columns, &.{}, .{});
+        defer program.deinit();
+        const proof = try program.numericProof(arena.allocator(), &columns, &fields, &.{});
+        try std.testing.expectEqual(entry.admitted, proof != null);
+        if (entry.admitted) try std.testing.expect(program.numericLinearCandidate());
+        if (proof) |form| try std.testing.expectEqual(entry.total, form.total());
+    }
+}
+
+test "SQL polynomial certificates retain every narrow integer intermediate" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const columns = [_]Column{.{ .name = "n", .type = .integer, .element_type = .int32 }};
+    const fields = [_]@import("cypher").linear_bounds.Field{.{ .name = "n", .bounds = .{ .low = 0, .high = 50000 }, .polynomial = try @import("cypher").statistic.Form.column(arena.allocator(), 1, 0, 50000) }};
+    for ([_][]const u8{ "n*n", "(n+2147483647)-2147483647" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &columns, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expect(try program.statisticProof(arena.allocator(), &columns, &fields, &.{}) == null);
+        try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(arena.allocator(), &.{Datum.json(.{ .integer = 50000 })}, &.{}, .{}));
+    }
+}
+
+test "SQL integer statistic casts retain value and checked width" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const columns = [_]Column{.{ .name = "n", .type = .integer, .element_type = .int32 }};
+    const fields = [_]@import("cypher").linear_bounds.Field{.{ .name = "n", .bounds = .{ .low = 0, .high = 50000 }, .polynomial = try @import("cypher").statistic.Form.column(arena.allocator(), 1, 0, 50000) }};
+    var compiled = try @import("compiler.zig").compileScalar(a, "CAST(n AS bigint)*CAST(n AS bigint)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &columns, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expect(program.statisticCandidate());
+    try std.testing.expect(try program.statisticProof(arena.allocator(), &columns, &fields, &.{}) != null);
+    try std.testing.expectEqual(@as(i64, 2500000000), (try program.evaluate(arena.allocator(), &.{Datum.json(.{ .integer = 50000 })}, &.{}, .{})).value.integer);
 }
 
 test "SQL serialized scalar fragments reconstruct unique column dependencies for sparse readers" {

@@ -20,6 +20,9 @@ import argparse
 import json
 import subprocess
 import sys
+from pathlib import Path
+
+from macho_merged_globals import prepare_entry_object
 
 # ld64 emits this when a large test binary's unwind tables exceed what the
 # compact unwind format can encode. Exception handling still works through
@@ -55,7 +58,7 @@ result = subprocess.run(
         "-adhoc_codesign",
         "-o",
         args.output,
-        args.object,
+        str(prepare_entry_object(Path(args.object), Path(args.output))),
         *inputs,
         "-lSystem",
     ],

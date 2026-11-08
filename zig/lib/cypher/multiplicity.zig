@@ -1,0 +1,261 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Immutable statement-owned bag counts shared by native and SQL execution.
+//! Common counts stay inline; arithmetic promotes through the statement
+//! allocator only when u64 is insufficient.
+const std = @import("std");
+const Big = std.math.big.int.Managed;
+pub const Count = struct {
+    small: u64,
+    big: ?*const Big = null,
+    pub const one: Count = .{ .small = 1 };
+    pub fn init(value: u64) Count {
+        return .{ .small = value };
+    }
+    pub fn cap(self: Count, bound: u64) u64 {
+        return if (self.big != null) bound else @min(self.small, bound);
+    }
+    pub fn exact(self: Count) ?u64 {
+        return if (self.big == null) self.small else null;
+    }
+    pub fn clone(self: Count, a: std.mem.Allocator) !Count {
+        const big = self.big orelse return self;
+        const owned = try a.create(Big);
+        errdefer a.destroy(owned);
+        owned.* = try big.cloneWithDifferentAllocator(a);
+        return .{ .small = self.small, .big = owned };
+    }
+    /// Release an independently cloned count, never a borrowed arithmetic view.
+    pub fn deinitOwned(self: Count, a: std.mem.Allocator) void {
+        if (self.big) |value| {
+            const owned = @constCast(value);
+            owned.deinit();
+            a.destroy(owned);
+        }
+    }
+    pub fn text(self: Count, a: std.mem.Allocator) ![]u8 {
+        if (self.big) |big| return big.toString(a, 10, .lower);
+        return std.fmt.allocPrint(a, "{d}", .{self.small});
+    }
+    pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Count {
+        if (bytes.len == 0 or (bytes.len > 1 and bytes[0] == '0')) return error.InvalidBagCount;
+        for (bytes) |byte| if (byte < '0' or byte > '9') return error.InvalidBagCount;
+        if (std.fmt.parseUnsigned(u64, bytes, 10)) |small| return init(small) else |_| {}
+        const big = try a.create(Big);
+        big.* = try Big.initSet(a, 0);
+        errdefer big.deinit();
+        try big.setString(10, bytes);
+        return .{ .small = std.math.maxInt(u64), .big = big };
+    }
+    pub fn isOne(self: Count) bool {
+        return self.big == null and self.small == 1;
+    }
+    pub fn add(self: Count, a: std.mem.Allocator, other: Count) !Count {
+        if (self.exact()) |left| if (other.exact()) |right| {
+            if (std.math.add(u64, left, right)) |sum| return init(sum) else |_| {}
+        };
+        if (self.cap(1) == 0) return other;
+        if (other.cap(1) == 0) return self;
+        var left = if (self.big) |p| p.* else try Big.initSet(a, self.small);
+        defer if (self.big == null) left.deinit();
+        var right = if (other.big) |p| p.* else try Big.initSet(a, other.small);
+        defer if (other.big == null) right.deinit();
+        const result = try a.create(Big);
+        result.* = try Big.initSet(a, 0);
+        errdefer result.deinit();
+        try result.add(&left, &right);
+        return .{ .small = std.math.maxInt(u64), .big = result };
+    }
+    pub fn multiply(self: Count, a: std.mem.Allocator, other: Count) !Count {
+        if ((self.big == null and self.small == 0) or (other.big == null and other.small == 0)) return init(0);
+        if (self.exact()) |left| if (other.exact()) |right| {
+            if (left == 0 or right == 0) return init(0);
+            if (std.math.mul(u64, left, right)) |product| return init(product) else |_| {}
+        };
+        if (self.isOne()) return other;
+        if (other.isOne()) return self;
+        var left = if (self.big) |p| p.* else try Big.initSet(a, self.small);
+        defer if (self.big == null) left.deinit();
+        var right = if (other.big) |p| p.* else try Big.initSet(a, other.small);
+        defer if (other.big == null) right.deinit();
+        const result = try a.create(Big);
+        result.* = try Big.initSet(a, 0);
+        errdefer result.deinit();
+        try result.mul(&left, &right);
+        return .{ .small = std.math.maxInt(u64), .big = result };
+    }
+    pub fn subtract(self: Count, a: std.mem.Allocator, amount: u64) !Count {
+        if (amount == 0) return self;
+        if (self.exact()) |value| return init(value - amount);
+        var subtrahend = try Big.initSet(a, amount);
+        defer subtrahend.deinit();
+        const result = try a.create(Big);
+        result.* = try Big.initSet(a, 0);
+        errdefer result.deinit();
+        try result.sub(self.big.?, &subtrahend);
+        if (result.toInt(u64)) |value| {
+            result.deinit();
+            return init(value);
+        } else |_| {}
+        return .{ .small = std.math.maxInt(u64), .big = result };
+    }
+    pub fn order(self: Count, other: Count) std.math.Order {
+        if (self.big) |left| {
+            if (other.big) |right| return left.toConst().order(right.toConst());
+            return .gt;
+        }
+        if (other.big != null) return .lt;
+        return std.math.order(self.small, other.small);
+    }
+    fn fromOwned(a: std.mem.Allocator, value: Big) !Count {
+        var result = value;
+        errdefer result.deinit();
+        if (result.toInt(u64)) |small| {
+            result.deinit();
+            return init(small);
+        } else |_| {}
+        const retained = try a.create(Big);
+        retained.* = result;
+        return .{ .small = std.math.maxInt(u64), .big = retained };
+    }
+    pub fn difference(self: Count, a: std.mem.Allocator, other: Count) !Count {
+        if (other.exact()) |small| return self.subtract(a, small);
+        std.debug.assert(self.order(other) != .lt);
+        var result = try Big.initSet(a, 0);
+        result.sub(self.big.?, other.big.?) catch |err| {
+            result.deinit();
+            return err;
+        };
+        return fromOwned(a, result);
+    }
+    pub fn divRem(self: Count, a: std.mem.Allocator, divisor: Count) !struct { quotient: Count, remainder: Count } {
+        std.debug.assert(divisor.cap(1) != 0);
+        if (self.exact()) |left| if (divisor.exact()) |right| return .{ .quotient = init(left / right), .remainder = init(left % right) };
+        var left = if (self.big) |p| p.* else try Big.initSet(a, self.small);
+        defer if (self.big == null) left.deinit();
+        var right = if (divisor.big) |p| p.* else try Big.initSet(a, divisor.small);
+        defer if (divisor.big == null) right.deinit();
+        var quotient = try Big.initSet(a, 0);
+        var remainder = Big.initSet(a, 0) catch |err| {
+            quotient.deinit();
+            return err;
+        };
+        Big.divTrunc(&quotient, &remainder, &left, &right) catch |err| {
+            quotient.deinit();
+            remainder.deinit();
+            return err;
+        };
+        const q = fromOwned(a, quotient) catch |err| {
+            remainder.deinit();
+            return err;
+        };
+        return .{ .quotient = q, .remainder = try fromOwned(a, remainder) };
+    }
+    pub const Scaled = struct {
+        fraction: f128,
+        exponent: i64,
+        pub fn from(value: f128) Scaled {
+            const parts = std.math.frexp(value);
+            return .{ .fraction = parts.significand, .exponent = parts.exponent };
+        }
+        pub fn plus(self: Scaled, other: Scaled) Scaled {
+            const high = @max(self.exponent, other.exponent);
+            const left = std.math.ldexp(self.fraction, -@as(i32, @intCast(@min(high - self.exponent, 20000))));
+            const right = std.math.ldexp(other.fraction, -@as(i32, @intCast(@min(high - other.exponent, 20000))));
+            var result = from(left + right);
+            result.exponent += high;
+            return result;
+        }
+        pub fn ratio(self: Scaled, total: Scaled) f128 {
+            return std.math.ldexp(self.fraction / total.fraction, -@as(i32, @intCast(@min(total.exponent - self.exponent, 20000))));
+        }
+        pub fn number(self: Scaled) f128 {
+            return std.math.ldexp(self.fraction, @intCast(@min(self.exponent, std.math.maxInt(i32))));
+        }
+    };
+    pub fn wideNumber(self: Count) f128 {
+        if (self.exact()) |value| return @floatFromInt(value);
+        return self.scaled().number();
+    }
+    pub fn scaled(self: Count) Scaled {
+        if (self.big) |big| {
+            const value = big.toConst();
+            // Retain more than binary128 precision on both 32- and 64-bit
+            // targets; native counts also serve the portable WASM runtime.
+            const high_limbs = std.math.divCeil(usize, 128, @bitSizeOf(std.math.big.Limb)) catch unreachable;
+            const dropped = value.limbs.len -| (high_limbs + 1);
+            const high: std.math.big.int.Const = .{ .positive = true, .limbs = value.limbs[dropped..] };
+            var result = Scaled.from(high.toFloat(f128, .nearest_even)[0]);
+            result.exponent += @as(i64, @intCast(dropped)) * @bitSizeOf(std.math.big.Limb);
+            return result;
+        }
+        return Scaled.from(@floatFromInt(self.small));
+    }
+};
+
+test "promoted counts preserve products, windows and normalized ratios" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const large = try Count.init(@as(u64, 1) << 63).multiply(a, Count.init(2));
+    try std.testing.expect(large.exact() == null);
+    const added = try Count.init(@as(u64, 1) << 63).add(a, Count.init(@as(u64, 1) << 63));
+    try std.testing.expectEqual(large.scaled().fraction, added.scaled().fraction);
+    try std.testing.expectEqual(large.scaled().exponent, added.scaled().exponent);
+    const clipped = try large.subtract(a, std.math.maxInt(i64));
+    try std.testing.expectEqual(@as(u64, 1) << 63 | 1, clipped.exact().?);
+    var enormous = Count.one;
+    for (0..400) |_| enormous = try enormous.multiply(a, Count.init(std.math.maxInt(u64)));
+    const doubled = try enormous.multiply(a, Count.init(2));
+    try std.testing.expectApproxEqAbs(@as(f128, 1.0 / 3.0), enormous.scaled().ratio(enormous.scaled().plus(doubled.scaled())), 1e-16);
+}
+
+test "promoted count allocation failures leave arena ownership intact" {
+    const Probe = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const large = try Count.init(std.math.maxInt(u64)).multiply(a, Count.init(2));
+            const owned = try large.clone(a);
+            const sum = try owned.add(a, Count.init(1));
+            const reduced = try sum.subtract(a, std.math.maxInt(u64));
+            const normalized = try reduced.subtract(a, 1);
+            try std.testing.expectEqual(std.math.maxInt(u64), normalized.exact().?);
+            try std.testing.expectEqual(@as(u64, 0), (try large.multiply(a, Count.init(0))).exact().?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "promoted count subtraction and division preserve representative weights" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const denominator = try Count.init(std.math.maxInt(u64)).multiply(a, Count.init(17));
+            const numerator = try (try denominator.multiply(a, Count.init(123))).add(a, Count.init(7));
+            const split = try numerator.divRem(a, denominator);
+            try std.testing.expectEqual(@as(u64, 123), split.quotient.exact().?);
+            try std.testing.expectEqual(@as(u64, 7), split.remainder.exact().?);
+            const remaining = try denominator.difference(a, split.remainder);
+            try std.testing.expectEqual(std.math.Order.eq, denominator.order(try remaining.add(a, Count.init(7))));
+            try std.testing.expectEqual(@as(u64, 0), (try remaining.difference(a, remaining)).exact().?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}

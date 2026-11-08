@@ -392,6 +392,7 @@ const TokenMappingContext = struct {
     const ScopeState = struct {
         in_select_projection: bool = false,
         is_cast_scope: bool = false,
+        is_graph_table: bool = false,
         saw_order_by: bool = false,
         function_argument_name_allowed: bool = false,
     };
@@ -486,6 +487,7 @@ const TokenMappingContext = struct {
                 self.paren_depth += 1;
                 self.scopes[self.paren_depth].in_select_projection = false;
                 self.scopes[self.paren_depth].is_cast_scope = index > 0 and tokens[index - 1].matchesKeywordTag(.cast);
+                self.scopes[self.paren_depth].is_graph_table = index > 0 and graphTableContext(tokens, index - 1);
                 self.delimiter_depth += 1;
                 self.scopes[self.delimiter_depth].saw_order_by = false;
                 self.scopes[self.delimiter_depth].function_argument_name_allowed = index > 0 and tokens[index - 1].kind == .identifier;
@@ -509,6 +511,7 @@ const TokenMappingContext = struct {
                 }
                 self.scopes[self.paren_depth].in_select_projection = false;
                 self.scopes[self.paren_depth].is_cast_scope = false;
+                self.scopes[self.paren_depth].is_graph_table = false;
                 self.paren_depth -= 1;
                 if (self.paren_depth == 0) self.segment_start = null;
             },
@@ -661,6 +664,16 @@ fn appendTokenIds(
     }
 }
 
+fn graphTableContext(tokens: []const token_mod.Token, index: usize) bool {
+    const t = tokens[index];
+    if (t.kind != .identifier or t.owned or !std.ascii.eqlIgnoreCase(t.text, "graph_table") or index + 3 >= tokens.len or tokens[index + 1].kind != .lparen) return false;
+    var end = index + 2;
+    if (tokens[end].kind != .identifier) return false;
+    end += 1;
+    while (end + 1 < tokens.len and tokens[end].kind == .dot and tokens[end + 1].kind == .identifier) end += 2;
+    return end < tokens.len and tokens[end].matchesKeywordTag(.match);
+}
+
 fn contextualKeywordSymbolId(
     tokens: []const token_mod.Token,
     index: usize,
@@ -669,6 +682,8 @@ fn contextualKeywordSymbolId(
     next: ?token_mod.Token,
     mapping_context: *const TokenMappingContext,
 ) ?u16 {
+    if (graphTableContext(tokens, index)) return generated.tokenId(.PGQ_GRAPH_TABLE);
+    if (mapping_context.scopes[mapping_context.paren_depth].is_graph_table and !token.owned and std.ascii.eqlIgnoreCase(token.text, "columns") and next != null and next.?.kind == .lparen) return generated.tokenId(.PGQ_COLUMNS);
     if (sessionAuthorizationKeywordContext(tokens, index)) {
         if (token.matchesKeywordTag(.authorization)) return generated.tokenId(.AUTHORIZATION);
         if (token.matchesKeywordTag(.session)) return generated.tokenId(.SESSION);
@@ -1574,4 +1589,15 @@ test "generated parser bridge deterministically fuzzes lexer parser and diagnost
             mutatedFuzzSql(random, seeds[random.intRangeLessThan(usize, 0, seeds.len)], &buffer);
         try exerciseFuzzSql(sql);
     }
+}
+
+test "generated GRAPH_TABLE grammar preserves unreserved identifiers and table aliases" {
+    const corpus = [_][]const u8{
+        "SELECT g.title FROM GRAPH_TABLE(knowledge MATCH (a IS Document)-[r IS CITES]->(b IS Document) WHERE a.id = $1 COLUMNS (b.title AS title)) AS g",
+        "SELECT g.title FROM GRAPH_TABLE(public.knowledge MATCH (a:Document)<-[r:CITES]-(b:Document) COLUMNS (b.title AS title)) g",
+        "SELECT * FROM GRAPH_TABLE(knowledge MATCH (a IS Document), (b IS Document) COLUMNS (a.id AS a_id, b.id AS b_id)) g JOIN docs d ON g.a_id=d.id",
+        "SELECT graph_table, columns FROM docs",
+    };
+    for (corpus) |sql| try parseSqlAlloc(std.testing.allocator, sql);
+    try std.testing.expectError(error.UnexpectedToken, parseSqlAlloc(std.testing.allocator, "SELECT * FROM GRAPH_TABLE(knowledge MATCH (a IS Document) WRONG (a.id))"));
 }

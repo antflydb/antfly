@@ -36,7 +36,14 @@ pub fn needsMerge(staged: *const transactions.OwnedTransactionCommitRequest, tab
     return writes;
 }
 
+pub const Projection = struct {
+    ptr: *anyopaque,
+    permits: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, std.json.Value, []const []const u8) anyerror!bool,
+};
 pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const transactions.OwnedTransactionCommitRequest, table: catalog.Table, request: catalog.Scan, row_filter_json: ?[]const u8) !catalog.Cursor {
+    return openWithProjection(alloc, native, staged, table, request, row_filter_json, null);
+}
+pub fn openWithProjection(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const transactions.OwnedTransactionCommitRequest, table: catalog.Table, request: catalog.Scan, row_filter_json: ?[]const u8, projection: ?Projection) !catalog.Cursor {
     const cursor = try alloc.create(Cursor);
     cursor.* = .{ .alloc = alloc, .native = native, .arena = std.heap.ArenaAllocator.init(alloc), .page_arena = std.heap.ArenaAllocator.init(alloc) };
     errdefer {
@@ -73,6 +80,7 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
             const value = try std.json.parseFromSliceLeaky(Json, arena, write.value, .{ .parse_numbers = false });
             if (value != .object) return error.InvalidSqlBackendResponse;
             if (row_filter) |*filter| if (!try filter.matchesJson(arena, write.key, value)) continue;
+            if (projection) |guard| if (!try guard.permits(guard.ptr, arena, table.physical_name, write.key, value, write.json_null_fields)) continue;
             var object: std.json.ObjectMap = .empty;
             var nulls: std.ArrayList(bool) = .empty;
             for (full_projection.columns) |column| {

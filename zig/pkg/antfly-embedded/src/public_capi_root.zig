@@ -26,4 +26,5 @@ comptime {
 test {
     _ = capi;
     _ = write_amplification_bench;
+    _ = @import("capi/cypher.zig");
 }

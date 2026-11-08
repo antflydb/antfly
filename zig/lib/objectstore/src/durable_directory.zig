@@ -31,6 +31,18 @@ pub const Cache = struct {
         self.* = .{};
     }
 
+    /// Drop proofs for a removed directory and its descendants.
+    pub fn invalidate(self: *Cache, alloc: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        for (&self.entries) |*entry| if (entry.*) |known| {
+            if (std.mem.eql(u8, known, path) or (known.len > path.len and std.mem.startsWith(u8, known, path) and known[path.len] == std.fs.path.sep)) {
+                alloc.free(known);
+                entry.* = null;
+            }
+        };
+    }
+
     pub fn ensure(self: *Cache, alloc: std.mem.Allocator, io: std.Io, path: []const u8) !void {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);

@@ -3148,6 +3148,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     const persisted_range = try range_state_mod.loadRange(alloc, store);
     defer range_state_mod.freeRange(alloc, persisted_range);
     shard_manager.* = try shard_mod.ShardManager.init(alloc, store, persisted_range);
+    errdefer shard_manager.deinit();
     const identity_namespace = try doc_identity.loadOrInitNamespaceWithPolicy(
         store,
         configured_identity_namespace,
@@ -3161,6 +3162,9 @@ pub fn openCoreResourcesFromPrimaryStore(
         index_base_path,
         index_backends,
     );
+    // A later schema/catalog failure must unregister cache reclaimers and
+    // release native scratch before the DB's resource manager is destroyed.
+    errdefer index_manager.deinit();
     index_manager.updateRange(shard_manager.getByteRange());
 
     const schema = try schema_mod.loadSchema(store, alloc);

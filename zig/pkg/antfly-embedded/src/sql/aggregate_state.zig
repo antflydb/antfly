@@ -36,7 +36,7 @@ pub const Column = struct {
         }
         fn add(self: *@This(), coefficient: i128, scale: u16, count: u64, minimum: bool) !void {
             if (count == 0) return;
-            const total = try Column.mergedCount(self.count, count);
+            const total: u64 = 1;
             if (self.count == 0 or @import("../common/decimal128.zig").order(coefficient, scale, self.coefficient, self.scale) == (if (minimum) std.math.Order.lt else .gt)) {
                 self.clear();
                 self.coefficient = coefficient;
@@ -419,19 +419,18 @@ pub const Column = struct {
                 },
                 else => unreachable,
             }
-            if (count == std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
             const replace = count == 0 or (try @import("scalar.zig").compareDatums(value, prior.?)) == (if (self.spec.kind == .min) std.math.Order.lt else .gt);
             switch (self.values) {
                 .integers => |*v| {
-                    v.items[index].count += 1;
+                    v.items[index].count = 1;
                     if (replace) v.items[index].selected = value.value.integer;
                 },
                 .numbers => |*v| {
-                    v.items[index].count += 1;
+                    v.items[index].count = 1;
                     if (replace) v.items[index].selected = value.value.float;
                 },
                 .booleans => |*v| {
-                    v.items[index].count += 1;
+                    v.items[index].count = 1;
                     if (replace) v.items[index].value = value.value.bool;
                 },
                 .bytes => |*v| {
@@ -440,7 +439,7 @@ pub const Column = struct {
                         if (v.items[index].value) |bytes| a.free(bytes);
                         v.items[index].value = owned;
                     }
-                    v.items[index].count += 1;
+                    v.items[index].count = 1;
                 },
                 else => unreachable,
             }
@@ -491,8 +490,7 @@ pub const Column = struct {
                     if (value.sql_null) continue;
                     const state = &booleans.items[id];
                     state.value = if (self.spec.kind == .bool_and) state.value and value.value.bool else state.value or value.value.bool;
-                    state.count = std.math.add(u64, state.count, 1) catch return error.SqlNumericOutOfRange;
-                    if (state.count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+                    state.count = 1;
                 }
             },
             else => for (ids, values) |id, value| try self.update(a, id, value),
@@ -526,7 +524,7 @@ pub const Column = struct {
                 const scale = try decimal.scaleAt(lane);
                 try @import("../common/decimal128.zig").validateCoefficient(coefficients.values[row], coefficients.precision, scale);
                 if (self.values == .counts) {
-                    self.values.counts.items[id] = try mergedCount(self.values.counts.items[id], 1);
+                    self.values.counts.items[id] = try self.mergeCount(self.values.counts.items[id], 1);
                     continue;
                 }
                 if (self.values == .fixed) {
@@ -545,7 +543,7 @@ pub const Column = struct {
                 if (self.values == .counts) {
                     for (ids, dictionary.indices) |id, index| {
                         if (index >= dictionary.values.len) return error.InvalidSqlBackendResponse;
-                        if (!dictionary.values[index].sql_null) self.values.counts.items[id] = try mergedCount(self.values.counts.items[id], 1);
+                        if (!dictionary.values[index].sql_null) self.values.counts.items[id] = try self.mergeCount(self.values.counts.items[id], 1);
                     }
                     return;
                 }
@@ -624,7 +622,7 @@ pub const Column = struct {
         switch (self.values) {
             .counts => |*states| for (ids, 0..) |id, lane| {
                 const row = physical.rowAt(lane);
-                if (!vector.nulls.isNull(row)) states.items[id] = try mergedCount(states.items[id], 1);
+                if (!vector.nulls.isNull(row)) states.items[id] = try self.mergeCount(states.items[id], 1);
             },
             .integers => |*states| switch (vector.values) {
                 inline .i64, .dictionary_i64 => |values| for (ids, 0..) |id, lane| {
@@ -632,7 +630,7 @@ pub const Column = struct {
                     if (vector.nulls.isNull(row)) continue;
                     const value = physicalValue(values, row);
                     const state = &states.items[id];
-                    const count = try mergedCount(state.count, 1);
+                    const count = try self.mergeCount(state.count, 1);
                     if (self.spec.kind == .sum) {
                         state.sum = std.math.add(i128, state.sum, value) catch return error.SqlNumericOutOfRange;
                     } else if (state.count == 0 or (if (self.spec.kind == .min) value < state.selected else value > state.selected)) state.selected = value;
@@ -647,7 +645,7 @@ pub const Column = struct {
                     const native = physicalValue(values, row);
                     const value: f64 = if (@TypeOf(native) == i64) @floatFromInt(native) else native;
                     const state = &states.items[id];
-                    const count = try mergedCount(state.count, 1);
+                    const count = try self.mergeCount(state.count, 1);
                     if (self.spec.kind == .sum) {
                         if (self.spec.input_element == .float32) state.sum = try operators.Aggregate.addRealSum(state.sum, value) else try operators.Aggregate.addFloatSum(&state.sum, &state.compensation, value);
                     } else if (self.spec.kind == .min or self.spec.kind == .max) {
@@ -672,7 +670,7 @@ pub const Column = struct {
                 if (vector.nulls.isNull(row)) continue;
                 const value = vector.values.bool[row];
                 const state = &states.items[id];
-                const count = try mergedCount(state.count, 1);
+                const count = try self.mergeCount(state.count, 1);
                 switch (self.spec.kind) {
                     .bool_and => state.value = state.value and value,
                     .bool_or => state.value = state.value or value,
@@ -688,7 +686,7 @@ pub const Column = struct {
                     if (vector.nulls.isNull(row)) continue;
                     const value = physicalValue(values, row);
                     const state = &states.items[id];
-                    const count = try mergedCount(state.count, 1);
+                    const count = try self.mergeCount(state.count, 1);
                     if (state.value == null or std.mem.order(u8, value, state.value.?) == (if (self.spec.kind == .min) std.math.Order.lt else .gt)) {
                         const owned = try a.dupe(u8, value);
                         if (state.value) |previous| a.free(previous);
@@ -734,7 +732,7 @@ pub const Column = struct {
         if (ids.len != states.len) return error.InvalidSqlBackendResponse;
         switch (self.values) {
             .counts => |*target| for (ids, states) |id, from| {
-                target.items[id] = try mergedCount(target.items[id], from.count);
+                target.items[id] = try self.mergeCount(target.items[id], from.count);
             },
             .fixed => {
                 for (ids, states) |id, from| {
@@ -758,20 +756,20 @@ pub const Column = struct {
             },
             .integers => |*target| for (ids, states) |id, from| {
                 const to = &target.items[id];
-                const count = try mergedCount(to.count, from.count);
+                const count = try self.mergeCount(to.count, from.count);
                 if (self.spec.kind == .sum) to.sum = std.math.add(i128, to.sum, from.sum) catch return error.SqlNumericOutOfRange else if (from.count != 0 and (to.count == 0 or (if (self.spec.kind == .min) from.selected.value.integer < to.selected else from.selected.value.integer > to.selected))) to.selected = from.selected.value.integer;
                 to.count = count;
             },
             .booleans => |*target| for (ids, states) |id, from| {
                 const to = &target.items[id];
-                const count = try mergedCount(to.count, from.count);
+                const count = try self.mergeCount(to.count, from.count);
                 const value = if (self.spec.kind == .min or self.spec.kind == .max) if (from.count == 0) false else from.selected.value.bool else from.boolean;
                 if (from.count != 0) to.value = if (to.count == 0) value else if (self.spec.kind == .bool_and or self.spec.kind == .min) to.value and value else to.value or value;
                 to.count = count;
             },
             .bytes => |*target| for (ids, states) |id, from| {
                 const to = &target.items[id];
-                const count = try mergedCount(to.count, from.count);
+                const count = try self.mergeCount(to.count, from.count);
                 if (from.count != 0 and (to.count == 0 or std.mem.order(u8, from.selected.value.string, to.value.?) == (if (self.spec.kind == .min) std.math.Order.lt else .gt))) {
                     const owned = try a.dupe(u8, from.selected.value.string);
                     if (to.value) |old| a.free(old);
@@ -834,7 +832,7 @@ pub const Column = struct {
         switch (self.values) {
             .counts => |*target| for (ids, 0..) |id, offset| {
                 const index = if (indices) |selected| selected[offset] else begin + offset;
-                target.items[id] = try mergedCount(target.items[id], source.values.counts.items[index]);
+                target.items[id] = try self.mergeCount(target.items[id], source.values.counts.items[index]);
             },
             .fixed => |*target| for (ids, 0..) |id, offset| {
                 const index = if (indices) |selected_| selected_[offset] else begin + offset;
@@ -849,7 +847,7 @@ pub const Column = struct {
                 const index = if (indices) |selected| selected[offset] else begin + offset;
                 const from = source.values.integers.items[index];
                 const to = &target.items[id];
-                const count = try mergedCount(to.count, from.count);
+                const count = try self.mergeCount(to.count, from.count);
                 if (self.spec.kind == .sum) {
                     to.sum = std.math.add(i128, to.sum, from.sum) catch return error.SqlNumericOutOfRange;
                 } else if (from.count != 0 and (to.count == 0 or (if (self.spec.kind == .min) from.selected < to.selected else from.selected > to.selected))) {
@@ -861,7 +859,7 @@ pub const Column = struct {
                 const index = if (indices) |selected| selected[offset] else begin + offset;
                 const from = source.values.booleans.items[index];
                 const to = &target.items[id];
-                const count = try mergedCount(to.count, from.count);
+                const count = try self.mergeCount(to.count, from.count);
                 if (from.count != 0) to.value = if (to.count == 0) from.value else if (self.spec.kind == .bool_and or self.spec.kind == .min) to.value and from.value else to.value or from.value;
                 to.count = count;
             },
@@ -869,7 +867,7 @@ pub const Column = struct {
                 const index = if (indices) |selected| selected[offset] else begin + offset;
                 const from = source.values.bytes.items[index];
                 const to = &target.items[id];
-                const count = try mergedCount(to.count, from.count);
+                const count = try self.mergeCount(to.count, from.count);
                 if (from.count != 0 and (to.count == 0 or std.mem.order(u8, from.value.?, to.value.?) == (if (self.spec.kind == .min) std.math.Order.lt else .gt))) {
                     const bytes = try a.dupe(u8, from.value.?);
                     if (to.value) |old| a.free(old);
@@ -891,6 +889,9 @@ pub const Column = struct {
                 }
             },
         }
+    }
+    fn mergeCount(self: *const Column, left: u64, right: u64) !u64 {
+        return if (operators.Aggregate.presenceOnly(self.spec.kind)) @intFromBool(left != 0 or right != 0) else mergedCount(left, right);
     }
     /// Source pages are gathered before destination pinning, so one-frame
     /// residency and a shared source/destination pager cannot deadlock. Lanes
@@ -934,6 +935,10 @@ pub const Column = struct {
             },
             .dynamic => |values| {
                 if (values.items[from].numeric) |reducer| return self.numericGrowth(index, reducer.state.weight, reducer.state.buckets.items.len);
+                if (values.items[from].distinct_support) |source_| {
+                    const target: @import("cypher").statistic.SupportSet = if (index) |i| (if (self.values.dynamic.items[i].distinct_support) |target_| target_.* else .{}) else .{};
+                    return target.growth(source_.*) +| 128;
+                }
                 if (values.items[from].selected) |selected| return (try operators.datumBytes(selected.row.values[0])) *| 4;
             },
             .bytes => |values| return if (values.items[from].value) |bytes| bytes.len +| 64 else 0,
@@ -948,6 +953,16 @@ pub const Column = struct {
             return view.column.mergeExact(a, 0, state);
         }
         if (state.kind != self.spec.kind or state.input_type != self.spec.input_type or state.input_element != self.spec.input_element or state.distinct != self.spec.distinct) return error.InvalidSqlBackendResponse;
+        if (self.values != .dynamic and state.wide == null and (self.spec.kind == .sum or self.spec.kind == .avg)) {
+            const prior_count = switch (self.values) {
+                .exact => |values| values.items[index].state.count,
+                .integers => |values| values.items[index].count,
+                .numbers => |values| values.items[index].count,
+                else => unreachable,
+            };
+            if (state.count > std.math.maxInt(i64) - prior_count) try self.promote(a);
+        }
+        if (state.wide != null and self.values != .dynamic) try self.promote(a);
         if (self.values == .exact) {
             const reducer = state.numeric orelse return error.InvalidSqlBackendResponse;
             if (reducer.state.count != state.count) return error.InvalidSqlBackendResponse;
@@ -956,20 +971,7 @@ pub const Column = struct {
         if (self.values == .dynamic) return @import("aggregate_partial.zig").merge(&self.values.dynamic.items[index], state);
         if (self.spec.kind == .min or self.spec.kind == .max) {
             if (state.count == 0) return;
-            const prior = switch (self.values) {
-                .counts, .dynamic, .exact => unreachable,
-                inline else => |values| values.items[index].count,
-            };
-            const total = std.math.add(u64, prior, state.count) catch return error.SqlNumericOutOfRange;
-            if (total > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
-            try self.update(a, index, state.selected.?.row.values[0]);
-            switch (self.values) {
-                .counts => unreachable,
-                .exact => unreachable,
-                .dynamic => |*values| values.items[index].count = total,
-                inline else => |*values| values.items[index].count = total,
-            }
-            return;
+            return self.update(a, index, state.selected.?.row.values[0]);
         }
         if (self.values == .numbers) {
             var target = try self.snapshot(a, index);
@@ -993,8 +995,7 @@ pub const Column = struct {
                 if (self.spec.kind != .bool_and and self.spec.kind != .bool_or) return error.InvalidSqlBackendResponse;
                 const target = &values.items[index];
                 target.value = if (self.spec.kind == .bool_and) target.value and state.boolean else target.value or state.boolean;
-                target.count = std.math.add(u64, target.count, state.count) catch return error.SqlNumericOutOfRange;
-                if (target.count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+                target.count = try self.mergeCount(target.count, state.count);
             },
             else => return error.InvalidSqlBackendResponse,
         }

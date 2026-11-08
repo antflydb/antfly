@@ -137,9 +137,10 @@ pub fn Adapter(comptime native: type) type {
         /// SQL already avoids. `null` for callers with no `HandleGuard` in scope
         /// (e.g. `executeEmbeddedSql`'s table-scoped path).
         writer_lane_hook: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook = null,
+        graph_parameters: []const std.json.Value = &.{},
 
         pub fn backend(self: *Self) catalog.Backend {
-            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
+            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
         }
 
         fn selected(self: *Self, name: []const u8) !Self {
@@ -600,6 +601,15 @@ pub fn Adapter(comptime native: type) type {
             const io = self.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
             const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
             const outcomes = dependencies.sql_errors;
+            const coordinator = @import("sql_commit.zig");
+            // Nothing committed yet: the equivalent of `sql_commit.zig`'s
+            // `test_before_store` boundary, fired before this write's own
+            // `beginTransaction` instead of before the cross-database
+            // coordinator's recovery-hint record (this path has none).
+            if (comptime @import("builtin").is_test) if (coordinator.test_before_store) |hook| {
+                coordinator.test_before_store = null;
+                hook.run(hook.ptr) catch |err| return outcomes.notApplied(err);
+            };
             const txn_id = self.db.beginTransaction(now) catch |err| return outcomes.notApplied(err);
             self.outcome_transaction_id = txn_id;
             self.db.writeTransaction(txn_id, .{
@@ -619,10 +629,24 @@ pub fn Adapter(comptime native: type) type {
                 if (err == error.VersionConflict) return error.SqlWriteConflict;
                 return outcomes.notApplied(err);
             };
+            // Equivalent of `test_after_prepare`: every participant (here,
+            // the one table) is prepared; about to make the commit decision.
+            // Abandon exactly as the `writeTransaction` failure above does.
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_prepare) |hook| {
+                coordinator.test_after_prepare = null;
+                hook.run(hook.ptr) catch |err| {
+                    self.db.abortTransaction(txn_id, now +| 1) catch {};
+                    self.outcome_transaction_id = null;
+                    return outcomes.notApplied(err);
+                };
+            };
             // Only durable status can classify a failure after commit starts.
             // Never abort/replay a possibly published mutation.
             self.db.commitTransaction(txn_id, now +| 1) catch |err| {
-                const status = self.db.getTransactionStatus(txn_id) catch return error.SqlMutationOutcomeUnknown;
+                const status = self.db.getTransactionStatus(txn_id) catch {
+                    if (self.handle) |handle| handle.sql_decision_uncertain = true;
+                    return error.SqlMutationOutcomeUnknown;
+                };
                 if (status == .committed) return switch (err) {
                     error.EnrichmentWorkerFailed => .committed_repair_required,
                     else => .committed_pending,
@@ -631,7 +655,44 @@ pub fn Adapter(comptime native: type) type {
                     self.outcome_transaction_id = null;
                     return error.SqlWriteConflict;
                 }
+                // `status == .pending`: durability is genuinely unknown only
+                // while the native checkpoint publication might still land
+                // (mirrors `sql_commit.zig`'s `commitLocked`). Otherwise the
+                // decision provably never became durable -- abort it so
+                // recovery can never commit it later, and report "not
+                // applied" instead of an unwarranted "unknown".
+                //
+                // Unlike `commitLocked`'s simple coordinator-decision commit,
+                // this commit also materializes the table's rows inline, and
+                // that path's own reconciliation can already have resolved
+                // (and cleared) `checkpoint_publication_uncertain` by the
+                // time it hands back an already-classified unknown-outcome
+                // error -- checking the flag at that point would wrongly see
+                // "resolved" and report "not applied" for a write whose
+                // recovery has not actually settled from this caller's
+                // perspective.
+                // Trust that classification first; fall back to the flag
+                // only for a plain error the lower layers never classified.
+                if (outcomes.isUnknownOutcome(err)) {
+                    if (self.handle) |handle| handle.sql_decision_uncertain = true;
+                    return error.SqlMutationOutcomeUnknown;
+                }
+                if (self.handle) |handle| {
+                    if (!coordinator.publicationUncertain(handle)) {
+                        self.db.abortTransaction(txn_id, now +| 2) catch {};
+                        self.outcome_transaction_id = null;
+                        return outcomes.notApplied(err);
+                    }
+                    handle.sql_decision_uncertain = true;
+                }
                 return error.SqlMutationOutcomeUnknown;
+            };
+            // Equivalent of `test_after_decision`: the decision is durable;
+            // simulate a post-decision step (participant resolution in the
+            // cross-database protocol) failing without losing the commit.
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_decision) |hook| {
+                coordinator.test_after_decision = null;
+                hook.run(hook.ptr) catch return .committed_pending;
             };
             self.outcome_transaction_id = null;
             return .committed;
@@ -674,19 +735,34 @@ pub fn Adapter(comptime native: type) type {
             for (requests, prepared) |request, *out| if (request.request.search) |search| {
                 var selected_adapter = try self.selected(request.table.physical_name);
                 out.* = try selected_adapter.prepareSearch(search_arena.allocator(), search);
+                // A durable SQL commit can precede derived publication. Drain
+                // the selected search owner's indexing before taking cohort
+                // fences, so ranking and row hydration describe the same cut.
+                try selected_adapter.db.waitForCurrentSyncLevel(.full_index);
             };
             var owners: [64]*DB = undefined;
             var owner_count: usize = 0;
+            var has_graph = false;
             for (requests) |request| {
-                const selected_adapter = try self.selected(request.table.physical_name);
-                const exists = for (owners[0..owner_count]) |db| {
-                    if (db == selected_adapter.db) break true;
-                } else false;
-                if (!exists) {
-                    owners[owner_count] = selected_adapter.db;
-                    owner_count += 1;
+                const dependencies_to_capture = if (request.table.graph) |binding| blk: {
+                    has_graph = true;
+                    break :blk binding.dependencies;
+                } else &.{request.table};
+                for (dependencies_to_capture) |table| {
+                    const selected_adapter = try self.selected(table.physical_name);
+                    const exists = for (owners[0..owner_count]) |db| {
+                        if (db == selected_adapter.db) break true;
+                    } else false;
+                    if (!exists) {
+                        if (owner_count == owners.len) return error.SqlProgramLimitExceeded;
+                        owners[owner_count] = selected_adapter.db;
+                        owner_count += 1;
+                    }
                 }
             }
+            if (has_graph) for (owners[0..owner_count]) |db| {
+                if (!self.read_only) _ = try db.lookup(alloc, "", .{ .cypher_prepare = true }) else try db.waitForCurrentSyncLevel(.full_index);
+            };
             std.mem.sort(*DB, owners[0..owner_count], {}, struct {
                 fn less(_: void, a: *DB, b: *DB) bool {
                     return a.core.identity_namespace.table_id < b.core.identity_namespace.table_id;
@@ -730,7 +806,9 @@ pub fn Adapter(comptime native: type) type {
                 if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.SqlStatementReadUnavailable;
             }
             for (requests, prepared, cursors) |request, *search, *cursor| {
-                if (search.*) |*owned| {
+                if (request.table.graph) |binding| {
+                    cursor.* = try @import("sql_graph.zig").open(self, alloc, binding.*, request.request, owners[0..owner_count], fences[0..held]);
+                } else if (search.*) |*owned| {
                     var selected_adapter = try self.selected(request.table.physical_name);
                     cursor.* = try selected_adapter.openSearch(alloc, request.table, request.request, owned.req);
                 } else cursor.* = (try open(ptr, alloc, request.table, request.request)) orelse return error.SqlStatementSnapshotRequired;
@@ -1016,6 +1094,10 @@ pub fn Adapter(comptime native: type) type {
             return .{ .ptr = cursor, .next = SearchCursor.next, .next_columns = if (reader == null) SearchCursor.nextColumns else null, .close = SearchCursor.close };
         }
 
+        fn resolveGraph(ptr: *anyopaque, alloc: std.mem.Allocator, definition: ast.GraphTable) !catalog.Table {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return @import("sql_graph.zig").resolve(self, alloc, definition);
+        }
         fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
             const adapter_owner: *Self = @ptrCast(@alignCast(ptr));
             if (name.database != null or (name.namespace != null and !std.mem.eql(u8, name.namespace.?, "public"))) return error.UndefinedTable;

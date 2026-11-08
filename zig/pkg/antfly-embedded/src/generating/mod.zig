@@ -377,7 +377,6 @@ const BackendState = struct {
         try cfg.validate();
         if (cfg.provider == .apple) try lib.apple_native.checkAvailable();
         state.require_completion = require_completion;
-        if (require_completion and cfg.provider == .apple) return error.UnsupportedInferenceFeature;
         state.limits = limits;
         state.usage_observer = usage_observer;
         _ = try provider_limits.Policy.fromConfig(cfg.rate_limit);
@@ -604,7 +603,7 @@ const BackendState = struct {
             const cancellation = if (self.request_context) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else httpx.CancellationToken.fromCallback(self.execution.cancellation.ptr, self.execution.cancellation.is_cancelled_fn);
             if (model.len > 0) return error.UnsupportedAppleGenerationOptions;
             self.notifyLocalSubmission();
-            return lib.generateApple(alloc, self.cfg, messages, self.max_response_bytes orelse (8 * 1024 * 1024), .{ .timeout_ms = timeout, .cancellation = cancellation });
+            return lib.generateApple(alloc, self.cfg, messages, self.max_response_bytes orelse (8 * 1024 * 1024), .{ .timeout_ms = timeout, .cancellation = cancellation, .require_completion = self.require_completion });
         }
         const policy = try provider_limits.Policy.fromConfig(self.cfg.rate_limit);
         try validateGenerationMessagesTokenBudget(self.cfg, messages);
@@ -2387,4 +2386,19 @@ test "generating backend Cloudflare configuration owns routing through parse clo
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+pub const dictation = lib.dictation;
+
+test "Apple strict completion factory accepts completion-aware native bridge" {
+    if (!lib.apple_native.enabled) return error.SkipZigTest;
+    try lib.apple_native.checkAvailable();
+    const a = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    var factory = BackendFactory.initWithOptions(a, &client, .{ .require_completion = true });
+    var generator = try factory.factory().create(a, .{ .provider = .apple, .model = "", .url = "" });
+    defer generator.deinit();
+    const state: *BackendState = @ptrCast(@alignCast(generator.ptr));
+    try std.testing.expect(state.require_completion);
 }

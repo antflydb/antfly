@@ -15,6 +15,8 @@
 
 const support = @import("embedded_support");
 
+pub const cypher = support.cypher;
+
 pub const db = @import("embedded_db_surface");
 pub const api = @import("embedded_api_surface");
 pub const host_environment = support.host_environment;

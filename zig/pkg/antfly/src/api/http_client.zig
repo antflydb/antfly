@@ -1446,6 +1446,7 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
+            400 => return remotePreflightError(resp.body),
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
@@ -4324,6 +4325,12 @@ test "relational row query remote transaction prepare preserves scalar validatio
         executor.body = field;
         try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
     }
+    inline for (@typeInfo(@import("relational_row_errors.zig").PolicyError).error_set.error_names.?) |field| {
+        const reason = @field(@import("relational_row_errors.zig").PolicyError, field);
+        executor.status = @import("relational_row_errors.zig").status(reason);
+        executor.body = field;
+        try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
+    }
     executor.status = 500;
     executor.body = "RelationalExpressionOverflow";
     try std.testing.expectError(error.InvalidRemoteResponse, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
@@ -6761,6 +6768,21 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "api http client preserves group query capability errors" {
+    const Executor = struct {
+        body: []const u8 = "UnsupportedQueryRequest",
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = 400, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    var executor: Executor = .{};
+    var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    try std.testing.expectError(error.UnsupportedQueryRequest, client.fetchGroupQueryWithControl("http://owner", 7, "docs", "{}", null, null));
+    executor.body = "unknown private failure";
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupQueryWithControl("http://owner", 7, "docs", "{}", null, null));
 }
 
 test "public graph metric borrowed wire edge batch endpoint capability" {

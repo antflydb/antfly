@@ -31,6 +31,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Specifica
     errdefer parsed.deinit();
     _ = try d.text(.{ .string = parsed.value.version });
     try parsed.value.decider.validate();
+    if (parsed.value.decider.cascade) |*body| _ = d.cascade_contract.omitDisabledAgreementDefinition(body);
     var dependencies = try registry(a, parsed.value);
     defer dependencies.deinit();
     parsed.value.questions = if (parsed.value.decider.decision_method == .generated) try d.generatedQuestions(parsed.arena.allocator(), parsed.value.questions, parsed.value.decider.instructions) else try d.publicQuestions(parsed.arena.allocator(), parsed.value.questions);

@@ -86,6 +86,22 @@ token, err := antfly.NewAntflyClientWithOptions(baseURL,
 See `examples/quickstart` for tables, indexes, hybrid search, reranking, and
 a retrieval agent end to end.
 
+## Graph catalog mutation outcomes
+
+`CreateGraph` and `UpdateGraph` return `GraphCatalogMutationResult`. Inspect
+`Entry` for a visible catalog definition or `Outcome` for a durable mutation
+whose catalog visibility is pending. `DropGraph` returns a non-nil outcome when
+deletion visibility is pending, and nil when deletion is visible. Do not replay
+pending mutations; use `GetGraph` to observe the catalog. `UpdateGraph` requires
+the revision returned by the last read.
+
+Graph queries and catalog mutations never follow HTTP redirects or replay their
+request bodies. This policy applies to the generated client as well as these
+wrappers, without changing a shared `http.Client`. A custom transport must
+implement `GraphNoReplayDoer` (`DoGraphNoReplay`) to explicitly provide the same
+delivery guarantee. Retain a query's `write_request_id` and inspect its receipt
+after uncertain delivery instead of resubmitting the statement.
+
 ## Model-aware media chunks
 
 `InferenceClient.ChunkAndEmbed` accepts `oapi.InferenceChunkRequest` with an

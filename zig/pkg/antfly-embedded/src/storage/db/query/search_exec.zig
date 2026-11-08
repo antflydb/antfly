@@ -318,6 +318,7 @@ pub const SearchTextQueryExecutor = struct {
 };
 
 pub const SearchTextStatsExecutor = struct {
+    checkpoint: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     ctx: ?*anyopaque,
     text_index_entry: *const fn (
         ctx: ?*anyopaque,
@@ -328,6 +329,9 @@ pub const SearchTextStatsExecutor = struct {
         alloc: Allocator,
         keys: []const []const u8,
     ) anyerror![]?[]u8 = null,
+    fn check(self: @This()) !void {
+        if (self.checkpoint) |control| try control.call(control.ptr);
+    }
 };
 
 pub const ExplicitTextStatRequest = control_contract.ExplicitTextStatRequest;
@@ -13568,6 +13572,19 @@ pub fn searchTextQuery(
     try convertNativeDocIdsToTextDocNumsAlloc(alloc, effective_req, snapshot, &native_constraints);
     try normalizeNativeDocNumConstraintsAlloc(alloc, &native_constraints);
     const convert_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - convert_start_ns else 0;
+    const CandidatePredicate = struct {
+        snapshot: @TypeOf(snapshot),
+        predicate: types.NativeKeyPredicate,
+        fn allows(ptr: *anyopaque, doc: u32) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const key = (try self.snapshot.storedIdScoped(scratch.allocator(), doc)) orelse return false;
+            return self.predicate.allows(self.predicate.ptr, key);
+        }
+    };
+    var candidate_predicate: CandidatePredicate = .{ .snapshot = snapshot, .predicate = effective_req.native_key_predicate orelse undefined };
+    const doc_predicate: ?search_mod.DocNumPredicate = if (effective_req.native_key_predicate != null) .{ .ptr = &candidate_predicate, .allows = CandidatePredicate.allows } else null;
     const unresolved_stored_filters =
         (effective_req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (effective_req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
@@ -13637,13 +13654,13 @@ pub fn searchTextQuery(
     const load_stored_in_search_engine = false;
     var field_sort_plan = SortExecutionPlan{ .kind = .none };
     if (requires_field_sort) field_sort_plan = try planTextNativeSortFields(effective_req, snapshot, text_source.runtime_schema);
-    if (requires_field_sort and executor.project_key != null and field_sort_plan.sorted_segment_executor_available) {
+    if (doc_predicate == null and requires_field_sort and executor.project_key != null and field_sort_plan.sorted_segment_executor_available) {
         field_sort_plan = docValuesCollectorPlanForSelectiveFilter(field_sort_plan);
         // Public-ID projection requires the exact tie-aware collector. Its
         // native primary stream remains available; this is not selectivity.
         field_sort_plan.selective_filter_doc_values_preferred = false;
     }
-    if (requires_field_sort and executor.project_key == null and
+    if (doc_predicate == null and requires_field_sort and executor.project_key == null and
         field_sort_plan.sorted_segment_executor_available and
         !chunk_backed and
         !group_chunk_parents and
@@ -13727,7 +13744,7 @@ pub fn searchTextQuery(
             return out;
         }
     }
-    if (requires_field_sort and (executor.project_key == null or executor.native_count_visibility_exact) and
+    if (doc_predicate == null and requires_field_sort and (executor.project_key == null or executor.native_count_visibility_exact) and
         (field_sort_plan.kind == .native_doc_values_top_n or
             (field_sort_plan.kind == .id_only and executor.native_count_visibility_exact and executor.open_ordered_candidates != null)) and
         !requestHasScoreSort(effective_req) and
@@ -13842,6 +13859,7 @@ pub fn searchTextQuery(
             try search_mod.executeCountCandidatesWithControl(alloc, snapshot, search_query, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns })
         else
             try search_mod.execute(alloc, snapshot, .{
+                .doc_num_predicate = doc_predicate,
                 .query = search_query,
                 .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs, .pattern_cache = effective_req.text_pattern_membership },
                 .k = if (collect_window_candidates) candidate_limit else paging.limit,
@@ -14005,7 +14023,7 @@ pub fn searchTextQuery(
             out.total_hits = visible_candidate_count;
             out.total_hits_relation = .gte;
         }
-        if (requires_field_sort and !candidates_exhausted) {
+        if (doc_predicate == null and requires_field_sort and !candidates_exhausted) {
             logExactSortBudgetRejection(
                 "text",
                 .text_field_sort_candidate_window,
@@ -14451,6 +14469,7 @@ pub fn collectSearchRequestTextStats(
             .index_name = entry.value_ptr.index_name,
             .field = entry.value_ptr.field,
             .terms = terms,
+            .resolved_doc_filter = if (req.resolved_doc_filter) |raw| @ptrCast(@alignCast(raw)) else null,
         };
         request_index += 1;
     }
@@ -14536,10 +14555,12 @@ fn collectFilteredExplicitTextStats(
         var segment_lease = try snapshot.leaseSegment(segment_index);
         defer segment_lease.deinit();
         const seg = segment_lease.entry;
+        try executor.check();
         {
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
             for (0..seg.reader.doc_count) |local_doc_usize| {
+                if (local_doc_usize % 256 == 0) try executor.check();
                 const local_doc: u32 = @intCast(local_doc_usize);
                 if (seg.shared.deleted) |deleted| {
                     if (deleted.contains(local_doc)) continue;
@@ -14596,6 +14617,7 @@ fn collectFilteredExplicitTextStats(
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
                 for (0..seg.reader.doc_count) |local_doc_usize| {
+                    if (local_doc_usize % 256 == 0) try executor.check();
                     const local_doc: u32 = @intCast(local_doc_usize);
                     if (seg.shared.deleted) |deleted| {
                         if (deleted.contains(local_doc)) continue;
@@ -14609,18 +14631,22 @@ fn collectFilteredExplicitTextStats(
             if (try seg.reader.invertedIndexScoped(alloc, request.field)) |opened| {
                 var inv_reader = opened;
                 defer inv_reader.deinit();
-                var terms = try inv_reader.termIterator();
-                defer terms.deinit();
-                while (try terms.next()) |entry| {
-                    var postings = try entry.result.iterator(alloc);
+                for (0..seg.reader.doc_count) |local_doc_usize| {
+                    if (local_doc_usize % 256 == 0) try executor.check();
+                    const local_doc: u32 = @intCast(local_doc_usize);
+                    if (allowed_local_docs.contains(local_doc)) global_total_field_len +|= try inv_reader.docLength(local_doc);
+                }
+                for (term_doc_freqs) |*item| {
+                    try executor.check();
+                    const found = (try inv_reader.lookup(item.term)) orelse continue;
+                    var postings = try found.iterator(alloc);
                     defer postings.deinit();
                     postings.decode_positions = false;
+                    var visited: usize = 0;
                     while (try postings.next()) |hit| {
-                        if (!allowed_local_docs.contains(hit.doc_id)) continue;
-                        global_total_field_len +|= hit.freq;
-                        for (term_doc_freqs) |*item| {
-                            if (std.mem.eql(u8, item.term, entry.term)) item.doc_freq +|= 1;
-                        }
+                        visited += 1;
+                        if (visited % 256 == 0) try executor.check();
+                        if (allowed_local_docs.contains(hit.doc_id)) item.doc_freq +|= 1;
                     }
                 }
             }
@@ -19430,6 +19456,8 @@ pub fn searchMatchAll(
     });
     defer native_constraints.deinit(alloc);
 
+    if (exec_req.native_key_predicate != null and planned_sort.kind == .sorted_segment_seek)
+        planned_sort = docValuesCollectorPlanForSelectiveFilter(planned_sort);
     const exact_sort_budget = lateVisibilityExactCandidateBudget();
     const unresolved_stored_filters =
         (exec_req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
@@ -20232,6 +20260,10 @@ const MatchAllCandidateCollectState = struct {
             self.alloc.free(raw_key);
             return;
         }
+        if (self.req.native_key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, raw_key)) {
+            self.alloc.free(raw_key);
+            return;
+        };
 
         const ordinal = if (self.collector.lookup_doc_ordinal) |lookup|
             try lookup(self.collector.ctx, self.alloc, raw_key, self.req.identity_read_generation)

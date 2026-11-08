@@ -16,6 +16,8 @@
 pub const antfly_sources = @import("source_owner_physical.zig");
 test {
     _ = @import("antfly_local_sources").storage_db_maintenance_transaction_runtime;
+    _ = @import("antfly_local_sources").storage_db_artifact_publication_resolution;
+    _ = @import("api/distributed_candidate_source.zig");
     _ = @import("storage/server_db_integration_test.zig");
     _ = @import("storage/server_transaction_recovery.zig");
     _ = @import("storage/artifact_upload_recovery.zig");

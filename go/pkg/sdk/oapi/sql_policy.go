@@ -35,64 +35,104 @@ type SQLNoReplayDoer interface {
 	DoSQLNoReplay(*http.Request) (*http.Response, error)
 }
 
+// GraphNoReplayDoer is the explicit contract for custom graph transports.
+// Implementations must not redirect or replay a possibly delivered statement.
+type GraphNoReplayDoer interface {
+	DoGraphNoReplay(*http.Request) (*http.Response, error)
+}
+
 func marshalSQLRequest(value any) ([]byte, error) {
+	return marshalBoundedRequest(value, sqlMaxRequestBytes, "SQL")
+}
+
+func marshalGraphRequest(value any) ([]byte, error) {
+	return marshalBoundedRequest(value, 1<<20, "graph")
+}
+
+func marshalGraphCatalogRequest(value any) ([]byte, error) {
+	// Catalog commands have a separate 3 MiB server ceiling.
+	return marshalBoundedRequest(value, 3<<20, "graph catalog")
+}
+
+func marshalBoundedRequest(value any, maximum int, protocol string) ([]byte, error) {
 	body, err := json.Marshal(value)
 	if err != nil {
 		return nil, err
 	}
-	if len(body) > sqlMaxRequestBytes {
-		return nil, errors.New("SQL request exceeds 4 MiB")
+	if len(body) > maximum {
+		return nil, fmt.Errorf("%s request exceeds %d bytes", protocol, maximum)
 	}
 	return body, nil
 }
 
 func executeSQLRequest(doer HttpRequestDoer, request *http.Request) (*http.Response, error) {
+	return executeBoundedNoReplayRequest(doer, request, sqlMaxRequestBytes, sqlMaxResponseBytes, "SQL")
+}
+
+func executeGraphRequest(doer HttpRequestDoer, request *http.Request) (*http.Response, error) {
+	return executeBoundedNoReplayRequest(doer, request, 1<<20, 32<<20, "graph")
+}
+
+func executeGraphCatalogRequest(doer HttpRequestDoer, request *http.Request) (*http.Response, error) {
+	return executeBoundedNoReplayRequest(doer, request, 3<<20, 32<<20, "graph catalog")
+}
+
+func executeBoundedNoReplayRequest(doer HttpRequestDoer, request *http.Request, maximumRequest, maximumResponse int64, protocol string) (*http.Response, error) {
 	// Editors may replace the encoded body: enforce the cap after every editor.
 	var body []byte
 	if request.Body != nil {
 		var err error
-		body, err = io.ReadAll(io.LimitReader(request.Body, sqlMaxRequestBytes+1))
+		body, err = io.ReadAll(io.LimitReader(request.Body, maximumRequest+1))
 		_ = request.Body.Close()
 		if err != nil {
 			return nil, err
 		}
-		if len(body) > sqlMaxRequestBytes {
-			return nil, errors.New("SQL request exceeds 4 MiB")
+		if int64(len(body)) > maximumRequest {
+			return nil, fmt.Errorf("%s request exceeds %d bytes", protocol, maximumRequest)
 		}
 	}
 	request.Body = io.NopCloser(bytes.NewReader(body))
 	request.ContentLength = int64(len(body))
-	// net/http cannot replay a consumed nonempty body without GetBody.
+	// net/http cannot replay a consumed nonempty body without GetBody, even
+	// when a caller supplies an Idempotency-Key header.
 	request.GetBody = nil
 	var response *http.Response
 	var err error
-	switch client := doer.(type) {
-	case *http.Client:
+	if client, ok := doer.(*http.Client); ok {
 		owned := *client
 		owned.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		response, err = owned.Do(request)
-	case SQLNoReplayDoer:
+	} else if protocol == "SQL" {
+		client, ok := doer.(SQLNoReplayDoer)
+		if !ok {
+			return nil, errors.New("SQL custom transport must implement SQLNoReplayDoer")
+		}
 		response, err = client.DoSQLNoReplay(request)
-	default:
-		return nil, errors.New("SQL custom transport must implement SQLNoReplayDoer")
+	} else {
+		client, ok := doer.(GraphNoReplayDoer)
+		if !ok {
+			return nil, errors.New("graph custom transport must implement GraphNoReplayDoer")
+		}
+		response, err = client.DoGraphNoReplay(request)
 	}
 	if err != nil {
 		return nil, err
 	}
 	if response == nil || response.Body == nil {
-		return nil, errors.New("SQL transport returned no response body")
+		return nil, fmt.Errorf("%s transport returned no response body", protocol)
 	}
-	if response.ContentLength > sqlMaxResponseBytes {
+	if response.ContentLength > maximumResponse {
 		_ = response.Body.Close()
-		return nil, errors.New("SQL response exceeds 16 MiB")
+		return nil, fmt.Errorf("%s response exceeds %d bytes", protocol, maximumResponse)
 	}
-	response.Body = &sqlBoundedBody{ReadCloser: response.Body, remaining: sqlMaxResponseBytes}
+	response.Body = &sqlBoundedBody{ReadCloser: response.Body, remaining: maximumResponse, protocol: protocol}
 	return response, nil
 }
 
 type sqlBoundedBody struct {
 	io.ReadCloser
 	remaining int64
+	protocol  string
 }
 
 func (body *sqlBoundedBody) Read(buffer []byte) (int, error) {
@@ -104,7 +144,7 @@ func (body *sqlBoundedBody) Read(buffer []byte) (int, error) {
 		n, err := body.ReadCloser.Read(extra[:])
 		if n != 0 {
 			_ = body.Close()
-			return 0, errors.New("SQL response exceeds 16 MiB")
+			return 0, fmt.Errorf("%s response exceeds its byte limit", body.protocol)
 		}
 		return 0, err
 	}
@@ -123,6 +163,17 @@ func readSQLResponseBody(body io.Reader) ([]byte, error) {
 	}
 	if len(value) > sqlMaxResponseBytes {
 		return nil, fmt.Errorf("SQL response exceeds 16 MiB")
+	}
+	return value, nil
+}
+
+func readGraphResponseBody(body io.Reader) ([]byte, error) {
+	value, err := io.ReadAll(io.LimitReader(body, (32<<20)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(value) > 32<<20 {
+		return nil, errors.New("graph response exceeds 32 MiB")
 	}
 	return value, nil
 }

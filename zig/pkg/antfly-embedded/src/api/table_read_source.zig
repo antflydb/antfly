@@ -245,6 +245,7 @@ pub const TableReadSource = struct {
     route_fence: ?metadata_api.CatalogRouteFence = null,
 
     pub const VTable = struct {
+        open_cypher_statement: ?*const fn (*anyopaque, std.mem.Allocator, @import("../storage/cypher_read.zig").Statement) anyerror!@import("../storage/cypher_read.zig").Read = null,
         /// First-party routing binds each read to a linearizable policy
         /// observation. The fixed-size return owns its identity across hops.
         privacy_policy_version: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, ?u64) anyerror![64]u8 = null,
@@ -687,6 +688,16 @@ pub const TableReadSource = struct {
         const fence = self.route_fence orelse return error.CatalogRouteFenceRequired;
         const acquire = self.vtable.try_statement_read_fence_group_local_routed orelse return error.SqlStatementSnapshotRequired;
         return BoundaryAbi.call("try_statement_read_fence_group_local_routed", self.boundary_dispatch, acquire, .{ self.ptr, alloc, fence, group, table, fenced, consistency });
+    }
+    pub fn openCypherStatement(self: TableReadSource, alloc: std.mem.Allocator, input: @import("../storage/cypher_read.zig").Statement) !@import("../storage/cypher_read.zig").Read {
+        const open = self.vtable.open_cypher_statement orelse return error.CypherSnapshotRequired;
+        if (self.vtable.privacy_policy_version == null) return BoundaryAbi.call("open_cypher_statement", self.boundary_dispatch, open, .{ self.ptr, alloc, input });
+        const tables = try alloc.dupe(@import("../storage/cypher_read.zig").Table, input.tables);
+        defer alloc.free(tables);
+        for (tables) |*table| table.privacy_policy_version = try self.privacyFence(alloc, table.name, input.deadline_ns, table.privacy_policy_version);
+        var fenced = input;
+        fenced.tables = tables;
+        return BoundaryAbi.call("open_cypher_statement", self.boundary_dispatch, open, .{ self.ptr, alloc, fenced });
     }
 
     pub fn bindCatalogRouteFenceJson(
@@ -1732,3 +1743,39 @@ test "scan stream preserves chunk backpressure without buffered fallback" {
 }
 
 pub const bindNativeCutBodyAlloc = @import("../storage/db/native_query_cut_contract.zig").bindBodyAlloc;
+
+test "graph statements bind privacy versions before capturing owners" {
+    const port = @import("../storage/cypher_read.zig");
+    const Fixture = struct {
+        opens: usize = 0,
+        fn version(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?u64) ![64]u8 {
+            return @splat('a');
+        }
+        fn open(raw: *anyopaque, _: std.mem.Allocator, input: port.Statement) !port.Read {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.opens += 1;
+            try std.testing.expectEqual(@as(usize, 1), input.tables.len);
+            try std.testing.expectEqual(@as(?[64]u8, @as([64]u8, @splat('a'))), input.tables[0].privacy_policy_version);
+            return error.CypherSnapshotRequired;
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_types.LookupOptions, _: read_gate.ReadConsistency) !?LookupResponse {
+            return error.UnexpectedLookup;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_types.ScanOptions, _: read_gate.ReadConsistency) !?ScanResponse {
+            return error.UnexpectedScan;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_types.SearchRequest, _: read_gate.ReadConsistency) !?query_api.QueryResponse {
+            return error.CypherSnapshotRequired;
+        }
+    };
+    var fixture: Fixture = .{};
+    const source: TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = Fixture.scan, .query = Fixture.query, .open_cypher_statement = Fixture.open, .privacy_policy_version = Fixture.version } };
+    var tables = [_]port.Table{.{ .name = "docs", .table_id = 1, .schema_version = 0 }};
+    const input: port.Statement = .{ .catalog_json = "{}", .tables = &tables, .cut_id = @splat('0'), .expires_ms = 1, .ttl_now_ns = 1 };
+    try std.testing.expectError(error.CypherSnapshotRequired, source.openCypherStatement(std.testing.allocator, input));
+    try std.testing.expectEqual(@as(usize, 1), fixture.opens);
+    try std.testing.expect(tables[0].privacy_policy_version == null);
+    tables[0].privacy_policy_version = @as([64]u8, @splat('b'));
+    try std.testing.expectError(error.IndexRebuilding, source.openCypherStatement(std.testing.allocator, input));
+    try std.testing.expectEqual(@as(usize, 1), fixture.opens);
+}

@@ -106,6 +106,24 @@ pub const Collector = struct {
         try self.grouped.add(keys, inputs);
         try self.capture(keys, inputs);
     }
+    pub fn addWeighted(self: *Collector, keys: []const Datum, inputs: []const Datum, weight: u64) !void {
+        if (weight == 1) return self.add(keys, inputs);
+        if (self.bound.ordered.len != 0) return error.InvalidSqlBackendResponse;
+        try self.grouped.addWeighted(keys, inputs, weight);
+    }
+    pub fn addCount(self: *Collector, keys: []const Datum, inputs: []const Datum, count: @import("catalog.zig").Count) !void {
+        if (count.isOne()) return self.add(keys, inputs);
+        if (self.bound.ordered.len != 0) return error.InvalidSqlBackendResponse;
+        try self.grouped.addCount(keys, inputs, count);
+    }
+    pub fn addStatistics(self: *Collector, keys: []const Datum, arguments: []const @import("cypher").statistic.Argument, weight: @import("catalog.zig").Count) !void {
+        if (self.bound.ordered.len != 0) return error.InvalidSqlBackendResponse;
+        try self.grouped.addStatistics(keys, arguments, weight);
+    }
+    pub fn addSupport(self: *Collector, keys: []const Datum, slot: usize, input: @import("cypher").statistic.SupportInput) !void {
+        if (self.bound.ordered.len != 0) return error.InvalidSqlBackendResponse;
+        try self.grouped.addSupport(keys, slot, input);
+    }
     pub fn addGlobalBatch(self: *Collector, inputs: []const []const Datum) !void {
         try self.grouped.addGlobalBatch(inputs);
         for (inputs) |row| try self.capture(&.{}, row);

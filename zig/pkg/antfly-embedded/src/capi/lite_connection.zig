@@ -111,6 +111,7 @@ pub const PreparedPublication = struct {
     snapshot_root: *h.Handle,
     snapshot_database: *h.db_mod.DB,
     source_read: ?*SourceRead,
+    root_catalog_read: ?*SourceRead = null,
     /// Exists only while one live writer fence excludes intervening commits.
     document_guards: ?*DocumentGuards = null,
     relational_rows: bool,
@@ -222,6 +223,22 @@ pub const PreparedPublication = struct {
         return result;
     }
 
+    pub fn publishPromotions(self: *@This(), allocator: std.mem.Allocator, entries: []const @import("../storage/db/runtime_callbacks.zig").EntityUpsert) !void {
+        const io = h.handleLockIo();
+        self.owner.gate.mutex.lockUncancelable(io);
+        defer self.owner.gate.mutex.unlock(io);
+        if (self.owner.stopping.load(.acquire)) return error.Canceled;
+        var lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
+        defer lease.close();
+        // Validate source namespace/catalog and replacement generation before
+        // opening destination intents. Foreground recovery cannot observe or
+        // abandon an in-flight preparation while this fence is held.
+        _ = try self.current();
+        try @import("entity_sink.zig").upsertBatch(self.owner.current.?, allocator, entries);
+        self.refreshSnapshotCheckpoint();
+        self.owner.notifyMutation();
+    }
+
     const HeldStore = struct {
         publication: *PreparedPublication,
         path_lease: native.PathWriterLock,
@@ -280,6 +297,36 @@ pub const PreparedPublication = struct {
                 if (self.owner.current) |live_root| snapshot.file.inheritAllocatorVerification(&live_root.owned_lite_backend.?.native_docstore.?.file) catch {};
             } else self.index_inputs_changed = true;
         } else self.index_inputs_changed = true;
+    }
+
+    /// Index publication needs current catalog bytes, not a complete foreground
+    /// runtime reopen for every native mutation. The path lease pins these raw
+    /// observations through commit; primary producer publication still uses current().
+    fn requireCurrentCatalog(self: *@This()) !void {
+        const captured = self.source_read orelse return error.EnrichmentWaitCanceled;
+        var expected = try captured.openReadScope(alloc);
+        defer expected.close();
+        var live = try self.snapshot_database.core.store.runtime_store.beginRead();
+        defer live.abort();
+        var actual = try live.openReadScope(alloc);
+        defer actual.close();
+        const inventory = @import("../storage/db/artifact_inventory.zig");
+        for ([_][]const u8{
+            "\x00\x00__metadata__:schema_json",
+            @import("../storage/db/table_catalog.zig").key,
+            inventory.index_key,
+            inventory.enrichment_key,
+            inventory.resolver_key,
+            &keys.identity_namespace_key,
+        }) |key| try sameValue(&expected, &actual, key);
+        const root_capture = self.root_catalog_read orelse return error.EnrichmentWaitCanceled;
+        var root_expected = try root_capture.openReadScope(alloc);
+        defer root_expected.close();
+        var root_live = try self.snapshot_root.db.core.store.runtime_store.beginRead();
+        defer root_live.abort();
+        var root_actual = try root_live.openReadScope(alloc);
+        defer root_actual.close();
+        try sameValue(&root_expected, &root_actual, @import("tables.zig").catalog_key);
     }
 
     fn guardDocument(self: *@This(), database: *h.db_mod.DB, doc_key: []const u8) !void {
@@ -1415,6 +1462,7 @@ pub const Owner = struct {
     maintenance_schedules: std.AutoHashMapUnmanaged(MaintenanceKey, MaintenanceSchedule) = .empty,
     maintenance_root_incarnation: ?u128 = null,
     wake: std.Io.Event = .unset,
+    maintenance_activity: @import("maintenance_activity.zig").Activity = .{},
     current: ?*h.Handle = null,
     retired: std.ArrayList(*h.Handle) = .empty,
     maintenance_snapshot: ?*h.Handle = null,
@@ -1526,12 +1574,12 @@ pub const Owner = struct {
             // An uncertain publication can fail before writing anything, so an
             // unchanged header does not prove the runtime is reusable: reopen
             // to reconcile from durable state.
-            if (current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and std.meta.eql(probe.header, file.header)) {
+            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
             }
-            if (current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and
+            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and
                 try file.runtimeMetadataUnchanged(&probe) and try loadedIndexInputsUnchanged(current, file, &probe))
             {
                 // Lease bookkeeping and unpublished shadow files do not change
@@ -1612,7 +1660,7 @@ pub const Owner = struct {
             previous.lease_snapshot = true;
             // Cursor continuation can only read this generation. Make every
             // namespace's shared native store reject publication immediately.
-            if (previous.maintenance_references == 0) {
+            if (previous.maintenance_references == 0 and previous.immutable_query_borrows == 0) {
                 previous.owned_lite_backend.?.native_docstore.?.read_only = true;
                 previous.owned_lite_backend.?.native_docstore.?.file.read_only = true;
             }
@@ -2015,6 +2063,10 @@ pub const Owner = struct {
     // Primary transactions and index publications join the fair writer queue.
     // Their DB/index locks belong to the detached runtime; foreground refresh
     // opens a separate runtime. Reclamation admission yields on contention.
+    fn enterReplacementWriter(ptr: *anyopaque) !void {
+        try enterMaintenanceWriter(ptr, .index);
+    }
+
     fn enterMaintenanceWriter(ptr: *anyopaque, scope: PublicationScope) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         const self = root.maintenance_owner.?;
@@ -2030,6 +2082,10 @@ pub const Owner = struct {
         if (self.stopping.load(.acquire)) return error.Canceled;
         self.publication_stats.attempts +|= 1;
         errdefer self.publication_stats.refused +|= 1;
+        // Bounded allocator service runs after detached publication/catalog
+        // pins have been released and computes no document/index output.
+        const requires_publication = scope != .reclamation and scope != .allocator_service;
+        if (requires_publication and root.maintenance_publication == null) return error.Canceled;
         // A resolver publication can change index inputs before its replay
         // watermark is saved. Fence subsequent immutable index work, while
         // allowing primary transactions to read the rebased checkpoint and
@@ -2087,6 +2143,13 @@ pub const Owner = struct {
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
             if (self.current) |current| try file.inheritAllocatorVerification(&current.owned_lite_backend.?.native_docstore.?.file);
             self.publication_stats.rebased +|= 1;
+        }
+        if (requires_publication) {
+            const publication = root.maintenance_publication orelse return error.Canceled;
+            publication.requireCurrentCatalog() catch |err| {
+                publication.index_inputs_changed = true;
+                return err;
+            };
         }
         // A changed tip invalidates a detached proof. Retry outside the gate
         // instead of falling back to a whole-file scan in this publication.
@@ -2630,11 +2693,14 @@ pub const Owner = struct {
         var source_read = if (run_database) try database.core.store.runtime_store.beginRead() else null;
         defer if (source_read) |*read| read.abort();
         clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.snapshot_ns);
+        var root_catalog_read = if (run_database) try root.db.core.store.runtime_store.beginRead() else null;
+        defer if (root_catalog_read) |*read| read.abort();
         var catalog = if (run_database) try PublicationCatalog.capture(turn_alloc, root, database) else null;
         defer if (catalog) |*proof| proof.deinit();
         clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.publication_catalog_ns);
-        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (catalog) |*proof| proof else null, .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
+        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (catalog) |*proof| proof else null, .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .root_catalog_read = if (root_catalog_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         root.maintenance_references += 1;
+        self.maintenance_activity.begin();
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
         const store = root.owned_lite_backend.?.native_docstore.?;
@@ -2656,6 +2722,7 @@ pub const Owner = struct {
 
         if (comptime h.builtin.is_test) if (self.test_after_capture) |hook| hook.notify(hook.ptr, root);
         const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
+        if (run_database) database.graph_replacement_admission = .{ .ptr = root, .enter = enterReplacementWriter, .leave = leaveMaintenanceWriter };
         var maintenance_error: ?anyerror = null;
         if (run_database) store.prepareAllocatorVerification(&self.verification_cancel) catch |err| {
             maintenance_error = err;
@@ -2689,6 +2756,7 @@ pub const Owner = struct {
             // no-consumer writes) traced back to.
             break :ran ran and self.registeredDemand().any();
         }) else projected;
+        if (run_database) database.graph_replacement_admission = null;
         if (run_database) if (database.enrichment_runtime) |runtime| {
             runtime.dense_result_cache = null;
             runtime.generated_publication = null;
@@ -2697,6 +2765,8 @@ pub const Owner = struct {
         root.maintenance_publication = null;
         if (source_read) |*read| read.abort();
         source_read = null;
+        if (root_catalog_read) |*read| read.abort();
+        root_catalog_read = null;
         // No detached computation/publication can use the catalog now. Drop
         // its checkpoint pin before physical service, which otherwise retains
         // an obsolete reader fence throughout its own reuse/vacuum attempt.
@@ -2743,6 +2813,7 @@ pub const Owner = struct {
         store.writer_admission = null;
         root.maintenance_owner = null;
         root.maintenance_references -= 1;
+        self.maintenance_activity.finish(io);
         if (independent) inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
         if (!independent and self.current != root) {
             store.read_only = true;
@@ -2824,6 +2895,7 @@ pub const Owner = struct {
         const store = root.owned_lite_backend.?.native_docstore.?;
         const maintenance_entry_header = store.file.header;
         root.maintenance_references += 1;
+        self.maintenance_activity.begin();
         root.maintenance_owner = self;
         root.maintenance_publication = null;
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
@@ -2838,6 +2910,7 @@ pub const Owner = struct {
         store.writer_admission = null;
         root.maintenance_owner = null;
         root.maintenance_references -= 1;
+        self.maintenance_activity.finish(io);
         inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
         try self.adoptIdleMaintenanceCheckpoint(foreground, entry_header, maintenance_entry_header, store);
         // Same benign-race exception as the full turn's maintainOnce call
@@ -3086,6 +3159,25 @@ pub const Owner = struct {
 
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
+        // `WriterLane.checkin` parks the kernel-level path lease
+        // (`native.PathWriterLock`, a `flock`-style advisory lock held open
+        // on its own file descriptor) between writers instead of releasing
+        // it, so a same-Store writer can reclaim it for free (see
+        // `WriterLane`'s doc comment). That is only ever safe while this
+        // Owner -- and so this lane -- stays alive to hand it off again.
+        // The last Connection closing means nobody ever will: leaving a
+        // parked (or, if a lane-managed call is somehow still mid-flight
+        // here, checked-out) lease open leaks the fd and keeps the kernel
+        // lease held past this process's own knowledge of it, so a later
+        // `open()` of the same path in this same process -- even from a
+        // brand new Owner -- can never acquire a fresh lease of its own:
+        // `flock` is per-descriptor, not per-process, so it just queues
+        // behind its own abandoned lock forever, eventually timing out
+        // with `FileBusy`/`WouldBlock` on every caller that needed it.
+        if (self.writer_lane.parked) |*lease| lease.close();
+        self.writer_lane.parked = null;
+        if (self.writer_lane.held_lease) |*lease| lease.close();
+        self.writer_lane.held_lease = null;
         self.certifyAllocatorOnClose() catch |err| {
             // Failure only loses the optimization; the previous checkpoint
             // remains recoverable and the next owner uses ordinary proof.
@@ -3217,6 +3309,14 @@ pub const Connection = struct {
     }
 
     pub fn acquire(self: *Connection) !native.PathWriterLock {
+        return self.acquireWithMaintenance(false);
+    }
+
+    pub fn acquireForMaintenance(self: *Connection) !native.PathWriterLock {
+        return self.acquireWithMaintenance(true);
+    }
+
+    fn acquireWithMaintenance(self: *Connection, manual_maintenance: bool) !native.PathWriterLock {
         const io = h.handleLockIo();
         const gate_started = std.Io.Clock.awake.now(io).nanoseconds;
         self.gate.mutex.lockForLease(io, self.storeIdentity());
@@ -3227,6 +3327,7 @@ pub const Connection = struct {
             stats.gate_wait_max_ns = @max(stats.gate_wait_max_ns, waited);
         }
         errdefer self.gate.mutex.unlock(io);
+        if (manual_maintenance) self.owner.maintenance_activity.wait(io, &self.gate.mutex);
         return self.acquirePathLeaseAssumeLocked();
     }
 
@@ -5913,6 +6014,12 @@ test "capi native allocator proof issue1431 bounded allocator service rebases a 
     // A prepared vacuum must still refuse this stale capture.
     try std.testing.expectError(error.EnrichmentWaitCanceled, Owner.enterMaintenanceWriter(detached, .reclamation));
     try std.testing.expectEqual(captured, file.header);
+    // The exemption is metadata-only: detached document/index writes still
+    // require their publication and catalog proof before they can rebase.
+    for ([_]PublicationScope{ .primary, .index, .artifact_lease }) |scope| {
+        try std.testing.expectError(error.Canceled, Owner.enterMaintenanceWriter(detached, scope));
+        try std.testing.expectEqual(captured, file.header);
+    }
     const admitted = owner.publication_stats.allocator_service_admissions;
     try Owner.enterMaintenanceWriter(detached, .allocator_service);
     var held = true;
