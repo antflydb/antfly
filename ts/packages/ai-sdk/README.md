@@ -156,10 +156,13 @@ const result = await generateText({
 each take their scope (memory space, table, database/namespace) as
 constructor options, not model-controllable tool arguments, per antfly#1505.
 
-- **Memory** (`/memory/v1`): `recall`, `remember` (an observation) and
-  `forget` (destructive, `needsApproval: true`). Covers only those three
-  operations; the rest of the memory API (assertions, corrections,
-  supersession, evaluation, lineage, entities, ...) is out of scope here.
+- **Memory** (`/memory/v1`): the default profile keeps `recall`, `remember`
+  (an evidence-backed assertion) and `forget` (`needsApproval: true`).
+  `profile: "agent"` opts into eight tools matching the native agent MCP profile:
+  `brief`, `recall`, `remember`, `get`, `explain`, `correct`, `forget`, `outcome`.
+  Consolidation, pin curation, proposal review, evaluation and lineage remain
+  explicit host/operator calls through the ordinary SDK. Native policy owns
+  authorization, retention, revision checks, truth and ranking.
   Tool results encode exact integers outside JavaScript’s safe numeric range
   as decimal strings so model messages, UI streams and JSON history retain
   their full precision. Safe numeric values remain numbers.
@@ -181,6 +184,61 @@ Tool execution forwards the AI SDK cancellation signal to Antfly requests,
 including memory mutations. Cancellation after a write has committed does not
 undo it.
 
+## Agent memory sessions
+
+`createMemorySession` adds explicit host lifecycle helpers and defaults its
+`tools` to the agent profile. Scope and budget ceilings are fixed by the host;
+model arguments can only reduce retrieval budgets. Server configuration still
+applies its own maximum. Defaults are 16 brief items/1024 response bytes and
+20 recall items/2048 response bytes. `utilityWeight` is a host option (0–1).
+
+```ts
+import { createMemorySession } from "@antfly/ai-sdk";
+
+const memory = createMemorySession({
+  client,
+  space: "assistant",
+  database: "projects",
+  namespace: "public",
+  branch: "",
+  runId: requestId, // Globally unique host request/task ID; stable across retries.
+  briefTokenBudget: 1024,
+  recallTokenBudget: 2048,
+  utilityWeight: 0.5,
+});
+const brief = await memory.loadBrief({ signal });
+// Supply this JSON-safe, bounded data in your application's task context.
+const context = JSON.stringify(brief);
+// Pass memory.tools to generateText/streamText alongside your other tools.
+
+// Once the application actually consumes the context:
+await memory.recordAccess(brief.items.map((item) => item.id), {
+  eventId: "initial-context", signal,
+});
+// Report the application's verified result, independently of model completion:
+await memory.recordOutcome({
+  eventId: "task-result",
+  taskId: requestId,
+  success: taskSucceeded,
+  usedMemoryIds: consumedMemoryIds,
+}, { signal });
+```
+
+Reusing a globally unique `runId` and the same AI SDK `toolCallId` reproduces
+mutation keys and evidence/assertion IDs across reconstructed tool sets and
+process restarts. The host must keep that run ID distinct across principals and
+unrelated tasks. Session access/outcome helpers use host event IDs: reuse one for
+a retry and choose a new one for a new event. Different inputs with the same
+identity are rejected by native idempotency policy. Basic tools without a run ID
+retain fresh-key behavior.
+
+`loadBrief` reads fresh native state on every call and performs no access write.
+The host reports only IDs actually consumed; an empty access list is a no-op.
+No outcome is inferred from a model finishing, and no chat transcript is ingested
+automatically. All helper requests accept cancellation signals. Exact native
+integers become decimal strings in model/history results; `correct` accepts a
+safe integer or decimal-string `expectedRevision` and sends an exact uint64.
+
 ## Chat history
 
 `createChatHistory({ client, table })` stores `ai` v7 `UIMessage[]` in a
@@ -193,9 +251,8 @@ little write latency for that guarantee rather than adding a read-side wait.
 
 ## Versions
 
-`ai@^7`, Node only (no edge runtime yet -- see antfly#1505). Automatic memory
-(middleware-driven context injection) is off; this package only ships
-explicit memory tools.
+`ai@^7`, Node only (no edge runtime yet -- see antfly#1505). Automatic ingestion and middleware-driven context injection are off; memory
+is exposed through explicit tools and host-controlled session helpers.
 
 ## Development
 

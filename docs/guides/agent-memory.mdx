@@ -264,6 +264,16 @@ with antfly_embedded.create("agent.aflite") as db:
 
 Against a server, the Python SDK uses the same action names: `AntflyClient(url).memory.execute("agent", "recall", body={...})`, plus helpers such as `memory.brief("agent")` and `memory.recall("agent", query=...)` that generate idempotency keys for you.
 
+For Vercel AI SDK agents, `@antfly/ai-sdk` exports `createMemorySession`. Give it
+the authenticated client, fixed space/catalog scope, a globally unique host
+`runId`, and brief/recall budget ceilings. `loadBrief()` returns fresh bounded
+context; `tools` opts into the native eight-tool agent profile. After consuming
+memory, the host calls `recordAccess(ids, {eventId})` and reports its actual task
+result with `recordOutcome(...)`. Stable run, tool-call and event IDs deduplicate
+retries across restarts. The existing `createMemoryTools` default keeps its three
+tools; pass `profile: "agent"` to opt in. Consolidation and curator review remain
+explicit application/operator calls, and transcript ingestion is never implicit.
+
 ### Connect an Agent over MCP
 
 Point an agent at `/memory/v1/mcp/agent`. It lists a small toolset: `memory_brief`, `memory_recall`, `memory_observe`, `memory_correct`, `memory_forget`, `memory_outcome`, `memory_get` and `memory_explain`. The tool descriptions say what memory is for rather than prescribing rules. Writes on this endpoint don't need an `idempotency_key`: when one is omitted, Antfly derives it from the tool arguments, so an identical retry replays the first result. Operators and curators use `/memory/v1/mcp`, which lists every action, including proposals, lineage, evaluation, pins and consolidation. The full contract, covering evidence and temporal policy, identity and supersession judging, provenance, and recorded explanations, is in [MEMORY.md](https://github.com/antflydb/antfly/blob/main/zig/MEMORY.md).
