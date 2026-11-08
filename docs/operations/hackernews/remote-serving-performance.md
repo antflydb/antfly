@@ -929,6 +929,60 @@ construction, resumed pagination and suppression checks. These options extend th
 existing real-corpus, selectivity, concurrent-write, restart and cache-cleared
 checks without changing their expected results or retry contracts.
 
+The larger pending-WAL case exposed a preparation-budget defect: physical-mask
+construction retained each partition's temporary predicate plans in the shared
+prepared-reader arena. Resolve each partition in reclaimable scratch while
+preserving the enclosing memory budgets, then copy only its completed physical
+row set into the retained owner. No query limit was increased. A native
+regression resolves 256 partitions with 128 KiB of temporary planning each under
+a 256 KiB budget, checks all retained row identities and verifies complete
+budget release. The original HTTP reproduction also passes with 10,000 real
+comments, 1,000 additional pending changes and an 8 MiB memory cache.
+
+Qualification used engine source `ee54d8350811e697b6638a0f578e26f57a1e3c19`
+with the same corpus hashes recorded above. The ReleaseSafe server SHA-256 is
+`9f7d5f101ac4b2eff91a44cab01ef0df01a11b43026fd6314b71da2ad2ad9b56`;
+the matching Lite library is
+`678d9aa63ed76836505f6c4472858260f401024fa6807f92bfed17b8768e0295`.
+The integrated build passed 96/96 steps and the 141-function public export
+boundary. All 70 focused native tests passed without failures, skips or leaks.
+The four local composed modes passed. The HN hierarchy/restart bridge initially
+returned HTTP 503 `InvalidSocketOption` during dry-run vacuum; an unchanged
+repeat passed. That intermittent transport observation remains visible here.
+
+Both fully remote GCS modes passed with highlights, 1,000 additional pending
+changes and an 8 MiB memory cache. They verified two preparations across three
+leaf calls for both profiling and resumed pending cursors, zero query-time
+cursor publication, and three acknowledged ingestion batches during concurrent
+reads. Stored-source and Parquet-hydration modes completed 424 and 449 successful
+publication-overlapping reads respectively, with no binding conflicts or
+retryable rebuild responses. Single-request samples were:
+
+| Mode | First after restart | Warm median (3) | Cache-cleared query | Sampled peak RSS | Sampled peak footprint |
+|---|---:|---:|---:|---:|---:|
+| Stored source | 2,643 ms | 81 ms | 6,399 ms | 194 MiB | 181 MiB |
+| Parquet hydration | 1,169 ms | 83 ms | 7,581 ms | 196 MiB | 233 MiB |
+
+These are client HTTP times excluding startup; memory peaks cover the restart,
+warm and cache-cleared samples. The two modes ran concurrently on a busy host
+(load averages approximately 14/18/17, four concurrent Zig compilers). The
+12-query burst at concurrency four had medians of 121/116 ms. Reads during
+ingestion/publication had medians of 319/327 ms and maxima of 5.49/5.24 seconds.
+Separate selectivity probes ranged from 74 ms to 1.86 seconds, including zero
+hits for the English stopword `the` and the absent term. Profiling uses
+`database`; the initial profiling attempts incorrectly required seven hits for
+`the`, after their correctness checks had passed. No analyzer or correctness
+expectation was relaxed.
+All object versions under the task-owned GCS UUID prefixes were deleted and
+their absence verified after the runs; private qualification token files were
+removed. No infrastructure, IAM, deployment or release was changed.
+
+This pressure workload differs from the earlier baseline. The results do not
+establish a cold-latency speedup, a matched A/B comparison, DuckDB parity or
+full-archive performance. Restart and cache-cleared reads still incur remote
+I/O; the bounded demand history alone does not remove those costs. Only this
+compact new evidence is retained in the repository.
+
 Remaining deployment qualification uses a released candidate on the existing
 managed route and intended CPU/memory shape, sustained credential refresh and
 owner replacement with loss of local cache. Full-archive query diversity and
