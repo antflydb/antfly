@@ -13830,7 +13830,16 @@ const DocumentPreparationPipeline = struct {
             if (job.capabilities == null or !std.meta.eql(job.capabilities.?, current)) continue;
             // Allocate before replacing the owner's unit. No partial metadata
             // transfer can authorize a source, retry or publication transition.
-            const replacement = try cloneDocumentExtractionUnit(alloc, job.units.items[0]);
+            const replacement = cloneDocumentExtractionUnit(alloc, job.units.items[0]) catch |err| {
+                if (err != error.OutOfMemory) return err;
+                // Copying optional cached output must not turn foreground
+                // memory pressure into document/provider failure. No unit has
+                // been replaced yet; discard it and use ordinary extraction.
+                job.clearPrepared();
+                if (job.budgeted) |*budget| _ = budget.releaseUnusedCredit();
+                pipeline_metrics.prefetch(.reclaimed);
+                return false;
+            };
             units[0].deinit(alloc);
             units[0] = replacement;
             job.consumed = true;
@@ -46272,4 +46281,72 @@ test "document preparation shares circuit admission without recording scanner pr
     try std.testing.expectError(error.UnboundedEnrichmentProvider, job.checkDiscovery(job.producer, &.{request}));
     job.cancel.store(true, .release);
     try std.testing.expectError(error.Canceled, job.checkInvocation(job.producer, &.{request}));
+}
+
+test "document preparation copy admission failure discards optional state without changing owner units" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.UnexpectedProviderCall;
+        }
+        fn caps(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !?inference_work.InferenceCapabilities {
+            return .{ .task = .read, .input_modalities = .{ .image = true }, .input_granularity = .page, .output = .read_result, .model_revision = @splat(1), .model_revision_pinning = true };
+        }
+    };
+    var runtime = EnrichmentRuntime{
+        .alloc = a,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .ownership = undefined,
+        .config = .{},
+    };
+    const producer: asset_producer_mod.Producer = .{ .ptr = &runtime, .vtable = &.{ .produce = Fake.produce, .capabilities_for_requests = Fake.caps } };
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var cache = PreparedDocumentSourceCache.initWithConfig(a, .{}, null);
+    defer cache.deinit();
+    var job: DocumentPreparationPipeline.Job = .{
+        .context = undefined,
+        .cache = &cache,
+        .doc_key = undefined,
+        .source_url = undefined,
+        .config_json = undefined,
+        .config = .{ .ocr_config_json = "{}" },
+        .description = undefined,
+        .policy = .{ .max_items = 1, .max_bytes = 65536 },
+        .requested_policy = .{ .max_items = 1, .max_bytes = 65536 },
+        .producer = producer,
+        .computed = true,
+        .capabilities = try Fake.caps(&runtime, a, &.{}),
+        .budgeted = resource_manager_mod.BudgetedAllocator.init(&manager, .document_extraction_working_set, a, 1),
+    };
+    defer job.budgeted.?.deinit();
+    defer job.clearPrepared();
+    job.source = try cache.adoptOwned("https://example.test/input.pdf", null, .{ .data = try a.dupe(u8, "source"), .content_type = try a.dupe(u8, "application/pdf") });
+    defer if (job.source) |*source| source.deinit();
+    job.fingerprint = try job.allocator().dupe(u8, "identity");
+    const native: document_extraction_mod.Unit = .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast("native text"), .method = @constCast("pdf_ocr_pending"), .page_number = 1, .extraction_status = @constCast("pending_ocr") };
+    job.original_first = try cloneDocumentExtractionUnit(job.allocator(), native);
+    {
+        var selected = try cloneDocumentExtractionUnit(job.allocator(), native);
+        errdefer selected.deinit(job.allocator());
+        try job.units.append(job.allocator(), selected);
+    }
+    var units = [_]document_extraction_mod.Unit{try cloneDocumentExtractionUnit(a, native)};
+    defer units[0].deinit(a);
+    var pipeline = DocumentPreparationPipeline{ .runtime = &runtime, .guard = .{}, .jobs = .{ &job, null } };
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expect(!try pipeline.restoreComputed(failing.allocator(), producer, job.config, job.requested_policy, "identity", job.source.?.entry().content.data, &units));
+    try std.testing.expect(!job.computed and !job.consumed and job.units.items.len == 0 and job.original_first == null);
+    try std.testing.expectEqualStrings("native text", units[0].text);
+    try std.testing.expectEqualStrings("pending_ocr", units[0].extraction_status.?);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
 }
