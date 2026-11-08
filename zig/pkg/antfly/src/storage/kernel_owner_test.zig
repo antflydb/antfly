@@ -5910,3 +5910,20 @@ test "opaque native retirement status requires exact current image and stored fe
     defer permanent.deinit();
     try std.testing.expectError(error.InvalidSqlRelationPersistence, permanent.nativeRetirementStatusJson(a, "rows", request));
 }
+
+test "opaque storage pipeline metrics snapshot versions and ownership" {
+    var context: client.Context = .{};
+    defer context.deinit();
+    var response = try context.pipelineMetricsJson();
+    defer response.deinit();
+    const Metrics = @import("antfly_platform").document_pipeline_metrics;
+    const parsed = try std.json.parseFromSlice(Metrics.Snapshot, std.testing.allocator, response.bytes(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.version);
+    try std.testing.expectEqual(@typeInfo(Metrics.Phase).@"enum".field_names.len, parsed.value.counts.len);
+    var rejected: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_context_pipeline_metrics_json(null, 1, &rejected));
+    try std.testing.expect(rejected.ptr == null);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_context_pipeline_metrics_json(context.handle, 2, &rejected));
+    try std.testing.expect(rejected.ptr == null);
+}

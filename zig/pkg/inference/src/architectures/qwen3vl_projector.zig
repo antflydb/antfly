@@ -965,6 +965,8 @@ fn encodePreparedProjectedImagesResidentBatchedPolicy(
     prepared_images: []const *const PreparedImage,
     limits: Limits,
 ) ![]ProjectedImages {
+    const phase_timer = @import("antfly_platform").document_pipeline_metrics.start(.vision);
+    defer phase_timer.finish();
     try limits.validate();
     if (prepared_images.len == 0 or prepared_images.len > maxResidentVisionBatchItems(cb.kind()) or prepared_images.len > limits.max_images) return error.ImageLimitExceeded;
     const cfg = try configFromResidentModel(config);
@@ -1345,6 +1347,8 @@ pub fn prepareProjectedImageResident(
     limits: Limits,
     control: image_work_control.Control,
 ) !PreparedImage {
+    const phase_timer = @import("antfly_platform").document_pipeline_metrics.start(.vision_prepare);
+    defer phase_timer.finish();
     const cfg = try configFromResidentModel(config);
     return prepareImageCpu(allocator, cfg, bytes, limits, control, true);
 }
@@ -1500,6 +1504,8 @@ fn encodePreparedSingleImage(
     limits: Limits,
     collect_preprocess_evidence: bool,
 ) !EncodedImage {
+    const phase_timer = @import("antfly_platform").document_pipeline_metrics.start(.vision);
+    defer phase_timer.finish();
     var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
     var stage_started_at = if (profile) monotonicNowNs() else 0;

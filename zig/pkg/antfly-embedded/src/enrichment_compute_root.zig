@@ -28,4 +28,5 @@ comptime {
     @export(&provider.pdfSessionClose, .{ .name = "antfly_enrichment_pdf_session_close", .visibility = .hidden });
     @export(&provider.pdfBackend, .{ .name = "antfly_enrichment_pdf_backend", .visibility = .hidden });
     @export(&provider.bufferDestroy, .{ .name = "antfly_enrichment_buffer_destroy", .visibility = .hidden });
+    @export(&provider.pipelineMetricsJson, .{ .name = "antfly_enrichment_pipeline_metrics_json", .visibility = .hidden });
 }

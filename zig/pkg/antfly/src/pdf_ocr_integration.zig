@@ -50,9 +50,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const LocalReaderBoundary = struct {
-        read_calls: usize = 0,
+        read_calls: std.atomic.Value(usize) = .init(0),
         generator_calls: usize = 0,
         embed_calls: usize = 0,
+        revisioned: bool = false,
+        prefetch_entered: std.atomic.Value(usize) = .init(0),
 
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
@@ -63,18 +65,44 @@ pub fn main(init: std.process.Init) !void {
                 .embed_dense_parts = embedParts,
                 .read_encoded_images = readEncodedImages,
                 .read_encoded_images_reported = readEncodedImagesReported,
+                .read_encoded_images_reported_with_context = readEncodedImagesReportedWithContext,
+                .model_capabilities_with_context = modelCapabilitiesWithContext,
                 .generate_messages_with_attachments = generateMessagesWithAttachments,
                 .model_capabilities = modelCapabilities,
             };
         }
 
+        fn modelCapabilitiesWithContext(ptr: *anyopaque, result_alloc: std.mem.Allocator, model: []const u8, task: inference_work.Task, context: managed_embedder.RequestContext) !inference_work.InferenceCapabilities {
+            try context.check();
+            return modelCapabilities(ptr, result_alloc, model, task);
+        }
+        fn readEncodedImagesReportedWithContext(ptr: *anyopaque, result_alloc: std.mem.Allocator, model: []const u8, request: readers.EncodedRequest, context: managed_embedder.RequestContext) !readers.BatchResult {
+            try context.check();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.revisioned) {
+                _ = self.prefetch_entered.fetchAdd(1, .acq_rel);
+                const deadline = @import("antfly_platform").time.monotonicNs() + 10 * std.time.ns_per_s;
+                // The first speculative page cannot complete until its peer
+                // enters the provider. Refilling after join would time out.
+                while (self.prefetch_entered.load(.acquire) < 2) {
+                    try context.check();
+                    if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.IntegrationPrefetchNotOverlapped;
+                    @import("antfly_platform").time.yieldNow();
+                }
+            }
+            return readEncodedImagesReported(ptr, result_alloc, model, request);
+        }
+
         fn modelCapabilities(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
             task: inference_work.Task,
         ) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
+                .model_revision = if (self.revisioned) @as([32]u8, @splat(1)) else null,
+                .model_revision_pinning = self.revisioned,
                 .task = task,
                 .input_modalities = switch (task) {
                     .read => .{ .image = true },
@@ -166,8 +194,9 @@ pub fn main(init: std.process.Init) !void {
             request: readers.EncodedRequest,
         ) ![]readers.Result {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.read_calls += 1;
-            if (!std.mem.eql(u8, model, "multistage-integration"))
+            _ = self.read_calls.fetchAdd(1, .monotonic);
+            if (!std.mem.eql(u8, model, "multistage-integration") and
+                !std.mem.eql(u8, model, "integration/multistage-integration@1111111111111111111111111111111111111111"))
                 return error.InvalidIntegrationReaderModel;
             if (request.images.len == 0 or request.images.len > 8 or request.prompt == null or
                 !std.mem.eql(u8, request.prompt.?, "<OCR>"))
@@ -237,7 +266,7 @@ pub fn main(init: std.process.Init) !void {
         ) !readers.BatchResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const items = try readEncodedImages(ptr, result_alloc, model, request);
-            if (self.read_calls == 3) return .{
+            if (self.read_calls.load(.monotonic) == 3) return .{
                 .items = items,
                 .execution = .{
                     .requested_items = request.images.len,
@@ -269,7 +298,7 @@ pub fn main(init: std.process.Init) !void {
         fixture.two_page_pdf,
         runtime.producer(),
     );
-    if (local.read_calls != 1) return error.IntegrationReaderWasNotBatched;
+    if (local.read_calls.load(.monotonic) != 1) return error.IntegrationReaderWasNotBatched;
 
     // Exercise the same bounded rendered-page window through the other two
     // task contracts. Gemma remains a generator; ClipClap receives one
@@ -370,7 +399,13 @@ pub fn main(init: std.process.Init) !void {
         producer,
         @import("storage/memory_budget.zig").smartResourceBudgets(0).options,
     );
-    if (local.read_calls != 4) return error.IntegrationGroundingReaderWasNotInvoked;
+    if (local.read_calls.load(.monotonic) != 4) return error.IntegrationGroundingReaderWasNotInvoked;
+    local.revisioned = true;
+    const bounded_runtime = try asset_producer_runtime.Runtime.createOwned(alloc, io_impl.io(), .{ .antfly_provider = local.provider() });
+    const bounded_producer = bounded_runtime.ownedProducer();
+    defer bounded_producer.deinit(alloc);
+    try enrichment_runtime.runNativeDocumentPreparationIntegration(alloc, io_impl.io(), fixture.reader_two_lines_scanned_pdf, bounded_producer);
+    if (local.read_calls.load(.monotonic) != 8 or local.prefetch_entered.load(.acquire) != 4) return error.IntegrationPrefetchRepeatedInference;
 }
 
 fn requiredEnv(name: [*:0]const u8) ![]const u8 {

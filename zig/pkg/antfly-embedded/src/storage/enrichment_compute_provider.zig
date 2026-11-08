@@ -413,6 +413,14 @@ pub fn bufferDestroy(buffer: *abi.OwnedBytes) callconv(.c) void {
     buffer.* = .{};
 }
 
+pub fn pipelineMetricsJson(version: u32, out_json: *abi.OwnedBytes) callconv(.c) abi.Status {
+    out_json.* = .{};
+    if (version != 1) return .invalid_abi;
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, @import("antfly_platform").document_pipeline_metrics.snapshot(), .{}) catch |err| return error_identity.statusFromError(err);
+    out_json.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
 /// Hidden operation accessors keep unused PDF operations dead-strippable.
 pub fn exportPdfNativeOperations() void {
     if (@hasDecl(@import("build_options"), "pdf_native_provider") and @import("build_options").pdf_native_provider)

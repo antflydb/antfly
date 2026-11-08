@@ -31,6 +31,10 @@ pub const InvocationContext = struct {
     deadline_ns: ?u64 = null,
     cancellation: CancellationToken = .none,
     max_response_bytes: ?usize = null,
+    /// Optional execution fence for speculative results. Supporting producers
+    /// reject an unprovable/different revision before dispatch and report the
+    /// bound revision on ProducedBatch. Other producers leave the report null.
+    expected_model_revision: ?[32]u8 = null,
     document_checkpoints: ?@import("antfly_readers").document_rpc.Factory = null,
     progress: ?request_context.ProgressSink = null,
 
@@ -153,6 +157,11 @@ pub const ProducedItem = inference_work.WorkItemResult([]u8);
 pub const ProducedBatch = struct {
     items: []ProducedItem,
     execution: inference_work.ExecutionReport,
+    /// Revision of the model actually dispatched, bound by an immutable model
+    /// reference or a server-enforced capability lease. Discovery metadata and
+    /// model_revision_pinning alone cannot populate this field. Null means the
+    /// producer cannot prove execution identity; callers must not reuse output.
+    executed_model_revision: ?[32]u8 = null,
 
     /// Validate the complete producer envelope against the logical requests
     /// that own its results. Execution telemetry is request-scoped at this
