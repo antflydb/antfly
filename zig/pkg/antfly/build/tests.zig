@@ -2457,7 +2457,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-catalog-authority-test", "Run configured remote catalog publication authority regression")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, catalog_authority_tests, &.{"unconfigured remote catalog authority skips background work without borrowing internal credentials"}).step);
-    const cypher_transport_filters = &.{ "retained read client scopes graph RPC", "graph admission batches", "sql graph overlay", "api http client preserves group query capability errors", "row policy publication Raft codec carries immutable owner-fetched bytes privately", "relational row query errors preserve exact remote reasons and HTTP classes", "relational row query remote transaction prepare preserves scalar validation failures", "distributed txn internal operations preserve every semantic participant rejection", "distributed shortest path" };
+    const cypher_transport_filters = &.{ "retained read client scopes graph RPC", "graph admission batches", "sql graph overlay", "api http client preserves group query capability errors", "row policy publication Raft codec carries immutable owner-fetched bytes privately", "relational row query errors preserve exact remote reasons and HTTP classes", "relational row query remote transaction prepare preserves scalar validation failures", "distributed txn internal operations preserve every semantic participant rejection", "distributed shortest path", "graph privacy availability retains retryable HTTP outcomes" };
     const cypher_transport_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = cypher_transport_filters,
@@ -3242,7 +3242,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
     const cypher_capture_tests = b.addTest(.{
         .root_module = lake_integration_mod,
-        .filters = &.{ "external lake Cypher execution reads immutable native document and graph cuts", "statement cut cleanup protects readers and immediately frees admission", "lake SQL GRAPH_TABLE shared graph joins release every provider allocation" },
+        .filters = &.{ "external lake Cypher execution reads immutable native document and graph cuts", "statement cut cleanup protects readers and immediately frees admission", "lake SQL GRAPH_TABLE shared graph joins release every provider allocation", "graph statements bind privacy versions before capturing owners" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("cypher-native-capture-test", "Verify immutable materialization and native capture capabilities")
@@ -6937,6 +6937,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "producer catalog proposal validates",
         "ordered artifact inventory semantic",
         "producer dispatch preserves foreign named failures",
+        "ordered artifact inventory producer dispatch backpressure is not terminal inference failure",
+        "privacy publication callback carries stable backpressure statuses",
         "ordered artifact inventory resolver authored review",
         "DistributedCandidateSource",
     };

@@ -3022,6 +3022,58 @@ def test_authenticated_cypher_identity_membership_and_edge_domains(
         )
         assert shared["rows"] == [[{"type": "boolean", "value": False}]] * 32
         assert shared["stats"]["intermediate_states"] < 10000, shared["stats"]
+        # Demand crosses aggregate, transform, pattern and accumulator boundaries.
+        for statement in (
+            "MATCH(d:D) WITH collect(d) AS xs RETURN [x IN xs | antfly.documentKey(x)]",
+            "MATCH(d:D) WITH collect(DISTINCT d) AS xs RETURN [x IN xs | antfly.documentKey(x)]",
+            "MATCH(d:D) WITH reverse([d]) AS xs RETURN [x IN xs | antfly.documentKey(x)]",
+            "MATCH(d:D) WITH tail([d,d]) AS xs RETURN [x IN xs | antfly.documentKey(x)]",
+            "MATCH(d:D) WITH reduce(acc=[],x IN [d]|acc+[x]) AS xs RETURN [x IN xs | antfly.documentKey(x)]",
+        ):
+            result = query(statement)
+            assert sorted(
+                item["value"] for row in result["rows"] for item in row[0]["value"]
+            ) == ["d1", "d2"], result
+        assert query(
+            "MATCH(d:D) RETURN reduce(total=0,x IN [d]|total+x.score) ORDER BY antfly.documentKey(d)"
+        )["rows"] == [[integer(7)], [integer(0)]]
+        assert query(
+            "MATCH(d:D) WITH reduce(acc=null,x IN [d]|coalesce(acc,x)) AS n RETURN antfly.documentKey(n) ORDER BY antfly.documentKey(n)"
+        )["rows"] == [[string("d1")], [string("d2")]]
+        pattern = query(
+            "MATCH(a:D) WITH [(a)-[r:R]->(b:D)|b] AS xs RETURN [x IN xs | antfly.documentKey(x)]"
+        )
+        assert sorted(
+            item["value"] for row in pattern["rows"] for item in row[0]["value"]
+        ) == ["d2"], pattern
+        assert len(pattern["rows"]) == 2, pattern
+        for expression in (
+            "d{.body}",
+            "{body:d.body}",
+            "d{body:d.payload}",
+        ):
+            assert query(f"MATCH(d:D) RETURN size(keys({expression}))")["rows"] == [
+                [integer(1)],
+                [integer(1)],
+            ]
+        assert query(
+            "MATCH(d:D) WITH coalesce(d.body,null) AS body RETURN size(keys({body:body}))"
+        )["rows"] == [[integer(1)], [integer(1)]]
+        for expression, expected in (
+            ("[d.body]<[toString(i)]", False),
+            ("[d.body]=[toString(i)]", False),
+            ("[0,d.body]<[i,'x']", True),
+            ("{a:d.body}<{a:toString(i)}", False),
+            ("{a:d.body}={a:toString(i)}", False),
+        ):
+            compared = query(
+                f"MATCH(d:D) WHERE d.id='d1' UNWIND range(1,32) AS i RETURN {expression}",
+                memory=128 << 20,
+            )
+            assert (
+                compared["rows"] == [[{"type": "boolean", "value": expected}]] * 32
+            ), compared
+            assert compared["stats"]["intermediate_states"] < 10000, compared["stats"]
         for statement in (
             "MATCH(d:D) RETURN d=d",
             "MATCH(d:D) RETURN d IS NOT NULL",
@@ -3130,6 +3182,15 @@ def test_authenticated_cypher_identity_membership_and_edge_domains(
             result["rows"][0][0]["value"]["properties"]["value"]["body"]["value"]
             == wide
         ), result
+        result = query(
+            "MATCH(d:D) WHERE d.id='d1' WITH collect(d) AS xs RETURN head(xs)",
+            128 << 20,
+        )
+        assert (
+            result["rows"][0][0]["value"]["properties"]["value"]["body"]["value"]
+            == wide
+        )
+        assert result["rows"][0][0]["value"]["labels"] == ["D"]
         result = query(
             "MATCH(d:D) WHERE d.id='d1' WITH coalesce(d,null) AS x RETURN x", 128 << 20
         )

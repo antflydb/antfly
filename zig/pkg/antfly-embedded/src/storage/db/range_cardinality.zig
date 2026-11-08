@@ -77,16 +77,6 @@ pub fn loadOrProveEmpty(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
     return loadOrProveEmptyFromTxn(&txn);
 }
 
-/// Keep absence and the durable range counter on one exact read revision.
-pub fn loadOrProveEmptyFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
-    if (try loadFromTxn(txn)) |count| return count;
-    var cursor = try txn.openPhysicalCursorAdapter();
-    defer cursor.close();
-    const row = try cursor.seekAtOrAfter(&.{internal_keys.user_namespace});
-    const populated = if (row) |entry| entry.key.len != 0 and entry.key[0] == internal_keys.user_namespace else false;
-    return if (populated) null else 0;
-}
-
 pub fn countPrimaryDocuments(
     alloc: Allocator,
     store: *docstore_mod.DocStore,

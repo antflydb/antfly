@@ -991,7 +991,8 @@ pub const Dispatcher = struct {
         trigger: @FieldType(UploadRecoveryInvocation, "trigger"),
     };
     const RecoveryReceiver = *const fn (*anyopaque, @FieldType(UploadRecovery, "recover"), RecoveryInvocation) anyerror!bool;
-    const NativeCallbacks = struct { enqueue: @FieldType(Dispatcher, "enqueue"), recover: RecoveryReceiver };
+    const EnqueueCallback = *const fn (*anyopaque, Namespace, []const u8) anyerror!void;
+    const NativeCallbacks = struct { enqueue: EnqueueCallback, recover: RecoveryReceiver };
     const NativeBoundary = named.Boundary(NativeCallbacks);
     callback_dispatch: named.Dispatch = NativeBoundary.local_dispatch,
     recovery_receiver: RecoveryReceiver = receiveRecovery,
@@ -1011,15 +1012,12 @@ pub const Dispatcher = struct {
         if (self.enqueue_status) |enqueue|
             return @import("kernel_error_identity").statusToError(enqueue(self.ptr, &namespace, command.ptr, command.len));
         const enqueue = self.enqueue orelse return error.ArtifactCatalogDrift;
-        return enqueue(self.ptr, namespace, command);
+        return NativeBoundary.call("enqueue", self.callback_dispatch, enqueue, .{ self.ptr, namespace, command });
     }
 
     fn receiveRecovery(ptr: *anyopaque, callback: @FieldType(UploadRecovery, "recover"), invocation: RecoveryInvocation) !bool {
         var receiver = try invocation.io.receive();
         return callback(ptr, .{ .io = receiver.io(), .now_ns = invocation.now_ns, .inventory = invocation.inventory, .trigger = invocation.trigger });
-    }
-    pub fn enqueueCommand(self: Dispatcher, namespace: Namespace, command: []const u8) !void {
-        return NativeBoundary.call("enqueue", self.callback_dispatch, self.enqueue, .{ self.ptr, namespace, command });
     }
     pub fn recoverUploads(self: Dispatcher, invocation: UploadRecoveryInvocation) !bool {
         const recovery = self.upload_recovery orelse return false;

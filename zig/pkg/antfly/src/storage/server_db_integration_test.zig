@@ -4244,110 +4244,161 @@ test "server index status reports ready for converged plural-source dense artifa
 }
 
 test "server Cypher producer catalog activation is replicated and idempotent" {
-    const alloc = std.testing.allocator;
-    var stage: []const u8 = "setup";
-    errdefer std.debug.print("producer catalog activation failed stage={s}\n", .{stage});
-    var directory = try TestDirectory.init("cypher-producer-catalog");
-    defer directory.cleanup();
-    const namespace: engine.DocIdentityNamespace = .{ .table_id = 17, .shard_id = 19, .range_id = 19 };
-    const left_path = try std.fs.path.join(alloc, &.{ directory.path(), "left" });
-    defer alloc.free(left_path);
-    const right_path = try std.fs.path.join(alloc, &.{ directory.path(), "right" });
-    defer alloc.free(right_path);
-    var left = try DB.open(alloc, left_path, .{ .identity_namespace = namespace, .online_source_authority = .raft, .start_optional_runtimes = false, .start_index_workers = false });
-    defer left.close();
-    var right = try DB.open(alloc, right_path, .{ .identity_namespace = namespace, .online_source_authority = .raft, .start_optional_runtimes = false, .start_index_workers = false });
-    defer right.close();
-    const owners = [_]*DB{ &left, &right };
-    for (owners) |db| {
-        try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"kg\",\"format\":\"extraction_graph\"},\"artifact\":{\"name\":\"kg\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"kg\"},\"content_type\":\"application/json\"}}" });
-        try db.addResolver(.{ .name = "entities", .table = "default", .promote = false, .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}" });
-    }
-    const Capture = struct {
-        db: *DB,
-        bytes: ?[]u8 = null,
-        calls: usize = 0,
-        fn enqueue(ptr: *anyopaque, _: [24]u8, bytes: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            // Publication must leave all owner read/apply fences before
-            // entering the server callback, including activation retries.
-            const clock = @import("antfly_platform").time;
-            const deadline = clock.monotonicNs() + std.time.ns_per_s;
-            while (!self.db.core.tryLockApplyExclusive()) {
-                if (clock.monotonicNs() >= deadline) return error.TestUnexpectedResult;
-                clock.sleepNs(std.time.ns_per_ms);
-            }
-            self.db.core.unlockApply();
-            const owned = try std.testing.allocator.dupe(u8, bytes);
-            if (self.bytes) |previous| std.testing.allocator.free(previous);
-            self.bytes = owned;
-            self.calls += 1;
+    for ([_]u16{ 15, @import("antfly_local_sources").storage_db_artifact_inventory.max_effect_protocol }) |protocol_floor| {
+        const alloc = std.testing.allocator;
+        var stage: []const u8 = "setup";
+        errdefer std.debug.print("producer catalog activation failed stage={s}\n", .{stage});
+        var directory = try TestDirectory.init("cypher-producer-catalog");
+        defer directory.cleanup();
+        const namespace: engine.DocIdentityNamespace = .{ .table_id = 17, .shard_id = 19, .range_id = 19 };
+        const left_path = try std.fs.path.join(alloc, &.{ directory.path(), "left" });
+        defer alloc.free(left_path);
+        const right_path = try std.fs.path.join(alloc, &.{ directory.path(), "right" });
+        defer alloc.free(right_path);
+        var left = try DB.open(alloc, left_path, .{ .identity_namespace = namespace, .online_source_authority = .raft, .start_optional_runtimes = false, .start_index_workers = false });
+        defer left.close();
+        var right = try DB.open(alloc, right_path, .{ .identity_namespace = namespace, .online_source_authority = .raft, .start_optional_runtimes = false, .start_index_workers = false });
+        defer right.close();
+        const owners = [_]*DB{ &left, &right };
+        for (owners) |db| {
+            try db.setSchemaJson(alloc, "{}");
+            try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"kg\",\"format\":\"extraction_graph\"},\"artifact\":{\"name\":\"kg\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"kg\"},\"content_type\":\"application/json\"}}" });
+            try db.addResolver(.{ .name = "entities", .table = "default", .promote = false, .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}" });
         }
-    };
-    var capture: Capture = .{ .db = &left };
-    defer if (capture.bytes) |bytes| alloc.free(bytes);
-    left.local_execution.artifact_publication_dispatcher = .{ .ptr = &capture, .enqueue = Capture.enqueue };
-    defer left.local_execution.artifact_publication_dispatcher = null;
-    stage = "enqueue catalog";
-    try left.enqueueGeneratedArtifactCatalog();
-    const proposals = @import("antfly_local_sources").storage_db_artifact_catalog_proposal;
-    stage = "decode catalog";
-    var catalog = try proposals.decode(alloc, capture.bytes.?);
-    defer catalog.deinit();
-    try std.testing.expectEqual(@as(u16, 15), catalog.value.binding.effect_protocol);
-    stage = "apply catalog";
-    for (owners) |db| try server_test_adapter.applyOrdered(db, .{ .artifact_catalog = catalog.value }, .{ .term = 1, .index = 1 });
-    // Persisting the catalog alone does not activate producer authority.
-    const publication = @import("antfly_local_sources").storage_db_artifact_publication;
-    for (owners) |db| {
-        var read = try db.core.store.beginReadTxn();
-        defer read.abort();
-        try std.testing.expectEqual(@as(?publication.Authority, null), try publication.authority(&read));
+        const Capture = struct {
+            db: *DB,
+            bytes: ?[]u8 = null,
+            calls: usize = 0,
+            fn enqueue(ptr: *anyopaque, _: [24]u8, bytes: []const u8) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                // Publication must leave all owner read/apply fences before
+                // entering the server callback, including activation retries.
+                const clock = @import("antfly_platform").time;
+                const deadline = clock.monotonicNs() + std.time.ns_per_s;
+                while (!self.db.core.tryLockApplyExclusive()) {
+                    if (clock.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+                    clock.sleepNs(std.time.ns_per_ms);
+                }
+                self.db.core.unlockApply();
+                const owned = try std.testing.allocator.dupe(u8, bytes);
+                if (self.bytes) |previous| std.testing.allocator.free(previous);
+                self.bytes = owned;
+                self.calls += 1;
+            }
+        };
+        var capture: Capture = .{ .db = &left };
+        defer if (capture.bytes) |bytes| alloc.free(bytes);
+        left.local_execution.artifact_publication_dispatcher = .{ .ptr = &capture, .enqueue = Capture.enqueue };
+        defer left.local_execution.artifact_publication_dispatcher = null;
+        stage = "enqueue catalog";
+        try left.enqueueGeneratedArtifactCatalog();
+        const proposals = @import("antfly_local_sources").storage_db_artifact_catalog_proposal;
+        stage = "decode catalog";
+        var catalog = try proposals.decode(alloc, capture.bytes.?);
+        defer catalog.deinit();
+        try std.testing.expectEqual(@as(u16, 15), catalog.value.binding.effect_protocol);
+        catalog.value.binding.effect_protocol = protocol_floor;
+        stage = "apply catalog";
+        for (owners) |db| try server_test_adapter.applyOrdered(db, .{ .artifact_catalog = catalog.value }, .{ .term = 1, .index = 1 });
+        const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+        const coupled = protocol_floor >= 16;
+        for (owners) |db| {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            const active = try publication.authority(&read);
+            if (coupled) try std.testing.expectEqual(@as(u64, 1), active.?.epoch) else try std.testing.expect(active == null);
+        }
+        stage = "enqueue activation";
+        try left.enqueueGeneratedArtifactCatalog();
+        if (!coupled) {
+            try std.testing.expectEqual(@as(usize, 2), capture.calls);
+            try std.testing.expectEqualStrings("APB1", capture.bytes.?[0..4]);
+            var activation = try @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.decodeBorrowed(alloc, capture.bytes.?);
+            defer activation.deinit();
+            try std.testing.expect(activation.command.mode == .activate);
+            for (owners) |db| try server_test_adapter.applyOrdered(db, .{ .artifact_publication = activation.command }, .{ .term = 1, .index = 2 });
+        }
+        const activated_calls = capture.calls;
+        try std.testing.expectEqual(@as(usize, if (coupled) 1 else 2), activated_calls);
+        try left.enqueueGeneratedArtifactCatalog();
+        try std.testing.expectEqual(activated_calls, capture.calls);
+        for (owners) |db| {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            const active = (try publication.authority(&read)).?;
+            try std.testing.expectEqual(@as(u64, 1), active.epoch);
+            try std.testing.expectEqualDeep(catalog.value.binding.digest, active.catalog_digest);
+        }
+        // A new ordered epoch invalidates readiness even when local definitions
+        // and their write-plan generation stay unchanged.
+        stage = "renew identical catalog";
+        var renewed = try left.artifactInventoryCommand(alloc);
+        defer renewed.catalogs.deinit(alloc);
+        try std.testing.expectEqual(protocol_floor, renewed.binding.effect_protocol);
+        renewed.previous = renewed.binding;
+        renewed.binding.epoch += 1;
+        for (owners) |db| try server_test_adapter.applyOrdered(db, .{ .artifact_catalog = renewed }, .{ .term = 1, .index = 3 });
+        try left.enqueueGeneratedArtifactCatalog();
+        if (!coupled) {
+            try std.testing.expectEqual(activated_calls + 1, capture.calls);
+            var reactivation = try @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.decodeBorrowed(alloc, capture.bytes.?);
+            defer reactivation.deinit();
+            try std.testing.expect(reactivation.command.mode == .activate);
+            try std.testing.expectEqual(@as(u64, 2), reactivation.command.authority_epoch);
+            for (owners) |db| try server_test_adapter.applyOrdered(db, .{ .artifact_publication = reactivation.command }, .{ .term = 1, .index = 4 });
+        }
+        const renewed_calls = capture.calls;
+        try std.testing.expectEqual(activated_calls + @as(usize, if (coupled) 0 else 1), renewed_calls);
+        try left.enqueueGeneratedArtifactCatalog();
+        try std.testing.expectEqual(renewed_calls, capture.calls);
+        // Active definitions retire through an exact ordered reconciliation
+        // intent; ambient local removals must remain fenced.
+        stage = "reconcile retirement";
+        const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
+        const empty: inventory.Catalogs = .{};
+        // Online admission requires the extended artifact capture protocol;
+        // retiring a legacy witness catalog upgrades that floor atomically.
+        const retirement: inventory.Command = .{ .namespace = renewed.namespace, .previous = renewed.binding, .binding = .{ .epoch = 3, .digest = empty.digest(), .semantic_digest = try empty.semanticDigest(alloc), .effect_protocol = inventory.max_effect_protocol }, .catalogs = empty };
+        for (owners) |db| {
+            const identity = try db.relationalTopologyIdentity();
+            const scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
+                .authority = .raft,
+                .fence = .{ .role = .merge_source, .transition_id = 7, .attempt = 1, .admission_epoch = identity.next_epoch, .owner_group_id = 19, .peer_group_id = 20, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest },
+                .receiver_namespace = .{ .table_id = 17, .shard_id = 20, .range_id = 20 },
+                .consumer_epoch = 1,
+                .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+            };
+            const request: types.BatchRequest = .{ .artifact_catalog = retirement, .online_source = .{ .admit = .{ .scope = scope, .artifact_catalog = retirement.binding } } };
+            var complete = false;
+            for (0..256) |_| {
+                server_test_adapter.applyOrdered(db, request, .{ .term = 1, .index = 5 }) catch |err| {
+                    if (err != error.ArtifactCatalogDrift) return err;
+                    continue;
+                };
+                complete = true;
+                break;
+            }
+            try std.testing.expect(complete);
+            try server_test_adapter.applyOrdered(db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 6 });
+            try std.testing.expect(!db.hasIndex("links"));
+        }
+        stage = "verify retired catalog authority";
+        for (owners) |db| {
+            // Extended admission installs authority atomically with the catalog.
+            // Its compound commit must also invalidate the readiness fast path.
+            try std.testing.expectEqual(@as(u64, 0), db.local_execution.producer_catalog_generation.load(.acquire));
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            const active = (try publication.authority(&read)).?;
+            try std.testing.expectEqual(@as(u64, 3), active.epoch);
+            try std.testing.expectEqualDeep(retirement.binding.digest, active.catalog_digest);
+        }
+        try left.enqueueGeneratedArtifactCatalog();
+        try std.testing.expectEqual(renewed_calls, capture.calls);
+        try std.testing.expectEqual(left.core.index_manager.writePlanGeneration(), left.local_execution.producer_catalog_generation.load(.acquire));
+        try left.enqueueGeneratedArtifactCatalog();
+        try std.testing.expectEqual(renewed_calls, capture.calls);
     }
-    stage = "enqueue activation";
-    try left.enqueueGeneratedArtifactCatalog();
-    stage = "decode activation";
-    var activation = try @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.decodeBorrowed(alloc, capture.bytes.?);
-    defer activation.deinit();
-    try std.testing.expect(activation.command.mode == .activate);
-    stage = "apply activation";
-    for (owners) |db| try server_test_adapter.applyOrdered(db, .{ .artifact_publication = activation.command }, .{ .term = 1, .index = 2 });
-    try left.enqueueGeneratedArtifactCatalog();
-    try std.testing.expectEqual(@as(usize, 2), capture.calls);
-    for (owners) |db| {
-        var read = try db.core.store.beginReadTxn();
-        defer read.abort();
-        const active = (try publication.authority(&read)).?;
-        try std.testing.expectEqual(@as(u64, 1), active.epoch);
-        try std.testing.expectEqualDeep(catalog.value.binding.digest, active.catalog_digest);
-    }
-    // A new ordered epoch invalidates readiness even when local definitions
-    // and their write-plan generation stay unchanged.
-    stage = "renew identical catalog";
-    var renewed = try left.artifactInventoryCommand(alloc);
-    defer renewed.catalogs.deinit(alloc);
-    renewed.binding.effect_protocol = 15;
-    for (owners) |db| try server_test_adapter.applyOrdered(db, .{ .artifact_catalog = renewed }, .{ .term = 1, .index = 3 });
-    try left.enqueueGeneratedArtifactCatalog();
-    try std.testing.expectEqual(@as(usize, 3), capture.calls);
-    var reactivation = try @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.decodeBorrowed(alloc, capture.bytes.?);
-    defer reactivation.deinit();
-    try std.testing.expect(reactivation.command.mode == .activate);
-    try std.testing.expectEqual(@as(u64, 2), reactivation.command.authority_epoch);
-    for (owners) |db| try server_test_adapter.applyOrdered(db, .{ .artifact_publication = reactivation.command }, .{ .term = 1, .index = 4 });
-    try left.enqueueGeneratedArtifactCatalog();
-    try std.testing.expectEqual(@as(usize, 3), capture.calls);
-    // Retiring the last producer still orders the now-empty definition cut.
-    for (owners) |db| {
-        _ = try db.removeResolverWithoutDrain("entities");
-        _ = try db.deleteIndex("links");
-    }
-    stage = "retire final producer";
-    try left.enqueueGeneratedArtifactCatalog();
-    try std.testing.expectEqual(@as(usize, 4), capture.calls);
-    var retired = try proposals.decode(alloc, capture.bytes.?);
-    defer retired.deinit();
-    try std.testing.expectEqual(@as(u64, 3), retired.value.binding.epoch);
 }
 
 test "server Cypher ordered publication wakes every downstream consumer" {

@@ -174,7 +174,7 @@ pub fn scan(db: anytype, a: A, cut: *Snapshot, from: []const u8, to: []const u8,
 /// Document point reads retain the primary bytes and use span projection, so
 /// wide unrequested payloads never become a DOM or escape into reply storage.
 pub fn get(db: anytype, a: A, cut: *Snapshot, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
-    const results = try getMany(db, a, cut, &.{key}, .{ .include_documents = true, .fields = opts.fields, .cypher_presence_fields = opts.cypher_presence_fields, .cypher_projection_json = opts.cypher_projection_json, .include_all_fields = opts.include_all_fields, .execution_deadline_ns = opts.execution_deadline_ns, .cancellation = opts.cancellation, .row_policy_principal_proof = opts.row_policy_principal_proof, .row_policy_database = opts.row_policy_database });
+    const results = try getMany(db, a, cut, &.{key}, .{ .include_documents = true, .fields = opts.fields, .cypher_presence_fields = opts.cypher_presence_fields, .cypher_projection_json = opts.cypher_projection_json, .include_all_fields = opts.include_all_fields, .execution_deadline_ns = opts.execution_deadline_ns, .cancellation = opts.cancellation, .row_policy_principal_proof = opts.row_policy_principal_proof, .row_policy_database = opts.row_policy_database, .privacy_policy_version = opts.privacy_policy_version });
     defer a.free(results);
     return results[0];
 }
@@ -240,7 +240,15 @@ pub fn getMany(db: anytype, a: A, cut: *Snapshot, keys: []const []const u8, inpu
     var read = try cut.primary.forkRead();
     defer read.abort();
     const projection = @import("document_query.zig");
-    const lookup: types.LookupOptions = .{ .fields = opts.fields, .cypher_presence_fields = opts.cypher_presence_fields, .cypher_projection_json = opts.cypher_projection_json, .include_all_fields = opts.include_all_fields };
+    const lookup: types.LookupOptions = .{ .privacy_policy_version = opts.privacy_policy_version, .fields = opts.fields, .cypher_presence_fields = opts.cypher_presence_fields, .cypher_projection_json = opts.cypher_projection_json, .include_all_fields = opts.include_all_fields };
+    const privacy = @import("privacy_read.zig");
+    const policy = try privacy.capture(db, temporary);
+    try privacy.requireExpected(temporary, opts.privacy_policy_version, policy);
+    const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
+    if (protected) {
+        const special = @import("query/projection.zig").buildLookupFieldSelectionPlan(lookup).special;
+        if (special.all_artifacts or special.all_chunks or special.all_embeddings) return error.PrivacyUnsupportedProjection;
+    }
     var plan = try projection.SpanProjectionPlan.init(temporary, lookup);
     defer if (plan) |*value| value.deinit();
     const internal = @import("../internal_keys.zig");
@@ -262,7 +270,13 @@ pub fn getMany(db: anytype, a: A, cut: *Snapshot, keys: []const []const u8, inpu
         };
         const version: u64 = if (timestamp) |bytes| if (bytes.len == 8) std.mem.readInt(u64, bytes[0..8], .little) else return error.InvalidData else 0;
         if (duration != 0 and version != 0 and @import("../ttl.zig").isExpired(version, duration, cut.now)) continue;
-        var result = if (plan) |*value| try projection.lookupJsonWithPlan(temporary, a, raw, value) else try projection.lookupJsonWithOutput(temporary, a, raw, lookup);
+        var privacy_row = std.heap.ArenaAllocator.init(cypher.backend.reclaimingAllocator(a));
+        defer privacy_row.deinit();
+        const safe = if (protected) privacy.project(privacy_row.allocator(), policy.?, key, raw, &read) catch |err| {
+            if (privacy.pending(err)) continue;
+            return err;
+        } else raw;
+        var result = if (plan) |*value| try projection.lookupJsonWithPlan(temporary, a, safe, value) else try projection.lookupJsonWithOutput(temporary, a, safe, lookup);
         result.version = version;
         out.* = result;
     }

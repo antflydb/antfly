@@ -9116,3 +9116,38 @@ test "row local scalar string equality does not hash wide inputs before obvious 
     try std.testing.expectEqual(@as(usize, 32), result.rows.len);
     for (result.rows) |row| try std.testing.expect(!row[0].boolean);
 }
+
+test "row local list and map predicates never hash an unobserved wide tail" {
+    const a = std.testing.allocator;
+    const body = try a.alloc(u8, 2 << 20);
+    defer a.free(body);
+    @memset(body, 'x');
+    for ([_][]const u8{
+        "UNWIND range(1,32) AS i RETURN [toString(i),$body]<['0','x']",
+        "UNWIND range(1,32) AS i RETURN [toString(i),$body]=['0','x']",
+        "UNWIND range(1,32) AS i RETURN {a:toString(i),b:$body}<{a:'0',b:'x'}",
+        "UNWIND range(1,32) AS i RETURN {a:toString(i),b:$body}={a:'0',b:'x'}",
+    }) |query| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{.{ .name = "body", .value = .{ .string = body } }}, .{ .intermediate_states = 10000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 32), result.rows.len);
+        for (result.rows) |row| try std.testing.expect(!row[0].boolean);
+    }
+}
+
+test "list tail preserves nulls empty lists aliases and rejects scalar overloads" {
+    try check("RETURN tail([1,null,3]),tail([]),tail([1]),tail(null)", "[[[null,3],[],[],null]]");
+    try check("MATCH(d:Document {id:'a'}) WITH tail([d,d]) AS xs RETURN [x IN xs|antfly.documentKey(x)]", "[[[\"a\"]]]");
+    try check("WITH tail([1,2,3]) AS xs WITH xs AS ys UNWIND ys AS x RETURN collect(x)", "[[[2,3]]]");
+    for ([_][]const u8{ "RETURN tail('abc')", "RETURN tail(1)" }) |query| {
+        var fixture: Fixture = .{};
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        try std.testing.expectError(error.CypherTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}

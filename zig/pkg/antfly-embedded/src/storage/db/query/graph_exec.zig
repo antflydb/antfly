@@ -3507,7 +3507,10 @@ pub const CompiledPatternFilter = union(enum) {
 
     fn selector(self: CompiledPatternFilter, a: Allocator) !?*const @import("json_projection_plan.zig").Selector {
         var paths: std.ArrayListUnmanaged(@import("json_projection_plan.zig").Path) = .empty;
-        try self.collectPaths(a, &paths);
+        self.collectPaths(a, &paths) catch |err| switch (err) {
+            error.InvalidQueryRequest => return null,
+            else => return err,
+        };
         return @import("json_projection_plan.zig").compile(a, paths.items) catch |err| switch (err) {
             error.InvalidQueryRequest => null,
             else => return err,
@@ -3516,6 +3519,10 @@ pub const CompiledPatternFilter = union(enum) {
     fn collectPaths(self: CompiledPatternFilter, a: Allocator, paths: *std.ArrayListUnmanaged(@import("json_projection_plan.zig").Path)) anyerror!void {
         switch (self) {
             .match_all, .match_none, .doc_id => {},
+            // Logical value search has its own array fanout/path rules. Keep
+            // the general source verifier until that matcher certifies this
+            // prepared JSON selector's semantics (including numeric members).
+            .logical_value => return error.InvalidQueryRequest,
             .conjuncts, .disjuncts => |items| for (items) |item| try item.collectPaths(a, paths),
             .bool_query => |query| {
                 for (query.must) |item| try item.collectPaths(a, paths);
@@ -3540,7 +3547,10 @@ pub const CompiledPatternFilter = union(enum) {
     }
     fn matchesWith(self: CompiledPatternFilter, alloc: Allocator, key: []const u8, doc: anytype) anyerror!bool {
         return switch (self) {
-            .logical_value => |matcher| try matcher.document(doc),
+            .logical_value => |matcher| if (comptime @TypeOf(doc) == *JsonView)
+                try matcher.document(try doc.materialize(&doc.root))
+            else
+                try matcher.document(doc),
             .match_all => true,
             .match_none => false,
             .doc_id => |ids| blk: {
@@ -8227,4 +8237,29 @@ test "prepared pattern filters borrow spans preserving parser failures and alloc
             try std.testing.expect(try prepared.matchesStored(alloc, "a", "{\"nested\":{\"tenant\":\"acme\",\"ignored\":[1,2,3]}}"));
         }
     }.run, .{});
+}
+
+test "prepared pattern filters retain logical value numeric member fanout" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const filter = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"value":{"kind":"contains","field":"a.0","text":"yes"}}
+    , .{});
+    var prepared = try PreparedPatternFilter.initValue(a, filter);
+    defer prepared.deinit();
+    try std.testing.expect(prepared.selector == null);
+    const documents = [_][]const u8{
+        \\{"a":[{"0":"yes"}]}
+        ,
+        \\{"a":[{"0":"no"},{"0":"yes"}]}
+        ,
+        \\{"a":["yes"]}
+        ,
+    };
+    for (documents, [_]bool{ true, true, false }) |document, expected| {
+        try std.testing.expectEqual(expected, try prepared.matchesStored(a, "doc", document));
+        const decoded = try std.json.parseFromSliceLeaky(std.json.Value, a, document, .{});
+        try std.testing.expectEqual(expected, try prepared.matchesJson(a, "doc", decoded));
+    }
 }

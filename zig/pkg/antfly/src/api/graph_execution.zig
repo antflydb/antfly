@@ -295,7 +295,7 @@ pub fn httpStatus(err: anyerror) u16 {
         error.Forbidden, error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => 403,
         error.CatalogNotFound, error.TableNotFound, error.IndexNotFound => 404,
         error.CatalogGenerationChanged, error.SchemaVersionChanged, error.RowPolicyCatalogChanged, error.CypherTransactionConflict, error.CypherWriteRequestAlreadyUsed => 409,
-        error.EnrichmentRetryInProgress, error.CypherSnapshotRequired, error.CypherSnapshotNotReady, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.ReadIndexTimeout, error.TopologyChanged, error.StorageReadTemporarilyUnavailable, error.RetainedReadRestartRequired, error.GroupLeaderUnavailable, error.Backpressured, error.ConnectionResetByPeer, error.ConnectionRefused, error.ConnectionTimedOut, error.Timeout => 503,
+        error.IndexRebuilding, error.PrivacyPending, error.PrivacyStale, error.PrivacyPublicationPending, error.PrivacyInspectionFailed, error.PrivacyReadFenceUnavailable, error.EnrichmentRetryInProgress, error.CypherSnapshotRequired, error.CypherSnapshotNotReady, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.ReadIndexTimeout, error.TopologyChanged, error.StorageReadTemporarilyUnavailable, error.RetainedReadRestartRequired, error.GroupLeaderUnavailable, error.Backpressured, error.ConnectionResetByPeer, error.ConnectionRefused, error.ConnectionTimedOut, error.Timeout => 503,
         error.OutOfMemory, error.CypherResponseTooLarge, error.CypherMemoryBudgetExceeded, error.CypherAnchorBudgetExceeded, error.CypherEdgeBudgetExceeded, error.CypherStateBudgetExceeded, error.SqlWriteCapacityUnavailable => 429,
         error.DeadlineExceeded => 408,
         error.Canceled => 499,
@@ -317,7 +317,7 @@ pub fn errorMessage(err: anyerror, outcome: WriteOutcome) []const u8 {
         error.TableNotFound, error.IndexNotFound => "A mapped table or graph index is unavailable. Refresh the graph definition and check its mappings.",
         error.CatalogGenerationChanged, error.SchemaVersionChanged, error.RowPolicyCatalogChanged => "The graph catalog, table schema, or row policy changed during execution. Refresh the graph and run a new query.",
         error.CypherTransactionConflict => "The write was aborted because its read set changed. Run a new statement with a new write request ID.",
-        error.EnrichmentRetryInProgress, error.CypherSnapshotRequired, error.CypherSnapshotNotReady, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.ReadIndexTimeout, error.TopologyChanged, error.StorageReadTemporarilyUnavailable, error.RetainedReadRestartRequired, error.GroupLeaderUnavailable, error.Backpressured, error.ConnectionResetByPeer, error.ConnectionRefused, error.ConnectionTimedOut, error.Timeout => "A coherent graph read is temporarily unavailable. Check graph readiness and try again after the owners become available.",
+        error.IndexRebuilding, error.PrivacyPending, error.PrivacyStale, error.PrivacyPublicationPending, error.PrivacyInspectionFailed, error.PrivacyReadFenceUnavailable, error.EnrichmentRetryInProgress, error.CypherSnapshotRequired, error.CypherSnapshotNotReady, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.ReadIndexTimeout, error.TopologyChanged, error.StorageReadTemporarilyUnavailable, error.RetainedReadRestartRequired, error.GroupLeaderUnavailable, error.Backpressured, error.ConnectionResetByPeer, error.ConnectionRefused, error.ConnectionTimedOut, error.Timeout => "A coherent graph read is temporarily unavailable. Check graph readiness and try again after the owners become available.",
         error.CypherValueDepthExceeded => "A computed or input value exceeds 64 nesting levels. Reduce nested list or map construction.",
         error.CypherResponseTooLarge => "The result exceeds the response limit. Reduce RETURN data or add a smaller LIMIT.",
         error.OutOfMemory, error.CypherMemoryBudgetExceeded, error.CypherAnchorBudgetExceeded, error.CypherEdgeBudgetExceeded, error.CypherStateBudgetExceeded => "The query exceeded its execution budget. Narrow the starting nodes, bound path lengths, or reduce intermediate results.",
@@ -428,4 +428,11 @@ test "graph admission batches SQL operation guards from completed authority chec
     try channel.validateAuthority(true);
     try std.testing.expect(fixture.calls >= 2);
     try std.testing.expect(channel.last_authority_check.? >= fixture.completed);
+}
+
+test "graph privacy availability retains retryable HTTP outcomes" {
+    for ([_]anyerror{ error.IndexRebuilding, error.PrivacyPending, error.PrivacyStale, error.PrivacyPublicationPending, error.PrivacyInspectionFailed, error.PrivacyReadFenceUnavailable }) |err| {
+        try std.testing.expectEqual(@as(u16, 503), httpStatus(err));
+        try std.testing.expect(std.mem.indexOf(u8, errorMessage(err, .not_started), "temporarily unavailable") != null);
+    }
 }

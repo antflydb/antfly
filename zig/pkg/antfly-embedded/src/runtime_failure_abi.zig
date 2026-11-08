@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 86;
+pub const abi_version: u32 = 87;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -939,6 +939,7 @@ test "Cypher statuses append after published upstream statuses" {
     try testing.expectEqual(@as(u32, 845), @backingInt(Status.gcs_connection_not_found_or_out_of_scope));
     try testing.expectEqual(@as(u32, 846), @backingInt(Status.ambiguous_gcs_connection));
     try testing.expectEqual(@as(u32, 847), @backingInt(Status.invalid_connection_credentials));
-    try testing.expectEqual(@as(u32, 848), @backingInt(Status.cypher_aggregate_scope));
-    try testing.expectEqual(@as(u32, 911), @backingInt(Status.cypher_invalid_regex));
+    try testing.expectEqual(@as(u32, 848), @backingInt(Status.raft_apply_writer_unavailable));
+    try testing.expectEqual(@as(u32, 849), @backingInt(Status.cypher_aggregate_scope));
+    try testing.expectEqual(@as(u32, 912), @backingInt(Status.cypher_invalid_regex));
 }

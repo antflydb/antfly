@@ -26858,6 +26858,9 @@ pub const DB = struct {
             try self.stageRestoreStagingReplicationOutbox(&txn, payload);
             try txn.commit();
             txn_open = false;
+            // Compound admission commits the ordered catalog just like the
+            // standalone catalog path. Invalidate before fallible pin work.
+            if (req.artifact_catalog != null) self.local_execution.producer_catalog_generation.store(0, .release);
             if (command == .admit) {
                 try @import("source_pin.zig").afterPrepare();
                 try @import("source_pin.zig").ensureAssumeApply(self, command.scope());
@@ -27113,33 +27116,35 @@ pub const DB = struct {
                 return;
             }
         }
-        var command = try self.artifactInventoryCommand(self.alloc);
+        var desired = try self.artifactInventoryDesired(self.alloc, 15);
+        const command = &desired.command;
         defer command.catalogs.deinit(self.alloc);
-        command.binding.effect_protocol = 15;
-        if (command.previous) |previous| {
-            if (previous.effect_protocol == 15 and std.mem.eql(u8, &previous.digest, &command.binding.digest)) {
-                const publication = @import("artifact_publication.zig");
-                const current = blk: {
-                    var read = try self.core.store.beginReadTxn();
-                    defer read.abort();
-                    const active = (try publication.authority(&read)) orelse break :blk false;
-                    break :blk active.epoch == previous.epoch and std.mem.eql(u8, &active.catalog_digest, &previous.digest);
-                };
-                if (current) {
-                    self.local_execution.producer_catalog_generation.store(generation, .release);
-                    return;
-                }
-                var activation: publication.Command = .{ .mode = .activate, .namespace = command.namespace, .authority_epoch = previous.epoch, .catalog_digest = previous.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
-                activation.publication_digest = activation.digest();
-                const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(self.alloc, activation);
-                defer self.alloc.free(encoded);
-                self.core.unlockApplyShared();
-                apply_held = false;
-                try dispatcher.enqueueCommand(command.namespace, encoded);
+        // An older reconciliation intent remains owned by its metadata
+        // workflow. Never rewrite its binding or lower a newer protocol floor.
+        if (!command.binding.supportsProducerWitnesses()) return;
+        if (desired.activatable) {
+            const binding = command.binding;
+            const publication = @import("artifact_publication.zig");
+            const current = blk: {
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                const active = (try publication.authority(&read)) orelse break :blk false;
+                break :blk active.epoch == binding.epoch and std.mem.eql(u8, &active.catalog_digest, &binding.digest);
+            };
+            if (current) {
+                self.local_execution.producer_catalog_generation.store(generation, .release);
                 return;
             }
+            var activation: publication.Command = .{ .mode = .activate, .namespace = command.namespace, .authority_epoch = binding.epoch, .catalog_digest = binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+            activation.publication_digest = activation.digest();
+            const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(self.alloc, activation);
+            defer self.alloc.free(encoded);
+            self.core.unlockApplyShared();
+            apply_held = false;
+            try dispatcher.enqueueCommand(command.namespace, encoded);
+            return;
         }
-        const encoded = try @import("artifact_catalog_proposal.zig").encode(self.alloc, command);
+        const encoded = try @import("artifact_catalog_proposal.zig").encode(self.alloc, command.*);
         defer self.alloc.free(encoded);
         self.core.unlockApplyShared();
         apply_held = false;
@@ -27150,6 +27155,14 @@ pub const DB = struct {
     /// before proposal. Ownership of catalogs belongs to the caller.
     pub fn artifactInventoryCommand(self: *DB, alloc: Allocator) !@import("artifact_inventory.zig").Command {
         if (comptime storage_engine.enabled) return storage_engine.call("artifactInventoryCommand", .{ self, alloc });
+        return (try self.artifactInventoryDesired(alloc, 14)).command;
+    }
+
+    const DesiredArtifactInventory = struct {
+        command: @import("artifact_inventory.zig").Command,
+        activatable: bool,
+    };
+    fn artifactInventoryDesired(self: *DB, alloc: Allocator, minimum: u16) !DesiredArtifactInventory {
         const inventory = @import("artifact_inventory.zig");
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
@@ -27161,7 +27174,7 @@ pub const DB = struct {
             command.catalogs.enrichments = try alloc.dupe(u8, command.catalogs.enrichments);
             errdefer alloc.free(command.catalogs.enrichments);
             command.catalogs.resolvers = try alloc.dupe(u8, command.catalogs.resolvers);
-            return command;
+            return .{ .command = command, .activatable = false };
         }
         var namespace: [24]u8 = undefined;
         doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
@@ -27171,7 +27184,10 @@ pub const DB = struct {
             var owned = catalogs;
             owned.deinit(alloc);
         }
-        return inventory.desiredCommand(alloc, &txn, namespace, catalogs, observed, 14);
+        const command = try inventory.desiredCommand(alloc, &txn, namespace, catalogs, observed, minimum);
+        // Reused commands retain their historical `previous` field. Only the
+        // current ordered binding on this exact read can authorize activation.
+        return .{ .command = command, .activatable = observed.ready and observed.ordered != null and std.meta.eql(observed.ordered.?, command.binding) };
     }
 
     fn completeArtifactUpload(txn: anytype, finalization: ?@import("artifact_publication_transport.zig").Finalization, entry: OrderedApplyReceipt) !void {
@@ -56230,7 +56246,7 @@ fn appendResolutionRecordWithProjection(
     applied_batch.sequence = sequence;
     try lockApplyForPortableRuntimeContext(&batch_ctx);
     defer batch_ctx.apply_mutex.unlockExclusive();
-    try applyDerivedBatchInlineAssumeApply(batch_ctx, applied_batch);
+    try applyDerivedBatchInlineAssumeApply(&batch_ctx, applied_batch);
     return sequence;
 }
 

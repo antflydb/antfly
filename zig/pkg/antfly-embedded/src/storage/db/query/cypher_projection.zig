@@ -52,6 +52,11 @@ fn projectValue(view: *View, node: *View.Node, item: Projection, depth: usize) a
             }
             return predicateNonmatch(view.alloc);
         },
+        .validation => {
+            const height = try cypher.value.validatedJsonDepth(view.alloc, node.raw, depth);
+            if (std.mem.eql(u8, std.mem.trim(u8, node.raw, " \r\n\t"), "null")) return .null;
+            return validationWitness(view.alloc, height);
+        },
         .presence => return presenceAtDepth(view.alloc, node.raw, depth),
         .children => {
             if (item.validate) try cypher.value.validateJsonSlice(view.alloc, node.raw, depth);
@@ -68,6 +73,61 @@ fn projectValue(view: *View, node: *View.Node, item: Projection, depth: usize) a
         },
     }
 }
+/// Licensed only for an unobserved constructor member. Preserve its actual
+/// height so later constructor depth checks remain eager, but retain no payload.
+fn validationWitness(a: A, height: usize) !std.json.Value {
+    var value: std.json.Value = .{ .bool = true };
+    for (0..height) |_| {
+        var array: std.array_list.Managed(std.json.Value) = .init(a);
+        try array.append(value);
+        value = .{ .array = array };
+    }
+    return value;
+}
+fn jsonHeight(input: std.json.Value, depth: usize) anyerror!usize {
+    if (depth > 64) return error.CypherValueDepthExceeded;
+    var height: usize = 0;
+    switch (input) {
+        .array => |items| for (items.items) |item| {
+            height = @max(height, 1 + try jsonHeight(item, depth + 1));
+        },
+        .object => |items| {
+            var iter = items.iterator();
+            while (iter.next()) |entry| height = @max(height, 1 + try jsonHeight(entry.value_ptr.*, depth + 1));
+        },
+        .float => |number| if (!std.math.isFinite(number)) {
+            return error.CypherNumericOverflow;
+        },
+        .number_string => |number| {
+            if (std.mem.indexOfAny(u8, number, ".eE") == null) {
+                _ = std.fmt.parseInt(i64, number, 10) catch return error.CypherNumericOverflow;
+            } else {
+                const parsed = std.fmt.parseFloat(f64, number) catch return error.CypherNumericOverflow;
+                if (!std.math.isFinite(parsed)) return error.CypherNumericOverflow;
+            }
+        },
+        else => {},
+    }
+    return height;
+}
+pub fn validationJson(a: A, input: std.json.Value) !std.json.Value {
+    const height = try jsonHeight(input, 0);
+    return if (input == .null) .null else validationWitness(a, height);
+}
+fn typedHeight(view: *View, node: *View.Node, depth: usize) anyerror!usize {
+    if (depth > 64) return error.CypherValueDepthExceeded;
+    const tag = try view.materialize((try view.field(node, "type")).?);
+    const payload = (try view.field(node, "value")).?;
+    if (std.mem.eql(u8, tag.string, "map") or std.mem.eql(u8, tag.string, "list")) {
+        var height: usize = 0;
+        for (try view.children(payload)) |*entry| height = @max(height, 1 + try typedHeight(view, &entry.node, depth + 1));
+        return height;
+    }
+    if (std.mem.eql(u8, tag.string, "string")) {
+        _ = try cypher.value.validatedJsonDepth(view.alloc, payload.raw, 0);
+    } else _ = try cypher.wire.parameter(view.alloc, try view.materialize(node));
+    return 0;
+}
 pub fn rawValue(a: A, raw: []const u8, item: Projection) !std.json.Value {
     var view = View.init(a, raw);
     const selector: Selector = .{ .prepared = true };
@@ -76,6 +136,11 @@ pub fn rawValue(a: A, raw: []const u8, item: Projection) !std.json.Value {
 }
 fn projectTyped(view: *View, node: *View.Node, item: Projection) anyerror!cypher.value.Value {
     if (item.mode == .value) return cypher.wire.parameter(view.alloc, try view.materialize(node));
+    if (item.mode == .validation) {
+        const tag = try view.materialize((try view.field(node, "type")).?);
+        const height = try typedHeight(view, node, 0);
+        return if (std.mem.eql(u8, tag.string, "null")) .null else try cypher.value.Value.fromJson(view.alloc, try validationWitness(view.alloc, height));
+    }
     const tag = try view.materialize((try view.field(node, "type")).?);
     if (std.mem.eql(u8, tag.string, "null")) return .null;
     if (item.mode == .presence or !std.mem.eql(u8, tag.string, "map")) return .{ .boolean = true };
@@ -611,4 +676,33 @@ test "Cypher demand projection fingerprints share JSON scanning without changing
     // cannot turn a false comparison into membership.
     fingerprints[0] = fingerprints[37];
     try std.testing.expectEqualStrings(alternatives[37].string, (try rawValue(allocator, actual, item)).string);
+}
+
+test "Cypher demand projection validates ignored payloads with bounded depth witnesses" {
+    const a = std.testing.allocator;
+    const wide = try a.alloc(u8, (2 << 20) + 2);
+    defer a.free(wide);
+    @memset(wide, 'x');
+    wide[0] = '"';
+    wide[wide.len - 1] = '"';
+    var buffer: [32768]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    const validation: Projection = .{ .name = "body", .mode = .validation };
+    try std.testing.expect((try rawValue(bounded.allocator(), wide, validation)).bool);
+    try std.testing.expect((try rawValue(bounded.allocator(), "null", validation)) == .null);
+    try std.testing.expectError(error.CypherNumericOverflow, rawValue(bounded.allocator(), "{\"hidden\":9223372036854775808}", validation));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const inputs = [_][]const u8{ "[]", "{}", "[1]", "{\"a\":[null,{}]}", "[[[true]]]" };
+    for (inputs) |input| {
+        const witness = try rawValue(scratch, input, validation);
+        const encoded = try std.json.Stringify.valueAlloc(scratch, witness, .{});
+        try std.testing.expectEqual(try cypher.value.validatedJsonDepth(scratch, input, 0), try cypher.value.validatedJsonDepth(scratch, encoded, 0));
+    }
+    const typed_raw = try std.json.Stringify.valueAlloc(scratch, .{ .source_table = "docs", .target_table = "docs", .antfly_cypher = .{ .version = 1, .properties = .{ .type = "map", .value = .{ .body = .{ .type = "string", .value = wide[1 .. wide.len - 1] } } } } }, .{});
+    var dummy: u8 = 0;
+    bounded.reset();
+    const selected = try metadata(&dummy, bounded.allocator(), typed_raw, 1, .{ .fields = &.{"body"}, .projection = &.{validation} });
+    try std.testing.expect(selected.properties[0].value.boolean);
 }

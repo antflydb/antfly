@@ -35,6 +35,7 @@ pub const signatures = [_]Signature{
     .{ .repeatable = true, .result = .primitive, .name = "abs" },
     .{ .repeatable = true, .result = .primitive_items, .name = "keys" },
     .{ .repeatable = true, .result = .preserve, .name = "reverse" },
+    .{ .repeatable = true, .result = .preserve, .name = "tail" },
     .{ .repeatable = true, .result = .primitive, .name = "trim" },
     .{ .repeatable = true, .result = .primitive, .name = "ltrim" },
     .{ .repeatable = true, .result = .primitive, .name = "rtrim" },

@@ -46,6 +46,7 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
         graphs: []const cypher.catalog.Graph,
         catalog_guards: []cypher.catalog_guard.Guard,
         graph_index: usize = 0,
+        privacy_generation: ?u64 = null,
         producer_visibility: cypher.producer_visibility.Memo = .{},
         visibility_filter: ?@import("../../search/pattern_filter.zig").PreparedPatternFilter = null,
         tables: [1]Adapter.Table,
@@ -59,7 +60,8 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
             var arena = std.heap.ArenaAllocator.init(a);
             errdefer arena.deinit();
             const owned = arena.allocator();
-            const copied = try std.json.parseFromSliceLeaky(port.Input, owned, try std.json.Stringify.valueAlloc(owned, input, .{}), .{ .allocate = .alloc_always });
+            var copied = try std.json.parseFromSliceLeaky(port.Input, owned, try std.json.Stringify.valueAlloc(owned, input, .{}), .{ .allocate = .alloc_always });
+            if (copied.privacy_policy_version == null) copied.privacy_policy_version = try @import("privacy_read.zig").servingVersion(db, owned);
             const record = try std.json.parseFromSliceLeaky(domain.Resource, owned, copied.catalog_json, .{ .allocate = .alloc_always });
             const graph = try domain.graphForExecution(owned, record);
             const records = if (copied.catalogs_json.len == 0) try owned.dupe(domain.Resource, &.{record}) else try std.json.parseFromSliceLeaky([]const domain.Resource, owned, copied.catalogs_json, .{ .allocate = .alloc_always });
@@ -144,7 +146,15 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
             try self.policy.checkAt(@intCast(time / std.time.ns_per_s));
             var scratch = std.heap.ArenaAllocator.init(self.a);
             defer scratch.deinit();
-            try self.catalog_guards[self.graph_index].validate(scratch.allocator(), CatalogSource{ .db = self.source });
+            const source: CatalogSource = .{ .db = self.source };
+            try self.catalog_guards[self.graph_index].validate(scratch.allocator(), source);
+            const generation = source.epoch().generation;
+            if (self.privacy_generation == null or self.privacy_generation.? != generation) {
+                const current = try @import("privacy_read.zig").servingVersion(self.source, scratch.allocator());
+                const expected = self.input.privacy_policy_version orelse return error.PrivacyReadFenceUnavailable;
+                if (!std.mem.eql(u8, &current, &expected)) return error.IndexRebuilding;
+                self.privacy_generation = generation;
+            }
         }
         const CatalogSource = struct {
             db: *DB,
@@ -171,7 +181,7 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
             const self = cast(ptr);
             if (!std.mem.eql(u8, table, self.input.table)) return error.Forbidden;
             const remaining_ms = self.input.expires_ms -| @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
-            return .{ .proof = self.input.principal_proof, .database = self.input.database, .filter_query_json = self.input.filter_query_json, .deadline_ns = @import("antfly_platform").time.monotonicNs() + @as(u64, @min(remaining_ms, 5000)) * std.time.ns_per_ms };
+            return .{ .privacy_policy_version = self.input.privacy_policy_version, .proof = self.input.principal_proof, .database = self.input.database, .filter_query_json = self.input.filter_query_json, .deadline_ns = @import("antfly_platform").time.monotonicNs() + @as(u64, @min(remaining_ms, 5000)) * std.time.ns_per_ms };
         }
         fn projectStored(ptr: *anyopaque, _: std.mem.Allocator, node: *const cypher.value.Node) !?*const cypher.value.Node {
             // Only the count visitor calls this after the retained source has
@@ -182,7 +192,7 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
         fn project(ptr: *anyopaque, a: std.mem.Allocator, node: *const cypher.value.Node) !?*const cypher.value.Node {
             const self = cast(ptr);
             if (self.input.filter_query_json.len != 0) {
-                var opts = try self.db.cypherDocumentScanOptions(a, .{ .inclusive_from = true, .limit = 1, .execution_deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, .filter_query_json = self.input.filter_query_json, .row_policy_principal_proof = self.input.principal_proof, .row_policy_database = self.input.database });
+                var opts = try self.db.cypherDocumentScanOptions(a, .{ .inclusive_from = true, .limit = 1, .execution_deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, .filter_query_json = self.input.filter_query_json, .row_policy_principal_proof = self.input.principal_proof, .row_policy_database = self.input.database, .privacy_policy_version = self.input.privacy_policy_version });
                 // Visibility needs only an admitted identity. Keep the filter
                 // authoritative against the full row, but never project wide
                 // user payloads into this metadata-only relational read.
@@ -270,6 +280,7 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
             if (!unrestricted or self.input.filter_query_json.len != 0 or self.db.core.table_catalog.row_policy_phase == .active)
                 request.native_key_predicate = .{ .ptr = &membership, .allows = SearchMembership.allows };
             request.include_stored = false;
+            request.privacy_policy_version = self.input.privacy_policy_version;
             var result = try self.db.searchCypherCut(a, request, authorization.proof, authorization.database);
             defer result.deinit();
             if (result.hits.len > input.max_examined) return error.CypherAnchorBudgetExceeded;
@@ -290,7 +301,7 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
         }
         fn producerVisible(self: *Self, a: std.mem.Allocator, key: []const u8) !bool {
             if (self.adapter.work) |work| try work.charge(work.ptr, 1);
-            var producer = (try self.db.getDocument(a, key, .{ .row_policy_principal_proof = self.input.principal_proof, .row_policy_database = self.input.database })) orelse return false;
+            var producer = (try self.db.getDocument(a, key, .{ .row_policy_principal_proof = self.input.principal_proof, .row_policy_database = self.input.database, .privacy_policy_version = self.input.privacy_policy_version })) orelse return false;
             defer producer.deinit(a);
             if (self.input.filter_query_json.len != 0) {
                 if (self.visibility_filter == null) self.visibility_filter = try @import("../../search/pattern_filter.zig").PreparedPatternFilter.init(self.arena.allocator(), self.input.filter_query_json);
@@ -425,6 +436,7 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
             var opts = input;
             opts.row_policy_principal_proof = self.input.principal_proof;
             opts.row_policy_database = self.input.database;
+            opts.privacy_policy_version = self.input.privacy_policy_version;
             if (self.input.filter_query_json.len != 0) {
                 if (opts.filter_query_json.len == 0) opts.filter_query_json = self.input.filter_query_json else opts.filter_query_json = try std.fmt.allocPrint(scratch.allocator(), "{{\"conjuncts\":[{s},{s}]}}", .{ opts.filter_query_json, self.input.filter_query_json });
             }

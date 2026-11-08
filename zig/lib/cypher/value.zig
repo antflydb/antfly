@@ -853,11 +853,18 @@ test "aggregate borrowing expires source addresses at each row while retaining o
 /// remain borrowed, including escaped strings, and container memory is O(depth).
 /// The caller supplies the depth of this value inside the projected document.
 pub fn validateJsonSlice(a: std.mem.Allocator, raw: []const u8, base_depth: usize) !void {
+    _ = try validatedJsonDepth(a, raw, base_depth);
+}
+/// Return the structural height of a fully validated value, without owning its
+/// strings or expanding its fanout. Empty containers have height zero.
+pub fn validatedJsonDepth(a: std.mem.Allocator, raw: []const u8, base_depth: usize) !usize {
     var scanner = std.json.Scanner.initCompleteInput(a, raw);
     defer scanner.deinit();
     var depth = base_depth;
+    var maximum = base_depth;
     while (true) {
         const token = try scanner.next();
+        if (token != .object_end and token != .array_end and token != .end_of_document) maximum = @max(maximum, depth);
         switch (token) {
             .object_begin, .array_begin => {
                 if (depth > 64) return error.CypherValueDepthExceeded;
@@ -877,6 +884,7 @@ pub fn validateJsonSlice(a: std.mem.Allocator, raw: []const u8, base_depth: usiz
             else => if (depth > 64) return error.CypherValueDepthExceeded,
         }
     }
+    return maximum - base_depth;
 }
 
 test "count nullness validation streams escaped strings and preserves numeric and depth failures" {

@@ -1274,7 +1274,6 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidCypherParameters => status(.invalid_argument, .invalid_cypher_parameters),
         error.MissingCypherParameter => status(.invalid_argument, .missing_cypher_parameter),
         error.SqlWriteCapacityUnavailable => status(.unavailable, .sql_write_capacity_unavailable),
-        error.SqlStatementReadUnavailable => status(.unavailable, .sql_statement_read_unavailable),
         error.CypherAggregateScope => status(.invalid_argument, .cypher_aggregate_scope),
         error.CypherAggregateWildcard => status(.invalid_argument, .cypher_aggregate_wildcard),
         error.CypherAmbiguousSearchTable => status(.invalid_argument, .cypher_ambiguous_search_table),
@@ -2328,7 +2327,6 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_cypher_parameters => "InvalidCypherParameters",
         .missing_cypher_parameter => "MissingCypherParameter",
         .sql_write_capacity_unavailable => "SqlWriteCapacityUnavailable",
-        .sql_statement_read_unavailable => "SqlStatementReadUnavailable",
         .cypher_aggregate_scope => "CypherAggregateScope",
         .cypher_aggregate_wildcard => "CypherAggregateWildcard",
         .cypher_ambiguous_search_table => "CypherAmbiguousSearchTable",
@@ -3460,7 +3458,7 @@ test "storage callback boundaries retain capability integrity and bounded-read o
 
 test "temporary SQL statement capture failure preserves retryable boundary identity" {
     const transported = statusFromError(error.SqlStatementReadUnavailable);
-    try std.testing.expectEqual(@backingInt(Code.unavailable), transported.code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
     try std.testing.expectEqual(error.SqlStatementReadUnavailable, errorFromStatus(transported));
     try std.testing.expect(errorHasStableDetail(error.SqlStatementReadUnavailable));
 }
@@ -3622,7 +3620,7 @@ test "merged runtime error details preserve the common prefix under ABI two" {
     try std.testing.expectEqual(@as(c_int, 839), @backingInt(Detail.read_output_truncated));
     try std.testing.expectEqual(@as(c_int, 840), @backingInt(Detail.invalid_document_extraction_config));
     try std.testing.expectEqual(@as(c_int, 841), @backingInt(Detail.document_extraction_model_required));
-    try std.testing.expectEqual(@as(c_int, 842), @backingInt(Detail.cypher_aggregate_scope));
+    try std.testing.expectEqual(@as(c_int, 891), @backingInt(Detail.cypher_aggregate_scope));
 }
 
 test "logical query work and scan policy failures retain their identities" {
@@ -3727,4 +3725,21 @@ test "privacy failures retain identity and retry classes across runtime callback
     }
     try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.PrivacyStale).code);
     try std.testing.expectEqual(@backingInt(Code.corrupt), statusFromError(error.InvalidPrivacyReceipt).code);
+}
+
+test "latest main error detail prefix remains append only across graph integration" {
+    @setEvalBranchQuota(30000);
+    var hash: u64 = 14695981039346656037;
+    var count: usize = 0;
+    inline for (@typeInfo(Detail).@"enum".field_names, @typeInfo(Detail).@"enum".field_values) |name, value| {
+        if (value <= 890) {
+            for (name) |byte| hash = (hash ^ byte) *% 1099511628211;
+            var encoded: [4]u8 = undefined;
+            std.mem.writeInt(u32, &encoded, @intCast(value), .little);
+            for (encoded) |byte| hash = (hash ^ byte) *% 1099511628211;
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 891), count);
+    try std.testing.expectEqual(@as(u64, 16819601552131841023), hash);
 }

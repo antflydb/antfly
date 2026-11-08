@@ -22,7 +22,20 @@ const std = @import("std");
 const v = @import("value.zig");
 const A = std.mem.Allocator;
 const Key = struct { address: usize, length: usize, kind: enum { list, map, string } };
-pub const Info = struct { hash: u64, depth: usize = 0, work: usize = 1, comparison_work: usize = 1, entity_work: usize = 1, unknown: bool = false, entities: bool = false };
+pub const Info = struct { hash: u64, depth: usize = 0, work: usize = 1, steps: usize = 1, entity_work: usize = 1, unknown: bool = false, entities: bool = false };
+/// Structural certificates never inspect string bodies or compute equality hashes.
+/// They share the same immutable allocation/epoch contract as hash metadata.
+pub const Shape = struct {
+    depth: usize = 0,
+    work: usize = 1,
+    steps: usize = 1,
+    entity_work: usize = 1,
+    unknown: bool = false,
+    entities: bool = false,
+    fn fromInfo(value: Info) Shape {
+        return .{ .depth = value.depth, .work = value.work, .steps = value.steps, .entity_work = value.entity_work, .unknown = value.unknown, .entities = value.entities };
+    }
+};
 pub const Work = struct {
     a: A,
     ptr: *anyopaque,
@@ -35,6 +48,7 @@ pub const Work = struct {
     /// evaluation scope. Transient probe metadata is never inserted there.
     parent: ?*Work = null,
     cache: std.AutoHashMapUnmanaged(Key, Info) = .empty,
+    shapes: std.AutoHashMapUnmanaged(Key, Shape) = .empty,
     fields: std.AutoHashMapUnmanaged(Key, std.StringHashMapUnmanaged(usize)) = .empty,
     order_depths: std.AutoHashMapUnmanaged(Key, usize) = .empty,
     order_entries: std.AutoHashMapUnmanaged(Key, []const v.Entry) = .empty,
@@ -56,7 +70,7 @@ pub const Work = struct {
         return null;
     }
     pub fn hasMetadata(self: *const Work, value: v.Value) bool {
-        return if (key(value)) |k| self.cache.contains(k) else false;
+        return if (key(value)) |k| (self.cache.contains(k) or self.shapes.contains(k)) else false;
     }
     pub fn lookup(self: *Work, entries: []const v.Entry, name: []const u8) !?v.Value {
         try self.charge(self.ptr, 1 + name.len / 64);
@@ -104,6 +118,61 @@ pub const Work = struct {
     fn identity(seed: u64, id: v.Identity) u64 {
         return text(text(seed, id.table), id.key);
     }
+    pub fn cachedShape(self: *const Work, value: v.Value) ?Shape {
+        const k = key(value) orelse return null;
+        var owner: ?*const Work = self;
+        while (owner) |current| : (owner = current.parent) {
+            if (current.shapes.get(k)) |known| return known;
+            if (current.cache.get(k)) |known| return Shape.fromInfo(known);
+        }
+        return null;
+    }
+    pub fn shape(self: *Work, value: v.Value) anyerror!Shape {
+        return self.shapeDepth(value, 0);
+    }
+    fn shapeDepth(self: *Work, value: v.Value, depth: usize) anyerror!Shape {
+        try self.charge(self.ptr, 1);
+        if (depth > 64) return error.CypherValueDepthExceeded;
+        if (self.cachedShape(value)) |known| {
+            if (depth + known.depth > 64) return error.CypherValueDepthExceeded;
+            return known;
+        }
+        var result: Shape = .{};
+        switch (value) {
+            .null => result.unknown = true,
+            .string => |bytes| result.work +|= bytes.len / 64,
+            .node, .relationship => result.entities = true,
+            .path => |path| {
+                result.entities = true;
+                result.work +|= path.nodes.len +| path.relationships.len;
+                result.entity_work = result.work;
+                result.steps = result.work;
+            },
+            .list => |items| for (items) |item| {
+                const child = try self.shapeDepth(item, depth + 1);
+                mergeShape(&result, child);
+            },
+            .map => |entries| for (entries) |entry| {
+                const child = try self.shapeDepth(entry.value, depth + 1);
+                mergeShape(&result, child);
+                result.work +|= entry.name.len / 64;
+            },
+            else => {},
+        }
+        if (key(value)) |k| try self.shapes.put(self.a, k, result);
+        return result;
+    }
+    fn mergeShape(result: *Shape, child: Shape) void {
+        result.depth = @max(result.depth, child.depth + 1);
+        result.work +|= child.work;
+        result.steps +|= child.steps;
+        result.entity_work +|= if (child.entities) child.entity_work else 1;
+        result.unknown = result.unknown or child.unknown;
+        result.entities = result.entities or child.entities;
+    }
+    pub fn rememberShape(self: *Work, value: v.Value, metadata: Shape) !void {
+        if (key(value)) |k| try self.shapes.put(self.a, k, metadata);
+    }
     pub fn info(self: *Work, value: v.Value) anyerror!Info {
         return self.infoDepth(value, 0);
     }
@@ -117,6 +186,10 @@ pub const Work = struct {
                 if (depth + cached.depth > 64) return error.CypherValueDepthExceeded;
                 return cached;
             };
+            owner = self.parent;
+            while (owner) |current| : (owner = current.parent) {
+                if (current.shapes.contains(k)) return current.infoDepth(value, depth);
+            }
         }
         var result: Info = .{ .hash = if (self.binding_identity) @backingInt(std.meta.activeTag(value)) else v.Value.rank(value) };
         switch (value) {
@@ -138,7 +211,6 @@ pub const Work = struct {
                 try self.charge(self.ptr, item.len / 64);
                 result.hash = text(result.hash, item);
                 result.work +|= item.len / 64;
-                result.comparison_work = result.work;
             },
             .node => |node| {
                 result.hash = identity(result.hash, node.identity);
@@ -153,8 +225,9 @@ pub const Work = struct {
                 for (path.nodes) |node| result.hash = identity(result.hash, node.identity);
                 for (path.relationships) |edge| result.hash = text(identity(result.hash, edge.identity), edge.index);
                 result.work +|= path.nodes.len +| path.relationships.len;
-                result.comparison_work = result.work;
+
                 result.entity_work = result.work;
+                result.steps = result.work;
             },
             .list => |items| {
                 result.hash = mix(result.hash, items.len);
@@ -163,7 +236,7 @@ pub const Work = struct {
                     result.hash = mix(result.hash, child.hash);
                     result.depth = @max(result.depth, child.depth + 1);
                     result.work +|= child.work;
-                    result.comparison_work +|= child.comparison_work;
+                    result.steps +|= child.steps;
                     result.entity_work +|= if (child.entities) child.entity_work else 1;
                     result.unknown = result.unknown or child.unknown;
                     result.entities = result.entities or child.entities;
@@ -179,15 +252,12 @@ pub const Work = struct {
                     entries +%= text(child.hash, item.name);
                     result.depth = @max(result.depth, child.depth + 1);
                     result.work +|= child.work +| (item.name.len / 64);
-                    result.comparison_work +|= child.comparison_work +| (item.name.len / 64);
+                    result.steps +|= child.steps;
                     result.entity_work +|= if (child.entities) child.entity_work else 1;
                     result.unknown = result.unknown or child.unknown;
                     result.entities = result.entities or child.entities;
                 }
                 result.hash = mix(mix(result.hash, items.len), entries);
-                // The existing total map ordering compares sorted keys using
-                // repeated selection. Reserve that work as well as traversal.
-                result.comparison_work +|= items.len *| items.len;
             },
         }
         if (cache_key) |k| try self.cache.put(self.a, k, result);
@@ -200,7 +270,7 @@ pub const Work = struct {
         if (key(value)) |cache_key| try self.cache.put(self.a, cache_key, metadata);
     }
     pub fn traversal(self: *Work, value: v.Value) !void {
-        try self.charge(self.ptr, (try self.info(value)).work);
+        try self.charge(self.ptr, (try self.shape(value)).work);
     }
     /// Wire depth includes entity property maps and path members. Entity
     /// identities are stable, but their properties can change during writes;
@@ -213,7 +283,7 @@ pub const Work = struct {
     }
     fn outputDepth(self: *Work, value: v.Value, depth: usize) anyerror!void {
         if (depth > 64) return error.CypherValueDepthExceeded;
-        const metadata = try self.info(value);
+        const metadata = try self.shape(value);
         if (!metadata.entities) {
             if (depth + metadata.depth > 64) return error.CypherValueDepthExceeded;
             return self.charge(self.ptr, metadata.work);
@@ -232,7 +302,7 @@ pub const Work = struct {
         }
     }
     pub fn entityTraversal(self: *Work, value: v.Value) !void {
-        try self.charge(self.ptr, (try self.info(value)).entity_work);
+        try self.charge(self.ptr, (try self.shape(value)).entity_work);
     }
     fn identical(a: v.Value, b: v.Value) bool {
         const left = key(a) orelse return false;
@@ -248,10 +318,10 @@ pub const Work = struct {
         if (a == .map and a.map.len != b.map.len) return false;
         if (a == .list and a.list.len != b.list.len) return false;
         if (a == .string and b == .string) return try self.equalText(a.string, b.string);
-        const left = try self.info(a);
-        const right = try self.info(b);
+        const left = try self.shape(a);
+        const right = try self.shape(b);
         if (identical(a, b)) return if (left.unknown) null else true;
-        try self.charge(self.ptr, left.work +| right.work);
+        try self.charge(self.ptr, left.steps +| right.steps);
         return self.equalInner(a, b, false);
     }
     fn equalInner(self: *Work, a: v.Value, b: v.Value, nulls_equal: bool) anyerror!?bool {
@@ -285,7 +355,7 @@ pub const Work = struct {
         }
         // Scalar/path equality has bounded traversal, with checkpoints above
         // each container member. Structural metadata reserves byte/path work.
-        try self.charge(self.ptr, (try self.info(a)).work +| (try self.info(b)).work);
+        try self.charge(self.ptr, (try self.shape(a)).work +| (try self.shape(b)).work);
         return if (nulls_equal) v.Value.eql(a, b) else v.Value.equal(a, b);
     }
     pub fn eql(self: *Work, a: v.Value, b: v.Value) !bool {
@@ -435,11 +505,38 @@ pub const Work = struct {
             if (a.string.ptr == b.string.ptr) return std.math.order(a.string.len, b.string.len);
             return try self.orderText(a.string, b.string);
         }
-        const left = try self.info(a);
+        const left = try self.shape(a);
         if (identical(a, b)) return if (left.unknown) null else .eq;
-        try self.charge(self.ptr, left.comparison_work);
-        try self.charge(self.ptr, (try self.info(b)).comparison_work);
-        return v.Value.compare(a, b);
+        const right = try self.shape(b);
+        try self.charge(self.ptr, left.steps +| right.steps);
+        return self.compareInner(a, b);
+    }
+    fn compareInner(self: *Work, a: v.Value, b: v.Value) anyerror!?std.math.Order {
+        try self.charge(self.ptr, 1);
+        if (a == .null or b == .null or v.Value.rank(a) != v.Value.rank(b)) return null;
+        if (a == .list) {
+            for (a.list[0..@min(a.list.len, b.list.len)], b.list[0..@min(a.list.len, b.list.len)]) |left, right| {
+                const comparison = (try self.compareInner(left, right)) orelse return null;
+                if (comparison != .eq) return comparison;
+            }
+            return std.math.order(a.list.len, b.list.len);
+        }
+        if (a == .map) {
+            if (a.map.len != b.map.len) return std.math.order(a.map.len, b.map.len);
+            const left = try self.sortedEntries(a.map);
+            const right = try self.sortedEntries(b.map);
+            for (left, right) |x, y| {
+                const comparison = try self.orderText(x.name, y.name);
+                if (comparison != .eq) return comparison;
+            }
+            for (left, right) |x, y| {
+                const comparison = (try self.compareInner(x.value, y.value)) orelse return null;
+                if (comparison != .eq) return comparison;
+            }
+            return .eq;
+        }
+        if (a == .string and a.string.ptr == b.string.ptr) return std.math.order(a.string.len, b.string.len);
+        return try self.orderInner(a, b);
     }
 };
 
@@ -687,4 +784,72 @@ test "nullable string comparison meters decisive prefixes and equal tails" {
     try std.testing.expectError(error.CypherStateBudgetExceeded, work.compare(.{ .string = text }, .{ .string = copy }));
     counter.left = 256;
     try std.testing.expectEqual(@as(?std.math.Order, null), try work.compare(.null, .{ .string = text }));
+}
+
+test "container predicates validate shape and meter only compared byte prefixes" {
+    const Counter = struct {
+        left: usize,
+        fn charge(ptr: *anyopaque, amount: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (amount > self.left) return error.CypherStateBudgetExceeded;
+            self.left -= amount;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try a.alloc(u8, 2 << 20);
+    @memset(bytes, 'x');
+    const left: v.Value = .{ .list = &.{.{ .string = bytes }} };
+    const right: v.Value = .{ .list = &.{.{ .string = "7" }} };
+    var counter: Counter = .{ .left = 2000 };
+    var work: Work = .{ .a = a, .ptr = &counter, .charge = Counter.charge };
+    for (0..32) |_| {
+        try std.testing.expectEqual(std.math.Order.gt, (try work.compare(left, right)).?);
+        try std.testing.expectEqual(@as(?bool, false), try work.equal(left, right));
+    }
+    try std.testing.expectEqual(@as(usize, 0), work.cache.count());
+    const nullable: v.Value = .{ .list = &.{ .null, .{ .integer = 1 } } };
+    const different: v.Value = .{ .list = &.{ .null, .{ .integer = 2 } } };
+    try std.testing.expectEqual(@as(?std.math.Order, null), try work.compare(nullable, different));
+    try std.testing.expectEqual(@as(?bool, false), try work.equal(nullable, different));
+    const copy: v.Value = .{ .list = &.{.{ .string = try a.dupe(u8, bytes) }} };
+    counter.left = 16;
+    try std.testing.expectError(error.CypherStateBudgetExceeded, work.compare(left, copy));
+}
+
+test "wide nullable map ordering sorts key views and immutable hashes stay lazy" {
+    const Counter = struct {
+        left: usize,
+        fn charge(ptr: *anyopaque, amount: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (amount > self.left) return error.CypherStateBudgetExceeded;
+            self.left -= amount;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const left = try a.alloc(v.Entry, 2048);
+    const right = try a.alloc(v.Entry, left.len);
+    for (left, 0..) |*entry, i| entry.* = .{ .name = try std.fmt.allocPrint(a, "{d:0>4}", .{i}), .value = .{ .integer = @intCast(i) } };
+    for (right, 0..) |*entry, i| entry.* = left[left.len - i - 1];
+    right[right.len - 1].value = .{ .integer = 1 };
+    var counter: Counter = .{ .left = 100000 };
+    var work: Work = .{ .a = a, .ptr = &counter, .charge = Counter.charge };
+    try std.testing.expectEqual(std.math.Order.lt, (try work.compare(.{ .map = left }, .{ .map = right })).?);
+    try std.testing.expectEqual(@as(usize, 0), work.cache.count());
+    const bytes = try a.alloc(u8, 2 << 20);
+    @memset(bytes, 'x');
+    const value: v.Value = .{ .list = &.{.{ .string = bytes }} };
+    counter.left = 40000;
+    var owner: Work = .{ .a = a, .ptr = &counter, .charge = Counter.charge };
+    _ = try owner.shape(value);
+    try std.testing.expectEqual(@as(usize, 0), owner.cache.count());
+    for (0..32) |_| {
+        var epoch: Work = .{ .a = a, .ptr = &counter, .charge = Counter.charge, .parent = &owner };
+        _ = try epoch.info(value);
+        try std.testing.expectEqual(@as(usize, 0), epoch.cache.count());
+    }
+    try std.testing.expect(owner.cache.count() == 2);
 }

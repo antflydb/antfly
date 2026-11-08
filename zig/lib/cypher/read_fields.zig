@@ -23,7 +23,7 @@ pub const predicate_fingerprint = @import("predicate_fingerprint.zig");
 /// Literal property names; children are partial maps, never public values.
 pub const Projection = struct {
     name: []const u8,
-    mode: enum { value, presence, children, predicate },
+    mode: enum { value, presence, children, predicate, validation },
     /// Private equality-only representative; never used for observed fields.
     alternatives: []const std.json.Value = &.{},
     fingerprints: []const predicate_fingerprint.Digest = &.{},
@@ -71,7 +71,7 @@ const Binding = struct {
     prefix: []const []const u8 = &.{},
     used: ?*bool = null,
 };
-const PropertyPath = struct { parts: []const []const u8, presence: bool, shape: bool = false, keys: bool = false };
+const PropertyPath = struct { parts: []const []const u8, presence: bool, shape: bool = false, keys: bool = false, validation: bool = false };
 const NodePlan = struct {
     labels: std.ArrayList(catalog.Label) = .empty,
     cover: ?[]const u8 = null,
@@ -83,9 +83,10 @@ const NodePlan = struct {
     keys: bool = false,
 };
 const RelationshipPlan = struct { table: []const u8, index: []const u8, stored_type: []const u8, plan: NodePlan = .{} };
-const Need = enum { value, identity, nullness, labels, keys, evaluate };
+const Need = enum { value, identity, nullness, labels, keys, evaluate, validate };
 const Selector = union(enum) { field: []const u8, item: i64, element, path_nodes, path_relationships };
 const Entities = std.StringHashMapUnmanaged(Binding);
+const Observation = struct { need: Need, selectors: []const Selector };
 const Derived = struct {
     expression: *const ast.Expr,
     entities: Entities,
@@ -94,6 +95,11 @@ const Derived = struct {
     seen: u8 = 0,
     used: bool = false,
     paths: Names = .empty,
+    feedback_seed: ?*Derived = null,
+    feedback_step: ?*Derived = null,
+    feedback_pending: std.ArrayList(Observation) = .empty,
+    feedback_next: usize = 0,
+    feedback_draining: bool = false,
 };
 const Plan = struct {
     a: A,
@@ -355,11 +361,13 @@ const Plan = struct {
                     else => {},
                 }
             } else false,
+            .reduce, .pattern_comprehension => true,
+            .binary => |binary| binary.op == .add and (self.forwards(binary.left.*) or self.forwards(binary.right.*)),
             .comprehension => |local| self.forwards(local.input.*) or (if (local.projection) |projection| self.forwards(projection.*) else false),
             .case_when => |case| for (case.branches) |branch| {
                 if (self.forwards(branch.value.*)) break true;
             } else if (case.otherwise) |other| self.forwards(other.*) else false,
-            .call => |call| if (std.ascii.eqlIgnoreCase(call.name, "coalesce") or std.ascii.eqlIgnoreCase(call.name, "head") or std.ascii.eqlIgnoreCase(call.name, "last") or std.ascii.eqlIgnoreCase(call.name, "properties") or std.ascii.eqlIgnoreCase(call.name, "nodes") or std.ascii.eqlIgnoreCase(call.name, "relationships")) for (call.args) |arg| {
+            .call => |call| if (std.ascii.eqlIgnoreCase(call.name, "coalesce") or std.ascii.eqlIgnoreCase(call.name, "head") or std.ascii.eqlIgnoreCase(call.name, "last") or std.ascii.eqlIgnoreCase(call.name, "properties") or std.ascii.eqlIgnoreCase(call.name, "nodes") or std.ascii.eqlIgnoreCase(call.name, "relationships") or std.ascii.eqlIgnoreCase(call.name, "collect") or std.ascii.eqlIgnoreCase(call.name, "reverse") or std.ascii.eqlIgnoreCase(call.name, "tail")) for (call.args) |arg| {
                 if (self.forwards(arg.*)) break true;
             } else false else false,
             else => false,
@@ -372,6 +380,9 @@ const Plan = struct {
         return term;
     }
     fn consumeDerived(self: *Plan, term: *Derived, need: Need, selectors: []const Selector) anyerror!void {
+        // Recursive accumulator paths form a monotone observation lattice.
+        // Widen indefinitely growing selector paths to a complete value.
+        if (selectors.len > 64) return self.consumeDerived(term, .value, &.{});
         if (need != .evaluate) term.used = true;
         if (selectors.len == 0) {
             const bit = @as(u8, 1) << @intCast(@backingInt(need));
@@ -380,6 +391,19 @@ const Plan = struct {
         } else {
             const key = try std.json.Stringify.valueAlloc(self.a, .{ need, selectors }, .{});
             if ((try term.paths.getOrPut(self.a, key)).found_existing) return;
+        }
+        if (term.feedback_seed) |seed| {
+            try term.feedback_pending.append(self.a, .{ .need = need, .selectors = selectors });
+            if (term.feedback_draining) return;
+            term.feedback_draining = true;
+            defer term.feedback_draining = false;
+            while (term.feedback_next < term.feedback_pending.items.len) {
+                const pending = term.feedback_pending.items[term.feedback_next];
+                term.feedback_next += 1;
+                try self.consumeDerived(seed, pending.need, pending.selectors);
+                try self.consumeDerived(term.feedback_step.?, pending.need, pending.selectors);
+            }
+            return;
         }
         const entities = self.entities;
         const derived = self.derived;
@@ -427,7 +451,17 @@ const Plan = struct {
             try parts.append(self.a, selector.field);
         }
         if (parts.items.len != 0) {
-            if (need == .evaluate) {
+            if (need == .validate) {
+                try self.recordPath(binding, parts.items, false, true);
+                const path: PropertyPath = .{ .parts = parts.items, .presence = false, .shape = true, .validation = true };
+                if (binding.kind == .node) {
+                    try self.node_paths.append(self.a, path);
+                    for (binding.tables) |table| try self.tables.get(table).?.paths.append(self.a, path);
+                } else if (binding.kind == .relationship) {
+                    try self.edge_paths.append(self.a, path);
+                    for (binding.relationship_ids) |id| try self.relationship_plans[id].plan.paths.append(self.a, path);
+                } else try self.whole(binding);
+            } else if (need == .evaluate) {
                 try self.recordPath(binding, parts.items, false, true);
             } else if (need == .keys) {
                 const path: PropertyPath = .{ .parts = parts.items, .presence = false, .shape = true, .keys = true };
@@ -459,11 +493,22 @@ const Plan = struct {
                     for (binding.relationship_ids) |id| self.relationship_plans[id].plan.keys = true;
                 } else try self.whole(binding);
             },
-            .identity, .nullness, .evaluate => {},
+            .identity, .nullness, .evaluate, .validate => {},
         }
     }
     fn consume(self: *Plan, expression: ast.Expr, need: Need, selectors: []const Selector) anyerror!void {
         if (!try self.observe(expression, need, selectors)) try self.walk(expression);
+    }
+    fn literalItem(expression: ast.Expr) ?i64 {
+        return switch (expression.value) {
+            .literal => |literal| if (literal == .integer) literal.integer else null,
+            .unary => |unary| if (literalItem(unary.operand.*)) |number| switch (unary.op) {
+                .positive => number,
+                .negative => std.math.cast(i64, -@as(i128, number)),
+                else => null,
+            } else null,
+            else => null,
+        };
     }
     fn observe(self: *Plan, expression: ast.Expr, need: Need, selectors: []const Selector) anyerror!bool {
         switch (expression.value) {
@@ -477,7 +522,7 @@ const Plan = struct {
             },
             .index => |index| {
                 try self.walk(index.index.*);
-                const selector: Selector = if (index.index.value == .literal and index.index.value.literal == .string) .{ .field = index.index.value.literal.string } else if (index.index.value == .literal and index.index.value.literal == .integer) .{ .item = index.index.value.literal.integer } else .element;
+                const selector: Selector = if (index.index.value == .literal and index.index.value.literal == .string) .{ .field = index.index.value.literal.string } else if (literalItem(index.index.*)) |number| .{ .item = number } else .element;
                 try self.consume(index.base.*, need, try self.prepend(selector, selectors));
                 return true;
             },
@@ -508,13 +553,13 @@ const Plan = struct {
                         .all => null,
                     };
                     const selected = selectors.len == 0 or selectors[0] == .element or (selectors[0] == .field and (name == null or std.mem.eql(u8, selectors[0].field, name.?)));
-                    const observation: Need = if (!selected or (selectors.len == 0 and (need == .keys or need == .nullness))) .identity else need;
+                    const observation: Need = if (!selected or (selectors.len == 0 and (need == .keys or need == .nullness or need == .evaluate or need == .validate))) .validate else need;
                     const rest = if (selected and selectors.len != 0) selectors[1..] else &.{};
                     switch (item) {
                         .property => |key| try self.consume(projection.base.*, observation, try self.prepend(.{ .field = key }, rest)),
                         .entry => |entry| try self.consume(entry.value.*, observation, rest),
                         .variable => |key| try self.consume(.{ .span = expression.span, .value = .{ .variable = key } }, observation, rest),
-                        .all => try self.consume(projection.base.*, if (selectors.len == 0) need else observation, if (selected) selectors else &.{}),
+                        .all => try self.consume(projection.base.*, if (selectors.len == 0 and (need == .validate or need == .evaluate or need == .nullness)) .value else if (selectors.len == 0) need else observation, if (selected) selectors else &.{}),
                     }
                 }
                 return true;
@@ -527,15 +572,54 @@ const Plan = struct {
                         .item => |index| @as(i128, if (index < 0) @as(i128, items.len) + index else index) == i,
                         else => false,
                     };
-                    try self.consume(item.*, if (selected) (if (selectors.len == 0 and (need == .nullness or need == .keys)) .identity else need) else .identity, if (selected and selectors.len != 0) selectors[1..] else &.{});
+                    try self.consume(item.*, if (selected) (if (selectors.len == 0 and (need == .nullness or need == .keys or need == .evaluate or need == .validate)) .validate else need) else .validate, if (selected and selectors.len != 0) selectors[1..] else &.{});
                 }
                 return true;
             },
             .map => |entries| {
                 for (entries) |entry| {
                     const selected = selectors.len == 0 or selectors[0] == .element or (selectors[0] == .field and std.mem.eql(u8, selectors[0].field, entry.name));
-                    try self.consume(entry.value.*, if (selected) (if (selectors.len == 0 and (need == .nullness or need == .keys)) .identity else need) else .identity, if (selected and selectors.len != 0) selectors[1..] else &.{});
+                    try self.consume(entry.value.*, if (selected) (if (selectors.len == 0 and (need == .nullness or need == .keys or need == .evaluate or need == .validate)) .validate else need) else .validate, if (selected and selectors.len != 0) selectors[1..] else &.{});
                 }
+                return true;
+            },
+            .pattern_comprehension => |pattern| {
+                const outer = self.entities;
+                const outer_derived = self.derived;
+                self.entities = try outer.clone(self.a);
+                self.derived = try outer_derived.clone(self.a);
+                defer {
+                    self.entities = outer;
+                    self.derived = outer_derived;
+                }
+                try self.names(pattern.path);
+                try self.walk(pattern.path);
+                try self.walk(pattern.predicate);
+                const rest = if (selectors.len != 0 and (selectors[0] == .item or selectors[0] == .element)) selectors[1..] else selectors;
+                try self.consume(pattern.projection.*, if (selectors.len == 0 and (need == .keys or need == .nullness or need == .evaluate or need == .validate)) .validate else need, rest);
+                return true;
+            },
+            .reduce => |local| {
+                const seed = try self.capture(local.initial, &.{});
+                const element = try self.capture(local.input, &.{.element});
+                const feedback = try self.capture(local.initial, &.{});
+                feedback.feedback_seed = seed;
+                try self.consumeDerived(seed, .evaluate, &.{});
+                try self.consume(local.input.*, .identity, &.{});
+                const outer = self.entities;
+                const outer_derived = self.derived;
+                self.entities = try outer.clone(self.a);
+                self.derived = try outer_derived.clone(self.a);
+                defer {
+                    self.entities = outer;
+                    self.derived = outer_derived;
+                }
+                _ = self.entities.remove(local.alias);
+                _ = self.entities.remove(local.accumulator);
+                try self.derived.put(self.a, local.alias, element);
+                try self.derived.put(self.a, local.accumulator, feedback);
+                feedback.feedback_step = try self.capture(local.projection, &.{});
+                try self.consumeDerived(feedback, need, selectors);
                 return true;
             },
             .case_when => |case| {
@@ -552,6 +636,18 @@ const Plan = struct {
                 return true;
             },
             .binary => |binary| switch (binary.op) {
+                .add => {
+                    // Addition may concatenate lists or perform scalar arithmetic.
+                    // Preserve eager scalar values/errors before forwarding a
+                    // conservative element domain through concatenation.
+                    try self.consume(binary.left.*, .identity, &.{});
+                    try self.consume(binary.right.*, .identity, &.{});
+                    if (need == .identity and selectors.len == 0) return true;
+                    const rest = if (selectors.len != 0 and selectors[0] == .item) try self.prepend(.element, selectors[1..]) else selectors;
+                    try self.consume(binary.left.*, need, rest);
+                    try self.consume(binary.right.*, need, rest);
+                    return true;
+                },
                 .eq, .neq, .lt, .lte, .gt, .gte, .in => {
                     try self.consume(binary.left.*, .identity, &.{});
                     try self.consume(binary.right.*, .identity, &.{});
@@ -564,6 +660,25 @@ const Plan = struct {
                 return true;
             },
             .call => |call| {
+                if (std.ascii.eqlIgnoreCase(call.name, "collect") and call.args.len == 1) {
+                    if (call.distinct) try self.consume(call.args[0].*, .identity, &.{});
+                    const rest = if (selectors.len != 0 and (selectors[0] == .item or selectors[0] == .element)) selectors[1..] else selectors;
+                    try self.consume(call.args[0].*, if (selectors.len == 0 and (need == .keys or need == .nullness or need == .evaluate or need == .validate)) .validate else need, rest);
+                    return true;
+                }
+                if ((std.ascii.eqlIgnoreCase(call.name, "reverse") or std.ascii.eqlIgnoreCase(call.name, "tail")) and call.args.len == 1) {
+                    try self.consume(call.args[0].*, .identity, &.{});
+                    if (need != .identity or selectors.len != 0) {
+                        const selected: Selector = if (selectors.len != 0 and selectors[0] == .item) item: {
+                            const index = selectors[0].item;
+                            if (std.ascii.eqlIgnoreCase(call.name, "reverse")) break :item .{ .item = ~index };
+                            break :item if (index < 0) .{ .item = index } else if (index < std.math.maxInt(i64)) .{ .item = index + 1 } else .element;
+                        } else .element;
+                        const rest = if (selectors.len != 0 and (selectors[0] == .item or selectors[0] == .element)) selectors[1..] else selectors;
+                        try self.consume(call.args[0].*, need, try self.prepend(selected, rest));
+                    }
+                    return true;
+                }
                 if (std.ascii.eqlIgnoreCase(call.name, "coalesce")) {
                     for (call.args) |arg| try self.consume(arg.*, need, selectors);
                     return true;
@@ -798,34 +913,6 @@ const Plan = struct {
         if (T == ast.Expr) {
             if (try self.observe(value, .value, &.{})) return;
             switch (value.value) {
-                .reduce => |local| {
-                    try self.walk(local.initial.*);
-                    try self.walk(local.input.*);
-                    const outer = try self.entities.clone(self.a);
-                    const outer_derived = try self.derived.clone(self.a);
-                    _ = self.entities.remove(local.alias);
-                    _ = self.derived.remove(local.alias);
-                    _ = self.entities.remove(local.accumulator);
-                    _ = self.derived.remove(local.accumulator);
-                    try self.walk(local.projection.*);
-                    self.entities = outer;
-                    self.derived = outer_derived;
-                    return;
-                },
-                .pattern_comprehension => |pattern| {
-                    // The comprehension introduces entity bindings which are
-                    // invisible to the enclosing projection. Their predicates
-                    // and values still contribute storage field requirements.
-                    const outer = try self.entities.clone(self.a);
-                    const outer_derived = try self.derived.clone(self.a);
-                    try self.names(pattern.path);
-                    try self.walk(pattern.path);
-                    try self.walk(pattern.predicate);
-                    try self.walk(pattern.projection.*);
-                    self.entities = outer;
-                    self.derived = outer_derived;
-                    return;
-                },
                 .exists => |inner| {
                     const outer = try self.entities.clone(self.a);
                     const outer_derived = try self.derived.clone(self.a);
@@ -1015,14 +1102,17 @@ fn projectTree(a: A, name: []const u8, paths: []const PropertyPath, depth: usize
     var validate = false;
     var shape = false;
     var keys_only = false;
+    var validation_only = false;
     for (paths) |path| {
         if (path.parts.len == depth) {
             if (!path.presence and !path.shape) return .{ .name = name, .mode = .value };
             validate = validate or path.presence;
             shape = shape or path.shape;
             keys_only = keys_only or path.keys;
+            validation_only = validation_only or path.validation;
         } else try children.put(a, path.parts[depth], {});
     }
+    if (validation_only) return .{ .name = name, .mode = if (children.count() == 0 and !keys_only) .validation else .value };
     if (children.count() == 0) return if (shape) .{ .name = name, .mode = .children, .validate = validate, .keys = keys_only } else .{ .name = name, .mode = .presence };
     const keys = try sortedNames(a, children);
     const out = try a.alloc(Projection, keys.len);

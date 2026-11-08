@@ -24,7 +24,7 @@ pub fn isProposal(bytes: []const u8) bool {
 }
 pub fn encode(alloc: std.mem.Allocator, command: inventory.Command) ![]u8 {
     try command.validate();
-    if (command.binding.effect_protocol != 15) return error.InvalidArtifactCatalogCommand;
+    if (!command.binding.supportsProducerWitnesses()) return error.InvalidArtifactCatalogCommand;
     const json = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(json);
     if (json.len > max_bytes - prefix.len) return error.InvalidArtifactCatalogCommand;
@@ -35,7 +35,7 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(inve
     var parsed = try std.json.parseFromSlice(inventory.Command, alloc, bytes[prefix.len..], .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
     try parsed.value.validate();
-    if (parsed.value.binding.effect_protocol != 15) return error.InvalidArtifactCatalogCommand;
+    if (!parsed.value.binding.supportsProducerWitnesses()) return error.InvalidArtifactCatalogCommand;
     return parsed;
 }
 test "producer catalog proposal validates bounded authenticated definitions" {
@@ -52,4 +52,22 @@ test "producer catalog proposal validates bounded authenticated definitions" {
     defer roundtrip.deinit();
     try std.testing.expectEqualDeep(good, roundtrip.value);
     try std.testing.expectError(error.MissingField, decode(a, "ACAT1{}"));
+}
+
+test "producer catalog proposal validates every supported witness floor without downgrading" {
+    const a = std.testing.allocator;
+    const catalogs: inventory.Catalogs = .{};
+    var command: inventory.Command = .{ .namespace = @splat(1), .catalogs = catalogs, .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(a), .effect_protocol = 15 } };
+    for (15..inventory.max_effect_protocol + 1) |floor| {
+        command.binding.effect_protocol = @intCast(floor);
+        const encoded = try encode(a, command);
+        defer a.free(encoded);
+        var decoded = try decode(a, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(command.binding.effect_protocol, decoded.value.binding.effect_protocol);
+    }
+    for ([_]u16{ 14, inventory.max_effect_protocol + 1 }) |unsupported| {
+        command.binding.effect_protocol = unsupported;
+        try std.testing.expectError(error.InvalidArtifactCatalogCommand, encode(a, command));
+    }
 }

@@ -93,7 +93,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             /// capability in a query backend after releasing the fence.
             capture_fence: if (@hasDecl(DB, "StatementReadFence")) ?*const DB.StatementReadFence else ?*const anyopaque = null,
         };
-        pub const ReadAuthorization = struct { proof: []const u8 = "", database: []const u8 = "", deadline_ns: ?u64 = null, filter_query_json: []const u8 = "" };
+        pub const ReadAuthorization = struct { privacy_policy_version: ?[64]u8 = null, proof: []const u8 = "", database: []const u8 = "", deadline_ns: ?u64 = null, filter_query_json: []const u8 = "" };
         /// Mandatory hooks hold graph/table authority, refresh revocation at
         /// checkpoints, and apply field projection before any value is bound.
         pub const Authority = struct {
@@ -172,6 +172,31 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             return db.core.relational_indexes.acquire();
         }
         const ScanOptions = if (@hasDecl(DB, "cypherDocumentScanOptions")) @typeInfo(@typeInfo(@TypeOf(DB.cypherDocumentScanOptions)).@"fn".return_type.?).error_union.payload else void;
+        const PointOptions = @typeInfo(@TypeOf(DB.getDocument)).@"fn".param_types[3];
+        fn pointOptions(input: anytype, privacy: ?[64]u8) !(PointOptions orelse @TypeOf(input)) {
+            const Options = PointOptions orelse @TypeOf(input);
+            var opts: Options = undefined;
+            const info = @typeInfo(Options).@"struct";
+            inline for (info.field_names, info.field_types, info.field_attrs) |name, Field, attributes| {
+                if (comptime attributes.@"comptime") continue;
+                if (comptime @hasField(@TypeOf(input), name)) {
+                    @field(opts, name) = @field(input, name);
+                } else if (comptime attributes.defaultValue(Field)) |value| {
+                    @field(opts, name) = value;
+                } else @compileError("Missing required native point-read option: " ++ name);
+            }
+            if (comptime @hasField(Options, "privacy_policy_version")) {
+                opts.privacy_policy_version = privacy;
+            } else if (privacy != null) return error.PrivacyReadFenceUnavailable;
+            return opts;
+        }
+        fn scanReadOptions(input: ScanOptions, authorization: ReadAuthorization) !ScanOptions {
+            var opts = input;
+            if (comptime @hasField(ScanOptions, "privacy_policy_version")) {
+                opts.privacy_policy_version = authorization.privacy_policy_version;
+            } else if (authorization.privacy_policy_version != null) return error.PrivacyReadFenceUnavailable;
+            return opts;
+        }
         fn scanOptions(self: *Self, a: A, db: *DB, table: []const u8, input: ScanOptions) !ScanOptions {
             return self.scanOptionsInGraph(a, db, table, input, try self.observedGraph(a, table));
         }
@@ -359,7 +384,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const db = try self.selected(table);
             const authorization = try self.readAuthorization(temporary, table);
             var found = if (comptime @hasDecl(DB, "cypherDocumentScanOptions"))
-                try db.scan(temporary, cursor orelse "", "", try self.scanOptions(temporary, db, table, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument }))
+                try db.scan(temporary, cursor orelse "", "", try self.scanOptions(temporary, db, table, try scanReadOptions(.{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument }, authorization)))
             else
                 try db.scan(temporary, cursor orelse "", "", .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument });
             defer found.deinit(temporary);
@@ -537,7 +562,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             // Only certified owner projections may consume visibility at the
             // original scan. Opaque providers retain their per-node callback.
             fold.stored = self.authority.project_stored != null;
-            var opts = try self.scanOptionsInGraph(temporary, db, table, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .filter_query_json = if (fold.stored) authorization.filter_query_json else "", .include_documents = true, .limit = @intCast(input.max_examined + 1) }, membership_graph);
+            var opts = try self.scanOptionsInGraph(temporary, db, table, try scanReadOptions(.{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .filter_query_json = if (fold.stored) authorization.filter_query_json else "", .include_documents = true, .limit = @intCast(input.max_examined + 1) }, authorization), membership_graph);
             if (opts.relational_query) |*query| {
                 const filters = try fold.evaluator.?.filters();
                 // Share the complete sparse/composite candidate planner, but
@@ -788,7 +813,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     }
                 }
                 const authorization = try self.readAuthorization(temporary, table);
-                var opts = try self.scanOptions(temporary, db, table, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(@min(limit, 1024)) });
+                var opts = try self.scanOptions(temporary, db, table, try scanReadOptions(.{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(@min(limit, 1024)) }, authorization));
                 if (opts.relational_query == null) return null;
                 // The explicit index supplies order; compatible predicates
                 // supply exact seek bounds through the native condition planner.
@@ -948,7 +973,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const cursor = if (encoded) |json| try std.json.parseFromSliceLeaky(PropertyCursor, temporary, json, .{}) else PropertyCursor{};
             if (cursor.primary) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             const authorization = try self.readAuthorization(temporary, table);
-            var opts = try self.scanOptions(temporary, db, table, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(limit) });
+            var opts = try self.scanOptions(temporary, db, table, try scanReadOptions(.{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(limit) }, authorization));
             if (opts.relational_query == null) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             var schema = acquireSchema(db) orelse return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             defer schema.release();
@@ -1197,7 +1222,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 return .{ .items = &.{} };
             };
             const authority = try self.readAuthorization(temporary, table);
-            var opts = try self.scanOptions(temporary, db, table, .{ .execution_deadline_ns = authority.deadline_ns, .row_policy_principal_proof = authority.proof, .row_policy_database = authority.database, .include_documents = true, .limit = @intCast(if (visitor != null) @min(limit, 4096) else limit) });
+            var opts = try self.scanOptions(temporary, db, table, try scanReadOptions(.{ .execution_deadline_ns = authority.deadline_ns, .row_policy_principal_proof = authority.proof, .row_policy_database = authority.database, .include_documents = true, .limit = @intCast(if (visitor != null) @min(limit, 4096) else limit) }, authority));
             if (visitor != null and self.authority.project_stored != null) opts.filter_query_json = authority.filter_query_json;
             if (opts.relational_query == null) return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
             var schema = acquireSchema(db) orelse return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
@@ -1631,7 +1656,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 if (count == 0) continue;
                 try checkpoint(ptr);
                 const authorization = try self.readAuthorization(temporary, table.name);
-                const opts = try self.scanOptions(temporary, table.db, table.name, .{ .include_documents = true, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns });
+                const opts = try self.scanOptions(temporary, table.db, table.name, try scanReadOptions(.{ .include_documents = true, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns }, authorization));
                 const documents = try table.db.getCypherDocuments(temporary, keys[0..count], opts, self.ttl_now_ns);
                 defer {
                     for (documents) |*document| if (document.*) |*value| value.deinit(temporary);
@@ -1658,10 +1683,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const authorization = try self.readAuthorization(temporary, identity.table);
             const result = if (comptime @hasDecl(DB, "cypherDocumentScanOptions")) projected: {
                 if (self.read_fields != null or self.nodeDemand(identity.table) != null) {
-                    const opts = try self.scanOptions(temporary, db, identity.table, .{ .inclusive_from = true, .include_documents = true, .limit = 1, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns });
+                    const opts = try self.scanOptions(temporary, db, identity.table, try scanReadOptions(.{ .inclusive_from = true, .include_documents = true, .limit = 1, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns }, authorization));
                     if (opts.relational_query == null) {
                         if (opts.include_all_fields) break :projected try self.getFull(a, temporary, db, identity, authorization);
-                        var document = (try db.getDocument(temporary, identity.key, .{ .fields = opts.fields, .cypher_presence_fields = opts.cypher_presence_fields, .cypher_projection_json = opts.cypher_projection_json, .include_all_fields = false, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns })) orelse break :projected null;
+                        var document = (try db.getDocument(temporary, identity.key, try pointOptions(.{ .fields = opts.fields, .cypher_presence_fields = opts.cypher_presence_fields, .cypher_projection_json = opts.cypher_projection_json, .include_all_fields = false, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns }, authorization.privacy_policy_version))) orelse break :projected null;
                         defer document.deinit(temporary);
                         break :projected try self.node(a, identity.table, identity.key, document.json);
                     }
@@ -1675,13 +1700,15 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             return result;
         }
         fn getFull(self: *Self, a: A, temporary: A, db: *DB, identity: v.Identity, authorization: ReadAuthorization) !?*const v.Node {
-            var document = (try db.getDocument(temporary, identity.key, .{ .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns })) orelse return null;
+            var document = (try db.getDocument(temporary, identity.key, try pointOptions(.{ .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns }, authorization.privacy_policy_version))) orelse return null;
             defer document.deinit(temporary);
             return self.node(a, identity.table, identity.key, document.json);
         }
         const Resume = struct { incoming: bool = false, cursor: ?EdgeScanCursor = null };
         fn readAuthorization(self: *Self, a: A, table: []const u8) !ReadAuthorization {
-            return if (self.authority.read_authorization) |resolve| try resolve(self.authority.ptr, a, table) else .{};
+            const bound: ReadAuthorization = if (self.authority.read_authorization) |resolve| try resolve(self.authority.ptr, a, table) else .{};
+            if (comptime ScanOptions == void) if (bound.privacy_policy_version != null) return error.PrivacyReadFenceUnavailable;
+            return bound;
         }
         fn expand(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, identity: v.Identity, direction: root.ast.Direction, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
             return expandPair(ptr, a, mapping, identity, null, direction, encoded, limit, 4096);

@@ -144,7 +144,9 @@ pub const Context = struct {
                     const cell = (try v.row.findCell(ordinal)) orelse continue;
                     const keys_only = @import("cypher").read_fields.rootKeys(self.property_projection);
                     const predicate_item = @import("cypher_projection.zig").find(self.property_projection, column.name);
-                    const value: std.json.Value = if (predicate_item != null and predicate_item.?.mode == .predicate and !cell.is_json) try @import("cypher_projection.zig").predicateJson(a, if (cell.is_null) .null else if (column.column_type == .string) .{ .string = cell.value.bytes_val } else try codec.borrowedJsonValueFromCellAlloc(a, column, cell), predicate_item.?) else if (cell.is_null) .null else if (keys_only and predicate_item == null and !cell.is_json and !isPresence(presence, column.name)) .{ .bool = true } else if (cell.is_json)
+                    const value: std.json.Value = if (predicate_item != null and predicate_item.?.mode == .validation and !cell.is_json)
+                        try @import("cypher_projection.zig").validationJson(a, if (cell.is_null) .null else if (column.column_type == .string) .{ .string = cell.value.bytes_val } else try codec.borrowedJsonValueFromCellAlloc(a, column, cell))
+                    else if (predicate_item != null and predicate_item.?.mode == .predicate and !cell.is_json) try @import("cypher_projection.zig").predicateJson(a, if (cell.is_null) .null else if (column.column_type == .string) .{ .string = cell.value.bytes_val } else try codec.borrowedJsonValueFromCellAlloc(a, column, cell), predicate_item.?) else if (cell.is_null) .null else if (keys_only and predicate_item == null and !cell.is_json and !isPresence(presence, column.name)) .{ .bool = true } else if (cell.is_json)
                         if (@import("cypher_projection.zig").find(self.property_projection, column.name)) |item|
                             try @import("cypher_projection.zig").rawValue(a, cell.value.bytes_val, item)
                         else

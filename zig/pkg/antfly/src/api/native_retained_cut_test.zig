@@ -428,7 +428,11 @@ test "external lake Cypher execution reads immutable native document and graph c
         var wrong_owner: DB.StatementReadFence = .{ .source = &snapshot, .primary = undefined, .replay = undefined };
         var invalid_capture: DB.CypherBackend = .{ .tables = &.{.{ .name = "docs", .db = &db, .capture_fence = &wrong_owner }}, .authority = authority, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() };
         try std.testing.expectError(error.CypherSnapshotRequired, cypher.snapshot.Materialized.create(a, invalid_capture.backend(), graph, .{}));
-        var read = try DB.CypherStatementSnapshot.create(a, &db, &statement_fence, .{ .durable = durable, .indexes = if (durable) null else &.{"links"}, .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('d'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none);
+        const read_input: local.storage_statement_read_fence.GraphInput = .{ .durable = durable, .indexes = if (durable) null else &.{"links"}, .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('d'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() };
+        var stale_privacy = read_input;
+        stale_privacy.privacy_policy_version = @as([64]u8, @splat('a'));
+        try std.testing.expectError(error.IndexRebuilding, DB.CypherStatementSnapshot.create(a, &db, &statement_fence, stale_privacy, .none));
+        var read = try DB.CypherStatementSnapshot.create(a, &db, &statement_fence, read_input, .none);
         var read_open = true;
         defer if (read_open) read.deinit();
         statement_fence.release();
@@ -869,4 +873,51 @@ test "external lake Cypher execution reads immutable native document and graph c
         try std.testing.expectEqual(case.count, result.rows[0][0].integer);
         try std.testing.expect(result.stats.scanned_anchors <= case.anchors);
     }
+}
+
+test "external lake Cypher execution hides pending privacy records in native point batches" {
+    const a = std.testing.allocator;
+    const DB = local.storage_db_db.DB;
+    var directory = try local.common_test_directory.TestDirectory.init("cypher-private-point");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"body\":\"private source\"}" }}, .sync_level = .full_index });
+    var fence = (try db.tryStatementReadFence()) orelse return error.TestExpectedFence;
+    defer fence.release();
+    var cut = try db.captureCypherSelectedSnapshot(a, &fence, &.{}, @import("antfly_platform").time.realtimeNs(), .none);
+    defer cut.deinit();
+    fence.release();
+    {
+        const visible = try db.getCypherPinnedDocuments(a, &cut, &.{"one"}, .{ .fields = &.{"body"}, .include_all_fields = false });
+        defer a.free(visible);
+        defer if (visible[0]) |*row| row.deinit(a);
+        try std.testing.expect(visible[0] != null);
+        try std.testing.expectEqualStrings("private source", visible[0].?.json.object.get("body").?.string);
+    }
+    // Install only the catalog guard. There is deliberately no published
+    // privacy artifact, so every point projection must hide this primary row.
+    const manager = db.core.index_manager;
+    const Config = @typeInfo(@TypeOf(manager.enrichments.items)).pointer.child;
+    var config = try Config.clone(a, .{
+        .name = "_privacy_document",
+        .kind = .asset,
+        .source_field = "__antfly_privacy_source",
+        .producer_json = "{\"config\":{\"_antfly_privacy\":{\"mode\":\"redact_for_search_and_ai\",\"fields\":[\"body\"]}}}",
+    });
+    var installed = false;
+    errdefer if (!installed) config.deinit(a);
+    {
+        manager.catalog_mutex.lockExclusive();
+        defer manager.catalog_mutex.unlockExclusive();
+        try manager.enrichments.append(a, config);
+        installed = true;
+    }
+    for ([_][]const []const u8{ &.{"body"}, &.{} }) |fields| {
+        const hidden = try db.getCypherPinnedDocuments(a, &cut, &.{"one"}, .{ .fields = fields, .include_all_fields = false });
+        defer a.free(hidden);
+        defer if (hidden[0]) |*row| row.deinit(a);
+        try std.testing.expect(hidden[0] == null);
+    }
+    try std.testing.expectError(error.IndexRebuilding, db.getCypherPinnedDocuments(a, &cut, &.{"one"}, .{ .privacy_policy_version = @as([64]u8, @splat('a')), .fields = &.{}, .include_all_fields = false }));
 }

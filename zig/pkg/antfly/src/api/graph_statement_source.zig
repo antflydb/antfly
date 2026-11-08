@@ -157,7 +157,7 @@ pub const Statement = struct {
             hash.update(&identity);
             var digest: [32]u8 = undefined;
             hash.final(&digest);
-            const read = try self.fence.captureGraph(a, .{ .defer_validation = self.fence.graph_finalizes_validation, .indexes = self.plan.table.indexes, .catalog_json = statement.input.catalog_json, .catalogs_json = statement.input.catalogs_json, .table = self.plan.table.name, .table_id = self.plan.table.table_id, .schema_version = self.plan.table.schema_version, .cut_id = std.fmt.bytesToHex(digest, .lower), .expires_ms = statement.input.expires_ms, .ttl_now_ns = statement.input.ttl_now_ns, .principal_proof = self.plan.table.principal_proof, .database = self.plan.table.database, .filter_query_json = self.plan.table.filter_query_json });
+            const read = try self.fence.captureGraph(a, .{ .defer_validation = self.fence.graph_finalizes_validation, .indexes = self.plan.table.indexes, .catalog_json = statement.input.catalog_json, .catalogs_json = statement.input.catalogs_json, .table = self.plan.table.name, .table_id = self.plan.table.table_id, .schema_version = self.plan.table.schema_version, .cut_id = std.fmt.bytesToHex(digest, .lower), .expires_ms = statement.input.expires_ms, .ttl_now_ns = statement.input.ttl_now_ns, .privacy_policy_version = self.plan.table.privacy_policy_version, .principal_proof = self.plan.table.principal_proof, .database = self.plan.table.database, .filter_query_json = self.plan.table.filter_query_json });
             errdefer read.deinit();
             self.read = read;
             errdefer self.read = null;

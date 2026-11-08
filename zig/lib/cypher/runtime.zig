@@ -2304,7 +2304,7 @@ const Engine = struct {
                 self.initialized = true;
                 return;
             }
-            const metadata = try engine.values.info(value);
+            const metadata = try engine.values.shape(value);
             var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
             errdefer arena.deinit();
             // Clone once with DAG sharing before releasing the old state.
@@ -2313,7 +2313,7 @@ const Engine = struct {
             var context: v.CloneContext = .{ .a = arena.allocator(), .scratch = scratch.allocator() };
             const copied = try context.clone(value);
             var owned_metadata: value_work.Work = .{ .a = arena.allocator(), .ptr = engine, .charge = chargeWork, .parent = if (engine.scalarOwner()) |owner| &owner.work else null };
-            try owned_metadata.remember(copied, metadata);
+            try owned_metadata.rememberShape(copied, metadata);
             if (self.owned) |*old| old.deinit();
             self.owned = arena;
             self.accumulator = copied;
@@ -2461,7 +2461,7 @@ const Engine = struct {
             try owner.mapped_lists.put(self.planning_allocator, key, null);
             return null;
         };
-        _ = owner.work.info(result) catch |err| {
+        _ = owner.work.shape(result) catch |err| {
             if (!StreamingAggregate.consumerFailure(err)) return err;
             try owner.mapped_lists.put(self.planning_allocator, key, null);
             return null;
@@ -2477,7 +2477,7 @@ const Engine = struct {
         if (owner != self.invariants) return null;
         // Reading an entity can apply authorization or rehydrate its visible
         // value. Raw input cardinalities cannot replace those reads.
-        if ((try owner.work.info(value)).entities) return null;
+        if ((try owner.work.shape(value)).entities) return null;
         const identity: Invariants.Identity = .{ .address = @intFromPtr(value.list.ptr), .length = value.list.len };
         if (owner.list_counts.get(identity)) |facts| return facts;
         try chargeWork(self, value.list.len);
@@ -2606,7 +2606,7 @@ const Engine = struct {
             // SIZE still observes projection errors and counts NULL projections.
             if (filter.projection) |projection| {
                 const projected = try engine.eval(projection, row, null);
-                _ = engine.values.info(.{ .list = &.{projected} }) catch |err| blk: {
+                _ = engine.values.shape(.{ .list = &.{projected} }) catch |err| blk: {
                     if (err != error.CypherValueDepthExceeded) return err;
                     state_value.embedding_failure = true;
                     break :blk null;
@@ -2646,7 +2646,7 @@ const Engine = struct {
             const projected = if (filter.projection) |projection| try engine.eval(projection, row, null) else value;
             // The original comprehension validates its full list, even when a
             // bounded consumer later discards this particular projection.
-            _ = engine.values.info(.{ .list = &.{projected} }) catch |err| blk: {
+            _ = engine.values.shape(.{ .list = &.{projected} }) catch |err| blk: {
                 if (err != error.CypherValueDepthExceeded) return err;
                 // List depth is checked after the original comprehension has
                 // evaluated every projection. A later scalar failure wins.
@@ -4241,7 +4241,7 @@ const Engine = struct {
             .items, .element => items: {
                 const values = if (kind == .items) kind.items.items else kind.element.items;
                 const value: v.Value = .{ .list = values };
-                const info = (if (self.immutableOwner(value)) |owner| owner.work.cachedInfo(value) else self.values.cachedInfo(value)) orelse break :items null;
+                const info = (if (self.immutableOwner(value)) |owner| owner.work.cachedShape(value) else self.values.cachedShape(value)) orelse break :items null;
                 if (info.entities) break :items null;
                 break :items if (kind == .items) info.depth else info.depth -| 1;
             },
@@ -4874,15 +4874,15 @@ const Engine = struct {
             // Arithmetic cardinality-only proofs do not own an enumerable set.
             if (state_value.integer_domain == null and keys.len != state_value.count) return error.CypherAxisMemoDeclined;
             members = .{ .list = keys };
-            if ((try self.values.info(members)).entities) return error.CypherAxisMemoDeclined;
+            if ((try self.values.shape(members)).entities) return error.CypherAxisMemoDeclined;
         }
-        if ((try self.values.info(state_value.best)).entities) return error.CypherAxisMemoDeclined;
+        if ((try self.values.shape(state_value.best)).entities) return error.CypherAxisMemoDeclined;
         const collection = if (std.ascii.eqlIgnoreCase(function_call.name, "collect")) try state_value.finishWindow(self) else v.Value.null;
-        if ((try self.values.info(collection)).entities) return error.CypherAxisMemoDeclined;
+        if ((try self.values.shape(collection)).entities) return error.CypherAxisMemoDeclined;
         try state_value.ensureFilters();
         const consumers = try self.a.alloc(v.Value, state_value.filter_states.len);
         for (consumers, state_value.filter_states) |*encoded, *consumer| {
-            if ((try self.values.info(consumer.fold.accumulator)).entities) return error.CypherAxisMemoDeclined;
+            if ((try self.values.shape(consumer.fold.accumulator)).entities) return error.CypherAxisMemoDeclined;
             encoded.* = .{ .map = try self.a.dupe(v.Entry, &.{
                 .{ .name = "count", .value = .{ .integer = @bitCast(consumer.count) } },
                 .{ .name = "failure", .value = .{ .integer = if (consumer.failure) |err| @intFromError(err) else 0 } },
@@ -4960,7 +4960,7 @@ const Engine = struct {
         } else if (row[5].value != .null) {
             // Read-only memo hits promote their complete rows to statement
             // storage. Register that destination before borrowing its support.
-            _ = try (try self.rootInvariantState()).work.info(row[5].value);
+            _ = try (try self.rootInvariantState()).work.shape(row[5].value);
             const facts = (try self.listCountFacts(row[5].value)) orelse return error.CypherInvalidBackendPage;
             facts.distinct = facts.input;
             state_value.list_domain = facts;
@@ -15443,16 +15443,16 @@ const Engine = struct {
     /// Metadata work happens only at an existing evaluation boundary. Parameter
     /// arrays are immutable for the statement, so their first real validation
     /// can be shared by planning and subsequent row/child epochs.
-    fn readMetadata(self: *Engine, value: v.Value) anyerror!value_work.Info {
+    fn readMetadata(self: *Engine, value: v.Value) anyerror!value_work.Shape {
         if (self.read_only) {
-            if (self.immutableOwner(value)) |owner| return owner.work.info(value);
+            if (self.immutableOwner(value)) |owner| return owner.work.shape(value);
             if (value == .list and self.invariants != null) {
                 const identity: Invariants.Identity = .{ .address = @intFromPtr(value.list.ptr), .length = value.list.len };
-                if (self.invariants.?.parameter_items.contains(identity)) return self.invariants.?.work.info(value);
+                if (self.invariants.?.parameter_items.contains(identity)) return self.invariants.?.work.shape(value);
             }
-            if (self.statement_ownership != null and self.statement_ownership.?.owns(value)) return (try self.rootInvariantState()).work.info(value);
+            if (self.statement_ownership != null and self.statement_ownership.?.owns(value)) return (try self.rootInvariantState()).work.shape(value);
         }
-        return self.values.info(value);
+        return self.values.shape(value);
     }
     fn readValue(self: *Engine, value: v.Value) anyerror!v.Value {
         const metadata = try self.readMetadata(value);
@@ -15466,7 +15466,7 @@ const Engine = struct {
     }
     fn readValueInner(self: *Engine, retained_value: v.Value) anyerror!v.Value {
         const value = self.currentEntity(retained_value);
-        if (!(try self.values.info(value)).entities) return value;
+        if (!(try self.values.shape(value)).entities) return value;
         const project_node = self.backend.vtable.project_node;
         if (self.isDeleted(value)) return switch (value) {
             .node => |retained| blk: {
@@ -15601,24 +15601,24 @@ const Engine = struct {
             const scope = EvalScope.enter(self, owner.work.a);
             defer scope.leave(self);
             const owned = try self.evalInner(expression, row, group);
-            _ = try owner.work.info(owned);
+            _ = try owner.work.shape(owned);
             try owner.scalars.put(owner.work.a, expression.execution_invariant.?, owned);
             break :result owned;
         };
         if (memoizable) try self.expression_memo.?.put(self, key, @intFromPtr(expression), .{ .rows = &.{&.{.{ .name = "value", .value = result }}}, .weights = &.{Count.one} });
         if (expression.value == .parameter or (expression.value == .literal and result == .string)) {
             const owner = if (expression.value == .parameter and lookup(self.private_parameters, expression.value.parameter) == null) try self.invocationState() else try self.invariantState();
-            _ = try owner.work.info(result);
+            _ = try owner.work.shape(result);
         } else if (self.read_only and self.statement_ownership != null and self.statement_ownership.?.owns(result)) {
             // A destination owned by the statement cannot be recycled by a
             // row/producer epoch. Cache its analysis in that same root epoch.
-            _ = try (try self.rootInvariantState()).work.info(result);
+            _ = try (try self.rootInvariantState()).work.shape(result);
         } else if (result != .string) {
             // Row-local strings need no depth certificate. Their consumers
             // request hashes or meter compared/decoded prefixes on demand;
             // eagerly hashing here repeats payload-sized work in each row.
             // Immutable statement owners above keep their reusable metadata.
-            _ = try self.values.info(result);
+            _ = try self.values.shape(result);
         }
         return result;
     }
@@ -15654,7 +15654,7 @@ const Engine = struct {
         if (self.immutableOwner(input)) |owner| {
             // Cached conversion results and borrowed trims share the immutable
             // input owner's lifetime; dynamic substrings are not registered.
-            _ = try owner.work.info(result);
+            _ = try owner.work.shape(result);
         }
         return result;
     }
@@ -16151,7 +16151,7 @@ const Engine = struct {
                 const row = try engine.replace(self.row, c.alias, value);
                 if (c.predicate) |predicate| if ((try (try engine.eval(predicate, row, null)).truth()) != true) continue;
                 const projected = if (c.projection) |projection| try engine.eval(projection, row, null) else value;
-                _ = engine.values.info(.{ .list = &.{projected} }) catch |err| blk: {
+                _ = engine.values.shape(.{ .list = &.{projected} }) catch |err| blk: {
                     if (err != error.CypherValueDepthExceeded) return err;
                     self.embedding_failure = true;
                     break :blk null;
@@ -16178,7 +16178,7 @@ const Engine = struct {
             const scope = EvalScope.enter(self, scratch.allocator());
             defer scope.leave(self);
             const value = try self.eval(c.projection, row, null);
-            _ = self.values.info(.{ .list = &.{value} }) catch |err| blk: {
+            _ = self.values.shape(.{ .list = &.{value} }) catch |err| blk: {
                 if (err != error.CypherValueDepthExceeded) return err;
                 embedding_failure = true;
                 break :blk null;
@@ -16657,7 +16657,7 @@ const Engine = struct {
         // depth is checked after both operands, just like ordinary addition.
         const source = try self.sequenceSource(expression, row, group);
         var embedding_failure = false;
-        if (source != null and source.?.values == .scalar) _ = self.values.info(.{ .list = &.{source.?.values.scalar} }) catch |err| blk: {
+        if (source != null and source.?.values == .scalar) _ = self.values.shape(.{ .list = &.{source.?.values.scalar} }) catch |err| blk: {
             if (err != error.CypherValueDepthExceeded) return err;
             embedding_failure = true;
             break :blk null;
@@ -17165,7 +17165,7 @@ const Engine = struct {
             if (self.cardinality) {
                 // A comprehension counts NULL projections too.
                 if (self.receiver) |receiver| {
-                    _ = engine.values.info(.{ .list = &.{value} }) catch |err| blk: {
+                    _ = engine.values.shape(.{ .list = &.{value} }) catch |err| blk: {
                         if (err != error.CypherValueDepthExceeded) return err;
                         self.embedding_failure = true;
                         break :blk null;
@@ -17173,7 +17173,7 @@ const Engine = struct {
                     try receiver.accept(engine, value, weight, null);
                 } else self.count = try addPathCount(self.count, weight.cap(std.math.maxInt(u64)));
             } else {
-                _ = engine.values.info(.{ .list = &.{value} }) catch |err| blk: {
+                _ = engine.values.shape(.{ .list = &.{value} }) catch |err| blk: {
                     if (err != error.CypherValueDepthExceeded) return err;
                     self.embedding_failure = true;
                     break :blk null;
@@ -17417,6 +17417,12 @@ const Engine = struct {
             const keys = try self.a.alloc(v.Value, properties.len);
             for (properties, keys) |property, *key| key.* = .{ .string = property.name };
             return .{ .list = keys };
+        }
+        if (std.ascii.eqlIgnoreCase(name, "tail")) {
+            if (value != .list) return error.CypherTypeMismatch;
+            // A list slice borrows the already-validated input allocation;
+            // ordinary epoch/retention ownership rules cover the shared tail.
+            return .{ .list = value.list[@min(@as(usize, 1), value.list.len)..] };
         }
         if (std.ascii.eqlIgnoreCase(name, "reverse")) {
             if (value == .list) {

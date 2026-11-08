@@ -707,3 +707,89 @@ test "read demand propagates projections comprehensions slices and path componen
         try expectNames(&.{}, demand.relationships.fields.?);
     }
 }
+
+test "read demand closes aggregate transform pattern and accumulator producers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "MATCH(d:D) WITH collect(d) AS xs RETURN [x IN xs | antfly.documentKey(x)]",
+        "MATCH(d:D) WITH collect(DISTINCT d) AS xs RETURN antfly.documentKey(head(xs))",
+        "MATCH(d:D) WITH reduce(acc=null,x IN [d]|{next:acc,node:x}) AS m RETURN antfly.documentKey(m.node)",
+        "MATCH(d:D) WITH reduce(acc=null,x IN [d]|reduce(inner=acc,y IN [x]|coalesce(inner,y))) AS n RETURN antfly.documentKey(n)",
+        "MATCH(d:D) WITH reverse([d]) AS xs RETURN antfly.documentKey(head(xs))",
+        "MATCH(d:D) WITH tail([d,d]) AS xs RETURN antfly.documentKey(head(xs))",
+        "MATCH(a:D) WITH [(a)-[r:R]->(b:D)|b] AS xs RETURN [x IN xs | antfly.documentKey(x)]",
+        "MATCH(d:D) WITH reduce(acc=null,x IN [d]|coalesce(acc,x)) AS n RETURN antfly.documentKey(n)",
+        "MATCH(d:D) WITH reduce(acc=[],x IN [d]|acc+[x]) AS xs RETURN [x IN xs|antfly.documentKey(x)]",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand;
+        try expectNames(&.{}, demand.table("docs").?.nodes.fields.?);
+        try expectNames(&.{}, demand.relationships.fields.?);
+    }
+    for ([_][]const u8{
+        "MATCH(d:D) RETURN reduce(total=0,x IN [d]|total+x.score)",
+        "MATCH(d:D) WITH reduce(acc={},x IN [d,d]|{wrap:acc,node:x}) AS m RETURN m.wrap.node.score",
+        "MATCH(d:D) WITH reduce(acc=[],x IN [d]|acc+[x]) AS xs RETURN head(xs).score",
+        "MATCH(d:D) WITH collect(d) AS xs RETURN head(reverse(xs)).score",
+        "MATCH(a:D) WITH [(a)-[r:R]->(b:D)|b] AS xs RETURN [x IN xs|x.score]",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand;
+        try expectNames(&.{"score"}, demand.table("docs").?.nodes.fields.?);
+    }
+    for ([_][]const u8{
+        "MATCH(d:D) WITH collect(d) AS xs RETURN xs",
+        "MATCH(d:D) RETURN reverse([d])",
+        "MATCH(d:D) RETURN reduce(acc=null,x IN [d]|coalesce(acc,x))",
+        "MATCH(a:D) RETURN [(a)-[r:R]->(b:D)|b]",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        try std.testing.expect((try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes.fields == null);
+    }
+}
+
+test "read demand key only constructor members validate without retaining payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "MATCH(d:D) RETURN keys(d{.body})",
+        "MATCH(d:D) RETURN keys({body:d.body})",
+        "MATCH(d:D) WITH coalesce(d.body,null) AS x RETURN keys({body:x})",
+        "MATCH(d:D) RETURN keys(d{body:d.payload})",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const entity = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try std.testing.expect(entity.projection.len == 1);
+        try std.testing.expect(entity.projection[0].mode == .validation);
+    }
+}
+
+test "read demand reverse and tail preserve exact literal element domains" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const two_tables: root.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .relationships = &.{}, .labels = &.{ .{ .name = "A", .table = "first" }, .{ .name = "B", .table = "second" } } };
+    for ([_][]const u8{
+        "MATCH(a:A),(b:B) RETURN head(reverse([a,b])).score",
+        "MATCH(a:A),(b:B) RETURN head(tail([a,b])).score",
+        "MATCH(a:A),(b:B) RETURN reverse([b,a])[-1].score",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, two_tables)).demand;
+        try expectNames(&.{}, demand.table("first").?.nodes.fields.?);
+        try expectNames(&.{"score"}, demand.table("second").?.nodes.fields.?);
+    }
+}

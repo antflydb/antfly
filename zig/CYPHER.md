@@ -5701,3 +5701,102 @@ checks pass. All Go SDK packages, 14 schema/generator contract tests, and the
 SDK/workbench build pass. Formatting, lint and whitespace checks pass. Repository
 cache cleanup was run; completed worktree object output was reclaimed after
 builds, preserving the tested binary and required disk admission headroom.
+
+### Aggregate producer closure and lazy structural metadata
+
+Backward observation demand now crosses `COLLECT` (including DISTINCT),
+`reverse`, `tail`, pattern comprehensions and REDUCE. Literal element selectors
+retain their physical table domains through reversal and tail offsets. Pattern
+locals and captured aliases keep their lexical scopes. Reducers bind a captured
+seed and input element to an accumulator feedback node; a monotone worklist
+propagates observations to a fixed point without consuming native stack on a
+feedback cycle. Indefinitely growing selector paths widen to a complete value.
+Opaque producers retain the conservative complete-value fallback.
+
+Structural validation and equality hashing are separate operations. Structural
+certificates retain depth, NULL/entity presence, expanded structural steps and
+output/traversal work without reading string bodies. Hash consumers request
+hashes lazily, and an existing immutable owner retains its deferred hash for
+later evaluation epochs. Row-local metadata never escapes its allocation epoch.
+Nullable list/map equality and comparison meter the members and byte prefixes
+actually compared; nullable map ordering uses cached sorted key views. Shared
+DAGs still reserve bounded structural work before an expanded traversal, while
+serialization retains its expanded output charge. Binding representation and
+Cypher numeric equality remain separate policies.
+
+Key/nullness-only constructor members use a private validation projection. The
+owner validates the complete selected source value, including numeric and depth
+errors, then retains only a bounded structural-height witness and root NULLness.
+This preserves eager constructor depth checks without copying ignored strings
+or container fanout. Document JSON, relational cells and typed relationship
+metadata share that contract. Actual value observers override private witnesses;
+mixed descendant observations conservatively retain the required subtree. These
+witnesses are licensed only inside unobserved constructor members and cannot be
+returned as public graph properties.
+
+The main merge preserves the pinned key-only empty-range proof and integrates
+main's logical-value verifier with prepared graph filters. Logical value search
+keeps its general verifier where its numeric-member array fanout differs from
+the borrowed selector's indexing semantics; regression coverage checks both
+stored JSON and decoded-value paths.
+
+The latest-main integration (`e08df520ac`) preserves main's complete 891-detail
+runtime error prefix and appends graph identities after it. SQL statement-read
+unavailability retains main's retryable classification. Metadata protocol 84,
+internal runtime ABI 87 and kernel-owner ABI 86 distinguish the combined graph,
+privacy and inference contracts from either predecessor. Artifact dispatch keeps
+main's explicit status callback and the named graph callback boundary. Producer
+activation follows the current installed binding rather than its historical
+predecessor, and preserves newer effect-protocol floors. Catalog proposals
+accept every supported producer-witness protocol. Protocol 15 queues separate
+activation; protocol 16 and later install authority atomically with the catalog.
+Activation, renewal and retirement use ordered receipts; retirement reconciles definitions through the
+durable admission workflow before activating the empty catalog. Compound catalog
+commits invalidate producer readiness before fallible pin creation.
+
+Retained graph cohorts bind each table's authoritative privacy version before
+owner capture and carry it through private graph RPCs. Local owners also bind an
+exact serving identity when there is no metadata-backed coordinator. Owner
+checkpoints reject changes, including absent/protected policy transitions; the
+catalog generation caches successful checks so immutable reads do not repeatedly
+parse policy configuration. Coordinator and native retained-owner regressions
+cover stale binding rejection and preserve snapshot/fence cleanup.
+
+Native point batches apply the same privacy projection and pending-record
+visibility as scans before their demand projection; an empty field selection
+cannot bypass that gate. Bound policy versions reach point, scan, SQL-child and
+search requests. Generic native adapters preserve option defaults and required
+fields when binding point options, and refuse an unsupported privacy fence.
+Privacy readiness and fence failures keep retryable graph HTTP 503 outcomes.
+`tail` is a registered unary list builtin with NULL/empty-list semantics and a
+borrowed result span, covered through aliases, row retention and scalar rejection.
+
+The authenticated 2 MiB root/nested/relationship fixture now qualifies the
+producer and constructor paths below a 1 MiB query-memory ceiling. Reported query-memory bytes
+are document / relational; the old implementation required a 128 MiB ceiling
+to measure the same narrow queries:
+
+| Query observation | Before bytes | After bytes |
+| --- | ---: | ---: |
+| `collect(d)` followed by document keys | 63,656,594 / 87,569,666 | 137,370 / 125,868 |
+| Pattern comprehension followed by document keys | 63,654,534 / 87,567,606 | 140,316 / 140,316 |
+| `size(keys(d{.body}))` | 22,987,600 / 43,364,934 | 80,710 / 68,314 |
+
+All 32 changing-operand list comparisons finish in 958 / 988 work units;
+changing-operand map comparisons use 990 / 1,020, and an earlier decisive list
+member uses 1,118 / 1,148. Previously four container comparisons consumed roughly
+262,000 units and 32 exceeded the one-million-work ceiling. The observed wide
+strings remain available under the existing 128 MiB input budget; predicates
+avoid hashing their unobserved byte tails. Full entity/aggregate returns still
+preserve the complete 2 MiB body and labels. `tail([d,d])` identity consumers use
+93,636 bytes and 73 work units in both layouts.
+
+Qualification on the settled `e08df520ac` merge: all 574 core tests, all ten
+authenticated performance campaigns, 48 runtime error ABI tests, two failure ABI
+tests, 14 schema/generator checks, all Go SDK packages and the SDK/workbench build
+pass. The final transport gate includes all 13 cases, including privacy HTTP
+retry classification. Native capture (eight cases), C API/bootstrap and the
+native count, projection, adjacency, callback and metadata gates pass. The
+ordered producer gate passes all nine private and fifteen server cases,
+including protocol-15 activation, newer atomic activation, renewal, retirement
+and compound-commit readiness invalidation.
