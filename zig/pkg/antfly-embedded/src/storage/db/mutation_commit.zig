@@ -421,7 +421,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (S.ownerField(self, "core").*.index_manager.resource_manager) |manager| {
                 try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
             }
-            const preparation_timestamp_ns = if (req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
+            const preparation_timestamp_ns = if (req.document_version_scheme == .revision_v1 or req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
             const preparation_alloc = prepared_row_allocator.allocator();
 
             // Resolve request ordering and transforms before row preparation. A
@@ -507,7 +507,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .graph_deletes = effective_graph_deletes,
                 .transforms = &.{},
                 .predicates = req.predicates,
-                .timestamp_ns = req.timestamp_ns,
+                .timestamp_ns = preparation_timestamp_ns,
+                .document_version_scheme = if (req.document_version_scheme != .admit_current) req.document_version_scheme else if (opts.ordered_apply_receipt != null) .legacy else .revision_v1,
                 .sync_level = req.sync_level,
                 .reject_graph_transform_projections = req.reject_graph_transform_projections,
                 .split_checkpoint = req.split_checkpoint,
@@ -1298,6 +1299,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 preparation_timestamp_ns;
 
+            // Current local writes and tagged ordered commands allocate a
+            // revision independently of their admitted wall-clock timestamp.
+            // Untagged historical commands retain their original semantics.
+            const document_revisions = effective_req.document_version_scheme != .legacy;
+            const document_version = if (document_revisions and relationalColumns(self) == null)
+                try @import("../ttl.zig").nextDocumentVersion(S.ownerField(self, "core").*.store, S.ownerField(self, "alloc").*, batch_timestamp_ns, effective_req.writes, effective_req.deletes)
+            else
+                null;
+
             if (opts.row_policy_principal) |principal| {
                 const policy_schema_view = if (use_preprepared_rows)
                     request_schema_view orelse return error.RowPolicyCatalogChanged
@@ -1386,6 +1396,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .use_preprepared_rows = use_preprepared_rows,
             };
             defer write_buffers.deinit();
+            if (document_version) |version| {
+                const bytes = try encodeTimestampValue(S.ownerField(self, "alloc").*, version);
+                write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, bytes) catch |err| {
+                    S.ownerField(self, "alloc").*.free(bytes);
+                    return err;
+                };
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("../ttl.zig").document_version_watermark_key, .value = bytes });
+            }
             if (S.ownerField(self, "local_execution").*.row_policy_table_name) |table_name| {
                 try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = internal_keys.graph_owning_table_key, .value = table_name });
             }
@@ -1679,7 +1697,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const resolved_write_timestamp_ns: ?i128 = if (!use_preprepared_rows and shouldWriteTimestamp(write.key))
                         if (prepared_relational) |*prepared|
                             if (restored_version) |version| @as(i128, version) else try resolveWriteTimestampFromValue(self, batch_timestamp_ns, prepared.parsedValue())
-                        else if (restored_source) |source| source else try resolveWriteTimestampNs(self, restored_version orelse batch_timestamp_ns, write.value)
+                        else if (restored_source) |source| source else if (opts.restore_ttl_sources != null and restored_version != null and restored_version.? == 0) 0 else try resolveWriteTimestampNs(self, restored_version orelse batch_timestamp_ns, write.value)
                     else
                         null;
                     if (!use_preprepared_rows) if (prepared_relational) |*prepared|
@@ -1741,15 +1759,31 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     });
                     try write_buffers.identity_upsert_keys.append(S.ownerField(self, "alloc").*, write.key);
                     try write_buffers.identity_upsert_write_indexes.append(S.ownerField(self, "alloc").*, i);
-                    if (shouldWriteTimestamp(write.key)) {
+                    if (shouldWriteTimestamp(write.key)) timestamp: {
+                        // The transfer map uses zero with no source slot for a
+                        // missing sidecar. An explicit epoch source has a slot,
+                        // so absence never becomes a receiver-policy timestamp.
+                        if (!use_preprepared_rows and prepared_relational == null and restored_version != null and restored_version.? == 0 and restored_source == null and opts.restore_ttl_sources != null) {
+                            const missing_key = try makeTimestampKey(S.ownerField(self, "alloc").*, write.key);
+                            write_buffers.timestamp_delete_keys.append(S.ownerField(self, "alloc").*, missing_key) catch |err| {
+                                S.ownerField(self, "alloc").*.free(missing_key);
+                                return err;
+                            };
+                            try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, missing_key);
+                            break :timestamp;
+                        }
                         const timestamp_start_ns = monotonicTimeNs();
                         const timestamp_key = if (use_preprepared_rows) preparation.effects.?[i].timestamp_key.? else try makeTimestampKey(S.ownerField(self, "alloc").*, write.key);
+                        errdefer if (!use_preprepared_rows) S.ownerField(self, "alloc").*.free(timestamp_key);
                         const timestamp_value = if (use_preprepared_rows) preparation.effects.?[i].timestamp_value.? else blk: {
                             break :blk if (prepared_relational != null)
                                 try encodeTimestampValue(S.ownerField(self, "alloc").*, @intCast(resolved_write_timestamp_ns.?))
+                            else if (!document_revisions and restored_version == null)
+                                try encodeTimestampValue(S.ownerField(self, "alloc").*, std.math.cast(u64, resolved_write_timestamp_ns.?) orelse return error.InvalidArgument)
                             else
-                                try encodeDocumentTimestampValue(S.ownerField(self, "alloc").*, batch_timestamp_ns, resolved_write_timestamp_ns.?, restored_version);
+                                try encodeDocumentTimestampValue(S.ownerField(self, "alloc").*, if (effective_req.document_version_scheme == .revision_v1) document_version orelse batch_timestamp_ns else batch_timestamp_ns, resolved_write_timestamp_ns.?, restored_version);
                         };
+                        errdefer if (!use_preprepared_rows) S.ownerField(self, "alloc").*.free(timestamp_value);
                         try write_buffers.timestamp_writes.append(S.ownerField(self, "alloc").*, .{
                             .key = timestamp_key,
                             .value = timestamp_value,
@@ -2097,7 +2131,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, store_key);
                 if (shouldWriteTimestamp(key)) {
                     const timestamp_key = try makeTimestampKey(S.ownerField(self, "alloc").*, key);
-                    try write_buffers.timestamp_delete_keys.append(S.ownerField(self, "alloc").*, timestamp_key);
+                    write_buffers.timestamp_delete_keys.append(S.ownerField(self, "alloc").*, timestamp_key) catch |err| {
+                        S.ownerField(self, "alloc").*.free(timestamp_key);
+                        return err;
+                    };
                     try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, timestamp_key);
                 }
             }
@@ -3998,6 +4035,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .writes = writes,
                     .deletes = intents.deletes,
                     .timestamp_ns = commit_version,
+                    .document_version_scheme = if (intents.document_revisions) .revision_v1 else .legacy,
                     .sync_level = commit_sync_level,
                     .restore_staging_scope = restore_scope,
                 }, null, .{

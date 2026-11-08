@@ -1762,6 +1762,7 @@ fn deinitKeyValueBatch(alloc: Allocator, batch: *std.ArrayListUnmanaged(backup_c
 }
 
 pub fn isPortableMetadataKey(key: []const u8) bool {
+    if (std.mem.eql(u8, key, @import("ttl.zig").document_version_watermark_key)) return true;
     // Destination facts must be rebuilt from imported physical records, never
     // copied from a source's potentially partial maintenance certificate.
     if (@import("artifact_footprint.zig").isKey(key)) return false;
@@ -4736,7 +4737,9 @@ fn validateMetadataEntries(
 ) !void {
     for (entries) |entry| {
         if (!isPortableMetadataKey(entry.key)) return error.InvalidMetadataBatch;
-        if (@import("db/group_source_index.zig").isRevisionClockKey(entry.key)) {
+        if (std.mem.eql(u8, entry.key, @import("ttl.zig").document_version_watermark_key)) {
+            if (entry.value.len != 8 or std.mem.readInt(u64, entry.value[0..8], .little) == 0) return error.InvalidMetadataBatch;
+        } else if (@import("db/group_source_index.zig").isRevisionClockKey(entry.key)) {
             @import("db/group_source_index.zig").validateRevisionClock(entry.key, entry.value) catch return error.InvalidMetadataBatch;
         } else if (entry.key.len == 20 and std.mem.startsWith(u8, entry.key, @import("db/group_source_state.zig").lease_clock_prefix)) {
             if (entry.value.len < 37 or entry.value.len > 64 or !std.mem.eql(u8, entry.value[0..4], "GSC1") or !std.mem.eql(u8, entry.value[entry.value.len - 32 ..], &@import("db/group_source_queue.zig").checksum(entry.key, entry.value[4 .. entry.value.len - 32]))) return error.InvalidMetadataBatch;

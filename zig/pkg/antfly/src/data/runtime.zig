@@ -3891,6 +3891,7 @@ const DataRaftProtocolCapabilityCacheEntry = struct {
 };
 
 const DataRaftProtocolActivationEntry = struct {
+    revision_probe_after_ns: std.atomic.Value(u64) = .init(0),
     /// One reference belongs to the map; every request retains its own so an
     /// exact-placement cleanup can unlink the entry without racing readers.
     ref_count: std.atomic.Value(usize) = .init(1),
@@ -12608,7 +12609,21 @@ pub const DataServer = struct {
         return legacy_req;
     }
 
+    fn preferredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest, minimum: u16, active: u16, probe_after_ns: u64, now_ns: u64) u16 {
+        // Establish a command's mandatory floor first. An optional v27 probe
+        // must not reject a v23 command that a mixed v26/v27 group can admit.
+        // Once the floor is active, later writes can negotiate the revision
+        // upgrade without probing both protocols on every mixed-group write.
+        if (batchMutatesDocuments(req) and (active >= minimum or minimum <= data_raft_batch.timestamp_protocol_version) and now_ns >= probe_after_ns)
+            return @max(minimum, @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version);
+        return minimum;
+    }
+
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        const revisions = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
+        if (req.document_version_scheme == .revision_v1) return revisions;
+        if (req.online_source) |command| if (command == .admit and command.admit.ttl_sources) return revisions;
+        if (req.merge_page) |page| if (page.ttl_sources.len != 0 or (if (page.chunk) |chunk| chunk.ttl_source != null else false)) return revisions;
         const execution = @import("../common/data_raft_protocol.zig").batch_execution_identity_protocol_version;
         if (req.group_source) |command| if (command.action == .activate_catalog) return execution;
         if (req.artifact_publication) |command| if (command.execution_identity != null) return execution;
@@ -13182,7 +13197,8 @@ pub const DataServer = struct {
             return error.OnlineMergeArtifactCatalogUncoordinated;
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
-        const required_protocol_version = requiredRaftBatchProtocolVersion(req);
+        const minimum_protocol_version = requiredRaftBatchProtocolVersion(req);
+        var required_protocol_version = minimum_protocol_version;
         const deadline_ns = @min(route.admission_deadline_ns orelse std.math.maxInt(u64), self.dataRaftMonotonicNs() +| leader_wait_ns);
         try ensureDataRaftBatchRouteActive(route);
         try self.reachDataRequestLifecycle(.{
@@ -13215,6 +13231,7 @@ pub const DataServer = struct {
         var last_placement_target_node_id: ?u64 = null;
         var failed_known_leader_node_id: ?u64 = null;
         while (true) {
+            required_protocol_version = minimum_protocol_version;
             try ensureDataRaftBatchRouteActive(route);
             const preflighted_local_leader = raft.host.http_host.host.isLocalLeader(group_id);
             var storage_owner_descriptor: ?antfly.public_api.ProvisionedKernelOwnerSource.LoadedDescriptor = null;
@@ -13244,6 +13261,7 @@ pub const DataServer = struct {
                     }
                 }
                 const activation_entry = try self.dataRaftProtocolActivationEntry(group_id);
+                required_protocol_version = preferredRaftBatchProtocolVersion(req, minimum_protocol_version, activation_entry.protocol_version.load(.acquire), activation_entry.revision_probe_after_ns.load(.acquire), self.dataRaftMonotonicNs());
                 protocol_activation_entry = activation_entry;
                 if (activation_entry.protocol_version.load(.acquire) >= required_protocol_version) {
                     protocol_preflight.activatable_version = activation_entry.protocol_version.load(.acquire);
@@ -13283,6 +13301,7 @@ pub const DataServer = struct {
                             else => return err,
                         }
                     };
+                    activation_entry.protocol_version.store(@max(durable_version, activation_entry.protocol_version.load(.acquire)), .release);
                     if (durable_version >= required_protocol_version) {
                         activation_entry.protocol_version.store(durable_version, .release);
                         activation_entry.pending_term.store(0, .release);
@@ -13320,6 +13339,8 @@ pub const DataServer = struct {
                             deadline_ns,
                             route.cancellation,
                         );
+                        if (required_protocol_version > minimum_protocol_version and protocol_preflight.activatable_version < required_protocol_version)
+                            activation_entry.revision_probe_after_ns.store(self.dataRaftMonotonicNs() +| std.time.ns_per_s, .release);
                     }
                 }
                 try ensureDataRaftBatchRouteActive(route);
@@ -13451,16 +13472,16 @@ pub const DataServer = struct {
                                 protocol_activation_entry.?.pending_term.store(status.hard.current_term, .release);
                             }
                         }
-                        if (active_protocol_version < required_protocol_version) {
+                        if (active_protocol_version < minimum_protocol_version) {
                             // Bulk ACKs have a compatible single-command path.
                             // This is a feature rejection before ACK admission,
                             // never a classification of an accepted write.
                             if (req.transaction) |transaction| if (transaction == .acknowledge_many) return error.UnsupportedOperation;
-                            if (required_protocol_version >= data_raft_batch.merge_copy_attempt_protocol_version)
+                            if (minimum_protocol_version >= data_raft_batch.merge_copy_attempt_protocol_version)
                                 return error.RaftBatchMergeProtocolUnavailable;
-                            if (required_protocol_version >= data_raft_batch.split_delta_predecessor_protocol_version)
+                            if (minimum_protocol_version >= data_raft_batch.split_delta_predecessor_protocol_version)
                                 return error.RaftBatchSplitDeltaProtocolUnavailable;
-                            if (required_protocol_version >= data_raft_batch.merge_transition_protocol_version)
+                            if (minimum_protocol_version >= data_raft_batch.merge_transition_protocol_version)
                                 return error.RaftBatchMergeProtocolUnavailable;
                         }
                         proposal_req = raftBatchRequestForProtocol(
@@ -13468,6 +13489,7 @@ pub const DataServer = struct {
                             active_protocol_version >= data_raft_batch.timestamp_protocol_version,
                             self.dataRaftRealtimeNs(),
                         );
+                        proposal_req.document_version_scheme = if (active_protocol_version >= @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version) .revision_v1 else .legacy;
                         const proposal_term = status.hard.current_term;
                         const encoded = if (comptime linked_storage)
                             try data_raft_batch.encodeWithStorageOwnerDescriptor(
@@ -24806,7 +24828,7 @@ fn onlineMergeRaftBatchRequiresArtifactBarrier(req: antfly.db.types.BatchRequest
 
 fn onlineMergePeerEligible(version: u16) !bool {
     if (version == 0) return error.GroupLeaderUnavailable;
-    return version >= data_raft_batch.artifact_catalog_protocol_version;
+    return version >= @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
 }
 
 fn onlineMergeRaftBatchHasArtifactBarrier(req: antfly.db.types.BatchRequest) bool {
@@ -42168,11 +42190,12 @@ fn consumerTests() type {
             }
         }
 
-        test "online merge admission distinguishes unsupported peers and fences leader authority" {
+        test "time series online merge admission distinguishes unsupported peers and fences leader authority" {
             try std.testing.expectError(error.GroupLeaderUnavailable, onlineMergePeerEligible(0));
             try std.testing.expect(!try onlineMergePeerEligible(data_raft_batch.source_pin_protocol_version - 1));
             try std.testing.expect(!try onlineMergePeerEligible(data_raft_batch.artifact_catalog_protocol_version - 1));
-            try std.testing.expect(try onlineMergePeerEligible(data_raft_batch.artifact_catalog_protocol_version));
+            try std.testing.expect(!try onlineMergePeerEligible(@import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version - 1));
+            try std.testing.expect(try onlineMergePeerEligible(@import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version));
             try validateOnlineMergeAdmissionAuthority(9, 9, 17, 17);
             try std.testing.expectError(error.GroupLeaderUnavailable, validateOnlineMergeAdmissionAuthority(0, 0, 17, 17));
             try std.testing.expectError(error.GroupLeaderUnavailable, validateOnlineMergeAdmissionAuthority(9, 10, 17, 17));
@@ -42293,7 +42316,7 @@ fn consumerTests() type {
             }));
         }
 
-        test "raft batch protocol preflight fingerprint fences every applying replica set" {
+        test "time series raft batch protocol preflight fingerprint fences every applying replica set" {
             var voters = [_]u64{ 1, 2, 3 };
             var outgoing = [_]u64{ 1, 2, 4 };
             var learners = [_]u64{5};
@@ -42311,7 +42334,7 @@ fn consumerTests() type {
             try std.testing.expect(fingerprint != DataServer.dataRaftConfStateFingerprint(base));
         }
 
-        test "raft batch protocol plan resolves only current group applying peers" {
+        test "time series raft batch protocol plan resolves only current group applying peers" {
             const alloc = std.testing.allocator;
             var resolver = antfly.raft.MemoryPeerResolver.init(alloc);
             defer resolver.deinit();
@@ -42353,7 +42376,7 @@ fn consumerTests() type {
             try std.testing.expect(!incomplete.routes_complete);
         }
 
-        test "raft batch protocol cache reuses only short lived negative evidence" {
+        test "time series raft batch protocol cache reuses only short lived negative evidence" {
             const alloc = std.testing.allocator;
             var server: DataServer = undefined;
             server.alloc = alloc;
@@ -42394,7 +42417,7 @@ fn consumerTests() type {
             second.probe_mutex.unlock();
         }
 
-        test "raft batch protocol activation is reusable only in its accepted leader term" {
+        test "time series raft batch protocol activation is reusable only in its accepted leader term" {
             var entry: DataRaftProtocolActivationEntry = .{};
             try std.testing.expect(!DataServer.dataRaftProtocolUsable(
                 &entry,
@@ -57015,4 +57038,23 @@ test "grouped source protocol dominates coexisting graph envelope features" {
     var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@TypeOf(request.group_source.?.action).activate_catalog, decoded.batch.req.group_source.?.action);
+}
+
+test "time series document revision protocol dominates older envelope features" {
+    const p = @import("../common/data_raft_protocol.zig");
+    var req: antfly.db.types.BatchRequest = .{ .document_version_scheme = .revision_v1, .writes = &.{.{ .key = "row", .value = "{}" }} };
+    try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    req.document_version_scheme = .legacy;
+    try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+}
+
+test "time series optional revision upgrade preserves a mixed group's mandatory protocol floor" {
+    const request: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "row", .value = "{}" }} };
+    const next = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
+    try std.testing.expectEqual(@as(u16, 23), DataServer.preferredRaftBatchProtocolVersion(request, 23, 0, 0, 100));
+    try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, 23, 23, 0, 100));
+    try std.testing.expectEqual(@as(u16, 23), DataServer.preferredRaftBatchProtocolVersion(request, 23, 23, 200, 100));
+    try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, 0, 0, 0, 100));
+    try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, data_raft_batch.timestamp_protocol_version, 0, 0, 100));
+    try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, next, 0, 200, 100));
 }

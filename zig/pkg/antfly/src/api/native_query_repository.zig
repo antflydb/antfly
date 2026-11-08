@@ -507,7 +507,9 @@ pub const Repository = struct {
     fn readManifestIfPresent(self: *Repository, a: A, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?[]u8 {
         try cancellation.check();
         const bridge: TokenBridge = .{ .token = cancellation };
-        var result = self.store.opened.client.getObject(self.store.opened.bucket, try self.key(a, request, namespace), .{ .skip_metadata_probe = true, .max_response_bytes = max_manifest_bytes, .cancellation = bridge.object() }) catch |err| {
+        const object_key = try self.key(a, request, namespace);
+        defer a.free(object_key);
+        var result = self.store.opened.client.getObject(self.store.opened.bucket, object_key, .{ .skip_metadata_probe = true, .max_response_bytes = max_manifest_bytes, .cancellation = bridge.object() }) catch |err| {
             try cancellation.check();
             return switch (err) {
                 error.NotFound, error.ObjectNotFound, error.FileNotFound => null,
@@ -2566,6 +2568,9 @@ test "external lake native reuse falls back when its basis expires behind collec
 }
 
 test "external lake native time series capture remains immutable after preflight and hint loss" {
+    // This regression inspects physical DB hints. Control-only test owners
+    // exercise the protocol contracts; the API runtime owner runs this case.
+    if (comptime !@hasDecl(local, "storage_db_db")) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
     for ([_]bool{ true, false }) |linked| {
@@ -2582,21 +2587,26 @@ test "external lake native time series capture remains immutable after preflight
         const options: local.storage_db_db.OpenOptions = .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .start_optional_runtimes = false };
         var db = try local.storage_db_db.DB.open(a, root, options);
         defer db.close();
+        var stage: []const u8 = "seed capture";
+        errdefer std.debug.print("\nnative capture linked={} stage={s}\n", .{ linked, stage });
         try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":1}" }} });
         const seed: cut.Request = .{ .id = &@as([64]u8, @splat('a')), .table_id = 7, .expires_ms = cut.nowMs() + 240000, .create = true };
         try db.captureQueryCut(seed, .none);
         var request = seed;
         request.id = &@as([64]u8, @splat('b'));
+        stage = "initial reuse";
         request.timeout_ms = 60000;
         try db.captureQueryCut(request, .none);
         const cache = try cut.pathAlloc(a, root, request.id);
         defer a.free(cache);
         // The preflight generation reused retained extents without a local pin.
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, cache, .{}));
+        stage = "repeated capture";
         request.timeout_ms = 55000;
         try db.captureQueryCut(request, .none);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, cache, .{}));
         try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":2}" }} });
+        stage = "capture after write";
         request.timeout_ms = 50000;
         try db.captureQueryCut(request, .none);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, cache, .{}));
@@ -2604,9 +2614,11 @@ test "external lake native time series capture remains immutable after preflight
         // over the newer live data and the caller's shorter transport deadline.
         db.close();
         db = try local.storage_db_db.DB.open(a, root, options);
+        stage = "capture after reopen";
         request.timeout_ms = 40000;
         try db.captureQueryCut(request, .none);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, cache, .{}));
+        stage = "open retained read";
         var read_request = request;
         read_request.create = false;
         {
@@ -2621,6 +2633,7 @@ test "external lake native time series capture remains immutable after preflight
         try std.testing.expectEqualStrings("{\"amount\":2}", live);
         // An invalid committed binding is an error, never permission to replace
         // its immutable generation with another snapshot of the live database.
+        stage = "reject corrupt binding";
         db.local_execution.native_query_reuse = null;
         if (linked) {
             const retained_root = try repository.linkedRoot(a, request, namespace);

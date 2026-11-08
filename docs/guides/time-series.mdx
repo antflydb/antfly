@@ -61,7 +61,13 @@ not fixed durations.
 Batch writes are ordinary upserts with the API's existing transaction guarantees.
 Replaying the same ID and payload avoids an extra observation, but an old retry
 can overwrite a newer correction. Use version-conditional writes where that must
-be prevented. Helpers do not automatically replay ambiguous writes. Split large
+be prevented. Document versions advance independently of event time. The allocator is durable:
+repeated timestamps, clock rollback, and delete/reinsert after restart cannot
+reuse a version. Replicated commands activate this behavior only after every
+applying replica crosses protocol 27; historical commands retain their original
+version semantics when replayed. Source-preserving online transfers carry the
+version and signed TTL instant together, independently of recipient TTL settings.
+Helpers do not automatically replay ambiguous writes. Split large
 imports into bounded batches and preserve the IDs and exact payload for retries.
 `client.writeSeries(table, timestamp, readings, { batchSize: 500 })` consumes an
 iterable or async iterable in sequential bounded batches. It stops on error;
@@ -269,10 +275,12 @@ path. Authorization and snapshot coverage still gate reuse.
 
 The document-table preset accepts pre-1970 observations with retention enabled.
 Retention uses the signed event instant, independently of the unsigned write
-version. New document writes use the admitted mutation timestamp as their version,
-so correcting a reading does not reuse its event timestamp as a mutation fence.
-Replay and restoration retain the original version. Old observations are accepted normally and immediately hidden when
-expired; sufficiently long retention can keep a pre-1970 observation visible.
+version. New document writes allocate nonzero revisions from durable state,
+using admission time only as a lower bound. Correcting a reading advances its
+version even when the clock repeats or moves backward. Replay and restoration
+retain the original version. Old observations are accepted normally and
+immediately hidden when expired; sufficiently long retention can keep a pre-1970
+observation visible.
 Existing timestamp metadata remains readable without rewriting retained data.
 
 Table TTL expires raw observations and removes their contributions from exact

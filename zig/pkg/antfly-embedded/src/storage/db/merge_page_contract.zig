@@ -473,7 +473,7 @@ pub fn validateRequest(request: anytype) !void {
     if (command.integrity.len != 0 and (command.source.integrity == null or (command.phase != .cleanup_integrity and command.phase != .artifacts and command.phase != .tail) or request.merge_artifacts.len != 0 or command.chunk != null)) return error.InvalidMergePage;
     if (request.timestamp_ns != 0 or (command.chunk == null and command.timestamps.len != request.writes.len)) return error.InvalidMergePage;
     if (command.ttl_sources.len != 0) {
-        if (command.chunk != null or command.ttl_sources.len != request.writes.len or command.phase != .rows) return error.InvalidMergePage;
+        if (command.chunk != null or command.ttl_sources.len != request.writes.len or (command.phase != .rows and command.phase != .tail)) return error.InvalidMergePage;
         var present = false;
         for (command.ttl_sources) |source| if (source != null) {
             present = true;
@@ -481,7 +481,7 @@ pub fn validateRequest(request: anytype) !void {
         if (!present) return error.InvalidMergePage;
     }
     if (command.chunk) |chunk| {
-        if (chunk.ttl_source != null and (chunk.payload != .row or command.phase != .rows)) return error.InvalidMergePage;
+        if (chunk.ttl_source != null and (chunk.payload != .row or (command.phase != .rows and command.phase != .tail))) return error.InvalidMergePage;
         if (chunk.payload == .provenance) {
             if (command.phase != .artifacts or !command.source.provenance_required or command.next_snapshot_position == null or
                 request.writes.len != 0 or command.integrity.len != 0 or command.artifact_effects.len != 0 or

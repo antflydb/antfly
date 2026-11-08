@@ -3491,8 +3491,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = time_series_filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    // Native macOS ReleaseFast runtime coverage peaks at 6.69 GB.
-    time_series_runtime_tests.step.max_rss = 8 * 1024 * 1024 * 1024;
+    // Expanded revision/recovery and retained-tail coverage measured a
+    // 12.92 GB native macOS ReleaseFast peak. Reserve 16 GiB with headroom;
+    // the physical local partition inherits this scheduling claim.
+    time_series_runtime_tests.step.max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 8) * 1024 * 1024 * 1024;
     b.step("time-series-runtime-test", "Verify temporal predicate proof, owner fanout and fallback contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, time_series_runtime_tests, time_series_filters).step);
 
     const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");

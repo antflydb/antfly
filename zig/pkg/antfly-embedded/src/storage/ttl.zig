@@ -49,6 +49,55 @@ pub const TtlConfig = struct {
 /// that version in the first eight bytes and append the signed TTL source instant.
 /// Keeping the two separate avoids turning historical event time into version zero.
 pub const TimestampMetadata = struct { version: u64, source: i128 };
+pub const document_version_watermark_key = "\x00\x00__metadata__:document_version_watermark_v1";
+
+/// Called under the primary apply fence. One sorted metadata read seeds a
+/// durable batch revision from both the allocator and legacy rows being changed.
+/// Deletions advance the watermark too, preventing delete/reinsert ABA.
+pub fn nextDocumentVersion(store: anytype, a: Allocator, wall: u64, writes: anytype, deletes: []const []const u8) !?u64 {
+    var keys = std.ArrayList([]const u8).empty;
+    defer {
+        for (keys.items) |key| if (!std.mem.eql(u8, key, document_version_watermark_key)) a.free(key);
+        keys.deinit(a);
+    }
+    try keys.append(a, document_version_watermark_key);
+    for (writes) |write| if (!internal_keys.isInternalUserKey(write.key) and !std.mem.startsWith(u8, write.key, "\x00\x00__metadata__:") and !std.mem.startsWith(u8, write.key, "splitstate:") and !std.mem.startsWith(u8, write.key, "splitdelta:")) {
+        const key = try internal_keys.ttlKeyAlloc(a, write.key);
+        errdefer a.free(key);
+        try keys.append(a, key);
+    };
+    for (deletes) |id| if (!internal_keys.isInternalUserKey(id) and !std.mem.startsWith(u8, id, "\x00\x00__metadata__:") and !std.mem.startsWith(u8, id, "splitstate:") and !std.mem.startsWith(u8, id, "splitdelta:")) {
+        const key = try internal_keys.ttlKeyAlloc(a, id);
+        errdefer a.free(key);
+        try keys.append(a, key);
+    };
+    if (keys.items.len == 1) return null;
+    std.mem.sort([]const u8, keys.items, {}, struct {
+        fn less(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.less);
+    var unique = std.ArrayList([]const u8).empty;
+    defer unique.deinit(a);
+    for (keys.items) |key| if (unique.items.len == 0 or !std.mem.eql(u8, unique.items[unique.items.len - 1], key)) try unique.append(a, key);
+    const values = try a.alloc(?[]const u8, unique.items.len);
+    defer a.free(values);
+    var txn = if (comptime @TypeOf(store) == *DocStore) try store.beginProbeTxn() else blk: {
+        var backend = store;
+        break :blk try backend.beginProbe();
+    };
+    defer txn.abort();
+    try txn.getManySorted(unique.items, values);
+    var previous: u64 = 0;
+    for (unique.items, values) |key, value| if (value) |bytes| {
+        const version = if (std.mem.eql(u8, key, document_version_watermark_key)) blk: {
+            if (bytes.len != 8) return error.InvalidTimestamp;
+            break :blk std.mem.readInt(u64, bytes[0..8], .little);
+        } else writeVersion(bytes) orelse return error.InvalidTimestamp;
+        previous = @max(previous, version);
+    };
+    return @max(wall, std.math.add(u64, previous, 1) catch return error.InvalidTimestamp);
+}
 
 /// The only decoder for primary timestamp sidecars. Version fences must use
 /// `version`; expiration must use `source`, including epoch and negative instants.

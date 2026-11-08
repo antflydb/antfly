@@ -31,6 +31,7 @@ pub const Fragment = struct {
     writes: []const types.BatchWrite,
     deletes: []const []const u8,
     timestamps: []const u64,
+    ttl_sources: []const ?[16]u8 = &.{},
     integrity: []const pages.IntegrityEffect,
     artifact_effects: []const pages.IntegrityEffect,
     tail: pages.Tail,
@@ -45,6 +46,7 @@ pub const Fragment = struct {
         value_offset: u32,
         value_len: u32,
         timestamp: u64,
+        ttl_source: ?[16]u8 = null,
         payload: pages.ChunkPayload,
         digest: pages.Digest,
         scratch: []u8,
@@ -94,7 +96,7 @@ pub const Fragment = struct {
         var chunk_digest: pages.Digest = undefined;
         std.crypto.hash.sha2.Sha256.hash(stream.scratch[0..len], &chunk_digest, .{});
         var result = try self.baseRequestUnchecked(source, context, sequence);
-        result.merge_page.?.chunk = .{ .payload = stream.payload, .row_key = stream.key, .timestamp = stream.timestamp, .total_bytes = stream.value_len, .row_digest = stream.digest, .offset = offset, .data = stream.scratch[0..len], .chunk_digest = chunk_digest };
+        result.merge_page.?.chunk = .{ .payload = stream.payload, .row_key = stream.key, .timestamp = stream.timestamp, .ttl_source = stream.ttl_source, .total_bytes = stream.value_len, .row_digest = stream.digest, .offset = offset, .data = stream.scratch[0..len], .chunk_digest = chunk_digest };
         result.merge_page.?.digest = pages.commandDigest(result);
         try pages.validateRequest(result);
         return result;
@@ -121,7 +123,7 @@ pub const Fragment = struct {
             .writes = self.writes,
             .deletes = self.deletes,
             .merge_replication = context,
-            .merge_page = .{ .source = source, .sequence = sequence, .phase = .tail, .exhausted = false, .digest = @splat(0), .timestamps = self.timestamps, .tail = self.tail, .integrity = self.integrity, .artifact_effects = self.artifact_effects },
+            .merge_page = .{ .source = source, .sequence = sequence, .phase = .tail, .exhausted = false, .digest = @splat(0), .timestamps = self.timestamps, .ttl_sources = self.ttl_sources, .tail = self.tail, .integrity = self.integrity, .artifact_effects = self.artifact_effects },
         };
         result.merge_page.?.digest = pages.commandDigest(result);
         return result;
@@ -255,6 +257,8 @@ pub const Session = struct {
         var writes: std.ArrayList(types.BatchWrite) = .empty;
         var deletes: std.ArrayList([]const u8) = .empty;
         var timestamps: std.ArrayList(u64) = .empty;
+        var ttl_sources: std.ArrayList(?[16]u8) = .empty;
+        var has_sources = false;
         var integrity: std.ArrayList(pages.IntegrityEffect) = .empty;
         var artifact_effects: std.ArrayList(pages.IntegrityEffect) = .empty;
         const view = self.chunkView();
@@ -275,6 +279,7 @@ pub const Session = struct {
             const is_graph = @import("online_graph_artifacts.zig").isKey(key) or @import("group_source_transfer.zig").isKey(key);
             const is_artifact = is_vector or is_graph;
             if (!is_integrity and !is_artifact and !internal.isStoredSourceRowKey(key)) return error.RetainedEffectsCorrupt;
+            if (effect.ttl_source != null and (!internal.isPrimaryDocumentKey(key) or effect.value_len == null)) return error.RetainedEffectsCorrupt;
             if (is_integrity or is_artifact) {
                 if (effect.timestamp != 0 or (is_artifact and !view.direct_vectors) or (is_graph and !view.graph_artifacts)) return error.RetainedEffectsCorrupt;
             }
@@ -296,7 +301,7 @@ pub const Session = struct {
                     hash.update(scratch[0..n]);
                     value_pos += @intCast(n);
                 }
-                streamed = .{ .session = self, .key = logical, .value_offset = effect.value_offset, .value_len = effect.value_len.?, .timestamp = effect.timestamp, .payload = if (is_artifact) .artifact else .row, .digest = hash.finalResult(), .scratch = scratch };
+                streamed = .{ .session = self, .key = logical, .value_offset = effect.value_offset, .value_len = effect.value_len.?, .timestamp = effect.timestamp, .ttl_source = effect.ttl_source, .payload = if (is_artifact) .artifact else .row, .digest = hash.finalResult(), .scratch = scratch };
                 count = 1;
                 last_key = key;
                 break;
@@ -330,6 +335,8 @@ pub const Session = struct {
             } else if (value) |raw| {
                 try writes.append(owned, .{ .key = logical, .value = raw });
                 try timestamps.append(owned, effect.timestamp);
+                try ttl_sources.append(owned, effect.ttl_source);
+                has_sources = has_sources or effect.ttl_source != null;
             } else try deletes.append(owned, logical);
             size +|= logical.len +| if (value) |raw| raw.len else 0;
             count += 1;
@@ -349,6 +356,7 @@ pub const Session = struct {
             .writes = writes.items,
             .deletes = deletes.items,
             .timestamps = timestamps.items,
+            .ttl_sources = if (has_sources) ttl_sources.items else &.{},
             .integrity = integrity.items,
             .artifact_effects = artifact_effects.items,
             .tail = .{ .fragment = .{ .sequence = self.sequence, .offset = self.offset, .total_effects = self.total, .frame_digest = self.frameDigest() } },
@@ -374,6 +382,8 @@ pub const Session = struct {
         var writes: std.ArrayList(types.BatchWrite) = .empty;
         var deletes: std.ArrayList([]const u8) = .empty;
         var timestamps: std.ArrayList(u64) = .empty;
+        var ttl_sources: std.ArrayList(?[16]u8) = .empty;
+        var has_sources = false;
         var integrity: std.ArrayList(pages.IntegrityEffect) = .empty;
         var artifact_effects: std.ArrayList(pages.IntegrityEffect) = .empty;
         var reader = self.frame.contiguous;
@@ -418,6 +428,8 @@ pub const Session = struct {
             if (value) |raw| {
                 try writes.append(owned, .{ .key = logical, .value = raw });
                 try timestamps.append(owned, timestamp);
+                try ttl_sources.append(owned, effect.ttl_source);
+                has_sources = has_sources or effect.ttl_source != null;
             } else try deletes.append(owned, logical);
             size +|= bytes;
             count += 1;
@@ -430,6 +442,7 @@ pub const Session = struct {
             .writes = writes.items,
             .deletes = deletes.items,
             .timestamps = timestamps.items,
+            .ttl_sources = if (has_sources) ttl_sources.items else &.{},
             .integrity = integrity.items,
             .artifact_effects = artifact_effects.items,
             .tail = .{ .fragment = .{ .sequence = self.sequence, .offset = self.offset, .total_effects = self.total, .frame_digest = self.frameDigest() } },

@@ -21061,7 +21061,12 @@ pub const DB = struct {
         if (publish and try self.tryReuseNativeQueryCut(io, request, token)) return;
         // A process-local hint is optional. Recover an already committed
         // binding before considering a fresh capture of mutable live state.
-        if (publish) if (self.backend_runtime.query_cut_repository) |repository| if (self.primary_lsm_storage) |storage| {
+        if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
+            // Default filesystem owners have no custom Storage override.
+            // They still need committed-binding discovery after hint loss;
+            // the native view simply has no remote checkpoint reference.
+            var native = lsm_backend_mod.storage_io.IoStorage.init(io);
+            const storage = self.primary_lsm_storage orelse native.storage();
             if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
         };
         try self.admitQueryCut(io, request.id, token);
@@ -25504,10 +25509,11 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans },
+                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
                 .index_span_digests = index_spans,
@@ -126431,11 +126437,11 @@ test "db primary digest guards projected rows with unchanged custom ttl timestam
         // to verify the stronger digest fence independently of event time.
         const old_json = "{\"id\":1,\"expires\":\"2090-01-01T00:00:00Z\",\"value\":1}";
         const new_json = "{\"id\":1,\"expires\":\"2090-01-01T00:00:00Z\",\"value\":2}";
-        try db.batch(.{ .timestamp_ns = 123, .writes = &.{.{ .key = "row", .value = old_json }} });
+        try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "row", .value = old_json }} });
         var before = (try db.lookup(alloc, "row", .{ .fields = &.{"id"}, .include_all_fields = false, .include_primary_digest = true })).?;
         defer before.deinit(alloc);
         try std.testing.expect(before.expected_content_digest != null and before.version != null);
-        try db.batch(.{ .timestamp_ns = 123, .writes = &.{.{ .key = "row", .value = new_json }} });
+        try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "row", .value = new_json }} });
         var after = (try db.lookup(alloc, "row", .{ .include_primary_digest = true })).?;
         defer after.deinit(alloc);
         try std.testing.expectEqual(before.version, after.version);
@@ -148643,10 +148649,12 @@ test "time series corrections fence mutations independently of event time" {
         const corrected = try std.fmt.allocPrint(a, "{{\"observed_at\":\"{s}\",\"v\":2}}", .{observed});
         defer a.free(corrected);
         try db.batch(.{ .timestamp_ns = 111, .writes = &.{.{ .key = observed, .value = first }} });
-        try std.testing.expectEqual(@as(u64, 111), try db.getTimestamp(a, observed));
-        try db.batch(.{ .timestamp_ns = 222, .writes = &.{.{ .key = observed, .value = corrected }}, .predicates = &.{.{ .key = observed, .expected_version = 111 }} });
-        try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(.{ .timestamp_ns = 333, .writes = &.{.{ .key = observed, .value = first }}, .predicates = &.{.{ .key = observed, .expected_version = 111 }} }));
-        try std.testing.expectEqual(@as(u64, 222), try db.getTimestamp(a, observed));
+        const initial_version = try db.getTimestamp(a, observed);
+        try std.testing.expect(initial_version != 0);
+        try db.batch(.{ .timestamp_ns = 222, .writes = &.{.{ .key = observed, .value = corrected }}, .predicates = &.{.{ .key = observed, .expected_version = initial_version }} });
+        try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(.{ .timestamp_ns = 333, .writes = &.{.{ .key = observed, .value = first }}, .predicates = &.{.{ .key = observed, .expected_version = initial_version }} }));
+        const corrected_version = try db.getTimestamp(a, observed);
+        try std.testing.expect(corrected_version > initial_version);
         try std.testing.expectEqual(@as(?i128, source), try ttl_mod.readSourceTimestamp(db.core.store, a, observed));
         const actual = (try db.get(a, observed)).?;
         defer a.free(actual);
@@ -148654,19 +148662,19 @@ test "time series corrections fence mutations independently of event time" {
         // Replay restores identity instead of minting a receiver-side version.
         var restored: std.StringHashMapUnmanaged(u64) = .empty;
         defer restored.deinit(a);
-        try restored.put(a, "restored", 222);
+        try restored.put(a, "restored", corrected_version);
         try db.batchInternal(.{ .timestamp_ns = 999, .writes = &.{.{ .key = "restored", .value = corrected }} }, null, .{ .restore_timestamps = &restored, .preserve_logical_values = true });
-        try std.testing.expectEqual(@as(u64, 222), try db.getTimestamp(a, "restored"));
+        try std.testing.expectEqual(corrected_version, try db.getTimestamp(a, "restored"));
         try std.testing.expectEqual(@as(?i128, source), try ttl_mod.readSourceTimestamp(db.core.store, a, "restored"));
     }
     // An existing eight-byte record upgrades on its first correction.
     const legacy_source: u64 = 1_793_966_400_000_000_000;
     const legacy = "{\"observed_at\":\"2026-11-06T12:00:00Z\",\"v\":1}";
-    try db.batch(.{ .timestamp_ns = legacy_source, .writes = &.{.{ .key = "legacy", .value = legacy }} });
+    try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = legacy_source, .writes = &.{.{ .key = "legacy", .value = legacy }} });
     try db.batch(.{ .timestamp_ns = 444, .writes = &.{.{ .key = "legacy", .value = legacy }}, .predicates = &.{.{ .key = "legacy", .expected_version = legacy_source }} });
     db.close();
     db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
-    try std.testing.expectEqual(@as(u64, 444), try db.getTimestamp(a, "legacy"));
+    try std.testing.expectEqual(legacy_source + 1, try db.getTimestamp(a, "legacy"));
     try std.testing.expectEqual(@as(?i128, legacy_source), try ttl_mod.readSourceTimestamp(db.core.store, a, "legacy"));
 }
 
@@ -148715,7 +148723,7 @@ test "time series historical TTL sources preserve write versions and signed visi
         .timestamp_ns = 12346,
         .writes = &.{.{ .key = "epoch", .value = "{\"observed_at\":\"1970-01-01T00:00:00Z\",\"v\":2}" }},
     });
-    try std.testing.expectEqual(@as(u64, 12346), try db.getTimestamp(a, "epoch"));
+    try std.testing.expect(try db.getTimestamp(a, "epoch") > 12345);
     try std.testing.expectEqual(@as(?i128, 0), try ttl_mod.readSourceTimestamp(db.core.store, a, "epoch"));
     try std.testing.expect((try db.get(a, "historical")) == null);
     try std.testing.expect((try db.lookup(a, "historical", .{})) == null);
@@ -148729,4 +148737,94 @@ test "time series historical TTL sources preserve write versions and signed visi
     try std.testing.expect((try ttl_mod.readSourceTimestamp(db.core.store, a, "historical")) == null);
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(a, "epoch"));
     try std.testing.expect((try ttl_mod.readSourceTimestamp(db.core.store, a, "epoch")) == null);
+}
+
+test "time series durable revisions survive frozen rollback zero clocks and deletion ABA" {
+    const a = std.testing.allocator;
+    var dir = try TestDirectory.init("series-durable-revisions");
+    defer dir.cleanup();
+    var db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+    var previous: u64 = 0;
+    for ([_]u64{ 100, 100, 10, 0, 0 }) |wall| {
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = wall, .writes = &.{.{ .key = "reading", .value = "{\"at\":\"1970-01-01T00:00:00Z\",\"v\":1}" }} });
+        const next = try db.getTimestamp(a, "reading");
+        try std.testing.expect(next > previous);
+        try std.testing.expectEqual(@as(?i128, 0), try ttl_mod.readSourceTimestamp(db.core.store, a, "reading"));
+        previous = next;
+    }
+    try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "reading", .value = "{}" }}, .predicates = &.{.{ .key = "reading", .expected_version = 1 }} }));
+    try std.testing.expectEqual(previous, try db.getTimestamp(a, "reading"));
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .deletes = &.{"reading"} });
+    db.close();
+    db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "reading", .value = "{}" }} });
+    try std.testing.expectEqual(previous + 2, try db.getTimestamp(a, "reading"));
+    // Historical admission rejects negative sources without committing a row
+    // or leaking a partially prepared timestamp key.
+    try std.testing.expectError(error.InvalidArgument, db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "rejected", .value = "{\"at\":\"1969-12-31T23:59:59Z\"}" }} }));
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(a, "rejected"));
+    // Untagged historical commands replay their original event-time version.
+    try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "old", .value = "{\"at\":\"1970-01-01T00:00:01Z\"}" }} });
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s), try db.getTimestamp(a, "old"));
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "old", .value = "{}" }} });
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s + 1), try db.getTimestamp(a, "old"));
+}
+
+test "time series retained afterimages preserve signed sources across restart and receiver policy" {
+    const a = std.testing.allocator;
+    const retained = @import("../retained_effects.zig");
+    const frame = @import("../retained_frame.zig");
+    for ([_]bool{ false, true }) |large| {
+        var dir = try TestDirectory.init("series-source-retention");
+        defer dir.cleanup();
+        var db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+        try db.batch(.{ .timestamp_ns = 1, .writes = &.{.{ .key = "bootstrap", .value = "{}" }} });
+        var ns: retained.Namespace = undefined;
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            ns = (try txn.get(&internal_keys.identity_namespace_key))[0..24].*;
+            _ = try retained.admitWithSourceCapabilities(&txn, ns, 1, @splat(9), retained.default_limit, large, true, large, true);
+            try txn.commit();
+        }
+        const padding = try a.alloc(u8, if (large) 2 * 1024 * 1024 else 0);
+        defer a.free(padding);
+        @memset(padding, 'x');
+        const json = try std.fmt.allocPrint(a, "{{\"at\":\"1969-12-31T23:59:59Z\",\"padding\":\"{s}\"}}", .{padding});
+        defer a.free(json);
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "reading", .value = json }} });
+        db.close();
+        db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const cache = try a.create(frame.View.ChunkCache);
+        defer a.destroy(cache);
+        const cache_bytes = try a.alloc(u8, frame.chunk_bytes);
+        defer a.free(cache_bytes);
+        cache.* = .{ .bytes = cache_bytes };
+        var captured = (try retained.readFrame(&read, ns, 1, @splat(9), 0, cache)).?;
+        try std.testing.expectEqual(large, captured == .chunked);
+        const source: [16]u8 = switch (captured) {
+            .contiguous => |*reader| (try reader.next()).?.ttl_source.?,
+            .chunked => |view| (try view.effectAt(0, cache)).ttl_source.?,
+        };
+        try std.testing.expectEqual(@as(i128, -std.time.ns_per_s), std.mem.readInt(i128, &source, .little));
+        var target_dir = try TestDirectory.init("series-retention-target");
+        defer target_dir.cleanup();
+        var target = try DB.open(a, target_dir.path(), .{ .start_optional_runtimes = false });
+        defer target.close();
+        var versions: std.StringHashMapUnmanaged(u64) = .empty;
+        defer versions.deinit(a);
+        var sources: std.StringHashMapUnmanaged(i128) = .empty;
+        defer sources.deinit(a);
+        try versions.put(a, "reading", 100);
+        try sources.put(a, "reading", std.mem.readInt(i128, &source, .little));
+        try target.batchInternal(.{ .writes = &.{.{ .key = "reading", .value = json }} }, null, .{ .restore_timestamps = &versions, .restore_ttl_sources = &sources, .preserve_logical_values = true });
+        try std.testing.expectEqual(@as(u64, 100), try target.getTimestamp(a, "reading"));
+        try std.testing.expectEqual(@as(?i128, -std.time.ns_per_s), try ttl_mod.readSourceTimestamp(target.core.store, a, "reading"));
+    }
 }

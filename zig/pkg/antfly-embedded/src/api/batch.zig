@@ -633,9 +633,10 @@ fn parseBatchRequestWithOptions(
     };
     defer parsed.deinit();
     const versioned = parsed.value == .array;
+    const document_versions_envelope = versioned and parsed.value.array.items.len == 2 and parsed.value.array.items[0] == .string and std.mem.eql(u8, parsed.value.array.items[0].string, "document-revisions-batch-v1");
     const root_value = if (versioned) blk: {
         const entries = parsed.value.array.items;
-        if (!allow_internal or entries.len != 2 or entries[0] != .string or !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1")) return error.InvalidBatchRequest;
+        if (!allow_internal or entries.len != 2 or entries[0] != .string or (!document_versions_envelope and !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1"))) return error.InvalidBatchRequest;
         break :blk entries[1];
     } else parsed.value;
     if (root_value != .object) return error.InvalidBatchRequest;
@@ -1012,8 +1013,21 @@ fn parseBatchRequestWithOptions(
         break :sync_level db_mod.types.SyncLevel.propose;
     };
 
+    const document_version_scheme: db_mod.types.DocumentVersionScheme = scheme: {
+        const value = root.get("_document_version_scheme") orelse break :scheme if (!allow_internal or local_owner) .admit_current else .legacy;
+        if (!allow_internal or !document_versions_envelope) return error.InvalidBatchRequest;
+        const version = try parseInternalU64(value);
+        break :scheme switch (version) {
+            0 => .legacy,
+            1 => .revision_v1,
+            else => return error.InvalidBatchRequest,
+        };
+    };
     const timestamp_ns = timestamp: {
-        const value = root.get("_timestamp_ns") orelse break :timestamp 0;
+        const value = root.get("_timestamp_ns") orelse {
+            if (document_version_scheme == .revision_v1) return error.InvalidBatchRequest;
+            break :timestamp 0;
+        };
         if (!allow_internal) return error.InvalidBatchRequest;
         break :timestamp try parseInternalU64(value);
     };
@@ -1594,6 +1608,7 @@ fn parseBatchRequestWithOptions(
             .graph_endpoint_cleanup_guards = if (graph_endpoint_cleanup_guards) |guards| guards.value else &.{},
             .predicates = predicates,
             .timestamp_ns = timestamp_ns,
+            .document_version_scheme = document_version_scheme,
             .sync_level = sync_level,
             .reject_graph_transform_projections = reject_graph_transform_projections,
             .split_checkpoint = split_checkpoint,
@@ -1622,6 +1637,7 @@ fn parseBatchRequestWithOptions(
     try @import("../storage/db/online_source_contract.zig").validateRequest(result_value.req);
     try @import("../storage/db/artifact_inventory.zig").validateRequest(result_value.req);
     if (requiresRowSemanticsEnvelope(result_value.req.writes, result_value.req.predicates) and !versioned) return error.InvalidBatchRequest;
+    if (allow_internal and requiresDocumentVersionsEnvelope(result_value.req) != document_versions_envelope) return error.InvalidBatchRequest;
     return result_value;
 }
 
@@ -1656,6 +1672,13 @@ fn validateGraphBatchCommand(req: db_mod.types.BatchRequest) !void {
         error.InvalidGraphEdges => return error.InvalidBatchRequest,
         else => return err,
     };
+}
+
+pub fn requiresDocumentVersionsEnvelope(req: db_mod.types.BatchRequest) bool {
+    if (req.document_version_scheme == .revision_v1) return true;
+    if (req.online_source) |command| if (command == .admit and command.admit.ttl_sources) return true;
+    if (req.merge_page) |page| if (page.ttl_sources.len != 0 or (if (page.chunk) |chunk| chunk.ttl_source != null else false)) return true;
+    return false;
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
@@ -1762,8 +1785,8 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
-    const versioned = requiresRowSemanticsEnvelope(req.writes, req.predicates);
-    if (versioned) try writer.writeAll("[\"row-semantics-batch-v1\",");
+    const versioned = requiresRowSemanticsEnvelope(req.writes, req.predicates) or requiresDocumentVersionsEnvelope(req);
+    if (versioned) try writer.writeAll(if (requiresDocumentVersionsEnvelope(req)) "[\"document-revisions-batch-v1\"," else "[\"row-semantics-batch-v1\",");
 
     try writer.writeAll("{\"inserts\":{");
     for (if (req.merge_page != null) &.{} else req.writes, 0..) |write, i| {
@@ -2090,9 +2113,10 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
             std.json.fmt(transition.split_key, .{}),
         });
     }
-    if (req.timestamp_ns != 0) {
+    if (req.timestamp_ns != 0 or req.document_version_scheme == .revision_v1) {
         try writer.print(",\"_timestamp_ns\":\"{d}\"", .{req.timestamp_ns});
     }
+    if (req.document_version_scheme == .revision_v1) try writer.writeAll(",\"_document_version_scheme\":1");
     if (req.reject_graph_transform_projections) {
         try writer.writeAll(",\"_reject_graph_transform_projections\":true");
     }
@@ -3393,4 +3417,23 @@ test "local owner conditional batch wire retains predicates without exposing rem
     try std.testing.expect(decoded.req.transaction == null);
     try std.testing.expectEqual(@as(u64, 7), decoded.req.predicates[0].expected_version);
     try std.testing.expectEqual(@as([32]u8, @splat(11)), decoded.req.predicates[0].expected_content_digest.?);
+}
+
+test "time series document revision wire discriminates legacy replay and epoch admission" {
+    const a = std.testing.allocator;
+    var legacy = try parseInternalBatchRequest(a, "{\"inserts\":{},\"_timestamp_ns\":\"123\"}");
+    defer legacy.deinit(a);
+    try std.testing.expectEqual(db_mod.types.DocumentVersionScheme.legacy, legacy.req.document_version_scheme);
+    for ([_]db_mod.types.DocumentVersionScheme{.revision_v1}) |scheme| {
+        const bytes = try encodeBatchRequest(a, .{ .document_version_scheme = scheme, .timestamp_ns = 0, .writes = &.{.{ .key = "event", .value = "{}" }} });
+        defer a.free(bytes);
+        try std.testing.expect(std.mem.startsWith(u8, bytes, "[\"document-revisions-batch-v1\","));
+        try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, bytes));
+        var decoded = try parseInternalBatchRequest(a, bytes);
+        defer decoded.deinit(a);
+        try std.testing.expectEqual(scheme, decoded.req.document_version_scheme);
+        try std.testing.expectEqual(@as(u64, 0), decoded.req.timestamp_ns);
+    }
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, "{\"_timestamp_ns\":\"1\",\"_document_version_scheme\":1}"));
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, "[\"document-revisions-batch-v1\",{\"_document_version_scheme\":1}]"));
 }

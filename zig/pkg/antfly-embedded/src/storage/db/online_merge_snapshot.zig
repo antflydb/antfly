@@ -824,13 +824,13 @@ test "relational index system online snapshot locator resumes immutable rows and
                 \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"v":{"type":"string"}},"additionalProperties":false}}}}
             );
             if (!relational) try db.setSchema(.{ .version = 1, .ttl_field = "observed_at", .ttl_duration_ns = std.math.maxInt(u64) });
-            try server_test_adapter.applyOrdered(&db, .{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = large }, .{ .key = "b", .value = small_value } } }, .{ .term = 1, .index = 1 });
+            try server_test_adapter.applyOrdered(&db, .{ .document_version_scheme = .revision_v1, .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = large }, .{ .key = "b", .value = small_value } } }, .{ .term = 1, .index = 1 });
             const identity = try db.relationalTopologyIdentity();
             scope = .{ .fence = .{ .role = .merge_source, .transition_id = 77, .attempt = 1, .admission_epoch = identity.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
-            try server_test_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
+            try server_test_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope, .ttl_sources = !relational } } }, .{ .term = 1, .index = 2 });
             certificate = try db.prepareOnlineSourcePublication(scope, .none);
             try server_test_adapter.applyOrdered(&db, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
-            try server_test_adapter.applyOrdered(&db, .{ .timestamp_ns = 222, .writes = &.{.{ .key = "a", .value = "{\"v\":\"changed\"}" }} }, .{ .term = 1, .index = 4 });
+            try server_test_adapter.applyOrdered(&db, .{ .document_version_scheme = .revision_v1, .timestamp_ns = 222, .writes = &.{.{ .key = "a", .value = "{\"v\":\"changed\"}" }} }, .{ .term = 1, .index = 4 });
         }
         var db = try DB.open(alloc, path, options);
         defer db.close();

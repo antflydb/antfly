@@ -352,7 +352,7 @@ test "privacy base vector source updates replace accepted absence without credit
     var activate: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activate.publication_digest = activate.digest();
     try adapter.applyOrdered(&db, .{ .artifact_publication = activate }, .{ .term = 1, .index = 2 });
-    try adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":null,\"observed_at\":\"1969-12-31T23:59:59Z\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
+    try adapter.applyOrdered(&db, .{ .document_version_scheme = .revision_v1, .writes = &.{.{ .key = "doc", .value = "{\"body\":null,\"observed_at\":\"1969-12-31T23:59:59Z\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
     var pin = try db.core.index_manager.acquireWritePlanSnapshot();
     defer pin.release();
     var request = for (pin.plan().generated_templates) |template| {
@@ -376,7 +376,7 @@ test "privacy base vector source updates replace accepted absence without credit
         defer read.abort();
         try std.testing.expect(try before.accepted(&read));
     }
-    try adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\",\"observed_at\":\"1969-12-31T23:59:59Z\"}" }}, .timestamp_ns = 200 }, .{ .term = 1, .index = 5 });
+    try adapter.applyOrdered(&db, .{ .document_version_scheme = .revision_v1, .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\",\"observed_at\":\"1969-12-31T23:59:59Z\"}" }}, .timestamp_ns = 200 }, .{ .term = 1, .index = 5 });
     var current = blk: {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
