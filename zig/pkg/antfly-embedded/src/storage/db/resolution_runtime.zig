@@ -2612,15 +2612,20 @@ fn loadReresolveCursor(alloc: Allocator, store: *backend_erased.Store, key: []co
     return try alloc.dupe(u8, raw);
 }
 
+// §3.2a's "Catch-up progress" ride-along entry: as the ResolutionRuntime
+// doc comment below notes, crash recovery here is ordinary replay and the
+// stage is idempotent, so a reresolve cursor lost on crash just means a
+// larger (still correct) backfill window next time. Ride along instead of
+// paying a dedicated fsync.
 fn saveReresolveCursor(store: *backend_erased.Store, cursor_key: []const u8, value: []const u8) !void {
-    var txn = try store.beginWrite();
+    var txn = try store.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     try txn.put(cursor_key, value);
     try txn.commit();
 }
 
 fn clearReresolveCursor(store: *backend_erased.Store, key: []const u8) !void {
-    var txn = try store.beginWrite();
+    var txn = try store.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     txn.delete(key) catch |err| switch (err) {
         error.NotFound => {},
@@ -2882,8 +2887,11 @@ pub const ResolutionRuntime = struct {
         self.pending_replay_record = null;
     }
 
+    // Within-window preparation progress, same ride-along category as
+    // saveReresolveCursor above (§3.2a): lost on crash, replay restarts the
+    // window from applied_sequence and redoing it is idempotent.
     fn saveReplayProgress(self: *ResolutionRuntime, progress: ?ReplayProgress) !void {
-        var write = try self.store_handle.store.beginWrite();
+        var write = try self.store_handle.store.beginBatchWithOptions(.{ .durability = .ride_along });
         errdefer write.abort();
         if (progress) |value| {
             const raw = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
