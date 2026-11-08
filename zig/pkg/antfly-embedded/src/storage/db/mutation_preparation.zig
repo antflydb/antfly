@@ -284,7 +284,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             transform_snapshot: ?*const TransformReadSnapshot,
         ) !CoalescedKeyValueRequest(T) {
             const planner = @import("mutation_plan.zig");
-            if (transform_snapshot) |snapshot| return planner.prepare(alloc, writes, deletes, transforms, snapshot);
+            if (transform_snapshot) |snapshot| return @import("mutation_effects.zig").coalesceCapturedKeyValueRequest(alloc, T, writes, deletes, transforms, snapshot);
             if (transforms.len == 0) return planner.prepare(alloc, writes, deletes, transforms, &.{});
             for (writes) |write| if (write.json_null_fields.len != 0) return error.UnsupportedTransformOperation;
             // Recovery has no foreground lookup capability. A request-local

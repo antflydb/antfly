@@ -135,6 +135,12 @@ test "owned request coalescing refuses uncaptured bases instead of treating them
     var snapshot: TransformReadSnapshot = .{};
     defer snapshot.deinit(a);
     try std.testing.expectError(error.PreparedReadSetChanged, coalesceCapturedKeyValueRequest(a, types.BatchWrite, &.{}, &.{}, &.{.{ .key = "counter", .upsert = true, .operations = &.{.{ .op = .inc, .path = "n", .value_json = "1" }} }}, &snapshot));
+    snapshot.entries = try a.alloc(TransformReadSnapshot.Entry, 1);
+    snapshot.entries[0] = .{ .key = "counter", .value = null, .expected_version = 0 };
+    try snapshot.positions.put(a, "counter", 0);
+    var result = try coalesceCapturedKeyValueRequest(a, types.BatchWrite, &.{}, &.{}, &.{.{ .key = "counter", .upsert = true, .operations = &.{.{ .op = .inc, .path = "n", .value_json = "1" }} }}, &snapshot);
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings("{\"n\":1}", result.writes[0].value);
 }
 
 fn testOwnedRequestCoalescingAllocation(a: Allocator) !void {

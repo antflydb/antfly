@@ -129456,6 +129456,9 @@ test "owned transform inputs reject changed primary bodies with equal timestamps
     defer db.close();
     const effects = @import("mutation_effects.zig");
     const owned = @import("owned_transform_inputs.zig");
+    var uncaptured: effects.TransformReadSnapshot = .{};
+    defer uncaptured.deinit(a);
+    try std.testing.expectError(error.PreparedReadSetChanged, db.coalesceKeyValueRequest(a, types.BatchWrite, &.{}, &.{}, &.{.{ .key = "counter", .upsert = true, .operations = &.{.{ .op = .inc, .path = "n", .value_json = "1" }} }}, &uncaptured));
     var request = try effects.OwnedRequest.init(a, &.{}, &.{}, &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "n", .value_json = "1" }} }});
     defer request.deinit();
     const bases = try owned.requiredBaseKeys(a, &request);

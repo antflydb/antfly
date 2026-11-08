@@ -6351,7 +6351,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "mutation-resource-frame-tests",
         .root_module = db_test_mod,
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("mutation-resource-frame-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024),
-        .filters = &.{"prepared commit disposition"},
+        .filters = &.{ "prepared commit disposition", "owned request coalescing", "owned transform inputs", "db owned transform preparation" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("mutation-resource-frame-test", "Verify committed disposition, partial preparation cleanup and durable replay")
