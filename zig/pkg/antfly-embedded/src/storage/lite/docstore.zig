@@ -1733,6 +1733,16 @@ pub const Store = struct {
     // for `noteSafeRetirementWatermark` callers/tests that want to assert
     // on the last value the DB layer's catalog walk computed.
     known_safe_retirement_watermark: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    // WS5 (a): consumer-generic clamp hook -- see `DocStore`'s sibling
+    // field (`storage/docstore.zig`) for the full rationale: enrichment
+    // and resolution/promotion progress ride along now too, but their
+    // modules import `docstore.zig`, so neither `DocStore` nor this native
+    // `Store` can import them back without a cycle. The DB layer registers
+    // a callback here that reads those other consumer kinds fresh.
+    extra_consumer_progress_ctx: ?*anyopaque = null,
+    extra_consumer_progress_fn: ?ExtraConsumerProgressFn = null,
+
+    pub const ExtraConsumerProgressFn = *const fn (ctx: *anyopaque, alloc: Allocator) anyerror!u64;
 
     pub const MaintenancePhase = enum { assessment, copy, verification };
     pub const MaintenanceTestHook = struct {
@@ -3885,6 +3895,15 @@ pub const Store = struct {
         self.known_safe_retirement_watermark.store(min_consumer_progress, .release);
     }
 
+    /// WS5 (a): register (or clear, with `null`) the consumer-generic
+    /// clamp callback `serviceRetirement` additionally consults. See
+    /// `extra_consumer_progress_fn`'s doc comment. Idempotent and cheap;
+    /// safe to call on every retirement-adjacent pass, not just once.
+    pub fn setExtraConsumerProgressProvider(self: *Store, ctx: ?*anyopaque, fn_: ?ExtraConsumerProgressFn) void {
+        self.extra_consumer_progress_ctx = ctx;
+        self.extra_consumer_progress_fn = fn_;
+    }
+
     pub fn setJournalCreditPolicy(self: *Store, capacity_bytes: u64, progress_reserve_bytes: u64) void {
         self.journal_credit_capacity_bytes = capacity_bytes;
         self.journal_credit_progress_reserve_bytes = progress_reserve_bytes;
@@ -3921,7 +3940,10 @@ pub const Store = struct {
     pub fn serviceRetirement(self: *Store, is_owner: bool, budget: replay_chunks.RetirementBudget) !replay_chunks.RetirementStats {
         if (!is_owner) return error.RetirementRequiresOwner;
         const requested = self.retirement_queue.requested();
-        const safe_ceiling = try apply_state.minAppliedSequenceAcrossAllConsumers(self.allocator, self);
+        var safe_ceiling = try apply_state.minAppliedSequenceAcrossAllConsumers(self.allocator, self);
+        if (self.extra_consumer_progress_fn) |fn_| {
+            safe_ceiling = @min(safe_ceiling, try fn_(self.extra_consumer_progress_ctx.?, self.allocator));
+        }
         const target = replay_chunks.clampRetireTarget(requested, safe_ceiling);
         return try retireReplaySlice(self, "", false, target, budget, false);
     }
@@ -9209,6 +9231,130 @@ test "WS5 serviceRetirement retires every lane in exactly one native commit" {
     try std.testing.expectError(error.NotFound, read.get(&all_key));
     try std.testing.expectError(error.NotFound, read.get(&dense_key));
     try std.testing.expectError(error.NotFound, read.get(&full_text_key));
+}
+
+// WS5 (a) regression: reproduces the exact race this fix closes. A
+// `requestRetirement` caller (a foreground ack's own just-applied
+// sequence, or -- as here -- a raw journal-tail watermark, standing in for
+// `lite/crash_consistency_test.zig`'s `runRetirementTurn`) asks to retire
+// through sequence 3, but the consumer's own durably persisted progress-v2
+// record (written through the same path WS6 coalescing uses: a coalesced
+// in-memory advance can reach the executor before its persisted commit
+// does) is still only at 1. Before this fix, `serviceRetirement` trusted
+// the requested ceiling outright and deleted journal entries 2 and 3 --
+// entries the consumer never actually applied -- with nothing left to
+// redo them from on the next reopen (`CatchUpStats.shouldTryTargetAdvance`
+// then sees an empty scan and silently advances past the gap: search
+// returns 0 hits, no error). After this fix, `clampRetireTarget` caps the
+// physical delete at the consumer's actual progress, leaving 2 and 3 for
+// catch-up to replay once it reaches them.
+test "WS5 serviceRetirement clamps to durably-applied consumer progress, never the raw requested ceiling" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "ws5-clamp-durable-progress.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    store.maintenance_start_suppressed = true;
+    defer store.close();
+
+    inline for (.{ 1, 2, 3 }) |sequence| {
+        const payload = try change_journal_mod.encodeRecord(a, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{"doc"},
+            .target_hints = &.{.full_text},
+        });
+        defer a.free(payload);
+        try store.appendReplayOpaque(a, sequence, payload);
+    }
+
+    // The consumer's durable progress-v2 record: only sequence 1 has
+    // actually been applied, exactly the WS6-coalescing-lag scenario.
+    try apply_state.contributeProgress(a, &store, &.{
+        .{ .consumer = "body_text", .sequence = 1 },
+    }, &.{});
+
+    // An unsafe request: the raw journal tail, with no proof every
+    // consumer has reached it (what `runRetirementTurn`'s
+    // `lastReplaySequence(0)` does, and what a foreground ack's own
+    // just-applied sequence can also raise the watermark to).
+    store.requestRetirement(3);
+    const stats = try store.serviceRetirement(true, .{});
+    try std.testing.expect(!stats.no_op);
+    try std.testing.expectEqual(@as(u64, 1), stats.retired_through);
+
+    var read = try Txn.openReadWithPrefix(&store, "");
+    defer read.abort();
+    const retired_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    try std.testing.expectError(error.NotFound, read.get(&retired_key));
+    // Entries 2 and 3 -- not yet applied by "body_text" -- must survive.
+    inline for (.{ 2, 3 }) |sequence| {
+        const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+        const full_text_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), sequence);
+        _ = try read.get(&all_key);
+        _ = try read.get(&full_text_key);
+    }
+}
+
+// WS5 (a) consumer-generic coverage: the fresh progress-v2 scan above only
+// sees managed-index consumers. Enrichment and resolution/promotion
+// progress (perf/lwa-integration's ride-along bookkeeping conversion) live
+// under a different key format the native `Store` cannot decode without
+// importing back through `docstore.zig` (a cycle -- see
+// `extra_consumer_progress_fn`'s doc comment). This proves the registered
+// callback closes that gap: a stub standing in for the DB layer's real
+// enrichment/resolution walk reports a low watermark, and
+// `serviceRetirement` must honor it even though the progress-v2 scan alone
+// (no managed indexes here at all) would otherwise impose no constraint.
+test "WS5 serviceRetirement also clamps to a registered extra-consumer (enrichment/resolution) watermark" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "ws5-clamp-extra-consumer.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    store.maintenance_start_suppressed = true;
+    defer store.close();
+
+    inline for (.{ 1, 2 }) |sequence| {
+        const payload = try change_journal_mod.encodeRecord(a, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{"doc"},
+            .target_hints = &.{.enrichment},
+        });
+        defer a.free(payload);
+        try store.appendReplayOpaque(a, sequence, payload);
+    }
+
+    const Stub = struct {
+        fn minApplied(ctx_ptr: *anyopaque, alloc: Allocator) anyerror!u64 {
+            _ = alloc;
+            // Returns the same exclusive-bound unit `requestRetirement`/
+            // `minAppliedSequenceAcrossAllConsumers` use: enrichment has
+            // applied only sequence 1, so the safe ceiling is 2.
+            const watermark: *const u64 = @ptrCast(@alignCast(ctx_ptr));
+            return watermark.*;
+        }
+    };
+    const enrichment_safe_ceiling: u64 = 2;
+    store.setExtraConsumerProgressProvider(@constCast(&enrichment_safe_ceiling), Stub.minApplied);
+
+    // No managed-index progress-v2 record exists at all: the plain scan
+    // alone would report maxInt (unconstrained). Request retirement
+    // through both entries -- without the registered callback this would
+    // delete both; with it, enrichment's own un-replayed sequence 2 must
+    // survive.
+    store.requestRetirement(3);
+    const stats = try store.serviceRetirement(true, .{});
+    try std.testing.expect(!stats.no_op);
+    try std.testing.expectEqual(@as(u64, 1), stats.retired_through);
+
+    var read = try Txn.openReadWithPrefix(&store, "");
+    defer read.abort();
+    const retired_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    try std.testing.expectError(error.NotFound, read.get(&retired_key));
+    const surviving_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
+    _ = try read.get(&surviving_key);
 }
 
 test "WS5 serviceRetirement refuses a non-owner caller without changing any state" {

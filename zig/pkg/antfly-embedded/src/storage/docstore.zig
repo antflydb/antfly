@@ -594,6 +594,22 @@ pub const DocStore = struct {
     // for `noteSafeRetirementWatermark` callers/tests that want to assert
     // on the last value the DB layer's catalog walk computed.
     known_safe_retirement_watermark: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    // WS5 (a): consumer-generic clamp hook. `apply_state.
+    // minAppliedSequenceAcrossAllConsumers` only covers managed-index
+    // progress-v2 records; enrichment (`enrichment/enrichment_state.zig`)
+    // and resolution/promotion (`resolution_runtime.zig`) now also ride
+    // along (per perf/lwa-integration) but keep their own, differently-
+    // keyed progress records and import this very file, so `DocStore`
+    // cannot import them back without a cycle. The DB layer registers a
+    // callback here (`setExtraConsumerProgressProvider`) that reads those
+    // other kinds fresh and returns their minimum applied sequence;
+    // `serviceRetirement` clamps against it too, alongside the progress-v2
+    // scan. `null` (no DB-layer registration yet, or a native-only caller
+    // with no such consumers) contributes no additional constraint.
+    extra_consumer_progress_ctx: ?*anyopaque = null,
+    extra_consumer_progress_fn: ?ExtraConsumerProgressFn = null,
+
+    pub const ExtraConsumerProgressFn = *const fn (ctx: *anyopaque, alloc: Allocator) anyerror!u64;
 
     const replay_index_unknown: u8 = 0;
     const replay_index_missing: u8 = 1;
@@ -3284,6 +3300,16 @@ pub const DocStore = struct {
         self.known_safe_retirement_watermark.store(min_consumer_progress, .release);
     }
 
+    /// WS5 (a): register (or clear, with `null`) the consumer-generic
+    /// clamp callback `serviceRetirement` additionally consults. See
+    /// `extra_consumer_progress_fn`'s doc comment. Idempotent and cheap
+    /// (two pointer stores); safe to call on every retirement-adjacent
+    /// pass, not just once at open.
+    pub fn setExtraConsumerProgressProvider(self: *DocStore, ctx: ?*anyopaque, fn_: ?ExtraConsumerProgressFn) void {
+        self.extra_consumer_progress_ctx = ctx;
+        self.extra_consumer_progress_fn = fn_;
+    }
+
     pub fn setJournalCreditPolicy(self: *DocStore, capacity_bytes: u64, progress_reserve_bytes: u64) void {
         self.journal_credit_capacity_bytes = capacity_bytes;
         self.journal_credit_progress_reserve_bytes = progress_reserve_bytes;
@@ -3301,14 +3327,19 @@ pub const DocStore = struct {
     /// are never required to prove it is safe. Per `clampRetireTarget`'s doc
     /// comment, the owner must independently clamp to whatever every
     /// registered consumer has actually applied before physically deleting
-    /// anything: `apply_state.minAppliedSequenceAcrossAllConsumers` is that
-    /// clamp, read fresh every call. Its default (`maxInt(u64)`, "no
-    /// constraint observed") preserves the historical unclamped behavior
-    /// for a store with no managed consumers.
+    /// anything: `apply_state.minAppliedSequenceAcrossAllConsumers` (managed
+    /// indexes) and `extra_consumer_progress_fn` (every other journal
+    /// consumer kind: enrichments, resolvers/promotions, and anything else
+    /// the DB layer registers) are that clamp, both read fresh every call.
+    /// Their defaults (`maxInt(u64)`/no registration) preserve the
+    /// historical unclamped behavior for a store with no such consumers.
     pub fn serviceRetirement(self: *DocStore, alloc: Allocator, is_owner: bool, budget: replay_chunks.RetirementBudget) !replay_chunks.RetirementStats {
         if (!is_owner) return error.RetirementRequiresOwner;
         const requested = self.retirement_queue.requested();
-        const safe_ceiling = try apply_state.minAppliedSequenceAcrossAllConsumers(alloc, self);
+        var safe_ceiling = try apply_state.minAppliedSequenceAcrossAllConsumers(alloc, self);
+        if (self.extra_consumer_progress_fn) |fn_| {
+            safe_ceiling = @min(safe_ceiling, try fn_(self.extra_consumer_progress_ctx.?, alloc));
+        }
         return try self.retireReplaySlice(alloc, replay_chunks.clampRetireTarget(requested, safe_ceiling), budget);
     }
 

@@ -449,6 +449,18 @@ pub fn loadAppliedSequence(alloc: Allocator, store: anytype, index_name: []const
 /// registry (WS7's job, not yet built) because every consumer's identity
 /// lives in the key it already writes under this one shared prefix.
 ///
+/// Returns an *exclusive* upper bound, in the same unit `requestRetirement`/
+/// `retireReplaySlice`'s `up_to_sequence` already uses (confirmed against
+/// `Store`'s own "WS5 serviceRetirement retires every lane in exactly one
+/// native commit" test: one journal entry at sequence 1, `requestRetirement(2)`,
+/// retires exactly that entry -- i.e. `up_to_sequence` deletes sequences
+/// strictly less than itself). A consumer whose `applied_sequence` is `N`
+/// has durably consumed entries `1..N` inclusive, so the safe exclusive
+/// ceiling this returns is `N + 1`, not `N` itself: returning `N` would
+/// never retire that consumer's own last-applied entry (overly
+/// conservative, not unsafe, but not what "durably applied through N"
+/// means here).
+///
 /// Returns `maxInt(u64)` ("no constraint observed") when no progress-v2
 /// record exists yet at all, matching `known_safe_retirement_watermark`'s
 /// default and preserving unclamped behavior for a store with no managed
@@ -483,7 +495,8 @@ pub fn minAppliedSequenceAcrossAllConsumers(alloc: Allocator, store: anytype) !u
         };
         min_applied = @min(min_applied, record.applied_sequence);
     }
-    return min_applied;
+    if (min_applied == std.math.maxInt(u64)) return min_applied;
+    return min_applied + 1;
 }
 
 pub fn loadProjectionCheckpoint(alloc: Allocator, store: anytype, index_name: []const u8) !ProjectionCheckpoint {
