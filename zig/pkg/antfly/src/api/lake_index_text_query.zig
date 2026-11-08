@@ -1374,9 +1374,7 @@ const Execution = struct {
             var result = @import("lake_index_physical_set.zig").Set.init(a);
             errdefer result.deinit();
             for (image.parts) |part| if (part) |held| {
-                var selected = try buildOverlayPhysicalFilter(raw, a, held.key_filter);
-                defer selected.deinit();
-                try result.orWith(&selected);
+                try self.addOverlayPhysicalFilter(&result, held.key_filter);
             };
             return result;
         }
@@ -1384,10 +1382,24 @@ const Execution = struct {
     }
     fn buildOverlayPhysicalFilter(raw: *anyopaque, a: A, filter: []const u8) anyerror!@import("lake_index_physical_set.zig").Set {
         const self: *Execution = @ptrCast(@alignCast(raw));
-        const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
-        const excluded = (try resolver.resolve(a, filter)) orelse return error.UnsupportedQueryRequest;
-        if (!excluded.exact) return error.UnsupportedQueryRequest;
-        return excluded.bitmap;
+        var result = @import("lake_index_physical_set.zig").Set.init(a);
+        errdefer result.deinit();
+        try self.addOverlayPhysicalFilter(&result, filter);
+        return result;
+    }
+    const OverlayPhysicalFilter = struct {
+        execution: *Execution,
+        filter: []const u8,
+        fn resolve(input: @This(), a: A) !@import("lake_index_physical_set.zig").Set {
+            const self = input.execution;
+            const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+            const excluded = (try resolver.resolve(a, input.filter)) orelse return error.UnsupportedQueryRequest;
+            if (!excluded.exact) return error.UnsupportedQueryRequest;
+            return excluded.bitmap;
+        }
+    };
+    fn addOverlayPhysicalFilter(self: *Execution, target: *@import("lake_index_physical_set.zig").Set, filter: []const u8) !void {
+        try target.unionFromScratch(OverlayPhysicalFilter{ .execution = self, .filter = filter }, OverlayPhysicalFilter.resolve);
     }
     fn resolveOverlayPhysical(self: *Execution) !void {
         const overlay = self.overlay orelse return;

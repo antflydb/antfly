@@ -73,6 +73,7 @@ test {
     _ = @import("api/lake_index_repairs.zig");
     _ = @import("api/lake_index_navigation_warming.zig");
     _ = @import("api/lake_index_readiness.zig");
+    _ = @import("api/lake_index_physical_set.zig");
     _ = @import("api/lake_row_identity_reader.zig");
     _ = @import("api/lake_row_identity.zig");
     _ = @import("api/lake_row_fragments.zig");
