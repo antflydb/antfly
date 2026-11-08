@@ -7,8 +7,9 @@ it does not introduce another model scheduler or change durable replay order.
 
 ## Bounded cross-document preparation
 
-A generated replay pass can retain the joined current document and one future
-root PDF. The future task downloads at most 16 MiB, verifies the configured
+A generated replay pass can retain the current document and one future root PDF.
+It refills the lookahead before joining the current task, including across a run
+of one-page PDFs, while ordered publication remains on the foreground worker. The future task downloads at most 16 MiB, verifies the configured
 checksum, borrows the shared prepared-source cache, inspects at most eight
 physical pages, and renders the first pending OCR page. Born-digital pages do
 not trigger speculative OCR. Existing manifests, privacy-managed artifacts, causal graph/prior-context inputs and derived/template inputs
@@ -25,8 +26,16 @@ completion credit, artifacts or replay advancement.
 
 All workers join before source-cache destruction or ownership transfer. Cancellation
 combines the lifecycle, visibility guard and producer cancellation. PDF/render and
-provider allocations use existing resource admission. A ready retained render
-window is reclaimable before foreground memory admission. The future task never
+provider allocations use existing resource admission. Speculative discovery and
+execution require cooperative deadline/cancellation hooks and the same synchronized
+provider circuit checks as foreground work. Legacy callbacks run only through
+the ordinary replay path. Actual execution bytes (including metadata and raster
+bytes) and pixels are checked against the narrowed policy before dispatch.
+
+Ready optional state is reclaimable before foreground memory admission, including
+selected text, rendered pages and source/PDF pins. Reclaim callbacks never wait on
+cache locks or worker joins. Transferred windows and units being copied are
+protected until their owner releases them. The future task never
 mutates the scanner's active request identity or progress state.
 
 Set `ANTFLY_ENRICHMENT_DOCUMENT_PREFETCH=false` on data nodes to disable this
@@ -40,8 +49,12 @@ optimization does not fetch through a staging bucket or copy remote sources.
 `vision_prepare`, `vision`, `prefill`, `decode`, `mixed_step`, `publication`, and
 `prefetch_wait`. These measure inclusive monotonic wall time, including failed
 attempts. They overlap; summing them does not produce exclusive CPU or GPU time.
-`reader_http` includes response decoding. Scheduled generation steps are timed
-at actual dispatch rather than around broker wait time. GPU utilization and
+`reader_http` includes response decoding. Direct and scheduled generation work is timed at dispatch after coordinator
+waits; merely having a coordinator no longer suppresses singleton timings.
+Prepared multimodal and eligible pending-token paths are included. A declined
+direct fast path and its fallback share a single decode-step sample, without
+including a subsequent coordinator wait. Counts describe execution scopes, not
+generated-token counts. GPU utilization and
 memory must still be sampled separately.
 
 `antfly_document_prefetch_events_total` distinguishes started, ready, failed,
@@ -54,7 +67,8 @@ buffer destruction contracts.
 ## Reproduction and limits
 
 Run the native PDF orchestration smoke (real PDF parser/rendering, deterministic
-fake reader with a pinned revision):
+fake reader with a pinned revision, four independent one-page PDFs, exact-once
+first-page reuse, DPI provenance and no speculative publication):
 
 ```sh
 cd zig

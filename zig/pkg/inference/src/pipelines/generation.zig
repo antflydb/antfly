@@ -7456,8 +7456,6 @@ pub const NativeGenerationPipeline = struct {
         allow_resident_greedy_token: bool,
         capture_last_hidden: bool,
     ) !PrefillOutput {
-        const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
-        defer if (self.scheduler == null) phase_timer.finish();
         const allocator = self.allocator;
         // Private opt-in qualification only. Preserve admitted chunk shapes,
         // scheduler turns and the original final-logit projection.
@@ -7601,6 +7599,8 @@ pub const NativeGenerationPipeline = struct {
                     return err;
                 };
                 const is_last_chunk = chunk_end == prompt_ids.len;
+                const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
+                defer phase_timer.finish();
                 var output = (graph_mod.execution.graphForwardCompiledModelOutput(
                     self,
                     self.graph_cache.?,
@@ -7815,6 +7815,8 @@ pub const NativeGenerationPipeline = struct {
                 );
                 var execution_scope = if (direct_execution_mutex) |mutex| try self.lockExecution(mutex) else null;
                 defer if (execution_scope) |*scope| scope.deinit();
+                const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
+                defer phase_timer.finish();
                 var exact_scope: if (build_options.enable_cuda) ?cuda_compute.CudaCompute.AttentionMatchRepeatScope else ?void = null;
                 if (comptime build_options.enable_cuda) {
                     if (exact_prefill_probe and chunk.len > 1) {
@@ -8097,6 +8099,8 @@ pub const NativeGenerationPipeline = struct {
         const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
         var execution_scope = if (direct_execution_mutex) |mutex| try self.lockExecution(mutex) else null;
         defer if (execution_scope) |*scope| scope.deinit();
+        const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
+        defer phase_timer.finish();
         prepared.input_embeddings = null;
         const input_embeddings = try self.cb.ensureDeviceResidentOwned(host_embeddings);
         var owns_input_embeddings = true;
@@ -8631,8 +8635,6 @@ pub const NativeGenerationPipeline = struct {
         on_token_ctx: ?*anyopaque,
         emitted_text: ?*StreamingTextState,
     ) !DecodeResult {
-        const phase_timer = @import("antfly_readers").pipeline_metrics.start(.decode);
-        defer if (self.scheduler == null) phase_timer.finish();
         const allocator = self.allocator;
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         var tokens_generated = initial_tokens_generated;
@@ -8666,6 +8668,11 @@ pub const NativeGenerationPipeline = struct {
         }
 
         while (tokens_generated < max_tokens) {
+            // One direct-step sample includes a declined device fast path and
+            // its fallback, excluding scheduler waits and scheduled dispatch.
+            var direct_ns: u64 = 0;
+            var direct_attempted = false;
+            defer if (direct_attempted) @import("antfly_readers").pipeline_metrics.observe(.decode, direct_ns);
             if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated), @intCast(max_tokens));
             if (tokens_generated > 0 and self.executor_sequence_control != null and
                 self.gpt_config.hasQwen35VisionArchitectureContract() and (self.cb.kind() == .metal or self.cb.kind() == .cuda) and
@@ -8755,6 +8762,9 @@ pub const NativeGenerationPipeline = struct {
                         }
                         var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
                         defer if (execution_scope) |*scope| scope.deinit();
+                        const phase_timer = @import("antfly_readers").pipeline_metrics.start(.decode);
+                        direct_attempted = true;
+                        defer direct_ns +|= platform.time.monotonicNs() -| phase_timer.started_ns;
                         break :direct_token_blk try self.forwardGreedyDeviceDecodeToken(
                             token_ids,
                             seq_len.*,
@@ -8810,6 +8820,9 @@ pub const NativeGenerationPipeline = struct {
                         }
                     }
 
+                    const phase_timer = @import("antfly_readers").pipeline_metrics.start(.decode);
+                    direct_attempted = true;
+                    defer direct_ns +|= platform.time.monotonicNs() -| phase_timer.started_ns;
                     self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
                     const query_seq_len = if (decode_runtime.kvView() != null and (tokens_generated > 0 or prefill_last_logits.* == null)) 1 else seq_len.*;
                     const decode_context = decode_runtime.makeDecodeContext(seq_len.*, query_seq_len);
@@ -9103,6 +9116,8 @@ pub const NativeGenerationPipeline = struct {
         const allocator = self.allocator;
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         if (decode_runtime.kvView() == null) return null;
+        const phase_timer = @import("antfly_readers").pipeline_metrics.start(.decode);
+        defer phase_timer.finish();
 
         var tokens_generated: usize = 0;
         var finish_reason: []const u8 = "length";
@@ -21057,4 +21072,42 @@ test "model selection request projector fallback cannot reopen a replacement pub
     try std.testing.expectError(error.ModelArtifactsChanging, pipeline.openRequestProjector(a, path));
     pipeline.projector_store_error = error.Cancelled;
     try std.testing.expectError(error.Cancelled, pipeline.openRequestProjector(a, path));
+}
+
+test "execution batch phase metrics include coordinator backed direct prefill and decode fallback once" {
+    const a = std.testing.allocator;
+    const metrics = @import("antfly_readers").pipeline_metrics;
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(a);
+    defer model.deinit(a);
+    try model.putWeight(a, "model.norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
+    try model.putWeight(a, "model.embed_tokens.weight", &.{ 2, 4 }, &.{ 0, 0, 0, 0, 1, 2, 3, 4 });
+    try model.putWeight(a, "lm_head.weight", &.{ 2, 4 }, &.{ 1, 0, 0, 0, 0, 1, 0, 0 });
+    var scheduler = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a);
+    defer scheduler.deinit();
+    var pipeline = model.pipeline(a, .{ .family = .llama, .hidden_size = 4, .vocab_size = 2, .num_hidden_layers = 0, .position_encoding = .rope });
+    pipeline.scheduler = &scheduler;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4 });
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer state.deinit();
+    const before = metrics.snapshot();
+    const prefill = try pipeline.executePrefill(&.{ 1, 1 }, 2, 0, &state, .{ .max_tokens = 1 }, false, false);
+    defer if (prefill.last_logits) |v| a.free(v);
+    const after_prefill = metrics.snapshot();
+    try std.testing.expectEqual(before.counts[@backingInt(metrics.Phase.prefill)] + 1, after_prefill.counts[@backingInt(metrics.Phase.prefill)]);
+    try std.testing.expect(after_prefill.totals_ns[@backingInt(metrics.Phase.prefill)] > before.totals_ns[@backingInt(metrics.Phase.prefill)]);
+    var tokens = [_]i64{ 1, 1, 0 };
+    var len: usize = 2;
+    var no_logits: ?[]f32 = null;
+    var no_greedy: ?usize = null;
+    var grammar: ?grammar_mod.JsonGrammar = null;
+    var penalties = SamplingPenaltyState.init(false);
+    defer penalties.deinit(a);
+    const result = try pipeline.standardDecode(&tokens, &len, &state, .{ .max_tokens = 1, .ignore_eos = true }, &no_logits, &no_greedy, &penalties, null, &grammar, null, 0, 1, 2, null, null, null);
+    try std.testing.expectEqual(@as(usize, 1), result.tokens_generated);
+    const after = metrics.snapshot();
+    try std.testing.expectEqual(after_prefill.counts[@backingInt(metrics.Phase.decode)] + 1, after.counts[@backingInt(metrics.Phase.decode)]);
+    try std.testing.expect(after.totals_ns[@backingInt(metrics.Phase.decode)] > after_prefill.totals_ns[@backingInt(metrics.Phase.decode)]);
 }
