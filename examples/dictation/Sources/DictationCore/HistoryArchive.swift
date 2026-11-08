@@ -38,24 +38,25 @@ public actor HistoryArchive {
     try FileManager.default.moveItem(at: directory, to: retired)
     try FileManager.default.removeItem(at: retired)
   }
-  private var revision: UInt64 = 0
-  private var requestedRevision: UInt64 = 0
+  private var committedRevision: UInt64?
   private let beforeWrite: @Sendable () async throws -> Void
   public init(file: URL, beforeWrite: @escaping @Sendable () async throws -> Void = {}) {
     self.file = file
     self.beforeWrite = beforeWrite
   }
   public func store(_ entries: [HistoryEntry], revision next: UInt64) async throws {
-    guard next > revision, next >= requestedRevision else { return }
-    requestedRevision = next
+    if let committedRevision, next <= committedRevision { return }
     try await beforeWrite()
-    guard next == requestedRevision else { return }
+    // A request is not a commit. A failed newer writer must never suppress
+    // an older durable cleanup. Returning successfully guarantees that this
+    // revision (or a newer one) really reached disk.
+    if let committedRevision, next <= committedRevision { return }
     let data = try JSONEncoder().encode(Self.bounded(entries))
     guard data.count <= Self.maxBytes else {
       throw DictationError.invalid("History archive exceeds its byte limit.")
     }
     try data.write(to: file, options: .atomic)
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
-    revision = next
+    committedRevision = next
   }
 }
