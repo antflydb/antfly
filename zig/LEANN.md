@@ -560,29 +560,28 @@ Three modes:
 
 ## Remaining work
 
-1. **Transient storage follow-ups.** Include `leann.store` in backups so
-   restores need not re-embed. (Done: the request's cancellation is checked
-   before every re-embed batch; `leann.reembed_budget_ms` bounds the time a
-   query spends re-embedding, after which `bounds` mode ranks the remaining
-   candidates by estimate; a 32 MiB `IndexManager.leann_reembed_cache`
-   keyed by index incarnation, key and stub digest serves hot candidates.) For
-   media-derived vectors, which `auto` keeps at full precision, an int8
-   stored copy would cut them about 4x without query-time embedding.
-2. **Splits.** Supported: when a split narrows a shard, every LEANN key
-   outside the new range is dropped (`IndexManager.updateRange` →
+1. **Native backups of replicated LEANN.** Local `leann.store` files are
+   pinned with native checkpoints, and stores persist through the dense
+   storage provider (Lite, remote dense storage). Replicated `leann.replica`
+   state carries the source group's Raft positions, so it still uses the
+   logical path until restore resets that domain.
+2. **Split follow-ups.** Splits work: when a split narrows a shard, every
+   LEANN key outside the new range is dropped (`IndexManager.updateRange` →
    `LeannStore.dropKeysWhere`; replicated stores mark them and the leader
    deletes them through the log), and the child indexes its documents
-   itself. Follow-ups: a bulk first build for large children (today the
+   itself. Still open: a bulk first build for large children (today the
    child buffers to `build_threshold`, then plans per-key deltas) and a
    production-cluster VOPR that checks replica graph equality across a
    split.
-3. **Remote storage and native backups.** Store `leann.store` through the
-   dense storage abstraction and include it in native checkpoints.
-4. **Leader replication follow-ups.** See
-   [Leader replication](#leader-replication): splits, a cluster VOPR, and
-   CI verification of the data runtime pieces.
-5. **E2E coverage.** Add a Python e2e test that creates an
-   `algorithm: "leann"` index over HTTP and queries it.
+3. **Leader replication follow-ups.** CI verification of the data runtime
+   pieces (see [Leader replication](#leader-replication)).
+
+Done since the first version: filter-aware traversal (`SearchOptions.filter`),
+a per-query re-embedding budget and cancellation (`leann.reembed_budget_ms`,
+`SearchOptions.gate`), a 32 MiB re-embed cache keyed by index incarnation,
+key and stub digest, `vector_storage: auto`, int8 copies for media vectors
+(`leann.media_vectors: int8`), and a Python e2e test
+(`test_leann_index_returns_exact_nearest_first`).
 
 ## Leader replication
 

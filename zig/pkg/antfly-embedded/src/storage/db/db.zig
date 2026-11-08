@@ -132423,6 +132423,61 @@ test "db native snapshot exports self-contained generation" {
     try std.testing.expectEqual(@as(u32, 1), parsed_manifest.value.primary.artifact_version);
 }
 
+test "db native snapshot pins a local leann graph file" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
+    defer runtime.deinit();
+    var db = try DB.open(alloc, std.mem.span(path), .{ .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "leann_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":4,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"leann_idx\",\"algorithm\":\"leann\",\"leann\":{\"max_degree\":8}}",
+    });
+    // Past the default graph build threshold, so the graph file exists.
+    const n = 300;
+    var writes: [n]types.BatchWrite = undefined;
+    var keys: [n][]u8 = undefined;
+    var values: [n][]u8 = undefined;
+    for (0..n) |i| {
+        keys[i] = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i});
+        const c: f32 = @floatFromInt(i % 4);
+        values[i] = try std.fmt.allocPrint(alloc, "{{\"_embeddings\":{{\"leann_idx\":[{d},{d},{d},{d}]}}}}", .{ c, c + 0.01 * @as(f32, @floatFromInt(i)), 1.0, @as(f32, @floatFromInt(i % 7)) });
+        writes[i] = .{ .key = keys[i], .value = values[i] };
+    }
+    defer for (keys, values) |k, v| {
+        alloc.free(k);
+        alloc.free(v);
+    };
+    try db.batch(.{ .writes = &writes, .sync_level = .full_index });
+
+    // A table with a LEANN index used to fail native snapshots outright.
+    _ = try db.snapshotNative("leann");
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(path)})) |snapshots| {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
+        } else |_| {}
+    }
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/leann/{s}", .{ std.mem.span(path), native_backup.manifest_file_name });
+    defer alloc.free(manifest_path);
+    const manifest_raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), manifest_path, alloc, .limited(16 * 1024 * 1024));
+    defer alloc.free(manifest_raw);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_raw, "indexes/leann_idx/leann.store") != null);
+}
+
 test "db native snapshot rejects storage without atomic host generation publication" {
     @import("antfly_test_error_logs").expectErrorLogs(1);
 
