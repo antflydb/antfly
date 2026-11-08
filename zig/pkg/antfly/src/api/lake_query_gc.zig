@@ -171,17 +171,22 @@ fn scopeDomain(a: A, store: *Store, table: u64, category: usize) ![32]u8 {
 }
 
 /// Remove only completed, unretained checkpoints before consuming the store's
-/// durable ownership witness. A short budget resumes this idempotent cleanup
-/// next turn; a concurrently advanced checkpoint retains ownership instead.
-pub fn retireCompleted(a: A, store: *Store, table: u64, proofs: *const CompletionProofs, progressed: *bool, budget: *Budget) !void {
+/// durable ownership witness. Unknown categories stay retained while proven
+/// categories drain independently. True means every category was validated in
+/// this turn; a changed checkpoint or exhausted budget never permits release.
+pub fn retireCompleted(a: A, store: *Store, table: u64, proofs: *const CompletionProofs, progressed: *bool, budget: *Budget) !bool {
     if (!proofs.matches(store.identity, table, budget.retire_after_ms)) return error.QueryGcRetainedProgress;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
     var client = store.opened.client;
+    var complete = true;
     for (proofs.slots, 0..) |proof, category| {
         const revision = switch (proof) {
-            .unknown => return error.QueryGcRetainedProgress,
+            .unknown => {
+                complete = false;
+                continue;
+            },
             .absent => continue,
             .revision => |value| value,
         };
@@ -198,6 +203,7 @@ pub fn retireCompleted(a: A, store: *Store, table: u64, proofs: *const Completio
         };
         progressed.* = true;
     }
+    return complete;
 }
 
 const ScopeProgress = struct {
@@ -293,7 +299,7 @@ fn collectScopes(a: A, store: *Store, table: u64, domain: [32]u8, now: u64, budg
     const scratch = arena.allocator();
     const key = try std.fmt.allocPrint(scratch, "{s}{s}expiring-gc/{d}/scope-{s}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", table, std.fmt.bytesToHex(&domain, .lower) });
     var client = store.opened.client;
-    var previous = readObject(client, store.opened.bucket, key, 16384, budget) catch |err| switch (err) {
+    var previous = readCheckpoint(client, store.opened.bucket, key, budget) catch |err| switch (err) {
         error.FileNotFound, error.NotFound, error.ObjectNotFound => null,
         else => return err,
     };
@@ -337,6 +343,16 @@ fn collectScopes(a: A, store: *Store, table: u64, domain: [32]u8, now: u64, budg
 }
 pub const RecordProgress = struct { version: u16 = 2, cursor: ?[]const u8 = null, after_key: ?[]const u8 = null, retained: bool = false, resume_after_ms: ?u64 = null, sweep_started_ms: ?u64 = null };
 const Progress = RecordProgress;
+fn readCheckpoint(source: anytype, bucket: []const u8, key: []const u8, budget: *Budget) !@import("objectstore").GetResult {
+    const limit = 16384;
+    const available = budget.reads;
+    return readObject(source, bucket, key, limit, budget) catch |err| {
+        // A small remainder is ordinary turn exhaustion, not a malformed
+        // category. Hard format-limit violations retain their error signal.
+        if (err == error.ResponseTooLarge and available < limit) return error.QueryGcBudgetExhausted;
+        return err;
+    };
+}
 fn readObject(source: anytype, bucket: []const u8, key: []const u8, limit: usize, budget: *Budget) !@import("objectstore").GetResult {
     var client = source;
     try budget.check();
@@ -367,7 +383,7 @@ pub fn collectRecords(a: A, store: *Store, table: u64, kind: []const u8, now: u6
     defer a.free(prefix);
     const checkpoint = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/{d}/{s}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", table, kind });
     defer a.free(checkpoint);
-    var previous = readObject(client, store.opened.bucket, checkpoint, 16384, budget) catch |err| switch (err) {
+    var previous = readCheckpoint(client, store.opened.bucket, checkpoint, budget) catch |err| switch (err) {
         error.FileNotFound, error.NotFound, error.ObjectNotFound => null,
         else => return err,
     };
@@ -698,10 +714,11 @@ test "external lake query cleanup completed categories rest durably while neighb
         const result = collect(a, &store, 7, 0, 231001, &budget);
         try std.testing.expect(!result.more and !result.retained and !result.failed);
         var retirement_progress = false;
-        retireCompleted(a, &store, 7, &proofs, &retirement_progress, &budget) catch |err| {
+        const complete = retireCompleted(a, &store, 7, &proofs, &retirement_progress, &budget) catch |err| {
             if (err != error.QueryGcBudgetExhausted) return err;
             continue;
         };
+        if (!complete) continue;
         retired = true;
         break;
     }
@@ -929,7 +946,7 @@ test "external lake query cleanup retirement reuses read proofs and fences concu
     const final = collect(a, &store, 7, 0, now + 30002, &next);
     try std.testing.expect(!final.more and !final.retained and !final.failed);
     const before = next.reads;
-    try retireCompleted(a, &store, 7, &proofs, &retirement_progress, &next);
+    try std.testing.expect(try retireCompleted(a, &store, 7, &proofs, &retirement_progress, &next));
     try std.testing.expectEqual(before, next.reads);
     try std.testing.expectEqual(@as(usize, 123), next.deletes);
 }
@@ -977,4 +994,129 @@ test "external lake query cleanup retirement restarts sweeps admitted before the
     const remaining: ?[]u8 = target.getAlloc(late.artifact_id) catch null;
     defer if (remaining) |bytes| a.free(bytes);
     try std.testing.expect(remaining == null);
+}
+
+test "external lake query cleanup retires individually readable checkpoints across short reopened turns" {
+    const a = std.testing.allocator;
+    for ([_]u64{ 128, 256 }) |read_limit| {
+        var directory = try local.common_test_directory.TestDirectory.init("partial-retirement-budget");
+        defer directory.cleanup();
+        var config = try local.common_config.Config.parseFromSlice(a, "{}");
+        defer config.deinit();
+        const now = clock.realtimeNs() / std.time.ns_per_ms;
+        {
+            var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+            defer store.deinit();
+            var budget: Budget = .{ .deletes = 128, .reads = 16384, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s };
+            const result = collect(a, &store, 7, 0, now, &budget);
+            try std.testing.expect(!result.more and !result.failed and !result.retained);
+            const prefix = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/7/", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/" });
+            defer a.free(prefix);
+            var markers = try store.opened.client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 16 });
+            defer markers.deinit(store.opened.client.allocator);
+            try std.testing.expectEqual(@as(usize, 5), markers.entries.len);
+            var total: usize = 0;
+            for (markers.entries) |entry| {
+                var marker = try store.opened.client.getObject(store.opened.bucket, entry.key, .{ .max_response_bytes = read_limit });
+                defer marker.deinit(store.opened.client.allocator);
+                total += marker.body.len;
+            }
+            try std.testing.expect(total > read_limit);
+        }
+        var retired = false;
+        var deleted: usize = 0;
+        for (0..10) |turn| {
+            var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+            defer store.deinit();
+            var proofs = CompletionProofs.init(a);
+            defer proofs.deinit();
+            var budget: Budget = .{ .deletes = 1, .reads = read_limit, .work = 1, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s, .retire_after_ms = now - 1, .proofs = &proofs };
+            const result = collect(a, &store, 7, @intCast(turn % 5), now + @as(u64, @intCast(turn)) * 30001 + 1, &budget);
+            try std.testing.expect(!result.failed and !result.retained);
+            var progress = false;
+            const complete = retireCompleted(a, &store, 7, &proofs, &progress, &budget) catch |err| exhausted: {
+                if (err != error.QueryGcBudgetExhausted) return err;
+                break :exhausted false;
+            };
+            try std.testing.expect(progress);
+            deleted += 1 - budget.deletes;
+            if (complete) {
+                try std.testing.expect(!result.more);
+                retired = true;
+                break;
+            }
+        }
+        try std.testing.expect(retired);
+        try std.testing.expectEqual(@as(usize, 5), deleted);
+    }
+}
+
+test "external lake query cleanup partial retirement preserves held categories" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("partial-retirement-held");
+    defer directory.cleanup();
+    var config = try local.common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+    defer store.deinit();
+    const now = clock.realtimeNs() / std.time.ns_per_ms;
+    const job = try std.fmt.allocPrint(a, "{s}{s}recent-search/7/held.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/" });
+    defer a.free(job);
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .expires_ms = now + 60000 }, .{});
+    defer a.free(bytes);
+    var saved = try store.opened.client.putObject(store.opened.bucket, job, bytes, .{});
+    saved.deinit(store.opened.client.allocator);
+    var seed: Budget = .{ .deletes = 128, .reads = 16384, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s };
+    const seeded = collect(a, &store, 7, 0, now, &seed);
+    try std.testing.expect(seeded.retained and !seeded.more and !seeded.failed);
+    for (0..10) |turn| {
+        var proofs = CompletionProofs.init(a);
+        defer proofs.deinit();
+        var budget: Budget = .{ .deletes = 1, .reads = 256, .work = 1, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s, .retire_after_ms = now - 1, .proofs = &proofs };
+        _ = collect(a, &store, 7, @intCast(turn % 5), now + 1, &budget);
+        var progress = false;
+        const complete = retireCompleted(a, &store, 7, &proofs, &progress, &budget) catch |err| exhausted: {
+            if (err != error.QueryGcBudgetExhausted) return err;
+            break :exhausted false;
+        };
+        try std.testing.expect(!complete);
+    }
+    const prefix = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/7/", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/" });
+    defer a.free(prefix);
+    var markers = try store.opened.client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 16 });
+    defer markers.deinit(store.opened.client.allocator);
+    try std.testing.expectEqual(@as(usize, 1), markers.entries.len);
+    try std.testing.expect(std.mem.endsWith(u8, markers.entries[0].key, "/recent-search.json"));
+    var held = try store.opened.client.getObject(store.opened.bucket, job, .{});
+    defer held.deinit(store.opened.client.allocator);
+}
+
+test "external lake query cleanup partial proofs fence concurrent marker changes" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("partial-retirement-cas");
+    defer directory.cleanup();
+    var config = try local.common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+    defer store.deinit();
+    const now = clock.realtimeNs() / std.time.ns_per_ms;
+    var seed: Budget = .{ .deletes = 128, .reads = 16384, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s };
+    _ = collect(a, &store, 7, 0, now, &seed);
+    var proofs = CompletionProofs.init(a);
+    defer proofs.deinit();
+    var budget: Budget = .{ .deletes = 128, .reads = 128, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s, .retire_after_ms = now - 1, .proofs = &proofs };
+    const result = collect(a, &store, 7, 3, now + 1, &budget);
+    try std.testing.expect(result.more and !result.failed);
+    try std.testing.expect(proofs.slots[0] == .unknown and proofs.slots[3] == .revision);
+    const key = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/7/recent-search.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/" });
+    defer a.free(key);
+    const bytes = try std.json.Stringify.valueAlloc(a, Progress{ .retained = true, .resume_after_ms = now + 30000, .sweep_started_ms = now + 1 }, .{ .emit_null_optional_fields = false });
+    defer a.free(bytes);
+    var saved = try store.opened.client.putObject(store.opened.bucket, key, bytes, .{});
+    saved.deinit(store.opened.client.allocator);
+    const reads_before = budget.reads;
+    var progress = false;
+    try std.testing.expectError(error.QueryGcRetainedProgress, retireCompleted(a, &store, 7, &proofs, &progress, &budget));
+    try std.testing.expect(!progress);
+    try std.testing.expectEqual(reads_before, budget.reads);
 }
