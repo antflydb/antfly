@@ -585,135 +585,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             });
         }
 
-        pub fn appendGraphTransformDelete(
-            alloc: Allocator,
-            writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
-            deletes: *std.ArrayListUnmanaged(types.GraphEdgeDelete),
-            source: []const u8,
-            path: transform_mod.GraphProjectionPath,
-            value_json: []const u8,
-        ) !void {
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
-            defer parsed.deinit();
-            if (parsed.value != .object) return error.InvalidGraphEdges;
-            const target_value = parsed.value.object.get("target") orelse return error.InvalidGraphEdges;
-            if (target_value != .string or target_value.string.len == 0) return error.InvalidGraphEdges;
+        pub const appendGraphTransformDelete = @import("mutation_plan.zig").appendGraphTransformDelete;
 
-            const index_name = try alloc.dupe(u8, path.index_name);
-            errdefer alloc.free(index_name);
-            const owned_source = try alloc.dupe(u8, source);
-            errdefer alloc.free(owned_source);
-            const target = try alloc.dupe(u8, target_value.string);
-            errdefer alloc.free(target);
-            const edge_type = try alloc.dupe(u8, path.edge_type);
-            errdefer alloc.free(edge_type);
-            const edge_id = if (parsed.value.object.get("edge_id")) |value| blk: {
-                if (value != .string or value.string.len == 0) return error.InvalidGraphEdges;
-                break :blk try alloc.dupe(u8, value.string);
-            } else "";
-            errdefer if (edge_id.len > 0) alloc.free(edge_id);
-
-            // A later pull overrides every earlier projected write for the same
-            // physical relationship before the split graph mutation batch is built.
-            var write_index = writes.items.len;
-            while (write_index > 0) {
-                write_index -= 1;
-                const prior = writes.items[write_index];
-                if (!graphMutationIdentityEql(prior, .{
-                    .index_name = index_name,
-                    .source = owned_source,
-                    .target = target,
-                    .edge_type = edge_type,
-                    .edge_id = edge_id,
-                })) continue;
-                var removed = writes.orderedRemove(write_index);
-                deinitOwnedGraphEdgeWrite(alloc, &removed);
-            }
-            try deletes.append(alloc, .{
-                .index_name = index_name,
-                .source = owned_source,
-                .target = target,
-                .edge_type = edge_type,
-                .edge_id = edge_id,
-            });
-        }
-
-        pub fn appendGraphTransformWrite(
-            alloc: Allocator,
-            writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
-            deletes: *std.ArrayListUnmanaged(types.GraphEdgeDelete),
-            source: []const u8,
-            path: transform_mod.GraphProjectionPath,
-            value_json: []const u8,
-        ) !void {
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
-            defer parsed.deinit();
-            if (parsed.value != .object) return error.InvalidGraphEdges;
-
-            const target_value = parsed.value.object.get("target") orelse return error.InvalidGraphEdges;
-            if (target_value != .string or target_value.string.len == 0) return error.InvalidGraphEdges;
-
-            const weight: f64 = if (parsed.value.object.get("weight")) |value| switch (value) {
-                .integer => |integer| @floatFromInt(integer),
-                .float => |float| float,
-                .number_string => |number| try std.fmt.parseFloat(f64, number),
-                else => return error.InvalidGraphEdges,
-            } else 1.0;
-            if (!std.math.isFinite(weight)) return error.InvalidGraphEdges;
-
-            const metadata_json: []const u8 = if (parsed.value.object.get("metadata")) |metadata| blk: {
-                // Edge metadata has one stable public shape across ingestion,
-                // storage, graph queries, and generated SDKs. Reject scalar or
-                // array values before they become durable artifacts rather than
-                // allowing a later response to violate the object contract.
-                if (metadata != .object) return error.InvalidGraphEdges;
-                break :blk try std.json.Stringify.valueAlloc(alloc, metadata, .{});
-            } else "";
-            errdefer if (metadata_json.len > 0) alloc.free(@constCast(metadata_json));
-
-            const index_name = try alloc.dupe(u8, path.index_name);
-            errdefer alloc.free(index_name);
-            const owned_source = try alloc.dupe(u8, source);
-            errdefer alloc.free(owned_source);
-            const target = try alloc.dupe(u8, target_value.string);
-            errdefer alloc.free(target);
-            const edge_type = try alloc.dupe(u8, path.edge_type);
-            errdefer alloc.free(edge_type);
-            const edge_id = if (parsed.value.object.get("edge_id")) |value| blk: {
-                if (value != .string or value.string.len == 0) return error.InvalidGraphEdges;
-                break :blk try alloc.dupe(u8, value.string);
-            } else "";
-            errdefer if (edge_id.len > 0) alloc.free(edge_id);
-
-            // Transform operations are ordered. Since the storage batch carries
-            // graph writes and deletes in separate slices (deletes execute first),
-            // discard any earlier projected delete for this identity so a later
-            // push/addToSet remains the final operation.
-            var delete_index = deletes.items.len;
-            while (delete_index > 0) {
-                delete_index -= 1;
-                const prior = deletes.items[delete_index];
-                if (!graphMutationIdentityEql(prior, .{
-                    .index_name = index_name,
-                    .source = owned_source,
-                    .target = target,
-                    .edge_type = edge_type,
-                    .edge_id = edge_id,
-                })) continue;
-                var removed = deletes.orderedRemove(delete_index);
-                deinitOwnedGraphEdgeDelete(alloc, &removed);
-            }
-
-            try writes.append(alloc, .{
-                .index_name = index_name,
-                .source = owned_source,
-                .target = target,
-                .edge_type = edge_type,
-                .edge_id = edge_id,
-                .weight = weight,
-                .metadata_json = metadata_json,
-            });
-        }
+        pub const appendGraphTransformWrite = @import("mutation_plan.zig").appendGraphTransformWrite;
 
         pub fn applyDenseArtifactCounterDelta(
             alloc: Allocator,
@@ -805,28 +679,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
         }
 
-        pub fn deinitOwnedGraphEdgeDelete(alloc: Allocator, delete: *types.GraphEdgeDelete) void {
-            alloc.free(@constCast(delete.index_name));
-            alloc.free(@constCast(delete.source));
-            alloc.free(@constCast(delete.target));
-            alloc.free(@constCast(delete.edge_type));
-            if (delete.edge_id.len > 0) alloc.free(@constCast(delete.edge_id));
-            if (delete.owner_document.len > 0) alloc.free(@constCast(delete.owner_document));
-            if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
-            delete.* = undefined;
-        }
+        pub const deinitOwnedGraphEdgeDelete = @import("mutation_plan.zig").deinitOwnedGraphEdgeDelete;
 
-        pub fn deinitOwnedGraphEdgeWrite(alloc: Allocator, write: *types.GraphEdgeWrite) void {
-            alloc.free(@constCast(write.index_name));
-            alloc.free(@constCast(write.source));
-            alloc.free(@constCast(write.target));
-            alloc.free(@constCast(write.edge_type));
-            if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
-            if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
-            if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-            if (write.owner.len > 0) alloc.free(@constCast(write.owner));
-            write.* = undefined;
-        }
+        pub const deinitOwnedGraphEdgeWrite = @import("mutation_plan.zig").deinitOwnedGraphEdgeWrite;
 
         pub fn deleteDocumentArtifactChildRangeOutboxEntry(self: anytype, key: []const u8) !void {
             var replication_mutation = self.acquireReplicationMutationShared();
@@ -924,14 +779,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             std.mem.writeInt(i64, out[offset..][0..@sizeOf(i64)], value.delta, .little);
         }
 
-        pub fn graphMutationIdentityEql(left: anytype, right: anytype) bool {
-            return std.mem.eql(u8, left.index_name, right.index_name) and
-                std.mem.eql(u8, left.source, right.source) and
-                std.mem.eql(u8, left.target, right.target) and
-                std.mem.eql(u8, left.edge_type, right.edge_type) and
-                std.mem.eql(u8, left.edge_id, if (@hasField(@TypeOf(right), "edge_id")) right.edge_id else "") and
-                std.mem.eql(u8, left.owner_document, if (@hasField(@TypeOf(right), "owner_document")) right.owner_document else "");
-        }
+        pub const graphMutationIdentityEql = @import("mutation_plan.zig").graphMutationIdentityEql;
 
         pub fn hasConfiguredResolvers(self: anytype) bool {
             return S.ownerField(self, "core").*.index_manager.resolvers.items.len > 0;

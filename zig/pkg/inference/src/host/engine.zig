@@ -86,7 +86,10 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
     const descriptor = if (@import("builtin").is_test) &@import("engine_exports.zig").descriptor else antfly_inference_engine_get_function_table();
     if (!descriptor.layout.matches(layout)) return error.UnsupportedVersion;
     const table: *const VTable = @ptrCast(@alignCast(descriptor.table));
-    const outcome = try Boundary.call(name, descriptor.dispatch, @field(table, name), args);
+    const outcome = if (@import("builtin").is_test)
+        try Boundary.call(name, descriptor.dispatch, @field(table, name), args)
+    else
+        try Boundary.callRemote(name, descriptor.dispatch, @field(table, name), args);
     if (outcome.failure.ptr) |ptr| {
         const error_name = ptr[0..outcome.failure.len];
         return @import("engine_errors").fromName(error_name);

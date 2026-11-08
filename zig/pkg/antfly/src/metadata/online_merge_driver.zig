@@ -442,7 +442,7 @@ fn Adapter(comptime Service: type) type {
                 if (!std.meta.eql(@as(?@import("antfly_local_sources").storage_db_artifact_inventory.Binding, catalog.binding), expected)) return error.OnlineMergeArtifactCatalogChanged;
                 proposed.artifact_catalog = catalog;
             }
-            const body = try @import("antfly_local_sources").api_batch.encodeBatchRequest(alloc, proposed);
+            const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, proposed);
             var transport = self.client(alloc);
             var cancellation: http.RequestCancellation = .{ .borrowed_context = owned.request.cancellation.ptr, .borrowed_is_cancelled = owned.request.cancellation.is_cancelled_fn };
             const timeout_ms = try timeout(owned.request);
@@ -645,7 +645,7 @@ test "metadata transition driver online artifact progress retains healthy peer a
 }
 
 test "metadata transition driver online constructs every native checkpoint without reassignment" {
-    const batch_wire = @import("antfly_local_sources").api_batch;
+    const batch_wire = @import("antfly_local_sources").api_internal_batch;
     const alloc = std.testing.allocator;
     var state: online.State = .{ .scope = .{
         .fence = .{ .transition_id = 9, .attempt = 1, .peer_group_id = 3, .owner_group_id = 2, .role = .merge_source, .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 4 }, .catalog_digest = @splat(7) },

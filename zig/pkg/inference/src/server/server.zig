@@ -12070,6 +12070,8 @@ pub const Node = struct {
             try self.resolveRequestModelSelection(scratch, io, request.model, "extractors");
         const model_path = model_path_selection.path;
         const model_path_selection_control: ?InferenceExecutionControl = model_path_selection.bind(self.bindExecutionControl(null, control orelse .{}));
+        // Preserve model-selection validity in direct and brokered execution.
+        execution_options.control = model_path_selection_control;
         defer scratch.free(model_path);
         execution_options.control = model_path_selection_control;
         // Only architecture/configuration and capability are needed here.

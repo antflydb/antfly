@@ -67,6 +67,7 @@ pub const WorkingSetAllocator = struct {
         return self.quota.max_live_bytes;
     }
     pub fn headroom(a: std.mem.Allocator) ?usize {
+        if (@import("../../api/lake_execution_memory.zig").BorrowedAllocator.headroom(a)) |capacity| return capacity.available;
         if (@import("antfly_platform").allocator.reclamation.Quota.owner(a)) |owner| return @min(owner.available(), headroom(owner.backing) orelse return null);
         if (@import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator.parentAllocator(a)) |parent| return headroom(parent);
         if (comptime @import("builtin").is_test) if (a.vtable == std.testing.allocator.vtable) return std.math.maxInt(usize);
