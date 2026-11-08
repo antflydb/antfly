@@ -144,9 +144,9 @@ class LoaderTests(unittest.TestCase):
         )
         cls.fixtures = {}
         for name, flags in [
-            ("valid", ["-DABI_VERSION=1"]),
-            ("wrong-abi", ["-DABI_VERSION=2"]),
-            ("missing-symbol", ["-DABI_VERSION=1", "-DMISSING_INVOKE"]),
+            ("valid", ["-DABI_VERSION=2"]),
+            ("wrong-abi", ["-DABI_VERSION=1"]),
+            ("missing-symbol", ["-DABI_VERSION=2", "-DMISSING_INVOKE"]),
         ]:
             path = cls.directory / f"{name}.dylib"
             cls.compile([cls.directory / "fixture.c"], path, ["-dynamiclib", *flags])

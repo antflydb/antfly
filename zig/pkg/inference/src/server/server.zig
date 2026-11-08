@@ -2843,13 +2843,12 @@ fn collectOnnxDependenciesForPath(
     allocator: std.mem.Allocator,
     dependencies: *OnnxDependencies,
     maybe_path: ?[]const u8,
+    primary: bool,
+    logical_path: ?[]const u8,
 ) !void {
     const path = maybe_path orelse return;
-    if (!std.mem.endsWith(u8, path, ".onnx")) return;
-    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSet(
-        allocator,
-        path,
-    ) catch |err| {
+    if (!primary and !std.mem.endsWith(u8, path, ".onnx")) return;
+    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSetWithBase(allocator, path, if (logical_path) |logical| std.fs.path.dirname(logical) else null) catch |err| {
         if (err == error.OutOfMemory) return err;
         dependencies.valid = false;
         return;
@@ -2874,7 +2873,7 @@ fn collectCompatibilityOnnxDependencies(
         man.visual_projection_path,
         man.audio_projection_path,
     };
-    for (paths) |path| try collectOnnxDependenciesForPath(allocator, &dependencies, path);
+    for (paths, 0..) |path, index| try collectOnnxDependenciesForPath(allocator, &dependencies, path, index == 0, if (index == 0) man.onnx_logical_path else null);
     return dependencies;
 }
 
@@ -2942,6 +2941,7 @@ fn addCompatibilityManifestFacts(
     const native_arch_hint: u8 = @backingInt(man.native_arch_hint);
     signature.update(&.{ model_type, model_type_origin, native_arch_hint });
     updateCompatibilitySignatureSlice(signature, man.config_model_arch);
+    updateCompatibilitySignatureSlice(signature, man.onnx_logical_path orelse "");
     updateCompatibilitySignatureSlice(signature, man.gliner_model_type);
     updateCompatibilitySignatureSlice(signature, man.inference_bundle_family);
     signature.update(&.{
@@ -2978,6 +2978,8 @@ fn computeCompatibilitySignatureWithDependencies(
     }
     try addArtifactIdentityToSignature(allocator, io, &signature, man.model_manifest_path, true);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.jina_adapter_config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.jina_adapter_weights_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.gguf_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.gguf_projector_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.safetensors_path, false);
@@ -6082,6 +6084,7 @@ pub const Node = struct {
         prompt_tokens: usize,
         completion_tokens: usize,
         truncated: bool,
+        naturally_completed: bool = false,
         /// Prompt tokens served from the model's prefix KV cache.
         cached_prompt_tokens: usize = 0,
         silent_audio: bool = false,
@@ -6625,6 +6628,7 @@ pub const Node = struct {
             .prompt_tokens = result.prompt_tokens,
             .completion_tokens = result.tokens_used,
             .truncated = std.mem.eql(u8, result.finish_reason, "length"),
+            .naturally_completed = std.mem.eql(u8, result.finish_reason, "stop"),
             .cached_prompt_tokens = result.cached_prompt_tokens,
         };
     }
@@ -22133,11 +22137,21 @@ pub const Node = struct {
     }
 
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        if (requestUsesAttachmentEnvelope(ctx)) {
-            var envelope = parseRequestAttachmentEnvelope(ctx, .{ .max_metadata_bytes = ctx.max_request_body_size, .max_attachment_bytes = requestMediaMaxBytes(self), .max_total_attachment_bytes = requestMediaMaxBytes(self) }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{ .@"error" = attachmentEnvelopeErrorCode(err), .message = attachmentEnvelopeErrorMessage(err) });
-            defer envelope.deinit();
+        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        if (uses_attachment_envelope) {
+            // The transport body is single-pass. Retain the admitted payload
+            // until either audio or image dispatch has finished using it.
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{ .max_metadata_bytes = ctx.max_request_body_size, .max_attachment_bytes = requestMediaMaxBytes(self), .max_total_attachment_bytes = requestMediaMaxBytes(self) }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{ .@"error" = attachmentEnvelopeErrorCode(err), .message = attachmentEnvelopeErrorMessage(err) });
+            const envelope = attachment_envelope.?;
             var metadata = std.json.parseFromSlice(std.json.Value, ctx.allocator, envelope.metadata, .{ .duplicate_field_behavior = .@"error" }) catch return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST" });
             defer metadata.deinit();
+            if (metadata.value == .object) {
+                const object = metadata.value.object;
+                const forms = @as(usize, @intFromBool(object.contains("images"))) + @intFromBool(object.contains("documents")) + @intFromBool(object.contains("audio"));
+                if (forms != 1) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "read requires exactly one input form" });
+            }
             if (metadata.value == .object) if (metadata.value.object.get("audio")) |audio| {
                 if (audio != .string or envelope.attachments.len != 1 or !std.mem.eql(u8, audio.string, "attachment:0")) return ctx.status(400).json(.{ .@"error" = "InvalidAudioAttachment" });
                 const attachment = envelope.attachments[0];
@@ -22147,8 +22161,7 @@ pub const Node = struct {
                 try ctx.setHeader("content-type", "application/json");
                 return ctx.response.build();
             };
-        }
-        if (try ctx.body()) |raw| {
+        } else if (try ctx.body()) |raw| {
             const envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw, .{}) catch null;
             if (envelope) |parsed_document| {
                 defer parsed_document.deinit();
@@ -22175,25 +22188,15 @@ pub const Node = struct {
             }
         }
         var execution_control = httpInferenceExecutionControl(self, ctx);
-        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
-        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
-        defer if (attachment_envelope) |*envelope| envelope.deinit();
-        var parsed = if (uses_attachment_envelope) blk: {
-            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
-                .max_metadata_bytes = ctx.max_request_body_size,
-                .max_attachment_bytes = requestMediaMaxBytes(self),
-                .max_total_attachment_bytes = requestMediaMaxBytes(self),
-            }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
-                .@"error" = attachmentEnvelopeErrorCode(err),
-                .message = attachmentEnvelopeErrorMessage(err),
-            });
-            break :blk std.json.parseFromSlice(api.ReadRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
+        var parsed = if (attachment_envelope) |envelope|
+            std.json.parseFromSlice(api.ReadRequest, ctx.allocator, envelope.metadata, .{}) catch
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
                     .message = "attachment envelope metadata must be a valid read request",
-                });
-        } else (try ctx.parseJson(api.ReadRequest)) orelse
-            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+                })
+        else
+            (try ctx.parseJson(api.ReadRequest)) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
         if ((body.images orelse @as([]const api.ImageURL, &.{})).len == 0) {
@@ -23003,6 +23006,10 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
+        if (body.transcript_text != null) return ctx.status(400).json(.{
+            .@"error" = "UNSUPPORTED_FEATURE",
+            .message = "text cleanup requires a named transcriber advertising text_cleanup",
+        });
         const model_name = std.mem.trim(u8, body.model, " \t\r\n");
         if (model_name.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
@@ -23267,7 +23274,11 @@ pub const Node = struct {
                 writer.close() catch {};
                 return ctx.response.build();
             }
-            const cleaned = try dictation_mod.normalizeOutput(ctx.allocator, generated.text);
+            const cleaned = normalizeDirectDictationOutput(ctx.allocator, generated) catch |err| {
+                writeGenerationStreamError(&writer, err);
+                writer.close() catch {};
+                return ctx.response.build();
+            };
             defer ctx.allocator.free(cleaned);
             writeDictationEvent(&writer, &payload, .{
                 .type = "dictation.completed",
@@ -23303,7 +23314,7 @@ pub const Node = struct {
             execution_control,
         ) catch |err| return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(generated.text);
-        const cleaned = try dictation_mod.normalizeOutput(ctx.allocator, generated.text);
+        const cleaned = normalizeDirectDictationOutput(ctx.allocator, generated) catch |err| return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(cleaned);
         return ctx.json(api.DictateResponse{
             .object = "dictation",
@@ -23314,6 +23325,14 @@ pub const Node = struct {
             .transcript = api_transcript,
             .text = cleaned,
             .usage = tokenUsageWithCachedPrompt(generated.prompt_tokens, generated.completion_tokens, generated.cached_prompt_tokens),
+        });
+    }
+
+    fn normalizeDirectDictationOutput(allocator: std.mem.Allocator, generated: DirectGenerateOutput) ![]u8 {
+        return @import("antfly_generating").dictation.normalizeCleanupOutput(allocator, .{
+            .finish_reason = @as(?api.FinishReason, if (generated.naturally_completed) .stop else .length),
+            .tool_calls = @as([]const u8, &.{}),
+            .content = generated.text,
         });
     }
 
@@ -32641,6 +32660,13 @@ test "direct generate preflight counts video without treating it as audio" {
     try std.testing.expectEqual(@as(usize, 4), preflight.decoded_media_bytes);
 }
 
+test "generation says what to do when no route can decode HEVC" {
+    const failure = generationRequestFailure(error.HevcDecoderUnavailable).?;
+    try std.testing.expectEqual(@as(u16, 400), failure.status);
+    try std.testing.expectEqualStrings("VIDEO_CODEC_UNAVAILABLE", failure.code);
+    try std.testing.expect(std.mem.indexOf(u8, failure.message, "transcode") != null);
+}
+
 test "generation maps undecodable images to a client error" {
     try std.testing.expectEqual(@as(u16, 400), generationRequestFailure(error.ImageDecodeFailed).?.status);
     try std.testing.expectEqual(@as(u16, 413), generationRequestFailure(error.ImageTooLarge).?.status);
@@ -37235,6 +37261,7 @@ test "download remote content accepts data uri" {
     const node = Node{
         .config = .{},
         .allocator = undefined,
+        .host_caches = undefined,
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
@@ -37484,6 +37511,7 @@ test "download remote content blocks private ip urls when configured" {
             .block_private_ips = true,
         } },
         .allocator = undefined,
+        .host_caches = undefined,
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
@@ -37503,6 +37531,7 @@ test "download remote content blocks hosts outside allowlist" {
     const node = Node{
         .config = .{ .content_security = .{ .allowed_hosts = &allowed_hosts } },
         .allocator = undefined,
+        .host_caches = undefined,
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
@@ -38634,6 +38663,66 @@ fn parseAttachmentUrl(url: []const u8) !?usize {
     return std.fmt.parseUnsigned(usize, digits, 10) catch error.InvalidAttachmentReference;
 }
 
+test "framed read consumes streaming image envelopes exactly once" {
+    const allocator = std.testing.allocator;
+    const Source = struct {
+        bytes: []const u8,
+        offset: usize = 0,
+        reads_after_end: usize = 0,
+        fn readAll(_: ?*anyopaque) !?[]const u8 {
+            return error.UnexpectedWholeBodyRead;
+        }
+        fn read(raw: ?*anyopaque, out: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.offset == self.bytes.len) self.reads_after_end += 1;
+            const n = @min(@min(out.len, 7), self.bytes.len - self.offset);
+            @memcpy(out[0..n], self.bytes[self.offset..][0..n]);
+            self.offset += n;
+            return n;
+        }
+    };
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+    const cases = [_]struct { metadata: []const u8, status: u16, message: []const u8 }{
+        .{ .metadata = "{\"model\":\"missing/model\",\"images\":[{\"url\":\"attachment:1\"}]}", .status = 400, .message = "every framed attachment must be referenced exactly once" },
+        // Valid image framing must reach model resolution without a GPU.
+        .{ .metadata = "{\"model\":\"missing/model\",\"images\":[{\"url\":\"attachment:0\"}]}", .status = 404, .message = "MODEL_NOT_FOUND" },
+        .{ .metadata = "{\"model\":\"missing/model\",\"audio\":\"attachment:1\"}", .status = 400, .message = "InvalidAudioAttachment" },
+        .{ .metadata = "{\"model\":\"missing/model\",\"audio\":\"attachment:0\",\"images\":[{\"url\":\"attachment:0\"}]}", .status = 400, .message = "read requires exactly one input form" },
+    };
+    for (cases) |case| {
+        const encoded = try httpx.attachment_envelope.encodeAlloc(allocator, case.metadata, &.{.{ .mime_type = "image/png", .data = "image bytes" }});
+        defer allocator.free(encoded);
+        for ([_]bool{ false, true }) |streaming| {
+            for ([_]bool{ false, true }) |budgeted| {
+                var budget = httpx.SharedBodyBudget.init(encoded.len);
+                var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
+                defer request.deinit();
+                if (budgeted) request.body_budget = &budget;
+                try request.headers.set("Content-Type", httpx.attachment_envelope.content_type);
+                var source = Source{ .bytes = encoded };
+                if (!streaming) request.body = encoded;
+                var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+                defer ctx.deinit();
+                if (streaming) ctx.body_delegate = .{ .ptr = &source, .read_all = Source.readAll, .read = Source.read, .streaming = true };
+                var response = try node.readImages(&ctx);
+                defer response.deinit();
+                try std.testing.expectEqual(case.status, response.status.code);
+                try std.testing.expect(std.mem.indexOf(u8, response.body.?, case.message) != null);
+                try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+                try std.testing.expectEqual(@as(usize, 0), request.body_budget_reserved);
+                if (streaming) {
+                    try std.testing.expectEqual(encoded.len, source.offset);
+                    // One EOF check from parseReaderAlloc, no second parse or readAll.
+                    try std.testing.expectEqual(@as(usize, 1), source.reads_after_end);
+                    try std.testing.expect(request.body == null);
+                    if (budgeted) try std.testing.expectEqual(case.metadata.len + "image/png".len + "image bytes".len, budget.stats().peak_in_use);
+                }
+            }
+        }
+    }
+}
+
 test "framed read attachment URLs are canonical and bounded integers" {
     try std.testing.expect((try parseAttachmentUrl("https://example.com/page.png")) == null);
     try std.testing.expectEqual(@as(?usize, 0), try parseAttachmentUrl("attachment:0"));
@@ -39640,6 +39729,7 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
             .message = "expanded embedding input exceeds the model context limit",
         },
         error.InvalidVideoInput => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported or corrupt video; expected progressive SDR H.264 MP4" },
+        error.HevcDecoderUnavailable => .{ .status = 400, .code = "VIDEO_CODEC_UNAVAILABLE", .message = "this host cannot decode this HEVC video; transcode it to H.264 or AV1, or use a host with hardware HEVC decoding, such as a Mac or an NVIDIA GPU" },
         error.VideoDurationExceeded, error.VideoInputTooLarge => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds the 60-second or 256-MiB limit" },
         error.UnsupportedVideoBackend => .{ .status = 400, .code = "UNSUPPORTED_VIDEO_BACKEND", .message = "video embeddings require the Linux CUDA backend with NVDEC" },
         error.NvdecUnavailable => .{ .status = 503, .code = "VIDEO_BACKEND_UNAVAILABLE", .message = "the CUDA video decoder is unavailable on this server" },
@@ -42592,7 +42682,8 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         error.MalformedAnnexB,
         error.MissingVideoParameterSet,
         => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported, empty, or corrupt video", .retryable = false },
-        error.VideoDurationExceeded, error.VideoInputTooLarge => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
+        error.HevcDecoderUnavailable => .{ .status = 400, .code = "VIDEO_CODEC_UNAVAILABLE", .message = "this host cannot decode this HEVC video; transcode it to H.264 or AV1, or use a host with hardware HEVC decoding, such as a Mac or an NVIDIA GPU", .retryable = false },
+        error.VideoDurationExceeded, error.VideoInputTooLarge, error.SharedAdmissionExceeded => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
         error.NvdecUnavailable => .{ .status = 503, .code = "VIDEO_BACKEND_UNAVAILABLE", .message = "the CUDA video decoder is unavailable on this server", .retryable = true },
         error.Timeout => .{
             .status = 504,
@@ -51553,4 +51644,80 @@ test "model selection VAD admission failures retain retry semantics" {
     var budget_response = try Node.sileroModelFailureResponse(&ctx, .load, error.MemoryBudgetExceeded);
     defer budget_response.deinit();
     try std.testing.expectEqual(@as(u16, 507), budget_response.status.code);
+}
+
+test "model selection compatibility signature preserves aliased ONNX context" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const ml = @import("ml");
+    const onnx = @import("onnx_graph");
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const weight = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(weight);
+    const values = [_]f32{ 1, 2, 3, 4 };
+    var exported = try onnx.exportGraphWithExternalData(a, &graph, .{ .parameter_initializers = &.{.{ .name = "weight", .shape = ml.graph.Shape.init(.f32, &.{4}), .data = .{ .raw_bytes = std.mem.asBytes(&values) } }} }, "weights.data");
+    defer exported.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "blobs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/graph", .data = exported.model_bytes });
+    try tmp.dir.symLink(io, "blobs/graph", "model.onnx", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.data", .data = exported.external_data.?.bytes });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var manifest = try manifest_mod.loadFromDir(a, root);
+    defer manifest.deinit();
+    var dependencies = try collectCompatibilityOnnxDependencies(a, &manifest);
+    defer dependencies.deinit(a);
+    try std.testing.expect(dependencies.valid);
+    try std.testing.expectEqual(@as(usize, 1), dependencies.paths.items.len);
+    const before = try computeCompatibilitySignatureWithDependencies(a, io, root, &manifest, dependencies.paths.items, true);
+    const changed = [_]f32{ 5, 6, 7, 8 };
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.data", .data = std.mem.asBytes(&changed) });
+    const after = try computeCompatibilitySignatureWithDependencies(a, io, root, &manifest, dependencies.paths.items, true);
+    try std.testing.expect(!std.mem.eql(u8, &before, &after));
+    const new_logical = try std.fs.path.join(a, &.{ root, "text_model.onnx" });
+    a.free(manifest.onnx_logical_path.?);
+    manifest.onnx_logical_path = new_logical;
+    const renamed = try computeCompatibilitySignatureWithDependencies(a, io, root, &manifest, dependencies.paths.items, true);
+    try std.testing.expect(!std.mem.eql(u8, &after, &renamed));
+}
+
+test "model selection compatibility signature tracks selected Jina adapter files" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "adapters/retrieval");
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"jina_embeddings_v5\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "base" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_config.json", .data = "{\"r\":1}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_model.safetensors", .data = "aaaa" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadListingFromDir(a, root);
+    defer man.deinit();
+    try std.testing.expect((try man.jinaRetrievalAdapter()) != null);
+    const before = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_config.json", .data = "{\"r\":2}" });
+    const config_changed = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
+    try std.testing.expect(!std.mem.eql(u8, &before, &config_changed));
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_model.safetensors", .data = "bbbbb" });
+    const weights_changed = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
+    try std.testing.expect(!std.mem.eql(u8, &config_changed, &weights_changed));
+}
+
+test "direct dictation cleanup rejects unfinished and normalized empty text" {
+    const a = std.testing.allocator;
+    const output = Node.DirectGenerateOutput{ .text = @constCast("Hello."), .prompt_tokens = 1, .completion_tokens = 1, .truncated = false };
+    try std.testing.expectError(error.InferenceOutputIncomplete, Node.normalizeDirectDictationOutput(a, output));
+    var complete = output;
+    complete.naturally_completed = true;
+    const text = try Node.normalizeDirectDictationOutput(a, complete);
+    defer a.free(text);
+    try std.testing.expectEqualStrings("Hello.", text);
+    complete.text = @constCast("\"\"");
+    try std.testing.expectError(error.InferenceOutputIncomplete, Node.normalizeDirectDictationOutput(a, complete));
 }

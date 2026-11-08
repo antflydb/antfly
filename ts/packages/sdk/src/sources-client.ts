@@ -27,6 +27,22 @@ export interface SourceDefinition {
   permissions: { public: boolean; readers: string[] };
   permission_ttl_seconds?: number;
   publication?: "text" | "media";
+  identity?: { namespace?: string };
+}
+
+/** Durable migration lineage returned by the companion; clients cannot mutate it directly. */
+export interface LocalMigrationReceipt {
+  version: 1;
+  source_id: string;
+  table: string;
+  namespace: string;
+  from_connection: string;
+  from_prefix: string;
+  from_binding: string;
+  to_connection: string;
+  to_bucket: string;
+  to_prefix: string;
+  to_binding: string;
 }
 
 export interface SourceProfile {
@@ -37,6 +53,7 @@ export interface SourceProfile {
   principals?: string[];
   connections: Record<string, SourceConnection>;
   sources: SourceDefinition[];
+  readonly local_migrations?: Record<string, LocalMigrationReceipt>;
 }
 
 export interface SourceSyncJob {
@@ -144,7 +161,7 @@ export class StandaloneSourcesClient extends SourceTransport {
   putSource(
     source: SourceDefinition,
     signal?: AbortSignal
-  ): Promise<{ version: 1; state: string }> {
+  ): Promise<{ version: 1; state: string; rekeys: boolean }> {
     return this.request("PUT", `/v1/sources/${encodeURIComponent(source.id)}`, source, signal);
   }
   removeSource(id: string, signal?: AbortSignal): Promise<{ version: 1; state: string }> {
@@ -160,8 +177,24 @@ export class StandaloneSourcesClient extends SourceTransport {
     );
   }
 
-  sync(options: { restart?: boolean; signal?: AbortSignal } = {}): Promise<SourceSyncJob> {
-    return this.request("POST", "/v1/sync", { restart: options.restart ?? false }, options.signal);
+  sync(
+    options: {
+      sourceId?: string;
+      restart?: boolean;
+      requestKey?: string;
+      signal?: AbortSignal;
+    } = {}
+  ): Promise<SourceSyncJob> {
+    return this.request(
+      "POST",
+      "/v1/sync",
+      {
+        source_id: options.sourceId,
+        restart: options.restart ?? false,
+        request_key: options.requestKey,
+      },
+      options.signal
+    );
   }
   /** Apply durable purge intents independently of ingestion credentials. */
   runPurges(signal?: AbortSignal): Promise<SourceSyncJob> {

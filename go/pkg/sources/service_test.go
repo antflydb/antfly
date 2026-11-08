@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -130,6 +131,124 @@ func TestServiceMediaRangesRevocationAndReconciliation(t *testing.T) {
 	require.Equal(t, 410, fetchService(s, ref, "GET", "").Code)
 	require.Equal(t, 400, serviceCall(s, "POST", "/v1/sync", map[string]any{}).Code)
 }
+
+// TestServiceSourceIdentityNamespaceLifecycle exercises Part 2's PUT contract
+// end to end: a source predating identity.namespace (serviceFixture's
+// source, exactly like a real pre-upgrade deployment) still re-keys on a
+// connection/config change with no namespace involved, and the response says
+// so; setting an ARBITRARY namespace (one that does not reproduce this
+// source's current keys -- verified for real against the connector, not
+// assumed from "namespace was empty") is a rekey; once set it is immutable,
+// and no later PUT -- including one that changes connection -- ever re-keys
+// again; a PUT that omits identity entirely never clears an existing
+// namespace; and a brand new source gets a namespace at creation, so
+// creating one never re-keys. See TestServiceAdoptingExactLegacyPrefixNeverRekeys
+// for the corrected, opposite case: adopting the EXACT prefix that
+// reproduces current keys never re-keys, even with a connection change.
+func TestServiceSourceIdentityNamespaceLifecycle(t *testing.T) {
+	s, _, _ := serviceFixture(t)
+	source := s.profile.Sources[0]
+	require.Empty(t, source.Identity.Namespace, "fixture source predates identity.namespace, like a real upgrade")
+
+	// Permissions-only change: no namespace, no connection/config change.
+	source.Permissions = &Permissions{Readers: []string{"another-user"}}
+	w := serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
+	require.Equal(t, 200, w.Code)
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Equal(t, false, response["rekeys"])
+	require.Empty(t, s.profile.Sources[0].Identity.Namespace)
+
+	// Connection change on a still-namespace-less source: re-keys as today.
+	require.Equal(t, 200, serviceCall(s, "PUT", "/v1/connections/retry-budget", Connection{Provider: ProviderS3}).Code)
+	source = s.profile.Sources[0]
+	source.Connection = "retry-budget"
+	w = serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
+	require.Equal(t, 200, w.Code)
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Equal(t, true, response["rekeys"])
+	require.Empty(t, s.profile.Sources[0].Identity.Namespace, "a connection change alone does not assign a namespace")
+
+	// Setting an arbitrary namespace -- one that does not reproduce this
+	// source's current keys -- is a rekey, confirmed against the fixture
+	// connector's own item rather than assumed.
+	source = s.profile.Sources[0]
+	source.Identity.Namespace = "adopted-namespace"
+	w = serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
+	require.Equal(t, 200, w.Code)
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Equal(t, true, response["rekeys"])
+	require.Equal(t, "adopted-namespace", s.profile.Sources[0].Identity.Namespace)
+
+	// Immutable: a PUT trying to change it is rejected, and the stored value
+	// is untouched.
+	source = s.profile.Sources[0]
+	source.Identity.Namespace = "different-namespace"
+	w = serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
+	require.Equal(t, 409, w.Code)
+	require.Equal(t, "adopted-namespace", s.profile.Sources[0].Identity.Namespace)
+
+	// Omitting identity on a later PUT does not clear it, and once a
+	// namespace is set, a connection change no longer re-keys anything.
+	source = s.profile.Sources[0]
+	source.Identity = Identity{}
+	require.Equal(t, 200, serviceCall(s, "PUT", "/v1/connections/retry-budget-2", Connection{Provider: ProviderS3}).Code)
+	source.Connection = "retry-budget-2"
+	w = serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
+	require.Equal(t, 200, w.Code)
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Equal(t, false, response["rekeys"])
+	require.Equal(t, "adopted-namespace", s.profile.Sources[0].Identity.Namespace)
+
+	// A brand new source gets a namespace at creation and never re-keys for it.
+	newID := "22222222-2222-4222-8222-222222222222"
+	newSource := Source{ID: newID, Connection: source.Connection, Table: "sources", Config: json.RawMessage(`{"bucket":"docs"}`), Permissions: &Permissions{Readers: []string{"user:self"}}}
+	w = serviceCall(s, "PUT", "/v1/sources/"+newID, newSource)
+	require.Equal(t, 200, w.Code)
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Equal(t, false, response["rekeys"])
+	for _, candidate := range s.profile.Sources {
+		if candidate.ID == newID {
+			require.Equal(t, newID, candidate.Identity.Namespace)
+		}
+	}
+}
+
+// TestServiceAdoptingExactLegacyPrefixNeverRekeys is the corrected
+// counterpart to TestServiceSourceIdentityNamespaceLifecycle's "arbitrary
+// namespace re-keys" case: adopting the EXACT namespace that reproduces a
+// source's current keys (LegacyNamespace, derived here from the fixture
+// connector's single canned item) must report rekeys: false, even when a
+// connection change rides along in the same PUT -- exactly what
+// migrate-local's own repoint does.
+func TestServiceAdoptingExactLegacyPrefixNeverRekeys(t *testing.T) {
+	s, _, _ := serviceFixture(t)
+	source := s.profile.Sources[0]
+	require.Empty(t, source.Identity.Namespace)
+
+	// The fixture connector's one canned item is
+	// "s3://job/<testSourceID>/docs/manual.txt" with no explicit
+	// RelativeKey, so its native-ID fallback relative key is
+	// "docs/manual.txt" and its legacy namespace is "s3://job/<testSourceID>".
+	legacyNamespace := "s3://job/" + testSourceID
+
+	require.Equal(t, 200, serviceCall(s, "PUT", "/v1/connections/adopted-prefix", Connection{Provider: ProviderS3}).Code)
+	source.Connection = "adopted-prefix"
+	source.Identity.Namespace = legacyNamespace
+	w := serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
+	require.Equal(t, 200, w.Code)
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Equal(t, false, response["rekeys"], "adopting the exact legacy prefix must not re-key, even alongside a connection change")
+	require.Equal(t, legacyNamespace, s.profile.Sources[0].Identity.Namespace)
+
+	// A later PUT trying to change it away is still rejected (immutability
+	// is unaffected by how the namespace was first set).
+	source = s.profile.Sources[0]
+	source.Identity.Namespace = "something-else"
+	require.Equal(t, 409, serviceCall(s, "PUT", "/v1/sources/"+source.ID, source).Code)
+}
+
 func TestServiceRuntimeConnectionSourceLifecycle(t *testing.T) {
 	s, _, backend := serviceFixture(t)
 	unauth := httptest.NewRecorder()
@@ -318,4 +437,111 @@ func TestCredentialFactoryRejectsAmbiguousReferences(t *testing.T) {
 	require.Error(t, err)
 	_, err = factory(t.Context(), Connection{Provider: ProviderS3, SecretRefs: map[string]string{"unknown": "key"}})
 	require.Error(t, err)
+}
+
+type blockingNamespaceConnector struct {
+	Connector
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (c *blockingNamespaceConnector) Enumerate(ctx context.Context, r Request) (Inventory, error) {
+	c.once.Do(func() { close(c.entered) })
+	select {
+	case <-c.release:
+		return Inventory{}, nil
+	case <-ctx.Done():
+		return Inventory{}, ctx.Err()
+	}
+}
+
+func TestServiceNamespaceVerificationDoesNotBlockAndFencesConcurrentEdits(t *testing.T) {
+	for _, change := range []string{"none", "source", "connection", "remove"} {
+		t.Run(change, func(t *testing.T) {
+			service, _, _ := serviceFixture(t)
+			original := service.factory
+			entered, release := make(chan struct{}), make(chan struct{})
+			service.factory = func(ctx context.Context, connection Connection) (Connector, error) {
+				connector, err := original(ctx, connection)
+				if err != nil {
+					return nil, err
+				}
+				return &blockingNamespaceConnector{Connector: connector, entered: entered, release: release}, nil
+			}
+			source := service.profile.Sources[0]
+			source.Identity.Namespace = "adopted"
+			putDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() { putDone <- serviceCall(service, "PUT", "/v1/sources/"+source.ID, source) }()
+			<-entered
+			released := false
+			defer func() {
+				if !released {
+					close(release)
+					<-putDone
+				}
+			}()
+			readDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() { readDone <- serviceCall(service, "GET", "/v1/profile", nil) }()
+			select {
+			case read := <-readDone:
+				require.Equal(t, 200, read.Code)
+			case <-time.After(time.Second):
+				t.Fatal("profile read blocked behind provider enumeration")
+			}
+			switch change {
+			case "source":
+				updated := source
+				updated.Identity = Identity{}
+				updated.Alias = "concurrently edited"
+				require.Equal(t, 200, serviceCall(service, "PUT", "/v1/sources/"+source.ID, updated).Code)
+			case "connection":
+				require.Equal(t, 200, serviceCall(service, "DELETE", "/v1/connections/"+source.Connection, nil).Code)
+			case "remove":
+				require.Equal(t, 200, serviceCall(service, "DELETE", "/v1/sources/"+source.ID, nil).Code)
+			}
+			close(release)
+			released = true
+			result := <-putDone
+			if change == "none" {
+				require.Equal(t, 200, result.Code, result.Body.String())
+				require.Equal(t, "adopted", service.profile.Sources[0].Identity.Namespace)
+			} else {
+				require.Equal(t, 412, result.Code, result.Body.String())
+				if change == "remove" {
+					require.Empty(t, service.profile.Sources)
+					return
+				}
+				require.Empty(t, service.profile.Sources[0].Identity.Namespace)
+				if change == "source" {
+					require.Equal(t, "concurrently edited", service.profile.Sources[0].Alias)
+				}
+			}
+		})
+	}
+}
+
+func TestServiceNamespaceVerificationSkipsProviderDuringSync(t *testing.T) {
+	service, _, _ := serviceFixture(t)
+	original := service.factory
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	service.factory = func(ctx context.Context, connection Connection) (Connector, error) {
+		connector, err := original(ctx, connection)
+		if err != nil {
+			return nil, err
+		}
+		return &blockingNamespaceConnector{Connector: connector, entered: entered, release: release}, nil
+	}
+	source := service.profile.Sources[0]
+	require.Equal(t, 202, serviceCall(service, "POST", "/v1/sync", map[string]any{"source_id": source.ID}).Code)
+	<-entered
+	source.Identity.Namespace = "adopted"
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- serviceCall(service, "PUT", "/v1/sources/"+source.ID, source) }()
+	select {
+	case response := <-done:
+		require.Equal(t, 409, response.Code)
+	case <-time.After(time.Second):
+		t.Fatal("namespace preflight competed with an active sync")
+	}
 }

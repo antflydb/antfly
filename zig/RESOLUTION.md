@@ -306,7 +306,9 @@ loss and portable backup. Recovery of the same source/execution reuses committed
 identity and evidence without candidate search, embedding, or model inference.
 The existing source transaction publishes the decision and downstream replay
 handoff atomically. A crash before publication may repeat inference; execution is
-not exactly-once. A committed failure is replay-stable too. Retry it by explicitly
+not exactly-once. A committed failure is replay-stable too, including a cascade
+failure or exhausted budget that produced no model response. Recovery reuses that
+receipt without model discovery, candidate search, or inference. Retry it by explicitly
 re-resolving, rather than relying on a later drain to flip identity.
 
 Policy changes participate in material config comparison, advance the effective
@@ -318,6 +320,58 @@ identity fields and selected description assets are rechecked after model execut
 concurrent changes return Busy for retry. Existing source/config/override read-set
 and ordered-publication checks fence stale publication. Databases using this policy
 require reader epoch 5; older readers must reject the database before parsing.
+
+**Cascades.** `decider` may be a cascade (`decision_method: cascade`; see
+[the decisions reference](../docs/reference/decisions.md#decider-cascades)): a
+cheap stage judges every REVIEW pair and only in-band pairs escalate. The
+policy hash covers the whole definition (credentials excluded), so editing
+stages or bands re-resolves like any policy change. `classify` checks the
+answer against the stage named in the response's `cascade.answered_by`, and
+requires the trace to list configured stages in order, ending on that stage.
+A response without the trace is invalid. The receipt keeps the normalized
+response, including the trace, under `response`; the `Evidence` layout is
+unchanged. Generated stages get the resolver's per-call batch bounds, and the
+receipt hash mixes in revisions reported by generated stages that actually
+answered, including generated answers returned through typed Antfly proxies. Reuse discovers only those dependencies; unreachable stages do not
+become availability dependencies. If an executed dependency cannot be verified,
+the previous committed verdict is preserved and the refresh fails. Explicit
+`keep_previous` outcomes remain replay-stable until inputs, policy, or a
+reported dependency changes.
+
+Reported generated revisions are execution dependencies for direct proxy
+policies and proxy stages too. Discovery is cached by local stage and resolved
+model within a resolution batch; it never invokes inference. A missing verifier,
+missing revision, or discovery failure preserves the committed receipt and
+returns a discovery error (`CapabilityDiscoveryUnavailable` when verification is
+absent), including under `on_failure: mint`.
+Receipts without reported revisions retain their offline replay behavior.
+The native adapter can verify an exact linked model route using native
+metadata. HTTP Decisions routes and opaque gateway aliases require a host revision verifier that can prove
+the current alias binding; querying the previously resolved leaf is insufficient.
+Earlier dependency-free proxy bindings and native hex-hash bindings are upgraded
+only after the recorded revision is verified, without repeating inference.
+
+New resolution artifacts store the base policy/source binding once as
+`adjudication_execution_hash`, outside the per-entity evidence. A changed binding
+invalidates obsolete failure receipts even when model revision metadata is
+unavailable. Older readers ignore the added artifact field; evidence parsing
+and disabled-guard definition identities retain their existing wire format.
+Legacy receipts without this binding migrate using verified revisions, or are
+invalidated when their recorded mention proves the input changed. Unknown
+legacy bindings are preserved rather than guessed. Ordinary abstentions and
+vetoes still refresh when their recorded model dependencies change; only a
+validated veto can replay without inference when verification is unavailable.
+
+Probability thresholds apply to the probabilistic stages; a terminal
+verdict-only stage must provide a categorical 0/1 distribution. Catalogs with a cascade policy
+require reader epoch 30; policies with an enabled `require_agreement` guard
+require epoch 31. Disabled guards are omitted from stored definitions, preserving
+the epoch-30 wire contract. Generated choice votes remain the sampled structured
+answer; they need not be the distribution's argmax. Thresholds act only on the
+selected vote, and raw-answer inconsistencies remain invalid. Agreement is recomputed from validated stage answers before
+thresholds apply. Disagreed or unverified comparisons commit an abstained
+receipt and remain REVIEW even with `on_failure: mint`. These receipts replay
+without fresh inference until their normal policy or dependency invalidation.
 
 **Description inputs.** Extraction mentions may supply `description` and a numeric
 `description_embedding`; candidate document fields supply the corresponding text
@@ -357,7 +411,9 @@ readiness cycle. No automatic retrospective candidate-dependency scan is introdu
 
 **Bounded execution and queries.** `max_pairs` bounds model invocations per source,
 `max_input_bytes` bounds rendered text, `timeout_ms` bounds an individual call, and
-`budget_ms` bounds the source's total model-time allowance. Calls use the shared
+`budget_ms` bounds the source's total adjudication allowance, including revision
+discovery and preparation before inference. One monotonic deadline is shared
+across all lookups and model calls, and a cascade's own deadline may narrow it. Calls use the shared
 decision executor's token, memory, rate, and provider capability limits. Query
 resolution applies the same policy against an ephemeral store and returns evidence
 without writing artifacts, promoting entities or recording curator overrides. Its
@@ -3195,3 +3251,11 @@ ordinary pin-maintenance scans match an identical qualified control namespace.
 Tests check processed byte counters against native row censuses, mutations on
 both sides of the cursor, header-only edits, legacy-work retirement, untracked
 cut restart and portable-row validation.
+
+Cascade adjudication prepares the resolver-bounded producer specification and
+compiled trace validator once per resolution batch. Classifying each response
+validates every executed stage without allocating or rebuilding the plan;
+revision-dependent specification hashes are reused within the batch. Both
+cascade adjudication and cascade decision enrichments fence readers below
+epoch 30, including grouped enrichment producers. Enabling an agreement guard
+raises that fence to epoch 31; absent or explicit-false guards retain epoch 30.

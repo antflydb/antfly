@@ -2413,7 +2413,7 @@ test "owner configuration preserves the prior excluded source epoch bytes" {
     defer a.free(historical);
     var reopened = try db_mod.DB.open(a, path, .{ .start_optional_runtimes = false });
     defer reopened.close();
-    try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(a, &reopened, "docs", json, "{}", null, null, null, null, null, false)));
+    try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(a, &reopened, "docs", json, "{}", null, null, null, null, .{}, null, false)));
     try std.testing.expect(try reopened.rehydrateSchemaJson(json));
     const encoded = try reopened.core.store.get(a, storage_schema.schema_key);
     defer a.free(encoded);

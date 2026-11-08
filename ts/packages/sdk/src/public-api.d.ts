@@ -5421,6 +5421,28 @@ export interface paths {
          *     `dictionary` are applied. Clips longer than the 30 s Whisper window
          *     are transcribed in windows cut at the quietest pause near the boundary.
          *
+         *     Database nodes also accept named transcribers such as
+         *     `transcribers/apple-speech`. Apple uses the server's native SpeechAnalyzer
+         *     for recorded clips and requires an Apple-provider build, macOS 26+, and
+         *     installed locale assets. Select a named cleanup generator with its bare
+         *     name or `generators/name`; this shares cleanup with named Whisper
+         *     transcribers. The standalone runtime continues to accept local Whisper
+         *     and generator model names.
+         *
+         *     Named non-Whisper providers apply `dictionary` during cleanup; they reject
+         *     Whisper-only `transcript_prompt`, `vad`, and `audio_context` options.
+         *     Apple does not support live transcription sessions. For provider-backed
+         *     cleanup, a delta may contain the entire cleaned result; the raw transcript
+         *     is delivered before cleanup starts. Missing token usage remains absent.
+         *
+         *     Empty recognition is a successful empty result and does not run cleanup.
+         *     Cleanup must confirm a complete text response: token-limited, filtered,
+         *     tool-only, empty, and unconfirmed outputs fail rather than replacing the
+         *     transcript. In streaming mode the error follows `dictation.transcript`
+         *     and no `dictation.completed` event is emitted. Strict Apple cleanup runs
+         *     to natural completion within context, deadline, and bounded output bytes;
+         *     macOS 27+ also verifies measured output tokens against the token budget.
+         *
          *     Set `cleanup_model` to the generator that rewrites the transcript.
          *     Without it, or with `style: verbatim`, the response carries the raw
          *     transcript and no generation runs.
@@ -17374,7 +17396,7 @@ export interface components {
             content_type_field?: string;
             /** @description Row field holding the source ETag. */
             etag_field?: string;
-            /** @description Row field holding the source checksum. */
+            /** @description Row field holding the source checksum. May name a dotted path (e.g. `metadata.sha256`) to reach a value nested under another row field. */
             checksum_field?: string;
             /** @description Row field holding the source version. */
             version_field?: string;
@@ -17735,6 +17757,11 @@ export interface components {
             etag?: string;
             /** @description Static checksum recorded as source version metadata. */
             checksum?: string;
+            /**
+             * @description Declares that `checksum` (or the row value named by `source.checksum_field`) is a digest of the original bytes, computed with this algorithm. When set and the row carries a well-formed digest, extraction identifies the row by that digest instead of by its location (URL, ETag, version, last-modified), so copying, re-hosting, or renaming a source does not force re-extraction as long as the bytes are unchanged. The downloaded bytes are verified against the declared digest; a mismatch fails extraction instead of keeping stale output alive. A present but malformed digest is also an error, never a silent fall back to location-based identity. Leaving this unset preserves prior behavior byte for byte, including for rows that only set `checksum_field`.
+             * @enum {string}
+             */
+            checksum_algorithm?: "sha256";
             /** @description Static source version. Together with the other metadata it lets extraction skip unchanged sources. */
             version?: string;
             /** @description Static last-modified timestamp recorded as source version metadata. */
@@ -18317,15 +18344,49 @@ export interface components {
                 review?: number;
             };
         };
+        DeciderCascadeStage: {
+            /** @description Unique within the cascade; reported in traces. */
+            name: string;
+            /** @description Inline typed or generated decider. Cascades and embedding_similarity deciders cannot be stages. */
+            decider: components["schemas"]["DeciderConfig"];
+            /** @description Required on every stage except the first, which must omit it. Inclusive band on the previous stage's answer. */
+            when?: {
+                /** @description Measure this question only. Omitted, any question in the band escalates. */
+                question?: string;
+                /** @description For choice questions, measure this value's probability. Omitted, the selected value's probability. */
+                choice?: string;
+                /** @description Lower and upper bound, lower strictly below upper. Inputs must have measured probabilities. The previous stage must not be verdict_only; a dynamically returned proxy verdict fails its producing stage under on_failure instead of driving the band. */
+                probability_between: number[];
+            };
+            /** @description Require this stage to agree with the preceding stage on the band question, or every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and abstains; a keep_previous failure leaves agreement unverified and also abstains. */
+            require_agreement?: boolean;
+            /**
+             * @description Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
+             * @default fail
+             * @enum {string}
+             */
+            on_failure?: "fail" | "keep_previous";
+        };
+        /** @description Required with decision_method=cascade, which allows no transport, model or rate-limit fields of its own. The first stage answers every input. Each later stage runs only for inputs whose previous answer falls inside its probability band, and all escalating inputs share one call. The final answer is the last answering stage's. Escalation applies to successful answers only; it is not failover. Probabilities are not calibrated across models, so set bands per model on labelled data. */
+        DeciderCascade: {
+            stages: components["schemas"]["DeciderCascadeStage"][];
+            budget?: {
+                /** @description Stage invocations allowed per request. Defaults to the stage count and cannot be lower. */
+                max_model_calls?: number;
+                /** @description Narrows the caller's deadline for the whole cascade. Checked before each stage and enforced by stage transports. */
+                deadline_ms?: number;
+            };
+        };
         DeciderConfig: {
             /** @enum {string} */
             provider?: "antfly" | "jev" | "openai" | "cloudflare";
             /**
-             * @description Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
+             * @description Execution contract. With provider antfly, typed invokes the Decisions endpoint; remote named deciders may return validated typed or generated answers, including upstream cascade outcomes. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate questions only.
              * @default typed
              * @enum {string}
              */
-            decision_method?: "typed" | "embedding_similarity" | "generated";
+            decision_method?: "typed" | "embedding_similarity" | "generated" | "cascade";
+            cascade?: components["schemas"]["DeciderCascade"];
             /** @description Required with decision_method=generated. Provider configuration belongs here rather than in the outer typed-decider fields. */
             generator?: components["schemas"]["GeneratorConfig"];
             instructions?: string;
@@ -18407,7 +18468,7 @@ export interface components {
         };
         /** @description Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges. */
         GraphResolverAdjudicationConfig: {
-            /** @description Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one. */
+            /** @description Frozen typed, generated or cascade decider configuration. Standalone generated verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds to probabilistic stages and require categorical zero-or-one terminal verdicts. A cascade answer is validated against the stage that produced it, and the receipt keeps the response's stage trace. */
             decider: components["schemas"]["DeciderConfig"];
             /** @description Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions. */
             template: string;
@@ -23426,6 +23487,8 @@ export interface components {
             resolution: {
                 /** Format: uint64 */
                 config_generation: number;
+                /** @description Shared base policy and source binding for adjudication receipts, independent of model revisions. Omitted by older writers. */
+                adjudication_execution_hash?: string;
                 skipped_mentions?: number;
                 entities: components["schemas"]["ResolverResolvedEntity"][];
                 _resolution_work?: {
@@ -24430,6 +24493,13 @@ export interface components {
              */
             audio: string;
             /**
+             * @description Clean an already finalized recognition segment without running recognition
+             *     again. Supported by named transcribers advertising text_cleanup. Set
+             *     audio to the empty string and omit attachments and recognition hints.
+             *     Partial hypotheses must never be submitted as finalized segments.
+             */
+            transcript_text?: string;
+            /**
              * @description Force the transcript language (ISO 639-1). Omit for automatic detection.
              * @example en
              */
@@ -24749,6 +24819,7 @@ export interface components {
             answers?: components["schemas"]["InferenceDecideAnswer"][];
             data?: components["schemas"]["DecisionBatchItem"][];
             usage: components["schemas"]["DecisionUsage"];
+            cascade?: components["schemas"]["DecisionCascadeTrace"];
         };
         InferenceModelsResponse: {
             /** @description Whether public inference execution is enabled on this deployment. When false, locally installed models are still listed with `invocable: false` and remote upstreams are not probed. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
@@ -30760,6 +30831,89 @@ export interface components {
             };
         };
         InferenceDecideAnswer: components["schemas"]["GeneratedChoiceAnswer"] | components["schemas"]["GeneratedMultiChoiceAnswer"] | components["schemas"]["GeneratedPredicateAnswer"] | components["schemas"]["GeneratedScoreAnswer"] | components["schemas"]["TrainedChoiceAnswer"] | components["schemas"]["TrainedScoreAnswer"] | components["schemas"]["TrainedPredicateAnswer"] | components["schemas"]["EmbeddingChoiceAnswer"] | components["schemas"]["EmbeddingMultiChoiceAnswer"];
+        /**
+         * @description A required comparison agreed, disagreed, or could not run because its stage failed with keep_previous or its upstream abstained. Disagreed and unverified outcomes abstain without discarding model answers or usage.
+         * @enum {string}
+         */
+        DecisionCascadeAgreementStatus: "agreed" | "disagreed" | "unverified";
+        /** @description Flat execution dependency relative to the upstream Decisions invocation. Model entries pin generated model revisions; cascade entries pin definitions. Unverified entries mark incomplete historical provenance and cannot authorize receipt reuse. */
+        DecisionRevisionDependency: {
+            /** @enum {string} */
+            kind: "model" | "cascade" | "unverified";
+            path: string[];
+            identity: string;
+            model?: string;
+        };
+        /** @description Bounded agreement summary reported by the stage's upstream provider. This preserves upstream abstention without recursively embedding its trace; the upstream definition is not locally verified. A disagreed or unverified upstream stops the input, including at the first or an unguarded stage. */
+        DecisionCascadeUpstreamAgreement: {
+            agreement_status: components["schemas"]["DecisionCascadeAgreementStatus"];
+            /** @description True for agreed, false for disagreed, absent for unverified. */
+            agreed?: boolean;
+            /** @description Sorted names from this stage's answers; required only for disagreed. */
+            disagreed_questions?: string[];
+            decider?: string;
+            definition_sha256?: string;
+            answered_by?: string;
+        };
+        DecisionUsage: {
+            /** @description True for estimated usage, including apportioned shared generated-batch costs and embedding-based estimates. Generated cascades divide shared totals evenly, assigning integer remainders in input order; their request aggregate remains measured. */
+            estimated?: boolean;
+            /** @description Encoded tokens including repeated input text for split model tasks. */
+            input_tokens: number;
+            /** @description Zero for classifiers, which generate no tokens. */
+            output_tokens: number;
+        };
+        DecisionCascadeStageTrace: {
+            /** @description Whether the version-2 projection has complete provenance. False preserves uncertainty without consuming a dependency slot. Required with version 2; absent with version 1, whose legacy unverified entries still imply incompleteness. Unversioned projections remain incomplete. */
+            upstream_revisions_complete?: boolean;
+            /**
+             * Format: int32
+             * @description Version 2 requires upstream_revisions_complete and separates provenance from the bounded dependency nodes. Version 1 uses legacy unverified entries to represent incompleteness. Unversioned historical projections may have lost definitions and cannot authorize identity verdict reuse.
+             */
+            upstream_revisions_version?: number;
+            /** @description Sorted question names compared by this stage. Present only when a local comparison ran. Allows upstream consumers to verify scoped agreement directly from the stage answers without reconstructing its policy. Historical traces may omit this field; ambiguous historical agreement abstains. */
+            agreement_questions?: string[];
+            /** @description Bounded upstream execution dependencies. New version-2 projections contain actual dependencies and use upstream_revisions_complete for uncertainty. Complete empty projections record no versioned dependencies. Version-1 legacy unverified entries are still readable; unversioned projections cannot prove completeness. */
+            upstream_revisions?: components["schemas"]["DecisionRevisionDependency"][];
+            upstream_agreement?: components["schemas"]["DecisionCascadeUpstreamAgreement"];
+            agreement_status?: components["schemas"]["DecisionCascadeAgreementStatus"];
+            /** @description Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable. */
+            agreed?: boolean;
+            /** @description Sorted question names that disagreed. Present only when agreement_status is disagreed. */
+            disagreed_questions?: string[];
+            name: string;
+            /** @enum {string} */
+            decision_method: "typed" | "generated";
+            model?: string;
+            /** @description Immutable model revision reported by this stage, when available. */
+            model_revision?: string;
+            /** @description This stage's answers. Absent when the stage failed. */
+            answers?: components["schemas"]["InferenceDecideAnswer"][];
+            usage?: components["schemas"]["DecisionUsage"];
+            /** @description Producer provenance reported for this stage, when present. */
+            provenance?: {
+                [key: string]: unknown;
+            };
+            /** @description Whether this answer fell inside the next stage's band, sending the input on. */
+            escalated: boolean;
+            /** @description Error code when this stage failed for the input. With on_failure keep_previous, the previous stage's answer stands. */
+            error?: string;
+        };
+        /** @description Present when a cascade decider answered. Lists the stages that ran for this input, in order. The top-level model and answers come from the answering stage, and usage is the sum over these stages. */
+        DecisionCascadeTrace: {
+            agreement_status?: components["schemas"]["DecisionCascadeAgreementStatus"];
+            /** @description Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable. */
+            agreed?: boolean;
+            /** @description Sorted question names that disagreed. Present only when agreement_status is disagreed. */
+            disagreed_questions?: string[];
+            /** @description The configured cascade name. */
+            decider: string;
+            /** @description Identity of the cascade definition, excluding credentials. Any change to stages, bands, failure policy or budget changes it. */
+            definition_sha256: string;
+            /** @description Name of the stage whose answer is final. */
+            answered_by: string;
+            stages: components["schemas"]["DecisionCascadeStageTrace"][];
+        };
         DecisionBatchItem: {
             input_index: number;
             id?: string;
@@ -30768,12 +30922,7 @@ export interface components {
             /** @description Resolved model reported for a successful named gateway batch item. */
             model?: string;
             answers: components["schemas"]["InferenceDecideAnswer"][];
-        };
-        DecisionUsage: {
-            /** @description Encoded tokens including repeated input text for split model tasks. */
-            input_tokens: number;
-            /** @description Zero for classifiers, which generate no tokens. */
-            output_tokens: number;
+            cascade?: components["schemas"]["DecisionCascadeTrace"];
         };
         QueryAdmissionConfig: {
             /**
@@ -44030,6 +44179,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["InferenceDictateRequest"];
+                "application/vnd.antfly.attachments.v1": string;
             };
         };
         responses: {

@@ -468,6 +468,7 @@ pub const DecideResponse = struct {
     answers: ?[]const DecideAnswer = null,
     data: ?[]const DecisionBatchItem = null,
     usage: DecisionUsage,
+    cascade: ?DecisionCascadeTrace = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -477,6 +478,7 @@ pub const DecideResponse = struct {
         .{ "answers", "answers", true },
         .{ "data", "data", true },
         .{ "usage", "usage", false },
+        .{ "cascade", "cascade", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -509,6 +511,10 @@ pub const DecideResponse = struct {
         }
         try jw.objectField("usage");
         try jw.write(self.usage);
+        if (self.cascade) |value| {
+            try jw.objectField("cascade");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -521,6 +527,7 @@ pub const DecisionBatchItem = struct {
     /// Resolved model reported for a successful named gateway batch item.
     model: ?[]const u8 = null,
     answers: []const DecideAnswer,
+    cascade: ?DecisionCascadeTrace = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -529,6 +536,7 @@ pub const DecisionBatchItem = struct {
         .{ "error", "error", true },
         .{ "model", "model", true },
         .{ "answers", "answers", false },
+        .{ "cascade", "cascade", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -557,6 +565,283 @@ pub const DecisionBatchItem = struct {
         }
         try jw.objectField("answers");
         try jw.write(self.answers);
+        if (self.cascade) |value| {
+            try jw.objectField("cascade");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// A required comparison agreed, disagreed, or could not run because its stage failed with keep_previous or its upstream abstained. Disagreed and unverified outcomes abstain without discarding model answers or usage.
+pub const DecisionCascadeAgreementStatus = enum {
+    agreed,
+    disagreed,
+    unverified,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .agreed => "agreed",
+            .disagreed => "disagreed",
+            .unverified => "unverified",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "agreed", .agreed },
+            .{ "disagreed", .disagreed },
+            .{ "unverified", .unverified },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const DecisionCascadeStageTrace = struct {
+    /// Whether the version-2 projection has complete provenance. False preserves uncertainty without consuming a dependency slot. Required with version 2; absent with version 1, whose legacy unverified entries still imply incompleteness. Unversioned projections remain incomplete.
+    upstream_revisions_complete: ?bool = null,
+    /// Version 2 requires upstream_revisions_complete and separates provenance from the bounded dependency nodes. Version 1 uses legacy unverified entries to represent incompleteness. Unversioned historical projections may have lost definitions and cannot authorize identity verdict reuse.
+    upstream_revisions_version: ?i32 = null,
+    /// Sorted question names compared by this stage. Present only when a local comparison ran. Allows upstream consumers to verify scoped agreement directly from the stage answers without reconstructing its policy. Historical traces may omit this field; ambiguous historical agreement abstains.
+    agreement_questions: ?[]const []const u8 = null,
+    /// Bounded upstream execution dependencies. New version-2 projections contain actual dependencies and use upstream_revisions_complete for uncertainty. Complete empty projections record no versioned dependencies. Version-1 legacy unverified entries are still readable; unversioned projections cannot prove completeness.
+    upstream_revisions: ?[]const DecisionRevisionDependency = null,
+    upstream_agreement: ?DecisionCascadeUpstreamAgreement = null,
+    agreement_status: ?DecisionCascadeAgreementStatus = null,
+    /// Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable.
+    agreed: ?bool = null,
+    /// Sorted question names that disagreed. Present only when agreement_status is disagreed.
+    disagreed_questions: ?[]const []const u8 = null,
+    name: []const u8,
+    decision_method: []const u8,
+    model: ?[]const u8 = null,
+    /// Immutable model revision reported by this stage, when available.
+    model_revision: ?[]const u8 = null,
+    /// This stage's answers. Absent when the stage failed.
+    answers: ?[]const DecideAnswer = null,
+    usage: ?DecisionUsage = null,
+    /// Producer provenance reported for this stage, when present.
+    provenance: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Whether this answer fell inside the next stage's band, sending the input on.
+    escalated: bool,
+    /// Error code when this stage failed for the input. With on_failure keep_previous, the previous stage's answer stands.
+    @"error": ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "upstream_revisions_complete", "upstream_revisions_complete", true },
+        .{ "upstream_revisions_version", "upstream_revisions_version", true },
+        .{ "agreement_questions", "agreement_questions", true },
+        .{ "upstream_revisions", "upstream_revisions", true },
+        .{ "upstream_agreement", "upstream_agreement", true },
+        .{ "agreement_status", "agreement_status", true },
+        .{ "agreed", "agreed", true },
+        .{ "disagreed_questions", "disagreed_questions", true },
+        .{ "name", "name", false },
+        .{ "decision_method", "decision_method", false },
+        .{ "model", "model", true },
+        .{ "model_revision", "model_revision", true },
+        .{ "answers", "answers", true },
+        .{ "usage", "usage", true },
+        .{ "provenance", "provenance", true },
+        .{ "escalated", "escalated", false },
+        .{ "error", "error", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.upstream_revisions_complete) |value| {
+            try jw.objectField("upstream_revisions_complete");
+            try jw.write(value);
+        }
+        if (self.upstream_revisions_version) |value| {
+            try jw.objectField("upstream_revisions_version");
+            try jw.write(value);
+        }
+        if (self.agreement_questions) |value| {
+            try jw.objectField("agreement_questions");
+            try jw.write(value);
+        }
+        if (self.upstream_revisions) |value| {
+            try jw.objectField("upstream_revisions");
+            try jw.write(value);
+        }
+        if (self.upstream_agreement) |value| {
+            try jw.objectField("upstream_agreement");
+            try jw.write(value);
+        }
+        if (self.agreement_status) |value| {
+            try jw.objectField("agreement_status");
+            try jw.write(value);
+        }
+        if (self.agreed) |value| {
+            try jw.objectField("agreed");
+            try jw.write(value);
+        }
+        if (self.disagreed_questions) |value| {
+            try jw.objectField("disagreed_questions");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("decision_method");
+        try jw.write(self.decision_method);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.model_revision) |value| {
+            try jw.objectField("model_revision");
+            try jw.write(value);
+        }
+        if (self.answers) |value| {
+            try jw.objectField("answers");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        if (self.provenance) |value| {
+            try jw.objectField("provenance");
+            try jw.write(value);
+        }
+        try jw.objectField("escalated");
+        try jw.write(self.escalated);
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Present when a cascade decider answered. Lists the stages that ran for this input, in order. The top-level model and answers come from the answering stage, and usage is the sum over these stages.
+pub const DecisionCascadeTrace = struct {
+    agreement_status: ?DecisionCascadeAgreementStatus = null,
+    /// Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable.
+    agreed: ?bool = null,
+    /// Sorted question names that disagreed. Present only when agreement_status is disagreed.
+    disagreed_questions: ?[]const []const u8 = null,
+    /// The configured cascade name.
+    decider: []const u8,
+    /// Identity of the cascade definition, excluding credentials. Any change to stages, bands, failure policy or budget changes it.
+    definition_sha256: []const u8,
+    /// Name of the stage whose answer is final.
+    answered_by: []const u8,
+    stages: []const DecisionCascadeStageTrace,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "agreement_status", "agreement_status", true },
+        .{ "agreed", "agreed", true },
+        .{ "disagreed_questions", "disagreed_questions", true },
+        .{ "decider", "decider", false },
+        .{ "definition_sha256", "definition_sha256", false },
+        .{ "answered_by", "answered_by", false },
+        .{ "stages", "stages", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.agreement_status) |value| {
+            try jw.objectField("agreement_status");
+            try jw.write(value);
+        }
+        if (self.agreed) |value| {
+            try jw.objectField("agreed");
+            try jw.write(value);
+        }
+        if (self.disagreed_questions) |value| {
+            try jw.objectField("disagreed_questions");
+            try jw.write(value);
+        }
+        try jw.objectField("decider");
+        try jw.write(self.decider);
+        try jw.objectField("definition_sha256");
+        try jw.write(self.definition_sha256);
+        try jw.objectField("answered_by");
+        try jw.write(self.answered_by);
+        try jw.objectField("stages");
+        try jw.write(self.stages);
+        try jw.endObject();
+    }
+};
+
+/// Bounded agreement summary reported by the stage's upstream provider. This preserves upstream abstention without recursively embedding its trace; the upstream definition is not locally verified. A disagreed or unverified upstream stops the input, including at the first or an unguarded stage.
+pub const DecisionCascadeUpstreamAgreement = struct {
+    agreement_status: DecisionCascadeAgreementStatus,
+    /// True for agreed, false for disagreed, absent for unverified.
+    agreed: ?bool = null,
+    /// Sorted names from this stage's answers; required only for disagreed.
+    disagreed_questions: ?[]const []const u8 = null,
+    decider: ?[]const u8 = null,
+    definition_sha256: ?[]const u8 = null,
+    answered_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "agreement_status", "agreement_status", false },
+        .{ "agreed", "agreed", true },
+        .{ "disagreed_questions", "disagreed_questions", true },
+        .{ "decider", "decider", true },
+        .{ "definition_sha256", "definition_sha256", true },
+        .{ "answered_by", "answered_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("agreement_status");
+        try jw.write(self.agreement_status);
+        if (self.agreed) |value| {
+            try jw.objectField("agreed");
+            try jw.write(value);
+        }
+        if (self.disagreed_questions) |value| {
+            try jw.objectField("disagreed_questions");
+            try jw.write(value);
+        }
+        if (self.decider) |value| {
+            try jw.objectField("decider");
+            try jw.write(value);
+        }
+        if (self.definition_sha256) |value| {
+            try jw.objectField("definition_sha256");
+            try jw.write(value);
+        }
+        if (self.answered_by) |value| {
+            try jw.objectField("answered_by");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -861,6 +1146,45 @@ pub const DecisionRequest = union(enum) {
     }
 };
 
+/// Flat execution dependency relative to the upstream Decisions invocation. Model entries pin generated model revisions; cascade entries pin definitions. Unverified entries mark incomplete historical provenance and cannot authorize receipt reuse.
+pub const DecisionRevisionDependency = struct {
+    kind: []const u8,
+    path: []const []const u8,
+    identity: []const u8,
+    model: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "path", "path", false },
+        .{ "identity", "identity", false },
+        .{ "model", "model", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("path");
+        try jw.write(self.path);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const DecisionSimilarity = struct {
     value: []const u8,
     similarity: f64,
@@ -952,10 +1276,40 @@ pub const DecisionTableSource = struct {
 };
 
 pub const DecisionUsage = struct {
+    /// True for estimated usage, including apportioned shared generated-batch costs and embedding-based estimates. Generated cascades divide shared totals evenly, assigning integer remainders in input order; their request aggregate remains measured.
+    estimated: ?bool = null,
     /// Encoded tokens including repeated input text for split model tasks.
     input_tokens: i64,
     /// Zero for classifiers, which generate no tokens.
     output_tokens: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "estimated", "estimated", true },
+        .{ "input_tokens", "input_tokens", false },
+        .{ "output_tokens", "output_tokens", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.estimated) |value| {
+            try jw.objectField("estimated");
+            try jw.write(value);
+        }
+        try jw.objectField("input_tokens");
+        try jw.write(self.input_tokens);
+        try jw.objectField("output_tokens");
+        try jw.write(self.output_tokens);
+        try jw.endObject();
+    }
 };
 
 /// Raw cosine scores are neither probabilities nor confidence. Empty means no label met its threshold; abstained means the requested margin could not be established.

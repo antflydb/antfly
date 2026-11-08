@@ -287,12 +287,23 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .database_catalog_record import DatabaseCatalogRecord
 from .date_range_string_query import DateRangeStringQuery
+from .decider_cascade import DeciderCascade
+from .decider_cascade_budget import DeciderCascadeBudget
+from .decider_cascade_stage import DeciderCascadeStage
+from .decider_cascade_stage_on_failure import DeciderCascadeStageOnFailure
+from .decider_cascade_stage_when import DeciderCascadeStageWhen
 from .decider_config import DeciderConfig
 from .decider_config_decision_method import DeciderConfigDecisionMethod
 from .decider_config_embedding_options import DeciderConfigEmbeddingOptions
 from .decider_config_embedding_options_task_type import DeciderConfigEmbeddingOptionsTaskType
 from .decider_config_provider import DeciderConfigProvider
 from .decision_batch_item import DecisionBatchItem
+from .decision_cascade_agreement_status import DecisionCascadeAgreementStatus
+from .decision_cascade_stage_trace import DecisionCascadeStageTrace
+from .decision_cascade_stage_trace_decision_method import DecisionCascadeStageTraceDecisionMethod
+from .decision_cascade_stage_trace_provenance import DecisionCascadeStageTraceProvenance
+from .decision_cascade_trace import DecisionCascadeTrace
+from .decision_cascade_upstream_agreement import DecisionCascadeUpstreamAgreement
 from .decision_choice import DecisionChoice
 from .decision_choice_probability import DecisionChoiceProbability
 from .decision_evidence_image import DecisionEvidenceImage
@@ -309,6 +320,8 @@ from .decision_evidence_text_type import DecisionEvidenceTextType
 from .decision_input import DecisionInput
 from .decision_level import DecisionLevel
 from .decision_level_probability import DecisionLevelProbability
+from .decision_revision_dependency import DecisionRevisionDependency
+from .decision_revision_dependency_kind import DecisionRevisionDependencyKind
 from .decision_similarity import DecisionSimilarity
 from .decision_table_source import DecisionTableSource
 from .decision_table_source_filter_query import DecisionTableSourceFilterQuery
@@ -350,6 +363,7 @@ from .document_artifact_table_reprocess_response_reprocess_status import (
     DocumentArtifactTableReprocessResponseReprocessStatus,
 )
 from .document_extraction_config import DocumentExtractionConfig
+from .document_extraction_config_checksum_algorithm import DocumentExtractionConfigChecksumAlgorithm
 from .document_extraction_config_route_preset import DocumentExtractionConfigRoutePreset
 from .document_extraction_native_text_config import DocumentExtractionNativeTextConfig
 from .document_extraction_native_text_config_policy import DocumentExtractionNativeTextConfigPolicy
@@ -2919,12 +2933,23 @@ __all__ = (
     "DataShapeDecl",
     "DataShapeKind",
     "DateRangeStringQuery",
+    "DeciderCascade",
+    "DeciderCascadeBudget",
+    "DeciderCascadeStage",
+    "DeciderCascadeStageOnFailure",
+    "DeciderCascadeStageWhen",
     "DeciderConfig",
     "DeciderConfigDecisionMethod",
     "DeciderConfigEmbeddingOptions",
     "DeciderConfigEmbeddingOptionsTaskType",
     "DeciderConfigProvider",
     "DecisionBatchItem",
+    "DecisionCascadeAgreementStatus",
+    "DecisionCascadeStageTrace",
+    "DecisionCascadeStageTraceDecisionMethod",
+    "DecisionCascadeStageTraceProvenance",
+    "DecisionCascadeTrace",
+    "DecisionCascadeUpstreamAgreement",
     "DecisionChoice",
     "DecisionChoiceProbability",
     "DecisionEvidenceImage",
@@ -2941,6 +2966,8 @@ __all__ = (
     "DecisionInput",
     "DecisionLevel",
     "DecisionLevelProbability",
+    "DecisionRevisionDependency",
+    "DecisionRevisionDependencyKind",
     "DecisionSimilarity",
     "DecisionTableSource",
     "DecisionTableSourceFilterQuery",
@@ -2980,6 +3007,7 @@ __all__ = (
     "DocumentArtifactTableReprocessResponseReprocess",
     "DocumentArtifactTableReprocessResponseReprocessStatus",
     "DocumentExtractionConfig",
+    "DocumentExtractionConfigChecksumAlgorithm",
     "DocumentExtractionConfigRoutePreset",
     "DocumentExtractionNativeTextConfig",
     "DocumentExtractionNativeTextConfigPolicy",

@@ -343,22 +343,23 @@ test "producer JSON equality ignores object key order" {
 /// looking artifacts with weaker semantics. Fence it before storing the catalog.
 pub fn requiredReaderVersion(alloc: Allocator, cfg: @import("../catalog/enrichment_catalog.zig").EnrichmentConfig) !u32 {
     const catalog = @import("../catalog/resolver_catalog.zig");
-    if (cfg.group_source_json.len > 0 or cfg.prior_context_json.len > 0) return catalog.grouped_sources_reader_version;
-    if (cfg.kind != .asset or cfg.producer_json.len == 0) return 1;
+    const baseline: u32 = if (cfg.group_source_json.len > 0 or cfg.prior_context_json.len > 0) catalog.grouped_sources_reader_version else 1;
+    if (cfg.kind != .asset or cfg.producer_json.len == 0) return baseline;
     var producer = try asset_producer.parseProducerConfig(alloc, cfg.producer_json);
     defer producer.deinit(alloc);
     if (producer.type == .generator) {
         var config = try @import("../../../generating/producer_config.zig").parse(alloc, producer.config_json);
         defer config.deinit(alloc);
-        if (config.output_schema != null) return catalog.generated_producers_reader_version;
+        if (config.output_schema != null) return @max(baseline, catalog.generated_producers_reader_version);
     } else if (producer.type == .extractor) {
-        if (try @import("antfly_structured").extraction.isGenerated(alloc, producer.config_json)) return catalog.generated_producers_reader_version;
+        if (try @import("antfly_structured").extraction.isGenerated(alloc, producer.config_json)) return @max(baseline, catalog.generated_producers_reader_version);
     } else if (producer.type == .decision) {
         const spec = try @import("../../../functions/materialization.zig").parse(alloc, producer.config_json);
         defer spec.deinit();
-        if (spec.value.decider.decision_method == .generated) return catalog.generated_producers_reader_version;
+        if (spec.value.decider.decision_method == .cascade) return @max(baseline, if (@import("antfly_decisions").cascade.requiresAgreement(spec.value.decider.cascade.?)) catalog.cascade_agreement_reader_version else catalog.decider_cascade_reader_version);
+        if (spec.value.decider.decision_method == .generated) return @max(baseline, catalog.generated_producers_reader_version);
     }
-    return 1;
+    return baseline;
 }
 
 pub fn priorSharesGroup(configs: anytype, name: []const u8, prior: []const u8) bool {

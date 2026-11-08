@@ -6336,6 +6336,33 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendForConsumers(alloc, dense_embeddings, request.doc_key, null, artifact_key, vector, consumer_indexes);
         }
 
+        fn reuseDocumentExtractionByFingerprint(
+            alloc: Allocator,
+            db: anytype,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            fingerprint: []const u8,
+            existing_state: ?[]const u8,
+            existing_manifest: ?[]const u8,
+            manifest_key: []const u8,
+            generation: u64,
+            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+        ) !bool {
+            const state = existing_state orelse return false;
+            const manifest = existing_manifest orelse return false;
+            if (!documentExtractionStateFingerprintMatches(alloc, state, fingerprint) or
+                !documentExtractionStateHasChunkUnitFingerprints(alloc, state)) return false;
+            const has_error = documentExtractionManifestHasLastError(alloc, manifest) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => true,
+            };
+            if (has_error) return false;
+            try appendDocumentExtractionNavigationBackfill(alloc, db, doc_key, artifact_name, fingerprint, state, generation, artifact_writes, artifact_delete_keys);
+            try artifact_writes.append(alloc, .{ .key = try alloc.dupe(u8, manifest_key), .value = try alloc.dupe(u8, manifest) });
+            return true;
+        }
+
         pub fn computeDocumentExtractionAssetRequestDerived(
             alloc: Allocator,
             db: anytype,
@@ -6388,38 +6415,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, source_url, config_json, config);
             defer if (metadata_fingerprint) |fingerprint| alloc.free(fingerprint);
+            // As in async replay, checksum opt-in requires verified bytes;
+            // metadata-only legacy fingerprints cannot prove that provenance.
             if (!force_reprocess) {
                 if (metadata_fingerprint) |fingerprint| {
-                    if (existing_state) |state| {
-                        if (documentExtractionStateFingerprintMatches(alloc, state, fingerprint) and
-                            documentExtractionStateHasChunkUnitFingerprints(alloc, state))
-                        {
-                            if (existing_manifest) |value| {
-                                const manifest_has_last_error = documentExtractionManifestHasLastError(alloc, value) catch |err| switch (err) {
-                                    error.OutOfMemory => return err,
-                                    else => true,
-                                };
-                                if (!manifest_has_last_error) {
-                                    try appendDocumentExtractionNavigationBackfill(
-                                        alloc,
-                                        db,
-                                        request.doc_key,
-                                        artifact_name,
-                                        fingerprint,
-                                        state,
-                                        from_generation,
-                                        artifact_writes,
-                                        artifact_delete_keys,
-                                    );
-                                    try artifact_writes.append(alloc, .{
-                                        .key = try alloc.dupe(u8, manifest_key),
-                                        .value = try alloc.dupe(u8, value),
-                                    });
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                    if (try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
                 }
             }
 
@@ -6439,6 +6439,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (extraction_budgeted) |*budgeted| budgeted.deinit();
             const extraction_alloc = if (extraction_budgeted) |*budgeted| budgeted.allocator() else alloc;
 
+            // See the matching log in enrichment_runtime.zig's
+            // processDocumentExtractionAsset: past this point the declared
+            // digest, if any, did not already prove this extraction
+            // unnecessary.
+            std.log.info("document extraction fetching source: doc_key={s} artifact={s}", .{ request.doc_key, artifact_name });
             const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
                 extraction_alloc,
                 remoteRenderConfig(db, null),
@@ -6466,6 +6471,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             var downloaded_mut = downloaded;
             defer downloaded_mut.deinit(extraction_alloc);
+
+            // Verify the declared digest against the bytes actually fetched,
+            // before any of them can be extracted, embedded, or otherwise
+            // referenced. downloaded_mut.data is already fully buffered by
+            // this path, so hashing it here adds no additional buffering,
+            // only an extra pass over memory already resident.
+            if (config.checksum_algorithm != null and config.checksum.len > 0) {
+                var content_digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(downloaded_mut.data, &content_digest, .{});
+                document_extraction_mod.verifyChecksumDigest(config, &content_digest) catch |raw_err| {
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(raw_err), "declared checksum does not match the downloaded bytes", "document_checksum_verification", artifact_writes);
+                    return;
+                };
+            }
+
+            const byte_source_fingerprint = if (metadata_fingerprint == null)
+                try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded_mut.content_type) orelse try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
+            else
+                null;
+            defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
+            const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
+
+            if (metadata_fingerprint == null and !force_reprocess and
+                try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, source_fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
 
             // Downloaded bytes, inspection state, and decoded extraction results are
             // charged at their actual live allocator size. OCR render scratch plus
@@ -6533,13 +6562,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return error.MissingAssetProducer;
             }
             document_extraction_mod.rebaseUnitCharOffsets(extraction.units);
-
-            const byte_source_fingerprint = if (metadata_fingerprint == null)
-                try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
-            else
-                null;
-            defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
-            const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
 
             var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
             defer {

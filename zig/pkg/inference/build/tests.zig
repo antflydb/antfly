@@ -86,6 +86,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("httpx", ctx.graph.httpx_mod);
     tests.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
     tests.root_module.addImport("inference_api", ctx.graph.inference_api_mod);
+    tests.root_module.addImport("antfly_generating", ctx.graph.inference_mod.import_table.get("antfly_generating").?);
     tests.root_module.addImport("antfly_generating_openapi", ctx.graph.generating_openapi_mod);
     tests.root_module.addImport("antfly_extraction_openapi", ctx.graph.extraction_openapi_mod);
     tests.root_module.addImport("antfly_extracting", ctx.graph.extracting_mod);
@@ -257,7 +258,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_bge_m3_e2e_bench_tests = checks.bge_benchmark;
     const test_step = ctx.step("test", "Run unit tests");
     const media_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/media/src/inference.zig" })),
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/media/inference_test_root.zig" })),
         .target = ctx.target,
         .optimize = ctx.optimize,
     }) });

@@ -96,6 +96,8 @@ pub const Model = struct {
     /// `location` entries. When null, external tensors become parameters and
     /// the caller is responsible for loading their data.
     base_dir: ?[]const u8 = null,
+    /// Borrowed only for synchronous conversion and initializer loading.
+    external_reader: ?tensor_mod.ExternalDataReader = null,
 
     // Pre-built indexes (populated in init)
     output_to_node: std.StringHashMapUnmanaged(u32),
@@ -392,7 +394,7 @@ pub const Model = struct {
         _ = self.graph() orelse return error.NodeNotFound;
         const idx = self.initializer_map.get(name) orelse return error.NodeNotFound;
         const tensor = try self.initializerAt(idx);
-        return tensor_mod.extractFloat32WithExternal(allocator, tensor, self.base_dir);
+        return tensor_mod.extractFloat32WithReader(allocator, tensor, self.base_dir, self.external_reader);
     }
 
     /// Convert the ONNX graph to a termite Graph.
@@ -556,7 +558,7 @@ pub const Model = struct {
             const can_load_external = !tensor.isExternal() or self.base_dir != null;
             if (count <= 16 and is_small_type and can_load_external) {
                 if (shape.dtype != .f32) {
-                    const bytes = tensor_mod.extractNativeBytesWithExternal(allocator, tensor, self.base_dir) catch |e| {
+                    const bytes = tensor_mod.extractNativeBytesWithReader(allocator, tensor, self.base_dir, self.external_reader) catch |e| {
                         log.warn("initializer '{s}': failed to load native data ({}), falling back to parameter", .{ name, e });
                         const node_id = try builder.parameter(name, shape);
                         try converted.put(allocator, name, node_id);
@@ -569,7 +571,7 @@ pub const Model = struct {
                     return node_id;
                 }
 
-                const data = tensor_mod.extractFloat32WithExternal(allocator, tensor, self.base_dir) catch |e| {
+                const data = tensor_mod.extractFloat32WithReader(allocator, tensor, self.base_dir, self.external_reader) catch |e| {
                     log.warn("initializer '{s}': failed to load data ({}), falling back to parameter", .{ name, e });
                     const node_id = try builder.parameter(name, shape);
                     try converted.put(allocator, name, node_id);
