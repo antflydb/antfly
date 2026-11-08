@@ -52,6 +52,7 @@ const relational_index_catalog = @import("relational_index_catalog.zig");
 const relational_index_jobs = @import("relational_index_jobs.zig");
 const relational_index_plans = @import("relational_index_plan.zig");
 const relational_index_records = @import("relational_index_records.zig");
+const wal_trace = @import("../write_amplification_trace.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const relational_store = @import("relational_store.zig");
 const replay_reference = @import("derived/replay_reference.zig");
@@ -3319,7 +3320,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // lite-single-commit-write-path.md §3.3a: the graph extension
             // of the fast path above. Deliberately narrow -- exactly one
             // graph edge write and nothing else graph-related in this
-            // batch (no deletes, no doc clears, no artifact
+            // batch (no deletes, no doc clears, no OTHER artifact
             // materialization) -- so every precondition
             // `prepareInlineGraphPublication`/`graphEdgeWriteEligibleFor
             // InlinePublication` cannot itself check (multiple edges in
@@ -3331,18 +3332,73 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // own, matching `types.SyncLevel`'s enum order and
             // `collectManagedSyncTargetsWithGeneratedSource`'s treatment
             // of non-full_text managed indexes.
+            //
+            // `changed_artifact_keys` is *not* required to be empty: every
+            // `effective_req.graph_writes` entry unconditionally produces
+            // its own "graph relationship artifact" record (`appendGraph
+            // EdgeArtifactWrite`, above, well before this check) -- the
+            // durable record that lets a later source-document delete find
+            // and retire this edge. For the single-caller-supplied-edge
+            // case (the common shape: a plain `graph_writes` batch with no
+            // owner/owner_document, no document body, no field-derived
+            // contributors) that one key is *always* present and is always
+            // this same write's own artifact, which already lands in the
+            // primary commit's `write_buffers.store_writes` unconditionally
+            // above, independent of whether the graph index's own forward/
+            // reverse publication below is inline or not. So a batch whose
+            // only changed-artifact key is verifiably this write's own
+            // artifact is exactly as narrow as the empty case this gate
+            // originally required -- not a batch with unrelated/multiple
+            // artifact effects needing the slow path's own ordering.
             var inline_graph_publication: ?*InlineGraphPublication = null;
             var inline_graph_handled_name: []const u8 = &.{};
             defer if (inline_graph_publication) |prepared| prepared.abort();
             defer if (inline_graph_handled_name.len != 0) S.ownerField(self, "alloc").*.free(@constCast(inline_graph_handled_name));
-            if (append_derived_replay and effective_req.sync_level == .full_index and
+            var graph_own_artifact_key: ?[]u8 = null;
+            defer if (graph_own_artifact_key) |key| S.ownerField(self, "alloc").*.free(key);
+            if (materialized_derived_batch != null and materialized_derived_batch.?.graph_writes.len == 1) {
+                const w = materialized_derived_batch.?.graph_writes[0];
+                const owner_key = if (w.owner_document.len > 0) w.owner_document else if (w.owner.len > 0) w.owner else w.source;
+                graph_own_artifact_key = internal_keys.graphRelationshipArtifactKeyAlloc(
+                    S.ownerField(self, "alloc").*,
+                    owner_key,
+                    w.index_name,
+                    w.edge_type,
+                    w.target,
+                    w.source,
+                    w.edge_id,
+                ) catch null;
+            }
+            const graph_changed_artifacts_are_own_edge = materialized_derived_batch != null and
+                materialized_derived_batch.?.changed_artifact_keys.len == 1 and
+                graph_own_artifact_key != null and
+                std.mem.eql(u8, materialized_derived_batch.?.changed_artifact_keys[0], graph_own_artifact_key.?);
+            // Diagnostic (test-only, see write_amplification_trace.zig):
+            // distinguishes "never attempted" (this batch's shape failed
+            // the caller-level gate below) from every reason `prepare*`
+            // itself can reject a write, so the write-amplification
+            // harness's graph mode can report exactly why it never shows
+            // one durable commit per write instead of guessing from the
+            // aggregate fsync/commit counts alone.
+            const graph_write_batch = materialized_derived_batch != null and materialized_derived_batch.?.graph_writes.len != 0;
+            const graph_gate_ok = append_derived_replay and effective_req.sync_level == .full_index and
                 opts.transaction_resolution == null and materialized_derived_batch != null and
                 materialized_derived_batch.?.graph_writes.len == 1 and
                 materialized_derived_batch.?.graph_deletes.len == 0 and
                 materialized_derived_batch.?.graph_doc_clears.len == 0 and
-                materialized_derived_batch.?.changed_artifact_keys.len == 0 and
-                materialized_derived_batch.?.deleted_keys.len == 0)
-            {
+                (materialized_derived_batch.?.changed_artifact_keys.len == 0 or graph_changed_artifacts_are_own_edge) and
+                materialized_derived_batch.?.deleted_keys.len == 0;
+            if (graph_write_batch and !graph_gate_ok) {
+                if (!append_derived_replay) wal_trace.recordOp(.graph_inline_gate_not_append_derived_replay);
+                if (effective_req.sync_level != .full_index) wal_trace.recordOp(.graph_inline_gate_sync_level_not_full_index);
+                if (opts.transaction_resolution != null) wal_trace.recordOp(.graph_inline_gate_transaction_resolution);
+                if (materialized_derived_batch.?.graph_writes.len != 1) wal_trace.recordOp(.graph_inline_gate_multiple_graph_writes);
+                if (materialized_derived_batch.?.graph_deletes.len != 0) wal_trace.recordOp(.graph_inline_gate_graph_deletes_present);
+                if (materialized_derived_batch.?.graph_doc_clears.len != 0) wal_trace.recordOp(.graph_inline_gate_graph_doc_clears_present);
+                if (materialized_derived_batch.?.changed_artifact_keys.len != 0 and !graph_changed_artifacts_are_own_edge) wal_trace.recordOp(.graph_inline_gate_changed_artifact_keys_present);
+                if (materialized_derived_batch.?.deleted_keys.len != 0) wal_trace.recordOp(.graph_inline_gate_deleted_keys_present);
+            }
+            if (graph_gate_ok) {
                 const write = materialized_derived_batch.?.graph_writes[0];
                 const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = write.index_name, .kind = .graph };
                 if (prepareInlineGraphPublication(
@@ -3358,7 +3414,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     };
                     inline_graph_publication = prepared;
                     inline_graph_handled_name = handled_name;
-                } else |_| {}
+                    wal_trace.recordOp(.graph_inline_engaged);
+                } else |err| {
+                    // `graphEdgeWriteEligibleForInlinePublication`/
+                    // `prepareInlineEdgePublication` already recorded a
+                    // specific reason for `error.InlineGraphPublicationUnsupported`/
+                    // `error.InlineEdgePublicationUnsupported`; only an
+                    // unexpected error (allocator failure, a real bug) needs
+                    // recording here.
+                    if (err != error.InlineGraphPublicationUnsupported) wal_trace.recordOp(.graph_inline_prepare_other_error);
+                }
+            } else if (graph_write_batch) {
+                wal_trace.recordOp(.graph_inline_caller_gate_failed);
             }
             // lite-single-commit-write-path.md §3.3a's sparse extension of
             // the fast path above, mirroring the graph block immediately

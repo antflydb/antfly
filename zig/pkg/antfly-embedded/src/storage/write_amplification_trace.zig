@@ -125,6 +125,49 @@ pub const Op = enum(u8) {
     maintenance_lease_acquired,
     serving_runtime_refresh,
     derived_worker_turn,
+    // Diagnostic breakdown of why `mutation_commit.zig`'s graph-edge inline
+    // publication fast path did or didn't engage for a given write -- added
+    // to find which gate was rejecting the write-amplification harness's
+    // own caller-supplied-edge graph mode (it never showed 1 commit/write).
+    // `graph_inline_engaged` is the only "it worked" outcome; every other
+    // `graph_inline_*` tag is mutually exclusive with it and with each
+    // other for one write, so their sum across one mode run always equals
+    // that mode's update count.
+    graph_inline_engaged,
+    // The caller-level shape gate in `mutation_commit.zig`
+    // (`batchInternalPreparedOwned`) never even attempted
+    // `prepareInlineGraphPublication` for this write. Split by which
+    // specific sub-condition of that AND-chain was false (more than one can
+    // be false for the same write; each false sub-condition increments its
+    // own counter, so these can sum to more than the write count).
+    graph_inline_caller_gate_failed,
+    graph_inline_gate_not_append_derived_replay,
+    graph_inline_gate_sync_level_not_full_index,
+    graph_inline_gate_transaction_resolution,
+    graph_inline_gate_multiple_graph_writes,
+    graph_inline_gate_graph_deletes_present,
+    graph_inline_gate_graph_doc_clears_present,
+    graph_inline_gate_changed_artifact_keys_present,
+    graph_inline_gate_deleted_keys_present,
+    // `IndexManager.graphEdgeWriteEligibleForInlinePublication` rejected the
+    // write before `prepareInlineEdgePublication` was even called.
+    graph_inline_eligibility_ttl,
+    graph_inline_eligibility_contributors,
+    graph_inline_eligibility_owner,
+    graph_inline_eligibility_out_of_range,
+    // `graph/graph.zig`'s `GraphIndex.prepareInlineEdgePublication` itself
+    // rejected the write despite passing the `IndexManager`-layer gate
+    // above.
+    graph_inline_prepare_backend_mismatch,
+    graph_inline_prepare_owner,
+    graph_inline_prepare_ttl,
+    graph_inline_prepare_metrics,
+    // Any other error out of `prepareInlineGraphPublication` (allocator
+    // failure, a real bug, a validation error on a malformed write) --
+    // caught the same way `error.InlineGraphPublicationUnsupported` is at
+    // the call site, so distinguishing it here is the only way to see it
+    // was not one of the expected "fall back to the slow path" reasons.
+    graph_inline_prepare_other_error,
 };
 const op_count = std.meta.tags(Op).len;
 
