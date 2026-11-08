@@ -145,7 +145,7 @@ pub const Routed = struct {
     request: @import("../api/operation.zig").RequestContext = .{},
 
     pub fn backend(self: *Routed) service.Backend {
-        return .{ .ptr = self, .random_bytes = if (self.request.fanout_io != null or self.request.deadline_io != null) randomBytes else null, .get = get, .get_brief = getBrief, .get_many = getMany, .get_many_brief = getManyBrief, .scan = scan, .scan_brief = scanBrief, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .drop_index = dropIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
+        return .{ .ptr = self, .random_bytes = if (self.request.fanout_io != null or self.request.deadline_io != null) randomBytes else null, .get = get, .get_metadata = getMetadata, .get_many = getMany, .get_many_metadata = getManyMetadata, .scan = scan, .scan_metadata = scanMetadata, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .drop_index = dropIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
     }
     fn randomBytes(ptr: *anyopaque, bytes: []u8) !void {
         const self: *Routed = @ptrCast(@alignCast(ptr));
@@ -230,17 +230,17 @@ pub const Routed = struct {
     fn getMany(ptr: *anyopaque, a: A, keys: []const []const u8) ![]const ?service.Row {
         return getManyImpl(ptr, a, keys, false);
     }
-    fn getBrief(ptr: *anyopaque, a: A, key: []const u8) !?service.Row {
-        return (try getManyBrief(ptr, a, &.{key}))[0];
+    fn getMetadata(ptr: *anyopaque, a: A, key: []const u8) !?service.Row {
+        return (try getManyMetadata(ptr, a, &.{key}))[0];
     }
-    fn getManyBrief(ptr: *anyopaque, a: A, keys: []const []const u8) ![]const ?service.Row {
+    fn getManyMetadata(ptr: *anyopaque, a: A, keys: []const []const u8) ![]const ?service.Row {
         return getManyImpl(ptr, a, keys, true);
     }
     fn getManyImpl(ptr: *anyopaque, a: A, keys: []const []const u8, brief: bool) ![]const ?service.Row {
         const self: *Routed = @ptrCast(@alignCast(ptr));
         try self.context.check();
         var request = try hydrationRequest(keys);
-        if (brief) request.fields = service.brief_projection_fields;
+        if (brief) request.fields = service.assertion_metadata_fields;
         request.execution_deadline_ns = self.request.deadline_ns;
         request.cancellation = self.request.cancellation;
         var documents = (try self.reads.hydrateDocuments(a, self.table, request, .read_index)) orelse return error.MemorySpaceNotFound;
@@ -258,7 +258,7 @@ pub const Routed = struct {
     fn scan(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32) !service.Page {
         return scanImpl(ptr, a, prefix, cursor, limit, false);
     }
-    fn scanBrief(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32) !service.Page {
+    fn scanMetadata(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32) !service.Page {
         return scanImpl(ptr, a, prefix, cursor, limit, true);
     }
     fn scanImpl(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32, brief: bool) !service.Page {
@@ -266,7 +266,7 @@ pub const Routed = struct {
         try self.context.check();
         try validateCursor(prefix, cursor);
         const end = try prefixEnd(a, prefix);
-        const response = (try self.reads.scan(a, self.table, cursor orelse prefix, end, .{ .execution_deadline_ns = self.request.deadline_ns, .cancellation = self.request.cancellation, .include_documents = true, .fields = if (brief) service.brief_projection_fields else &.{}, .include_all_fields = !brief, .inclusive_from = cursor == null, .exclusive_to = true, .limit = limit + 1 }, .read_index)) orelse return error.MemorySpaceNotFound;
+        const response = (try self.reads.scan(a, self.table, cursor orelse prefix, end, .{ .execution_deadline_ns = self.request.deadline_ns, .cancellation = self.request.cancellation, .include_documents = true, .fields = if (brief) service.assertion_metadata_fields else &.{}, .include_all_fields = !brief, .inclusive_from = cursor == null, .exclusive_to = true, .limit = limit + 1 }, .read_index)) orelse return error.MemorySpaceNotFound;
         var rows: std.ArrayList(service.Row) = .empty;
         var lines = std.mem.tokenizeScalar(u8, response.ndjson, '\n');
         while (lines.next()) |line| {
@@ -303,7 +303,7 @@ pub fn Native(comptime DB: type) type {
         resource_fn: ?*const fn (*anyopaque, A, service.types.provenance.Resource) anyerror!service.types.provenance.Snapshot = null,
         const Self = @This();
         pub fn backend(self: *Self) service.Backend {
-            return .{ .ptr = self, .random_bytes = if (self.db.backend_runtime.io() != null) randomBytes else null, .get = get, .get_brief = getBrief, .get_many = getMany, .get_many_brief = getManyBrief, .scan = scan, .scan_brief = scanBrief, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .drop_index = dropIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
+            return .{ .ptr = self, .random_bytes = if (self.db.backend_runtime.io() != null) randomBytes else null, .get = get, .get_metadata = getMetadata, .get_many = getMany, .get_many_metadata = getManyMetadata, .scan = scan, .scan_metadata = scanMetadata, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .drop_index = dropIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
         }
         fn randomBytes(ptr: *anyopaque, bytes: []u8) !void {
             const self: *Self = @ptrCast(@alignCast(ptr));
@@ -362,10 +362,10 @@ pub fn Native(comptime DB: type) type {
         fn getMany(ptr: *anyopaque, a: A, keys: []const []const u8) ![]const ?service.Row {
             return getManyImpl(ptr, a, keys, false);
         }
-        fn getBrief(ptr: *anyopaque, a: A, key: []const u8) !?service.Row {
-            return (try getManyBrief(ptr, a, &.{key}))[0];
+        fn getMetadata(ptr: *anyopaque, a: A, key: []const u8) !?service.Row {
+            return (try getManyMetadata(ptr, a, &.{key}))[0];
         }
-        fn getManyBrief(ptr: *anyopaque, a: A, keys: []const []const u8) ![]const ?service.Row {
+        fn getManyMetadata(ptr: *anyopaque, a: A, keys: []const []const u8) ![]const ?service.Row {
             return getManyImpl(ptr, a, keys, true);
         }
         fn getManyImpl(ptr: *anyopaque, a: A, keys: []const []const u8, brief: bool) ![]const ?service.Row {
@@ -377,7 +377,7 @@ pub fn Native(comptime DB: type) type {
                 try self.context.check();
                 // Native hydration is exact primary lookup. The public search
                 // entry point intentionally rejects lookup-authority requests.
-                const row = try self.db.lookup(a, key, .{ .fields = if (brief) service.brief_projection_fields else &.{}, .include_all_fields = !brief });
+                const row = try self.db.lookup(a, key, .{ .fields = if (brief) service.assertion_metadata_fields else &.{}, .include_all_fields = !brief });
                 out.* = if (row) |value| .{ .key = key, .json = try decodeRow(a, value.json), .version = value.version orelse 0, .digest = value.expected_content_digest } else null;
             }
             return rows;
@@ -391,14 +391,14 @@ pub fn Native(comptime DB: type) type {
         fn scan(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32) !service.Page {
             return scanImpl(ptr, a, prefix, cursor, limit, false);
         }
-        fn scanBrief(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32) !service.Page {
+        fn scanMetadata(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32) !service.Page {
             return scanImpl(ptr, a, prefix, cursor, limit, true);
         }
         fn scanImpl(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32, brief: bool) !service.Page {
             const self: *Self = @ptrCast(@alignCast(ptr));
             try self.context.check();
             try validateCursor(prefix, cursor);
-            const result = try self.db.scan(a, cursor orelse prefix, try prefixEnd(a, prefix), .{ .include_documents = true, .fields = if (brief) service.brief_projection_fields else &.{}, .include_all_fields = !brief, .inclusive_from = cursor == null, .exclusive_to = true, .limit = limit + 1 });
+            const result = try self.db.scan(a, cursor orelse prefix, try prefixEnd(a, prefix), .{ .include_documents = true, .fields = if (brief) service.assertion_metadata_fields else &.{}, .include_all_fields = !brief, .inclusive_from = cursor == null, .exclusive_to = true, .limit = limit + 1 });
             const rows = try a.alloc(service.Row, result.documents.len);
             for (result.documents, rows) |document, *row| row.* = .{ .key = document.id, .json = try decodeRow(a, document.json) };
             const count = @min(rows.len, limit);

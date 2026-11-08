@@ -112,7 +112,7 @@ pub const RecallSearchRequest = struct {
 pub const RecallSearchPage = struct { keys: []const []const u8, more: bool };
 /// Preserve every field used by native authorization, temporal/support policy
 /// and brief ranking; discard only payloads never read by those paths.
-pub const brief_projection_fields: []const []const u8 = blk: {
+pub const assertion_metadata_fields: []const []const u8 = blk: {
     const skipped = .{ "steps", "preconditions", "expected_outcome", "embedding", "embedding_model" };
     var fields: [@typeInfo(t.StoredAssertion).@"struct".field_names.len + @typeInfo(t.Assertion).@"struct".field_names.len - skipped.len][]const u8 = undefined;
     var count: usize = 0;
@@ -142,10 +142,10 @@ pub const Backend = struct {
     // Bounded data-only hydration; never used for control CAS tokens.
     get_many: ?*const fn (*anyopaque, A, []const []const u8) anyerror![]const ?Row = null,
     scan: *const fn (*anyopaque, A, []const u8, ?[]const u8, u32) anyerror!Page,
-    /// Read-only brief hydration omits non-policy procedural/vector payloads.
-    get_brief: ?*const fn (*anyopaque, A, []const u8) anyerror!?Row = null,
-    scan_brief: ?*const fn (*anyopaque, A, []const u8, ?[]const u8, u32) anyerror!Page = null,
-    get_many_brief: ?*const fn (*anyopaque, A, []const []const u8) anyerror![]const ?Row = null,
+    /// Read-only metadata hydration omits non-policy procedural/vector payloads.
+    get_metadata: ?*const fn (*anyopaque, A, []const u8) anyerror!?Row = null,
+    scan_metadata: ?*const fn (*anyopaque, A, []const u8, ?[]const u8, u32) anyerror!Page = null,
+    get_many_metadata: ?*const fn (*anyopaque, A, []const []const u8) anyerror![]const ?Row = null,
     commit: *const fn (*anyopaque, A, ?Row, []const Change) anyerror!void,
     // Model integration must use Antfly's admitted provider/runtime. No model
     // client or credentials are owned by this policy module.
@@ -607,7 +607,7 @@ const Run = struct {
     retention_maintenance: bool = false,
     administrative_view: bool = false,
     resource_states: std.StringHashMapUnmanaged(ResourceRead) = .empty,
-    brief_resources: std.StringHashMapUnmanaged(ResourceRead) = .empty,
+    scratch_resources: std.StringHashMapUnmanaged(ResourceRead) = .empty,
     judged_views: std.ArrayList(t.EntityViewInput) = .empty,
     inferred: bool = false,
     semantic_ready_after_commit: bool = false,
@@ -635,44 +635,120 @@ const Run = struct {
     backend_rows: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     historical: std.StringHashMapUnmanaged(?t.StoredAssertion) = .empty,
     utility_outcomes: std.StringHashMapUnmanaged(bool) = .empty,
-    utility_cache_owner: ?*Run = null,
-    brief_read_budget: ?*BriefReadBudget = null,
-    brief_rows: std.StringHashMapUnmanaged(Row) = .empty,
-    brief_cache_bytes: usize = 0,
-    brief_batched_prefetch: bool = false,
+    read_owner: ?*Run = null,
+    metadata_read_budget: ?*MetadataReadBudget = null,
+    read_proofs: std.StringHashMapUnmanaged(Row) = .empty,
+    read_proof_bytes: usize = 0,
+    metadata_batched_prefetch: bool = false,
     lineage_head: ?t.LineageHead = null,
     lineage_index: ?@import("persistent_index.zig").Index = null,
     lineage_raw: bool = false,
 
-    const BriefReadBudget = struct { used: usize = 0, limit: usize = 8 * 1024 * 1024 };
+    const MetadataReadBudget = struct { used: usize = 0, limit: usize = 8 * 1024 * 1024 };
+    // Scratch readers share request-wide work/utility budgets and the final
+    // source fence, while decoded record payloads die after each root.
+    fn scratchReader(self: *Run, allocator: A, budget: *MetadataReadBudget) Run {
+        return .{ .service = self.service, .a = allocator, .lexical_allocator = self.lexical_allocator, .state = self.state, .state_row = self.state_row, .explanation_snapshot_scratch = .init(allocator), .lineage_head = self.lineage_head, .metadata_read_budget = budget, .read_owner = self, .support_work = self.support_work, .utility_bytes = self.utility_bytes, .utility_bindings = self.utility_bindings, .utility_inputs = self.utility_inputs, .utility_exhausted = self.utility_exhausted };
+    }
+    fn bindScratchIndex(self: *Run) void {
+        if (self.lineage_head != null) self.lineage_index = .{ .a = self.a, .store = .{ .ptr = self, .get = lineageNodeGet, .put = lineageNodePut }, .prefix = "lineage-node/" };
+    }
+    fn finishScratch(self: *Run, owner: *Run) void {
+        owner.support_work = self.support_work;
+        owner.utility_bytes = self.utility_bytes;
+        owner.utility_bindings = self.utility_bindings;
+        owner.utility_inputs = self.utility_inputs;
+        owner.utility_exhausted = self.utility_exhausted;
+        owner.administrative_view = owner.administrative_view or self.administrative_view;
+        self.explanation_snapshot_scratch.deinit();
+    }
+    const ReadPages = struct {
+        buffer: []u8,
+        spill: std.heap.ArenaAllocator,
+        page: Page = .{ .rows = &.{} },
+        position: usize = 0,
+        done: bool = false,
+        limit: u32 = 128,
+        after: ?[]const u8 = null,
+        fn init(owner: *Run, after: ?[]const u8) !@This() {
+            return .{ .buffer = try owner.lexical_allocator.alloc(u8, 512 * 1024), .spill = .init(owner.lexical_allocator), .after = after };
+        }
+        fn deinit(pages: *@This(), owner: *Run) void {
+            pages.spill.deinit();
+            owner.lexical_allocator.free(pages.buffer);
+        }
+        fn reset(pages: *@This()) void {
+            pages.page = .{ .rows = &.{} };
+            pages.position = 0;
+            pages.done = false;
+            pages.after = null;
+        }
+        fn next(pages: *@This(), reader: *Run, owner: *Run, prefix: []const u8, remaining: u32) !?Row {
+            if (pages.position == pages.page.rows.len) {
+                if (pages.done) return null;
+                _ = pages.spill.reset(.retain_capacity);
+                var use_spill = false;
+                while (true) {
+                    var fixed: std.heap.FixedBufferAllocator = .init(pages.buffer);
+                    var fetch = owner.scratchReader(if (use_spill) pages.spill.allocator() else fixed.allocator(), reader.metadata_read_budget.?);
+                    defer fetch.explanation_snapshot_scratch.deinit();
+                    fetch.metadata_batched_prefetch = true;
+                    fetch.bindScratchIndex();
+                    pages.page = fetch.recordPage(prefix, pages.after, @min(pages.limit, remaining)) catch |err| switch (err) {
+                        error.OutOfMemory => {
+                            if (pages.limit > 1) {
+                                pages.limit = @max(1, pages.limit / 2);
+                                continue;
+                            }
+                            if (!use_spill) {
+                                use_spill = true;
+                                continue;
+                            }
+                            return err;
+                        },
+                        else => return err,
+                    };
+                    break;
+                }
+                pages.position = 0;
+                pages.done = pages.page.next == null;
+                pages.after = if (pages.page.next) |value| try owner.a.dupe(u8, value) else null;
+                if (pages.page.rows.len == 0) return null;
+            }
+            const row = pages.page.rows[pages.position];
+            pages.position += 1;
+            if (try reader.snapshotPath(row.key)) |path| try reader.backend_rows.put(reader.a, path, row.json);
+            return row;
+        }
+    };
     fn chargeRead(self: *Run, bytes: usize) !void {
-        if (self.brief_read_budget) |budget| {
-            if (bytes > budget.limit - budget.used) return error.MemoryBriefReadLimit;
+        if (self.metadata_read_budget) |budget| {
+            if (bytes > budget.limit - budget.used) return error.MemoryReadLimit;
             budget.used += bytes;
         }
     }
     fn backendGet(self: *Run, path: []const u8) !?Row {
-        const owner = if (self.brief_read_budget != null) self.utility_cache_owner else null;
-        if (owner) |cache| if (cache.brief_rows.get(path)) |row| return row;
-        const fetch = if (self.brief_read_budget != null and (std.mem.startsWith(u8, path, "assertion/") or std.mem.startsWith(u8, path, "history/"))) self.service.backend.get_brief orelse self.service.backend.get else self.service.backend.get;
+        const owner = if (self.metadata_read_budget != null) self.read_owner else null;
+        if (owner) |cache| if (cache.read_proofs.get(path)) |row| return row;
+        const fetch = if (self.metadata_read_budget != null and (std.mem.startsWith(u8, path, "assertion/") or std.mem.startsWith(u8, path, "history/"))) self.service.backend.get_metadata orelse self.service.backend.get else self.service.backend.get;
         const row = try fetch(self.service.backend.ptr, self.a, path);
         if (row) |value| {
             try self.chargeRead(value.json.len);
             // Small immutable proofs are shared across scratch readers. Large
             // assertion/evidence payloads never enter the retained cache.
-            if (owner) |cache| if (value.json.len <= 4096 and cache.brief_cache_bytes + value.json.len + path.len <= 1024 * 1024) {
+            if (owner) |cache| if (value.json.len <= 4096 and cache.read_proof_bytes + value.json.len + path.len <= 1024 * 1024) {
                 const stored_path = try cache.a.dupe(u8, path);
                 var cached_row = value;
                 cached_row.key = stored_path;
                 cached_row.json = try cache.a.dupe(u8, value.json);
-                try cache.brief_rows.put(cache.a, stored_path, cached_row);
-                cache.brief_cache_bytes += value.json.len + path.len;
+                try cache.read_proofs.put(cache.a, stored_path, cached_row);
+                cache.read_proof_bytes += value.json.len + path.len;
             };
         }
         return row;
     }
     fn backendScan(self: *Run, prefix: []const u8, cursor: ?[]const u8, limit: u32) !Page {
-        const scan = if (self.brief_read_budget != null and eql(u8, prefix, "assertion/")) self.service.backend.scan_brief orelse self.service.backend.scan else self.service.backend.scan;
+        const scan = if (self.metadata_read_budget != null and eql(u8, prefix, "assertion/")) self.service.backend.scan_metadata orelse self.service.backend.scan else self.service.backend.scan;
         const page = try scan(self.service.backend.ptr, self.a, prefix, cursor, limit);
         for (page.rows) |row| try self.chargeRead(row.json.len);
         return page;
@@ -1380,7 +1456,14 @@ const Run = struct {
         }
         if (operation.evaluation_id != null) try self.feedEmit(&items, .evaluation_changed, null, operation.owner, .team, true);
         if (eql(u8, operation.action, "fork_lineage") or eql(u8, operation.action, "checkpoint_lineage") or eql(u8, operation.action, "revert_lineage")) try self.feedEmit(&items, .lineage_changed, null, operation.owner, .team, false);
-        if (operation.proposal_id) |id| {
+        if (eql(u8, operation.action, "prepare_consolidation")) {
+            // Only staged proposals are newly opened. Reusing an existing
+            // deterministic proposal must not publish a second open event.
+            for (self.changes.items) |change| if (std.mem.startsWith(u8, change.key, "supersession-proposal/")) {
+                const proposal = try parse(t.SupersessionProposal, self.a, change.json orelse continue);
+                try self.feedEmit(&items, .proposal_opened, .{ .kind = .supersession_proposal, .id = proposal.id, .revision = proposal.revision }, proposal.owner, .team, true);
+            };
+        } else if (operation.proposal_id) |id| {
             // Proposal access is narrower than ordinary team record access.
             const supersession = eql(u8, operation.action, "propose_supersession") or eql(u8, operation.action, "review_supersession");
             const relationship = eql(u8, operation.action, "propose_relationship") or eql(u8, operation.action, "review_relationship");
@@ -1657,8 +1740,12 @@ const Run = struct {
         var offset: usize = 0;
         while (offset < batch.items.len) {
             try self.service.context.check();
-            const chunk = batch.items[offset..@min(offset + @as(usize, if (self.brief_read_budget != null and !self.brief_batched_prefetch) 1 else 64), batch.items.len)];
-            const hydrate = if (self.brief_batched_prefetch) self.service.backend.get_many_brief orelse self.service.backend.get_many else self.service.backend.get_many;
+            const chunk = batch.items[offset..@min(offset + @as(usize, if (self.metadata_read_budget != null and !self.metadata_batched_prefetch) 1 else 64), batch.items.len)];
+            const assertion_metadata = self.metadata_batched_prefetch and metadata: {
+                for (chunk) |path| if (!std.mem.startsWith(u8, path, "assertion/") and !std.mem.startsWith(u8, path, "history/")) break :metadata false;
+                break :metadata true;
+            };
+            const hydrate = if (assertion_metadata) self.service.backend.get_many_metadata orelse self.service.backend.get_many else self.service.backend.get_many;
             if (hydrate) |get_many| {
                 const rows = try get_many(self.service.backend.ptr, self.a, chunk);
                 if (rows.len != chunk.len) return error.MemoryCorruptState;
@@ -1936,12 +2023,12 @@ const Run = struct {
             @field(owned, field) = try self.a.dupe(u8, value);
         };
         try self.resource_states.put(self.a, cache_key, .{ .reference = owned, .snapshot = snapshot, .epoch = self.inference_epoch });
-        if (self.brief_read_budget != null) if (self.utility_cache_owner) |owner| {
+        if (self.metadata_read_budget != null) if (self.read_owner) |owner| {
             try self.chargeRead(snapshot.json.len);
             // Final source fences retain hashes and routing metadata, never
             // the discarded source payload or pointers into scratch memory.
             const identity = try hash(owner.a, .{ reference, self.service.context.principal });
-            if (!owner.brief_resources.contains(identity)) {
+            if (!owner.scratch_resources.contains(identity)) {
                 var routing = reference;
                 inline for (.{ "database", "namespace", "table", "id" }) |field| @field(routing, field) = try owner.a.dupe(u8, @field(reference, field));
                 inline for (.{ "storage_name", "digest" }) |field| if (@field(reference, field)) |value| {
@@ -1953,7 +2040,7 @@ const Run = struct {
                 compact.digest = if (snapshot.digest) |value| try owner.a.dupe(u8, value) else null;
                 var payload_hash: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(snapshot.json, &payload_hash, .{});
-                try owner.brief_resources.put(owner.a, identity, .{ .reference = routing, .snapshot = compact, .epoch = self.inference_epoch, .payload_hash = payload_hash });
+                try owner.scratch_resources.put(owner.a, identity, .{ .reference = routing, .snapshot = compact, .epoch = self.inference_epoch, .payload_hash = payload_hash });
             }
         };
     }
@@ -1996,8 +2083,8 @@ const Run = struct {
         while (reads.next()) |input| try self.validateResource(input.*);
         var scratch: std.heap.ArenaAllocator = .init(self.lexical_allocator);
         defer scratch.deinit();
-        var brief_reads = self.brief_resources.valueIterator();
-        while (brief_reads.next()) |input| {
+        var scratch_reads = self.scratch_resources.valueIterator();
+        while (scratch_reads.next()) |input| {
             _ = scratch.reset(.retain_capacity);
             var reader: Run = .{ .service = self.service, .a = scratch.allocator(), .lexical_allocator = self.lexical_allocator, .explanation_snapshot_scratch = .init(scratch.allocator()) };
             defer reader.explanation_snapshot_scratch.deinit();
@@ -2305,6 +2392,7 @@ const Run = struct {
     }
     fn addCount(self: *Run, map: *std.StringArrayHashMapUnmanaged(u32), name: []const u8) !void {
         const entry = try map.getOrPut(self.a, name);
+        if (!entry.found_existing) entry.key_ptr.* = try self.a.dupe(u8, name);
         entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
     }
     fn countValues(self: *Run, map: std.StringArrayHashMapUnmanaged(u32)) ![]const t.Count {
@@ -2325,7 +2413,7 @@ const Run = struct {
         if (cursor) |value| {
             if (std.mem.startsWith(u8, value, "statistics/e/")) entities = true else if (!std.mem.startsWith(u8, value, "statistics/a/")) return error.InvalidMemoryCursor;
             const suffix = value["statistics/a/".len..];
-            after = if (suffix.len == 0) null else suffix;
+            after = if (suffix.len > 0) suffix else null;
         }
         var out: t.Statistics = .{};
         var kinds: std.StringArrayHashMapUnmanaged(u32) = .empty;
@@ -2333,19 +2421,39 @@ const Run = struct {
         var stability: std.StringArrayHashMapUnmanaged(u32) = .empty;
         var producers: std.StringArrayHashMapUnmanaged(u32) = .empty;
         const pinned = try self.pinnedIds();
+        var budget: MetadataReadBudget = .{};
+        var scratch: std.heap.ArenaAllocator = .init(self.lexical_allocator);
+        defer scratch.deinit();
+        var pages = try ReadPages.init(self, after);
+        defer pages.deinit(self);
+        var complete = false;
         while (out.scanned < request.limit) {
-            const prefix = if (entities) "entity/" else "assertion/";
-            const page = try self.recordPage(prefix, after, @intCast(request.limit - out.scanned));
-            for (page.rows) |row| {
+            try self.service.context.check();
+            _ = scratch.reset(.retain_capacity);
+            var reader = self.scratchReader(scratch.allocator(), &budget);
+            defer reader.finishScratch(self);
+            reader.bindScratchIndex();
+            const row = pages.next(&reader, self, if (entities) "entity/" else "assertion/", @intCast(request.limit - out.scanned)) catch |err| switch (err) {
+                error.MemoryReadLimit, error.MemoryWorkLimit => {
+                    if (out.scanned == 0) return error.MemoryWorkLimit;
+                    break;
+                },
+                else => return err,
+            };
+            if (row) |value| {
+                // No page progress is published until this root's live
+                // authorization and retention checks have completed.
+                const projected = reader.statisticsRecord(value, entities) catch |err| switch (err) {
+                    error.MemoryReadLimit, error.MemoryWorkLimit => {
+                        if (out.scanned == 0) return error.MemoryWorkLimit;
+                        break;
+                    },
+                    else => return err,
+                };
                 out.scanned += 1;
-                if (entities) {
-                    const record = (try self.read(t.EntityRecord, row.key)) orelse continue;
-                    self.authorize(record.owner, record.entity.visibility) catch continue;
-                    if (try self.entityVisible(record)) out.stats.entities += 1;
-                } else {
-                    const record = (try self.assertion((try parse(t.StoredAssertion, self.a, row.json)).assertion.id)) orelse continue;
-                    self.authorize(record.owner, record.assertion.visibility) catch continue;
-                    if (!try self.retained(record, 0)) continue;
+                after = try self.a.dupe(u8, value.key);
+                if (projected.entity) out.stats.entities += 1;
+                if (projected.memory) |record| {
                     out.stats.memories += 1;
                     if (pinned.contains(record.assertion.id)) out.stats.pinned += 1;
                     try self.addCount(&kinds, @tagName(record.assertion.kind));
@@ -2354,21 +2462,34 @@ const Run = struct {
                     try self.addCount(&producers, record.assertion.producer);
                 }
             }
-            after = page.next;
-            if (after == null) {
-                if (entities) break;
+            if (row == null or (pages.done and pages.position == pages.page.rows.len)) {
+                if (entities) {
+                    complete = true;
+                    break;
+                }
                 entities = true;
-            }
-            if (out.scanned == request.limit) {
-                out.complete = false;
-                out.next_cursor = try self.encodeCursor("statistics/", try std.fmt.allocPrint(self.a, "statistics/{s}/{s}", .{ if (entities) "e" else "a", after orelse "" }));
+                after = null;
+                pages.reset();
             }
         }
+        out.complete = complete;
+        if (!complete) out.next_cursor = try self.encodeCursor("statistics/", try std.fmt.allocPrint(self.a, "statistics/{s}/{s}", .{ if (entities) "e" else "a", after orelse "" }));
         out.stats.by_kind = try self.countValues(kinds);
         out.stats.by_lifecycle = try self.countValues(lifecycles);
         out.stats.by_stability = try self.countValues(stability);
         out.stats.by_producer = try self.countValues(producers);
         return out;
+    }
+    const StatisticsRecord = struct { memory: ?t.StoredAssertion = null, entity: bool = false };
+    fn statisticsRecord(self: *Run, row: Row, entities: bool) !StatisticsRecord {
+        if (entities) {
+            const record = (try self.read(t.EntityRecord, row.key)) orelse return .{};
+            self.authorize(record.owner, record.entity.visibility) catch return .{};
+            return .{ .entity = try self.entityVisible(record) };
+        }
+        const record = (try self.assertion((try parse(t.StoredAssertion, self.a, row.json)).assertion.id)) orelse return .{};
+        self.authorize(record.owner, record.assertion.visibility) catch return .{};
+        return .{ .memory = if (try self.retained(record, 0)) record else null };
     }
     fn usageKey(self: *Run, id: []const u8) ![]const u8 {
         try t.validateId(id);
@@ -7786,7 +7907,7 @@ const Run = struct {
                 try self.requireAdmin();
             }
             if (known_at) |known| if (signal.recorded_at > known) continue;
-            const cache = self.utility_cache_owner orelse self;
+            const cache = self.read_owner orelse self;
             if (!cache.utility_outcomes.contains(signal.id)) {
                 if (signal.used_memory_ids.len > max_utility_bindings_per_request - self.utility_inputs) {
                     self.utility_exhausted = true;
@@ -7908,18 +8029,11 @@ const Run = struct {
         const slots = try self.a.alloc(BriefSlot, request.limit);
         for (slots) |*slot| slot.* = .{ .buffer = try self.a.alloc(u8, @as(usize, request.token_budget) + 256) };
         var selected: BriefSelection = .{ .a = self.a, .slots = slots };
-        var budget: BriefReadBudget = .{};
+        var budget: MetadataReadBudget = .{};
         var scratch: std.heap.ArenaAllocator = .init(self.lexical_allocator);
         defer scratch.deinit();
-        const page_buffer = try self.lexical_allocator.alloc(u8, 512 * 1024);
-        defer self.lexical_allocator.free(page_buffer);
-        var spill: std.heap.ArenaAllocator = .init(self.lexical_allocator);
-        defer spill.deinit();
-        var page: Page = .{ .rows = &.{} };
-        var page_position: usize = 0;
-        var page_done = false;
-        var page_limit: u32 = 128;
-        var after: ?[]const u8 = null;
+        var pages = try ReadPages.init(self, null);
+        defer pages.deinit(self);
         var scanned: usize = 0;
         var more = false;
         var pin_index: usize = 0;
@@ -7927,84 +8041,43 @@ const Run = struct {
             try self.service.context.check();
             _ = scratch.reset(.retain_capacity);
             const allocator = scratch.allocator();
-            var reader: Run = .{ .service = self.service, .a = allocator, .lexical_allocator = self.lexical_allocator, .state = self.state, .state_row = self.state_row, .explanation_snapshot_scratch = .init(allocator), .lineage_head = self.lineage_head, .brief_read_budget = &budget, .utility_cache_owner = self, .support_work = self.support_work, .utility_bytes = self.utility_bytes, .utility_bindings = self.utility_bindings, .utility_inputs = self.utility_inputs, .utility_exhausted = self.utility_exhausted };
-            defer reader.explanation_snapshot_scratch.deinit();
-            defer {
-                self.support_work = reader.support_work;
-                self.utility_bytes = reader.utility_bytes;
-                self.utility_bindings = reader.utility_bindings;
-                self.utility_inputs = reader.utility_inputs;
-                self.utility_exhausted = reader.utility_exhausted;
-                self.administrative_view = self.administrative_view or reader.administrative_view;
-            }
-            if (self.lineage_head != null) reader.lineage_index = .{ .a = allocator, .store = .{ .ptr = &reader, .get = lineageNodeGet, .put = lineageNodePut }, .prefix = "lineage-node/" };
+            var reader = self.scratchReader(allocator, &budget);
+            defer reader.finishScratch(self);
+            reader.bindScratchIndex();
             const is_pin = pin_index < pinned.count();
             const record: ?t.StoredAssertion = blk: {
                 if (is_pin) {
                     const id = pinned.keys()[pin_index];
                     pin_index += 1;
                     break :blk reader.assertion(id) catch |err| switch (err) {
-                        error.MemoryBriefReadLimit, error.MemoryWorkLimit => {
+                        error.MemoryReadLimit, error.MemoryWorkLimit => {
                             more = true;
                             break;
                         },
                         else => return err,
                     };
                 }
-                if (page_position == page.rows.len) {
-                    if (page_done) break;
-                    _ = spill.reset(.retain_capacity);
-                    var use_spill = false;
-                    while (true) {
-                        var fixed = std.heap.FixedBufferAllocator.init(page_buffer);
-                        const page_allocator = if (use_spill) spill.allocator() else fixed.allocator();
-                        var page_reader: Run = .{ .service = self.service, .a = page_allocator, .lexical_allocator = self.lexical_allocator, .state = self.state, .state_row = self.state_row, .explanation_snapshot_scratch = .init(page_allocator), .lineage_head = self.lineage_head, .brief_read_budget = &budget, .utility_cache_owner = self, .brief_batched_prefetch = true };
-                        defer page_reader.explanation_snapshot_scratch.deinit();
-                        if (self.lineage_head != null) page_reader.lineage_index = .{ .a = page_allocator, .store = .{ .ptr = &page_reader, .get = lineageNodeGet, .put = lineageNodePut }, .prefix = "lineage-node/" };
-                        page = page_reader.recordPage("assertion/", after, @min(page_limit, @as(u32, @intCast(4096 - scanned)))) catch |err| switch (err) {
-                            error.OutOfMemory => {
-                                if (page_limit > 1) {
-                                    page_limit = @max(1, page_limit / 2);
-                                    continue;
-                                }
-                                if (!use_spill) {
-                                    use_spill = true;
-                                    continue;
-                                }
-                                return err;
-                            },
-                            error.MemoryBriefReadLimit, error.MemoryWorkLimit => {
-                                more = true;
-                                break :blk null;
-                            },
-                            else => return err,
-                        };
-                        break;
-                    }
-                    page_position = 0;
-                    page_done = page.next == null;
-                    after = if (page.next) |next| try self.a.dupe(u8, next) else null;
-                    if (page.rows.len == 0) break;
-                }
-                const row = page.rows[page_position];
-                page_position += 1;
+                const row = (pages.next(&reader, self, "assertion/", @intCast(4096 - scanned)) catch |err| switch (err) {
+                    error.MemoryReadLimit, error.MemoryWorkLimit => {
+                        more = true;
+                        break :blk null;
+                    },
+                    else => return err,
+                }) orelse break;
                 scanned += 1;
-                // Reuse the page hydration when policy follows this record's
-                // logical ID through an immutable branch snapshot.
-                if (try reader.snapshotPath(row.key)) |path| try reader.backend_rows.put(allocator, path, row.json);
                 const raw = try parse(t.StoredAssertion, allocator, row.json);
                 break :blk if (pinned.contains(raw.assertion.id)) null else raw;
             };
             if (record) |raw| {
                 const result = reader.recallHit(raw, .{ .scope = request.scope, .task = request.task, .environment = request.environment, .include_provisional = is_pin or request.include_provisional }, null, false) catch |err| switch (err) {
-                    error.MemoryBriefReadLimit, error.MemoryWorkLimit => {
+                    error.MemoryReadLimit, error.MemoryWorkLimit => {
                         more = true;
                         break;
                     },
                     else => return err,
                 };
                 if (result) |hit| selected.consider(&reader, hit, is_pin, outcomes, request) catch |err| switch (err) {
-                    error.MemoryBriefReadLimit, error.MemoryWorkLimit => {
+                    error.MemoryReadLimit, error.MemoryWorkLimit => {
                         more = true;
                         break;
                     },
@@ -8012,7 +8085,7 @@ const Run = struct {
                 };
             }
             if (more) break;
-            if (!is_pin and page_position == page.rows.len and page_done) break;
+            if (!is_pin and pages.position == pages.page.rows.len and pages.done) break;
             if (!is_pin and scanned == 4096) more = true;
         }
         const items = try self.a.alloc(t.BriefItem, selected.count);
@@ -8367,6 +8440,113 @@ const Run = struct {
         }
         return .{ .complete = cursor.probe == members.len };
     }
+    const ReviewStep = struct {
+        cursor: ReviewCursor,
+        work: usize,
+        findings: []const t.Finding = &.{},
+        count_claim: ?t.StoredAssertion = null,
+        count_entity: bool = false,
+        omitted: usize = 0,
+        stop: bool = false,
+    };
+    fn reviewStep(self: *Run, request: t.ConsolidationRequest, initial: ReviewCursor, work: usize, limit: usize, pinned: std.StringArrayHashMapUnmanaged(void), outcomes: bool) !ReviewStep {
+        var result: ReviewStep = .{ .cursor = initial, .work = work + 1 };
+        const cursor = &result.cursor;
+        const claims = cursor.stage == .claims or cursor.stage == .duplicates;
+        const page = try self.recordPage(if (claims) "assertion/" else "entity/", cursor.after, 1);
+        if (page.rows.len == 0) {
+            cursor.* = .{ .stage = if (claims) .entities else .done, .at = cursor.at, .window = cursor.window };
+            return result;
+        }
+        const row = page.rows[0];
+        if (claims) {
+            const raw = try parse(t.StoredAssertion, self.a, row.json);
+            const hit = (try self.recallHit(raw, .{}, null, false)) orelse {
+                cursor.after = row.key;
+                cursor.stage = .claims;
+                cursor.finding_after = null;
+                cursor.probe = 0;
+                cursor.posting = null;
+                return result;
+            };
+            var findings: std.ArrayList(t.Finding) = .empty;
+            if (cursor.stage == .claims) {
+                if (cursor.finding_after == null) result.count_claim = hit.memory;
+                var local: BoundedFindings = .{ .limit = limit };
+                if (cursor.finding_after) |prior| local.after = .{ .kind = prior.kind, .memory_ids = &.{prior.id}, .target_id = prior.target, .reason = "", .suggested_action = .verify };
+                var retired_links: std.StringHashMapUnmanaged(bool) = .empty;
+                try self.claimFindings(hit, pinned, outcomes, request, cursor.at, &retired_links, &local);
+                const items = try local.sorted(self.a);
+                try findings.appendSlice(self.a, items);
+                result.findings = findings.items;
+                if (local.total > items.len) {
+                    const last = items[items.len - 1];
+                    cursor.finding_after = .{ .kind = last.kind, .id = last.memory_ids[0], .target = last.target_id };
+                    result.omitted = local.total - items.len;
+                    result.stop = true;
+                    return result;
+                }
+                cursor.finding_after = null;
+                cursor.stage = .duplicates;
+            }
+            if (findings.items.len == limit) {
+                result.stop = true;
+                return result;
+            }
+            if (hit.memory.lifecycle == .active) {
+                const duplicate = try self.duplicateProbe(hit.memory, cursor, &result.work, 256, true);
+                if (duplicate.id) |id| try findings.append(self.a, .{ .kind = .duplicate, .memory_ids = try self.a.dupe([]const u8, &.{ id, hit.memory.assertion.id }), .reason = "same canonical subject, applicability and value; review as restates", .suggested_action = .propose_supersession });
+                result.findings = findings.items;
+                if (!duplicate.complete) {
+                    result.stop = true;
+                    return result;
+                }
+            }
+            cursor.after = row.key;
+            cursor.stage = .claims;
+        } else {
+            const record = (try self.read(t.EntityRecord, row.key)) orelse return error.MemoryCorruptState;
+            const canonical_id = try self.canonical(record.entity.id);
+            const authorized = authorized: {
+                self.authorize(record.owner, record.entity.visibility) catch break :authorized false;
+                break :authorized true;
+            };
+            if (authorized and try self.entityVisible(record) and canonical_id != null and eql(u8, canonical_id.?, record.entity.id)) {
+                if (cursor.stage == .entities) result.count_entity = true;
+                cursor.stage = .references;
+                const reference = try self.referenceProbe(record.entity.id, cursor, &result.work, 256);
+                if (!reference.complete) {
+                    result.stop = true;
+                    return result;
+                }
+                if (reference.id == null) result.findings = try self.a.dupe(t.Finding, &.{.{ .kind = .orphan_entity, .entity_id = record.entity.id, .reason = "no current claim references this canonical entity", .suggested_action = .curate_entity }});
+            }
+            cursor.after = row.key;
+            cursor.stage = .entities;
+        }
+        cursor.probe = 0;
+        cursor.posting = null;
+        return result;
+    }
+    fn ownReviewCursor(self: *Run, value: ReviewCursor) !ReviewCursor {
+        var cursor = value;
+        if (value.after) |text| cursor.after = try self.a.dupe(u8, text);
+        if (value.posting) |text| cursor.posting = try self.a.dupe(u8, text);
+        if (value.finding_after) |position| {
+            cursor.finding_after = .{ .kind = position.kind, .id = try self.a.dupe(u8, position.id), .target = if (position.target) |text| try self.a.dupe(u8, text) else null };
+        }
+        return cursor;
+    }
+    fn ownFinding(self: *Run, value: t.Finding) !t.Finding {
+        var finding = value;
+        finding.reason = try self.a.dupe(u8, value.reason);
+        if (value.entity_id) |text| finding.entity_id = try self.a.dupe(u8, text);
+        if (value.target_id) |text| finding.target_id = try self.a.dupe(u8, text);
+        const ids = try self.a.alloc([]const u8, value.memory_ids.len);
+        for (value.memory_ids, ids) |id, *owned| owned.* = try self.a.dupe(u8, id);
+        finding.memory_ids = ids;
+        return finding;
+    }
     fn consolidate(self: *Run, request: t.ConsolidationRequest) ![]const u8 {
         if (request.limit == 0 or request.limit > t.max_consolidation_findings) return error.InvalidMemoryRequest;
         if (!self.state.restates_ready) return error.MemoryCapabilityUnavailable;
@@ -8379,93 +8559,42 @@ const Run = struct {
         var lifecycles: std.StringArrayHashMapUnmanaged(u32) = .empty;
         var stability: std.StringArrayHashMapUnmanaged(u32) = .empty;
         var producers: std.StringArrayHashMapUnmanaged(u32) = .empty;
-        var retired_links: std.StringHashMapUnmanaged(bool) = .empty;
         var work: usize = 0;
         var scanned: usize = 0;
         var omitted: usize = 0;
+        var budget: MetadataReadBudget = .{};
+        var scratch: std.heap.ArenaAllocator = .init(self.lexical_allocator);
+        defer scratch.deinit();
         while (work < 256 and findings.items.len < request.limit and cursor.stage != .done) {
             try self.service.context.check();
-            const claims = cursor.stage == .claims or cursor.stage == .duplicates;
-            const page = try self.recordPage(if (claims) "assertion/" else "entity/", cursor.after, 1);
-            work += 1;
-            if (page.rows.len == 0) {
-                cursor = .{ .stage = if (claims) .entities else .done, .at = cursor.at, .window = cursor.window };
-                continue;
+            _ = scratch.reset(.retain_capacity);
+            var reader = self.scratchReader(scratch.allocator(), &budget);
+            defer reader.finishScratch(self);
+            reader.bindScratchIndex();
+            // Commit cursor/counts/findings only after the whole root step
+            // succeeds. A byte/work limit resumes that exact step next time.
+            const step = reader.reviewStep(request, cursor, work, request.limit - findings.items.len, pinned, outcomes) catch |err| switch (err) {
+                error.MemoryReadLimit, error.MemoryWorkLimit => {
+                    if (work == 0) return error.MemoryWorkLimit;
+                    break;
+                },
+                else => return err,
+            };
+            cursor = try self.ownReviewCursor(step.cursor);
+            work = step.work;
+            omitted = step.omitted;
+            if (step.count_claim) |record| {
+                scanned += 1;
+                stats.memories += 1;
+                if (pinned.contains(record.assertion.id)) stats.pinned += 1;
+                try self.addCount(&kinds, @tagName(record.assertion.kind));
+                try self.addCount(&lifecycles, @tagName(record.lifecycle));
+                try self.addCount(&stability, @tagName(record.assertion.stability));
+                try self.addCount(&producers, record.assertion.producer);
             }
-            const row = page.rows[0];
-            if (claims) {
-                const raw = try parse(t.StoredAssertion, self.a, row.json);
-                const hit = (try self.recallHit(raw, .{}, null, false)) orelse {
-                    cursor.after = row.key;
-                    cursor.stage = .claims;
-                    cursor.finding_after = null;
-                    cursor.probe = 0;
-                    cursor.posting = null;
-                    continue;
-                };
-                if (cursor.stage == .claims) {
-                    if (cursor.finding_after == null) {
-                        scanned += 1;
-                        stats.memories += 1;
-                        if (pinned.contains(hit.memory.assertion.id)) stats.pinned += 1;
-                        try self.addCount(&kinds, @tagName(hit.memory.assertion.kind));
-                        try self.addCount(&lifecycles, @tagName(hit.memory.lifecycle));
-                        try self.addCount(&stability, @tagName(hit.memory.assertion.stability));
-                        try self.addCount(&producers, hit.memory.assertion.producer);
-                    }
-                    var local: BoundedFindings = .{ .limit = request.limit - findings.items.len };
-                    if (cursor.finding_after) |prior| local.after = .{ .kind = prior.kind, .memory_ids = &.{prior.id}, .target_id = prior.target, .reason = "", .suggested_action = .verify };
-                    try self.claimFindings(hit, pinned, outcomes, request, cursor.at, &retired_links, &local);
-                    const items = try local.sorted(self.a);
-                    try findings.appendSlice(self.a, items);
-                    if (local.total > items.len) {
-                        const last = items[items.len - 1];
-                        cursor.finding_after = .{ .kind = last.kind, .id = last.memory_ids[0], .target = last.target_id };
-                        omitted = local.total - items.len;
-                        break;
-                    }
-                    cursor.finding_after = null;
-                    cursor.stage = .duplicates;
-                }
-                if (findings.items.len == request.limit) break;
-                if (hit.memory.lifecycle == .active) {
-                    const result = try self.duplicateProbe(hit.memory, &cursor, &work, 256, true);
-                    if (result.id) |id| try findings.append(self.a, .{ .kind = .duplicate, .memory_ids = try self.a.dupe([]const u8, &.{ id, hit.memory.assertion.id }), .reason = "same canonical subject, applicability and value; review as restates", .suggested_action = .propose_supersession });
-                    if (!result.complete) break;
-                }
-                cursor.after = row.key;
-                cursor.stage = .claims;
-                cursor.probe = 0;
-                cursor.posting = null;
-            } else {
-                const entity_record = (try self.read(t.EntityRecord, row.key)) orelse return error.MemoryCorruptState;
-                const canonical_id = try self.canonical(entity_record.entity.id);
-                self.authorize(entity_record.owner, entity_record.entity.visibility) catch {
-                    cursor.after = row.key;
-                    cursor.stage = .entities;
-                    cursor.probe = 0;
-                    cursor.posting = null;
-                    continue;
-                };
-                if (!try self.entityVisible(entity_record) or canonical_id == null or !eql(u8, canonical_id.?, entity_record.entity.id)) {
-                    cursor.after = row.key;
-                    cursor.stage = .entities;
-                    cursor.probe = 0;
-                    cursor.posting = null;
-                    continue;
-                }
-                if (cursor.stage == .entities) {
-                    stats.entities += 1;
-                    cursor.stage = .references;
-                }
-                const result = try self.referenceProbe(entity_record.entity.id, &cursor, &work, 256);
-                if (!result.complete) break;
-                if (result.id == null) try findings.append(self.a, .{ .kind = .orphan_entity, .entity_id = entity_record.entity.id, .reason = "no current claim references this canonical entity", .suggested_action = .curate_entity });
-                cursor.after = row.key;
-                cursor.stage = .entities;
-                cursor.probe = 0;
-                cursor.posting = null;
-            }
+            if (step.count_entity) stats.entities += 1;
+            for (step.findings) |finding| try findings.append(self.a, try self.ownFinding(finding));
+            if (step.stop) break;
         }
         stats.by_kind = try self.countValues(kinds);
         stats.by_lifecycle = try self.countValues(lifecycles);

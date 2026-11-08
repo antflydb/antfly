@@ -20257,7 +20257,7 @@ test "native memory brief, consolidation, pins and the agent MCP profile" {
     defer db.close();
     const context: module.memory.Context = .{ .principal = "local", .admin = true, .now_ms = 1, .space = "team" };
     var native: module.engine.Native(db_mod.DB) = .{ .db = &db, .context = context };
-    const created = try (module.memory.Service{ .backend = native.backend(), .context = context }).execute(a, .create, "", "{}", "create");
+    const created = try (module.memory.Service{ .backend = native.backend(), .context = context }).execute(a, .create, "", "{\"features\":{\"lineage\":true}}", "create");
     a.free(created);
     var reads = table_reads.BoundTableReadSource.init("memory_team", 7002, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("memory_team", &db);
@@ -20290,6 +20290,7 @@ test "native memory brief, consolidation, pins and the agent MCP profile" {
     @memset(procedure_payload, 'x');
     const procedure_body = try std.json.Stringify.valueAlloc(a, module.memory.types.ObservationRequest{
         .evidence = &.{.{ .id = "procedure-note", .text = "Deployment procedure" }},
+        .entities = &.{.{ .id = "deploys", .name = "Deployments", .evidence = &.{.{ .id = "procedure-note" }} }},
         .assertions = &.{.{ .id = "procedure", .subject = "deploys", .predicate = "procedure", .value = "release", .statement = "A bounded deployment procedure", .kind = .procedural, .steps = &.{procedure_payload}, .evidence = &.{.{ .id = "procedure-note" }} }},
     }, .{});
     defer a.free(procedure_body);
@@ -20301,7 +20302,7 @@ test "native memory brief, consolidation, pins and the agent MCP profile" {
         defer arena.deinit();
         const scratch = arena.allocator();
         const backend = native.backend();
-        const projected = try backend.scan_brief.?(backend.ptr, scratch, "assertion/", null, 16);
+        const projected = try backend.scan_metadata.?(backend.ptr, scratch, "assertion/", null, 16);
         var found_procedure = false;
         for (projected.rows) |row| {
             const record = try std.json.parseFromSliceLeaky(module.memory.types.StoredAssertion, scratch, row.json, .{});
@@ -20309,10 +20310,10 @@ test "native memory brief, consolidation, pins and the agent MCP profile" {
             if (std.mem.eql(u8, record.assertion.id, "procedure")) {
                 found_procedure = true;
                 try std.testing.expect(row.json.len < procedure_payload.len);
-                const one = (try backend.get_brief.?(backend.ptr, scratch, row.key)).?;
+                const one = (try backend.get_metadata.?(backend.ptr, scratch, row.key)).?;
                 const single = try std.json.parseFromSliceLeaky(module.memory.types.StoredAssertion, scratch, one.json, .{});
                 try std.testing.expectEqual(@as(usize, 0), single.assertion.steps.len);
-                const hydrated = try backend.get_many_brief.?(backend.ptr, scratch, &.{row.key});
+                const hydrated = try backend.get_many_metadata.?(backend.ptr, scratch, &.{row.key});
                 const selected = try std.json.parseFromSliceLeaky(module.memory.types.StoredAssertion, scratch, hydrated[0].?.json, .{});
                 try std.testing.expectEqual(@as(usize, 0), selected.assertion.steps.len);
             }
@@ -20322,6 +20323,18 @@ test "native memory brief, consolidation, pins and the agent MCP profile" {
         const full = try std.json.parseFromSliceLeaky(module.memory.types.StoredAssertion, scratch, full_json, .{});
         try std.testing.expectEqual(@as(usize, 1), full.assertion.steps.len);
     }
+
+    // Lineage maps entities to immutable entity snapshots. Assertion-only
+    // projections must never be applied to this batched root hydration.
+    const inspect_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team?limit=256", .{base});
+    defer a.free(inspect_url);
+    var inspection = try requestWithRetry(&client, threaded.io(), .GET, inspect_url, "", &.{}, 20);
+    defer inspection.deinit();
+    try std.testing.expectEqual(@as(u16, 200), inspection.status.code);
+    const inspected = try std.json.parseFromSlice(module.memory.types.Inspection, a, inspection.body.?, .{});
+    defer inspected.deinit();
+    try std.testing.expectEqual(@as(u32, 1), inspected.value.statistics.stats.entities);
+    try std.testing.expectEqual(@as(u32, 3), inspected.value.statistics.stats.memories);
 
     const brief_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/brief?limit=4&token_budget=2048", .{base});
     defer a.free(brief_url);

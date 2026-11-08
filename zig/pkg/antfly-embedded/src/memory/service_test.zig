@@ -113,6 +113,70 @@ fn discard(store: *Store, action: m.Action, id: []const u8, body: []const u8, to
     std.testing.allocator.free(result);
 }
 const source = "{\"evidence\":[{\"id\":\"e1\",\"source_id\":\"runbook\",\"source_version\":\"v1\",\"text\":\"Production uses Helm\"}]}";
+test "memory regression: each prepared proposal has one supersession feed event" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    const svc = store.service("alice", true, 1000);
+    for (0..4) |i| {
+        const claim: m.types.Assertion = .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = if (i < 2) "first" else "second", .predicate = "p", .value = "same", .statement = "Same fact", .evidence = &.{.{ .id = "e1" }} };
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{claim} }, .{}), claim.id);
+    }
+    const before = try std.json.parseFromSliceLeaky(m.types.ChangePage, a, try svc.execute(a, .changes, "", "{}", ""), .{});
+    const operation = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .prepare_consolidation, "", "{}", "prepare"), .{});
+    const feed = try std.json.parseFromSliceLeaky(m.types.ChangePage, a, try svc.execute(a, .changes, "", try std.json.Stringify.valueAlloc(a, m.types.ChangeRequest{ .cursor = before.next_cursor }, .{}), ""), .{});
+    var opened: usize = 0;
+    for (feed.items) |event| if (event.kind == .proposal_opened) {
+        opened += 1;
+        try std.testing.expect(event.target.?.kind == .supersession_proposal);
+    };
+    std.debug.print("FOURTH REVIEW proposal_ids={d} feed_opened={d}\n", .{ operation.proposal_ids.len, opened });
+    try std.testing.expectEqual(@as(usize, 2), operation.proposal_ids.len);
+    try std.testing.expectEqual(operation.proposal_ids.len, opened);
+    _ = try svc.execute(a, .prepare_consolidation, "", "{}", "prepare-again");
+    const replay_feed = try std.json.parseFromSliceLeaky(m.types.ChangePage, a, try svc.execute(a, .changes, "", try std.json.Stringify.valueAlloc(a, m.types.ChangeRequest{ .cursor = feed.next_cursor }, .{}), ""), .{});
+    try std.testing.expectEqual(@as(usize, 0), replay_feed.items.len);
+}
+test "memory regression: review and inspection discard procedural payloads" {
+    var amplified = false;
+    for ([_]m.Action{ .consolidate, .inspect }) |action| {
+        var baseline: usize = 0;
+        for ([_]usize{ 0, 32 * 1024 }) |payload_len| {
+            var store = Store.init();
+            defer store.deinit();
+            const a = store.arena.allocator();
+            try setup(&store);
+            const payload = try a.alloc(u8, payload_len);
+            @memset(payload, 'x');
+            const svc = store.service("alice", true, 10);
+            for (0..32) |i| {
+                const id = try std.fmt.allocPrint(a, "claim-{d}", .{i});
+                const claim: m.types.Assertion = .{ .id = id, .subject = "s", .predicate = "p", .value = id, .statement = "Short useful note", .kind = .procedural, .steps = &.{payload}, .evidence = &.{.{ .id = "e1" }} };
+                _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{claim} }, .{}), id);
+            }
+            const storage = try std.testing.allocator.alloc(u8, 64 * 1024 * 1024);
+            defer std.testing.allocator.free(storage);
+            var buffer = std.heap.FixedBufferAllocator.init(storage);
+            const response = try svc.execute(buffer.allocator(), action, "", "{}", "");
+            std.debug.print("FOURTH REVIEW {s} payload={d} response={d} allocation={d}\n", .{ @tagName(action), payload_len * 32, response.len, buffer.end_index });
+            if (payload_len == 0) baseline = buffer.end_index else amplified = amplified or buffer.end_index >= baseline + 1024 * 1024;
+        }
+    }
+    try std.testing.expect(!amplified);
+}
+test "memory regression: managed remember preserves native producer separation" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = modelService(&store, 10);
+    const config: m.types.Config = .{ .processing = .managed, .features = .{ .assertion_distillation = true }, .models = .{ .generator = fake_model } };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    try std.testing.expectError(error.MemoryProducerConflict, svc.execute(a, .observe, "", "{\"scoped_evidence_ids\":true,\"evidence\":[{\"id\":\"note\",\"text\":\"A fact\"}],\"assertions\":[{\"id\":\"claim\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"A fact\",\"evidence\":[{\"id\":\"note\"}]}]}", "remember"));
+    const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .observe, "", "{\"scoped_evidence_ids\":true,\"evidence\":[{\"id\":\"note\",\"text\":\"A fact\",\"managed\":true}]}", "managed-remember"), .{});
+    try std.testing.expectEqual(m.types.Stage.pending, receipt.phase);
+    try std.testing.expectEqual(@as(usize, 1), receipt.evidence_ids.len);
+}
 const helm = "{\"assertions\":[{\"id\":\"helm\",\"subject\":\"production\",\"predicate\":\"deploys_with\",\"value\":\"Helm\",\"statement\":\"Production uses Helm\",\"valid_from\":100,\"evidence\":[{\"id\":\"e1\"}]}]}";
 const terraform = "{\"assertions\":[{\"id\":\"terraform\",\"subject\":\"production\",\"predicate\":\"deploys_with\",\"value\":\"Terraform\",\"statement\":\"Production uses Terraform\",\"valid_from\":300,\"evidence\":[{\"id\":\"e1\"}]}]}";
 fn setup(store: *Store) !void {
@@ -8902,16 +8966,18 @@ test "memory streaming brief preserves the final resource payload fence" {
             store.resource_json = "{\"message\":\"Changed without a revision or digest update\"}";
         }
     };
-    var store = Store.init();
-    defer store.deinit();
-    const a = store.arena.allocator();
-    try setup(&store);
-    store.resource_digest = @splat(3);
-    var svc = store.service("alice", true, 10);
-    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"external\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"assertions\":[{\"id\":\"fact\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"Approved production policy\",\"evidence\":[{\"id\":\"external\"}]}]}", "external");
-    svc.context.final_check_ptr = &store;
-    svc.context.final_check_fn = ChangeAtFinish.finish;
-    try std.testing.expectError(error.MemoryResourceChanged, svc.execute(a, .brief, "", "{}", ""));
+    for ([_]m.Action{ .brief, .consolidate, .inspect }) |action| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try setup(&store);
+        store.resource_digest = @splat(3);
+        var svc = store.service("alice", true, 10);
+        _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"external\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"assertions\":[{\"id\":\"fact\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"Approved production policy\",\"evidence\":[{\"id\":\"external\"}]}]}", "external");
+        svc.context.final_check_ptr = &store;
+        svc.context.final_check_fn = ChangeAtFinish.finish;
+        try std.testing.expectError(error.MemoryResourceChanged, svc.execute(a, action, "", "{}", ""));
+    }
 }
 
 test "memory streaming brief handles one large record and bounds total hydrated bytes" {
@@ -8941,6 +9007,26 @@ test "memory streaming brief handles one large record and bounds total hydrated 
         } else {
             try std.testing.expect(!result.complete);
             try std.testing.expect(result.scanned < count);
+            for ([_]m.Action{ .consolidate, .inspect }) |action| {
+                var cursor: ?[]const u8 = null;
+                var total: u32 = 0;
+                var pages: usize = 0;
+                while (true) {
+                    const body = try std.json.Stringify.valueAlloc(a, .{ .cursor = cursor, .limit = @as(u16, 256) }, .{});
+                    const response = try svc.execute(a, action, "", body, "");
+                    const stats = if (action == .inspect) (try std.json.parseFromSliceLeaky(m.types.Inspection, a, response, .{})).statistics else stats: {
+                        const report = try std.json.parseFromSliceLeaky(m.types.Consolidation, a, response, .{});
+                        break :stats m.types.Statistics{ .stats = report.stats, .scanned = report.scanned, .complete = report.complete, .next_cursor = report.next_cursor };
+                    };
+                    total += stats.stats.memories;
+                    pages += 1;
+                    try std.testing.expect(pages < 16);
+                    if (stats.complete) break;
+                    cursor = stats.next_cursor orelse return error.TestUnexpectedResult;
+                }
+                try std.testing.expectEqual(@as(u32, @intCast(count)), total);
+                try std.testing.expect(pages > 1);
+            }
         }
     }
 }
