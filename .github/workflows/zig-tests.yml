@@ -770,6 +770,11 @@ jobs:
           tools/test_sync_generated.py
           pkg/inference/build/test_prepare_wasm64_zig_lib.py
 
+      - name: Test linked read-session provider finalization and archive limits
+        run: |
+          zig build --build-file zig/build_read_session_graph_test.zig -Dtarget=x86_64-linux-musl --summary all
+          python3 -m unittest discover -s scripts/packaging -p test_native_archives.py
+
       - name: Test benchmark orchestration and fixture setup
         run: |
           python3 -m unittest discover -s scripts/ci -p test_eval_extract.py
@@ -1323,6 +1328,11 @@ jobs:
           tools/test_test_runner.py
           tools/test_local_test_partitions.py
           tools/test_sync_generated.py
+
+      - name: Test linked read-session provider finalization and archive limits
+        run: |
+          zig build --build-file zig/build_read_session_graph_test.zig -Dtarget=x86_64-linux-musl --summary all
+          python3 -m unittest discover -s scripts/packaging -p test_native_archives.py
 
       - name: Test benchmark orchestration and fixture setup
         run: |
@@ -2846,7 +2856,6 @@ jobs:
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_STANDALONE_TESTS: "1"
-          ANTFLY_INFERENCE_STANDALONE_MODELS_DIR: ~/.antfly/inference/models
           ANTFLY_INFERENCE_STANDALONE_MODEL_NAME: ggml-org/gemma-4-e2b-it-gguf
           # Match the cold-start contract used by the full inference suite.
           # Standalone exercises the same CPU-only model initialization path.
@@ -2855,6 +2864,8 @@ jobs:
           ANTFLY_INFERENCE_STANDALONE_HOST_BUDGET_MB: "12000"
           ANTFLY_INFERENCE_STANDALONE_COMBINED_BUDGET_MB: "12000"
         run: |
+          # Reuse the immutable models downloaded by the generation shard.
+          export ANTFLY_INFERENCE_STANDALONE_MODELS_DIR="$ANTFLY_INFERENCE_MODELS_DIR"
           taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q \
             e2e/antfly/test_standalone.py::test_standalone_inference_process_envelope_composition
 

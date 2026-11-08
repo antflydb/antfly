@@ -6874,3 +6874,26 @@ pub const test_support = if (@import("builtin").is_test) struct {
     pub const candidateSource = StorageOwnerRuntimeHooks.candidateSource;
     pub const transactionRecoveryConfig = StorageOwnerTransactionRecovery.serverConfig;
 } else struct {};
+
+pub fn storageOwnerPipelineMetricsJson(context: ?*anyopaque, version: u32, out_json: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out_json.* = .{};
+    if (version != 1) return .invalid_abi;
+    _ = asStorageOwnerContext(context) orelse return .invalid_argument;
+    const metrics = @import("antfly_platform").document_pipeline_metrics;
+    var snapshot = metrics.snapshot();
+    // Native PDF compute belongs to another compiled unit. Read its counters
+    // through its owning ABI, never through a host-side duplicate global.
+    if (comptime !builtin.is_test) {
+        const compute = @import("enrichment_compute_abi");
+        var bytes: compute.OwnedBytes = .{};
+        const status = compute.antfly_enrichment_pipeline_metrics_json(1, &bytes);
+        if (status != .ok) return status;
+        defer compute.antfly_enrichment_buffer_destroy(&bytes);
+        const parsed = std.json.parseFromSlice(metrics.Snapshot, std.heap.c_allocator, bytes.slice(), .{}) catch |err| return kernel_error_identity.statusFromError(err);
+        defer parsed.deinit();
+        snapshot.merge(parsed.value) catch return .invalid_abi;
+    }
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, snapshot, .{}) catch |err| return kernel_error_identity.statusFromError(err);
+    out_json.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}

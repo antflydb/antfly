@@ -114,6 +114,16 @@ jobs:
       base_sha: ${{ needs.approve.outputs.base_sha }}
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
+  dictation:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'dictation')
+    uses: ./.github/workflows/dictation-example.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
   scale:
     needs: approve
     if: contains(fromJSON(needs.approve.outputs.suites), 'scale')
@@ -187,7 +197,7 @@ jobs:
       comment_id: ${{ inputs.comment_id }}
   result:
     name: PR CI result
-    needs: [approve, policy, zig, operation-owners, sdks, scale, gpu, vopr, darwin, linux-release, apple-video]
+    needs: [approve, policy, zig, operation-owners, sdks, dictation, scale, gpu, vopr, darwin, linux-release, apple-video]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

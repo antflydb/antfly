@@ -325,6 +325,7 @@ fn writeServerlessPrometheus(writer: *std.Io.Writer, run_stats: anytype, query_m
     try append(writer, "antfly_serverless_sparse_queries_total", "counter", "Sparse query executions", query_metrics.sparse_queries);
     try antfly.db.query_metrics.writePrometheus(writer);
     try antfly.db.enrichment_utf8_text.writePrometheus(writer);
+    try @import("antfly_readers").pipeline_metrics.writePrometheus(writer);
 }
 
 fn parseEnvOptionalInt(

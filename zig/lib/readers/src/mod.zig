@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const pipeline_metrics = @import("antfly_platform").document_pipeline_metrics;
 pub const document_runs = @import("antfly_document_runs");
 pub const document_failure = @import("document_failure.zig");
 const httpx = @import("httpx");
@@ -703,6 +704,8 @@ const AntflyReaderState = struct {
                 headers[count] = .{ "X-Antfly-Capability-Revision", v };
                 count += 1;
             }
+            const wire_timer = pipeline_metrics.start(.reader_http);
+            defer wire_timer.finish();
             var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms", .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
             defer response.deinit();
             if (!response.ok()) return readAntflyHttpError(alloc, response.status.code, responseCapabilityStale(response), response.body orelse "");
@@ -741,6 +744,8 @@ const AntflyReaderState = struct {
             header_count += 1;
         }
         const headers = header_buf[0..header_count];
+        const wire_timer = pipeline_metrics.start(.reader_http);
+        defer wire_timer.finish();
         var resp = try self.http.post(url, .{
             .json = body,
             .headers = headers,
@@ -806,6 +811,8 @@ const AntflyReaderState = struct {
         }
         header_buf[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
         header_count += 1;
+        const wire_timer = pipeline_metrics.start(.reader_http);
+        defer wire_timer.finish();
         var resp = try self.http.post(url, .{
             .borrowed_body_segments = body.segments,
             .headers = header_buf[0..header_count],
@@ -1997,4 +2004,8 @@ test "audio source URL schemes ignore case while signed paths and queries stay b
     try std.testing.expectEqualStrings("data:application/octet-stream;base64,AA==", wrapped);
     try std.testing.expectError(error.InvalidDocumentSource, audioSourceUrl(bounded.allocator(), ""));
     try std.testing.expectError(error.InvalidBase64, audioSourceUrl(bounded.allocator(), "not audio"));
+}
+
+test {
+    _ = pipeline_metrics;
 }

@@ -453,11 +453,22 @@ pub const SegmentShared = struct {
         std.debug.assert((previous & ~deletion_writer_bit) > 0);
     }
 
+    /// Single-threaded browser owners retain the full revision domain without
+    /// requiring unsupported wasm32 i64 atomics. Native readers stay atomic.
+    pub fn deletionRevision(self: *SegmentShared) u64 {
+        if (comptime builtin.single_threaded) return self.deletion_revision.raw;
+        return self.deletion_revision.load(.acquire);
+    }
+
     fn lockDeletionExclusive(self: *SegmentShared) void {
         const previous = self.deletion_lock.fetchOr(deletion_writer_bit, .acq_rel);
         std.debug.assert((previous & deletion_writer_bit) == 0);
         while (self.deletion_lock.load(.acquire) != deletion_writer_bit) spinOrYield();
-        _ = self.deletion_revision.fetchAdd(1, .acq_rel);
+        if (comptime builtin.single_threaded) {
+            self.deletion_revision.raw +%= 1;
+        } else {
+            _ = self.deletion_revision.fetchAdd(1, .acq_rel);
+        }
     }
 
     fn unlockDeletionExclusive(self: *SegmentShared) void {
@@ -1227,7 +1238,7 @@ pub const GraphPredicateCache = struct {
     }
 
     pub fn lockFlight(self: *@This(), key: []const u8, control: query_mod.ExecutionControl) !*std.atomic.Mutex {
-        const lock = &self.flights[std.hash.Wyhash.hash(0, key) % self.flights.len];
+        const lock = &self.flights[@intCast(std.hash.Wyhash.hash(0, key) % self.flights.len)];
         while (!lock.tryLock()) {
             try control.check();
             spinOrYield();

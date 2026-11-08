@@ -25,6 +25,8 @@ class MemoryEvaluationCounts:
         false_positive (int | Unset):  Default: 0.
         false_negative (int | Unset):  Default: 0.
         true_negative (int | Unset):  Default: 0.
+        tokens (int | Unset):  Default: 0.
+        token_cases (int | Unset):  Default: 0.
     """
 
     cases: int | Unset = 0
@@ -38,6 +40,8 @@ class MemoryEvaluationCounts:
     false_positive: int | Unset = 0
     false_negative: int | Unset = 0
     true_negative: int | Unset = 0
+    tokens: int | Unset = 0
+    token_cases: int | Unset = 0
 
     def to_dict(self) -> dict[str, Any]:
         cases = self.cases
@@ -61,6 +65,10 @@ class MemoryEvaluationCounts:
         false_negative = self.false_negative
 
         true_negative = self.true_negative
+
+        tokens = self.tokens
+
+        token_cases = self.token_cases
 
         field_dict: dict[str, Any] = {}
 
@@ -87,6 +95,10 @@ class MemoryEvaluationCounts:
             field_dict["false_negative"] = false_negative
         if true_negative is not UNSET:
             field_dict["true_negative"] = true_negative
+        if tokens is not UNSET:
+            field_dict["tokens"] = tokens
+        if token_cases is not UNSET:
+            field_dict["token_cases"] = token_cases
 
         return field_dict
 
@@ -115,6 +127,10 @@ class MemoryEvaluationCounts:
 
         true_negative = d.pop("true_negative", UNSET)
 
+        tokens = d.pop("tokens", UNSET)
+
+        token_cases = d.pop("token_cases", UNSET)
+
         memory_evaluation_counts = cls(
             cases=cases,
             binary_supersession_cases=binary_supersession_cases,
@@ -127,6 +143,8 @@ class MemoryEvaluationCounts:
             false_positive=false_positive,
             false_negative=false_negative,
             true_negative=true_negative,
+            tokens=tokens,
+            token_cases=token_cases,
         )
 
         return memory_evaluation_counts
