@@ -98,12 +98,30 @@ fn acknowledge(raw: *anyopaque, table_id: u64, generation: u64, nonce: [16]u8, l
             if (observed.dropped or newer.object_generation != generation or !std.mem.eql(u8, &newer.owner, &nonce) or newer.epoch <= owner.epoch) return err;
         };
     }
-    // A lost wakeup is repaired by the native inventory sweep. Eager capture
-    // makes the new accepted cut ready before a successful write returns.
+    // The ACK is already durable. Eager capture is best effort; until a
+    // failed capture is repaired by reconciliation, fresh reads rebuild rather
+    // than serve a cut behind the accepted watermark.
     @import("lake_index_text_query.zig").refreshOwnedCut(a, server, table, request) catch {
         server.notifyLakeCommit(table.name) catch {};
     };
 }
+/// Check cheap binding/configuration facts before joining global recovery
+/// admission. The authoritative state is re-read by activate after the claim.
+pub fn needsRecovery(a: A, server: *server_api.ApiHttpServer, table: Table, request: Request) !bool {
+    try request.ensureActive();
+    if (server.source.lakeIndexLifecycleAuthority(request) == null) return false;
+    var schema = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return false;
+    defer schema.deinit(a);
+    if (eligible(schema.binding) == null) return false;
+    var published = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
+    defer published.deinit();
+    if (published.value.published == null) return false;
+    if (server.cfg.node_config) |config| if (config.lake_indexes.serving_cuts.enabled) return true;
+    // A disabled option cannot abandon durable ownership or a partial claim.
+    // Lookup remains a small native point read; no provider I/O is admitted.
+    return (try readOwner(a, server, table.table_id, request)).owner != null;
+}
+
 pub fn activate(a: A, server: *server_api.ApiHttpServer, table: Table, request: Request) !?admission.State {
     var schema = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return null;
     defer schema.deinit(a);

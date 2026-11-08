@@ -31,6 +31,7 @@ const Progress = struct {
     pending: [max_pages]Navigation = undefined,
     count: usize = 0,
     position: usize = 0,
+    working_set: WorkingSet = .{},
 };
 pub const Stats = struct { attempts: u64 = 0, failures: u64 = 0, pages: u64 = 0, nanoseconds: u64 = 0 };
 pub const Cache = struct {
@@ -104,7 +105,9 @@ pub const Cache = struct {
         for (self.active) |item| if (item) |old| if (std.mem.eql(u8, &old, &key)) return error.NavigationWarmupInProgress;
         // Prefer a retained continuation, then rotate idle lanes so another
         // publication cannot repeatedly overwrite the only resumable plan.
-        for (self.plans, 0..) |plan, index| if (self.active[index] == null and std.mem.eql(u8, &plan.key, &key)) {
+        // Active plans are mutated only by their admitted owner. Taking a
+        // by-value snapshot would race with those writes despite this mutex.
+        for (&self.plans, 0..) |*plan, index| if (self.active[index] == null and std.mem.eql(u8, &plan.key, &key)) {
             self.active[index] = key;
             return index;
         };
@@ -237,11 +240,13 @@ const Guard = struct {
 /// levels, plus 16 segments/16 MiB of immutable working blocks. Every worker joins before its operation-local reader lease ends.
 pub fn warmRoots(store: stores.ArtifactStore, cached: artifacts.CachedRead, roots: []const Navigation, token: Token) !usize {
     var progress: Progress = .{};
-    return warmRootsGuarded(store, cached, roots, token, null, &progress);
+    return warmRootsGuarded(store, cached, roots, token, null, &progress, null);
 }
-fn warmRootsGuarded(store: stores.ArtifactStore, cached: artifacts.CachedRead, roots: []const Navigation, token: Token, guard: ?Guard, progress: *Progress) !usize {
-    var working_set: WorkingSet = .{};
+fn warmRootsGuarded(store: stores.ArtifactStore, cached: artifacts.CachedRead, roots: []const Navigation, token: Token, guard: ?Guard, progress: *Progress, completed_pages: ?*std.atomic.Value(u64)) !usize {
     if (progress.count == 0 or progress.position >= progress.count) {
+        // The traversal and its working-block quota form one resumable sweep.
+        // A retry cannot turn each completed wave into another 16 MiB warmup.
+        progress.working_set = .{};
         progress.count = @min(roots.len, progress.pending.len);
         progress.position = 0;
         @memcpy(progress.pending[0..progress.count], roots[0..progress.count]);
@@ -261,7 +266,7 @@ fn warmRootsGuarded(store: stores.ArtifactStore, cached: artifacts.CachedRead, r
             owned.cancel(io) catch {};
         };
         for (work[0..width], 0..) |*item, slot| {
-            item.* = .{ .navigation = pending[position + slot], .store = store, .cached = cached, .token = token, .working_set = &working_set };
+            item.* = .{ .navigation = pending[position + slot], .store = store, .cached = cached, .token = token, .working_set = &progress.working_set };
             if (cached.context.io) |io| tasks[slot] = local.sql_parallel_scheduler.global().submitIo(io, page_workspace, PageWarm.run, .{item});
             if (tasks[slot] == null) {
                 // Saturated I/O admission must yield to foreground queries.
@@ -291,6 +296,9 @@ fn warmRootsGuarded(store: stores.ArtifactStore, cached: artifacts.CachedRead, r
         position += width;
         progress.count = count;
         progress.position = position;
+        // Count completed work even when a later wave times out. Resuming the
+        // sweep must neither lose earlier pages nor count them a second time.
+        if (completed_pages) |counter| _ = counter.fetchAdd(width, .monotonic);
     }
     return position - initial_position;
 }
@@ -350,12 +358,17 @@ pub fn warmNavigationWithin(a: A, server: *@import("http_server.zig").ApiHttpSer
             if (stop.owner.index_installation_closing.load(.acquire)) return true;
             return stop.context.isCancellationRequested();
         }
+        fn check(raw: *const anyopaque) !void {
+            const stop: *const @This() = @ptrCast(@alignCast(raw));
+            try stop.context.ensureActive();
+            if (stop.owner.index_installation_closing.load(.acquire)) return error.Canceled;
+        }
     };
     var stop: Stop = .{ .owner = server, .context = try caller.platformDeadline() };
     stop.context.deadline_ns = @min(stop.context.deadline_ns orelse std.math.maxInt(u64), started +| 2 * std.time.ns_per_s);
-    const token: Token = .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled };
+    const token: Token = .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled, .check_fn = Stop.check };
     var request = stop.context;
-    request.cancellation = .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled };
+    request.cancellation = .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled, .check_fn = Stop.check };
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return;
     const normalized = try request.platformDeadline();
     var context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) };
@@ -415,8 +428,7 @@ pub fn warmNavigationWithin(a: A, server: *@import("http_server.zig").ApiHttpSer
         if (count == roots.len) break;
     }
     const native_state = try authority.readState(a, table.table_id);
-    const pages = try warmRootsGuarded(store.artifactStore(), cached, roots[0..count], token, .{ .authority = authority, .table = table.table_id, .generation = publication.generation, .epoch = if (native_state.source_owner) |owner| owner.epoch else null }, progress);
-    _ = server.lake_navigation_warming.pages.fetchAdd(pages, .monotonic);
+    _ = try warmRootsGuarded(store.artifactStore(), cached, roots[0..count], token, .{ .authority = authority, .table = table.table_id, .generation = publication.generation, .epoch = if (native_state.source_owner) |owner| owner.epoch else null }, progress, &server.lake_navigation_warming.pages);
     completed = true;
 }
 
@@ -527,9 +539,9 @@ test "external lake navigation warming resumes completed waves without retaining
             return plan.position >= 4;
         }
     };
-    try std.testing.expectError(error.Canceled, warmRootsGuarded(store, cached, &roots, .{ .ptr = &progress, .is_cancelled_fn = Stop.canceled }, null, &progress));
+    try std.testing.expectError(error.Canceled, warmRootsGuarded(store, cached, &roots, .{ .ptr = &progress, .is_cancelled_fn = Stop.canceled }, null, &progress, null));
     try std.testing.expectEqual(@as(usize, 4), progress.position);
-    try std.testing.expectEqual(@as(usize, 4), try warmRootsGuarded(store, cached, &roots, .none, null, &progress));
+    try std.testing.expectEqual(@as(usize, 4), try warmRootsGuarded(store, cached, &roots, .none, null, &progress, null));
     try std.testing.expectEqual(@as(usize, 8), progress.position);
     var plans: Cache = .{};
     const slot = (try plans.beginAt(@splat(1), 1)).?;
@@ -543,4 +555,96 @@ test "external lake navigation warming resumes completed waves without retaining
     try std.testing.expectEqual(slot, resumed);
     try std.testing.expectEqual(@as(usize, 8), plans.plans[resumed].position);
     plans.finishAt(resumed, @splat(1), true, 5 * std.time.ns_per_s + 4);
+}
+
+test "external lake navigation warming keeps cumulative quotas and completed-page metrics across resumes" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("resumable-navigation-quota");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    const bytes = (try local.storage_db_document_mapper.buildTextSegmentFromDocuments(a, &.{.{ .key = "one", .value = "{\"body\":\"alpha beta\"}" }}, .{}, null)).?;
+    defer a.free(bytes);
+    const ref = try @import("lake_index_seekable_text.zig").publish(a, a, &store, bytes, .none);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    const route: @import("lake_index_native_text.zig").SegmentRouting = .{ .ref = ref, .summary = null, .bytes = bytes.len, .doc_count = 1, .fields = &.{} };
+    const value = try std.json.Stringify.valueAlloc(a, .{ .route = route }, .{});
+    defer a.free(value);
+    var read_bytes: u64 = 1024 * 1024;
+    var write_bytes: u64 = 1024 * 1024;
+    var pages: page_store.PageStore = .{ .domain = @splat(6), .attempt = store.upload_scope.?.attempt, .artifacts = &store, .cancellation = .none, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes };
+    const root = (try tree.apply(a, pages.store(), null, &.{.{ .key = "segment", .value = value }})).?;
+    const roots: [24]Navigation = @splat(.{ .domain = @splat(6), .ref = root, .text_segments = true });
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(1), .context = .{} };
+    var progress: Progress = .{};
+    var completed = std.atomic.Value(u64).init(0);
+    const Stop = struct {
+        progress: *Progress,
+        after: usize,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.progress.position >= self.after;
+        }
+    };
+    for (1..6) |wave| {
+        var stop: Stop = .{ .progress = &progress, .after = wave * 4 };
+        try std.testing.expectError(error.Canceled, warmRootsGuarded(store, cached, &roots, .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled }, null, &progress, &completed));
+        try std.testing.expectEqual(wave * 4, progress.position);
+        try std.testing.expectEqual(@as(u64, @intCast(wave * 4)), completed.load(.acquire));
+        const remaining: usize = 16 - @min(16, wave * 4);
+        try std.testing.expectEqual(remaining, progress.working_set.remaining_segments.load(.acquire));
+        try std.testing.expectEqual(remaining * 1024 * 1024, progress.working_set.remaining_bytes.load(.acquire));
+    }
+    try std.testing.expectEqual(@as(usize, 4), try warmRootsGuarded(store, cached, &roots, .none, null, &progress, &completed));
+    try std.testing.expectEqual(@as(u64, 24), completed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), progress.working_set.remaining_segments.load(.acquire));
+    // A completed sweep may be restarted after eviction, with a fresh quota.
+    var next: Stop = .{ .progress = &progress, .after = 4 };
+    try std.testing.expectError(error.Canceled, warmRootsGuarded(store, cached, &roots, .{ .ptr = &next, .is_cancelled_fn = Stop.canceled }, null, &progress, &completed));
+    try std.testing.expectEqual(@as(usize, 12), progress.working_set.remaining_segments.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 28), completed.load(.acquire));
+}
+
+test "external lake navigation warming admits idle plans while another owner mutates its active continuation" {
+    const io = std.testing.io;
+    var cache: Cache = .{};
+    const busy = (try cache.beginAt(@splat(1), 1)).?;
+    cache.plans[busy].key = @splat(1);
+    const Writer = struct {
+        plan: *Progress,
+        started: std.Io.Event = .unset,
+        stop: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) anyerror!void {
+            self.started.set(std.testing.io);
+            while (!self.stop.load(.acquire)) {
+                self.plan.position +%= 1;
+                self.plan.pending[0].domain = @splat(@truncate(self.plan.position));
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    var writer: Writer = .{ .plan = &cache.plans[busy] };
+    var task = try io.concurrent(Writer.run, .{&writer});
+    defer {
+        writer.stop.store(true, .release);
+        if (task.any_future != null) task.cancel(io) catch {};
+        cache.finishAt(busy, @splat(1), false, 1);
+    }
+    try writer.started.wait(io);
+    for (0..100) |i| {
+        const now = 1 + i * (5 * std.time.ns_per_s + 1);
+        const idle = (try cache.beginAt(@splat(2), now)).?;
+        try std.testing.expect(idle != busy);
+        cache.finishAt(idle, @splat(2), false, now);
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    writer.stop.store(true, .release);
+    try task.await(io);
+    try std.testing.expect(cache.plans[busy].position != 0);
+    try std.testing.expectEqual(@as([32]u8, @splat(1)), cache.plans[busy].key);
 }

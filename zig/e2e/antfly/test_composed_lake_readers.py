@@ -758,14 +758,14 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         assert len(longer["hits"]["hits"]) == 7
         if owned:
             encoded = longer["next_source_cursor"].split(":")[4]
-            envelope = json.loads(
-                base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-            )
-            assert (
-                3_500_000
-                < envelope["expires_ms"] - envelope["issued_ms"]
-                <= cursor_retention_ms
-            )
+            envelope = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+            if envelope[0] == 2:
+                assert len(envelope) > 17
+                issued_ms, expires_ms = struct.unpack("<QQ", envelope[1:17])
+            else:
+                legacy = json.loads(envelope)
+                issued_ms, expires_ms = legacy["issued_ms"], legacy["expires_ms"]
+            assert 3_500_000 < expires_ms - issued_ms <= cursor_retention_ms
         # Increasing the new-cursor horizon must preserve already-issued cuts.
         _, old_page = call(
             "POST", "/query", {**query, "source_cursor": first["next_source_cursor"]}

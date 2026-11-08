@@ -129,7 +129,10 @@ containing the published generation and bounded pending row images. Queries
 issue authenticated cursor references to that state and a WAL position, without
 uploading another retained image or cursor envelope. The implementation uses
 HMAC-authenticated `lake3:` and `source3:` capabilities, while retaining legacy
-`lake2:`/`source2:` reads. Signing keys stay in private native metadata. Cursor validation still
+`lake2:`/`source2:` reads. A compact framed payload avoids JSON-escape expansion
+within the existing token bound; existing JSON-envelope capabilities remain
+readable through their original expiry. Signing keys stay in private native
+metadata. Cursor validation still
 checks current permissions, incarnation, recipe, ownership and expiry. Reader
 leases protect published generations through every issued cursor's expiry;
 state images and their row groups must live at least as long. Admission extends
@@ -151,8 +154,8 @@ The owner warms the admitted cut's bounded working set: navigation, dictionaries
 postings, row locators and replacement-key indexes. Existing process accounting,
 eviction and cancellation apply; warming yields to foreground work and stops
 when the admitted generation changes. Four bounded continuation plans retain
-completed navigation waves across timeout, with eviction-aware rewarming after
-a cooldown. Plans own immutable references, never request credentials or reader
+completed navigation waves and their working-set quota across timeout, with
+eviction-aware rewarming after a cooldown. Plans own immutable references, never request credentials or reader
 leases. Compressed opening bundles replace redundant individual metadata fetches.
 Retained state, row groups and sealed heads also use the authenticated durable
 byte cache, with exact provider generation and credential scope in their keys.

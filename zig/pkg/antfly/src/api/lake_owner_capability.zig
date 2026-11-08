@@ -26,6 +26,8 @@ fn tokenLimit(kind: Kind) usize {
 }
 pub const Kind = enum { lake, composed };
 pub const Scope = struct { table_id: u64, object_generation: u64, owner: [16]u8 };
+const binary_version: u8 = 2;
+const binary_header_bytes = 1 + 8 + 8;
 const Envelope = struct { version: u8 = 1, issued_ms: u64, expires_ms: u64, payload: []const u8 };
 pub const Opened = struct { scope: Scope, expires_ms: u64, payload: []const u8 };
 fn prefix(kind: Kind) []const u8 {
@@ -39,8 +41,17 @@ fn signature(key: Key, bytes: []const u8) [32]u8 {
 pub fn seal(a: A, kind: Kind, scope: Scope, key: Key, payload: []const u8, now: u64, expires: u64) ![]const u8 {
     if (payload.len == 0 or payload.len > max_payload or now == 0 or (expires > now and expires - now > std.time.ms_per_hour) or scope.table_id == 0 or std.mem.allEqual(u8, &scope.owner, 0) or std.mem.allEqual(u8, &key, 0)) return error.InvalidQueryRequest;
     if (expires <= now) return error.DeadlineExceeded;
-    const bytes = try std.json.Stringify.valueAlloc(a, Envelope{ .issued_ms = now, .expires_ms = expires, .payload = payload }, .{});
+    // Raw framing preserves the full payload allowance independently of JSON
+    // escape density. The outer scope and HMAC contract remains unchanged.
+    const bytes = try a.alloc(u8, binary_header_bytes + payload.len);
     defer a.free(bytes);
+    bytes[0] = binary_version;
+    std.mem.writeInt(u64, bytes[1..9], now, .little);
+    std.mem.writeInt(u64, bytes[9..17], expires, .little);
+    @memcpy(bytes[binary_header_bytes..], payload);
+    return encodeEnvelope(a, kind, scope, key, bytes);
+}
+fn encodeEnvelope(a: A, kind: Kind, scope: Scope, key: Key, bytes: []const u8) ![]const u8 {
     const codec = std.base64.url_safe_no_pad;
     const encoded_size = codec.Encoder.calcSize(bytes.len);
     if (encoded_size > tokenLimit(kind)) return error.QueryCandidateBudgetExceeded;
@@ -87,9 +98,21 @@ pub fn open(a: A, kind: Kind, scope: Scope, key: Key, token: []const u8, now: u6
     const bytes = try a.alloc(u8, size);
     defer a.free(bytes);
     codec.decode(bytes, parsed.encoded) catch return error.InvalidQueryRequest;
+    if (bytes.len != 0 and bytes[0] == binary_version) {
+        if (bytes.len <= binary_header_bytes or bytes.len - binary_header_bytes > max_payload) return error.CatalogGenerationChanged;
+        const issued_ms = std.mem.readInt(u64, bytes[1..9], .little);
+        const expires_ms = std.mem.readInt(u64, bytes[9..17], .little);
+        try validateLifetime(issued_ms, expires_ms, now);
+        return .{ .scope = scope, .expires_ms = expires_ms, .payload = try a.dupe(u8, bytes[binary_header_bytes..]) };
+    }
+    // Existing cursors retain their complete horizon through upgrades.
     const value = std.json.parseFromSliceLeaky(Envelope, a, bytes, .{ .allocate = .alloc_always }) catch return error.InvalidQueryRequest;
-    if (value.version != 1 or value.issued_ms == 0 or value.expires_ms <= value.issued_ms or value.expires_ms - value.issued_ms > std.time.ms_per_hour or value.issued_ms > now +| 60_000 or value.expires_ms <= now or value.payload.len == 0 or value.payload.len > max_payload) return error.CatalogGenerationChanged;
+    if (value.version != 1 or value.payload.len == 0 or value.payload.len > max_payload) return error.CatalogGenerationChanged;
+    try validateLifetime(value.issued_ms, value.expires_ms, now);
     return .{ .scope = scope, .expires_ms = value.expires_ms, .payload = value.payload };
+}
+fn validateLifetime(issued_ms: u64, expires_ms: u64, now: u64) !void {
+    if (issued_ms == 0 or expires_ms <= issued_ms or expires_ms - issued_ms > std.time.ms_per_hour or issued_ms > now +| 60_000 or expires_ms <= now) return error.CatalogGenerationChanged;
 }
 
 test "owner capabilities preserve opaque bytes and fence signatures scope kind and expiry" {
@@ -125,7 +148,66 @@ test "owner capability encoder and decoder share encoded limits" {
     const token = try seal(a, .composed, scope, key, payload, 1, 1000);
     try std.testing.expectEqualStrings(payload, (try open(a, .composed, scope, key, token, 2)).payload);
     @memset(payload, '"');
-    try std.testing.expectError(error.QueryCandidateBudgetExceeded, seal(a, .composed, scope, key, payload, 1, 1000));
+    const escaped = try seal(a, .composed, scope, key, payload, 1, 1000);
+    try std.testing.expect(escaped.len <= max_token_bytes);
+    try std.testing.expectEqualStrings(payload, (try open(a, .composed, scope, key, escaped, 2)).payload);
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, seal(a, .lake, scope, key, payload, 1, 1000));
     try std.testing.expectError(error.DeadlineExceeded, seal(a, .composed, scope, key, "payload", 1000, 1000));
+}
+
+test "owner capability framing preserves quote-heavy ordered composed frontiers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const quote = try a.alloc(u8, 200_000);
+    @memset(quote, '"');
+    const Position = struct {
+        table: []const u8,
+        after: []const []const u8,
+        raw_count: usize = 1,
+        visible_count: usize = 1,
+        total: usize = 2,
+        identity_pinned: bool = true,
+        remote_snapshot: []const u8 = "lake3:already-durable",
+        identity: []const u8 = "null",
+    };
+    const positions = [_]Position{
+        .{ .table = "history", .after = &.{ quote, "row-one" } },
+        .{ .table = "current", .after = &.{ quote, "row-two" } },
+    };
+    const payload = try std.json.Stringify.valueAlloc(a, .{ .version = 3, .fingerprint = @as([]const u8, &(@as([64]u8, @splat('a')))), .sources = positions, .total = @as(?usize, null), .aggregations = @as(?bool, null) }, .{});
+    try std.testing.expect(payload.len <= max_payload);
+    // These are admitted scalar sort-key sizes. Nesting the JSON frontier
+    // inside another JSON string used to exceed the encoded token allowance.
+    const nested = try std.json.Stringify.valueAlloc(a, Envelope{ .issued_ms = 1000, .expires_ms = 301000, .payload = payload }, .{});
+    try std.testing.expect(std.base64.url_safe_no_pad.Encoder.calcSize(nested.len) > max_token_bytes);
+    const scope: Scope = .{ .table_id = 1, .object_generation = 1, .owner = @splat(1) };
+    const key: Key = @splat(2);
+    const token = try seal(a, .composed, scope, key, payload, 1000, 301000);
+    try std.testing.expect(token.len <= max_token_bytes);
+    try std.testing.expectEqualStrings(payload, (try open(a, .composed, scope, key, token, 2000)).payload);
+}
+
+test "owner capabilities decode legacy envelopes and preserve opaque binary payloads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const scope: Scope = .{ .table_id = 1, .object_generation = 1, .owner = @splat(1) };
+    const key: Key = @splat(2);
+    const legacy_payload = "{\"sources\":[],\"escaped\":\"\\\\\\\"\"}";
+    const legacy_envelope = try std.json.Stringify.valueAlloc(a, Envelope{ .issued_ms = 1000, .expires_ms = 301000, .payload = legacy_payload }, .{});
+    const legacy = try encodeEnvelope(a, .composed, scope, key, legacy_envelope);
+    try std.testing.expectEqualStrings(legacy_payload, (try open(a, .composed, scope, key, legacy, 2000)).payload);
+    try std.testing.expectError(error.CatalogGenerationChanged, open(a, .composed, scope, key, legacy, 301000));
+    const binary_payload = [_]u8{ 0, 1, 2, 255, 0xc3, 0x28, '"', '\\' };
+    const token = try seal(a, .composed, scope, key, &binary_payload, 1000, 301000);
+    try std.testing.expectEqualSlices(u8, &binary_payload, (try open(a, .composed, scope, key, token, 2000)).payload);
+    const truncated = try encodeEnvelope(a, .composed, scope, key, &.{binary_version});
+    try std.testing.expectError(error.CatalogGenerationChanged, open(a, .composed, scope, key, truncated, 2000));
+    var bad_lifetime: [binary_header_bytes + 1]u8 = @splat(0);
+    bad_lifetime[0] = binary_version;
+    std.mem.writeInt(u64, bad_lifetime[1..9], 1000, .little);
+    std.mem.writeInt(u64, bad_lifetime[9..17], 1000, .little);
+    const invalid = try encodeEnvelope(a, .composed, scope, key, &bad_lifetime);
+    try std.testing.expectError(error.CatalogGenerationChanged, open(a, .composed, scope, key, invalid, 1000));
 }

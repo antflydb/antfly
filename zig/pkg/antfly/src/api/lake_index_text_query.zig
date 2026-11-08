@@ -482,7 +482,7 @@ const Manifest = struct {
     }
     fn load(a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, token: @import("antfly_cancellation").CancellationToken, cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead) !Manifest {
         var artifacts = store;
-        const bytes = try @import("lake_generation_envelope.zig").readCached(&artifacts, .{ .id = ref.artifact_id, .bytes = @intCast(ref.byte_len), .generation = if (ref.name.len != 0) @constCast(ref.name) else null }, token, cached);
+        const bytes = try @import("lake_retained_cut.zig").readRetainedCached(&artifacts, .{ .id = ref.artifact_id, .bytes = @intCast(ref.byte_len), .generation = if (ref.name.len != 0) @constCast(ref.name) else null }, token, cached);
         defer artifacts.allocator.free(bytes);
         return .{ .bytes = try a.dupe(u8, bytes) };
     }
@@ -495,11 +495,21 @@ pub fn refreshOwnedCut(backing: A, server: *server_api.ApiHttpServer, table: loc
             const self: *const @This() = @ptrCast(@alignCast(raw));
             return self.server.index_installation_closing.load(.acquire) or self.parent.isCancellationRequested();
         }
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            try self.parent.ensureActive();
+            if (self.server.index_installation_closing.load(.acquire)) return error.Canceled;
+        }
     };
     var stop: Stop = .{ .server = server, .parent = try caller.platformDeadline() };
     var request = stop.parent;
     request.deadline_ns = @min(request.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 60 * std.time.ns_per_s);
-    request.cancellation = .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled };
+    request.cancellation = .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled, .check_fn = Stop.check };
+    {
+        var preflight = std.heap.ArenaAllocator.init(backing);
+        defer preflight.deinit();
+        if (!try source_owner.needsRecovery(preflight.allocator(), server, table, request)) return;
+    }
     const recovery_key = @import("lake_wal_image.zig").digest(.{ .table = table.table_id, .incarnation = table.object_storage_generation });
     const recovery = try server.lake_navigation_warming.claimRecovery(recovery_key, server.embedding_provider_runtime.io, request);
     defer recovery.deinit();
@@ -6526,4 +6536,77 @@ test "external lake composed local cuts pass explicit text index leaf parsing" {
     var scope = Scope.init(a);
     defer scope.deinit();
     try std.testing.expect((try scope.find(.{ .table_id = 7, .name = "events" }, parsed.req)) == null);
+}
+
+test "external lake owned serving recovery admission skips unrelated tables and preserves live deadlines" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const lifecycle = @import("../metadata/lake_index_lifecycle.zig");
+    const View = @import("../metadata/lake_source_owner_view.zig");
+    const Harness = struct {
+        owner: ?source_owner.admission.State = null,
+        captures: usize = 0,
+        fn catalog(raw: *anyopaque, alloc: A, _: local.api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (input != .lake_source_owner_read) return error.UnsupportedOperation;
+            return View.encode(alloc, .{ .owner = self.owner });
+        }
+        fn read(raw: *anyopaque, _: A, _: u64, _: local.api_operation.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.captures += 1;
+            return error.IndexRebuilding;
+        }
+        fn mutate(_: *anyopaque, _: u64, _: u64, _: lifecycle.Mutation, _: local.api_operation.RequestContext) !void {
+            return error.IndexRebuilding;
+        }
+    };
+    var harness: Harness = .{};
+    const vtable: server_api.StatusSource.VTable = .{ .status = undefined, .system_catalog = Harness.catalog, .get_lake_index_lifecycle = Harness.read, .mutate_lake_index_lifecycle = Harness.mutate };
+    var server = server_api.ApiHttpServer.init(a, .{}, .{ .ptr = &harness, .vtable = &vtable }, null, null);
+    defer server.deinit();
+    const metadata = local.metadata_lake_index_catalog;
+    var table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "events", .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://archive/sealed.parquet-manifest.json","schema_fingerprint":"schema","object_mutability":"immutable"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"}},"additionalProperties":true}}}}
+    , .indexes_json = "{\"body\":{\"type\":\"full_text\"}}" };
+    const schema_json = table.schema_json;
+    const publication: metadata.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = metadata.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://archive/sealed.parquet-manifest.json", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
+    const catalog_json = try metadata.encode(scratch, .{ .generation = 1, .published = publication });
+    table.lake_index_catalog_json = catalog_json;
+    var lanes: [4]@import("lake_index_navigation_warming.zig").Cache.Recovery = undefined;
+    var held: usize = 0;
+    defer for (lanes[0..held]) |lane| lane.deinit();
+    for (&lanes, 0..) |*lane, index| {
+        lane.* = try server.lake_navigation_warming.claimRecovery(@splat(@intCast(index + 1)), std.testing.io, .{});
+        held += 1;
+    }
+    // Native disabled and no durable owner: there is no required work, even
+    // though all recovery lanes are occupied by other tables.
+    try refreshOwnedCut(a, &server, table, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s });
+    table.schema_json = "{}";
+    try refreshOwnedCut(a, &server, table, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s });
+    table.schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://archive/prefix","schema_fingerprint":"schema","object_mutability":"immutable"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"}},"additionalProperties":true}}}}
+    ;
+    try refreshOwnedCut(a, &server, table, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s });
+    table.schema_json = schema_json;
+    harness.owner = .{ .kind = .sealed_manifest, .owner = @splat(1), .signing_key = @splat(2), .object_generation = table.object_storage_generation, .source = @splat(3) };
+    table.lake_index_catalog_json = "{}";
+    try refreshOwnedCut(a, &server, table, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s });
+    table.lake_index_catalog_json = catalog_json;
+    server.source.vtable = &.{ .status = undefined };
+    try refreshOwnedCut(a, &server, table, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s });
+    server.source.vtable = &vtable;
+    try std.testing.expectEqual(@as(usize, 0), harness.captures);
+    // Persisted ownership must still enter recovery with the option off. A
+    // deadline that expires after admission began remains DeadlineExceeded,
+    // not a boolean Canceled result; the queue counter proves a live wait.
+    const before = server.lake_navigation_warming.recovery_coalesced.load(.acquire);
+    try std.testing.expectError(error.DeadlineExceeded, refreshOwnedCut(a, &server, table, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 100 * std.time.ns_per_ms }));
+    try std.testing.expect(server.lake_navigation_warming.recovery_coalesced.load(.acquire) > before);
+    for (lanes) |lane| lane.deinit();
+    held = 0;
+    try std.testing.expectError(error.IndexRebuilding, refreshOwnedCut(a, &server, table, .{}));
+    try std.testing.expectEqual(@as(usize, 1), harness.captures);
 }

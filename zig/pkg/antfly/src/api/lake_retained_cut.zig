@@ -335,7 +335,13 @@ fn readParts(a: A, store: *stores.ArtifactStore, state: *State, expected_domain:
     if (state.change_parts.len != 0) state.pending.changes = try changes.toOwnedSlice(a);
 }
 fn readRetained(store: *stores.ArtifactStore, ref: StateRef, cancellation: Token) ![]u8 {
-    return generations.read(store, ref, cancellation) catch |err| switch (err) {
+    return readRetainedCached(store, ref, cancellation, null);
+}
+/// Missing retained state is an expired/changed pagination cut, regardless of
+/// whether bytes were fetched through the optional immutable cache. Preserve
+/// transport, authorization, allocation and cancellation failures unchanged.
+pub fn readRetainedCached(store: *stores.ArtifactStore, ref: StateRef, cancellation: Token, cached: ?CachedRead) ![]u8 {
+    return generations.readCached(store, ref, cancellation, cached) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => error.CatalogGenerationChanged,
         else => err,
     };
@@ -371,7 +377,7 @@ const GroupLoader = struct {
         // The temporary body and decoded values use this group's own budget.
         var backend = self.store;
         backend.allocator = item.budget.allocator();
-        const bytes = try generations.readCached(&backend, self.ref, self.cancellation, self.cached);
+        const bytes = try readRetainedCached(&backend, self.ref, self.cancellation, self.cached);
         defer backend.allocator.free(bytes);
         const a = item.arena.allocator();
         const value = try a.create(DecodedGroup);
@@ -488,7 +494,7 @@ const StateLoader = struct {
 };
 const GroupOwner = struct { item: *local.serverless_query_lake_decoded_cache.Item, cache: *local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context, cached: ?CachedRead = null };
 fn decodeState(a: A, store: *stores.ArtifactStore, ref: StateRef, expected_domain: [32]u8, expiry: u64, cancellation: Token, groups: ?GroupOwner, cached: ?CachedRead) !Decoded {
-    const body = try generations.readCached(store, ref, cancellation, cached);
+    const body = try readRetainedCached(store, ref, cancellation, cached);
     defer store.allocator.free(body);
     var state = try std.json.parseFromSliceLeaky(State, a, body, .{ .allocate = .alloc_always });
     if (state.version != 2) return error.InvalidQueryRequest;
@@ -1059,3 +1065,50 @@ const CollectionFixture = struct {
         }
     }
 };
+
+test "external lake global frontier retained missing state and row groups preserve conflict semantics" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |missing_group| {
+        var directory = try local.common_test_directory.TestDirectory.init("retained-missing-state");
+        defer directory.cleanup();
+        var backend = try @import("lake_index_store.zig").Store.openNative(a, null, null, false, .standalone, directory.path());
+        defer backend.deinit();
+        var store = backend.artifactStore();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const sa = arena.allocator();
+        const table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "history", .schema_json = "{}", .indexes_json = "{}" };
+        const publication: catalog.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://bucket/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
+        const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+        const row = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"id\":1,\"body\":\"quasar\"}", .{});
+        const descriptor: Descriptor = .{ .expires_ms = now + ttl_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = catalog.desiredFingerprint(table), .publication = publication, .reader_token = @splat(5), .pending = .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} }, .published_only = false };
+        const token = try save(sa, &store, backend.identity, std.testing.io, descriptor, .none);
+        const envelope_ref = try generations.decode(sa, prefix, token, max_bytes);
+        const envelope_bytes = try readRetained(&store, envelope_ref, .none);
+        defer store.allocator.free(envelope_bytes);
+        const envelope = try std.json.parseFromSliceLeaky(LeaseEnvelope, sa, envelope_bytes, .{ .allocate = .alloc_always });
+        const state_bytes = try readRetained(&store, envelope.state, .none);
+        defer store.allocator.free(state_bytes);
+        const state = try std.json.parseFromSliceLeaky(State, sa, state_bytes, .{ .allocate = .alloc_always });
+        try std.testing.expectEqual(@as(usize, 1), state.change_parts.len);
+        try store.delete(if (missing_group) state.change_parts[0].id else envelope.state.id);
+
+        var decoded: local.serverless_query_lake_decoded_cache.Cache = .{ .a = a };
+        defer decoded.deinit();
+        var groups: local.serverless_query_lake_decoded_cache.Cache = .{ .a = a };
+        defer groups.deinit();
+        const context: local.serverless_query_lake_read_context.Context = .{ .io = std.testing.io };
+        // The legacy envelope is still readable; its missing transitive state
+        // must remain a conflict through the shared decoded-reader path.
+        try std.testing.expectError(error.CatalogGenerationChanged, loadWithGroups(sa, &store, backend.identity, token, table, now + 1, .none, &decoded, &groups, context));
+        const cut: @import("../metadata/lake_source_admission.zig").Cut = .{ .desired = descriptor.desired, .store = backend.identity, .generation = publication.generation, .reader_token = descriptor.reader_token, .state = .{ .id = envelope.state.id, .bytes = envelope.state.bytes, .generation = envelope.state.generation }, .wal_lsn = 8, .base_lsn = 0, .created_ms = now, .refresh_after_ms = now + ttl_ms / 2, .expires_ms = descriptor.expires_ms, .cursor_ttl_ms = ttl_ms };
+        var bytes = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer bytes.deinit();
+        // Native owner admission and the new immutable-byte cache must expose
+        // the same error after restart/eviction, without warming either cache.
+        try std.testing.expectError(error.CatalogGenerationChanged, loadOwned(sa, &store, backend.identity, table, cut, now + 1, .none, &decoded, &groups, context, .{ .cache = &bytes, .scope = backend.cache_identity, .context = context }));
+        var canceled = std.atomic.Value(bool).init(true);
+        try std.testing.expectError(error.Canceled, readRetainedCached(&store, envelope.state, Token.fromAtomic(&canceled), null));
+        try std.testing.expectError(error.DeadlineExceeded, readRetainedCached(&store, envelope.state, .none, .{ .cache = &bytes, .scope = backend.cache_identity, .context = .{ .deadline_ns = 0 } }));
+    }
+}
