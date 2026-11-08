@@ -88,9 +88,12 @@ coordination or an explicit bounded-staleness contract.
 
 Activation conditionally claims the managed catalog and WAL heads with the
 same durable owner nonce. Unhooked writers fail, including older binaries whose
-strict parsers reject the ownership field. A partially completed claim remains
-unavailable until reconciliation finishes; turning the configuration off does
-not remove an established fence. Sealed manifests have immutable membership.
+strict parsers reject the ownership field. Claiming stages ownership; admitting
+a complete first cut atomically enables native reads. Strict coordinated reads
+remain available while initial capture is incomplete. Turning the configuration
+off does not remove an established fence. Sealed manifests have immutable
+membership, and capture retains their exact parsed head even without a published
+file-navigation index.
 
 The native owner persists source identity, incarnation, ownership epoch,
 acknowledged WAL watermark and the current reusable serving-cut reference.
@@ -136,13 +139,25 @@ bounds can impose explicit backpressure at high publication rates. Refresh happe
 before the remaining retention horizon becomes too short for a new cursor.
 Increasing the configured cursor lifetime forces refresh when the existing
 horizon cannot cover it; unavailable cuts also trigger keyed reconciliation.
+Required recovery coalesces by table incarnation within four process-wide lanes.
+Each waiting caller keeps its own deadline/cancellation; recovery also observes
+shutdown and a 60-second maximum deadline. Readiness does not swallow a required
+recovery failure for an active owner or advertise a cut whose retention cannot
+cover the configured cursor lifetime. Optional warming cannot establish readiness.
 Raw captured WAL heads cannot substitute for retained row images when their
 underlying roots can be collected independently.
 
 The owner warms the admitted cut's bounded working set: navigation, dictionaries,
 postings, row locators and replacement-key indexes. Existing process accounting,
 eviction and cancellation apply; warming yields to foreground work and stops
-when the admitted generation changes. Query execution merges pinned readers
+when the admitted generation changes. Four bounded continuation plans retain
+completed navigation waves across timeout, with eviction-aware rewarming after
+a cooldown. Plans own immutable references, never request credentials or reader
+leases. Compressed opening bundles replace redundant individual metadata fetches.
+Retained state, row groups and sealed heads also use the authenticated durable
+byte cache, with exact provider generation and credential scope in their keys.
+Cache hits still require current native authority or a valid retained capability.
+Query execution merges pinned readers
 directly, fetches remote blocks on misses and hydrates winning hits. These
 optimizations must preserve unfiltered replacement probes and exact pagination.
 External-writer freshness, vector overlays and unsupported cursor shapes keep

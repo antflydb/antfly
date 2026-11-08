@@ -126,11 +126,12 @@ pub const State = struct {
     pub fn admit(self: State, expected_epoch: u64, source_uuid: []const u8, cut: Cut) !State {
         try self.validate();
         try cut.validate();
-        if (!self.enabled or expected_epoch != self.epoch) return error.CatalogGenerationChanged;
+        if (expected_epoch != self.epoch) return error.CatalogGenerationChanged;
         if (cut.wal_lsn < self.accepted_lsn) return error.IndexRebuilding;
         if (self.source_uuid.len != 0 and !std.mem.eql(u8, self.source_uuid, source_uuid)) return error.ExternalLakeSnapshotMismatch;
         if (self.current) |current| if (cut.wal_lsn < current.wal_lsn) return error.CatalogGenerationChanged;
         var next = self;
+        next.enabled = true;
         next.source_uuid = source_uuid;
         next.current = cut;
         next.accepted_lsn = @max(next.accepted_lsn, cut.wal_lsn);
@@ -171,4 +172,17 @@ test "native source admission retention preserves the maximum public cursor life
     try std.testing.expect(horizon.expires_ms >= 1000 + 2 * max_cursor_ms);
     try std.testing.expectError(error.InvalidQueryRequest, retention(1000, max_cursor_ms + 1));
     try std.testing.expectError(error.InvalidQueryRequest, retention(std.math.maxInt(u64) - 1, 1));
+}
+
+test "native source admission enables staged ownership only with a complete cut" {
+    var state: State = .{ .kind = .sealed_manifest, .owner = @splat(1), .signing_key = @splat(2), .object_generation = 3, .source = @splat(4) };
+    const ref: Reference = .{ .id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:graph:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:cccccccccccccccccccccccccccccccc", .bytes = 64 };
+    var cut: Cut = .{ .desired = @splat(5), .store = @splat(6), .generation = 1, .reader_token = @splat(7), .state = ref, .wal_lsn = 10, .base_lsn = 8, .created_ms = 1000, .refresh_after_ms = 301000, .expires_ms = 721000, .cursor_ttl_ms = 300000 };
+    cut.generation = 0;
+    try std.testing.expectError(error.InvalidLakeIndexLifecycle, state.admit(1, "source", cut));
+    try std.testing.expect(!state.enabled and state.current == null);
+    cut.generation = 1;
+    state = try state.admit(1, "source", cut);
+    try std.testing.expect(state.enabled and state.current != null);
+    try state.validate();
 }

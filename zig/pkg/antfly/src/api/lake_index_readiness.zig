@@ -33,16 +33,20 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         if ((declaration.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(declaration.artifact.metadata_version)) or declaration.artifact.kind == .ordered_row_index) break true;
     } else false;
     if (!eligible and publication.directory == null) return &.{};
-    // A replica attempts bounded navigation warming before reporting an index
-    // queryable. Concurrent checks do not duplicate warm I/O. Failure/timeout
-    // is an optional cache miss and does not weaken the source proof below.
-    @import("lake_index_navigation_warming.zig").warmPublicationWithin(a, server, table, request) catch |err| {
-        if (err == error.NavigationWarmupInProgress) return &.{};
+    // Required cut recovery and optional cache warming have different failure
+    // semantics. A failed active cut must never advertise legacy-index readiness.
+    @import("lake_index_text_query.zig").refreshOwnedCut(a, server, table, request) catch {
+        try request.ensureActive();
+        if (try @import("lake_source_owner.zig").lookup(sa, server, table, request)) |owner| if (owner.enabled) return &.{};
+    };
+    if (try @import("lake_source_owner.zig").lookup(sa, server, table, request)) |owner| if (owner.enabled) {
+        const cut = owner.current orelse return &.{};
+        if (!cut.canIssue(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(server.cfg.node_config))) return &.{};
+    };
+    @import("lake_index_navigation_warming.zig").warmNavigationWithin(a, server, table, request) catch |err| {
+        _ = err;
         try request.ensureActive();
     };
-    if (try @import("lake_source_owner.zig").lookup(sa, server, table, request)) |owner| {
-        if (!owner.enabled or owner.current == null) return &.{};
-    }
     const normalized = try request.platformDeadline();
     var context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, sa, table.schema_json, table.table_id, table.name);

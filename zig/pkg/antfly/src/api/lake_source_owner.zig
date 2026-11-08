@@ -122,7 +122,7 @@ pub fn activate(a: A, server: *server_api.ApiHttpServer, table: Table, request: 
         };
         state = try authority.readState(a, table.table_id);
     }
-    var owner = (try lookup(a, server, table, request)) orelse return null;
+    const owner = (try lookup(a, server, table, request)) orelse return null;
     if (owner.enabled) return owner;
     const normalized = try request.platformDeadline();
     const context: Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
@@ -141,8 +141,8 @@ pub fn activate(a: A, server: *server_api.ApiHttpServer, table: Table, request: 
         defer wal.deinit();
         try wal.indexed.?.claimNativeOwner(store.collectionNamespace(), owner.owner);
     }
-    try authority.apply(table.table_id, .{ .activate_source = scope(table, owner) });
-    owner = (try lookup(a, server, table, request)) orelse return error.CatalogGenerationChanged;
+    // Claiming fences writers, but fresh reads retain strict coordination
+    // until admit_source atomically enables a fully constructed first cut.
     return owner;
 }
 

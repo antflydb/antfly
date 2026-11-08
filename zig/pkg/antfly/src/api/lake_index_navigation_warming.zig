@@ -26,12 +26,20 @@ const Token = @import("antfly_cancellation").CancellationToken;
 pub const max_pages = 64;
 const page_workspace = 4 * 1024 * 1024;
 pub const Navigation = struct { domain: [32]u8, ref: tree.Ref, text_segments: bool = false, depth: u8 = 0 };
+const Progress = struct {
+    key: [32]u8 = @splat(0),
+    pending: [max_pages]Navigation = undefined,
+    count: usize = 0,
+    position: usize = 0,
+};
 pub const Stats = struct { attempts: u64 = 0, failures: u64 = 0, pages: u64 = 0, nanoseconds: u64 = 0 };
 pub const Cache = struct {
     attempts: std.atomic.Value(u64) = .init(0),
     failures: std.atomic.Value(u64) = .init(0),
     pages: std.atomic.Value(u64) = .init(0),
     nanoseconds: std.atomic.Value(u64) = .init(0),
+    recovery_active: [4]?[32]u8 = @splat(null),
+    recovery_coalesced: std.atomic.Value(u64) = .init(0),
     active: [4]?[32]u8 = @splat(null),
     // Retry history belongs to publications, independently of reusable lanes.
     failed: [256]?struct { key: [32]u8, retry_ns: u64 } = @splat(null),
@@ -39,28 +47,84 @@ pub const Cache = struct {
     mutex: std.atomic.Mutex = .unlocked,
     keys: [256]?[32]u8 = @splat(null),
     next: usize = 0,
+    plans: [4]Progress = @splat(.{}),
+    plan_next: usize = 0,
+    residency: [256]u64 = @splat(0),
+    checked_ns: [256]u64 = @splat(0),
+    pub const Recovery = struct {
+        owner: *Cache,
+        slot: usize,
+        pub fn deinit(self: Recovery) void {
+            @import("antfly_platform").sync.lockYielding(&self.owner.mutex);
+            defer self.owner.mutex.unlock();
+            self.owner.recovery_active[self.slot] = null;
+        }
+    };
+    pub fn claimRecovery(self: *Cache, key: [32]u8, io: std.Io, context: local.api_operation.RequestContext) !Recovery {
+        var waited = false;
+        while (true) {
+            try context.ensureActive();
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            var free: ?usize = null;
+            var duplicate = false;
+            for (self.recovery_active, 0..) |active, i| {
+                if (active) |value| {
+                    if (std.mem.eql(u8, &value, &key)) duplicate = true;
+                } else if (free == null) free = i;
+            }
+            if (!duplicate) if (free) |slot| {
+                self.recovery_active[slot] = key;
+                self.mutex.unlock();
+                return .{ .owner = self, .slot = slot };
+            };
+            self.mutex.unlock();
+            if (!waited) {
+                _ = self.recovery_coalesced.fetchAdd(1, .monotonic);
+                waited = true;
+            }
+            try io.sleep(.fromMilliseconds(5), .awake);
+        }
+    }
     pub fn snapshot(self: *const Cache) Stats {
         return .{ .attempts = self.attempts.load(.monotonic), .failures = self.failures.load(.monotonic), .pages = self.pages.load(.monotonic), .nanoseconds = self.nanoseconds.load(.monotonic) };
     }
     fn begin(self: *Cache, key: [32]u8) !?usize {
-        return self.beginAt(key, @import("antfly_platform").time.monotonicNs());
+        return self.beginResident(key, @import("antfly_platform").time.monotonicNs(), 0);
     }
     fn beginAt(self: *Cache, key: [32]u8, now_ns: u64) !?usize {
+        return self.beginResident(key, now_ns, 0);
+    }
+    fn beginResident(self: *Cache, key: [32]u8, now_ns: u64, epoch: u64) !?usize {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
-        for (self.keys) |item| if (item) |old| if (std.mem.eql(u8, &old, &key)) return null;
+        for (self.keys, 0..) |item, i| if (item) |old| if (std.mem.eql(u8, &old, &key)) {
+            if (self.residency[i] == epoch or now_ns -| self.checked_ns[i] < 5 * std.time.ns_per_s) return null;
+        };
         for (self.failed) |item| if (item) |failure| if (std.mem.eql(u8, &failure.key, &key) and now_ns < failure.retry_ns) return null;
         for (self.active) |item| if (item) |old| if (std.mem.eql(u8, &old, &key)) return error.NavigationWarmupInProgress;
-        for (&self.active, 0..) |*item, index| if (item.* == null) {
-            item.* = key;
+        // Prefer a retained continuation, then rotate idle lanes so another
+        // publication cannot repeatedly overwrite the only resumable plan.
+        for (self.plans, 0..) |plan, index| if (self.active[index] == null and std.mem.eql(u8, &plan.key, &key)) {
+            self.active[index] = key;
             return index;
         };
+        for (0..self.active.len) |offset| {
+            const index = (self.plan_next + offset) % self.active.len;
+            if (self.active[index] == null) {
+                self.active[index] = key;
+                self.plan_next = (index + 1) % self.active.len;
+                return index;
+            }
+        }
         return error.NavigationWarmupInProgress;
     }
     fn finish(self: *Cache, slot: usize, key: [32]u8, completed: bool) void {
         self.finishAt(slot, key, completed, @import("antfly_platform").time.monotonicNs());
     }
     fn finishAt(self: *Cache, slot: usize, key: [32]u8, completed: bool, now_ns: u64) void {
+        return self.finishResident(slot, key, completed, now_ns, 0);
+    }
+    fn finishResident(self: *Cache, slot: usize, key: [32]u8, completed: bool, now_ns: u64, epoch: u64) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         self.active[slot] = null;
@@ -79,7 +143,14 @@ pub const Cache = struct {
         for (&self.failed) |*item| if (item.*) |failure| {
             if (std.mem.eql(u8, &failure.key, &key)) item.* = null;
         };
+        for (self.keys, 0..) |item, i| if (item) |old| if (std.mem.eql(u8, &old, &key)) {
+            self.residency[i] = epoch;
+            self.checked_ns[i] = now_ns;
+            return;
+        };
         self.keys[self.next] = key;
+        self.residency[self.next] = epoch;
+        self.checked_ns[self.next] = now_ns;
         self.next = (self.next + 1) % self.keys.len;
     }
 
@@ -165,14 +236,20 @@ const Guard = struct {
 /// Four admitted I/O lanes, at most 64 authenticated pages and three child
 /// levels, plus 16 segments/16 MiB of immutable working blocks. Every worker joins before its operation-local reader lease ends.
 pub fn warmRoots(store: stores.ArtifactStore, cached: artifacts.CachedRead, roots: []const Navigation, token: Token) !usize {
-    return warmRootsGuarded(store, cached, roots, token, null);
+    var progress: Progress = .{};
+    return warmRootsGuarded(store, cached, roots, token, null, &progress);
 }
-fn warmRootsGuarded(store: stores.ArtifactStore, cached: artifacts.CachedRead, roots: []const Navigation, token: Token, guard: ?Guard) !usize {
+fn warmRootsGuarded(store: stores.ArtifactStore, cached: artifacts.CachedRead, roots: []const Navigation, token: Token, guard: ?Guard, progress: *Progress) !usize {
     var working_set: WorkingSet = .{};
-    var pending: [max_pages]Navigation = undefined;
-    var count: usize = @min(roots.len, pending.len);
-    @memcpy(pending[0..count], roots[0..count]);
-    var position: usize = 0;
+    if (progress.count == 0 or progress.position >= progress.count) {
+        progress.count = @min(roots.len, progress.pending.len);
+        progress.position = 0;
+        @memcpy(progress.pending[0..progress.count], roots[0..progress.count]);
+    }
+    const pending = &progress.pending;
+    var count = progress.count;
+    var position = progress.position;
+    const initial_position = position;
     while (position < count) {
         if (guard) |fence| try fence.check();
         try cached.context.ensureActive();
@@ -212,18 +289,24 @@ fn warmRootsGuarded(store: stores.ArtifactStore, cached: artifacts.CachedRead, r
             }
         }
         position += width;
+        progress.count = count;
+        progress.position = position;
     }
-    return position;
+    return position - initial_position;
+}
+fn residencyEpoch(cache: *local.serverless_query_lake_serving_cache.Cache) u64 {
+    // Cache eviction is a hint to retry bounded warming, never read authority.
+    return cache.navigation.eviction_epoch.load(.monotonic) +% cache.decoded.eviction_epoch.load(.monotonic) +% cache.text_pages.eviction_epoch.load(.monotonic) +% cache.snapshot().evictions;
 }
 pub fn warmPublication(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local.common_topology_records.TableRecord) !void {
     return warmPublicationWithin(a, server, table, .{});
 }
 pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local.common_topology_records.TableRecord, caller: local.api_operation.RequestContext) !void {
-    // Serving-cut recovery is required even when speculative page warming is off.
-    @import("lake_index_text_query.zig").refreshOwnedCut(a, server, table, caller) catch |err| switch (err) {
-        error.IndexRebuilding, error.ExternalLakeIndexNotPublished, error.ExternalLakeIndexUnavailable, error.ExternalLakeIndexSourceChanged, error.ExternalLakeSnapshotMismatch, error.LakeTableNotFound => {},
-        else => return err,
-    };
+    try @import("lake_index_text_query.zig").refreshOwnedCut(a, server, table, caller);
+    return warmNavigationWithin(a, server, table, caller);
+}
+/// Optional navigation warming never owns required serving-cut recovery.
+pub fn warmNavigationWithin(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local.common_topology_records.TableRecord, caller: local.api_operation.RequestContext) !void {
     if (server.cfg.node_config) |config| if (!config.lake_indexes.navigation_warming.enabled) return;
     // Initialization may reconcile before lifecycle callbacks are installed.
     // Do not memoize that absence as a completed warmup for this generation.
@@ -247,12 +330,14 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     hash.update(publication_json);
     var key: [32]u8 = undefined;
     hash.final(&key);
-    const slot = (try server.lake_navigation_warming.begin(key)) orelse return;
+    const slot = (try server.lake_navigation_warming.beginResident(key, @import("antfly_platform").time.monotonicNs(), residencyEpoch(&server.lake_read_cache))) orelse return;
+    const progress = &server.lake_navigation_warming.plans[slot];
+    if (!std.mem.eql(u8, &progress.key, &key)) progress.* = .{ .key = key };
     // Warming is best effort: readiness waits for a bounded attempt, not for
     // every page to become cached. Generation/read authority is checked again
     // by ordinary readiness and every query, independently of this hint.
     var completed = false;
-    defer server.lake_navigation_warming.finish(slot, key, completed);
+    defer server.lake_navigation_warming.finishResident(slot, key, completed, @import("antfly_platform").time.monotonicNs(), residencyEpoch(&server.lake_read_cache));
     const started = @import("antfly_platform").time.monotonicNs();
     _ = server.lake_navigation_warming.attempts.fetchAdd(1, .monotonic);
     defer _ = server.lake_navigation_warming.nanoseconds.fetchAdd(@import("antfly_platform").time.monotonicNs() -| started, .monotonic);
@@ -330,7 +415,7 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
         if (count == roots.len) break;
     }
     const native_state = try authority.readState(a, table.table_id);
-    const pages = try warmRootsGuarded(store.artifactStore(), cached, roots[0..count], token, .{ .authority = authority, .table = table.table_id, .generation = publication.generation, .epoch = if (native_state.source_owner) |owner| owner.epoch else null });
+    const pages = try warmRootsGuarded(store.artifactStore(), cached, roots[0..count], token, .{ .authority = authority, .table = table.table_id, .generation = publication.generation, .epoch = if (native_state.source_owner) |owner| owner.epoch else null }, progress);
     _ = server.lake_navigation_warming.pages.fetchAdd(pages, .monotonic);
     completed = true;
 }
@@ -356,7 +441,6 @@ test "external lake navigation warming retries failed hints after bounded backof
     try std.testing.expect(try cache.beginAt(key, 3) == null);
     const other: [32]u8 = @splat(2);
     const reused = (try cache.beginAt(other, 3)).?;
-    try std.testing.expectEqual(slot, reused);
     cache.finishAt(reused, other, false, 4);
     // Reusing an execution slot cannot erase another publication's backoff.
     try std.testing.expect(try cache.beginAt(key, 5) == null);
@@ -365,4 +449,98 @@ test "external lake navigation warming retries failed hints after bounded backof
     try std.testing.expect(cache.contains(key));
     try std.testing.expect(try cache.beginAt(other, 3 + 5 * std.time.ns_per_s) == null);
     try std.testing.expect(try cache.beginAt(key, 10 * std.time.ns_per_s) == null);
+}
+
+test "external lake navigation warming recovery waits cancel independently and residency eviction permits retry" {
+    var cache: Cache = .{};
+    const leader = try cache.claimRecovery(@splat(1), std.testing.io, .{});
+    {
+        defer leader.deinit();
+        try std.testing.expectError(error.DeadlineExceeded, cache.claimRecovery(@splat(1), std.testing.io, .{ .deadline_ns = 0 }));
+        const other = try cache.claimRecovery(@splat(2), std.testing.io, .{});
+        other.deinit();
+    }
+    const retry = try cache.claimRecovery(@splat(1), std.testing.io, .{});
+    retry.deinit();
+    const slot = (try cache.beginResident(@splat(3), 1, 1)).?;
+    cache.finishResident(slot, @splat(3), true, 2, 1);
+    try std.testing.expect(try cache.beginResident(@splat(3), 3, 1) == null);
+    try std.testing.expect(try cache.beginResident(@splat(3), 3, 2) == null);
+    const rewarmed = (try cache.beginResident(@splat(3), 5 * std.time.ns_per_s + 3, 2)).?;
+    cache.finishResident(rewarmed, @splat(3), true, 5 * std.time.ns_per_s + 4, 2);
+    try std.testing.expect(try cache.beginResident(@splat(3), 10 * std.time.ns_per_s, 2) == null);
+}
+
+test "external lake navigation warming canceled recovery waiter leaves leader and capacity intact" {
+    var cache: Cache = .{};
+    const io = std.testing.io;
+    const leader = try cache.claimRecovery(@splat(1), io, .{});
+    var held = true;
+    defer if (held) leader.deinit();
+    const Waiter = struct {
+        cache: *Cache,
+        canceled: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) anyerror!void {
+            const lease = try self.cache.claimRecovery(@splat(1), std.testing.io, .{ .cancellation = Token.fromAtomic(&self.canceled) });
+            defer lease.deinit();
+        }
+    };
+    var waiter: Waiter = .{ .cache = &cache };
+    var future = try io.concurrent(Waiter.run, .{&waiter});
+    defer {
+        if (future.any_future != null) future.cancel(io) catch {};
+    }
+    var attempts: usize = 0;
+    while (cache.recovery_coalesced.load(.acquire) == 0 and attempts < 5000) : (attempts += 1) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(cache.recovery_coalesced.load(.acquire) != 0);
+    waiter.canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, future.await(io));
+    try std.testing.expectError(error.DeadlineExceeded, cache.claimRecovery(@splat(1), io, .{ .deadline_ns = 0 }));
+    const other = try cache.claimRecovery(@splat(2), io, .{});
+    other.deinit();
+    leader.deinit();
+    held = false;
+    const next = try cache.claimRecovery(@splat(1), io, .{});
+    next.deinit();
+}
+
+test "external lake navigation warming resumes completed waves without retaining request capabilities" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("resumable-navigation-warming");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 1024 * 1024;
+    var pages: page_store.PageStore = .{ .domain = @splat(6), .attempt = store.upload_scope.?.attempt, .artifacts = &store, .cancellation = .none, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const root = (try tree.apply(a, pages.store(), null, &.{.{ .key = "key", .value = "value" }})).?;
+    const roots: [8]Navigation = @splat(.{ .domain = @splat(6), .ref = root });
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(1), .context = .{} };
+    var progress: Progress = .{};
+    const Stop = struct {
+        fn canceled(raw: *const anyopaque) bool {
+            const plan: *const Progress = @ptrCast(@alignCast(raw));
+            return plan.position >= 4;
+        }
+    };
+    try std.testing.expectError(error.Canceled, warmRootsGuarded(store, cached, &roots, .{ .ptr = &progress, .is_cancelled_fn = Stop.canceled }, null, &progress));
+    try std.testing.expectEqual(@as(usize, 4), progress.position);
+    try std.testing.expectEqual(@as(usize, 4), try warmRootsGuarded(store, cached, &roots, .none, null, &progress));
+    try std.testing.expectEqual(@as(usize, 8), progress.position);
+    var plans: Cache = .{};
+    const slot = (try plans.beginAt(@splat(1), 1)).?;
+    plans.plans[slot] = progress;
+    plans.plans[slot].key = @splat(1);
+    plans.finishAt(slot, @splat(1), false, 2);
+    const other = (try plans.beginAt(@splat(2), 3)).?;
+    try std.testing.expect(other != slot);
+    plans.finishAt(other, @splat(2), true, 4);
+    const resumed = (try plans.beginAt(@splat(1), 5 * std.time.ns_per_s + 3)).?;
+    try std.testing.expectEqual(slot, resumed);
+    try std.testing.expectEqual(@as(usize, 8), plans.plans[resumed].position);
+    plans.finishAt(resumed, @splat(1), true, 5 * std.time.ns_per_s + 4);
 }

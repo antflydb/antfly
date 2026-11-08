@@ -1184,8 +1184,9 @@ and remaining release qualification.
 For deployments where Antfly owns the complete write path, the candidate adds
 `lake_indexes.serving_cuts.enabled: true`. Enable it only after every writer,
 maintenance worker and reader runs the compatible release. Activation records
-native ownership and conditionally claims both the managed Iceberg catalog and
-WAL heads. This is a durable protocol transition: switching the option off does
+staged native ownership and conditionally claims both the managed Iceberg catalog
+and WAL heads. A complete first cut atomically enables native reads; until then,
+queries retain strict publication reads. This is a durable protocol transition: switching the option off does
 not remove ownership or permit older writers. Shared REST catalogs and mutable
 prefix inventories retain their existing strict remote checks.
 
@@ -1197,6 +1198,8 @@ Queries issue signed `lake3:` and `source3:` capabilities to images built during
 publication/write acceptance, avoiding query-time cursor uploads for these cuts.
 The gateway transports opaque cursors in POST bodies, bounds them to the native
 encoded capability limit, and acquires capacity before reading a request body.
+A ten-second absolute upload deadline releases that capacity even when a client
+keeps trickling bytes below the socket's idle timeout.
 If remote commitment succeeds but native acknowledgment is unconfirmed, the
 changes API returns `state: unknown` without a read receipt. The producer keeps
 its exact pending transaction and checkpoint for retry; it advances only after
@@ -1207,7 +1210,15 @@ bounded and optional, uses the same verified memory/disk caches as foreground
 reads, and does not copy the whole archive or establish authority. Retention
 protects each prepared image and its publication reader for the complete cursor
 horizon. Existing generation, metadata and WAL bounds continue to apply and
-can impose explicit backpressure at high publication rates.
+can impose explicit backpressure at high publication rates. Authenticated retained
+state, row-group and sealed-manifest bytes use the same credential-scoped durable
+cache as search blocks, so process restarts can reuse them without provider GETs.
+The exact provider generation and content checksum remain part of verification;
+a cache hit never establishes read authority.
+
+Set `ANTFLY_E2E_COMPOSED_CONCURRENT_WRITES=1` when running
+`zig/e2e/antfly/test_composed_lake_readers.py` to qualify searches during managed
+publication and three accepted write batches, including continuation stability.
 
 This candidate requires qualification before deployment. Do not interpret the
 older reader-sharing measurements as measurements of owner serving cuts.

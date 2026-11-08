@@ -441,6 +441,10 @@ pub const ServingSource = struct {
     planner_statistics: []const external_source_api.types.ColumnStatistics = &.{},
     statistics_owner: ?struct { ptr: *anyopaque, close: *const fn (*anyopaque) void } = null,
     deferred_snapshot: ?DeferredSnapshot = null,
+    // Preserve the exact admitted manifest even when optional navigation is
+    // unavailable. Ownership activation cannot depend on cache admission.
+    sealed_manifest: ?[]u8 = null,
+    sealed_manifest_owned: bool = true,
     catalog_files_owned: bool = false,
     alloc: std.mem.Allocator,
     snapshot_pin: ?host_store.SnapshotPin = null,
@@ -528,6 +532,7 @@ pub const ServingSource = struct {
         view.catalog_files = false;
         view.pinned_files_owned = false;
         view.attachment_uri = null;
+        view.sealed_manifest_owned = false;
         view.versions = .empty;
         view.delete_lease = if (self.delete_lease) |lease| lease.retain() else null;
         view.scanner.shared_reader = null;
@@ -622,6 +627,8 @@ pub const ServingSource = struct {
         errdefer if (attachment_uri) |uri| alloc.free(uri);
         var file_navigation: ?FileNavigation = null;
         errdefer if (file_navigation) |value| value.close(value.ptr);
+        var sealed_manifest: ?[]u8 = null;
+        errdefer if (sealed_manifest) |bytes| alloc.free(bytes);
         var deferred_snapshot: ?DeferredSnapshot = null;
         errdefer if (deferred_snapshot) |value| value.deinit(alloc);
         var plan_identity: ?[32]u8 = null;
@@ -678,6 +685,7 @@ pub const ServingSource = struct {
                         snapshot = lease.item.payload.snapshot;
                     }
                 } else snapshot = try manifest_api.plan(alloc, .{ .client = client, .source = binding.table_id, .uri = binding.source_uri, .schema = binding.schema_fingerprint, .context = context }, bytes);
+                if (deferred_snapshot == null) sealed_manifest = try alloc.dupe(u8, bytes);
                 break :blk snapshot.inventory;
             },
             .iceberg => blk: {
@@ -803,7 +811,7 @@ pub const ServingSource = struct {
         errdefer if (snapshot_pin) |pin| pin.deinit(pin.ptr);
         if (snapshot_pin) |pin| context_store.extra_checkpoint = .{ .ptr = pin.ptr, .check = pin.check };
         const local_plan = if (plan_lease == null and file_navigation == null) try PreparedPlan.init(alloc, inventory) else null;
-        var result: ServingSource = .{ .file_navigation = file_navigation, .deferred_snapshot = deferred_snapshot, .alloc = alloc, .snapshot_pin = snapshot_pin, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_identity = plan_identity, .plan_lease = plan_lease, .local_plan = local_plan, .inventory_owned = plan_lease == null, .attachment_uri = attachment_uri, .catalog_metadata = retained_metadata, .lazy_versions = lazy_versions, .immutable_objects = binding.object_mutability == .immutable, .pinned_files = pinned_files };
+        var result: ServingSource = .{ .file_navigation = file_navigation, .deferred_snapshot = deferred_snapshot, .sealed_manifest = sealed_manifest, .alloc = alloc, .snapshot_pin = snapshot_pin, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_identity = plan_identity, .plan_lease = plan_lease, .local_plan = local_plan, .inventory_owned = plan_lease == null, .attachment_uri = attachment_uri, .catalog_metadata = retained_metadata, .lazy_versions = lazy_versions, .immutable_objects = binding.object_mutability == .immutable, .pinned_files = pinned_files };
         errdefer result.freeCatalogFiles();
         try result.ensureDeleteQualification();
         errdefer if (result.delete_qualification_owned) if (result.delete_qualification) |qualification| qualification.destroy();
@@ -1255,7 +1263,7 @@ pub const ServingSource = struct {
     }
     pub fn sealedManifestBytes(self: *const ServingSource) ?[]const u8 {
         if (self.deferred_snapshot) |frozen| if (@import("lake_parquet_manifest.zig").isManifest(frozen.uri)) return frozen.metadata;
-        return null;
+        return self.sealed_manifest;
     }
     pub fn attachCache(self: *ServingSource, cache: *@import("lake_serving_cache.zig").Cache, binding: @import("../external_source/catalog_binding.zig").Binding, context: @import("lake_read_context.zig").Context) !void {
         const reader = try self.alloc.create(@import("lake_serving_cache.zig").Reader);
@@ -1290,6 +1298,7 @@ pub const ServingSource = struct {
         if (self.file_navigation) |value| value.close(value.ptr);
         if (self.statistics_owner) |owner| owner.close(owner.ptr);
         if (self.deferred_snapshot) |value| value.deinit(self.alloc);
+        if (self.sealed_manifest_owned) if (self.sealed_manifest) |bytes| self.alloc.free(bytes);
         if (self.private_snapshot_owned) if (self.private_snapshot) |snapshot| {
             snapshot.deinit(self.alloc);
             self.alloc.destroy(snapshot);
@@ -1561,4 +1570,37 @@ test "external lake native source binding survives token refresh without crossin
     var changed = binding;
     changed.credential_ref = .{ .ref_id = "other-policy" };
     try std.testing.expect(!std.mem.eql(u8, &try ServingSource.bindingIdentity(a, first, binding), &try ServingSource.bindingIdentity(a, next, changed)));
+}
+
+test "external lake metadata navigation fallback retains sealed manifest through parallel views" {
+    const a = std.testing.allocator;
+    var memory = object_storage_api.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    const Resolver = struct {
+        fn open(raw: *const anyopaque, alloc: std.mem.Allocator, _: external_binding_api.Binding) !object_store_support.OpenedObjectStore {
+            const client: *object_storage_api.MemoryObjectStorage = @ptrCast(@alignCast(@constCast(raw)));
+            return .{ .alloc = alloc, .client = client.client(), .owns_client = false, .bucket = try alloc.dupe(u8, "bucket"), .prefix = try alloc.dupe(u8, "history.parquet-manifest.json") };
+        }
+    };
+    const manifest = "{\"version\":1,\"source_id\":\"hn\",\"chunks\":[],\"file_count\":0}";
+    const schema: storage_schema.TableSchema = .{ .external_base_source = .{
+        .binding = .{ .table_id = "hn", .format = .parquet, .source_uri = "s3://bucket/history.parquet-manifest.json", .schema_fingerprint = "schema", .object_mutability = .immutable },
+        .table_id = @constCast("hn"),
+        .source_uri = @constCast("s3://bucket/history.parquet-manifest.json"),
+        .schema_fingerprint = @constCast("schema"),
+    } };
+    var cache = @import("lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    for ([_]?*@import("lake_serving_cache.zig").Cache{ null, &cache }) |shared| {
+        var source = try ServingSource.openLazyCached(a, schema, .{ .resolver = .{ .ptr = &memory, .open_fn = Resolver.open }, .retained_manifest = manifest }, .{}, shared);
+        defer source.deinit();
+        try std.testing.expect(source.deferred_snapshot == null);
+        try std.testing.expectEqualStrings(manifest, source.sealedManifestBytes().?);
+        {
+            var view = try source.parallelView(a);
+            defer view.closeParallelView(&source);
+            try std.testing.expectEqualStrings(manifest, view.sealedManifestBytes().?);
+        }
+        try std.testing.expectEqualStrings(manifest, source.sealedManifestBytes().?);
+    }
 }

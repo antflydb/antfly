@@ -23335,13 +23335,13 @@ pub const ApiHttpServer = struct {
                     const started = @import("antfly_platform").time.monotonicNs();
                     defer runner.profile.record(&runner.server.lake_query_metrics, .composed_cursor, started);
                     try checkpoint(raw);
-                    var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
-                    defer store.deinit();
-                    try runner.server.retainLakeQueryStore(a, &store, 0, .{ .cancellation = if (runner.cancellation) |v| v.token() else .none });
-                    var artifacts = store.artifactStore();
                     const durable = try runner.lake_scope.publishCursorSources(a, runner.server, bytes);
                     defer a.free(durable);
                     if (try runner.lake_scope.sealCursor(a, durable)) |inline_cursor| return inline_cursor;
+                    var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
+                    defer store.deinit();
+                    try runner.server.retainLakeQueryStore(a, &store, 0, .{ .deadline_ns = runner.deadline, .cancellation = if (runner.cancellation) |v| v.token() else .none });
+                    var artifacts = store.artifactStore();
                     _ = runner.server.lake_query_metrics.cursor_publications.fetchAdd(1, .monotonic);
                     return @import("lake_retained_cut.zig").saveCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), runner.server.embedding_provider_runtime.io, durable, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| cancel.token() else .none);
                 }

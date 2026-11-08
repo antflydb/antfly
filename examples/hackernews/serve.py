@@ -319,6 +319,29 @@ class Gateway(BaseHTTPRequestHandler):
         except (URLError, TimeoutError, ValueError):
             return False
 
+    body_read_timeout_seconds = 10.0
+
+    def read_search_body(self, length):
+        # Socket timeouts bound idle time only. Recompute a monotonic deadline
+        # before each receive so trickled input cannot hold admitted capacity.
+        deadline = time.monotonic() + self.body_read_timeout_seconds
+        chunks = []
+        remaining = length
+        try:
+            while remaining:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("Search body deadline exceeded")
+                self.connection.settimeout(budget)
+                chunk = self.rfile.read1(min(65536, remaining))
+                if not chunk:
+                    raise ValueError("Incomplete search body")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+        finally:
+            self.connection.settimeout(10)
+
     def do_POST(self):
         if self.path != "/api/search":
             return self.respond(404, {"error": "Not found"})
@@ -341,7 +364,7 @@ class Gateway(BaseHTTPRequestHandler):
         try:
             # Bound body allocation as well as backend work by admitted searches.
             try:
-                query = search_request(json.loads(self.rfile.read(length)))
+                query = search_request(json.loads(self.read_search_body(length)))
             except (ValueError, TimeoutError):
                 return self.respond(400, {"error": "Invalid search request"})
             started = time.monotonic()

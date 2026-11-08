@@ -232,6 +232,68 @@ class SearchGatewayTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 next_cursor(query, {"next_source_cursor": cursor})
 
+    def test_body_deadline_and_truncated_upload_release_capacity(self):
+        import socket
+        import time
+
+        class ShortDeadline(Gateway):
+            body_read_timeout_seconds = 0.2
+
+            def log_message(self, *args):
+                pass
+
+            def upstream(self, *args, **kwargs):
+                return {"responses": [{"hits": {"hits": []}}]}
+
+        for truncated in (False, True):
+            with self.subTest(truncated=truncated):
+                server = ThreadingHTTPServer(("127.0.0.1", 0), ShortDeadline)
+                server.searches = threading.BoundedSemaphore(1)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                client = socket.create_connection(server.server_address, timeout=2)
+                stop = threading.Event()
+
+                def trickle():
+                    while not stop.wait(0.03):
+                        try:
+                            client.sendall(b" ")
+                        except OSError:
+                            return
+
+                writer = threading.Thread(target=trickle, daemon=True)
+                try:
+                    started = time.monotonic()
+                    client.sendall(
+                        b"POST /api/search HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100000\r\n\r\n{"
+                    )
+                    if truncated:
+                        client.shutdown(socket.SHUT_WR)
+                    else:
+                        writer.start()
+                    with client.makefile("rb") as response:
+                        self.assertIn(b" 400 ", response.readline())
+                    self.assertLess(time.monotonic() - started, 1.5)
+                    stop.set()
+                    self.assertTrue(server.searches.acquire(timeout=1))
+                    server.searches.release()
+                    with urlopen(
+                        Request(
+                            f"http://127.0.0.1:{server.server_port}/api/search",
+                            json.dumps({"q": "database"}).encode(),
+                        ),
+                        timeout=2,
+                    ) as response:
+                        self.assertEqual(response.status, 200)
+                finally:
+                    stop.set()
+                    if writer.ident is not None:
+                        writer.join()
+                    client.close()
+                    server.shutdown()
+                    server.server_close()
+                    thread.join()
+
     def test_saturated_gateway_rejects_before_waiting_for_request_body(self):
         from http.client import HTTPConnection
 

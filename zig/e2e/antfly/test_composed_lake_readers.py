@@ -880,6 +880,128 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 "cold_cache_startup_and_query_ms",
                 (time.monotonic() - cold_started) * 1000,
             )
+            # Separate warm selectivity probes from the restart/cold samples.
+            # Common, fixture-rare and absent terms exercise different posting
+            # traversal lengths without claiming archive-scale qualification.
+            selectivity = []
+            for term in ("the", profile_term, "quasar", "absentqualificationtoken"):
+                probe = {
+                    **profile_query,
+                    "full_text_search": {"match": term, "field": "body"},
+                }
+                started = time.monotonic()
+                response = requests.post(
+                    server.api_url + "/query",
+                    json=probe,
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    timeout=60,
+                )
+                assert response.ok, f"Selectivity probe failed: {response.status_code}"
+                result = response.json()["responses"][0]
+                assert_highlights(result, term)
+                hits = len(result["hits"]["hits"])
+                if term == "absentqualificationtoken":
+                    assert hits == 0
+                selectivity.append(
+                    {
+                        "term": term,
+                        "hits": hits,
+                        "elapsed_ms": (time.monotonic() - started) * 1000,
+                    }
+                )
+            record_property("warm_selectivity_queries", json.dumps(selectivity))
+        if owned and os.environ.get("ANTFLY_E2E_COMPOSED_CONCURRENT_WRITES") == "1":
+            # Exercise accepted-cut replacement while the managed publisher
+            # advances independently. Existing continuations must retain their
+            # original WAL horizon through all three acknowledgments.
+            from concurrent.futures import ThreadPoolExecutor
+            import threading
+
+            publication_blocked = False
+            server.restart()
+            _, pinned = call("POST", "/query", query)
+            stop = threading.Event()
+            reads = []
+
+            def searching():
+                while not stop.is_set():
+                    started = time.monotonic()
+                    response = requests.post(
+                        server.api_url + "/query",
+                        json=query,
+                        auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                        timeout=60,
+                    )
+                    assert response.ok, (
+                        f"Search during publication: {response.status_code}"
+                    )
+                    result = response.json()["responses"][0]
+                    assert len(result["hits"]["hits"]) == 7
+                    assert result["next_source_cursor"].startswith("source3:")
+                    reads.append((time.monotonic() - started) * 1000)
+
+            receipts = []
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                readers = [pool.submit(searching) for _ in range(3)]
+                try:
+                    for checkpoint in range(3, 6):
+                        _, receipt = call(
+                            "POST",
+                            "/tables/current/lake/changes",
+                            {
+                                "batch_id": f"concurrent-{checkpoint}",
+                                "source": "e2e",
+                                "epoch": "one",
+                                "expected_checkpoint": str(checkpoint - 1),
+                                "checkpoint": str(checkpoint),
+                                "key_fields": ["id"],
+                                "changes": [
+                                    {
+                                        "op": "upsert",
+                                        "row": {
+                                            "id": archive_rows + 1000 + checkpoint,
+                                            "body": "raceproof quasar",
+                                            "deleted": False,
+                                        },
+                                    }
+                                ],
+                            },
+                        )
+                        assert receipt["read_receipt"]
+                        receipts.append(receipt["read_receipt"])
+                finally:
+                    stop.set()
+                for reader in readers:
+                    reader.result()
+            assert reads
+            published = wait_query(
+                "current",
+                {
+                    "full_text_search": {"match": "raceproof", "field": "body"},
+                    "limit": 10,
+                    "read_requirements": {
+                        "visibility": "published",
+                        "after_write": receipts[-1],
+                        "wait_ms": 1000,
+                    },
+                },
+            )
+            assert {hit["_source"]["id"] for hit in published["hits"]["hits"]} == {
+                archive_rows + 1000 + checkpoint for checkpoint in range(3, 6)
+            }
+            cursor = pinned["next_source_cursor"]
+            seen = {hit["_source"]["id"] for hit in pinned["hits"]["hits"]}
+            while cursor:
+                _, page = call("POST", "/query", {**query, "source_cursor": cursor})
+                ids = {hit["_source"]["id"] for hit in page["hits"]["hits"]}
+                assert not seen & ids
+                seen.update(ids)
+                cursor = page.get("next_source_cursor")
+            assert seen == (set(range(100)) | {extra_id, later_id}) - {1, 2, 3, 50}
+            record_property(
+                "concurrent_ingestion_publication_query_ms", json.dumps(reads)
+            )
+            record_property("concurrent_ingestion_batches", len(receipts))
         failed = False
     finally:
         server.stop(test_failed=failed)

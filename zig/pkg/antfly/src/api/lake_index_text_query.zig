@@ -286,8 +286,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     const compatible_owned = allow_owned and !buildsVector(req) and (req.full_text_queries.len == 0 or (req.full_text_queries.len == 1 and req.full_text == null));
     if (!compatible_owned) if (req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, "lake3:")) return error.UnsupportedQueryRequest;
     if (compatible_owned and (if (req.lake_read) |read| read.visibility != .published else true)) {
-        if (prepared.native_owner) |owner| {
-            if (!owner.enabled) return error.IndexRebuilding;
+        if (prepared.native_owner) |owner| if (owner.enabled) {
             if (req.remote_snapshot) |token| {
                 if (std.mem.startsWith(u8, token, "lake3:")) {
                     const opened = try owner_capability.open(a, .lake, .{ .table_id = table.table_id, .object_generation = table.object_storage_generation, .owner = owner.owner }, owner.signing_key, token, now_ms);
@@ -304,7 +303,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
                 prepared.native_cut = cut;
                 prepared.native_expires_ms = now_ms + ttl;
             }
-        }
+        };
     }
     if (prepared.native_cut) |cut| {
         var cut_store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
@@ -312,7 +311,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
         cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
         var artifacts = cut_store.artifactStore();
         try server.prepareLakeCache();
-        retained_pin = try retained_api.loadOwned(ra, &artifacts, cut_store.identity, table, cut, now_ms, retained_cancellation, &server.lake_read_cache.decoded, &server.lake_retained_groups, prepared.retained_context);
+        retained_pin = try retained_api.loadOwned(ra, &artifacts, cut_store.identity, table, cut, now_ms, retained_cancellation, &server.lake_read_cache.decoded, &server.lake_retained_groups, prepared.retained_context, .{ .cache = &server.lake_read_cache, .scope = cut_store.cache_identity, .context = prepared.retained_context });
         retained = retained_pin.?.descriptor;
         table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
     }
@@ -481,14 +480,32 @@ const Manifest = struct {
     fn artifact(ref: source_owner.admission.Reference) !local.serverless_manifest_artifact_ref.ArtifactRef {
         return .{ .kind = .external_base_source, .artifact_id = ref.id, .checksum = try @import("../serverless/artifacts/store.zig").sha256ChecksumFromArtifactId(ref.id), .byte_len = ref.bytes, .name = ref.generation orelse "" };
     }
-    fn load(a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, token: @import("antfly_cancellation").CancellationToken, _: ?@import("lake_index_aggregate_artifact.zig").CachedRead) !Manifest {
+    fn load(a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, token: @import("antfly_cancellation").CancellationToken, cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead) !Manifest {
         var artifacts = store;
-        const bytes = try @import("lake_generation_envelope.zig").read(&artifacts, .{ .id = ref.artifact_id, .bytes = @intCast(ref.byte_len), .generation = if (ref.name.len != 0) @constCast(ref.name) else null }, token);
+        const bytes = try @import("lake_generation_envelope.zig").readCached(&artifacts, .{ .id = ref.artifact_id, .bytes = @intCast(ref.byte_len), .generation = if (ref.name.len != 0) @constCast(ref.name) else null }, token, cached);
         defer artifacts.allocator.free(bytes);
         return .{ .bytes = try a.dupe(u8, bytes) };
     }
 };
-pub fn refreshOwnedCut(backing: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, request: local.api_operation.RequestContext) !void {
+pub fn refreshOwnedCut(backing: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, caller: local.api_operation.RequestContext) !void {
+    const Stop = struct {
+        server: *server_api.ApiHttpServer,
+        parent: local.api_operation.RequestContext,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.server.index_installation_closing.load(.acquire) or self.parent.isCancellationRequested();
+        }
+    };
+    var stop: Stop = .{ .server = server, .parent = try caller.platformDeadline() };
+    var request = stop.parent;
+    request.deadline_ns = @min(request.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 60 * std.time.ns_per_s);
+    request.cancellation = .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled };
+    const recovery_key = @import("lake_wal_image.zig").digest(.{ .table = table.table_id, .incarnation = table.object_storage_generation });
+    const recovery = try server.lake_navigation_warming.claimRecovery(recovery_key, server.embedding_provider_runtime.io, request);
+    defer recovery.deinit();
+    try refreshOwnedCutExclusive(backing, server, table, request);
+}
+fn refreshOwnedCutExclusive(backing: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, request: local.api_operation.RequestContext) !void {
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
     const a = arena.allocator();
