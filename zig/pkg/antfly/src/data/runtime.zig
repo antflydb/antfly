@@ -34500,6 +34500,25 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "time series document revision protocol dominates older envelope features" {
+            const p = @import("../common/data_raft_protocol.zig");
+            var req: antfly.db.types.BatchRequest = .{ .document_version_scheme = .revision_v1, .writes = &.{.{ .key = "row", .value = "{}" }} };
+            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+            req.document_version_scheme = .legacy;
+            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+        }
+
+        test "time series optional revision upgrade preserves a mixed group's mandatory protocol floor" {
+            const request: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "row", .value = "{}" }} };
+            const next = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
+            try std.testing.expectEqual(@as(u16, 23), DataServer.preferredRaftBatchProtocolVersion(request, 23, 0, 0, 100));
+            try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, 23, 23, 0, 100));
+            try std.testing.expectEqual(@as(u16, 23), DataServer.preferredRaftBatchProtocolVersion(request, 23, 23, 200, 100));
+            try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, 0, 0, 0, 100));
+            try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, data_raft_batch.timestamp_protocol_version, 0, 0, 100));
+            try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, next, 0, 200, 100));
+        }
+
         test "system catalog runtime observation targets its group and preserves errors" {
             if (comptime !control_only_storage_sources) return error.SkipZigTest;
             const Fake = struct {
@@ -57130,23 +57149,4 @@ test "grouped source protocol dominates coexisting graph envelope features" {
     var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@TypeOf(request.group_source.?.action).activate_catalog, decoded.batch.req.group_source.?.action);
-}
-
-test "time series document revision protocol dominates older envelope features" {
-    const p = @import("../common/data_raft_protocol.zig");
-    var req: antfly.db.types.BatchRequest = .{ .document_version_scheme = .revision_v1, .writes = &.{.{ .key = "row", .value = "{}" }} };
-    try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
-    req.document_version_scheme = .legacy;
-    try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
-}
-
-test "time series optional revision upgrade preserves a mixed group's mandatory protocol floor" {
-    const request: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "row", .value = "{}" }} };
-    const next = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
-    try std.testing.expectEqual(@as(u16, 23), DataServer.preferredRaftBatchProtocolVersion(request, 23, 0, 0, 100));
-    try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, 23, 23, 0, 100));
-    try std.testing.expectEqual(@as(u16, 23), DataServer.preferredRaftBatchProtocolVersion(request, 23, 23, 200, 100));
-    try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, 0, 0, 0, 100));
-    try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, data_raft_batch.timestamp_protocol_version, 0, 0, 100));
-    try std.testing.expectEqual(next, DataServer.preferredRaftBatchProtocolVersion(request, next, 0, 200, 100));
 }
