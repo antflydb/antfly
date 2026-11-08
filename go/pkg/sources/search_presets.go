@@ -39,7 +39,7 @@ type TextProcessingPreset struct {
 }
 
 func BuildTextProcessing(preset TextProcessingPreset) (ProcessingDeclaration, SearchStream, ArtifactBinding, error) {
-	if !validBindingName(preset.Name) || preset.Field == "" && preset.ResourceField == "" {
+	if !validBindingName(preset.Name) || (preset.Field == "") == (preset.ResourceField == "") {
 		return ProcessingDeclaration{}, SearchStream{}, ArtifactBinding{}, fmt.Errorf("processing preset requires a name and source")
 	}
 
@@ -48,6 +48,9 @@ func BuildTextProcessing(preset TextProcessingPreset) (ProcessingDeclaration, Se
 		input = preset.ResourceField + ".uri"
 	}
 	producer := preset.Producer
+	if preset.ResourceField != "" && producer == nil {
+		return ProcessingDeclaration{}, SearchStream{}, ArtifactBinding{}, fmt.Errorf("resource processing requires an explicit native producer")
+	}
 	if producer == nil {
 		producer = map[string]any{"type": "copy"}
 	}
@@ -62,6 +65,9 @@ func BuildTextProcessing(preset TextProcessingPreset) (ProcessingDeclaration, Se
 	if outputField == "" {
 		outputField = "text"
 	}
+	if contentType == "text/plain" && outputField != "text" {
+		return ProcessingDeclaration{}, SearchStream{}, ArtifactBinding{}, fmt.Errorf("plain text assets use the native text indexing slot")
+	}
 	unitConfig := map[string]any{"kind": "asset", "template": "{{" + input + "}}", "content_type": contentType, "producer": producer}
 	if preset.Purpose == "summary" || preset.Purpose == "caption" {
 		preset.Generated = true
@@ -74,7 +80,11 @@ func BuildTextProcessing(preset TextProcessingPreset) (ProcessingDeclaration, Se
 	enrichments := []any{unitConfig, chunkConfig}
 	textConfig := map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": units, "field": outputField}}, "enrichments": enrichments}
 	textName := NativeIndexName(preset.Name+"_text", textConfig)
-	stream := SearchStream{Name: preset.Name, Artifact: units, Field: outputField, Purpose: preset.Purpose, Generated: preset.Generated, Boundary: "unit", LocationField: "provenance", Retrieval: &RetrievalBindings{Exact: &management.ExactRetrieval{Default: !preset.Generated}, FullText: &management.FullTextRetrieval{Index: textName, Default: !preset.Generated}}}
+	projectionField := outputField
+	if contentType == "text/plain" {
+		projectionField = "$"
+	}
+	stream := SearchStream{Name: preset.Name, Artifact: units, Field: projectionField, Purpose: preset.Purpose, Generated: preset.Generated, Boundary: "unit", LocationField: "provenance", Retrieval: &RetrievalBindings{Exact: &management.ExactRetrieval{Default: !preset.Generated}, FullText: &management.FullTextRetrieval{Index: textName, Default: !preset.Generated}}}
 	plan := ProcessingDeclaration{Indexes: []management.NativeIndexDeclaration{{Name: textName, Config: textConfig}}}
 	artifact := ArtifactBinding{Name: preset.Name, Artifact: units, Purpose: preset.Purpose, Generated: preset.Generated, ContentType: contentType, LocationField: "provenance"}
 	if preset.VectorSpace != nil {

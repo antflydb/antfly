@@ -334,6 +334,16 @@ fn streamReadiness(search: anytype, http: *httpx.Client, config: Config, table: 
         const field = document.field(binding, "field") orelse document.field(index_config, "field");
         if (field) |value| {
             if (value == .string and std.mem.eql(u8, value.string, stream.field)) matching_field = true;
+            if (value == .string and std.mem.eql(u8, value.string, "text") and std.mem.eql(u8, stream.field, "$")) {
+                if (document.field(index_config, "enrichments")) |enrichments| if (enrichments == .array) {
+                    for (enrichments.array.items) |enrichment| {
+                        const name = document.string(enrichment, "name") catch continue;
+                        const kind = document.string(enrichment, "kind") catch continue;
+                        const mime = document.string(enrichment, "content_type") catch continue;
+                        if (std.mem.eql(u8, name, stream.artifact.?) and std.mem.eql(u8, kind, "asset") and std.mem.eql(u8, mime, "text/plain")) matching_field = true;
+                    }
+                };
+            }
             if (value == .null and std.mem.eql(u8, stream.field, "$")) matching_field = true;
         } else if (std.mem.eql(u8, stream.field, "$")) matching_field = true;
     }

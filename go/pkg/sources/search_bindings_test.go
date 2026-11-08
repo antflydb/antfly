@@ -288,3 +288,19 @@ func TestRefreshSearchDiscoveryDoesNotAcquireOrExtendAccess(t *testing.T) {
 	require.NoError(t, loadJSON(runner.CatalogPath, &after, 32<<20))
 	require.NotEqual(t, "unpublished", after.Sources[0].Streams[0].Name)
 }
+
+func TestScalarTextBindingRequiresDeclaredNativeAssetType(t *testing.T) {
+	_, _, _, err := BuildTextProcessing(TextProcessingPreset{Name: "media", ResourceField: "content.resource"})
+	require.Error(t, err, "a resource URI must not become extracted text through the default copy producer")
+
+	plan, stream, _, err := BuildTextProcessing(TextProcessingPreset{Name: "plain", Field: "content.text"})
+	require.NoError(t, err)
+	require.Equal(t, "$", stream.Field)
+	raw, err := json.Marshal(map[string]any{"config": plan.Indexes[0].Config})
+	require.NoError(t, err)
+	index, err := decodeSearchIndex(raw)
+	require.NoError(t, err)
+	require.NoError(t, checkNativeStream(stream, index, false))
+	nativeEnrichments(index.Config)[stream.Artifact]["content_type"] = "application/json"
+	require.Error(t, checkNativeStream(stream, index, false), "an object field must not be treated as a scalar text slot")
+}

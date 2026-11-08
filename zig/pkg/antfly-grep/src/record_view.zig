@@ -104,7 +104,7 @@ pub fn view(a: A, source: std.json.Value, fields: Fields, content: []const u8) !
 }
 
 pub fn text(source: std.json.Value, path: []const u8) ![]const u8 {
-    const value = if (std.mem.eql(u8, path, "$")) document.field(source, "$") orelse return error.MissingArtifactText else document.at(source, path) orelse (if (std.mem.eql(u8, path, "text")) document.field(source, "$") else null) orelse return error.MissingArtifactText;
+    const value = if (std.mem.eql(u8, path, "$")) document.field(source, "$") orelse return error.MissingArtifactText else document.at(source, path) orelse return error.MissingArtifactText;
     if (value != .string) return error.InvalidArtifactText;
     return value.string;
 }
@@ -131,6 +131,6 @@ test "raw text asset projections use the native scalar envelope" {
     var object = std.json.ObjectMap.empty;
     defer object.deinit(std.testing.allocator);
     try object.put(std.testing.allocator, "$", .{ .string = "asset text" });
-    try std.testing.expectEqualStrings("asset text", try text(.{ .object = object }, "text"));
+    try std.testing.expectEqualStrings("asset text", try text(.{ .object = object }, "$"));
     try std.testing.expectError(error.MissingArtifactText, text(.{ .object = object }, "private"));
 }

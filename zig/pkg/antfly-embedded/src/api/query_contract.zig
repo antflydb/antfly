@@ -5056,7 +5056,15 @@ fn projectHierarchyMemberSource(alloc: std.mem.Allocator, raw: []const u8, optio
     defer db_mod.types.deinitJsonValue(alloc, &value);
     if (value != .object) {
         var object = std.json.ObjectMap.empty;
-        try object.put(alloc, try alloc.dupe(u8, "text"), try db_mod.types.cloneJsonValue(alloc, value));
+        var scalar_field: []const u8 = "$";
+        if (!options.include_all_fields) for (options.fields) |field| {
+            if (std.mem.eql(u8, field, "text")) scalar_field = "text";
+            if (std.mem.eql(u8, field, "$")) {
+                scalar_field = "$";
+                break;
+            }
+        };
+        try object.put(alloc, try alloc.dupe(u8, scalar_field), try db_mod.types.cloneJsonValue(alloc, value));
         db_mod.types.deinitJsonValue(alloc, &value);
         value = .{ .object = object };
     }
@@ -5068,6 +5076,9 @@ test "api query contract projects raw text asset evidence without exposing unreq
     var projected = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"text"}, .include_all_fields = false });
     defer db_mod.types.deinitJsonValue(a, &projected);
     try std.testing.expectEqualStrings("launch at 04:12", projected.object.get("text").?.string);
+    var scalar = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"$"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &scalar);
+    try std.testing.expectEqualStrings("launch at 04:12", scalar.object.get("$").?.string);
     var hidden = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"provenance"}, .include_all_fields = false });
     defer db_mod.types.deinitJsonValue(a, &hidden);
     try std.testing.expectEqual(@as(usize, 0), hidden.object.count());

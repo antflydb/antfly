@@ -150,7 +150,9 @@ func checkNativeStream(stream SearchStream, index nativeSearchIndex, semantic bo
 				return fmt.Errorf("text stream index must scope the declared artifact; use a union stream for combined retrieval")
 			}
 			field, ok := sources[stream.Artifact]
-			if !ok || field != stream.Field && !(field == "" && stream.Field == "$") {
+			e := nativeEnrichments(cfg)[stream.Artifact]
+			scalarAlias := stream.Field == "$" && field == "text" && e["kind"] == "asset" && e["content_type"] == "text/plain"
+			if !ok || field != stream.Field && !(field == "" && stream.Field == "$") && !scalarAlias {
 				return fmt.Errorf("text artifact projection mismatch")
 			}
 		} else if cfg["field"] != stream.Field {

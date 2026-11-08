@@ -98,7 +98,7 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 	require.Len(t, wire.Responses[0].Hits.Hits, 1)
 	require.Equal(t, "text", wire.Responses[0].Hits.Hits[0].ID)
 	require.NotEmpty(t, wire.Responses[0].Hits.Hits[0].Hierarchy.Matches)
-	require.Equal(t, "launch at 04:12", wire.Responses[0].Hits.Hits[0].Hierarchy.Matches[0].Source["text"])
+	require.Equal(t, "launch at 04:12", wire.Responses[0].Hits.Hits[0].Hierarchy.Matches[0].Source["$"])
 	chunkStream := text
 	chunkStream.Name, chunkStream.Artifact = "chunks", chunkArtifact
 	chunkStream.Retrieval = &RetrievalBindings{FullText: &management.FullTextRetrieval{Index: chunkIndex.Name}}

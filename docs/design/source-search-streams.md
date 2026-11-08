@@ -233,3 +233,9 @@ This implementation reuses native artifact repair/reprocess job APIs for retries
 rebuilds and cancellation; those operations are separate from source sync runs.
 It does not claim model quality, GPU throughput, or media-query routes beyond the
 advertised text/vector inputs. Qualify deployed models and hardware separately.
+
+Plain text scalar artifacts use the native `$` evidence projection. Their native
+full-text source names its synthetic `text` indexing slot; validators accept that
+mapping only for a matching asset declared `content_type: text/plain`. Object
+artifacts keep explicit fields. Exact scanning never substitutes an arbitrary
+object field or a caption for a selected representation.
