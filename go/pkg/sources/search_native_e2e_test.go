@@ -153,4 +153,18 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(raw, &wire))
 	require.Empty(t, wire.Responses[0].Hits.Hits, "new acquisition cannot expose an older external vector")
+	// Management repair controls delegate to the ordinary durable native job API.
+	source := management.Source{Table: table, Artifacts: []ArtifactBinding{artifact}}
+	job, err := p.ProcessingJob(ctx, source, management.ProcessingJobRequest{Artifact: artifact.Artifact, Action: "start", Limit: 2})
+	require.NoError(t, err)
+	id, ok := job["job_id"].(string)
+	require.True(t, ok)
+	require.NotEmpty(t, id)
+	_, err = p.ProcessingJob(ctx, source, management.ProcessingJobRequest{Artifact: artifact.Artifact, Action: "status", JobId: id})
+	require.NoError(t, err)
+	_, err = p.ProcessingJob(ctx, source, management.ProcessingJobRequest{Artifact: artifact.Artifact, Action: "advance", JobId: id})
+	require.NoError(t, err)
+	_, err = p.ProcessingJob(ctx, source, management.ProcessingJobRequest{Artifact: artifact.Artifact, Action: "cancel", JobId: id})
+	require.NoError(t, err)
+
 }
