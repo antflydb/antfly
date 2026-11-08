@@ -13566,6 +13566,8 @@ const DocumentPreparationPipeline = struct {
             defer coordinator.destroy();
             coordinator.session.setCancellationProbe(.{ .context = self, .is_cancelled_fn = probeCancelled });
             document_extraction_mod.extractPreparedPdfStreaming(a, &coordinator.session, "application/pdf", self.config.native_text, self.config.ocr_mode, .{ .ptr = self, .on_begin = begin, .on_unit = collect, .on_end = end }) catch |err| if (err != error.PrefetchWindowFull) return err;
+            // Avoid model discovery/activation entirely for born-digital pages.
+            if (self.units.items.len == 0) return;
             const prototype = asset_producer_mod.Request{ .producer_type = document_extraction_mod.ocrProducerType(self.config), .config_json = document_extraction_mod.effectiveOcrConfigJson(self.config), .source_text = "", .content_type = "image/png", .inline_media_trusted = true };
             self.raster = try producer.borrowedRasterBatchAvailable(a, &.{prototype});
             if (try producer.capabilitiesForRequests(a, &.{prototype})) |cap| {
@@ -13581,10 +13583,6 @@ const DocumentPreparationPipeline = struct {
                     self.policy.preferred_image_height = transform.target_height;
                 }
             }
-            // Do not paint born-digital pages or speculate an entire large PDF.
-            if (for (self.units.items) |unit| {
-                if (unit.extraction_status) |status| if (std.mem.eql(u8, status, "pending_ocr")) break false;
-            } else true) return;
             self.policy.render_items = 1;
             self.policy.defer_render_pressure = true;
             self.window = try renderRuntimePdfWindow(&self.context, a, producer, &coordinator.session, self.config, try coordinator.availableRenderBytes(), self.policy, document_extraction_mod.ocrProducerType(self.config), document_extraction_mod.effectiveOcrConfigJson(self.config), "pdf", "application/pdf", self.fingerprint.?, self.units.items, 0, self.raster, .{ .context = self, .is_cancelled_fn = probeCancelled });
@@ -45945,4 +45943,15 @@ test "document preparation computed reuse requires exact source policy and live 
     try std.testing.expectEqualStrings("selected OCR text", units[0].text);
     try std.testing.expect(units[0].ocr_attempted and job.consumed);
     try std.testing.expect(!try pipeline.restoreComputed(a, producer, job.config, job.requested_policy, "fingerprint", bytes, &units));
+}
+
+test "document preparation keeps born digital pages out of speculative model work" {
+    var job: DocumentPreparationPipeline.Job = undefined;
+    job.inspected_pages = 0;
+    job.units = .empty;
+    var native = document_extraction_mod.Unit{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast("native text"), .method = @constCast("pdf_text"), .extraction_status = @constCast("completed") };
+    for (0..8) |_| try DocumentPreparationPipeline.Job.collect(&job, &native);
+    try std.testing.expectEqual(@as(usize, 0), job.units.items.len);
+    try std.testing.expectEqual(@as(usize, 8), job.inspected_pages);
+    try std.testing.expectError(error.PrefetchWindowFull, DocumentPreparationPipeline.Job.collect(&job, &native));
 }
