@@ -150100,3 +150100,32 @@ test "time series retained afterimages preserve signed sources across restart an
         try std.testing.expectEqual(@as(?i128, -std.time.ns_per_s), try ttl_mod.readSourceTimestamp(target.core.store, a, "reading"));
     }
 }
+
+test "time series portable document codec preserves signed TTL and write versions" {
+    const a = std.testing.allocator;
+    const entries = [_]backup_codec.DocumentEntry{
+        .{ .key = "historical", .value_flags = 0, .value = "{}", .timestamp_ns = 123, .ttl_source_ns = -1_000_000_000 },
+        .{ .key = "legacy", .value_flags = 0, .value = "{}", .timestamp_ns = 456 },
+    };
+    const encoded = try backup_codec.encodeDocumentBatch(a, &entries);
+    defer a.free(encoded);
+    try std.testing.expectEqual(@as(u32, 2), try backup_codec.documentBatchEntryCount(encoded));
+    const borrowed = try backup_codec.decodeDocumentBatchBorrowed(a, encoded);
+    defer a.free(borrowed);
+    const owned = try backup_codec.decodeDocumentBatch(a, encoded);
+    defer {
+        for (owned) |entry| {
+            a.free(entry.key);
+            a.free(entry.value);
+        }
+        a.free(owned);
+    }
+    for ([_][]backup_codec.DocumentEntry{ borrowed, owned }) |decoded| {
+        try std.testing.expectEqual(@as(u64, 123), decoded[0].timestamp_ns);
+        try std.testing.expectEqual(@as(?i128, -1_000_000_000), decoded[0].ttl_source_ns);
+        try std.testing.expectEqual(@as(?i128, null), decoded[1].ttl_source_ns);
+    }
+    for (0..encoded.len) |length| {
+        try std.testing.expectError(if (length < 4) error.BatchTooShort else error.Truncated, backup_codec.documentBatchEntryCount(encoded[0..length]));
+    }
+}

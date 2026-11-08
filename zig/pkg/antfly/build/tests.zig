@@ -3566,7 +3566,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const time_series_storage_tests = b.addTest(.{
         .name = "time-series-storage-tests",
         .root_module = antfly_test_mod,
-        .filters = selectTestFilters(b, &.{ "date histogram", "storage.ttl.", "storage.backup_codec.", "storage.portable_backup.", "storage.retained_effects.", "storage.document_mutation_revision.", "storage.db.maintenance.ttl_runtime." }),
+        .filters = selectTestFilters(b, &.{ "date histogram", "storage.ttl.", "storage.backup_codec.", "storage.portable_backup.", "storage.retained_effects.", "storage.document_mutation_revision.", "storage.db.maintenance.ttl_runtime.", "time series portable document codec preserves signed TTL and write versions" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     // Portable archive and legacy histogram coverage peaks around 6.6 GB on
