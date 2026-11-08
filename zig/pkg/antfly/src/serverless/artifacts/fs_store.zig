@@ -24,6 +24,8 @@ const CancellationToken = @import("antfly_cancellation").CancellationToken;
 // publications independent; interprocess file locks remain in place.
 var journal_mutexes: [64]std.Io.Mutex = @splat(.init);
 var content_mutexes: [64]std.Io.Mutex = @splat(.init);
+var publication_locks: [64]std.Io.RwLock = @splat(.init);
+var publication_waiters: [64]std.atomic.Value(usize) = @splat(.init(0));
 
 pub const FsStore = struct {
     const verified_file_cache_limit: usize = 4096;
@@ -142,6 +144,8 @@ pub const FsStore = struct {
 
         var write_io = threadedIo();
         defer write_io.deinit();
+        var publication = if (scope) |value| try self.publicationGuard(write_io.io(), value, .shared, cancellation) else null;
+        defer if (publication) |*guard| guard.deinit();
         const content_mutex = &content_mutexes[std.hash.Wyhash.hash(0, artifact_id) % content_mutexes.len];
         try content_mutex.lock(write_io.io());
         defer content_mutex.unlock(write_io.io());
@@ -402,6 +406,59 @@ pub const FsStore = struct {
             self.mutex.unlock(self.io);
         }
     };
+    pub const PublicationGuard = struct {
+        io: std.Io,
+        lock: *std.Io.RwLock,
+        file: std.Io.File,
+        mode: std.Io.File.Lock,
+        pub fn deinit(self: *PublicationGuard) void {
+            self.file.unlock(self.io);
+            self.file.close(self.io);
+            if (self.mode == .shared) self.lock.unlockShared(self.io) else self.lock.unlock(self.io);
+        }
+    };
+    /// Writers share the barrier through physical publication. Cleanup takes
+    /// it exclusively before touching staging or retiring an empty directory.
+    /// Permanent bounded stripes keep lock inodes stable across retirement.
+    pub fn publicationGuard(self: *FsStore, io: std.Io, scope: artifact_store.UploadScope, mode: std.Io.File.Lock, cancellation: CancellationToken) !PublicationGuard {
+        try scope.validate();
+        if (mode != .shared and mode != .exclusive) return error.InvalidArtifactUploadScope;
+        var hash = std.hash.Wyhash.init(0);
+        hash.update(&scope.domain);
+        hash.update(&scope.attempt);
+        const stripe = hash.final() % publication_locks.len;
+        const lock = &publication_locks[stripe];
+        const waiters = &publication_waiters[stripe];
+        if (mode == .exclusive) _ = waiters.fetchAdd(1, .seq_cst);
+        defer if (mode == .exclusive) {
+            _ = waiters.fetchSub(1, .seq_cst);
+        };
+        while (true) {
+            try cancellation.check();
+            if (mode == .shared) {
+                if (waiters.load(.seq_cst) == 0 and lock.tryLockShared(io)) {
+                    if (waiters.load(.seq_cst) == 0) break;
+                    lock.unlockShared(io);
+                }
+            } else if (lock.tryLock(io)) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        errdefer if (mode == .shared) lock.unlockShared(io) else lock.unlock(io);
+        const root = try std.fs.path.join(self.alloc, &.{ self.inventory_root, ".publication-locks-v1" });
+        defer self.alloc.free(root);
+        try self.durable_dirs.ensure(self.alloc, io, root);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/{x:0>2}", .{ root, stripe });
+        defer self.alloc.free(path);
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+        errdefer file.close(io);
+        while (!try file.tryLock(io, mode)) {
+            try cancellation.check();
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        errdefer file.unlock(io);
+        try cancellation.check();
+        return .{ .io = io, .lock = lock, .file = file, .mode = mode };
+    }
     // These 64 lock files are permanent. Deleting an attempt must never
     // replace the lock inode while another initializer is waiting on it.
     fn journalGuard(self: *FsStore, io: std.Io, scope: artifact_store.UploadScope, cancellation: CancellationToken) !JournalGuard {
@@ -435,7 +492,10 @@ pub const FsStore = struct {
         return @import("fs_inventory_scan.zig").legacyTemporary(name);
     }
     fn readJournalIdentity(io: std.Io, directory: std.Io.Dir) !?[16]u8 {
-        const file = directory.openFile(io, ".uploads-id-v1", .{}) catch |err| switch (err) {
+        return readInventoryIdentity(io, directory, ".uploads-id-v1");
+    }
+    fn readInventoryIdentity(io: std.Io, directory: std.Io.Dir, name: []const u8) !?[16]u8 {
+        const file = directory.openFile(io, name, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -454,6 +514,7 @@ pub const FsStore = struct {
             else => return err,
         };
         defer dir.close(io);
+        if (try readInventoryIdentity(io, dir, ".rediscover-v1") != null) return false;
         dir.access(io, ".uploads-v1", .{}) catch |err| switch (err) {
             error.FileNotFound => return false,
             else => return err,
@@ -494,20 +555,22 @@ pub const FsStore = struct {
         }
         defer lock.unlock(io);
         try cancellation.check();
-        const rebuild = if (attempt.access(io, ".uploads-v1", .{})) |_| false else |err| switch (err) {
+        const rediscover = try readInventoryIdentity(io, attempt, ".rediscover-v1");
+        var id = try readJournalIdentity(io, attempt);
+        const needs_discovery = if (rediscover) |identity| id == null or !std.mem.eql(u8, &identity, &id.?) else false;
+        const rebuild = needs_discovery or (if (attempt.access(io, ".uploads-v1", .{})) |_| false else |err| switch (err) {
             error.FileNotFound => true,
             else => return err,
-        };
+        });
         const temp_exists = if (attempt.access(io, ".temporaries-v1", .{})) |_| true else |err| switch (err) {
             error.FileNotFound => false,
             else => return err,
         };
-        var id = if (rebuild) null else try readJournalIdentity(io, attempt);
         if (rebuild or !temp_exists or id == null) {
             _ = try removeMaintenanceFile(io, attempt, ".uploads-id-v1", visitor, cancellation);
             try @import("fs_inventory_scan.zig").build(self, io, payloads, attempt, rebuild, visitor, cancellation);
             var identity: [16]u8 = undefined;
-            io.random(&identity);
+            if (rediscover) |value| identity = value else io.random(&identity);
             const pending = try attempt.createFile(io, ".uploads-id-building", .{});
             defer pending.close(io);
             try pending.writePositionalAll(io, &identity, 0);
@@ -516,6 +579,9 @@ pub const FsStore = struct {
             id = identity;
             try fs_paths.syncDirectoryHandlePortable(io, attempt);
         }
+        // Identity equality proves rediscovery committed. This cleanup may
+        // use a later one-unit turn without rebuilding the installed logs.
+        if (rediscover != null) _ = try removeMaintenanceFile(io, attempt, ".rediscover-v1", visitor, cancellation);
         const journal = try attempt.openFile(io, ".uploads-v1", .{ .mode = .read_write, .allow_directory = false });
         errdefer journal.close(io);
         var header: [journal_header.len]u8 = undefined;
@@ -628,6 +694,8 @@ pub const FsStore = struct {
             }
             var identity: [16]u8 = undefined;
             {
+                var publication = if (visitor.cleanup_staging or visitor.reclaim_retired_inventory) try self.publicationGuard(io, scope, .exclusive, cancellation) else null;
+                defer if (publication) |*guard| guard.deinit();
                 const attempt = dir.openDir(io, &name, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
                     error.FileNotFound => continue,
                     else => return err,
@@ -881,6 +949,8 @@ pub const FsStore = struct {
     // Only call after processing an entire attempt behind a fencing cutoff.
     // Non-empty attempts include held payloads and are always preserved.
     fn reclaimEmptyScopedAttempt(self: *FsStore, io: std.Io, scope: artifact_store.UploadScope, visitor: ?artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !bool {
+        var publication = try self.publicationGuard(io, scope, .exclusive, cancellation);
+        defer publication.deinit();
         var guard = try self.journalGuard(io, scope, cancellation);
         defer guard.deinit();
         try cancellation.check();
@@ -894,6 +964,25 @@ pub const FsStore = struct {
             defer dir.close(io);
             var entries = dir.iterate();
             if (try entries.next(io)) |entry| {
+                if (try self.retirementPending(io, scope)) {
+                    // An older uploader may already have registered before
+                    // publication barriers were installed. Reopen discovery
+                    // durably, including canonical payloads and staging.
+                    try admitMaintenance(visitor, .inspect);
+                    const metadata_path = try std.fs.path.join(self.alloc, &.{ self.inventory_root, &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
+                    defer self.alloc.free(metadata_path);
+                    const metadata = try std.Io.Dir.cwd().openDir(io, metadata_path, .{});
+                    defer metadata.close(io);
+                    var identity: [16]u8 = undefined;
+                    io.random(&identity);
+                    const marker = try metadata.openFile(io, ".retiring-v1", .{ .mode = .read_write });
+                    defer marker.close(io);
+                    try marker.writePositionalAll(io, &identity, 0);
+                    try marker.sync(io);
+                    try metadata.rename(".retiring-v1", metadata, ".rediscover-v1", io);
+                    try fs_paths.syncDirectoryHandlePortable(io, metadata);
+                    return error.ArtifactEnumerationPaused;
+                }
                 if (legacyTemporary(entry.name)) {
                     const inventory_path = try std.fs.path.join(self.alloc, &.{ self.inventory_root, &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
                     defer self.alloc.free(inventory_path);
@@ -934,7 +1023,7 @@ pub const FsStore = struct {
                 artifact_store.validateSha256Checksum(entry.name) catch continue;
                 _ = try removeMaintenanceFile(io, dir, entry.name, visitor, cancellation);
             }
-            for ([_][]const u8{ ".uploads-building", ".uploads-lock", ".uploads-v1", ".uploads-id-v1", ".uploads-id-building", ".temporaries-building", ".temporaries-v1", ".inventory-scan-v1", ".inventory-scan-building" }) |name|
+            for ([_][]const u8{ ".uploads-building", ".uploads-lock", ".uploads-v1", ".uploads-id-v1", ".uploads-id-building", ".temporaries-building", ".temporaries-v1", ".inventory-scan-v1", ".inventory-scan-building", ".rediscover-v1" }) |name|
                 _ = try removeMaintenanceFile(io, dir, name, visitor, cancellation);
             // Commit an empty namespace retirement as one final unit. The
             // marker and both empty directories are constant-size bookkeeping.
@@ -2123,4 +2212,140 @@ test "external lake filesystem journal migration resumes canceled scans and reje
     }
     try std.testing.expect(complete);
     try std.testing.expectEqual(@as(usize, 37), inspected);
+}
+
+test "external lake filesystem journal retirement rediscovers late publication with one-unit turns" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("retirement-late-publication");
+    defer directory.cleanup();
+    const scope = try artifact_store.UploadScope.forPublication(@splat(73), 1, io);
+    const Visitor = struct {
+        target: *artifact_store.ArtifactStore,
+        work: usize = 1,
+        deletes: usize = 1,
+        visits: usize = 0,
+        token: ?[]u8 = null,
+        fn admit(raw: *anyopaque, operation: artifact_store.ScopedUploadVisitor.Maintenance) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.work == 0 or (operation == .remove and self.deletes == 0)) return error.QueryGcBudgetExhausted;
+            self.work -= 1;
+            if (operation == .remove) self.deletes -= 1;
+        }
+        fn visit(raw: *anyopaque, _: artifact_store.UploadScope, id: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try admit(raw, .remove);
+            self.visits += 1;
+            try self.target.delete(id);
+        }
+        fn checkpoint(raw: *anyopaque, token: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const owned = try std.testing.allocator.dupe(u8, token);
+            if (self.token) |old| std.testing.allocator.free(old);
+            self.token = owned;
+        }
+    };
+    var payload: []u8 = &.{};
+    var legacy: []u8 = &.{};
+    var pending: []u8 = &.{};
+    defer a.free(payload);
+    defer a.free(legacy);
+    defer a.free(pending);
+    {
+        var fs = try FsStore.init(a, directory.path());
+        defer fs.deinit();
+        var store = fs.artifactStore();
+        var value = try store.putScoped(scope, "late orphan", .none);
+        defer value.deinit(a);
+        const suffix = try artifact_store.storageSuffixAlloc(a, value.artifact_id);
+        defer a.free(suffix);
+        payload = try std.fs.path.join(a, &.{ fs.root_dir, suffix });
+        legacy = try std.fmt.allocPrint(a, "{s}.tmp-{s}", .{ payload, z17RepeatString("0", 32) });
+        pending = try std.fmt.allocPrint(a, "{s}.pending-v2", .{payload});
+        try store.delete(value.artifact_id);
+        var visitor: Visitor = .{ .target = &store };
+        try std.testing.expectError(error.QueryGcBudgetExhausted, fs.reclaimEmptyScopedAttempt(io, scope, .{ .ptr = &visitor, .visit = Visitor.visit, .maintenance = Visitor.admit }, .none));
+        try std.testing.expect(try fs.retirementPending(io, scope));
+        // Model publication from an older registered uploader, including
+        // staging. Current writers are fenced by the shared publication guard.
+        for ([_][]const u8{ payload, legacy, pending }) |path| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "late orphan" });
+    }
+    var visitor: Visitor = .{ .target = undefined };
+    defer if (visitor.token) |token| a.free(token);
+    var complete = false;
+    var migration_reads: usize = 0;
+    for (0..80) |_| {
+        var fs = try FsStore.initExisting(a, directory.path());
+        defer fs.deinit();
+        var store = fs.artifactStore();
+        visitor.target = &store;
+        visitor.work = 1;
+        visitor.deletes = 1;
+        const previous = if (visitor.token) |token| try a.dupe(u8, token) else null;
+        defer if (previous) |token| a.free(token);
+        store.visitScopedUploads(scope.domain, .{
+            .ptr = &visitor,
+            .visit = Visitor.visit,
+            .checkpoint = Visitor.checkpoint,
+            .maintenance = Visitor.admit,
+            .continuation = previous,
+            .cleanup_staging = true,
+            .reclaim_retired_inventory = true,
+            .fencing_cutoff = 2,
+            .max_entries = 1,
+        }, .none) catch |err| {
+            if (err != error.QueryGcBudgetExhausted and err != error.ArtifactEnumerationPaused) return err;
+            migration_reads += fs.migration_entries_read.load(.monotonic);
+            continue;
+        };
+        migration_reads += fs.migration_entries_read.load(.monotonic);
+        complete = true;
+        break;
+    }
+    try std.testing.expect(complete);
+    try std.testing.expectEqual(@as(usize, 1), visitor.visits);
+    try std.testing.expectEqual(@as(usize, 3), migration_reads);
+    for ([_][]const u8{ payload, legacy, pending }) |path|
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, path, .{}));
+}
+
+test "external lake filesystem journal publication barrier shares writers and cancels retirement waits" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("publication-barrier");
+    defer directory.cleanup();
+    var fs = try FsStore.init(a, directory.path());
+    defer fs.deinit();
+    const alias_path = try std.fs.path.join(a, &.{ directory.path(), "." });
+    defer a.free(alias_path);
+    var alias = try FsStore.initExisting(a, alias_path);
+    defer alias.deinit();
+    const scope = try artifact_store.UploadScope.forPublication(@splat(82), 1, io);
+    const Stop = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls > 3) return error.DeadlineExceeded;
+        }
+    };
+    {
+        var first = try fs.publicationGuard(io, scope, .shared, .none);
+        defer first.deinit();
+        var second = try alias.publicationGuard(io, scope, .shared, .none);
+        defer second.deinit();
+        var stop: Stop = .{};
+        try std.testing.expectError(error.DeadlineExceeded, fs.publicationGuard(io, scope, .exclusive, .{ .ptr = &stop, .check_fn = Stop.check }));
+        stop = .{};
+        try std.testing.expectError(error.DeadlineExceeded, fs.reclaimEmptyScopedAttempt(io, scope, null, .{ .ptr = &stop, .check_fn = Stop.check }));
+        try std.testing.expect(!try fs.retirementPending(io, scope));
+    }
+    {
+        var retirement = try alias.publicationGuard(io, scope, .exclusive, .none);
+        defer retirement.deinit();
+        var stop: Stop = .{};
+        try std.testing.expectError(error.DeadlineExceeded, fs.publicationGuard(io, scope, .shared, .{ .ptr = &stop, .check_fn = Stop.check }));
+    }
+    var resumed = try fs.publicationGuard(io, scope, .shared, .none);
+    resumed.deinit();
 }

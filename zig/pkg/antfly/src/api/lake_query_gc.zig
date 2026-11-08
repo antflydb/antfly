@@ -173,7 +173,7 @@ fn scopeDomain(a: A, store: *Store, table: u64, category: usize) ![32]u8 {
 /// Remove only completed, unretained checkpoints before consuming the store's
 /// durable ownership witness. A short budget resumes this idempotent cleanup
 /// next turn; a concurrently advanced checkpoint retains ownership instead.
-pub fn retireCompleted(a: A, store: *Store, table: u64, proofs: *const CompletionProofs, budget: *Budget) !void {
+pub fn retireCompleted(a: A, store: *Store, table: u64, proofs: *const CompletionProofs, progressed: *bool, budget: *Budget) !void {
     if (!proofs.matches(store.identity, table, budget.retire_after_ms)) return error.QueryGcRetainedProgress;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -196,6 +196,7 @@ pub fn retireCompleted(a: A, store: *Store, table: u64, proofs: *const Completio
             error.PreconditionFailed => return error.QueryGcRetainedProgress,
             else => return err,
         };
+        progressed.* = true;
     }
 }
 
@@ -696,7 +697,8 @@ test "external lake query cleanup completed categories rest durably while neighb
         var budget: Budget = .{ .deletes = 1, .reads = 512, .work = 1, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s, .sweep_interval_ms = 1234, .retire_after_ms = 200000, .proofs = &proofs };
         const result = collect(a, &store, 7, 0, 231001, &budget);
         try std.testing.expect(!result.more and !result.retained and !result.failed);
-        retireCompleted(a, &store, 7, &proofs, &budget) catch |err| {
+        var retirement_progress = false;
+        retireCompleted(a, &store, 7, &proofs, &retirement_progress, &budget) catch |err| {
             if (err != error.QueryGcBudgetExhausted) return err;
             continue;
         };
@@ -916,7 +918,8 @@ test "external lake query cleanup retirement reuses read proofs and fences concu
     defer a.free(held_bytes);
     var changed = try client.putObject(store.opened.bucket, key, held_bytes, .{});
     changed.deinit(client.allocator);
-    try std.testing.expectError(error.QueryGcRetainedProgress, retireCompleted(a, &store, 7, &proofs, &budget));
+    var retirement_progress = false;
+    try std.testing.expectError(error.QueryGcRetainedProgress, retireCompleted(a, &store, 7, &proofs, &retirement_progress, &budget));
     // A complete sweep after the retained completion's rest interval clears
     // its evidence. Retirement then uses the newly collected CAS revisions.
     var refresh: Budget = .{ .deletes = 128, .reads = 512, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s, .retire_after_ms = now - 1, .proofs = &proofs };
@@ -926,7 +929,7 @@ test "external lake query cleanup retirement reuses read proofs and fences concu
     const final = collect(a, &store, 7, 0, now + 30002, &next);
     try std.testing.expect(!final.more and !final.retained and !final.failed);
     const before = next.reads;
-    try retireCompleted(a, &store, 7, &proofs, &next);
+    try retireCompleted(a, &store, 7, &proofs, &retirement_progress, &next);
     try std.testing.expectEqual(before, next.reads);
     try std.testing.expectEqual(@as(usize, 123), next.deletes);
 }

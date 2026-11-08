@@ -163,25 +163,31 @@ pub fn build(fs: anytype, io: std.Io, payloads: std.Io.Dir, metadata: std.Io.Dir
         const directory_file: std.Io.File = .{ .handle = payloads.handle, .flags = .{ .nonblocking = false } };
         try io.vtable.fileSeekTo(io.userdata, directory_file, state.buffer_start);
         if (state.end != 0) {
-            // Some virtual/network filesystems expose handle-local directory
-            // cookies. Re-read one fixed buffer to verify that this reopened
-            // handle interprets the cookie identically. Never silently skip
-            // or loop over entries when the filesystem cannot resume it.
+            // Verify the consumed entry prefix, not the syscall's batch
+            // length. A reopened reader may legally return shorter or longer
+            // batches. Verification stays bounded by one saved buffer.
+            const records_start: usize = if (builtin.os.tag == .macos) 8 else 0;
+            if (state.index <= records_start or state.end < state.index) return error.InvalidArtifactUploadInventory;
+            var saved = payloads.iterateAssumeFirstIteration();
+            saved.reader_buffer = iterator.reader_buffer;
+            saved.reader.index = records_start;
+            saved.reader.end = state.end;
             var verify = payloads.iterateAssumeFirstIteration();
             @memset(&verify.reader_buffer, 0);
-            _ = try verify.next(io);
-            try canonicalize(&verify);
-            // Darwin may return a different cookie encoding for equivalent
-            // positions on a new handle. Compare the actual directory records,
-            // excluding its advisory buffer header, rather than cookie bits.
-            const records_start: usize = if (builtin.os.tag == .macos) 8 else 0;
-            if (verify.reader.end != state.end or state.end < records_start or
-                !std.mem.eql(u8, verify.reader_buffer[records_start..state.end], iterator.reader_buffer[records_start..state.end])) return error.ArtifactInventoryCursorUnavailable;
+            var start = state.buffer_start;
+            while (saved.reader.index < state.index) {
+                const expected = (try saved.next(io)) orelse return error.InvalidArtifactUploadInventory;
+                if (saved.reader.index > state.index) return error.InvalidArtifactUploadInventory;
+                if (verify.reader.index == verify.reader.end) start = try offset(payloads);
+                const actual = (try verify.next(io)) orelse return error.ArtifactInventoryCursorUnavailable;
+                if (expected.inode != actual.inode or expected.kind != actual.kind or !std.mem.eql(u8, expected.name, actual.name))
+                    return error.ArtifactInventoryCursorUnavailable;
+            }
+            state.buffer_start = start;
             iterator = verify;
+        } else {
+            iterator.reader.state = .reading;
         }
-        iterator.reader.index = state.index;
-        iterator.reader.end = state.end;
-        iterator.reader.state = .reading;
         if (payload) |file| try file.setLength(io, state.payload_length);
         try temporaries.setLength(io, state.temporary_length);
     } else {
@@ -333,4 +339,61 @@ test "external lake filesystem journal inventory scan resumes across directory b
     const temporaries = try metadata.openFile(io, ".temporaries-v1", .{});
     defer temporaries.close(io);
     try std.testing.expectEqual(@as(u64, temporary_header.len + 257 * 101), try temporaries.length(io));
+}
+
+test "external lake filesystem journal migration accepts shorter and longer reopened directory batches" {
+    const io = std.testing.io;
+    const ShortRead = struct {
+        fn read(raw: ?*anyopaque, reader: *std.Io.Dir.Reader, entries: []std.Io.Dir.Entry) std.Io.Dir.Reader.Error!usize {
+            const buffer = reader.buffer;
+            defer reader.buffer = buffer;
+            if (reader.index == reader.end) reader.buffer = buffer[0..std.Io.Dir.Reader.min_buffer_len];
+            return std.testing.io.vtable.dirRead(raw, reader, entries);
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.dirRead = ShortRead.read;
+    var short_io = io;
+    short_io.vtable = &vtable;
+    const Visitor = struct {
+        left: usize = 27,
+        fn admit(raw: *anyopaque, _: api.ScopedUploadVisitor.Maintenance) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.left == 0) return error.QueryGcBudgetExhausted;
+            self.left -= 1;
+        }
+        fn visit(_: *anyopaque, _: api.UploadScope, _: []const u8) !void {}
+    };
+    for ([_]bool{ false, true }) |short_first| {
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        try directory.dir.createDir(io, "payloads", .default_dir);
+        try directory.dir.createDir(io, "metadata", .default_dir);
+        const metadata = try directory.dir.openDir(io, "metadata", .{});
+        defer metadata.close(io);
+        {
+            const payloads = try directory.dir.openDir(io, "payloads", .{});
+            defer payloads.close(io);
+            for (0..80) |i| {
+                var name: [101]u8 = undefined;
+                @memset(name[0..64], '0');
+                _ = try std.fmt.bufPrint(name[64..], ".tmp-{x:0>32}", .{i});
+                try payloads.writeFile(io, .{ .sub_path = &name, .data = "legacy" });
+            }
+        }
+        var fs = .{ .alloc = std.testing.allocator, .migration_entries_read = std.atomic.Value(usize).init(0), .journal_backfills = std.atomic.Value(usize).init(0) };
+        {
+            const payloads = try directory.dir.openDir(io, "payloads", .{ .iterate = true });
+            defer payloads.close(io);
+            var visitor: Visitor = .{};
+            try std.testing.expectError(error.QueryGcBudgetExhausted, build(&fs, if (short_first) short_io else io, payloads, metadata, true, .{ .ptr = &visitor, .visit = Visitor.visit, .maintenance = Visitor.admit }, .none));
+        }
+        const reopened = try directory.dir.openDir(io, "payloads", .{ .iterate = true });
+        defer reopened.close(io);
+        try build(&fs, if (short_first) io else short_io, reopened, metadata, true, null, .none);
+        try std.testing.expectEqual(@as(usize, 80), fs.migration_entries_read.load(.monotonic));
+        const log = try metadata.openFile(io, ".temporaries-v1", .{});
+        defer log.close(io);
+        try std.testing.expectEqual(@as(u64, temporary_header.len + 80 * 101), try log.length(io));
+    }
 }
