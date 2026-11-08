@@ -37,7 +37,7 @@ func (s *Service) serveManagement(w http.ResponseWriter, r *http.Request) {
 type localManagement struct{ s *Service }
 
 func (b localManagement) Capabilities(context.Context) (management.Capabilities, error) {
-	return management.Capabilities{SearchVersions: []int{1, 2}, ArtifactDiscovery: true, Version: 1, Runtime: "standalone", PerSourceRuns: true, CancelRuns: true, ConfigureSources: true, PurgeSources: true, MediaProxy: true, SerializedRuns: true, ConfigurationUrl: "/v1/connections"}, nil
+	return management.Capabilities{ProcessingPresets: true, ProcessingJobs: true, SearchVersions: []int{1, 2}, ArtifactDiscovery: true, Version: 1, Runtime: "standalone", PerSourceRuns: true, CancelRuns: true, ConfigureSources: true, PurgeSources: true, MediaProxy: true, SerializedRuns: true, ConfigurationUrl: "/v1/connections"}, nil
 }
 func managementSource(source Source) management.Source {
 	var cfg map[string]any

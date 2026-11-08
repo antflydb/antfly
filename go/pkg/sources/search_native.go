@@ -106,11 +106,22 @@ func nativeEnrichments(config map[string]any) map[string]map[string]any {
 	}
 	return out
 }
+
+// Validate each projection transition, including the fixed text output of a
+// chunk producer. An ancestor name alone does not prove which field was read.
 func nativeLineage(enrichments map[string]map[string]any, member string, stream SearchStream) bool {
 	seen := map[string]bool{}
+	projected := stream.Retrieval.Semantic.MemberField
 	for hops := 0; hops <= 64; hops++ {
 		if stream.Artifact != "" && member == stream.Artifact {
-			return true
+			if stream.Field == "" {
+				return projected == ""
+			}
+			if projected == stream.Field {
+				return true
+			}
+			e := enrichments[member]
+			return stream.Field == "$" && projected == "text" && e["kind"] == "asset" && e["content_type"] == "text/plain"
 		}
 		if seen[member] {
 			return false
@@ -120,19 +131,35 @@ func nativeLineage(enrichments map[string]map[string]any, member string, stream 
 		if !ok {
 			return false
 		}
-		upstream, _ := e["source_artifact_name"].(string)
-		if upstream == "" {
-			if stream.Artifact != "" {
+		field, _ := e["field"].(string)
+		template, _ := e["template"].(string)
+		if template != "" {
+			if field != "" || !strings.HasPrefix(template, "{{") || !strings.HasSuffix(template, "}}") {
 				return false
 			}
+			field = strings.TrimSuffix(strings.TrimPrefix(template, "{{"), "}}")
+		}
+		switch e["kind"] {
+		case "embedding":
+			if projected != "" && projected != field {
+				return false
+			}
+		case "chunk":
+			if projected != "text" {
+				return false
+			}
+		default:
+			return false
+		}
+		upstream, _ := e["source_artifact_name"].(string)
+		if upstream == "" {
 			expected := stream.Field
 			if stream.ResourceField != "" {
 				expected = stream.ResourceField + ".uri"
 			}
-			field, _ := e["field"].(string)
-			template, _ := e["template"].(string)
-			return expected != "" && (field == expected || template == "{{"+expected+"}}")
+			return stream.Artifact == "" && expected != "" && field == expected
 		}
+		projected = field
 		member = upstream
 	}
 	return false
@@ -203,14 +230,10 @@ func checkNativeStream(stream SearchStream, index nativeSearchIndex, semantic bo
 			return fmt.Errorf("semantic member does not derive from representation")
 		}
 	}
-	for _, input := range binding.QueryInputs {
-		if input == "text" {
-			embedder, _ := cfg["embedder"].(map[string]any)
-			if embedder["model"] != binding.VectorSpace.Model {
-				return fmt.Errorf("query embedder differs from pinned model")
-			}
-		}
+	if err := ValidateManagedVectorSpace(binding.VectorSpace, func() map[string]any { e, _ := cfg["embedder"].(map[string]any); return e }()); err != nil {
+		return err
 	}
+
 	return nil
 }
 func intNumber(v any) int {

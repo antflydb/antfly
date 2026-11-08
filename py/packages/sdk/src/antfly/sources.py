@@ -126,6 +126,12 @@ class SourcesClient(_SourceTransport):
     def source(self, source_id: str) -> dict[str, Any]:
         return self._request("GET", f"/sources/{quote(source_id, safe='')}")
 
+    def preview_processing(self, source_id: str, preset: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", f"/sources/{quote(source_id, safe='')}/processing-preview", preset)
+
+    def processing_job(self, source_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", f"/sources/{quote(source_id, safe='')}/processing-jobs", request)
+
     def put_source(self, source: dict[str, Any]) -> dict[str, Any]:
         return self._request(
             "PUT",

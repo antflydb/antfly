@@ -380,6 +380,101 @@
           }
         }
       }
+    },
+    "/sources/{source_id}/processing-preview": {
+      "post": {
+        "operationId": "previewProcessing",
+        "description": "Native processing only; never runs acquisition. Processing jobs have table-wide artifact scope and require table administrator access.",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProcessingPreset"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Processing result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessingPreview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid declaration"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "503": {
+            "description": "Native operation unavailable"
+          }
+        }
+      }
+    },
+    "/sources/{source_id}/processing-jobs": {
+      "post": {
+        "operationId": "operateProcessingJob",
+        "description": "Native processing only; never runs acquisition. Processing jobs have table-wide artifact scope and require table administrator access.",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProcessingJobRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Processing result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid declaration"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "503": {
+            "description": "Native operation unavailable"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -431,6 +526,12 @@
             "x-go-type-skip-optional-pointer": true
           },
           "artifact_discovery": {
+            "type": "boolean"
+          },
+          "processing_presets": {
+            "type": "boolean"
+          },
+          "processing_jobs": {
             "type": "boolean"
           }
         }
@@ -950,6 +1051,10 @@
           },
           "external": {
             "type": "boolean"
+          },
+          "member_field": {
+            "type": "string",
+            "description": "Projection returned from semantic members. Chunk-backed embeddings use text even when their ancestor representation is scalar ($). Managed textual streams must declare this field."
           }
         },
         "required": [
@@ -1116,6 +1221,103 @@
               "$ref": "#/components/schemas/NativeIndexDeclaration"
             },
             "x-go-type-skip-optional-pointer": true
+          }
+        }
+      },
+      "ProcessingPreset": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "kind"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "content",
+              "extract",
+              "transcription",
+              "caption",
+              "summary"
+            ]
+          },
+          "producer_config": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "embedder": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "dimension": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65536
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "cosine",
+              "inner_product",
+              "l2_squared"
+            ]
+          }
+        }
+      },
+      "ProcessingPreview": {
+        "type": "object",
+        "required": [
+          "processing",
+          "stream",
+          "artifact"
+        ],
+        "properties": {
+          "processing": {
+            "$ref": "#/components/schemas/ProcessingDeclaration"
+          },
+          "stream": {
+            "$ref": "#/components/schemas/SearchStream"
+          },
+          "artifact": {
+            "$ref": "#/components/schemas/ArtifactBinding"
+          }
+        }
+      },
+      "ProcessingJobRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "artifact",
+          "action"
+        ],
+        "properties": {
+          "artifact": {
+            "type": "string",
+            "minLength": 1
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "start",
+              "status",
+              "advance",
+              "cancel"
+            ]
+          },
+          "job_id": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 256
           }
         }
       }

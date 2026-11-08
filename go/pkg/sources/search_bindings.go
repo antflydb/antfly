@@ -90,6 +90,12 @@ func ValidateSearchBindings(version int, streams []SearchStream, artifacts []Art
 			return fmt.Errorf("full-text retrieval requires an index")
 		}
 		if semantic := r.Semantic; semantic != nil {
+			if semantic.MemberField != "" && !validBindingName(semantic.MemberField) {
+				return fmt.Errorf("invalid semantic member projection")
+			}
+			if !semantic.External && stream.Field != "" && semantic.MemberField == "" {
+				return fmt.Errorf("managed textual retrieval requires a member projection")
+			}
 			if !validBindingName(semantic.Index) {
 				return fmt.Errorf("semantic retrieval requires an index")
 			}

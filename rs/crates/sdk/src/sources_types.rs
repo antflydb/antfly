@@ -36,6 +36,10 @@ pub struct Capabilities {
     pub search_versions: Option<Vec<i64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_discovery: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_presets: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_jobs: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +206,8 @@ pub struct SemanticRetrieval {
     pub default: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_field: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,4 +252,35 @@ pub struct NativeIndexDeclaration {
 pub struct ProcessingDeclaration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexes: Option<Vec<NativeIndexDeclaration>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessingPreset {
+    pub name: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_config: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedder: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessingPreview {
+    pub processing: ProcessingDeclaration,
+    pub stream: SearchStream,
+    pub artifact: ArtifactBinding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessingJobRequest {
+    pub artifact: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
 }

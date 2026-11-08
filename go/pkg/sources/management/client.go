@@ -130,3 +130,12 @@ func (c *Client) CancelRun(ctx context.Context, source, id string) (out Run, err
 	err = c.call(ctx, "POST", "/sources/"+url.PathEscape(source)+"/runs/"+url.PathEscape(id)+"/cancel", "", struct{}{}, &out)
 	return
 }
+
+func (c *Client) PreviewProcessing(ctx context.Context, id string, input ProcessingPreset) (out ProcessingPreview, err error) {
+	err = c.call(ctx, "POST", "/sources/"+url.PathEscape(id)+"/processing-preview", "", input, &out)
+	return
+}
+func (c *Client) ProcessingJob(ctx context.Context, id string, input ProcessingJobRequest) (out map[string]any, err error) {
+	err = c.call(ctx, "POST", "/sources/"+url.PathEscape(id)+"/processing-jobs", "", input, &out)
+	return
+}

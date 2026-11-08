@@ -30,6 +30,7 @@ const CatalogRecordVersion = 1
 // CatalogRecord contains only portable search metadata. Credentials, provider
 // selectors, reader session identities and job checkpoints never belong here.
 type CatalogRecord struct {
+	AcquisitionID     string      `json:"acquisition_id,omitempty"`
 	Version           int         `json:"version"`
 	DocType           string      `json:"doc_type"`
 	Source            Binding     `json:"source"`

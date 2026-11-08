@@ -6057,6 +6057,7 @@ pub const IndexManager = struct {
         text_requires_root: bool = true,
         text_fields: [][]u8 = &.{},
         dense_fields: []DenseFieldWritePlan,
+        external_vector_spaces: std.StringHashMapUnmanaged([]u8) = .empty,
         sparse_fields: []SparseFieldWritePlan,
         graph_fields: []GraphFieldWritePlan,
         /// Catalog-derived provider work compiled once for this generation.
@@ -6073,6 +6074,12 @@ pub const IndexManager = struct {
         chunk_dependents: [][]u32,
 
         pub fn deinit(self: *WritePlanSnapshot) void {
+            var spaces = self.external_vector_spaces.iterator();
+            while (spaces.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            self.external_vector_spaces.deinit(self.alloc);
             if (self.group_sources) |*plan| plan.deinit();
             if (self.completion_plan) |*plan| plan.deinit();
             if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
@@ -6614,9 +6621,32 @@ pub const IndexManager = struct {
         errdefer alloc.free(catalog_resolvers);
         var completion_plan = try @import("../artifact_completion_plan.zig").Plan.init(alloc, .{ .indexes = catalog_indexes, .enrichments = catalog_enrichments, .resolvers = catalog_resolvers }, generated_templates);
         errdefer completion_plan.deinit();
+        // Compile admission identities once per immutable catalog generation.
+        var external_spaces: std.StringHashMapUnmanaged([]u8) = .empty;
+        errdefer {
+            var spaces = external_spaces.iterator();
+            while (spaces.next()) |entry| {
+                alloc.free(entry.key_ptr.*);
+                alloc.free(entry.value_ptr.*);
+            }
+            external_spaces.deinit(alloc);
+        }
+        for (self.dense_indexes.items) |entry| {
+            if (!entry.external) continue;
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, entry.config.config_json, .{});
+            defer parsed.deinit();
+            const value = parsed.value.object.get("external_vector_space") orelse continue;
+            if (value != .string or value.string.len == 0) return error.InvalidIndexConfig;
+            const name = try alloc.dupe(u8, entry.config.name);
+            errdefer alloc.free(name);
+            const identity = try alloc.dupe(u8, value.string);
+            errdefer alloc.free(identity);
+            try external_spaces.put(alloc, name, identity);
+        }
         return .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
+            .external_vector_spaces = external_spaces,
             .artifact_catalogs = .{ .indexes = catalog_indexes, .enrichments = catalog_enrichments, .resolvers = catalog_resolvers },
             .catalog_empty = .{ self.count() == 0, self.enrichments.items.len == 0, self.resolvers.items.len == 0 and self.retired_resolvers.items.len == 0 },
             .has_text_consumers = blk: {
@@ -19839,31 +19869,35 @@ pub const IndexManager = struct {
         return false;
     }
 
-    /// Caller holds the catalog read/apply fence. Compatibility identity is an
-    /// authored assertion; vector shape is independently validated by admission.
-    pub fn validateExternalVectorSpaces(self: *const IndexManager, alloc: Allocator, embeddings: []const mapper.DenseEmbeddingWrite, document_json: []const u8) !void {
-        var document: ?std.json.Parsed(std.json.Value) = null;
-        defer if (document) |*parsed| parsed.deinit();
+    /// Caller holds the catalog read/apply fence. The immutable write plan owns
+    /// indexed expected identities; ordinary writes do no index/config scans.
+    pub fn validateExternalVectorSpaces(self: *IndexManager, alloc: Allocator, embeddings: []const mapper.DenseEmbeddingWrite, document_json: []const u8) !void {
+        if (embeddings.len == 0) return;
+        var plan = try self.acquireWritePlanSnapshot();
+        defer plan.release();
+        if (plan.plan().external_vector_spaces.count() == 0) return;
+        const document = std.json.parseFromSlice(std.json.Value, alloc, document_json, .{}) catch return error.InvalidEmbedding;
+        defer document.deinit();
+        try validateExternalVectorSpacesInPlan(plan.plan(), embeddings, document.value);
+    }
+
+    pub fn validateExternalVectorSpacesParsed(self: *IndexManager, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
+        if (embeddings.len == 0) return;
+        var plan = try self.acquireWritePlanSnapshot();
+        defer plan.release();
+        try validateExternalVectorSpacesInPlan(plan.plan(), embeddings, document);
+    }
+
+    fn validateExternalVectorSpacesInPlan(plan: *const WritePlanSnapshot, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
         for (embeddings) |embedding| {
-            for (self.dense_indexes.items) |entry| {
-                if (!entry.external or !std.mem.eql(u8, entry.config.name, embedding.index_name)) continue;
-                // Legacy external indexes retain their original admission path.
-                if (std.mem.indexOf(u8, entry.config.config_json, "external_vector_space") == null) break;
-                const config = try std.json.parseFromSlice(std.json.Value, alloc, entry.config.config_json, .{});
-                defer config.deinit();
-                const expected = config.value.object.get("external_vector_space") orelse break;
-                if (expected != .string or expected.string.len == 0) return error.InvalidEmbedding;
-                if (document == null) document = std.json.parseFromSlice(std.json.Value, alloc, document_json, .{}) catch return error.InvalidEmbedding;
-                const root = document.?.value;
-                if (root != .object) return error.InvalidEmbedding;
-                const metadata = root.object.get("metadata") orelse return error.InvalidEmbedding;
-                if (metadata != .object) return error.InvalidEmbedding;
-                const spaces = metadata.object.get("embedding_spaces") orelse return error.InvalidEmbedding;
-                if (spaces != .object) return error.InvalidEmbedding;
-                const supplied = spaces.object.get(embedding.index_name) orelse return error.InvalidEmbedding;
-                if (supplied != .string or !std.mem.eql(u8, supplied.string, expected.string)) return error.InvalidEmbedding;
-                break;
-            }
+            const expected = plan.external_vector_spaces.get(embedding.index_name) orelse continue;
+            if (document != .object) return error.InvalidEmbedding;
+            const metadata = document.object.get("metadata") orelse return error.InvalidEmbedding;
+            if (metadata != .object) return error.InvalidEmbedding;
+            const spaces = metadata.object.get("embedding_spaces") orelse return error.InvalidEmbedding;
+            if (spaces != .object) return error.InvalidEmbedding;
+            const supplied = spaces.object.get(embedding.index_name) orelse return error.InvalidEmbedding;
+            if (supplied != .string or !std.mem.eql(u8, supplied.string, expected)) return error.InvalidEmbedding;
         }
     }
 

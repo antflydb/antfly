@@ -69,6 +69,15 @@ func BuildTextProcessing(preset TextProcessingPreset) (ProcessingDeclaration, Se
 		return ProcessingDeclaration{}, SearchStream{}, ArtifactBinding{}, fmt.Errorf("plain text assets use the native text indexing slot")
 	}
 	unitConfig := map[string]any{"kind": "asset", "template": "{{" + input + "}}", "content_type": contentType, "producer": producer}
+	if preset.ResourceField != "" {
+		delete(unitConfig, "template")
+		if producer["type"] == "generator" {
+			unitConfig["template"] = "{{#if " + input + "}}{{remoteMedia url=" + input + "}}{{/if}}"
+		} else {
+			unitConfig["field"] = input
+		}
+	}
+
 	if preset.Purpose == "summary" || preset.Purpose == "caption" {
 		preset.Generated = true
 	}
@@ -77,7 +86,7 @@ func BuildTextProcessing(preset TextProcessingPreset) (ProcessingDeclaration, Se
 	chunkConfig := map[string]any{"kind": "chunk", "source_artifact_name": units, "field": outputField, "chunk_size": 512, "chunk_overlap": 64}
 	chunks := NativeIndexName(preset.Name+"_chunks", chunkConfig)
 	chunkConfig["name"] = chunks
-	enrichments := []any{unitConfig, chunkConfig}
+	enrichments := []any{unitConfig}
 	textConfig := map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": units, "field": outputField}}, "enrichments": enrichments}
 	textName := NativeIndexName(preset.Name+"_text", textConfig)
 	projectionField := outputField
@@ -88,13 +97,16 @@ func BuildTextProcessing(preset TextProcessingPreset) (ProcessingDeclaration, Se
 	plan := ProcessingDeclaration{Indexes: []management.NativeIndexDeclaration{{Name: textName, Config: textConfig}}}
 	artifact := ArtifactBinding{Name: preset.Name, Artifact: units, Purpose: preset.Purpose, Generated: preset.Generated, ContentType: contentType, LocationField: "provenance"}
 	if preset.VectorSpace != nil {
+		if preset.VectorSpace.DocumentModality != "text" {
+			return plan, stream, artifact, fmt.Errorf("text processing embeds text members; use a media representation for native image/audio embeddings")
+		}
 		if err := ValidateVectorSpace(*preset.VectorSpace); err != nil {
 			return plan, stream, artifact, err
 		}
-		if preset.Embedder["model"] != preset.VectorSpace.Model {
-			return plan, stream, artifact, fmt.Errorf("preset query embedder must match the pinned vector model")
+		if err := ValidateManagedVectorSpace(*preset.VectorSpace, preset.Embedder); err != nil {
+			return plan, stream, artifact, err
 		}
-		all := append([]any{}, enrichments...)
+		all := append(append([]any{}, enrichments...), chunkConfig)
 		vectorSource, vectorField := chunks, outputField
 		denseConfig := map[string]any{"kind": "embedding", "source_artifact_name": vectorSource, "field": vectorField, "expected_dims": preset.VectorSpace.Dimension, "vector_space": VectorSpaceIdentity(*preset.VectorSpace)}
 		dense := NativeIndexName(preset.Name+"_dense", denseConfig)
@@ -102,7 +114,7 @@ func BuildTextProcessing(preset TextProcessingPreset) (ProcessingDeclaration, Se
 		all = append(all, denseConfig)
 		config := map[string]any{"type": "embeddings", "dimension": preset.VectorSpace.Dimension, "distance_metric": preset.VectorSpace.Metric, "embedder": preset.Embedder, "sources": []any{map[string]any{"artifact": dense}}, "enrichments": all}
 		name := NativeIndexName(preset.Name+"_vectors", config)
-		stream.Retrieval.Semantic = &management.SemanticRetrieval{Index: name, MemberArtifacts: []string{dense}, VectorSpace: *preset.VectorSpace, QueryInputs: []management.SemanticRetrievalQueryInputs{"text", "vector"}, Default: !preset.Generated}
+		stream.Retrieval.Semantic = &management.SemanticRetrieval{Index: name, MemberField: "text", MemberArtifacts: []string{dense}, VectorSpace: *preset.VectorSpace, QueryInputs: []management.SemanticRetrievalQueryInputs{"text", "vector"}, Default: !preset.Generated}
 		plan.Indexes = append(plan.Indexes, management.NativeIndexDeclaration{Name: name, Config: config})
 	}
 	return plan, stream, artifact, ValidateProcessing(&plan)

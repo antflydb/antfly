@@ -47,8 +47,10 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 	space := testVectorSpace()
 	ext, err := ExternalVectorIndex("original_vectors", space)
 	require.NoError(t, err)
-	chunkArtifact := plan.Indexes[0].Config["enrichments"].([]any)[1].(map[string]any)["name"].(string)
-	chunkIndex := management.NativeIndexDeclaration{Name: "chunk_text", Config: map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": chunkArtifact, "field": "text"}}}}
+	units := text.Artifact
+	chunkConfig := map[string]any{"kind": "chunk", "name": "fixture_chunks", "source_artifact_name": units, "field": "text", "chunk_size": 512, "chunk_overlap": 64}
+	chunkArtifact := "fixture_chunks"
+	chunkIndex := management.NativeIndexDeclaration{Name: "chunk_text", Config: map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": chunkArtifact, "field": "text"}}, "enrichments": []any{chunkConfig}}}
 	plan.Indexes = append(plan.Indexes, ext, chunkIndex)
 	require.NoError(t, ReconcileProcessing(ctx, p, table, &plan))
 	original := SearchStream{Name: "original", ResourceField: "content.resource", Retrieval: &RetrievalBindings{Semantic: &management.SemanticRetrieval{Index: ext.Name, External: true, VectorSpace: space, QueryInputs: []management.SemanticRetrievalQueryInputs{"vector"}}}}
@@ -100,7 +102,7 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 	require.NotEmpty(t, wire.Responses[0].Hits.Hits[0].Hierarchy.Matches)
 	require.Equal(t, "launch at 04:12", wire.Responses[0].Hits.Hits[0].Hierarchy.Matches[0].Source["$"])
 	chunkStream := text
-	chunkStream.Name, chunkStream.Artifact = "chunks", chunkArtifact
+	chunkStream.Name, chunkStream.Artifact, chunkStream.Field = "chunks", chunkArtifact, "text"
 	chunkStream.Retrieval = &RetrievalBindings{FullText: &management.FullTextRetrieval{Index: chunkIndex.Name}}
 	binding.Streams = append(binding.Streams, chunkStream)
 	require.Eventually(t, func() bool {

@@ -149604,3 +149604,24 @@ test "scalar text asset chunks track parent updates and retirement" {
     defer retired.deinit();
     try std.testing.expectEqual(@as(usize, 0), retired.hits.len);
 }
+
+test "scalar text asset chunks asynchronous mixed parents settle publication" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-async-publication");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "content_units", .kind = .asset, .template = "{{content.text}}", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addEnrichment(.{ .name = "content_chunks", .kind = .chunk, .source_artifact_name = "content_units", .field = "text", .chunk_size = 512, .chunk_overlap = 64 });
+    try db.addIndex(.{ .name = "units_text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"content_units\",\"field\":\"text\"}]}" });
+    try db.addIndex(.{ .name = "chunks_text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"content_chunks\",\"field\":\"text\"}]}" });
+    try db.batch(.{ .writes = &.{ .{ .key = "text", .value = "{\"content\":{\"text\":\"launch at 04:12\"}}" }, .{ .key = "image", .value = "{\"content\":{\"resource\":{\"uri\":\"image\"}}}" } }, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    for ([_][]const u8{ "units_text", "chunks_text" }) |index| {
+        var status = types.DBIndexStats{ .name = try a.dupe(u8, index), .kind = .full_text };
+        defer types.freeDBIndexStatsItem(a, status);
+        try db.populateIndexSourceReplayStats(a, index, 0, 0, &status);
+        try std.testing.expectEqual(@as(usize, 1), status.source_replay.len);
+        try std.testing.expect(status.source_replay[0].producer_complete);
+    }
+}

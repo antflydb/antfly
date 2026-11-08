@@ -5052,6 +5052,17 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
 // JSON objects. Apply the same explicit projection to a synthetic text field
 // instead of feeding raw bytes into the JSON-only document projector.
 fn projectHierarchyMemberSource(alloc: std.mem.Allocator, raw: []const u8, options: db_mod.types.LookupOptions) !std.json.Value {
+    // `$` explicitly selects the original scalar bytes. Never sniff plaintext
+    // as JSON: numeric/quoted/object-shaped text must retain its exact bytes.
+    if (!options.include_all_fields) for (options.fields) |field| {
+        if (!std.mem.eql(u8, field, "$")) continue;
+        var scalar = std.json.ObjectMap.empty;
+        var value: std.json.Value = .{ .object = scalar };
+        defer db_mod.types.deinitJsonValue(alloc, &value);
+        try scalar.put(alloc, try alloc.dupe(u8, "$"), .{ .string = try alloc.dupe(u8, raw) });
+        value = .{ .object = scalar };
+        return try document_query.projectLookupValue(alloc, value, options);
+    };
     var value = try parseStoredSourceValue(alloc, raw);
     defer db_mod.types.deinitJsonValue(alloc, &value);
     if (value != .object) {
@@ -20942,4 +20953,13 @@ test "native member traversal requires producer and private parent admission" {
     defer json.deinit();
     try json.value.object.put(json.arena.allocator(), "_hierarchy_parent_admitted", .{ .bool = true });
     try std.testing.expect(objectHasInternalShardField(json.value.object));
+}
+
+test "api query contract scalar evidence preserves JSON-shaped plaintext bytes" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "123", "true", "\"quoted\"", "{\"text\":\"launch\"}" }) |raw| {
+        var projected = try projectHierarchyMemberSource(a, raw, .{ .fields = &.{"$"}, .include_all_fields = false });
+        defer db_mod.types.deinitJsonValue(a, &projected);
+        try std.testing.expectEqualStrings(raw, projected.object.get("$").?.string);
+    }
 }

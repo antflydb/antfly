@@ -6130,7 +6130,24 @@ fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enric
     }
     defer runtime.alloc.free(raw.?);
 
-    if (request.upstream_artifact_name.len != 0 and upstream_raw == null) return error.ArtifactPublicationPending;
+    if (request.upstream_artifact_name.len != 0 and upstream_raw == null) {
+        // A mixed text/media corpus legitimately has no text input on some
+        // parents. Prove that absence from the captured primary, rather than
+        // retrying a producer that intentionally published no output forever.
+        // Nested upstreams and nonempty inputs still require publication proof.
+        const upstream = runtime.index_manager.getEnrichment(.asset, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
+        if (upstream.source_artifact_name.len != 0) return error.ArtifactPublicationPending;
+        var root_request = request;
+        root_request.kind = .asset;
+        root_request.source_field = upstream.source_field;
+        root_request.source_template = upstream.source_template;
+        const input = try extractAssetSourceValue(runtime.alloc, runtime.config, raw.?, root_request);
+        defer if (input) |text| runtime.alloc.free(@constCast(text));
+        if (input != null) return error.ArtifactPublicationPending;
+        const empty = try runtime.alloc.alloc(chunker_mod.Chunk, 0);
+        try cache.append(runtime.alloc, .{ .key = cache_key, .chunks = empty, .source_record_digest = source_digest });
+        return .{ .chunks = empty, .source_record_digest = source_digest };
+    }
     if (upstream_raw) |bytes| {
         const privacy = @import("../../../privacy/document.zig");
         if (privacy.isProtectedArtifactName(request.upstream_artifact_name) or privacy.consumerPolicyVersion(request.upstream_artifact_name) != null) {

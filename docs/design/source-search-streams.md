@@ -239,3 +239,47 @@ full-text source names its synthetic `text` indexing slot; validators accept tha
 mapping only for a matching asset declared `content_type: text/plain`. Object
 artifacts keep explicit fields. Exact scanning never substitutes an arbitrary
 object field or a caption for a selected representation.
+
+## Resolved encoders, presets, and repair operations
+
+Managed semantic bindings resolve an immutable native `antfly` encoder pin.
+`NativeVectorSpace` derives the model revision from `embedder.model_identity` and
+uses the native retrieval-query/document role encodings. Native admission checks
+that pin against the loaded assets and processor. A mutable hosted model alias,
+an arbitrary preprocessing label, or an unpinned encoder is not advertised as
+resolved native compatibility. Such applications can supply externally authored
+vectors with the explicitly declared external-writer trust boundary.
+
+Semantic bindings declare `member_field` independently of their representation
+field. For example, a scalar text unit uses `$`, while embeddings of its chunks
+return `member_field: text`. Validation checks each embedding/chunk projection
+transition to the representation, not just the presence of an ancestor name.
+`$` is an explicit raw scalar byte projection; JSON-looking plaintext is never
+coerced to a number, string literal, or object by content sniffing.
+
+Both management runtimes expose `POST /sources/{id}/processing-preview` for
+content, extraction/OCR, transcription, caption, and summary presets. The preview
+returns ordinary native declarations for review; applying them remains a source
+PUT. Producer models, prompts, and native secret references are explicit. Only
+semantic plans install chunk producers. Media-consuming presets use native media
+parts or locator fields rather than send a resource URI as caption text.
+
+`POST /sources/{id}/processing-jobs` delegates start/status/advance/cancel to native
+artifact reprocess jobs. These jobs operate on the named artifact across the
+**whole table**, including other sources sharing it. Colony requires table.admin
+for every job operation, including status; the dashboard requires explicit scope
+acknowledgment for mutations. Only artifacts declared by that source are accepted.
+Native job IDs are exposed as decimal strings to avoid JavaScript u64 rounding.
+Jobs are durable and advance in bounded pages; cancellation does not cancel source
+acquisition, and retrying an artifact does not fetch provider content again.
+
+Colony processing-only PUTs now refresh consumer catalog bindings while holding
+the source job lock. Publication preserves the acquired revision and access lease;
+competing edits, active acquisition, retirement, and acquisition changes prevent
+a stale refresh. Standalone retains its filesystem state-lock equivalent.
+
+The source CI gate now starts a disposable native owner and runs the strict HTTP
+regression automatically. Mixed parents with no text input settle intentional
+absence from the captured primary; nonempty or unresolved upstream inputs still
+require publication proof. External-vector receipt identities are compiled into
+the cached immutable write plan and relational writes reuse their parsed row.

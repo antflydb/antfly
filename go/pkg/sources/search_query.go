@@ -97,8 +97,12 @@ func BuildSearchQuery(binding Binding, request SearchRequest) ([]byte, error) {
 	if binding.Fields != nil {
 		fields = []string{binding.Fields.URI, binding.Fields.Path, binding.Fields.Revision, binding.Fields.Metadata}
 	}
+	memberField := stream.Field
+	if request.Mode == "semantic" && stream.Retrieval.Semantic != nil {
+		memberField = stream.Retrieval.Semantic.MemberField
+	}
 	memberFields := []string{}
-	for _, field := range []string{stream.Field, stream.LocationField} {
+	for _, field := range []string{memberField, stream.LocationField} {
 		if field != "" {
 			memberFields = append(memberFields, field)
 		}

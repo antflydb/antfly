@@ -230,6 +230,9 @@ export type {
   VectorSpace,
   ProcessingDeclaration,
   SearchStatus,
+  ProcessingPreset,
+  ProcessingPreview,
+  ProcessingJobRequest,
 } from "./sources-types.js";
 
 import type {
@@ -247,6 +250,9 @@ import type {
   VectorSpace,
   ProcessingDeclaration,
   SearchStatus,
+  ProcessingPreset,
+  ProcessingPreview,
+  ProcessingJobRequest,
 } from "./sources-types.js";
 
 /** Common management API. baseUrl includes the runtime's /sources/v1 mount. */
@@ -264,6 +270,30 @@ export class SourcesClient extends SourceTransport {
   }
   source(id: string, signal?: AbortSignal): Promise<Source> {
     return this.request("GET", `/sources/${encodeURIComponent(id)}`, undefined, signal);
+  }
+  previewProcessing(
+    id: string,
+    input: ProcessingPreset,
+    signal?: AbortSignal
+  ): Promise<ProcessingPreview> {
+    return this.request(
+      "POST",
+      `/sources/${encodeURIComponent(id)}/processing-preview`,
+      input,
+      signal
+    );
+  }
+  processingJob(
+    id: string,
+    input: ProcessingJobRequest,
+    signal?: AbortSignal
+  ): Promise<Record<string, unknown>> {
+    return this.request(
+      "POST",
+      `/sources/${encodeURIComponent(id)}/processing-jobs`,
+      input,
+      signal
+    );
   }
   putSource(source: Source, signal?: AbortSignal): Promise<Source> {
     const { search_status: _observed, ...desired } = source;

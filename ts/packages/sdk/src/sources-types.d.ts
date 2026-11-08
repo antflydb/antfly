@@ -27,6 +27,8 @@ export interface Capabilities {
   serialized_runs?: boolean;
   search_versions?: Array<number>;
   artifact_discovery?: boolean;
+  processing_presets?: boolean;
+  processing_jobs?: boolean;
 }
 
 export interface SourceIdentity {
@@ -144,6 +146,7 @@ export interface SemanticRetrieval {
   query_inputs: Array<"text" | "vector">;
   default?: boolean;
   external?: boolean;
+  member_field?: string;
 }
 
 export interface ArtifactBinding {
@@ -177,4 +180,26 @@ export interface NativeIndexDeclaration {
 
 export interface ProcessingDeclaration {
   indexes?: Array<NativeIndexDeclaration>;
+}
+
+export interface ProcessingPreset {
+  name: string;
+  kind: "content" | "extract" | "transcription" | "caption" | "summary";
+  producer_config?: Record<string, unknown>;
+  embedder?: Record<string, unknown>;
+  dimension?: number;
+  metric?: "cosine" | "inner_product" | "l2_squared";
+}
+
+export interface ProcessingPreview {
+  processing: ProcessingDeclaration;
+  stream: SearchStream;
+  artifact: ArtifactBinding;
+}
+
+export interface ProcessingJobRequest {
+  artifact: string;
+  action: "start" | "status" | "advance" | "cancel";
+  job_id?: string;
+  limit?: number;
 }

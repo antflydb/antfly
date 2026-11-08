@@ -157,3 +157,31 @@ if __name__ == "__main__":
                 raise SystemExit(f"{target} needs regeneration")
         else:
             path.write_text(content)
+
+    # Grep consumes only search bindings, but their wire schema must remain
+    # identical to management, including semantic member projections.
+    for target in [
+        "zig/pkg/antfly-grep/schema/sources-v2.json",
+        "zig/pkg/antfly-grep/schema/tables-v1.json",
+    ]:
+        path = ROOT / target
+        data = json.loads(path.read_text())
+        for name in [
+            "SearchStream",
+            "RetrievalBindings",
+            "ExactRetrieval",
+            "FullTextRetrieval",
+            "SemanticRetrieval",
+            "VectorSpace",
+            "ArtifactBinding",
+        ]:
+            schema = json.loads(
+                json.dumps(SCHEMAS[name]).replace("#/components/schemas/", "#/$defs/")
+            )
+            data["$defs"][name] = schema
+        content = json.dumps(data, indent=2) + "\n"
+        if args.check:
+            if path.read_text() != content:
+                raise SystemExit(f"{target} needs regeneration")
+        else:
+            path.write_text(content)

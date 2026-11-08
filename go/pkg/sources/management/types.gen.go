@@ -48,6 +48,78 @@ func (e ErrorVersion) Valid() bool {
 	}
 }
 
+// Defines values for ProcessingJobRequestAction.
+const (
+	Advance ProcessingJobRequestAction = "advance"
+	Cancel  ProcessingJobRequestAction = "cancel"
+	Start   ProcessingJobRequestAction = "start"
+	Status  ProcessingJobRequestAction = "status"
+)
+
+// Valid indicates whether the value is a known member of the ProcessingJobRequestAction enum.
+func (e ProcessingJobRequestAction) Valid() bool {
+	switch e {
+	case Advance:
+		return true
+	case Cancel:
+		return true
+	case Start:
+		return true
+	case Status:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ProcessingPresetKind.
+const (
+	Caption       ProcessingPresetKind = "caption"
+	Content       ProcessingPresetKind = "content"
+	Extract       ProcessingPresetKind = "extract"
+	Summary       ProcessingPresetKind = "summary"
+	Transcription ProcessingPresetKind = "transcription"
+)
+
+// Valid indicates whether the value is a known member of the ProcessingPresetKind enum.
+func (e ProcessingPresetKind) Valid() bool {
+	switch e {
+	case Caption:
+		return true
+	case Content:
+		return true
+	case Extract:
+		return true
+	case Summary:
+		return true
+	case Transcription:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ProcessingPresetMetric.
+const (
+	ProcessingPresetMetricCosine       ProcessingPresetMetric = "cosine"
+	ProcessingPresetMetricInnerProduct ProcessingPresetMetric = "inner_product"
+	ProcessingPresetMetricL2Squared    ProcessingPresetMetric = "l2_squared"
+)
+
+// Valid indicates whether the value is a known member of the ProcessingPresetMetric enum.
+func (e ProcessingPresetMetric) Valid() bool {
+	switch e {
+	case ProcessingPresetMetricCosine:
+		return true
+	case ProcessingPresetMetricInnerProduct:
+		return true
+	case ProcessingPresetMetricL2Squared:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for RepresentationStatusState.
 const (
 	RepresentationStatusStateBuilding    RepresentationStatusState = "building"
@@ -272,19 +344,19 @@ func (e VectorSpaceDocumentModality) Valid() bool {
 
 // Defines values for VectorSpaceMetric.
 const (
-	Cosine       VectorSpaceMetric = "cosine"
-	InnerProduct VectorSpaceMetric = "inner_product"
-	L2Squared    VectorSpaceMetric = "l2_squared"
+	VectorSpaceMetricCosine       VectorSpaceMetric = "cosine"
+	VectorSpaceMetricInnerProduct VectorSpaceMetric = "inner_product"
+	VectorSpaceMetricL2Squared    VectorSpaceMetric = "l2_squared"
 )
 
 // Valid indicates whether the value is a known member of the VectorSpaceMetric enum.
 func (e VectorSpaceMetric) Valid() bool {
 	switch e {
-	case Cosine:
+	case VectorSpaceMetricCosine:
 		return true
-	case InnerProduct:
+	case VectorSpaceMetricInnerProduct:
 		return true
-	case L2Squared:
+	case VectorSpaceMetricL2Squared:
 		return true
 	default:
 		return false
@@ -334,6 +406,8 @@ type Capabilities struct {
 	ConfigureSources  bool                `json:"configure_sources,omitempty,omitzero"`
 	MediaProxy        bool                `json:"media_proxy,omitempty,omitzero"`
 	PerSourceRuns     bool                `json:"per_source_runs"`
+	ProcessingJobs    bool                `json:"processing_jobs,omitempty,omitzero"`
+	ProcessingPresets bool                `json:"processing_presets,omitempty,omitzero"`
 	PurgeSources      bool                `json:"purge_sources,omitempty,omitzero"`
 	Runtime           string              `json:"runtime"`
 	SearchVersions    []int               `json:"search_versions,omitempty,omitzero"`
@@ -386,6 +460,40 @@ type Permissions struct {
 // ProcessingDeclaration defines model for ProcessingDeclaration.
 type ProcessingDeclaration struct {
 	Indexes []NativeIndexDeclaration `json:"indexes,omitempty,omitzero"`
+}
+
+// ProcessingJobRequest defines model for ProcessingJobRequest.
+type ProcessingJobRequest struct {
+	Action   ProcessingJobRequestAction `json:"action"`
+	Artifact string                     `json:"artifact"`
+	JobId    string                     `json:"job_id,omitempty,omitzero"`
+	Limit    int                        `json:"limit,omitempty,omitzero"`
+}
+
+// ProcessingJobRequestAction defines model for ProcessingJobRequest.Action.
+type ProcessingJobRequestAction string
+
+// ProcessingPreset defines model for ProcessingPreset.
+type ProcessingPreset struct {
+	Dimension      int                    `json:"dimension,omitempty,omitzero"`
+	Embedder       map[string]interface{} `json:"embedder,omitempty,omitzero"`
+	Kind           ProcessingPresetKind   `json:"kind"`
+	Metric         ProcessingPresetMetric `json:"metric,omitempty,omitzero"`
+	Name           string                 `json:"name"`
+	ProducerConfig map[string]interface{} `json:"producer_config,omitempty,omitzero"`
+}
+
+// ProcessingPresetKind defines model for ProcessingPreset.Kind.
+type ProcessingPresetKind string
+
+// ProcessingPresetMetric defines model for ProcessingPreset.Metric.
+type ProcessingPresetMetric string
+
+// ProcessingPreview defines model for ProcessingPreview.
+type ProcessingPreview struct {
+	Artifact   ArtifactBinding       `json:"artifact"`
+	Processing ProcessingDeclaration `json:"processing"`
+	Stream     SearchStream          `json:"stream"`
 }
 
 // RepresentationStatus defines model for RepresentationStatus.
@@ -478,12 +586,15 @@ type SearchStreamBoundary string
 
 // SemanticRetrieval defines model for SemanticRetrieval.
 type SemanticRetrieval struct {
-	Default         bool                           `json:"default,omitempty,omitzero"`
-	External        bool                           `json:"external,omitempty,omitzero"`
-	Index           string                         `json:"index"`
-	MemberArtifacts []string                       `json:"member_artifacts,omitempty,omitzero"`
-	QueryInputs     []SemanticRetrievalQueryInputs `json:"query_inputs"`
-	VectorSpace     VectorSpace                    `json:"vector_space"`
+	Default         bool     `json:"default,omitempty,omitzero"`
+	External        bool     `json:"external,omitempty,omitzero"`
+	Index           string   `json:"index"`
+	MemberArtifacts []string `json:"member_artifacts,omitempty,omitzero"`
+
+	// MemberField Projection returned from semantic members. Chunk-backed embeddings use text even when their ancestor representation is scalar ($). Managed textual streams must declare this field.
+	MemberField string                         `json:"member_field,omitempty,omitzero"`
+	QueryInputs []SemanticRetrievalQueryInputs `json:"query_inputs"`
+	VectorSpace VectorSpace                    `json:"vector_space"`
 }
 
 // SemanticRetrievalQueryInputs defines model for SemanticRetrieval.QueryInputs.
@@ -583,6 +694,12 @@ type StartSourceRunParams struct {
 
 // PutSourceJSONRequestBody defines body for PutSource for application/json ContentType.
 type PutSourceJSONRequestBody = Source
+
+// OperateProcessingJobJSONRequestBody defines body for OperateProcessingJob for application/json ContentType.
+type OperateProcessingJobJSONRequestBody = ProcessingJobRequest
+
+// PreviewProcessingJSONRequestBody defines body for PreviewProcessing for application/json ContentType.
+type PreviewProcessingJSONRequestBody = ProcessingPreset
 
 // StartSourceRunJSONRequestBody defines body for StartSourceRun for application/json ContentType.
 type StartSourceRunJSONRequestBody = RunInput

@@ -28,7 +28,7 @@ import (
 )
 
 func testVectorSpace() VectorSpace {
-	return VectorSpace{Id: "images-v1", Dimension: 3, Metric: "cosine", Model: "pinned-model@revision", Revision: "revision", QueryPreprocessing: "text:v1", DocumentPreprocessing: "image:v1", QueryModality: "text", DocumentModality: "image"}
+	return VectorSpace{Id: "images-v1", Dimension: 3, Metric: "cosine", Model: "pinned-model@revision", Revision: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", QueryPreprocessing: "antfly:retrieval_query:v1", DocumentPreprocessing: "antfly:retrieval_document:v1", QueryModality: "text", DocumentModality: "image"}
 }
 func testMediaStream() SearchStream {
 	return SearchStream{Name: "original", ResourceField: "content.resource", Retrieval: &RetrievalBindings{Semantic: &management.SemanticRetrieval{Index: "image_vectors", MemberArtifacts: []string{"image_dense"}, VectorSpace: testVectorSpace(), QueryInputs: []management.SemanticRetrievalQueryInputs{"vector"}, Default: true}}}
@@ -126,7 +126,7 @@ func (c *testSearchIndexClient) CreateSearchIndex(_ context.Context, _, _ string
 }
 func testNativeIndex(stream SearchStream, complete bool) []byte {
 	space := stream.Retrieval.Semantic.VectorSpace
-	raw, _ := json.Marshal(map[string]any{"config": map[string]any{"type": "embeddings", "dimension": 3, "distance_metric": "cosine", "sources": []any{map[string]any{"artifact": "image_dense"}}, "enrichments": []any{map[string]any{"name": "image_dense", "kind": "embedding", "template": "{{content.resource.uri}}", "vector_space": VectorSpaceIdentity(space)}}}, "status": map[string]any{"readiness": map[string]any{"queryable": true, "complete": complete}}})
+	raw, _ := json.Marshal(map[string]any{"config": map[string]any{"type": "embeddings", "dimension": 3, "distance_metric": "cosine", "embedder": map[string]any{"provider": "antfly", "model": space.Model, "model_identity": space.Revision}, "sources": []any{map[string]any{"artifact": "image_dense"}}, "enrichments": []any{map[string]any{"name": "image_dense", "kind": "embedding", "template": "{{content.resource.uri}}", "vector_space": VectorSpaceIdentity(space)}}}, "status": map[string]any{"readiness": map[string]any{"queryable": true, "complete": complete}}})
 	return raw
 }
 func TestSearchReadinessVerifiesNativeRecipeAndCachesIndexes(t *testing.T) {
@@ -142,6 +142,7 @@ func TestSearchReadinessVerifiesNativeRecipeAndCachesIndexes(t *testing.T) {
 	binding.Streams[0].Retrieval.Semantic.VectorSpace.Revision = "wrong"
 	status = ObserveSearch(t.Context(), client, binding)
 	require.Equal(t, management.RepresentationStatusState("unsupported"), status.Streams[0].State)
+	stream = testMediaStream()
 	client = &testSearchIndexClient{raw: map[string][]byte{"image_vectors": testNativeIndex(stream, false)}}
 	binding.Streams = []SearchStream{stream}
 	status = ObserveSearch(t.Context(), client, binding)
@@ -314,4 +315,30 @@ func TestScalarTextBindingRequiresDeclaredNativeAssetType(t *testing.T) {
 	index.Config["sources"] = originalSources
 	nativeEnrichments(index.Config)[stream.Artifact]["content_type"] = "application/json"
 	require.Error(t, checkNativeStream(stream, index, false), "an object field must not be treated as a scalar text slot")
+}
+
+func TestManagedSearchResolvesEncoderAndProjection(t *testing.T) {
+	embedder := map[string]any{"provider": "antfly", "model": "pinned-encoder", "model_identity": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+	space, err := NativeVectorSpace("text-v1", embedder, 3, "cosine", "text")
+	require.NoError(t, err)
+	plan, stream, _, err := BuildTextProcessing(TextProcessingPreset{Name: "content", Field: "content.text", VectorSpace: &space, Embedder: embedder})
+	require.NoError(t, err)
+	require.Len(t, plan.Indexes[0].Config["enrichments"].([]any), 1, "full-text branch needs no unused chunk producer")
+	require.Equal(t, "text", stream.Retrieval.Semantic.MemberField)
+	raw, err := BuildSearchQuery(Binding{SearchVersion: 2, Streams: []SearchStream{stream}, Filter: SourceFilter(testSourceID)}, SearchRequest{Stream: stream.Name, Mode: "semantic", Text: "launch"})
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"fields":["text","provenance"]`)
+	wire, _ := json.Marshal(map[string]any{"config": plan.Indexes[1].Config})
+	index, err := decodeSearchIndex(wire)
+	require.NoError(t, err)
+	require.NoError(t, checkNativeStream(stream, index, true))
+	dense := nativeEnrichments(index.Config)[stream.Retrieval.Semantic.MemberArtifacts[0]]
+	dense["field"] = "unrelated"
+	require.Error(t, checkNativeStream(stream, index, true))
+	dense["field"] = "text"
+	index.Config["embedder"].(map[string]any)["model_identity"] = "different"
+	require.Error(t, checkNativeStream(stream, index, true))
+	altered := space
+	altered.QueryPreprocessing = "custom-query-prefix"
+	require.Error(t, ValidateManagedVectorSpace(altered, embedder))
 }

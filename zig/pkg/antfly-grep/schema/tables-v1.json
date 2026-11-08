@@ -388,6 +388,10 @@
         },
         "external": {
           "type": "boolean"
+        },
+        "member_field": {
+          "type": "string",
+          "description": "Projection returned from semantic members. Chunk-backed embeddings use text even when their ancestor representation is scalar ($). Managed textual streams must declare this field."
         }
       },
       "required": [

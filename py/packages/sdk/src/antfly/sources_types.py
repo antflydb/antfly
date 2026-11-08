@@ -30,6 +30,8 @@ class Capabilities(TypedDict):
     serialized_runs: NotRequired[bool]
     search_versions: NotRequired[list[int]]
     artifact_discovery: NotRequired[bool]
+    processing_presets: NotRequired[bool]
+    processing_jobs: NotRequired[bool]
 
 
 class SourceIdentity(TypedDict):
@@ -148,6 +150,7 @@ class SemanticRetrieval(TypedDict):
     query_inputs: list[Literal["text", "vector"]]
     default: NotRequired[bool]
     external: NotRequired[bool]
+    member_field: NotRequired[str]
 
 
 class ArtifactBinding(TypedDict):
@@ -181,3 +184,25 @@ class NativeIndexDeclaration(TypedDict):
 
 class ProcessingDeclaration(TypedDict):
     indexes: NotRequired[list[NativeIndexDeclaration]]
+
+
+class ProcessingPreset(TypedDict):
+    name: str
+    kind: Literal["content", "extract", "transcription", "caption", "summary"]
+    producer_config: NotRequired[dict[str, Any]]
+    embedder: NotRequired[dict[str, Any]]
+    dimension: NotRequired[int]
+    metric: NotRequired[Literal["cosine", "inner_product", "l2_squared"]]
+
+
+class ProcessingPreview(TypedDict):
+    processing: ProcessingDeclaration
+    stream: SearchStream
+    artifact: ArtifactBinding
+
+
+class ProcessingJobRequest(TypedDict):
+    artifact: str
+    action: Literal["start", "status", "advance", "cancel"]
+    job_id: NotRequired[str]
+    limit: NotRequired[int]
