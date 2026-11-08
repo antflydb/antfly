@@ -1,7 +1,7 @@
 # Bounded CUDA write-pool serving qualification
 
 > Fresh PR #1574 qualification passed on 2026-11-08 on glowworm/GB10.
-> The current results below identify production code `c845eded3c`; the separately
+> The current results identify qualified source `ade11524f1`, merged as `a3009dbd46`; the separately
 > labelled historical results retain their original identities. This qualifies
 > the declared fixture and serving envelope, not arbitrary workloads.
 
@@ -165,51 +165,55 @@ successful reruns.
 
 ## Fresh PR #1574 GB10 results
 
-The complete campaign and legacy write regression passed on `glowworm`
-(`spark-beb5`, NVIDIA GB10). The optimized CUDA HTTP server was built from
-`c845eded3c8f6a86552d57bc321ea27c61859203`; its SHA-256 is
-`850cbe958ea8f29d65a5edf017d95d21a9f177d6159b8956cf11a4d8fc0deb22`.
-The subsequent merge of main `3e8975a1da` changes no inference-package Zig source.
-The merged branch also passes the 64 focused tests and production type-check.
+The final campaign and legacy write regression passed on glowworm (spark-beb5,
+NVIDIA GB10) using source `ade11524f1467dc786db623ea962ce98acdf3c67`,
+admin-squash-merged as `a3009dbd46b707b57f435a6e7f191115154ca30a`.
+The post-merge review verified byte-identical critical serving inputs and
+reviewed the remaining inference changes. No additional serving defect was found.
+The merged tree passed 69 focused Zig tests and 17 production check steps;
+the follow-up harness passes 51 Python tests.
 
-The [machine-readable receipt](write-pool-pr1574-qualification.json) records
-configuration, loaded model hashes, environment, physical batch counters,
-context/schema sweeps, memory sampling and independent pressure recovery.
-Raw requests, samples, acquisition receipts and service logs are retained in
-`.benchmark-results/pr1574` on the qualification worktree and in the local
-`fresh-evidence.tar.gz` bundle; the receipt records its SHA-256.
+The [final machine-readable receipt](write-pool-pr1574-qualification.json)
+contains the exact binary, harness, configuration and model hashes, source
+comparison, complete campaign results and raw evidence bundle hash. Raw evidence
+and both binaries are retained at
+`/home/ajroetker/antfly/.benchmark-results/pr1574-final-reviewed` on glowworm;
+the local bundle is `.benchmark-results/pr1574/reviewed/final-evidence.tar.gz`.
+The [initial receipt](write-pool-pr1574-qualification-initial.json) preserves the
+superseded `c845eded3c` campaign.
+
+The GPU was shared with an unrelated resident process using about 31 GiB.
+These results qualify this serving envelope; they do not establish a
+source-to-source performance regression or dedicated-GPU throughput.
 
 | Model | Concurrent / serialized throughput, five rounds | Mixed p95 |
 |---|---:|---:|
-| EmbeddingGemma 2 | 1.61× | 21.7 ms |
-| GLiNER2.5 | 2.95× | 50.8 ms |
-| Whisper small | 1.39× | 445.8 ms |
-| LightOnOCR3 | 1.91× | 2,458.9 ms |
+| EmbeddingGemma 2 | 1.46× | 38.5 ms |
+| GLiNER2.5 | 2.03× | 276.9 ms |
+| Whisper small | 1.13× | 870.9 ms |
+| LightOnOCR3 | 1.88× | 5,432.0 ms |
 
-Every controlled cohort retained output/usage parity and repeated physical
-batching. The mixed soak completed 172 turnovers and 1,376 requests in 300.9 s,
-including exclusive windowed extraction. All context and frozen schema sweeps
-passed, including exact per-caller decoded/returned/token observations.
+All four models passed the 10% promotion gates with observed physical batching.
+The sustained phase completed 100 turnovers / 800 mixed requests in 377.7 s.
+Context/schema sweeps, cancellation, disconnect, healthy-peer recovery and
+memory gates passed. The follow-up closes a harness coverage gap by comparing
+mixed OCR and Whisper responses with prior identical-input responses, including
+text, model identity and usage. Applied offline to this campaign's preserved
+responses, the stronger check passed all 200 Whisper and 200 OCR responses.
+The receipt distinguishes that supplementary check from the original live harness.
 
-All 73 pinned speech clips scored 7.57% WER. The 86.345 s and 156.08 s varied
-composites scored 12.00% and 12.47%. The intentionally repetitive checkpoint
-accuracy case still scores 87.5% WER; it is recorded as a known limitation and
-is excluded from passed accuracy claims. The four synthetic OCR layouts passed.
+The pinned 73-clip speech corpus scored 7.57% WER. Varied long-audio fixtures
+and all four synthetic OCR layouts passed their declared gates. The repetitive
+speech accuracy stress case remains a known checkpoint limitation, excluded
+from passed accuracy claims. These fixtures do not establish broad ASR/OCR accuracy.
 
-Memory evidence is complete for every phase, with service-PID NVML attribution
-and no sampling errors. Peak sampled managed CUDA allocation was 6,307,409,404 B;
-peak service NVML was 6,833,618,944 B. The cgroup recorded a 3,987,664,896 B peak.
-These overlapping measurements must not be added. Configured limits remain
-38 GiB managed CUDA and 72 GiB process memory; unified-memory auto-sizing may
-resolve admission ceilings below the nominal configuration. Deadlines,
-disconnects, healthy-peer recovery and instance identity checks passed. Recovery
-returned to the warmed scratch reservations with no active requests or KV.
-
-The independent production engine/host pressure test also passed guard rejection,
-failed-free quarantine, unload/reload and confirmed-free cleanup. Its sampler
-collected 50 raw samples, including stable samples for all four required phases,
-under a deliberately bounded 64 MiB managed allocation guard. This test exercises
-failure recovery without filling the GPU.
+The separate physical GPU recovery test passed guard rejection, failed-free
+quarantine, unload/reload and confirmed-free cleanup with 49 raw samples and
+stable samples in every required phase. It uses a bounded 64 MiB managed guard
+and an explicit 2 GiB excluded-allocation allowance, without filling the GPU.
+Service-PID NVML, managed allocation and cgroup measurements overlap and must
+not be added. Limits remain 38 GiB managed CUDA and 72 GiB process memory;
+unified-memory auto-sizing can resolve admission ceilings below nominal limits.
 
 ## Historical GB10 results
 
