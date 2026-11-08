@@ -318,6 +318,14 @@ const vtable: std.Io.VTable = blk: {
 
 fn dispatchLocal(borrow: *const Borrow, method: u16, raw_args: *const anyopaque, output: *anyopaque, reader_transfer: ?*ReaderTransfer, names: ErrorNames) callconv(.c) void {
     @setEvalBranchQuota(100_000);
+    // Qualification roots can compare dispatch strategies in one binary.
+    // Production keeps the original chain and instantiates no alternative.
+    if (comptime @hasDecl(@import("root"), "runtimeIoDispatchLinear")) {
+        if (!@import("root").runtimeIoDispatchLinear()) {
+            dispatchSwitchForQualification(borrow, method, raw_args, output, reader_transfer, names);
+            return;
+        }
+    }
     inline for (fields, 0..) |field_name, index| {
         if (method == index) {
             const Args = std.meta.ArgsTuple(Function(field_name));
@@ -357,4 +365,49 @@ fn dispatchLocal(borrow: *const Borrow, method: u16, raw_args: *const anyopaque,
         }
     }
     @panic("invalid executor bridge method");
+}
+
+// Same-binary diagnostic alternative; unreachable from production roots.
+fn dispatchSwitchForQualification(borrow: *const Borrow, method: u16, raw_args: *const anyopaque, output: *anyopaque, reader_transfer: ?*ReaderTransfer, names: ErrorNames) callconv(.c) void {
+    @setEvalBranchQuota(100_000);
+    if (method >= fields.len) @panic("invalid executor bridge method");
+    const field: std.meta.FieldEnum(std.Io.VTable) = @fromBackingInt(@intCast(method));
+    switch (field) {
+        inline else => |tag| {
+            const field_name = @tagName(tag);
+            const Args = std.meta.ArgsTuple(Function(field_name));
+            var args = @as(*const Args, @ptrCast(@alignCast(raw_args))).*;
+            args[0] = borrow.userdata;
+            const owner_vtable: *const std.Io.VTable = @ptrCast(@alignCast(borrow.vtable));
+            var reader_io: Receiver = undefined;
+            var local_reader: std.Io.File.Reader = undefined;
+            inline for (@typeInfo(Args).@"struct".field_names, @typeInfo(Args).@"struct".field_types) |arg_name, arg_type| {
+                if (comptime arg_type == *std.Io.File.Reader) {
+                    const transfer = reader_transfer.?;
+                    reader_io = transfer.executor.receive() catch @panic("invalid reader executor borrow");
+                    const state = decode(ReaderState, transfer.state);
+                    local_reader = std.Io.File.Reader.init(state.file, reader_io.io(), state.buffer);
+                    state.restore(&local_reader);
+                    @field(args, arg_name) = &local_reader;
+                }
+                if (comptime arg_type == *std.Io.Batch) remapBatch(@field(args, arg_name), names);
+            }
+            const result = @call(.auto, @field(owner_vtable, field_name), args);
+            if (comptime std.mem.eql(u8, field_name, "lockStderr")) {
+                if (result) |locked| locked.file_writer.interface.flush() catch {} else |_| {}
+            } else if (comptime std.mem.eql(u8, field_name, "tryLockStderr")) {
+                if (result) |maybe_locked| {
+                    if (maybe_locked) |locked| locked.file_writer.interface.flush() catch {};
+                } else |_| {}
+            }
+            if (reader_transfer) |transfer| {
+                // Only the file-copy methods accept ReaderTransfer.
+                inline for (@typeInfo(Args).@"struct".field_types) |arg_type| {
+                    if (comptime arg_type == *std.Io.File.Reader)
+                        transfer.state = encode(ReaderState, ReaderState.capture(&local_reader));
+                }
+            }
+            @as(*Wire(Return(field_name)), @ptrCast(@alignCast(output))).* = encode(Return(field_name), result);
+        },
+    }
 }

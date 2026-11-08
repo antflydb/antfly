@@ -19,7 +19,7 @@ const build_options = @import("build_options");
 const jpeg = @import("jpeg.zig");
 const jpeg2000_decode = @import("jpeg2000/decode.zig");
 const png = @import("png.zig");
-const processing = @import("processing.zig");
+const processing = @import("image_processing");
 const test_support = @import("test_support.zig");
 const c = @import("spng_c");
 

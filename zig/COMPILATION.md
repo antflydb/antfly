@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-10-28
+Last updated: 2026-11-02
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -9,7 +9,7 @@ probes and superseded measurements, is preserved in the
 
 ## Status at a glance
 
-Production builds seven runtime archives plus shared Apache storage and inference
+Production builds eight runtime archives plus shared Apache storage and inference
 owners and links them into one Antfly executable. The executable and `libantfly`
 use the same compiled physical engine and inference implementations. The C API
 links the Apache owners without server coordination. Native owner sharing is the
@@ -35,6 +35,165 @@ compiler timings and memory reservations are historical, not measurements of
 the current source roots. The matched x86_64 GNU release measurement below
 updates admission claims only for that measured profile; ARM64/musl and GPU
 profiles still need their own release measurements.
+
+## Retained PDF operation owner
+
+Production template PDF helpers now use the shared media owner by default.
+The accepted native screen reduced the server by 6.72 MB and increased the C
+library by 347 KB; `-Dshared-pdf-templates=false` permits comparison.
+
+The separately selectable `-Dshared-pdf-sessions=true` migration routes retained
+readers, fork caches, analysis and complete PNG/raster batches through that same
+owner. Shared PDF values import no implementation. Its eleven-phase Debug cache matrix
+preserves the client object across reader/renderer edits. Routine ownership,
+cancellation, GPU-scene transport and cache checks now default to Debug; use
+`--optimize fast` on the PDF cache/scene tools for final optimized qualification.
+Whole-product size and
+memory qualification remains separate; see the [retained-owner evidence](../docs/design/compilation/history/production-owners-2026-11-02.md).
+
+## Image operations and query capabilities
+
+`-Dshared-image-operations=true` routes complete image codec operations and
+retained CPU VP8 sessions through the media owner and enables shared PDF
+sessions. It is opt-in on supported native 64-bit macOS/Linux profiles. The
+[image qualification](../docs/design/compilation/history/production-owners-2026-11-02.md)
+records source/native equivalence and nine Debug cache phases; combined product
+qualification and final Release size/cost measurements remain separate.
+
+Local query parsing, execution and encoding now run beside the private database
+in the storage kernel. The local-query archive dispatches a checked operation
+capability instead of casting a transported private DB layout. This removes one
+private-layout consumer; other engine/lifecycle boundaries remain checked and
+still depend on their private layouts. See the
+[query capability evidence](../docs/design/compilation/history/production-owners-2026-11-02.md).
+
+`-Dshared-lake-execution=true` selects whole lake-index attempts in the serverless
+owner, retaining publication/lease authority in the coordinator. This opt-in
+migration passes combined Debug integration; its production cache qualification
+is recorded in the [lake owner evidence](../docs/design/compilation/history/production-owners-2026-11-02.md).
+
+## Compile-cost qualification
+
+Standalone index/tensor and Q8 screening experiments were removed after the
+investigation. Accepted decisions, measured limits and pinned detailed evidence
+are in the [qualification summary](../docs/design/compilation/history/production-owners-2026-11-02.md).
+
+The opt-in **Profile Zig compile costs** workflow measures `memory-test`,
+`unit-storage-compile`, or `antfly` on a heavy Linux runner. It retains the exact
+commit/toolchain/CPU profile, build summary, compiler RSS and CPU samples,
+response files, and (for `antfly`) an unstripped ELF symbol/section report.
+`postlink-stripped-bytes.txt` measures a stripped copy of that same image; it is
+not a separate `-Dstrip=true` compilation qualification. No release or functional
+CI defaults change. Run matched baseline and candidate revisions with the same
+profile before drawing whole-product conclusions.
+
+Local equivalents, run from the repository/worktree root:
+
+```sh
+scripts/diagnose-zig-build-memory.sh --command --label storage-debug \
+  --target native --optimize debug --install-step unit-storage-compile -- \
+  python3 tools/run_bounded_zig_build.py -- build unit-storage-compile -Doptimize=debug --summary all
+python3 scripts/report_zig_binary_size.py zig/zig-out/bin/antfly \
+  --source-root zig --output .benchmark-results/compile-costs/binary-size.json
+```
+
+The symbol report requires an unstripped ELF image and `llvm-nm`/`llvm-size`.
+Use `--source-root zig` alone for the lexical asset inventory on macOS. Asset
+references include tests and inactive backends; their sizes do not establish
+release reachability. Mutation function families identify specialization
+candidates, not proven duplicate machine code. The process sampler now includes
+`zig test` and attributes every observed compiler PID, including unnamed test
+artifacts, rather than only Antfly runtime names. Per-process observed spans
+are sampled lower bounds; exact step durations remain in the Zig summary.
+Response files preserve argument boundaries, whereas `ps` output may lose
+quoting. A cached or very short compilation can have no samples.
+
+The follow-up implementation shares common/provider/parser test artifacts and
+extracts the full concrete mutation coalescer from DB receivers. Its measured
+scope and verification are recorded in the
+[work reduction record](../docs/design/compilation/history/production-owners-2026-11-02.md).
+
+Inventory the actual compilers reachable from a gate without compiling it:
+
+```sh
+cd zig
+zig build test-build-graph -Dtest-graph-step=unit-test
+# zig-out/share/antfly/test-build-graph.json
+```
+
+The inventory deduplicates compiler steps, includes test objects and the native
+source partitions, and records optimization, filters, and memory reservations.
+It counts compiler jobs, not whole-program recompilations or measured costs.
+
+Current experiments:
+
+- `memory-test` and `memory-dependency-test` share one compiled policy artifact;
+  the dependency slice selects its tests at runtime. Both suites passed locally
+  (370 named policy tests and 37 dependency tests). The shared Debug compilation
+  reported 11 seconds and sampled 1,266,941,952 bytes peak RSS. This is one small
+  consolidation, not evidence that merging the large storage shards lowers RSS.
+- Batch and transaction writes use one canonical value type. The full
+  coalescer, document transform resolution, and projected graph effects live
+  in a concrete `mutation_plan.prepare` function with explicit snapshot input.
+  It has no DB/backend/schema/inference imports and does not specialize by
+  receiver. MVCC reads and relational reconstruction share the concrete
+  `PreparedBatchOwner` helper. The existing preparation scope retains schema
+  pins and read-set validation. Release binary size and request throughput
+  still require matched qualification.
+- Common, configuration, preload parser, provider-default, and secret suites
+  share one artifact per source partition and keep separate runtime filters and
+  environment policies. The reachable `unit-test` compiler count fell from 225
+  to 217 for the same native CPU-only configuration. This is a job-count
+  reduction; it does not establish the wall-time or peak-RSS change.
+- `-Dcli-optimize=small` changes only the CLI runtime entry module. Shared
+  dependencies retain the product mode. Default releases remain `fast`.
+  A native Apple Silicon Zig 0.17.0 CPU-only, stripped `fast` product experiment
+  produced CLI archives of 6,706,272 bytes (`fast`) and 4,951,456 bytes (`small`),
+  a 26.2% archive reduction. Sampled CLI compiler peaks increased from
+  1,379,549,184 to 1,607,712,768 bytes. Observed compiler spans were 88 and 48
+  seconds, with dependencies warmer for the second build. These are archive
+  observations, not matched cold-build or final executable measurements.
+- `make -C zig watch` retains the Linux incremental loop from PR #1437 and the
+  cacheable `unit-storage-compile` emission. Native macOS Zig 0.17.0 panicked
+  with `TODO(MachO2): load archive` under `-fincremental`; macOS therefore
+  defaults to ordinary watch. `WATCH_INCREMENTAL=true` permits testing a fixed
+  compiler. Ordinary watch does not promise the Linux 4–6 second edit timings.
+
+Production already splits runtime owners into archives, functional CI already
+uses Debug, and packaging already strips releases. Further codec/vector splits,
+large test mergers, external asset loading, or generic-owner refactors should
+be driven by these reports. Externalizing assets would also change standalone
+deployment; no such dependency is introduced by these experiments.
+
+## Focused plan and caller compilation
+
+The [work-avoidance follow-up](../docs/design/compilation/history/production-owners-2026-11-02.md)
+adds a separate small build graph, concrete query-window/domain plans and opaque
+compiled query callers. Foreign storage/inference callers use checked caller-only
+transport, so they no longer emit the provider's complete method dispatcher.
+Production ownership remains eight runtime archives plus shared physical owners.
+
+```sh
+cd zig
+python3 tools/run_bounded_zig_build.py -- build --build-file build.focused.zig test
+make watch-plans                         # default: query-paging-test
+make watch-plans WATCH_STEP=aggregation-plan-test
+make watch-linux                         # pinned Linux compiler through Docker
+python3 tools/run_bounded_zig_build.py -- build opaque-query-consumer-compile
+```
+
+The focused graph runs 33 mutation, transform, paging and aggregation tests using
+production implementations and value contracts. The normal unit gate includes
+the two query-plan owners as well (219 compiler jobs in the CPU-only inventory).
+The compiled query regression caller uses only opaque owner capabilities, including
+repository-backed retained continuations after the donor DB has been deleted.
+`local-query-owner-test` and `opaque-query-owner-test` reuse that same artifact.
+
+Native macOS watch remains ordinary on the pinned compiler; Linux supports the
+incremental path. The follow-up records verified edit timings, failing compiler
+experiments, emitted-code checks and the limits of the release measurements.
+The original 137-to-5-second Linux storage-loop observation concerns a different
+workload and is not a matched baseline for these focused planner tests.
 
 ## Main goal
 
@@ -77,7 +236,7 @@ The work has two related objectives:
 
 ## Current compilation architecture
 
-The production topology produces seven independently code-generated static
+The production topology produces eight independently code-generated runtime static
 libraries and links them into one executable:
 
 ```text
@@ -89,6 +248,8 @@ thin linked antfly executable
 │   └── public C API and handle registry
 ├── antfly-storage-kernel (Apache-2.0)
 │   └── server/Raft adapters over the compiled physical engine
+├── antfly-runtime-local_query
+│   └── complete query parsing, leased execution, aggregation and response encoding
 ├── antfly-runtime-distributed
 │   ├── data, metadata and hot-standby control
 │   └── standalone lifecycle and product composition
@@ -113,11 +274,35 @@ one implementation of each owned subsystem.
 The former combined storage/application layout is retained in repository
 history for comparison; it is no longer a supported build topology.
 
+The [query-owner implementation record](../docs/design/compilation/history/production-owners-2026-11-02.md)
+describes the completed production split and its verification. The query ABI is
+storage-free; the provider resolves a synchronous native DB borrow only after
+checking its type/layout/compiler descriptor. The storage caller retains its
+readable-handle lease. The query provider keeps all derived read leases, retained
+cuts, cancellation/deadline checks, aggregation work and response allocation
+within the complete call, and destroys its response with its own allocator.
+
+Query implementation and storage-adapter implementation edits reuse the opposite
+archive. Shared physical DB sources remain dependencies of their consumers;
+this split does not promise that editing a shared DB declaration rebuilds only
+one archive. The physical search/index loops remain emitted by the shared engine.
+
+```sh
+cd zig
+zig build local-query-contract-test local-query-owner-test antfly-storage-owner-test
+zig build query-owner-archives -Doptimize=fast -Dstrip=true
+# zig-out/lib/libantfly-storage-kernel.a and libantfly-runtime-local_query.a
+cd ..
+python3 zig/tools/check_query_owner_cache.py --report .benchmark-results/compile-costs/query-owner-cache.json
+```
+
 ### Unit ownership
 
 | Unit | Owns | Must not own |
 |---|---|---|
-| Storage/local query | Physical table and shard handles, DB/LSM/index execution, local planning, batches, transaction participants, snapshots, restore publication, maintenance, Lite and CAPI exports | HTTP, auth, cluster routing, remote topology, model execution |
+| Physical storage | Table/shard lifetime, DB/LSM/index loops, local plans, batches, transactions, snapshots, restore, maintenance, Lite and public CAPI exports | HTTP, auth, cluster routing, remote topology, model execution |
+| Server storage adapter | Server/Raft adaptation over the physical owner, live DB ownership and admission | Complete local-query code generation |
+| Local query owner | Complete search/graph/text/algebraic/preflight operations, parsing, read-generation leases, aggregations and response ownership | DB lifetime, per-record cross-owner callbacks, a second index implementation |
 | Distributed/standalone | Table routing, topology, leadership, fanout, merge, distributed transactions, HA control, standalone startup/shutdown | Physical DB, index-manager, LSM, enrichment implementation or a second inference implementation |
 | API kernel | HTTP, auth, public validation, request translation and protocol handlers | Provisioned DB ownership, physical query execution or Raft apply |
 | Serverless | Published-artifact orchestration and serverless requests | Provisioned storage ownership, physical index execution or cluster Raft apply |
@@ -200,8 +385,11 @@ warm builds, then verifies these source changes:
 
 | Changed source | Required rebuild | Required reuse |
 |---|---|---|
-| Read/write coordination | Distributed runtime and affected consumer objects/links | Every other runtime archive and unrelated test objects |
-| Physical DB/local query | Storage archive and final test links | Other runtime archives and consumer/owner test objects |
+| Read coordination | Distributed and local-query archives, affected consumer objects/links | Storage adapter and unrelated runtime/test objects |
+| Write coordination | Distributed runtime and affected consumer objects/links | Other runtime archives and unrelated test objects |
+| Query-provider implementation | Local-query archive and final links | Storage adapter and consumer objects |
+| Storage-adapter implementation | Storage adapter and final links | Local-query archive and consumer objects |
+| Physical DB/local query | Storage and local-query archives and final test links | Unrelated runtime archives and consumer/owner test objects |
 | Owner or consumer test root | Its test object and final link | Every runtime archive and unrelated test objects |
 | Storage ABI contract | Storage, distributed runtime, owner tests | CLI, inference, enrichment |
 
@@ -623,9 +811,12 @@ shorten one of those two critical paths without unacceptable aggregate work.
 
 ### Priority 1: storage/local query
 
-Storage was the largest compiler in the historical six-unit baseline at 482.880 seconds. The next credible
-experiment is inside the physical owner, not another source facade or top-level
-role split.
+Storage was the largest compiler in the historical six-unit baseline at 482.880 seconds.
+Complete server queries now have a production archive with checked DB borrows;
+its cache and release results are in the query-owner record above. That isolates
+query orchestration edits and retains physical index/search loops in the shared
+engine. It does not establish a lower whole-product peak or cold build time.
+Further physical-engine cuts need complete-operation measurements.
 
 The leading candidate is a coarse local-index subsystem built from exact
 production entry points. It should own a complete, coherent family such as:
@@ -666,6 +857,40 @@ Storage and inference experiments should be measured independently before
 combining them. Otherwise a regression in one unit can be hidden by scheduling
 variance in the other.
 
+### Attribute the current largest owners
+
+A native CPU-only profile also placed the API compiler above storage/inference
+in sampled RSS. Measure API separately instead of assuming generated schemas
+or model dispatch dominate. Install and inspect the exact production owners:
+
+```sh
+cd zig
+zig build runtime-archives -Doptimize=fast -Dstrip=true
+# runtime-unit-api_kernel, runtime-unit-storage-engine and
+# runtime-unit-inference-core also expose independent compiler steps.
+cd ..
+python3 scripts/report_zig_archive_work.py \
+  --artifact query=zig/zig-out/lib/libantfly-runtime-local_query.a \
+  --artifact storage=zig/zig-out/lib/libantfly-storage-kernel.a \
+  --forbid 'query=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
+  --forbid 'storage=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
+  --output .benchmark-results/compile-costs/archive-work.json
+```
+
+Text sizes and repeated names identify candidates; they do not measure LLVM
+work or establish that every same-named function is identical. The profile
+workflow retains this report for all production owners. Native CPU observations
+do not lower the separately qualified GPU, Linux or cross-SDK reservations.
+
+Backend exclusion must cover implementation owners, including cleanup, runtime
+backend dispatch and shared dry-run entry points. A runtime null check in cleanup
+still instantiates the disabled backend's destructor; a CLI-only capability
+check still compiles GPU execution when the same runner serves CPU admission. Keep compile-time
+guards at those owners and inspect the emitted production archive. Preserve
+admission-only dry runs before the execution guard. See the
+[production retention investigation](../docs/design/compilation/history/production-owners-2026-11-02.md)
+for the CUDA caller evidence and a rejected mutation outlining experiment.
+
 ### Artifact and duplication budget
 
 Phase 4ab's accepted API split intentionally grew the executable to
@@ -691,6 +916,11 @@ For subsequent increments:
   reduction.
 
 ## Goal loop
+
+The [production cost implementation plan](../docs/design/compilation/production-cost-plan.md)
+records the current linked-artifact investigation, proposed ownership cuts,
+delivery order, and per-experiment decision gates. Its hypotheses do not replace
+the qualification requirements below.
 
 Repeat this loop until the exit criteria are satisfied:
 
@@ -742,7 +972,7 @@ from local Apple-Silicon cross-builds.
 
 - One static `antfly` executable contains every required command and embedded
   standalone inference.
-- `libantfly` remains below 80 MiB (see the raised gate above) and exposes
+- `libantfly` remains below the current 88 MiB release gate and exposes
   only the public C API.
 - Production artifacts contain no LMDB implementation symbols or entry-point
   strings.
@@ -751,8 +981,9 @@ from local Apple-Silicon cross-builds.
 
 ### Architecture and behavior
 
-- Storage/local query implementation is emitted once and reused by the
-  executable and C API.
+- Physical storage/index/search implementations are emitted once and reused
+  by the executable and C API. Complete server-query orchestration has its own
+  checked archive; repeated helper emission is reported separately.
 - API, distributed control, standalone composition, and serverless do not
   analyze physical storage implementation roots.
 - Calls remain coarse and ownership-safe.
