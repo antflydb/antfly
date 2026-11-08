@@ -273,6 +273,17 @@ pub const Client = struct {
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
+    /// Generate a memory answer with optional source verification
+    /// POST /memorilla/generate
+    pub fn generateMemorilla(self: *@This(), body: types.MemorillaGenerateRequest) !ApiResponse(types.MemorillaGenerateResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memorilla/generate", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.MemorillaGenerateResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// List available models
     /// GET /models
     pub fn listModels(self: *@This()) !ApiResponse(types.ModelsResponse) {

@@ -336,11 +336,19 @@ test "indexed embedding calls clear prior errors and token usage" {
     try std.testing.expectError(error.InvalidInputShape, resetIndexedCallState(&tokens, errors[0..1], 2));
 }
 
+/// Optional synchronous observer of the actual text tokenization admitted to
+/// an encoder run. Receivers must copy borrowed slices they retain.
+pub const TextTokenizationObserver = struct {
+    ptr: *anyopaque,
+    observe: *const fn (*anyopaque, []const u8, []const i32, []const i32) anyerror!void,
+};
+
 pub const EmbeddingPipeline = struct {
     batch_observation: ?*@import("batch_execution.zig").Observation = null,
     allocator: std.mem.Allocator,
     session: backends.Session,
     tok: Tokenizer,
+    tokenization_observer: ?TextTokenizationObserver = null,
     config: EmbeddingConfig,
     /// Optional vision encoder session for CLIP/SigLIP multimodal embedding.
     vision_session: ?backends.Session = null,
@@ -813,6 +821,8 @@ pub const EmbeddingPipeline = struct {
                 };
                 defer encoded.deinit();
                 if (self.config.ensure_trailing_eos_id) |eos| ensureTrailingEos(&encoded, eos);
+                if (self.tokenization_observer) |observer|
+                    try observer.observe(observer.ptr, text, encoded.ids, encoded.attention_mask);
                 const length = activeTokenLength(encoded.attention_mask);
                 const ids = try alloc.dupe(i32, encoded.ids[0..length]);
                 errdefer alloc.free(ids);
@@ -1022,6 +1032,8 @@ pub const EmbeddingPipeline = struct {
             if (self.config.ensure_trailing_eos_id) |eos_id| {
                 ensureTrailingEos(&encoded[i], eos_id);
             }
+            if (self.tokenization_observer) |observer|
+                try observer.observe(observer.ptr, text, encoded[i].ids, encoded[i].attention_mask);
             if (self.trace != null and i < trace_lengths.len) trace_lengths[i] = activeTokenLength(encoded[i].attention_mask);
             if (self.config.trim_padding_to_batch_max and !fixed_len) {
                 effective_len = @max(effective_len, activeTokenLength(encoded[i].attention_mask));

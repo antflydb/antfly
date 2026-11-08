@@ -43,6 +43,7 @@ const clap_mod = @import("../models/clap.zig");
 const deberta_mod = @import("../models/deberta.zig");
 const layoutlmv3_mod = @import("../models/layoutlmv3.zig");
 const boundary_bundle = @import("../models/gliner_boundary_bundle.zig");
+const memorilla_qualification = @import("../models/memorilla_qualification.zig");
 const boundary_resident = @import("../ops/gliner_boundary_resident.zig");
 const bert_arch = @import("bert.zig");
 const modern_bert_arch = @import("modern_bert.zig");
@@ -101,6 +102,7 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     gemma4,
     gemma4_training,
     qwen3_embedding,
+    qwen3_generation,
     embedding_gemma2,
     qwen3_vl_generation,
     lightonocr3,
@@ -1659,12 +1661,31 @@ pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !
     return createCudaSessionWithKernelJit(allocator, model_path, .{});
 }
 
+/// Diagnostic numerical reference. Widen source weights before GPU upload so
+/// BF16/F16 activation staging cannot change the F32 oracle's arithmetic.
+/// This does not promote the reference's residency cost to normal serving.
+pub fn createQwen3CudaReferenceSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
+    return createCudaSessionWithRequiredProfile(allocator, model_path, null, .{}, .dynamic, null, .qwen3_generation, .fp32, null);
+}
+
+/// Offline encoder qualification only. The normal embedding serving profile
+/// retains its BF16-weight/mixed-arithmetic policy and smaller residency cost.
+pub fn createQwen3EmbeddingCudaReferenceSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
+    return createCudaSessionWithRequiredProfile(allocator, model_path, null, .{}, .dynamic, null, .qwen3_embedding, .fp32, null);
+}
+
+/// Managed production path: manifest role, complete source integrity, normal
+/// load-context/JIT policy and caller cancellation all remain authoritative.
+pub fn createCudaSessionWithManagedMemorillaProfile(allocator: std.mem.Allocator, model_path: []const u8, config: kernel_jit.Config, load_context: kernel_jit.LoadContext, control: ?InferenceExecutionControl) !Session {
+    return createCudaSessionWithRequiredProfile(allocator, model_path, null, config, load_context, null, null, .fp32, control);
+}
+
 pub const GlinerCudaPrecision = enum { auto, fp32, fp16, bf16 };
 
 /// Explicit precision for qualification and model owners. Automatic selection
 /// remains FP32 until a measured artifact/profile is added to release policy.
 pub fn createGlinerCudaSessionWithPrecision(allocator: std.mem.Allocator, model_path: []const u8, precision: GlinerCudaPrecision) !Session {
-    return createCudaSessionWithRequiredProfile(allocator, model_path, null, .{}, .dynamic, null, null, precision);
+    return createCudaSessionWithRequiredProfile(allocator, model_path, null, .{}, .dynamic, null, null, precision, null);
 }
 
 /// Managed loads retain the release gate even when an explicit precision is
@@ -1686,7 +1707,7 @@ fn createGlinerCudaSessionWithLoadPolicy(allocator: std.mem.Allocator, model_pat
     var manifest = try manifest_mod.loadListingFromDir(allocator, model_path);
     defer manifest.deinit();
     if (manifest.gliner_architecture != .boundary and manifest.gliner_classification_head != .label_marker_mlp) return error.UnsupportedGlinerCudaPrecision;
-    return createCudaSessionWithRequiredProfile(allocator, model_path, null, config, load_context, null, null, precision);
+    return createCudaSessionWithRequiredProfile(allocator, model_path, null, config, load_context, null, null, precision, null);
 }
 
 test "GLiNER CUDA managed reduced precision remains release gated" {
@@ -1882,6 +1903,7 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
         a4b_request,
         null,
         .fp32,
+        null,
     );
 }
 
@@ -1901,6 +1923,7 @@ pub fn createGemma4CudaTrainingSession(
         null,
         .gemma4_training,
         .fp32,
+        null,
     );
 }
 
@@ -1913,6 +1936,7 @@ fn createCudaSessionWithRequiredProfile(
     a4b_request: ?backend_contracts.A4bInferenceRequest,
     required_profile_override: ?CudaCapabilityProfile,
     gliner_precision: GlinerCudaPrecision,
+    load_control: ?InferenceExecutionControl,
 ) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
     const load_started_ns = platform.time.monotonicNs();
@@ -1924,6 +1948,19 @@ fn createCudaSessionWithRequiredProfile(
 
     var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
     defer model_manifest.deinit();
+    const profile_io = if (load_control) |active| active.io orelse std.Options.debug_io else std.Options.debug_io;
+    const profile_generation = if (model_manifest.memorilla_profile) |profile|
+        try memorilla_qualification.artifactGeneration(allocator, profile_io, model_path, profile, load_control orelse .{})
+    else
+        null;
+    if (model_manifest.memorilla_profile) |profile| {
+        try memorilla_qualification.requireCudaEnvironment();
+        if (override != null or a4b_request != null or required_profile_override != null)
+            return error.IncompatibleCudaLoadPolicies;
+        try memorilla_qualification.requireRecipe(profile, model_manifest);
+        try memorilla_qualification.verifyArtifacts(allocator, model_path, profile, load_control orelse .{});
+        try memorilla_qualification.verifySelectedPaths(allocator, if (load_control) |active| active.io orelse std.Options.debug_io else std.Options.debug_io, model_path, model_manifest);
+    }
     try model_manifest.requireRecognizedGlinerArchitecture();
     if (model_manifest.gliner_specialty_profile) |profile|
         try gliner_specialty.requireBackend(profile, .cuda);
@@ -1999,6 +2036,9 @@ fn createCudaSessionWithRequiredProfile(
     if (debug_cuda_session) std.log.info("cuda-session: create native session done path={s}", .{model_path});
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
     if (native_impl.backend_type != .native) return error.InvalidBackend;
+    if (model_manifest.memorilla_profile != null) {
+        if (native_impl.backend_data.native.tensor_store) |store| store.preserveFileCacheOnDeinit();
+    }
     if (a4b_inference) |a4b| {
         try cuda_compute_mod.CudaCompute.preflightA4bPreparedPackInventory(
             allocator,
@@ -2013,6 +2053,22 @@ fn createCudaSessionWithRequiredProfile(
         native_impl.task,
         &model_manifest,
     ) orelse return error.UnsupportedCudaArchitecture;
+    if (model_manifest.memorilla_profile) |profile| {
+        const expected: CudaCapabilityProfile = if (memorilla_qualification.role(profile) == .encoder) .qwen3_embedding else .qwen3_generation;
+        if (architecture_profile != expected) return error.UnsupportedMemorillaArtifact;
+    }
+    if (required_profile_override == .qwen3_generation and architecture_profile != .qwen3_generation)
+        return error.UnsupportedCudaArchitecture;
+    if (required_profile_override == .qwen3_embedding or model_manifest.memorilla_profile == .qwen3_encoder_f32_v1) {
+        if (architecture_profile != .qwen3_embedding) return error.UnsupportedCudaArchitecture;
+        const cfg = switch (native_impl.arch_config) {
+            .gpt => |value| value,
+            else => return error.UnsupportedCudaArchitecture,
+        };
+        if (cfg.family != .qwen3 or cfg.hidden_size != 2560 or cfg.num_hidden_layers != 36 or
+            cfg.num_attention_heads != 32 or cfg.effectiveKVHeads() != 8 or cfg.headDim() != 128 or
+            cfg.intermediate_size != 9728 or cfg.usesMoe()) return error.UnsupportedCudaArchitecture;
+    }
     if (required_profile_override == .gemma4_training) {
         const training_config = switch (native_impl.arch_config) {
             .gpt => |value| value,
@@ -2044,7 +2100,16 @@ fn createCudaSessionWithRequiredProfile(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
-    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null;
+    if (model_manifest.memorilla_profile != null and
+        (cuda_compute.kernels.gqa_decode_profile != .off or cuda_compute.kernels.gqa_prefill_profile != .automatic or cuda_compute.kernels.gqa_attention_decode_splitk_online_workspace.ptr != 0 or
+            cuda_compute.kernels.attention_match_repeat_scratch.ptr != 0)) return error.UnsupportedMemorillaCudaPolicy;
+    if (model_manifest.memorilla_profile != null and
+        (cuda_compute.ctx.info.compute_major != 12 or cuda_compute.ctx.info.compute_minor != 1))
+        return error.UnsupportedMemorillaDevice;
+    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null or required_profile_override == .qwen3_generation or required_profile_override == .qwen3_embedding or model_manifest.memorilla_profile != null;
+    // The qualified managed path owns fresh KV and eager request state. The
+    // generic SM121 capture defaults are for other serving profiles.
+    if (model_manifest.memorilla_profile != null) cuda_compute.capture_gates = .{};
     cuda_compute.qualified_span_fp32 = model_manifest.gliner_specialty_profile != null;
     if (model_manifest.gliner_specialty_profile) |profile| {
         std.log.info("gliner_specialty_cuda_policy profile={s} weights=f32 attention=f32 diagnostic_overrides=ignored", .{@tagName(profile)});
@@ -2093,13 +2158,24 @@ fn createCudaSessionWithRequiredProfile(
             dense_mmap_weight_count,
         });
     }
+    if (required_profile_override == .qwen3_generation or required_profile_override == .qwen3_embedding or model_manifest.memorilla_profile != null) {
+        // The strict F32 insertion helper owns the key if its final map put
+        // fails, while earlier upload failures leave it with this caller.
+        // Reserve before handing over any keys so that put cannot allocate.
+        try cuda_compute.resident_weights.ensureUnusedCapacity(allocator, @intCast(resident_uploads.items.len));
+    }
     for (resident_uploads.items) |upload| {
+        if (load_control) |active| try active.check();
         if (upload.mmap_bytes) |bytes| c_file.MmapRegion.adviseBytesSequential(bytes);
         const owned_key = try allocator.dupe(u8, upload.key);
         uploadGlinerCudaWeight(&cuda_compute, owned_key, upload.loaded, gliner_precision) catch |err| {
             allocator.free(owned_key);
             return err;
         };
+    }
+    if (model_manifest.memorilla_profile != null) {
+        // Retained load-time staging cannot outlive its cold-load admission.
+        _ = cuda_compute.releaseMemorillaRequestResources() catch @panic("Memorilla CUDA load cleanup failed; worker restart required");
     }
     std.log.info("inference_model_load backend=cuda phase=weight_upload weights={d} elapsed_ms={d}", .{ resident_uploads.items.len, (platform.time.monotonicNs() -| dense_upload_start_ns) / std.time.ns_per_ms });
     if (a4b_inference != null) {
@@ -2131,6 +2207,15 @@ fn createCudaSessionWithRequiredProfile(
         std.log.info("cuda: attached {d} decoded Q8 FP16 projection mirrors; raw Q8 and F32 heads retained; ANTFLY_CUDA_GLINER_1B_Q8_F16_MIRRORS=0 disables", .{cuda_compute.gliner_boundary_f16_mirrors.count()});
     }
     const upload_stats = cuda_compute.snapshotStats();
+    if (model_manifest.memorilla_profile) |profile| {
+        const expected = if (memorilla_qualification.role(profile) == .encoder) memorilla_qualification.encoder_weight_bytes else memorilla_qualification.decoder_weight_bytes;
+        if (!cuda_compute.strict_f32_weights or cuda_compute.lazy_host_store != null or
+            cuda_compute.capture_gates.persistent_replay or cuda_compute.capture_gates.update_exec or cuda_compute.capture_gates.device_scalars or
+            upload_stats.resident_weight_bytes != expected or upload_stats.bf16_mirror_weight_count != 0)
+            return error.UnsupportedMemorillaPrecision;
+        const after = try memorilla_qualification.artifactGeneration(allocator, profile_io, model_path, profile, load_control orelse .{});
+        if (!std.mem.eql(u8, &after, &profile_generation.?)) return error.ModelArtifactsChanging;
+    }
     if (upload_stats.bf16_mirror_weight_count > 0) {
         // The default-on prefill mirrors trade device memory for cuBLASLt
         // prefill speed; say so at load time so an OOM investigation can see
@@ -2168,6 +2253,7 @@ fn createCudaSessionWithRequiredProfile(
     impl.* = .{
         .allocator = allocator,
         .arch_config = resolved_arch_config,
+        .memorilla_profile = model_manifest.memorilla_profile,
         .recurrent_execution = recurrent_execution,
         .task = native_impl.task,
         .gliner_span_encoder_family = native_impl.gliner_span_encoder_family,
@@ -2349,7 +2435,14 @@ fn cudaProfileForArch(
             (cfg.num_mel_bins == 80 or cfg.num_mel_bins == 128)) .whisper else null,
         .gpt => |cfg| switch (cfg.family) {
             .gemma => .gemma4,
-            .qwen3 => if (task == .generic and model_manifest.isLastTokenDecoderEmbedder()) .qwen3_embedding else null,
+            .qwen3 => if (task != .generic)
+                null
+            else if (model_manifest.isLastTokenDecoderEmbedder())
+                .qwen3_embedding
+            else if (cudaQwen3GenerationEligible(cfg, model_manifest))
+                .qwen3_generation
+            else
+                null,
             .qwen3_vl => if (task == .generic and
                 model_manifest.model_type == .generator and
                 model_manifest.isQwen3VlGenerationSafetensorsBundle())
@@ -2368,6 +2461,85 @@ fn cudaProfileForArch(
         .embedding_gemma2 => .embedding_gemma2,
         else => null,
     };
+}
+
+/// Initial dense Qwen3 generation route. This admits the canonical 8B
+/// SafeTensors contract used by Memorilla, not every model in the family.
+/// Artifact integrity and numerical qualification remain separate gates.
+fn cudaQwen3GenerationEligible(cfg: gpt_mod.Config, model_manifest: *const manifest_mod.ModelManifest) bool {
+    if (model_manifest.model_type != .generator or
+        !std.mem.eql(u8, model_manifest.config_model_arch, "qwen3")) return false;
+    switch (model_manifest.nativeWeightArtifactKind() orelse return false) {
+        .safetensors, .sharded_safetensors => {},
+        else => return false,
+    }
+    if (!gpt_arch.denseQwen3PrefillEligible(cfg)) return false;
+    return cfg.hidden_size == 4096 and cfg.num_hidden_layers == 36 and
+        cfg.num_attention_heads == 32 and cfg.effectiveKVHeads() == 8 and
+        cfg.headDim() == 128 and cfg.intermediate_size == 12288 and
+        cfg.vocab_size == 151936 and
+        cfg.max_position_embeddings > 0 and cfg.max_position_embeddings <= 40960 and
+        cfg.num_local_experts == 0 and cfg.num_experts_per_tok == 0 and cfg.num_shared_experts == 0 and
+        cfg.rope_layout == .half_split and cfg.rope_partial_factor == 1 and
+        cfg.rope_dim_override == 0 and cfg.rope_theta == 1_000_000 and cfg.rope_freq_scale == 1 and
+        cfg.norm_eps == 1e-6 and cfg.final_logit_softcapping == 0 and !cfg.weight_tying;
+}
+
+test "Qwen3 generation CUDA admission is scoped to dense 8B SafeTensors" {
+    const cfg = gpt_mod.Config{
+        .family = .qwen3,
+        .hidden_size = 4096,
+        .num_hidden_layers = 36,
+        .num_attention_heads = 32,
+        .num_key_value_heads = 8,
+        .attention_head_dim = 128,
+        .intermediate_size = 12288,
+        .vocab_size = 151936,
+        .max_position_embeddings = 40960,
+        .norm_type = .rms_norm,
+        .position_encoding = .rope,
+        .activation = .silu,
+        .norm_eps = 1e-6,
+        .rope_theta = 1_000_000,
+    };
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .generator,
+        .config_model_arch = "qwen3",
+        .safetensors_index_path = "model.safetensors.index.json",
+    };
+    try std.testing.expectEqual(CudaCapabilityProfile.qwen3_generation, cudaProfileForArch(.{ .gpt = cfg }, .generic, &manifest).?);
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .classifier, &manifest) == null);
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .extractor, &manifest) == null);
+    var unsupported = cfg;
+    unsupported.num_local_experts = 8;
+    unsupported.num_experts_per_tok = 2;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = unsupported }, .generic, &manifest) == null);
+    unsupported = cfg;
+    unsupported.attention_head_dim = 256;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = unsupported }, .generic, &manifest) == null);
+    unsupported = cfg;
+    unsupported.rope_partial_factor = 0.5;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = unsupported }, .generic, &manifest) == null);
+    unsupported = cfg;
+    unsupported.sliding_window = 512;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = unsupported }, .generic, &manifest) == null);
+    unsupported = cfg;
+    unsupported.max_position_embeddings = 131072;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = unsupported }, .generic, &manifest) == null);
+    unsupported = cfg;
+    unsupported.ple_hidden_size = 256;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = unsupported }, .generic, &manifest) == null);
+    var wrong_role = manifest;
+    wrong_role.model_type = .reranker;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .generic, &wrong_role) == null);
+    var gguf = manifest;
+    gguf.safetensors_index_path = null;
+    gguf.gguf_path = "model.gguf";
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .generic, &gguf) == null);
+    var absent_weights = manifest;
+    absent_weights.safetensors_index_path = null;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .generic, &absent_weights) == null);
 }
 
 test "cuda support gate admits only supported model roles" {
@@ -7760,6 +7932,7 @@ const BackendData = union {
 };
 
 const ArchSession = struct {
+    memorilla_profile: ?memorilla_qualification.Profile = null,
     // Independent of the model execution lane: preparation can overlap model
     // work. Session close follows worker shutdown, like the borrowed device.
     video_coefficient_mutex: std.Io.Mutex = .init,
@@ -8015,6 +8188,7 @@ const arch_vtable = Session.VTable{
     .hasLayaDecisions = archHasLayaDecisions,
     .runLayaDecisions = archRunLayaDecisions,
     .run = &archRun,
+    .runAdmitted = &archRunAdmitted,
     .runWithControl = &archRunWithControl,
     .runResident = &archRunResident,
     .runResidentTextEmbedding = &archRunResidentTextEmbedding,
@@ -8577,6 +8751,58 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
         .cuda => self.backend_data.cuda.compute.snapshotStats(),
         else => null,
     };
+}
+
+/// Validate the actual managed execution owner, not a caller supplied label.
+/// Diagnostic constructors deliberately have no production profile proof.
+pub fn requireMemorillaProfile(session: Session, expected: memorilla_qualification.Profile) !void {
+    if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    if (session.vtable != &arch_vtable) return error.UnsupportedMemorillaProfile;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .cuda or self.memorilla_profile != expected) return error.UnsupportedMemorillaProfile;
+    const compute = &self.backend_data.cuda.compute;
+    const encoder = memorilla_qualification.role(expected) == .encoder;
+    if (!compute.strict_f32_weights or compute.lazy_host_store != null or compute.capture_gates.persistent_replay or compute.capture_gates.update_exec or compute.capture_gates.device_scalars or
+        compute.capability_profile != (if (encoder) CudaCapabilityProfile.qwen3_embedding else .qwen3_generation) or
+        compute.resident_weights.count() != (if (encoder) @as(usize, 398) else 399))
+        return error.UnsupportedMemorillaPrecision;
+    var iter = compute.resident_weights.valueIterator();
+    while (iter.next()) |weight| if (weight.dtype != .f32 or weight.quant_type != null) return error.UnsupportedMemorillaPrecision;
+}
+
+pub fn requireMemorillaDecoderF32(session: Session) !gpt_mod.Config {
+    try requireMemorillaProfile(session, .qwen3_decoder_f32_kv_f32_v1);
+    return getGptConfig(session) orelse error.UnsupportedMemorillaProfile;
+}
+
+/// Call only while holding the backend's execution mutex/Scope. Mutable
+/// counters must not be sampled by the lock-free loaded-identity check.
+pub fn requireMemorillaCudaExecution(backend: *const ops.ComputeBackend) !void {
+    if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    if (backend.kind() != .cuda) return error.MemorillaRequiresCuda;
+    const compute: *cuda_compute_mod.CudaCompute = @ptrCast(@alignCast(backend.ptr));
+    if (!compute.strict_f32_weights or compute.lazy_host_store != null or compute.capture_gates.persistent_replay or compute.capture_gates.update_exec or compute.capture_gates.device_scalars or (compute.capability_profile != null and
+        compute.capability_profile != .qwen3_embedding and compute.capability_profile != .qwen3_generation))
+        return error.UnsupportedMemorillaPrecision;
+    try memorilla_qualification.requireCudaEnvironment();
+    try memorilla_qualification.requireCudaExecutionStats(compute.snapshotStats());
+}
+
+pub fn requireMemorillaBackend(session: Session, expected: memorilla_qualification.Profile, backend: *const ops.ComputeBackend) !void {
+    try requireMemorillaProfile(session, expected);
+    if (comptime build_options.enable_cuda) {
+        const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        if (backend.kind() != .cuda or backend.ptr != @as(*anyopaque, @ptrCast(&self.backend_data.cuda.compute)))
+            return error.UnsupportedMemorillaProfile;
+    }
+}
+
+pub fn releaseMemorillaRequestResources(session: Session, expected: memorilla_qualification.Profile) !void {
+    try requireMemorillaProfile(session, expected);
+    if (comptime build_options.enable_cuda) {
+        const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        _ = try self.backend_data.cuda.compute.releaseMemorillaRequestResources();
+    }
 }
 
 /// Dense Gemma 4 mirrors are created during eager upload, before the native
@@ -10258,7 +10484,7 @@ fn runGlinerDecision(cb: *ops.ComputeBackend, allocator: std.mem.Allocator, enco
 }
 
 fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
-    return archRunImpl(ptr, inputs, allocator, null);
+    return archRunManaged(ptr, inputs, allocator, null);
 }
 
 fn archRunWithControl(
@@ -10267,6 +10493,36 @@ fn archRunWithControl(
     allocator: std.mem.Allocator,
     control: InferenceExecutionControl,
 ) ![]Tensor {
+    return archRunManaged(ptr, inputs, allocator, control);
+}
+
+fn archRunManaged(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) ![]Tensor {
+    return archRunAdmitted(ptr, inputs, allocator, control, null);
+}
+
+fn archRunAdmitted(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, amounts: ?runtime.tier.memory.AdmissionAmounts) ![]Tensor {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (comptime build_options.enable_cuda) {
+        if (self.memorilla_profile == .qwen3_encoder_f32_v1) {
+            const held = amounts orelse return error.MemorillaAdmissionRequired;
+            if (held.backend_scratch_bytes == 0) return error.MemorillaAdmissionRequired;
+            var physical = try self.backend_data.cuda.compute.beginMemorillaDeviceBudget(held.backend_scratch_bytes);
+            defer physical.deinit();
+            // Inner CT defers finish first; retire caches before restoring the
+            // allocation limit and before the caller refunds its real lease.
+            defer _ = self.backend_data.cuda.compute.releaseMemorillaRequestResources() catch
+                @panic("Memorilla encoder cleanup failed; worker restart required before releasing admission");
+            const backend = self.backend_data.cuda.compute.computeBackend();
+            try requireMemorillaCudaExecution(&backend);
+            const outputs = try archRunImpl(ptr, inputs, allocator, control);
+            errdefer {
+                for (outputs) |*output| output.deinit();
+                allocator.free(outputs);
+            }
+            try requireMemorillaCudaExecution(&backend);
+            return outputs;
+        }
+    }
     return archRunImpl(ptr, inputs, allocator, control);
 }
 

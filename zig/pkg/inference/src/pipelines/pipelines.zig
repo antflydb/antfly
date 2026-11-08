@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const memorilla_encoder = @import("memorilla_encoder.zig");
 
 pub const media_audio_checkpoints = @import("media_audio_checkpoints.zig");
 pub const media_audio_plan = @import("media_audio_plan.zig");
@@ -94,6 +95,7 @@ pub const document_token_classification = documents.token_classification;
 pub const JsonGrammar = grammar.JsonGrammar;
 
 test {
+    _ = memorilla_encoder;
     _ = media_classification;
     _ = media_audio_checkpoints;
     _ = media_audio_plan;

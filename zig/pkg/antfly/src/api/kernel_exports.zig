@@ -776,11 +776,14 @@ test "linked API route manifest preserves internal scan response streaming" {
     var found_query = false;
     var public_queries: usize = 0;
     var gateway_routes: usize = 0;
+    var found_memorilla = false;
     for (entries.?[0..len]) |entry| {
         if (entry.method != .post) continue;
         if (@import("inference_gateway.zig").ownsPath(entry.path.slice())) {
             try std.testing.expectEqual(if (std.mem.endsWith(u8, entry.path.slice(), "/stream")) abi.RequestBodyMode.streaming_raw else abi.RequestBodyMode.buffered, entry.request_body);
-            try std.testing.expectEqual(@as(u8, 1), entry.streaming_response);
+            const memorilla = std.mem.eql(u8, entry.path.slice(), "/ai/v1/memorilla/generate");
+            try std.testing.expectEqual(@as(u8, if (memorilla) 0 else 1), entry.streaming_response);
+            found_memorilla = found_memorilla or memorilla;
             gateway_routes += 1;
         }
         inline for (.{ "/db/v1/query", "/db/v1/tables/:tableName/query", "/db/v1/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/query" }) |path| {
@@ -802,7 +805,8 @@ test "linked API route manifest preserves internal scan response streaming" {
         }
     }
     try std.testing.expect(found_scan and found_query);
-    try std.testing.expectEqual(@as(usize, 23), gateway_routes);
+    try std.testing.expect(found_memorilla);
+    try std.testing.expectEqual(@as(usize, 24), gateway_routes);
     try std.testing.expectEqual(@as(usize, 3), public_queries);
 }
 

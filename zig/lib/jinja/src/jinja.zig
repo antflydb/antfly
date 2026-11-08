@@ -306,6 +306,31 @@ pub const ChatTemplateOptions = struct {
 
 // --- Tests ---
 
+test "pinned Qwen3 text and Memorilla prompts match Transformers including reasoning history" {
+    const source = @embedFile("testdata/qwen3_8b_template.txt");
+    var raw_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source, &raw_digest, .{});
+    const digest = std.fmt.bytesToHex(raw_digest, .lower);
+    try std.testing.expectEqualStrings("a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8", &digest);
+    var fixture_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer fixture_arena.deinit();
+    const fixture = try std.json.parseFromSliceLeaky(std.json.Value, fixture_arena.allocator(), @embedFile("testdata/qwen3_8b_rendered.json"), .{});
+    try std.testing.expectEqualStrings("b968826d9c46dd6066d109eabc6255188de91218", fixture.object.get("revision").?.string);
+    try std.testing.expectEqual(@as(usize, 12), fixture.object.get("cases").?.array.items.len);
+    var template = try Template.initHuggingFace(std.testing.allocator, source);
+    defer template.deinit();
+    for (fixture.object.get("cases").?.array.items) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        var context = (try jsonToTemplateValue(arena_state.allocator(), case.object.get("variables").?)).map;
+        const actual = try template.render(arena_state.allocator(), &context);
+        std.testing.expectEqualStrings(case.object.get("expected").?.string, actual) catch |err| {
+            std.debug.print("Qwen3 template case: {s}\n", .{case.object.get("id").?.string});
+            return err;
+        };
+    }
+}
+
 test "tool history validates arguments and preserves JSON value types" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

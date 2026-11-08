@@ -29,6 +29,7 @@ const model_manager_mod = @import("server/model_manager.zig");
 const native_backend_guard = @import("native_backend_guard.zig");
 const sparse_embedding_mod = @import("pipelines/sparse_embedding.zig");
 const embedding_mod = @import("pipelines/embedding.zig");
+const session_factory = @import("architectures/session_factory.zig");
 const gemma2_model = @import("models/embedding_gemma2.zig");
 const data_uri = @import("antfly_scraping").data_uri;
 
@@ -63,6 +64,7 @@ const Options = struct {
     order: std.ArrayListUnmanaged(InputRef) = .empty,
     graph_runtime_strategy: ?graph_runtime.Strategy = null,
     print_timing: bool = false,
+    diagnostics: bool = false,
     combined: bool = false,
     content_json_path: ?[]const u8 = null,
     task_type: ?[]const u8 = null,
@@ -90,6 +92,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         printUsage();
         return error.InvalidArguments;
     }
+    if (opts.diagnostics and (opts.image_paths.items.len > 0 or opts.audio_paths.items.len > 0 or opts.video_paths.items.len > 0 or opts.content_json_path != null or opts.combined or opts.group))
+        return error.EmbeddingDiagnosticsRequireFlatText;
+    if (opts.diagnostics) {
+        if (opts.texts.items.len > 16) return error.EmbeddingDiagnosticsInputTooLarge;
+        for (opts.texts.items) |text| if (text.len > 8192) return error.EmbeddingDiagnosticsInputTooLarge;
+    }
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
@@ -113,6 +121,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var model_handle = try model_manager.acquireFromDirWithControl(opts.model_dir, control);
     defer model_handle.release();
     const model = model_handle.get();
+    if (opts.diagnostics and (model.manifest.embedding_style == .embedding_gemma2 or model.manifest.hasCapability("sparse")))
+        return error.UnsupportedEmbeddingDiagnostics;
     const loaded_model_at = std.Io.Timestamp.now(io, .awake);
     if (model.manifest.embedding_style == .embedding_gemma2) {
         if (model.session.backend() == .cuda or opts.content_json_path != null) {
@@ -187,6 +197,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const ensured_initial_assets_at = std.Io.Timestamp.now(io, .awake);
     pipeline.print_timing = opts.print_timing;
     pipeline.execution_control = control;
+    var diagnostics: ?TokenizationDiagnostics = if (opts.diagnostics) try TokenizationDiagnostics.init(allocator, opts.texts.items) else null;
+    defer if (diagnostics) |*capture| capture.deinit();
+    if (diagnostics) |*capture| pipeline.tokenization_observer = .{ .ptr = capture, .observe = TokenizationDiagnostics.observe };
 
     const audio_bytes = try loadFiles(allocator, opts.audio_paths.items);
     const loaded_audio_at = std.Io.Timestamp.now(io, .awake);
@@ -209,12 +222,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     }
     const ensured_primary_assets_at = std.Io.Timestamp.now(io, .awake);
 
+    // Snapshot after asset upload so weight initialization cannot count as a
+    // forward. Final host output readback remains part of this measured region.
+    const cuda_before = if (opts.diagnostics) CudaForwardSnapshot.capture(model.session) else null;
     const text_embeddings = if (opts.texts.items.len > 0)
         try pipeline.embed(opts.texts.items)
     else
         try allocator.alloc([]f32, 0);
     const embedded_text_at = std.Io.Timestamp.now(io, .awake);
     defer freeEmbeddings(allocator, text_embeddings);
+    const cuda_execution = if (cuda_before) |before| if (CudaForwardSnapshot.capture(model.session)) |after| CudaForwardEvidence.between(before, after) else null else null;
 
     const image_bytes = try loadFiles(allocator, opts.image_paths.items);
     const loaded_images_at = std.Io.Timestamp.now(io, .awake);
@@ -227,15 +244,19 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     defer freeEmbeddings(allocator, image_embeddings);
     asset_lease.release();
 
-    try writeResultJson(
-        allocator,
-        &stdout.interface,
-        opts.model_dir,
-        opts.order.items,
-        text_embeddings,
-        image_embeddings,
-        audio_embeddings,
-    );
+    if (diagnostics) |*capture| {
+        try writeDiagnosticResultJson(allocator, &stdout.interface, model.session.backend(), pipeline.config, capture, text_embeddings, cuda_execution);
+    } else {
+        try writeResultJson(
+            allocator,
+            &stdout.interface,
+            opts.model_dir,
+            opts.order.items,
+            text_embeddings,
+            image_embeddings,
+            audio_embeddings,
+        );
+    }
     const finished_at = std.Io.Timestamp.now(io, .awake);
     if (opts.print_timing) {
         print(
@@ -288,6 +309,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {
             opts.graph_runtime_strategy = graph_runtime.parseStrategy(arg["--graph-runtime=".len..]) orelse return error.InvalidGraphRuntime;
         } else if (std.mem.eql(u8, arg, "--print-timing")) {
             opts.print_timing = true;
+        } else if (std.mem.eql(u8, arg, "--diagnostics")) {
+            opts.diagnostics = true;
         } else if (std.mem.eql(u8, arg, "--combined")) {
             opts.combined = true;
         } else if (std.mem.eql(u8, arg, "--content-json")) {
@@ -716,6 +739,123 @@ fn appendEmbeddingJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allo
     try buf.append(allocator, ']');
 }
 
+const TokenizationDiagnostics = struct {
+    allocator: std.mem.Allocator,
+    texts: []const []const u8,
+    rows: []?[]i32,
+
+    fn init(a: std.mem.Allocator, texts: []const []const u8) !TokenizationDiagnostics {
+        const rows = try a.alloc(?[]i32, texts.len);
+        @memset(rows, null);
+        return .{ .allocator = a, .texts = texts, .rows = rows };
+    }
+
+    fn deinit(self: *TokenizationDiagnostics) void {
+        for (self.rows) |row| if (row) |ids| self.allocator.free(ids);
+        self.allocator.free(self.rows);
+    }
+
+    fn observe(ptr: *anyopaque, text: []const u8, ids: []const i32, mask: []const i32) !void {
+        const self: *TokenizationDiagnostics = @ptrCast(@alignCast(ptr));
+        if (ids.len != mask.len) return error.InvalidTokenizationDiagnostics;
+        var active = std.ArrayListUnmanaged(i32).empty;
+        defer active.deinit(self.allocator);
+        for (ids, mask) |id, used| if (used > 0) try active.append(self.allocator, id);
+        var found = false;
+        for (self.texts, self.rows) |input, *row| {
+            if (!std.mem.eql(u8, input, text)) continue;
+            found = true;
+            if (row.*) |previous| {
+                if (!std.mem.eql(i32, previous, active.items)) return error.InconsistentTokenizationDiagnostics;
+            } else row.* = try self.allocator.dupe(i32, active.items);
+        }
+        if (!found) return error.UnknownTokenizationDiagnosticInput;
+    }
+};
+
+// A small projection of the actual compute counters keeps this diagnostic
+// testable in CPU builds. These dispatch categories may overlap; they are not
+// an estimate of FLOPs or a sum of unique CUDA operations.
+const CudaForwardSnapshot = struct {
+    kernel_launches: usize = 0,
+    linear_kernel_launches: usize = 0,
+    linear_qkv_kernel_launches: usize = 0,
+    bf16_cublaslt_linear_calls: usize = 0,
+    bf16_cublaslt_qkv_calls: usize = 0,
+    f16_cublaslt_linear_calls: usize = 0,
+    f16_cublaslt_qkv_calls: usize = 0,
+    attention_kernel_launches: usize = 0,
+    resident_weight_bytes: usize = 0,
+    host_attention_fallbacks: usize = 0,
+    paged_attention_host_fallbacks: usize = 0,
+    rope_host_fallbacks: usize = 0,
+    cross_backend_sync_fallbacks: usize = 0,
+    d2h_bytes: usize = 0,
+
+    fn capture(session: backends.Session) ?CudaForwardSnapshot {
+        if (comptime build_options.enable_cuda) {
+            const stats = session_factory.getCudaRuntimeStats(session) orelse return null;
+            return .{
+                .kernel_launches = stats.kernel_launches,
+                .linear_kernel_launches = stats.launch_linear,
+                .linear_qkv_kernel_launches = stats.launch_linear_qkv,
+                .bf16_cublaslt_linear_calls = stats.bf16_cublaslt_linear_calls,
+                .bf16_cublaslt_qkv_calls = stats.bf16_cublaslt_qkv_calls,
+                .f16_cublaslt_linear_calls = stats.f16_cublaslt_linear_calls,
+                .f16_cublaslt_qkv_calls = stats.f16_cublaslt_qkv_calls,
+                .attention_kernel_launches = stats.launch_attention,
+                .resident_weight_bytes = stats.resident_weight_bytes,
+                .host_attention_fallbacks = stats.host_attention_fallbacks,
+                .paged_attention_host_fallbacks = stats.paged_attention_host_fallbacks,
+                .rope_host_fallbacks = stats.rope_host_fallbacks,
+                .cross_backend_sync_fallbacks = stats.cross_backend_sync_fallbacks,
+                .d2h_bytes = stats.d2h_bytes,
+            };
+        }
+        return null;
+    }
+};
+
+const CudaForwardEvidence = struct {
+    scope: []const u8 = "text-forward-after-asset-init",
+    counters: CudaForwardSnapshot,
+    resident_weight_bytes_before: usize,
+    resident_weight_bytes_after: usize,
+    host_output_readback_allowed: bool = true,
+
+    fn between(before: CudaForwardSnapshot, after: CudaForwardSnapshot) CudaForwardEvidence {
+        var delta = CudaForwardSnapshot{};
+        inline for (@typeInfo(CudaForwardSnapshot).@"struct".field_names) |name| {
+            @field(delta, name) = @field(after, name) -| @field(before, name);
+        }
+        // Residency is a gauge, reported separately rather than as work done.
+        delta.resident_weight_bytes = 0;
+        return .{ .counters = delta, .resident_weight_bytes_before = before.resident_weight_bytes, .resident_weight_bytes_after = after.resident_weight_bytes };
+    }
+};
+
+fn writeDiagnosticResultJson(a: std.mem.Allocator, writer: *std.Io.Writer, backend: backends.BackendType, config: embedding_mod.EmbeddingConfig, capture: *TokenizationDiagnostics, vectors: [][]f32, cuda_execution: ?CudaForwardEvidence) !void {
+    const rows = try a.alloc([]const i32, capture.rows.len);
+    defer a.free(rows);
+    if (vectors.len != rows.len) return error.InvalidTokenizationDiagnostics;
+    for (capture.rows, rows) |row, *output| output.* = row orelse return error.MissingTokenizationDiagnostics;
+    const json = try std.json.Stringify.valueAlloc(a, .{
+        .schema = "antfly.embedding.diagnostics.v1",
+        .backend = @tagName(backend),
+        .text_prefix = config.text_prefix,
+        .trailing_eos_id = config.ensure_trailing_eos_id,
+        .pooling = @tagName(config.pooling),
+        .normalize = config.normalize,
+        .token_ids = rows,
+        .embeddings = vectors,
+        .cuda_execution = cuda_execution,
+    }, .{});
+    defer a.free(json);
+    try writer.writeAll(json);
+    try writer.writeByte('\n');
+    try writer.flush();
+}
+
 fn appendSparseEmbeddingJson(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -807,6 +947,7 @@ fn printUsage() void {
         \\  graph-runtime controls imported static graph execution; default is environment fallback, then interpreter.
         \\  Benchmark gates: TERMITE_GRAPH_RUNTIME_FAIL_CLOSED=1, TERMITE_GRAPH_EXECUTOR_STATS=1, TERMITE_GRAPH_PARTITION_REPORT=1.
         \\  --print-timing prints phase timings to stderr.
+        \\  --diagnostics adds actual token IDs, backend, and recipe for up to 16 flat dense texts of 8 KiB each.
         \\  EmbeddingGemma 2: --task-type <task>, --dimensions 1..768 (trained: 128/256/512/768).
         \\  --combined embeds repeated input flags as one ordered EmbeddingGemma 2 input.
         \\  --content-json <path> accepts API input JSON with ordered content groups and inline media.
@@ -848,6 +989,68 @@ test "parseArgs preserves multimodal input order" {
     try std.testing.expectEqual(Modality.audio, opts.order.items[2].modality);
     try std.testing.expectEqual(Modality.text, opts.order.items[3].modality);
     try std.testing.expectEqual(@as(usize, 1), opts.order.items[3].index);
+}
+
+test "embedding diagnostics capture actual active token order across duplicates and padding" {
+    const a = std.testing.allocator;
+    var capture = try TokenizationDiagnostics.init(a, &.{ "first", "second", "first" });
+    defer capture.deinit();
+    try TokenizationDiagnostics.observe(&capture, "second", &.{ 151643, 42, 43, 151643 }, &.{ 0, 1, 1, 1 });
+    try TokenizationDiagnostics.observe(&capture, "first", &.{ 7, 151643, 0, 0 }, &.{ 1, 1, 0, 0 });
+    try std.testing.expectEqualSlices(i32, &.{ 7, 151643 }, capture.rows[0].?);
+    try std.testing.expectEqualSlices(i32, &.{ 42, 43, 151643 }, capture.rows[1].?);
+    try std.testing.expectEqualSlices(i32, capture.rows[0].?, capture.rows[2].?);
+    try std.testing.expectError(error.InconsistentTokenizationDiagnostics, TokenizationDiagnostics.observe(&capture, "first", &.{ 8, 151643 }, &.{ 1, 1 }));
+
+    var vectors = [_][]f32{ @constCast(&[_]f32{ 1, 0 }), @constCast(&[_]f32{ 0, 1 }), @constCast(&[_]f32{ 1, 0 }) };
+    var out = std.Io.Writer.Allocating.init(a);
+    defer out.deinit();
+    try writeDiagnosticResultJson(a, &out.writer, .native, .{ .pooling = .last, .ensure_trailing_eos_id = 151643 }, &capture, &vectors, null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("antfly.embedding.diagnostics.v1", parsed.value.object.get("schema").?.string);
+    try std.testing.expectEqualStrings("native", parsed.value.object.get("backend").?.string);
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.object.get("token_ids").?.array.items.len);
+    try std.testing.expect(parsed.value.object.get("cuda_execution").? == .null);
+}
+
+test "embedding diagnostics CUDA evidence excludes initialization and retains fallback counters" {
+    const evidence = CudaForwardEvidence.between(.{
+        .kernel_launches = 100,
+        .linear_kernel_launches = 7,
+        .attention_kernel_launches = 2,
+        .resident_weight_bytes = 4096,
+        .host_attention_fallbacks = 3,
+        .d2h_bytes = 1000,
+    }, .{
+        .kernel_launches = 112,
+        .linear_kernel_launches = 11,
+        .attention_kernel_launches = 4,
+        .resident_weight_bytes = 4096,
+        .host_attention_fallbacks = 4,
+        .d2h_bytes = 1040,
+    });
+    try std.testing.expectEqual(@as(usize, 12), evidence.counters.kernel_launches);
+    try std.testing.expectEqual(@as(usize, 4), evidence.counters.linear_kernel_launches);
+    try std.testing.expectEqual(@as(usize, 2), evidence.counters.attention_kernel_launches);
+    try std.testing.expectEqual(@as(usize, 1), evidence.counters.host_attention_fallbacks);
+    try std.testing.expectEqual(@as(usize, 40), evidence.counters.d2h_bytes);
+    try std.testing.expectEqual(@as(usize, 4096), evidence.resident_weight_bytes_before);
+    try std.testing.expectEqual(@as(usize, 4096), evidence.resident_weight_bytes_after);
+    try std.testing.expect(evidence.host_output_readback_allowed);
+}
+
+test "embedding diagnostics require every input and parse explicitly" {
+    const a = std.testing.allocator;
+    var opts = try parseArgs(a, &.{ "/model", "--diagnostics", "--text", "raw input" });
+    defer opts.deinit(a);
+    try std.testing.expect(opts.diagnostics);
+    var capture = try TokenizationDiagnostics.init(a, &.{"input"});
+    defer capture.deinit();
+    var vector = [_][]f32{@constCast(&[_]f32{1})};
+    var out = std.Io.Writer.Allocating.init(a);
+    defer out.deinit();
+    try std.testing.expectError(error.MissingTokenizationDiagnostics, writeDiagnosticResultJson(a, &out.writer, .native, .{}, &capture, &vector, null));
 }
 
 test "EmbeddingGemma 2 CLI parses ordered content tasks and MRL dimensions" {

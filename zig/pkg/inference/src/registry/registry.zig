@@ -37,6 +37,7 @@ pub const pull_diagnostics = @import("pull_diagnostics.zig");
 pub const download = @import("download.zig");
 pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
+pub const memorilla_catalog = @import("memorilla_catalog.zig");
 pub const embedding_gemma2_catalog = @import("embedding_gemma2_catalog.zig");
 pub const qwen3_reranker_catalog = @import("qwen3_reranker_catalog.zig");
 
@@ -77,6 +78,7 @@ test {
     _ = download;
     _ = qwen3vl_catalog;
     _ = qwen3_embedding_catalog;
+    _ = memorilla_catalog;
     _ = embedding_gemma2_catalog;
     _ = qwen3_reranker_catalog;
 }
@@ -190,6 +192,8 @@ test "Qwen model refs require canonical repositories and preserve bundle variant
     }
     const embedding = try parsePullModelRef("Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1");
     try std.testing.expect(qwen3_embedding_catalog.findBundleForHubRef(embedding.owner, embedding.name, embedding.variant) != null);
+    const memory = try parsePullModelRef("Qwen/Qwen3-Embedding-4B:memorilla-bf16-safetensors-bundle-v1");
+    try std.testing.expect(qwen3_embedding_catalog.findBundleForHubRef(memory.owner, memory.name, memory.variant) != null);
     const reranker = try parsePullModelRef("ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:q8-0-bundle-v1");
     try std.testing.expect(qwen3_reranker_catalog.findBundleForHubRef(reranker.owner, reranker.name, reranker.variant) != null);
     const explicit = try parsePullModelRef("Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1@main");
@@ -675,6 +679,11 @@ pub const ModelRegistry = struct {
                     .artifacts = &qwen3vl_catalog.rerankerArtifacts(),
                     .generated = &.{.{ .path = download.bundle_descriptor_filename, .bytes = qwen3vl_catalog.reranker_bundle_manifest }},
                 }, hub_config, progress_sink)
+            else if (memorilla_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{
+                    .artifacts = bundle.artifacts(),
+                    .generated = &.{.{ .path = "model_manifest.json", .bytes = bundle.generated_model_manifest.? }},
+                }, hub_config, progress_sink)
             else if (qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
                 try download.installedPinnedBundleMatches(self.allocator, io, dest, .{ .artifacts = bundle.artifacts() }, hub_config, progress_sink)
             else if (embedding_gemma2_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
@@ -736,6 +745,18 @@ pub const ModelRegistry = struct {
                 ref.owner,
                 ref.name,
                 ref.variant,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (memorilla_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3EmbeddingBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
                 transaction.staging,
                 hub_config,
                 progress_sink,
@@ -919,6 +940,8 @@ pub const ModelRegistry = struct {
     ) !void {
         var existing = try manifest_mod.loadFromManagedPlanDir(self.allocator, dest_dir);
         defer existing.deinit();
+        if (existing.memorilla_profile != null and (tasks_csv != null or capabilities_csv != null))
+            return error.UnsupportedMemorillaArtifact;
         if (existing.model_manifest_path != null and tasks_csv == null and capabilities_csv == null and
             !isGlinerDecisionCandidate(&existing) and existing.gliner_specialty_profile == null)
         {
@@ -2207,6 +2230,27 @@ fn synthesizePulledModelManifestJsonInternal(
         try body.appendSlice(allocator, ",\"sparse_3d_output_layout\":");
         try appendJsonString(&body, allocator, sparse3DOutputLayoutName(layout));
     }
+    if (manifest.embedding_trailing_eos_id) |eos_id| {
+        // Task/capability overrides must preserve this explicit encoding
+        // recipe, including Memorilla's deliberately empty query prefix.
+        const recipe = try std.json.Stringify.valueAlloc(allocator, .{
+            .pooling = @tagName(manifest.pooling),
+            .normalize = manifest.normalize,
+            .embedding_style = @tagName(manifest.embedding_style),
+            .embedding_trailing_eos_id = eos_id,
+            .embedding_profile = .{
+                .task_contract = @tagName(manifest.embedding_profile.task_contract),
+                .query = .{
+                    .prefix = manifest.embedding_profile.query.prefix,
+                    .instruction_template = manifest.embedding_profile.instruction_template,
+                },
+                .document = .{ .prefix = manifest.embedding_profile.document.prefix },
+            },
+        }, .{});
+        defer allocator.free(recipe);
+        try body.append(allocator, ',');
+        try body.appendSlice(allocator, recipe[1 .. recipe.len - 1]);
+    }
     try body.append(allocator, '}');
 
     return try body.toOwnedSlice(allocator);
@@ -3115,6 +3159,76 @@ test "pull preserves the pinned Qwen3 BF16 executable profile through manifest f
     try std.testing.expectEqual(manifest_mod.ModelType.embedder, loaded.model_type);
     try std.testing.expect(loaded.embedding_profile.isResolved());
     try std.testing.expectEqual(manifest_mod.PoolingStrategy.last, loaded.pooling);
+}
+
+test "Qwen3-Embedding-4B Memorilla install preserves empty role prefixes and distinct recipe identity" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const model_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer alloc.free(model_dir);
+    try tmp.dir.createDirPath(io, "model/1_Pooling");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/config.json",
+        .data =
+        \\{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3","hidden_size":2560,"head_dim":128,"num_hidden_layers":36,"num_attention_heads":32,"num_key_value_heads":8,"max_position_embeddings":40960}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/1_Pooling/config.json",
+        .data = "{\"word_embedding_dimension\":2560,\"pooling_mode_lasttoken\":true}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/modules.json",
+        .data = "[{\"idx\":1,\"path\":\"1_Pooling\",\"type\":\"sentence_transformers.models.Pooling\"},{\"idx\":2,\"path\":\"2_Normalize\",\"type\":\"sentence_transformers.models.Normalize\"}]",
+    });
+    // Preserve the upstream retrieval sidecar. The memory manifest must
+    // override its query instruction rather than editing a pinned artifact.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/config_sentence_transformers.json",
+        .data = "{\"prompts\":{\"query\":\"upstream retrieval instruction\",\"document\":\"\"}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/model_manifest.json",
+        .data = qwen3_embedding_catalog.memorilla_bundle_model_manifest,
+    });
+
+    var full = try manifest_mod.loadFromDir(alloc, model_dir);
+    defer full.deinit();
+    var listing = try manifest_mod.loadListingFromDir(alloc, model_dir);
+    defer listing.deinit();
+    for ([_]*const manifest_mod.ModelManifest{ &full, &listing }) |loaded| {
+        try std.testing.expect(loaded.isLastTokenDecoderEmbedder());
+        try std.testing.expect(loaded.normalize);
+        try std.testing.expect(loaded.embedding_profile.isResolved());
+        try std.testing.expectEqualStrings("", loaded.embedding_profile.query.prefix);
+        try std.testing.expectEqualStrings("", loaded.embedding_profile.document.prefix);
+        try std.testing.expectEqualStrings("", loaded.embedding_profile.instruction_template);
+        // tokenizer_config's EOS is <|im_end|>, while the pinned postprocessor
+        // appends <|endoftext|>. Never add a different trailing token.
+        try std.testing.expectEqual(@as(?i32, 151643), loaded.embeddingTrailingEosId(151645));
+        try std.testing.expectEqual(@as(?i32, 151643), loaded.embeddingTrailingEosId(-1));
+    }
+    try std.testing.expectEqual(qwen3_embedding_catalog.memorilla_embedding_dimensions, full.denseEmbeddingOutput().?.native_dimensions);
+    // Cheap listing intentionally does not resolve generic encoder geometry.
+    try std.testing.expect(listing.denseEmbeddingOutput() == null);
+    const rewritten = try synthesizePulledModelManifestJson(alloc, model_dir, "embed", null);
+    defer alloc.free(rewritten);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model_manifest.json", .data = rewritten });
+    var overridden = try manifest_mod.loadFromDir(alloc, model_dir);
+    defer overridden.deinit();
+    try std.testing.expectEqual(@as(?i32, 151643), overridden.embeddingTrailingEosId(151645));
+    try std.testing.expectEqualStrings("", overridden.embedding_profile.query.prefix);
+    try std.testing.expectEqualStrings("", overridden.embedding_profile.instruction_template);
+
+    const retrieval = try ModelRef.parse("Qwen/Qwen3-Embedding-4B:bf16-safetensors-bundle-v1");
+    const memory = try ModelRef.parse("Qwen/Qwen3-Embedding-4B:memorilla-bf16-safetensors-bundle-v1");
+    const retrieval_dir = try modelInstallDirAlloc(alloc, model_dir, retrieval);
+    defer alloc.free(retrieval_dir);
+    const memory_dir = try modelInstallDirAlloc(alloc, model_dir, memory);
+    defer alloc.free(memory_dir);
+    try std.testing.expect(!std.mem.eql(u8, retrieval_dir, memory_dir));
 }
 
 test "model refs accept independent formats and revisions" {

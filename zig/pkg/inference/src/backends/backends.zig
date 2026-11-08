@@ -256,6 +256,9 @@ pub const SessionManager = struct {
     /// never consulted as mutable process-global state during inference.
     a4b_inference_request: ?backend_contracts.A4bInferenceRequest = null,
     gliner_cuda_precision: ?session_factory.GlinerCudaPrecision = null,
+    /// Borrowed only by the synchronous construction call; copied manager
+    /// values keep concurrent loads' cancellation contracts independent.
+    model_load_control: ?execution_control.InferenceExecutionControl = null,
     /// Per-manager qualification override, absent from production builds.
     test_allow_unqualified_gliner_cuda_precision: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// Optional Io runtime threaded into compute backends so parallel GEMM
@@ -327,6 +330,12 @@ pub const SessionManager = struct {
         return self.loadModelWithImportedOnnxContext(model_path, null);
     }
 
+    pub fn loadModelWithControl(self: *SessionManager, model_path: []const u8, control: ?execution_control.InferenceExecutionControl) !Session {
+        var scoped = self.*;
+        scoped.model_load_control = control;
+        return scoped.loadModel(model_path);
+    }
+
     pub fn loadModelWithImportedOnnxContext(
         self: *SessionManager,
         model_path: []const u8,
@@ -334,12 +343,15 @@ pub const SessionManager = struct {
     ) !Session {
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (manifest) |*m| m.deinit();
+        const memorilla_profile = if (manifest) |m| m.memorilla_profile else null;
+        if (memorilla_profile != null and (self.gliner_cuda_precision != null or self.a4b_inference_request != null or self.graph_runtime_strategy != null))
+            return error.IncompatibleCudaLoadPolicies;
         var effective_buf: [backend_order_capacity]BackendType = undefined;
         // Constructors and discovery run in the database's proxy process too.
         // Enter a device driver only at the execution boundary, after checking
         // whether this host can isolate uninterruptible native calls.
         var device_order_buf: [backend_order_capacity]BackendType = undefined;
-        const preferred = try self.executionBackendOrder(&device_order_buf, self.preferred_backends, null);
+        const preferred = try self.executionBackendOrder(&device_order_buf, self.preferred_backends, self.model_load_control);
         const fallback_backends = effectiveBackendOrder(
             self.allocator,
             &effective_buf,
@@ -377,6 +389,7 @@ pub const SessionManager = struct {
 
         if (self.gliner_cuda_precision != null and self.a4b_inference_request != null) return error.IncompatibleCudaLoadPolicies;
         for (effective_backends) |backend| {
+            if (memorilla_profile != null and backend != .cuda) continue;
             if (self.gliner_cuda_precision != null and backend != .cuda) continue;
             if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) {
                 std.log.err(
@@ -460,7 +473,9 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_cuda)
-                    (if (self.gliner_cuda_precision) |precision|
+                    (if (memorilla_profile != null)
+                        session_factory.createCudaSessionWithManagedMemorillaProfile(self.allocator, model_path, self.kernel_jit, self.kernel_jit_load_context, self.model_load_control)
+                    else if (self.gliner_cuda_precision) |precision|
                         (if (if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false)
                             session_factory.createCudaSessionWithGlinerPrecisionForTest(self.allocator, model_path, self.kernel_jit, self.kernel_jit_load_context, precision)
                         else

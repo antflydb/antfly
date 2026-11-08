@@ -1487,6 +1487,7 @@ pub const AntflyApiHandler = struct {
         try root_server.postResponseStreaming("/ai/v1/dictate", httpx.Handler.bind(self, gatewayDictate));
         try root_server.postResponseStreaming("/ai/v1/embed", httpx.Handler.bind(self, gatewayEmbed));
         try root_server.postResponseStreaming("/ai/v1/generate", httpx.Handler.bind(self, gatewayGenerate));
+        try root_server.post("/ai/v1/memorilla/generate", httpx.Handler.bind(self, gatewayMemorilla));
         try root_server.postResponseStreaming("/ai/v1/generate/batch", httpx.Handler.bind(self, gatewayBatch));
         try root_server.get("/ml/v1/models", httpx.Handler.bind(self, gatewayModels));
         try root_server.get("/ml/v1/predictors", httpx.Handler.bind(self, gatewayModels));
@@ -4632,6 +4633,13 @@ pub const AntflyApiHandler = struct {
     }
     fn gatewayGenerate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequestOperation(ctx, .generate, "generate");
+    }
+    fn gatewayMemorilla(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        inference_gateway.prepare(self.api_server, ctx) catch |err| return gatewayFailure(ctx, err);
+        return inference_gateway.memorilla(self.api_server, ctx) catch |err| gatewayFailure(ctx, err);
     }
     fn gatewayEmbed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequestOperation(ctx, .embed, "embed");
@@ -19632,22 +19640,24 @@ test "httpx inference gateway authorization covers inventory execution and sessi
         fn request(a: std.mem.Allocator, h: *AntflyApiHandler, auth_header: []const u8, path: []const u8, expected: u16) !void {
             var req = try httpx.Request.init(a, if (inference_gateway.isDiscoveryPath(path)) .GET else .POST, path);
             defer req.deinit();
-            try req.headers.append("authorization", auth_header);
+            if (auth_header.len != 0) try req.headers.append("authorization", auth_header);
             req.body = "{\"model\":\"raw-model\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}";
             var ctx = httpx.Context.init(a, std.testing.io, &req);
             defer ctx.deinit();
-            var response = if (std.mem.eql(u8, path, "/ai/v1/generate/batch")) try h.gatewayBatch(&ctx) else if (std.mem.startsWith(u8, path, "/ai/v1/transcription/sessions")) try h.gatewaySessionRequest(&ctx, .post, "") else try h.gatewayRequest(&ctx, if (inference_gateway.isDiscoveryPath(path)) null else .generate);
+            var response = if (std.mem.indexOf(u8, path, "/memorilla/") != null) try h.gatewayMemorilla(&ctx) else if (std.mem.eql(u8, path, "/ai/v1/generate/batch")) try h.gatewayBatch(&ctx) else if (std.mem.startsWith(u8, path, "/ai/v1/transcription/sessions")) try h.gatewaySessionRequest(&ctx, .post, "") else try h.gatewayRequest(&ctx, if (inference_gateway.isDiscoveryPath(path)) null else .generate);
             defer response.deinit();
             try std.testing.expectEqual(expected, response.status.code);
         }
     };
-    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/models", "/ai/v1/chat/completions", "/ai//v1/chat/completions/", "/ml/v1/predict", "/ai/v1/generate/batch", "/ai/v1/transcription/sessions", "/ai/v1/transcription//sessions/" }) |path| try Cases.request(alloc, &handler, authorization, path, 403);
+    try Cases.request(alloc, &handler, "", "/ai/v1/memorilla/generate", 401);
+    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/models", "/ai/v1/chat/completions", "/ai//v1/chat/completions/", "/ml/v1/predict", "/ai/v1/generate/batch", "/ai/v1/memorilla/generate", "/ai//v1/memorilla/generate/", "/ai/v1/transcription/sessions", "/ai/v1/transcription//sessions/" }) |path| try Cases.request(alloc, &handler, authorization, path, 403);
     try std.testing.expectEqual(@as(usize, 0), target.calls);
     var inference_read = try usermgr.Permission.initOwned(alloc, .inference, "*", .read);
     defer inference_read.deinit(alloc);
     try auth.manager.addPermissionToUser("gateway-reader", inference_read);
     try Cases.request(alloc, &handler, authorization, "/ai/v1/models", 200);
     try Cases.request(alloc, &handler, authorization, "/ai/v1/chat/completions", 403);
+    try Cases.request(alloc, &handler, authorization, "/ai/v1/memorilla/generate", 403);
     try Cases.request(alloc, &handler, authorization, "/ai/v1/transcription/sessions", 403);
     var inference_write = try usermgr.Permission.initOwned(alloc, .inference, "*", .write);
     defer inference_write.deinit(alloc);
@@ -19655,11 +19665,101 @@ test "httpx inference gateway authorization covers inventory execution and sessi
     target.calls = 0;
     try Cases.request(alloc, &handler, authorization, "/ai/v1/chat/completions", 200);
     try std.testing.expectEqual(@as(usize, 1), target.calls);
+    try Cases.request(alloc, &handler, authorization, "/ai/v1/memorilla/generate", 200);
+    try Cases.request(alloc, &handler, authorization, "/ai//v1/memorilla/generate/", 200);
+    try std.testing.expectEqual(@as(usize, 3), target.calls);
     config.public_inference.enabled = false;
     try Cases.request(alloc, &handler, authorization, "/ai/v1/chat/completions", 403);
     try Cases.request(alloc, &handler, authorization, "/ai/v1/transcription/sessions", 403);
+    try Cases.request(alloc, &handler, authorization, "/ai/v1/memorilla/generate", 403);
     try Cases.request(alloc, &handler, authorization, "/ai/v1/models", 200);
+    try std.testing.expectEqual(@as(usize, 3), target.calls);
+}
+
+test "httpx inference gateway Memorilla preserves the profile body and buffers with one runtime admission" {
+    const Target = struct {
+        const input = "{\"model\":\"memorilla-stage3\",\"question\":\"q\",\"document_embeddings\":[[1]],\"encoder_execution_identity\":\"identity\"}";
+        const output = "{\"model\":\"memorilla-stage3\",\"text\":\"buffered answer\"}";
+        gate: RequestAdmission = RequestAdmission.init(1),
+        parent_acquires: usize = 0,
+        calls: usize = 0,
+        fn acquire(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.parent_acquires += 1;
+            return self.gate.tryAcquire();
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.gate.release();
+        }
+        fn stats(raw: *anyopaque) RequestAdmission.Stats {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.gate.stats();
+        }
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            if (!std.mem.eql(u8, context.operation.slice(), "memorilla/generate") or
+                !std.mem.eql(u8, context.body.slice(), input) or context.deadline_ns == 0 or
+                context.stream.start != null or context.stream.write != null or context.stream.close != null)
+                return inference_connection_abi.statusFromError(error.InvalidArgument);
+            if (!self.gate.tryAcquire()) return inference_connection_abi.statusFromError(error.InvalidArgument);
+            defer self.gate.release();
+            self.calls += 1;
+            const body = context.allocator.asStd().dupe(u8, output) catch return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = body.ptr, .len = body.len } };
+            return .ok;
+        }
+    };
+    const Capture = struct {
+        touched: bool = false,
+        fn start(raw: ?*anyopaque, _: u16, _: []const u8, _: *const httpx.Headers) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.touched = true;
+            return error.UnexpectedStreaming;
+        }
+        fn write(raw: ?*anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.touched = true;
+            return error.UnexpectedStreaming;
+        }
+        fn close(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.touched = true;
+            return error.UnexpectedStreaming;
+        }
+    };
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    config.public_inference.enabled = true;
+    // No generator registry entry exists for this composition profile.
+    var source = AuthStatusSource{};
+    var target: Target = .{};
+    var server = ApiHttpServer.init(a, .{
+        .node_config = &config,
+        .inference_request_admission_source = .{ .ptr = &target, .try_acquire_fn = Target.acquire, .release_fn = Target.release, .stats_fn = Target.stats },
+        .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke },
+    }, source.iface(), null, null);
+    defer server.deinit();
+    server.antfly_provider = .{ .ptr = &target, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .owns_invocation_admission = true };
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/memorilla/generate");
+    defer request.deinit();
+    request.body = Target.input;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var capture: Capture = .{};
+    ctx.stream_delegate = .{ .ptr = &capture, .start = Capture.start, .write = Capture.write, .close = Capture.close };
+    var response = try handler.gatewayMemorilla(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqualStrings(Target.output, response.body.?);
     try std.testing.expectEqual(@as(usize, 1), target.calls);
+    try std.testing.expectEqual(@as(usize, 0), target.parent_acquires);
+    try std.testing.expectEqual(@as(usize, 1), target.gate.stats().peak_in_flight);
+    try std.testing.expectEqual(@as(usize, 0), target.gate.stats().in_flight);
+    try std.testing.expectEqual(@as(u64, 0), target.gate.stats().rejected_total);
+    try std.testing.expect(!capture.touched);
 }
 
 test "httpx inference gateway large source batch items bypass metadata limits and release between items" {

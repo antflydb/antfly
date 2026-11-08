@@ -33,6 +33,114 @@ pub const CooperativeExecution = struct {
     decode_handoff_wait_us: u32 = 5000,
 };
 
+pub const MemorillaProfile = struct {
+    name: []const u8,
+    encoder: []const u8,
+    decoder: []const u8,
+    memory_module_path: []const u8,
+    max_documents: usize = 64,
+    max_new_tokens: usize = 128,
+};
+
+/// Named assets are operator policy; requests select a name and never supply
+/// filesystem paths or substitute a component of the admitted composition.
+pub const Memorilla = struct {
+    enabled: bool = false,
+    profiles: []const MemorillaProfile = &.{},
+
+    pub fn validate(self: Memorilla) !void {
+        if (self.profiles.len > 16 or (self.enabled and self.profiles.len == 0)) return error.InvalidMemorillaConfig;
+        for (self.profiles, 0..) |profile, i| {
+            if (profile.name.len == 0 or profile.name.len > 128 or profile.encoder.len == 0 or
+                profile.encoder.len > 4096 or profile.decoder.len == 0 or profile.decoder.len > 4096 or
+                profile.memory_module_path.len == 0 or profile.memory_module_path.len > 4096 or
+                profile.max_documents == 0 or profile.max_documents > 64 or profile.max_new_tokens == 0 or profile.max_new_tokens > 128)
+                return error.InvalidMemorillaConfig;
+            inline for (.{ "name", "encoder", "decoder", "memory_module_path" }) |field| {
+                const text = @field(profile, field);
+                _ = std.unicode.Utf8View.init(text) catch return error.InvalidMemorillaConfig;
+                if (std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidMemorillaConfig;
+            }
+            for (self.profiles[0..i]) |previous| if (std.mem.eql(u8, previous.name, profile.name)) return error.DuplicateMemorillaProfile;
+        }
+    }
+
+    pub fn find(self: Memorilla, name: []const u8) !MemorillaProfile {
+        if (!self.enabled) return error.MemorillaDisabled;
+        for (self.profiles) |profile| if (std.mem.eql(u8, profile.name, name)) return profile;
+        return error.MemorillaProfileNotFound;
+    }
+
+    pub fn clone(self: Memorilla, a: std.mem.Allocator) !Memorilla {
+        try self.validate();
+        const profiles = try a.alloc(MemorillaProfile, self.profiles.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (profiles[0..initialized]) |profile| freeProfile(a, profile);
+            a.free(profiles);
+        }
+        for (self.profiles, profiles) |source, *dest| {
+            const name = try a.dupe(u8, source.name);
+            errdefer a.free(name);
+            const encoder = try a.dupe(u8, source.encoder);
+            errdefer a.free(encoder);
+            const decoder = try a.dupe(u8, source.decoder);
+            errdefer a.free(decoder);
+            const path = try a.dupe(u8, source.memory_module_path);
+            dest.* = .{ .name = name, .encoder = encoder, .decoder = decoder, .memory_module_path = path, .max_documents = source.max_documents, .max_new_tokens = source.max_new_tokens };
+            initialized += 1;
+        }
+        return .{ .enabled = self.enabled, .profiles = profiles };
+    }
+
+    fn freeProfile(a: std.mem.Allocator, profile: MemorillaProfile) void {
+        a.free(profile.name);
+        a.free(profile.encoder);
+        a.free(profile.decoder);
+        a.free(profile.memory_module_path);
+    }
+
+    /// Only call on an owned clone; Node configuration borrows its source.
+    pub fn deinit(self: *Memorilla, a: std.mem.Allocator) void {
+        for (self.profiles) |profile| freeProfile(a, profile);
+        if (self.profiles.len > 0) a.free(self.profiles);
+        self.* = .{};
+    }
+};
+
+test "Memorilla settings bind named compositions and reject ambiguous or oversized profiles" {
+    const a = std.testing.allocator;
+    const profile = MemorillaProfile{ .name = "stage3", .encoder = "encoder", .decoder = "decoder", .memory_module_path = "/models/stage3" };
+    const config = Memorilla{ .enabled = true, .profiles = &.{profile} };
+    try config.validate();
+    var owned = try config.clone(a);
+    defer owned.deinit(a);
+    try std.testing.expectEqualStrings("encoder", (try owned.find("stage3")).encoder);
+    try std.testing.expectError(error.MemorillaDisabled, (Memorilla{}).find("stage3"));
+    try std.testing.expectError(error.MemorillaProfileNotFound, config.find("missing"));
+    try std.testing.expectError(error.DuplicateMemorillaProfile, (Memorilla{ .enabled = true, .profiles = &.{ profile, profile } }).validate());
+    var oversized = profile;
+    oversized.max_documents = 65;
+    try std.testing.expectError(error.InvalidMemorillaConfig, (Memorilla{ .profiles = &.{oversized} }).validate());
+}
+
+test "Memorilla owned profile copies unwind every allocation failure" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const config = Memorilla{ .enabled = true, .profiles = &.{
+                .{ .name = "first", .encoder = "encoder-a", .decoder = "decoder-a", .memory_module_path = "/models/first" },
+                .{ .name = "second", .encoder = "encoder-b", .decoder = "decoder-b", .memory_module_path = "/models/second" },
+            } };
+            var owned = try config.clone(a);
+            defer owned.deinit(a);
+            try std.testing.expect(owned.profiles.ptr != config.profiles.ptr);
+            try std.testing.expect(owned.profiles[1].encoder.ptr != config.profiles[1].encoder.ptr);
+            try std.testing.expectEqualStrings("decoder-b", (try owned.find("second")).decoder);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 pub fn parseKeepAliveMs(raw: []const u8) !u64 {
     if (std.mem.eql(u8, raw, "0")) return 0;
     if (raw.len == 0) return error.InvalidInferenceModelCacheConfig;
@@ -82,7 +190,7 @@ pub fn replacementPath(key: []const u8, nested: bool) ?[]const u8 {
     if (nested) return null;
     if (std.mem.eql(u8, key, "graph_execution")) return "resources.query.request_limits.graph";
     if (std.mem.eql(u8, key, "process_memory_budget_mb")) return "resources.memory.max_bytes (byte units)";
-    inline for (.{ "models_dir", "ml_dir", "preload", "max_loaded_models", "keep_alive", "prompt_cache", "kernel_jit", "content_security", "s3_credentials", "pool_size", "generation_batching", "cooperative_execution", "http_max_body_mb" }) |model_key| {
+    inline for (.{ "models_dir", "ml_dir", "preload", "max_loaded_models", "keep_alive", "prompt_cache", "kernel_jit", "content_security", "s3_credentials", "pool_size", "generation_batching", "cooperative_execution", "http_max_body_mb", "memorilla" }) |model_key| {
         if (std.mem.eql(u8, key, model_key)) return "inference." ++ model_key;
     }
     return null;

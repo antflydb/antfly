@@ -21,6 +21,8 @@
 // - Model architecture implementations (BERT, etc.)
 
 pub const safetensors = @import("safetensors.zig");
+pub const memorilla_qualification = @import("memorilla_qualification.zig");
+pub const memorilla_runtime = @import("memorilla_runtime.zig");
 pub const weight_source = @import("weight_source.zig");
 pub const tensor_access = @import("tensor_access.zig");
 pub const tensor_store = @import("tensor_store.zig");
@@ -41,6 +43,8 @@ pub const gliner_boundary_artifact = @import("gliner_boundary_artifact.zig");
 pub const gliner_boundary_bundle = @import("gliner_boundary_bundle.zig");
 
 test {
+    _ = memorilla_qualification;
+    _ = memorilla_runtime;
     _ = safetensors;
     _ = weight_source;
     _ = tensor_access;

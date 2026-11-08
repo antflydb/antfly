@@ -1665,6 +1665,7 @@ pub const JitModelProfile = enum {
     florence2,
     gemma4,
     qwen3_embedding,
+    qwen3_generation,
     qwen3_vl_generation,
 };
 
@@ -1694,6 +1695,7 @@ pub const JitRouteScope = struct {
             .gliner2,
             .florence2,
             .qwen3_embedding,
+            .qwen3_generation,
             .qwen3_vl_generation,
             => .{},
             .gemma4 => .{ .production = .{
@@ -4871,6 +4873,27 @@ pub const KernelModule = struct {
             self.attention_f32 != null and
             self.attention_f32_block != null and
             self.layer_norm_f32 != null;
+    }
+
+    /// Dense Qwen3 text decoding needs ordinary RoPE and Q/K head RMSNorm,
+    /// not Qwen3-VL vision/M-RoPE or Gemma-only sampling primitives. Keep the
+    /// initial route on bundled BF16-weight/F32-activation kernels.
+    pub fn hasQwen3GenerationPrimitives(self: *const KernelModule) bool {
+        return self.hasBf16WeightPrimitives() and
+            self.linear_f32 != null and
+            self.copy_f32 != null and
+            self.rms_norm_f32 != null and
+            self.rms_norm_heads_rope_f32 != null and
+            self.rope_f32 != null and
+            self.elementwise_f32 != null and
+            self.silu_multiply_f32 != null and
+            self.gqa_attention_f32 != null and
+            self.gqa_attention_decode_f32 != null and
+            self.gqa_attention_decode_scalars_f32 != null and
+            self.kv_write_suffix_decode_scalars_f32 != null and
+            self.gqa_attention_decode_turboquant_f32 != null and
+            self.kv_write_suffix_turboquant_f32 != null and
+            self.argmax_last_row_f32 != null;
     }
 
     pub fn hasBf16WeightPrimitives(self: *const KernelModule) bool {
@@ -20443,6 +20466,40 @@ test "bundled BF16 Q4_0 WMMA availability excludes compute-75 PTX fallbacks" {
     }
 }
 
+test "Qwen3 generation CUDA primitive gate requires device decode and QK normalization" {
+    const available: driver_mod.CUfunction = @ptrFromInt(1);
+    var module = KernelModule{
+        .linear_bf16_weight_f32_tiled = available,
+        .embedding_lookup_bf16_weight_f32 = available,
+        .embedding_lookup_i32_bf16_weight_f32 = available,
+        .linear_bf16_weight_f32_qkv_nobias_tiled = available,
+        .linear_f32 = available,
+        .copy_f32 = available,
+        .rms_norm_f32 = available,
+        .rms_norm_heads_rope_f32 = available,
+        .rope_f32 = available,
+        .elementwise_f32 = available,
+        .silu_multiply_f32 = available,
+        .gqa_attention_f32 = available,
+        .gqa_attention_decode_f32 = available,
+        .gqa_attention_decode_scalars_f32 = available,
+        .kv_write_suffix_decode_scalars_f32 = available,
+        .gqa_attention_decode_turboquant_f32 = available,
+        .kv_write_suffix_turboquant_f32 = available,
+        .argmax_last_row_f32 = available,
+    };
+    try std.testing.expect(module.hasQwen3GenerationPrimitives());
+    // Text-only BF16 execution must not need unrelated quantized or vision
+    // kernels. Losing a decode/write/norm kernel must fail admission.
+    try std.testing.expect(!module.hasQwen3EmbeddingPrimitives());
+    try std.testing.expect(!module.hasQwen3VlGenerationPrimitives());
+    inline for (.{ "rms_norm_heads_rope_f32", "gqa_attention_decode_scalars_f32", "kv_write_suffix_decode_scalars_f32", "kv_write_suffix_turboquant_f32", "linear_bf16_weight_f32_tiled" }) |name| {
+        @field(module, name) = null;
+        try std.testing.expect(!module.hasQwen3GenerationPrimitives());
+        @field(module, name) = available;
+    }
+}
+
 test "CUDA runtime JIT profile scope covers only Gemma4 production routes" {
     inline for (.{
         JitModelProfile.clipclap,
@@ -20451,6 +20508,7 @@ test "CUDA runtime JIT profile scope covers only Gemma4 production routes" {
         JitModelProfile.gliner2,
         JitModelProfile.florence2,
         JitModelProfile.qwen3_embedding,
+        JitModelProfile.qwen3_generation,
         JitModelProfile.qwen3_vl_generation,
     }) |profile| {
         try std.testing.expect(!JitRouteScope.maximumForProfile(profile).enabled());

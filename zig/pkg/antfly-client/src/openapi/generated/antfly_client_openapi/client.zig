@@ -880,6 +880,17 @@ pub const Client = struct {
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
+    /// Generate a memory answer with optional source verification
+    /// POST /ai/v1/memorilla/generate
+    pub fn generateMemorilla(self: *@This(), body: types.InferenceMemorillaGenerateRequest) !ApiResponse(types.InferenceMemorillaGenerateResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/memorilla/generate", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceMemorillaGenerateResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// List available models
     /// GET /ai/v1/models
     pub fn listModels(self: *@This()) !ApiResponse(types.InferenceModelsResponse) {

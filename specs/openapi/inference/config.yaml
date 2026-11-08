@@ -981,6 +981,178 @@ components:
           type: string
           description: ID of the tool call this message is responding to (only for role=tool)
 
+    MemorillaProfileConfig:
+      type: object
+      additionalProperties: false
+      required: [name, encoder, decoder, memory_module_path]
+      description: An administrator-configured, immutable Memorilla model composition. Only the qualified Qwen3 F32 CUDA profiles are supported.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        encoder:
+          type: string
+          minLength: 1
+          description: Managed encoder reference using the qwen3_encoder_f32_v1 execution profile.
+        decoder:
+          type: string
+          minLength: 1
+          description: Managed decoder reference using the qwen3_decoder_f32_kv_f32_v1 execution profile.
+        memory_module_path:
+          type: string
+          minLength: 1
+          description: Local exported released-checkpoint bundle directory. This path is configured by the administrator and cannot be supplied by an inference request.
+        max_documents:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 64
+        max_new_tokens:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 128
+    MemorillaRuntimeConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        enabled:
+          type: boolean
+          default: false
+        profiles:
+          type: array
+          maxItems: 16
+          default: []
+          items:
+            $ref: '#/components/schemas/MemorillaProfileConfig'
+    MemorillaGenerateRequest:
+      type: object
+      additionalProperties: false
+      required: [model, question, document_embeddings, encoder_execution_identity]
+      description: |
+        Generate a buffered answer over caller-supplied stored document embeddings.
+        Features must be full-width normalized outputs of the configured encoder
+        execution profile. The server applies the pinned FP16-storage/BF16-readout
+        conversion. The identity pins compatibility; it does not authenticate the
+        origin, authorization, or collection coverage of caller-supplied vectors.
+        The first release supports greedy decoding with fresh F32 KV only.
+        context_mode=source_verified generates an independent source answer and
+        checks its support. A memory candidate requires exact agreement with that
+        supported answer; otherwise the source answer or abstention is returned.
+        This explicit mode does not establish
+        source truth, authorization, or text/vector association cryptographically.
+      properties:
+        model:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Name from inference.memorilla.profiles. Requests cannot override the bound model assets or memory module.
+        question:
+          type: string
+          minLength: 1
+          maxLength: 8192
+          description: A nonempty question admitted to the configured encoder's 256-token limit after canonical whitespace normalization.
+        document_embeddings:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: array
+            minItems: 2560
+            maxItems: 2560
+            items:
+              type: number
+              format: float
+        encoder_execution_identity:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Exact model_identity returned by the qualified encoder. Ordinary mixed-precision encoder identities are incompatible.
+        max_new_tokens:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 64
+          description: Maximum tokens for each answer candidate. Source-verified mode generates a memory candidate and an independent source answer, plus at most one verifier call of eight tokens; usage reports all phases. Every phase also respects profile and operator ceilings.
+        context_mode:
+          type: string
+          enum: [latent, source_verified]
+          default: latent
+          description: Latent uses stored features alone. Source-verified mode requires document_texts and explicitly checks or replaces the memory candidate using their contents.
+        document_texts:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+            maxLength: 8192
+          description: Required only for source_verified and rejected in latent mode. One nonblank UTF-8 source text per embedding row, in the same order; at most 8192 bytes each and 32768 source bytes total. The complete rendered prompt must fit the 1024-token internal bound and operator limits, without truncation. Pairing is asserted by the caller, not recomputed or authenticated.
+    MemorillaGenerateUsage:
+      type: object
+      additionalProperties: false
+      required: [encoder_query_tokens, prompt_tokens, completion_tokens]
+      properties:
+        encoder_query_tokens: { type: integer, minimum: 0 }
+        prompt_tokens: { type: integer, minimum: 0 }
+        completion_tokens: { type: integer, minimum: 0 }
+        total_prompt_tokens:
+          type: integer
+          minimum: 0
+          description: Source-verified mode only. Decoder prompt tokens across memory, independent source answering and verification phases, regardless of the final answer path.
+        total_completion_tokens:
+          type: integer
+          minimum: 0
+          description: Source-verified mode only. Actual decoder output tokens across every phase, including discarded candidates and verifier labels.
+        verification_calls: { type: integer, minimum: 0, maximum: 1 }
+        source_fallback_used:
+          type: boolean
+          description: Source-verified mode only. True when the final selection uses the source-answer or abstention path, false for memory_verified. Independent source-answer work occurs even for memory_verified and is included in total token usage.
+    MemorillaGenerateResponse:
+      type: object
+      additionalProperties: false
+      required: [model, text, token_ids, finish_reason, input_documents, memory_tokens, context_source, encoder_execution_identity, decoder_execution_identity, memory_module_sha256, usage]
+      properties:
+        model: { type: string }
+        text: { type: string }
+        token_ids:
+          type: array
+          items: { type: integer, minimum: 0 }
+        finish_reason:
+          type: string
+          enum: [eos, length, abstained]
+          description: Abstained is a policy-produced UNKNOWN answer with empty token_ids and zero final completion tokens. Source-verified mode never publishes a truncated factual answer.
+        input_documents: { type: integer, minimum: 1, maximum: 64 }
+        memory_tokens:
+          type: integer
+          enum: [0, 16]
+          description: Memory slots used by the published answer. Sixteen for latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-verified mode still evaluates an initial memory candidate.
+        context_source:
+          type: string
+          enum: [supplied_embeddings, supplied_embeddings_and_documents]
+        answer_path:
+          type: string
+          enum: [memory_verified, source_fallback_verified, abstained]
+          description: Present in source-verified mode and identifies the actual published answer path.
+        verification_status:
+          type: string
+          enum: [model_supported, abstained]
+          description: Model-supported means a completed verifier emitted the exact positive support label. It is a model judgment, not a formal entailment proof or a guarantee that caller-provided source facts are true.
+        source_alignment:
+          type: string
+          enum: [caller_supplied]
+          description: Source text and embedding row association was supplied by the caller; native embeddings are not recomputed to certify it.
+        document_text_sha256s:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items: { type: string, pattern: '^[0-9a-f]{64}$' }
+          description: Source-verified mode only. SHA256 of each original UTF-8 source text, preserving row order; identifies supplied bytes, not source authority or selected supporting citations.
+        encoder_execution_identity: { type: string, pattern: '^[0-9a-f]{64}$' }
+        decoder_execution_identity: { type: string, pattern: '^[0-9a-f]{64}$' }
+        memory_module_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        usage:
+          $ref: '#/components/schemas/MemorillaGenerateUsage'
     GenerateRequest:
       type: object
       required:
@@ -1520,6 +1692,9 @@ components:
     RuntimeConfig:
       type: object
       properties:
+        memorilla:
+          $ref: '#/components/schemas/MemorillaRuntimeConfig'
+          description: Disabled-by-default native memory generation over supplied stored features. Profiles bind all model assets administratively; existing resource policy remains authoritative.
         http_max_body_mb:
           type: integer
           minimum: 1

@@ -1,0 +1,887 @@
+{
+  "schema": "antfly.memorilla.quality.v1",
+  "description": "Frozen synthetic development diagnostic: fictional factual worlds, counterfactual document dependence, multihop reasoning, distractors, order invariance, and missing-fact abstention. This small suite is not a production answer-quality release gate or an upstream benchmark reproduction.",
+  "diagnostic_only": true,
+  "release_gate": false,
+  "max_new_tokens": 48,
+  "cases": [
+    {
+      "id": "copper_badge_a",
+      "scenario": "copper_badge",
+      "category": "single_hop",
+      "question": "Who owns the copper access badge at Neral station? Give only the name.",
+      "documents": [
+        "At Neral station, the copper access badge belongs to Tovik.",
+        "At Neral station, the silver access badge belongs to Daskel.",
+        "At Orven station, the copper access badge belongs to Zorun."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Tovik"
+        ],
+        "forbidden": [
+          "Mivra",
+          "Daskel",
+          "Zorun"
+        ]
+      },
+      "evidence_document_indices": [
+        0
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "copper_badge_b",
+      "scenario": "copper_badge",
+      "category": "single_hop",
+      "question": "Who owns the copper access badge at Neral station? Give only the name.",
+      "documents": [
+        "At Neral station, the copper access badge belongs to Mivra.",
+        "At Neral station, the silver access badge belongs to Daskel.",
+        "At Orven station, the copper access badge belongs to Zorun."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Mivra"
+        ],
+        "forbidden": [
+          "Tovik",
+          "Daskel",
+          "Zorun"
+        ]
+      },
+      "evidence_document_indices": [
+        0
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "vault_code_a",
+      "scenario": "vault_code",
+      "category": "single_hop",
+      "question": "What is the unlock code for the Kelmor vault? Give only the four digits.",
+      "documents": [
+        "The unlock code for the Kelmor vault is 7428.",
+        "The unlock code for the Pelvan vault is 2806.",
+        "The Kelmor vault contains survey maps."
+      ],
+      "answer": {
+        "mode": "exact",
+        "aliases": [
+          "7428"
+        ],
+        "forbidden": [
+          "5931",
+          "2806"
+        ]
+      },
+      "evidence_document_indices": [
+        0
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "vault_code_b",
+      "scenario": "vault_code",
+      "category": "single_hop",
+      "question": "What is the unlock code for the Kelmor vault? Give only the four digits.",
+      "documents": [
+        "The unlock code for the Kelmor vault is 5931.",
+        "The unlock code for the Pelvan vault is 2806.",
+        "The Kelmor vault contains survey maps."
+      ],
+      "answer": {
+        "mode": "exact",
+        "aliases": [
+          "5931"
+        ],
+        "forbidden": [
+          "7428",
+          "2806"
+        ]
+      },
+      "evidence_document_indices": [
+        0
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "ferry_destination_a",
+      "scenario": "ferry_destination",
+      "category": "single_hop",
+      "question": "Where does the Ruma ferry terminate? Give only the destination name.",
+      "documents": [
+        "The Ruma ferry terminates at Velkor.",
+        "The Saren ferry terminates at Nerith.",
+        "The Ruma ferry carries sealed mailbags."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Velkor"
+        ],
+        "forbidden": [
+          "Nimeth",
+          "Nerith"
+        ]
+      },
+      "evidence_document_indices": [
+        0
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "ferry_destination_b",
+      "scenario": "ferry_destination",
+      "category": "single_hop",
+      "question": "Where does the Ruma ferry terminate? Give only the destination name.",
+      "documents": [
+        "The Ruma ferry terminates at Nimeth.",
+        "The Saren ferry terminates at Nerith.",
+        "The Ruma ferry carries sealed mailbags."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Nimeth"
+        ],
+        "forbidden": [
+          "Velkor",
+          "Nerith"
+        ]
+      },
+      "evidence_document_indices": [
+        0
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "indicator_color_a",
+      "scenario": "indicator_color",
+      "category": "single_hop",
+      "question": "What color is the Selnix indicator? Give only the color.",
+      "documents": [
+        "The Selnix indicator is cobalt.",
+        "The Marvek indicator is green.",
+        "The Selnix indicator is mounted beside the hatch."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "cobalt"
+        ],
+        "forbidden": [
+          "amber",
+          "green"
+        ]
+      },
+      "evidence_document_indices": [
+        0
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "indicator_color_b",
+      "scenario": "indicator_color",
+      "category": "single_hop",
+      "question": "What color is the Selnix indicator? Give only the color.",
+      "documents": [
+        "The Selnix indicator is amber.",
+        "The Marvek indicator is green.",
+        "The Selnix indicator is mounted beside the hatch."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "amber"
+        ],
+        "forbidden": [
+          "cobalt",
+          "green"
+        ]
+      },
+      "evidence_document_indices": [
+        0
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "banner_material_a",
+      "scenario": "banner_material",
+      "category": "single_hop",
+      "question": "What fabric is the Ralo banner made from? Give only the fabric.",
+      "documents": [
+        "The Ralo banner is made from velvet.",
+        "The Varnek banner is made from silk.",
+        "The Ralo banner hangs in the north alcove."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "velvet"
+        ],
+        "forbidden": [
+          "linen",
+          "silk"
+        ]
+      },
+      "evidence_document_indices": [
+        0
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "banner_material_b",
+      "scenario": "banner_material",
+      "category": "single_hop",
+      "question": "What fabric is the Ralo banner made from? Give only the fabric.",
+      "documents": [
+        "The Ralo banner is made from linen.",
+        "The Varnek banner is made from silk.",
+        "The Ralo banner hangs in the north alcove."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "linen"
+        ],
+        "forbidden": [
+          "velvet",
+          "silk"
+        ]
+      },
+      "evidence_document_indices": [
+        0
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "lantern_courier_a",
+      "scenario": "lantern_courier",
+      "category": "two_hop",
+      "question": "Who carries the crate containing the signal lantern? Give only the name.",
+      "documents": [
+        "The signal lantern is inside the Kovar crate.",
+        "Veyra carries the Kovar crate.",
+        "Dasken carries the Nerel crate."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Veyra"
+        ],
+        "forbidden": [
+          "Lethan",
+          "Dasken"
+        ]
+      },
+      "evidence_document_indices": [
+        0,
+        1
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "lantern_courier_b",
+      "scenario": "lantern_courier",
+      "category": "two_hop",
+      "question": "Who carries the crate containing the signal lantern? Give only the name.",
+      "documents": [
+        "The signal lantern is inside the Kovar crate.",
+        "Lethan carries the Kovar crate.",
+        "Dasken carries the Nerel crate."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Lethan"
+        ],
+        "forbidden": [
+          "Veyra",
+          "Dasken"
+        ]
+      },
+      "evidence_document_indices": [
+        0,
+        1
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "power_caretaker_a",
+      "scenario": "power_caretaker",
+      "category": "two_hop",
+      "question": "Who maintains the observatory that powers Project Zenix? Give only the name.",
+      "documents": [
+        "Project Zenix draws power from the Kavor observatory.",
+        "The Kavor observatory is maintained by Oskel.",
+        "The Fendor observatory is maintained by Fesna.",
+        "Project Marlen draws power from the Fendor observatory."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Oskel"
+        ],
+        "forbidden": [
+          "Ravik",
+          "Fesna"
+        ]
+      },
+      "evidence_document_indices": [
+        0,
+        1
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "power_caretaker_b",
+      "scenario": "power_caretaker",
+      "category": "two_hop",
+      "question": "Who maintains the observatory that powers Project Zenix? Give only the name.",
+      "documents": [
+        "Project Zenix draws power from the Kavor observatory.",
+        "The Kavor observatory is maintained by Ravik.",
+        "The Fendor observatory is maintained by Fesna.",
+        "Project Marlen draws power from the Fendor observatory."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Ravik"
+        ],
+        "forbidden": [
+          "Oskel",
+          "Fesna"
+        ]
+      },
+      "evidence_document_indices": [
+        0,
+        1
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "beacon_home_a",
+      "scenario": "beacon_home",
+      "category": "two_hop",
+      "question": "Where does the caretaker of the Meren beacon live? Give only the place name.",
+      "documents": [
+        "The caretaker of the Meren beacon is Nuvik.",
+        "Nuvik lives in Talvor.",
+        "The caretaker of the Sarnel beacon is Favin.",
+        "Favin lives in Vameth."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Talvor"
+        ],
+        "forbidden": [
+          "Eshren",
+          "Vameth"
+        ]
+      },
+      "evidence_document_indices": [
+        0,
+        1
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "beacon_home_b",
+      "scenario": "beacon_home",
+      "category": "two_hop",
+      "question": "Where does the caretaker of the Meren beacon live? Give only the place name.",
+      "documents": [
+        "The caretaker of the Meren beacon is Nuvik.",
+        "Nuvik lives in Eshren.",
+        "The caretaker of the Sarnel beacon is Favin.",
+        "Favin lives in Vameth."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Eshren"
+        ],
+        "forbidden": [
+          "Talvor",
+          "Vameth"
+        ]
+      },
+      "evidence_document_indices": [
+        0,
+        1
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "parcel_key_a",
+      "scenario": "parcel_key",
+      "category": "two_hop",
+      "question": "Which locker holds the personal key of the courier for parcel Denra? Give only the locker name.",
+      "documents": [
+        "The courier for parcel Denra is Quven.",
+        "Quven keeps a personal key in the Durnel locker.",
+        "Sivren keeps a personal key in the Kelvan locker."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Durnel",
+          "Durnel locker"
+        ],
+        "forbidden": [
+          "Rethal",
+          "Rethal locker",
+          "Kelvan",
+          "Kelvan locker"
+        ]
+      },
+      "evidence_document_indices": [
+        0,
+        1
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "parcel_key_b",
+      "scenario": "parcel_key",
+      "category": "two_hop",
+      "question": "Which locker holds the personal key of the courier for parcel Denra? Give only the locker name.",
+      "documents": [
+        "The courier for parcel Denra is Quven.",
+        "Quven keeps a personal key in the Rethal locker.",
+        "Sivren keeps a personal key in the Kelvan locker."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Rethal",
+          "Rethal locker"
+        ],
+        "forbidden": [
+          "Durnel",
+          "Durnel locker",
+          "Kelvan",
+          "Kelvan locker"
+        ]
+      },
+      "evidence_document_indices": [
+        0,
+        1
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "instrument_key_a",
+      "scenario": "instrument_key",
+      "category": "three_hop",
+      "question": "What is the name of the access key owned by the person assigned the chest containing the Selmar instrument? Give only the key name.",
+      "documents": [
+        "The Selmar instrument is stored in the Veylen chest.",
+        "The Veylen chest is assigned to Lomar.",
+        "Lomar owns the access key named Fenvik.",
+        "Darven owns the access key named Norvak."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Fenvik"
+        ],
+        "forbidden": [
+          "Kethra",
+          "Norvak"
+        ]
+      },
+      "evidence_document_indices": [
+        0,
+        1,
+        2
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "instrument_key_b",
+      "scenario": "instrument_key",
+      "category": "three_hop",
+      "question": "What is the name of the access key owned by the person assigned the chest containing the Selmar instrument? Give only the key name.",
+      "documents": [
+        "The Selmar instrument is stored in the Veylen chest.",
+        "The Veylen chest is assigned to Lomar.",
+        "Lomar owns the access key named Kethra.",
+        "Darven owns the access key named Norvak."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Kethra"
+        ],
+        "forbidden": [
+          "Fenvik",
+          "Norvak"
+        ]
+      },
+      "evidence_document_indices": [
+        0,
+        1,
+        2
+      ],
+      "tags": [
+        "fictional",
+        "counterfactual",
+        "distractors"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": false
+    },
+    {
+      "id": "notebook_order_a",
+      "scenario": "notebook_order",
+      "category": "order_invariance",
+      "question": "Who owns the drawer containing the yellow notebook? Give only the name.",
+      "documents": [
+        "The yellow notebook is in the Torven drawer.",
+        "The Torven drawer belongs to Zalin.",
+        "The black notebook is in the Kasven drawer.",
+        "The Kasven drawer belongs to Mereth."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Zalin"
+        ],
+        "forbidden": [
+          "Mereth"
+        ]
+      },
+      "evidence_document_indices": [
+        0,
+        1
+      ],
+      "tags": [
+        "fictional",
+        "distractors",
+        "permutation"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": true
+    },
+    {
+      "id": "notebook_order_b",
+      "scenario": "notebook_order",
+      "category": "order_invariance",
+      "question": "Who owns the drawer containing the yellow notebook? Give only the name.",
+      "documents": [
+        "The Kasven drawer belongs to Mereth.",
+        "The black notebook is in the Kasven drawer.",
+        "The Torven drawer belongs to Zalin.",
+        "The yellow notebook is in the Torven drawer."
+      ],
+      "answer": {
+        "mode": "entity",
+        "aliases": [
+          "Zalin"
+        ],
+        "forbidden": [
+          "Mereth"
+        ]
+      },
+      "evidence_document_indices": [
+        2,
+        3
+      ],
+      "tags": [
+        "fictional",
+        "distractors",
+        "permutation"
+      ],
+      "diagnostic_only": false,
+      "permutation_check": true
+    },
+    {
+      "id": "missing_bowl_shelf_a",
+      "scenario": "missing_bowl_shelf",
+      "category": "missing_fact",
+      "question": "Which shelf holds the Felnar bowl? If the records do not state a shelf, answer UNKNOWN.",
+      "documents": [
+        "The Felnar bowl is ceramic.",
+        "The Felnar bowl was catalogued by Taren.",
+        "The Olmek bowl is kept on the third shelf."
+      ],
+      "answer": {
+        "mode": "abstention",
+        "aliases": [
+          "UNKNOWN",
+          "Not stated",
+          "Not provided",
+          "Cannot be determined",
+          "The records do not say"
+        ],
+        "forbidden": [
+          "third",
+          "third shelf",
+          "Taren"
+        ]
+      },
+      "evidence_document_indices": [],
+      "tags": [
+        "fictional",
+        "distractors",
+        "missing_fact",
+        "abstention_diagnostic"
+      ],
+      "diagnostic_only": true,
+      "permutation_check": false
+    },
+    {
+      "id": "missing_bowl_shelf_b",
+      "scenario": "missing_bowl_shelf",
+      "category": "missing_fact",
+      "question": "Which shelf holds the Felnar bowl? If the records do not state a shelf, answer UNKNOWN.",
+      "documents": [
+        "The Felnar bowl is copper.",
+        "The Felnar bowl was catalogued by Vasken.",
+        "The Olmek bowl is kept on the sixth shelf."
+      ],
+      "answer": {
+        "mode": "abstention",
+        "aliases": [
+          "UNKNOWN",
+          "Not stated",
+          "Not provided",
+          "Cannot be determined",
+          "The records do not say"
+        ],
+        "forbidden": [
+          "sixth",
+          "sixth shelf",
+          "Vasken"
+        ]
+      },
+      "evidence_document_indices": [],
+      "tags": [
+        "fictional",
+        "distractors",
+        "missing_fact",
+        "abstention_diagnostic"
+      ],
+      "diagnostic_only": true,
+      "permutation_check": false
+    }
+  ],
+  "pairs": [
+    {
+      "id": "copper_badge",
+      "relation": "counterfactual",
+      "case_ids": [
+        "copper_badge_a",
+        "copper_badge_b"
+      ]
+    },
+    {
+      "id": "vault_code",
+      "relation": "counterfactual",
+      "case_ids": [
+        "vault_code_a",
+        "vault_code_b"
+      ]
+    },
+    {
+      "id": "ferry_destination",
+      "relation": "counterfactual",
+      "case_ids": [
+        "ferry_destination_a",
+        "ferry_destination_b"
+      ]
+    },
+    {
+      "id": "indicator_color",
+      "relation": "counterfactual",
+      "case_ids": [
+        "indicator_color_a",
+        "indicator_color_b"
+      ]
+    },
+    {
+      "id": "banner_material",
+      "relation": "counterfactual",
+      "case_ids": [
+        "banner_material_a",
+        "banner_material_b"
+      ]
+    },
+    {
+      "id": "lantern_courier",
+      "relation": "counterfactual",
+      "case_ids": [
+        "lantern_courier_a",
+        "lantern_courier_b"
+      ]
+    },
+    {
+      "id": "power_caretaker",
+      "relation": "counterfactual",
+      "case_ids": [
+        "power_caretaker_a",
+        "power_caretaker_b"
+      ]
+    },
+    {
+      "id": "beacon_home",
+      "relation": "counterfactual",
+      "case_ids": [
+        "beacon_home_a",
+        "beacon_home_b"
+      ]
+    },
+    {
+      "id": "parcel_key",
+      "relation": "counterfactual",
+      "case_ids": [
+        "parcel_key_a",
+        "parcel_key_b"
+      ]
+    },
+    {
+      "id": "instrument_key",
+      "relation": "counterfactual",
+      "case_ids": [
+        "instrument_key_a",
+        "instrument_key_b"
+      ]
+    },
+    {
+      "id": "notebook_order",
+      "relation": "order_invariance",
+      "case_ids": [
+        "notebook_order_a",
+        "notebook_order_b"
+      ]
+    },
+    {
+      "id": "missing_bowl_shelf",
+      "relation": "missing_fact",
+      "case_ids": [
+        "missing_bowl_shelf_a",
+        "missing_bowl_shelf_b"
+      ]
+    }
+  ]
+}

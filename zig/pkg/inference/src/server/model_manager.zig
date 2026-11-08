@@ -1490,6 +1490,15 @@ const EmbeddingAssetGate = struct {
         if (self.reader_count == 1) spinLock(&self.resource_mutex);
     }
 
+    fn lockSharedWithControl(self: *EmbeddingAssetGate, control: InferenceExecutionControl) !void {
+        try control.lock(&self.reader_gate);
+        defer self.reader_gate.unlock();
+        try control.lock(&self.reader_mutex);
+        defer self.reader_mutex.unlock();
+        if (self.reader_count == 0) try control.lock(&self.resource_mutex);
+        self.reader_count += 1;
+    }
+
     fn tryLockShared(self: *EmbeddingAssetGate) bool {
         if (!self.reader_gate.tryLock()) return false;
         defer self.reader_gate.unlock();
@@ -1513,6 +1522,12 @@ const EmbeddingAssetGate = struct {
     fn lockExclusive(self: *EmbeddingAssetGate) void {
         spinLock(&self.reader_gate);
         spinLock(&self.resource_mutex);
+    }
+
+    fn lockExclusiveWithControl(self: *EmbeddingAssetGate, control: InferenceExecutionControl) !void {
+        try control.lock(&self.reader_gate);
+        errdefer self.reader_gate.unlock();
+        try control.lock(&self.resource_mutex);
     }
 
     fn tryLockExclusive(self: *EmbeddingAssetGate) bool {
@@ -2532,7 +2547,28 @@ fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_
         for (artifacts.external_paths) |tensor_path| try external.append(alloc, try alloc.dupe(u8, tensor_path));
     }
     try paths.appendSlice(alloc, external.items);
-    return componentDependencySignature(io, paths.items);
+    return memorillaModelIdentity(try componentDependencySignature(io, paths.items), manifest.memorilla_profile);
+}
+
+fn memorillaModelIdentity(base: [32]u8, profile: ?@import("../models/memorilla_qualification.zig").Profile) [32]u8 {
+    const selected = profile orelse return base;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly.memorilla.model-identity.v1\x00");
+    hash.update(&base);
+    hash.update(@tagName(selected));
+    hash.update("\x00");
+    hash.update(@import("../models/memorilla_qualification.zig").lock_bytes);
+    return hash.finalResult();
+}
+
+test "Memorilla model identity binds execution profile while preserving legacy identities" {
+    const base: [32]u8 = @splat(42);
+    try std.testing.expectEqualSlices(u8, &base, &memorillaModelIdentity(base, null));
+    const encoder = memorillaModelIdentity(base, .qwen3_encoder_f32_v1);
+    const decoder = memorillaModelIdentity(base, .qwen3_decoder_f32_kv_f32_v1);
+    try std.testing.expect(!std.mem.eql(u8, &base, &encoder));
+    try std.testing.expect(!std.mem.eql(u8, &encoder, &decoder));
+    try std.testing.expectEqualSlices(u8, &encoder, &memorillaModelIdentity(base, .qwen3_encoder_f32_v1));
 }
 
 // Legacy managed receipts may lack a digest. Hash those files once per local
@@ -2654,7 +2690,7 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
         }
         var result: [32]u8 = undefined;
         hash.final(&result);
-        return result;
+        return memorillaModelIdentity(result, manifest.memorilla_profile);
     }
     return resolutionModelRevision(a, io, manifest);
 }
@@ -2773,6 +2809,13 @@ fn chunkPlanningPaths(manifest: manifest_mod.ModelManifest, out: *[9][]const u8)
         out[count] = path;
         count += 1;
     };
+    // Explicit wrap policy lives in model_manifest.json rather than tokenizer
+    // bytes. Its changes must fence warm chunk planning just like a tokenizer
+    // replacement. Legacy recipes keep their existing dependency set.
+    if (manifest.embedding_trailing_eos_id != null) if (manifest.model_manifest_path) |path| {
+        out[count] = path;
+        count += 1;
+    };
     return out[0..count];
 }
 fn chunkPlanningSnapshot(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest, fallback: [32]u8) !ChunkPlanningSnapshot {
@@ -2789,6 +2832,12 @@ fn chunkPlanningSnapshotWithControl(a: std.mem.Allocator, io: std.Io, manifest: 
     const recipe = try std.json.Stringify.valueAlloc(a, .{ .style = manifest.embedding_style, .tokenizer = manifest.tokenizer_type, .context = manifest.maxTextSequenceLength() }, .{});
     defer a.free(recipe);
     hash.update(recipe);
+    if (manifest.embedding_trailing_eos_id) |token_id| {
+        hash.update("explicit-embedding-trailing-eos-v1");
+        var encoded: [4]u8 = undefined;
+        std.mem.writeInt(i32, &encoded, token_id, .little);
+        hash.update(&encoded);
+    }
     if (manifest.tokenizer_json_path == null and manifest.vocab_txt_path == null) hash.update(&fallback);
     var embedded_tokenizer_digest: ?[32]u8 = null;
     for (paths) |path| {
@@ -2873,6 +2922,7 @@ pub const LoadedModel = struct {
     residency_mode: RuntimeResidencyMode = .backend_managed,
     chunk_planning: ?ChunkPlanningSnapshot = null,
     resolution_revision: ?[32]u8 = null,
+    memorilla_artifact_generation: ?[32]u8 = null,
     /// Portable checkpoint identity is bound to this loaded asset generation.
     /// Unsupported bundles keep this optional capability disabled.
     native_kv_asset_generation: ?[32]u8 = null,
@@ -3067,6 +3117,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn verifyEmbeddingIdentityWithControl(self: *const LoadedModel, control: InferenceExecutionControl) !void {
+        if (self.manifest.memorilla_profile != null) return self.verifyMemorillaIdentityWithControl(control);
         const mutable = @constCast(self);
         try control.check();
         const validation = if (mutable.embedding_validation) |*value| value else return;
@@ -3090,6 +3141,29 @@ pub const LoadedModel = struct {
         // calls reload instead of reusing a permanently stale generation.
         self.model_manager.retireLoadedModel(mutable);
         return error.ModelArtifactsChanging;
+    }
+
+    pub fn verifyMemorillaIdentityWithControl(self: *const LoadedModel, control: InferenceExecutionControl) !void {
+        const qualified = @import("../models/memorilla_qualification.zig");
+        const profile = self.manifest.memorilla_profile orelse return error.UnsupportedMemorillaArtifact;
+        try self.verifyOwnerPublication(control);
+        try session_factory.requireMemorillaProfile(self.session, profile);
+        const expected = self.memorilla_artifact_generation orelse return error.InvalidEmbeddingIdentity;
+        const actual = qualified.artifactGeneration(self.allocator, self.publicationIo(control), self.model_dir, profile, control) catch |err| switch (err) {
+            error.Cancelled, error.Canceled, error.Timeout => return err,
+            else => {
+                self.model_manager.retireLoadedModel(@constCast(self));
+                return err;
+            },
+        };
+        const identity = qualified.executionIdentity(profile);
+        if (!std.mem.eql(u8, &expected, &actual) or self.embedding_identity == null or
+            !std.mem.eql(u8, &identity, &self.embedding_identity.?))
+        {
+            self.model_manager.retireLoadedModel(@constCast(self));
+            return error.ModelArtifactsChanging;
+        }
+        try control.check();
     }
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
@@ -3312,6 +3386,15 @@ pub const LoadedModel = struct {
             return .{ .gate = &self.embedding_asset_gate, .access = .exclusive };
         }
         self.embedding_asset_gate.lockShared();
+        return .{ .gate = &self.embedding_asset_gate, .access = .shared };
+    }
+
+    pub fn acquireEmbeddingAssetLeaseWithControl(self: *LoadedModel, include_audio: bool, control: InferenceExecutionControl) !EmbeddingAssetLease {
+        if (include_audio) {
+            try self.embedding_asset_gate.lockExclusiveWithControl(control);
+            return .{ .gate = &self.embedding_asset_gate, .access = .exclusive };
+        }
+        try self.embedding_asset_gate.lockSharedWithControl(control);
         return .{ .gate = &self.embedding_asset_gate, .access = .shared };
     }
 
@@ -3553,8 +3636,9 @@ pub const LoadedModel = struct {
         const resident_text_encoder = (self.session.backend() == .native and self.manifest.embedding_style == .embedding_gemma2) or
             ((self.session.backend() == .metal or self.session.backend() == .cuda) and session_factory.supportsResidentTextEncoder(self.session));
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
-            .max_length = self.manifest.maxTextSequenceLength(),
-            .reject_truncation = self.manifest.embedding_style == .embedding_gemma2,
+            .max_length = if (self.manifest.memorilla_profile == .qwen3_encoder_f32_v1) @import("../models/memorilla_qualification.zig").max_text_tokens else self.manifest.maxTextSequenceLength(),
+            .batch_size = if (self.manifest.memorilla_profile == .qwen3_encoder_f32_v1) 4 else 32,
+            .reject_truncation = self.manifest.embedding_style == .embedding_gemma2 or self.manifest.memorilla_profile == .qwen3_encoder_f32_v1,
             .normalize = self.manifest.normalize,
             .pooling = switch (self.manifest.pooling) {
                 .mean => .mean,
@@ -3578,14 +3662,11 @@ pub const LoadedModel = struct {
             .allow_image = self.manifest.inputs.len == 0 or model_caps.modelAcceptsInput(&self.manifest, "image"),
             .allow_video = self.manifest.embedding_style == .embedding_gemma2 and model_caps.modelAcceptsInput(&self.manifest, "video"),
             .allow_audio = self.manifest.inputs.len == 0 or model_caps.modelAcceptsInput(&self.manifest, "audio"),
-            .strict_max_length = self.manifest.embedding_style == .embedding_gemma2,
+            .strict_max_length = self.manifest.embedding_style == .embedding_gemma2 or self.manifest.memorilla_profile == .qwen3_encoder_f32_v1,
             .preprocess_io = self.executor_io,
             // Last-token pooling reads the EOS position; guarantee exactly
             // one trailing EOS regardless of tokenizer.json snapshot age.
-            .ensure_trailing_eos_id = if (isJinaStyleEmbeddingManifest(&self.manifest) and tok.specialTokens().sep_id >= 0)
-                tok.specialTokens().sep_id
-            else
-                null,
+            .ensure_trailing_eos_id = self.manifest.embeddingTrailingEosId(tok.specialTokens().sep_id),
         });
         if (usesClipImagePreprocessProfile(&self.manifest)) {
             pipeline.config.image_preprocess_profile = .clip;
@@ -3885,6 +3966,42 @@ test "embedding asset gate admits concurrent readers and excludes writers" {
     var lease = EmbeddingAssetLease{ .gate = &gate, .access = .shared };
     lease.release();
     lease.release();
+    try std.testing.expect(gate.tryLockExclusive());
+    gate.unlockExclusive();
+}
+
+test "embedding asset controlled acquisition unwinds cancellation at every lock" {
+    const Probe = struct {
+        checks: usize = 0,
+        fail_at: usize,
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks == self.fail_at) return error.Cancelled;
+        }
+    };
+    for (1..4) |fail_at| {
+        var gate = EmbeddingAssetGate{};
+        var probe = Probe{ .fail_at = fail_at };
+        try std.testing.expectError(error.Cancelled, gate.lockSharedWithControl(.{ .ptr = &probe, .check_fn = Probe.check }));
+        try std.testing.expectEqual(@as(usize, 0), gate.reader_count);
+        try std.testing.expect(gate.tryLockExclusive());
+        gate.unlockExclusive();
+    }
+    for (1..3) |fail_at| {
+        var gate = EmbeddingAssetGate{};
+        var probe = Probe{ .fail_at = fail_at };
+        try std.testing.expectError(error.Cancelled, gate.lockExclusiveWithControl(.{ .ptr = &probe, .check_fn = Probe.check }));
+        try std.testing.expect(gate.tryLockShared());
+        gate.unlockShared();
+    }
+    var gate = EmbeddingAssetGate{};
+    gate.lockExclusive();
+    var queued = Probe{ .fail_at = 2 };
+    try std.testing.expectError(error.Cancelled, gate.lockSharedWithControl(.{ .ptr = &queued, .check_fn = Probe.check }));
+    try std.testing.expect(!gate.tryLockShared());
+    gate.unlockExclusive();
     try std.testing.expect(gate.tryLockExclusive());
     gate.unlockExclusive();
 }
@@ -4862,6 +4979,18 @@ const TeardownTicket = struct {
 /// A caller may keep its lightweight weight preflight or delegate to the
 /// manager's exact construction plan and retained residency/workspace lease.
 pub const ModelLoadAdmission = enum { preflight_checked, managed };
+
+fn requiresManagedModelAdmission(enabled: bool, admission: ModelLoadAdmission, profile: ?@import("../models/memorilla_qualification.zig").Profile) bool {
+    return enabled or admission == .managed or profile != null;
+}
+
+test "Memorilla model profiles require retained admission in an unconfigured manager" {
+    try std.testing.expect(!requiresManagedModelAdmission(false, .preflight_checked, null));
+    try std.testing.expect(requiresManagedModelAdmission(true, .preflight_checked, null));
+    try std.testing.expect(requiresManagedModelAdmission(false, .managed, null));
+    try std.testing.expect(requiresManagedModelAdmission(false, .preflight_checked, .qwen3_encoder_f32_v1));
+    try std.testing.expect(requiresManagedModelAdmission(false, .preflight_checked, .qwen3_decoder_f32_kv_f32_v1));
+}
 
 pub const ModelLoadPreflight = struct {
     context: *anyopaque,
@@ -9476,6 +9605,10 @@ pub const ModelManager = struct {
         defer tokenizer_artifacts.deinit();
         tokenizer_artifacts.verification_cache = &self.verified_artifacts;
         const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
+        const memorilla_artifact_generation: ?[32]u8 = if (man.memorilla_profile) |profile|
+            try @import("../models/memorilla_qualification.zig").artifactGeneration(self.allocator, publication_io, model_dir, profile, control orelse .{})
+        else
+            null;
         const resolution_revision = try modelIdentityWithArtifacts(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man, &tokenizer_artifacts);
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
         const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
@@ -9714,10 +9847,17 @@ pub const ModelManager = struct {
         const chunk_planning = try chunkPlanningSnapshotWithControl(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision, control orelse .{});
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
         if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
+        if (man.memorilla_profile) |profile| {
+            const qualified = @import("../models/memorilla_qualification.zig");
+            const current = try qualified.artifactGeneration(self.allocator, publication_io, model_dir, profile, control orelse .{});
+            if (!std.mem.eql(u8, &memorilla_artifact_generation.?, &current)) return error.ModelArtifactsChanging;
+            try session_factory.requireMemorillaProfile(session, profile);
+        }
         model.* = .{
             .managed_publication = managed_publication,
             .chunk_planning = chunk_planning,
             .resolution_revision = resolution_revision,
+            .memorilla_artifact_generation = memorilla_artifact_generation,
             .native_kv_asset_generation = native_kv_asset_generation,
             .native_kv_tokenizer_contract = if (native_kv_asset_generation != null) .{
                 .route = switch (tokenizer_type) {
@@ -9726,7 +9866,7 @@ pub const ModelManager = struct {
                 },
                 .preserve_inline_specials = if (sp_tok) |sp| sp.preserve_inline_specials_after_literal_bos else false,
             } else null,
-            .embedding_identity = if (embedding_snapshot) |snapshot| eg2_identity.forBackend(snapshot.digest, session.backend()) else null,
+            .embedding_identity = if (man.memorilla_profile) |profile| @import("../models/memorilla_qualification.zig").executionIdentity(profile) else if (embedding_snapshot) |snapshot| eg2_identity.forBackend(snapshot.digest, session.backend()) else null,
             .embedding_validation = if (embedding_snapshot) |snapshot| .{ .value = snapshot } else null,
             .manifest = man,
             .hf_tok = hf_tok,
@@ -11398,6 +11538,15 @@ fn estimateModelLoadAdmission(
     a4b_request: ?backend_contracts.A4bInferenceRequest,
     laya_packed: bool,
 ) !ModelLoadAdmissionPlan {
+    if (man.memorilla_profile) |profile| {
+        if (backend_runtime.backend != .cuda) return error.MemorillaRequiresCuda;
+        const qualified = @import("../models/memorilla_qualification.zig");
+        try qualified.requireRecipe(profile, man);
+        const amounts = try qualified.residencyPlan(man.allocator, profile);
+        // Keep operator limits authoritative. A named precision profile never
+        // enlarges a shared deployment budget to make its own admission pass.
+        return .{ .peak = amounts.peak, .resident = amounts.resident };
+    }
     const weights = try estimateModelArtifactBytes(man);
     if (!manifestHasNativeAssets(man)) return onnxModelLoadAdmission(weights, backend_runtime);
     if (backend_runtime.backend == .metal) {
@@ -11775,6 +11924,27 @@ fn enterSessionConstruction(
     return active.enterUninterruptible(backend_runtime.loadInterruption());
 }
 
+fn memorillaBackendOrder(
+    profile: ?@import("../models/memorilla_qualification.zig").Profile,
+    candidates: []const backends.BackendType,
+    scratch: *[1]backends.BackendType,
+) ![]const backends.BackendType {
+    if (profile == null) return candidates;
+    for (candidates) |candidate| if (candidate == .cuda) {
+        scratch[0] = .cuda;
+        return scratch;
+    };
+    return error.MemorillaRequiresCuda;
+}
+
+test "Memorilla managed models require CUDA without changing ordinary fallback order" {
+    var scratch: [1]backends.BackendType = undefined;
+    const ordinary: []const backends.BackendType = &.{ .native, .cuda, .metal };
+    try std.testing.expectEqualSlices(backends.BackendType, ordinary, try memorillaBackendOrder(null, ordinary, &scratch));
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, try memorillaBackendOrder(.qwen3_encoder_f32_v1, ordinary, &scratch));
+    try std.testing.expectError(error.MemorillaRequiresCuda, memorillaBackendOrder(.qwen3_decoder_f32_kv_f32_v1, &.{ .native, .metal }, &scratch));
+}
+
 fn loadSessionForPreferredBackends(
     manager: *ModelManager,
     preferred_backends: []const backends.BackendType,
@@ -11794,7 +11964,8 @@ fn loadSessionForPreferredBackends(
         available_backends,
         &required_backend_scratch,
     );
-    const effective_backends = policy_backends;
+    var memorilla_backend_scratch: [1]backends.BackendType = undefined;
+    const effective_backends = try memorillaBackendOrder(man.memorilla_profile, policy_backends, &memorilla_backend_scratch);
     const fail_closed_cuda_a4b = source_session_manager.a4b_inference_request == null and
         backends.backendOrderSelectsCudaBeforeCpu(effective_backends) and
         (try session_factory.resolveCudaA4bInferenceConfigForModelListing(
@@ -11869,7 +12040,7 @@ fn loadSessionForPreferredBackends(
             }
         else
             .preflight_checked;
-        const managed_admission = manager.admission_enabled or load_admission == .managed;
+        const managed_admission = requiresManagedModelAdmission(manager.admission_enabled, load_admission, man.memorilla_profile);
         var single_backend = [_]backends.BackendType{backend};
         var backend_session_manager = sessionManagerForPreferredBackends(manager.allocator, single_backend[0..], source_session_manager);
         const backend_runtime = backend_session_manager.resolveBackendRuntime(backend) catch |err| {
@@ -11943,7 +12114,7 @@ fn loadSessionForPreferredBackends(
             return err;
         };
         defer if (close_protection) |protection| protection.release();
-        if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
+        if (backend_session_manager.loadModelWithControl(candidate_path, control)) |loaded_session| {
             var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
             std.debug.assert(loaded.session.close_protection == null);
             loaded.session.close_protection = close_protection;
@@ -16427,6 +16598,74 @@ test "embeddinggemma2 planning precision follows required backend before prefere
     try std.testing.expectEqual(backends.BackendType.metal, embeddingPlanningBackend(manager));
     manager.required_backend = .native;
     try std.testing.expectEqual(backends.BackendType.native, embeddingPlanningBackend(manager));
+}
+
+test "memory encoder recipe identity fences EOS policy and manifest changes in chunk planning" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "same tokenizer bytes" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = "{\"embedding_trailing_eos_id\":151643}" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const tokenizer = try std.fs.path.join(a, &.{ root, "tokenizer.json" });
+    defer a.free(tokenizer);
+    const declaration = try std.fs.path.join(a, &.{ root, "model_manifest.json" });
+    defer a.free(declaration);
+    var manifest: manifest_mod.ModelManifest = .{ .allocator = a, .tokenizer_json_path = tokenizer, .model_manifest_path = declaration, .model_type = .embedder, .embedding_style = .qwen3_embedding };
+    const legacy = try chunkPlanningSnapshot(a, io, manifest, @splat(0));
+    manifest.embedding_trailing_eos_id = 151643;
+    const original = try chunkPlanningSnapshot(a, io, manifest, @splat(0));
+    try std.testing.expect(!std.mem.eql(u8, &legacy.digest, &original.digest));
+    manifest.embedding_trailing_eos_id = 151645;
+    const other = try chunkPlanningSnapshot(a, io, manifest, @splat(0));
+    try std.testing.expect(!std.mem.eql(u8, &original.digest, &other.digest));
+    manifest.embedding_trailing_eos_id = 151643;
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = "{\"embedding_trailing_eos_id\":151645,\"changed\":true}" });
+    const changed_file = try chunkPlanningSnapshot(a, io, manifest, @splat(0));
+    try std.testing.expect(!std.mem.eql(u8, &original.signature, &changed_file.signature));
+    try std.testing.expect(!std.mem.eql(u8, &original.digest, &changed_file.digest));
+    manifest.embedding_trailing_eos_id = null;
+    const same_legacy = try chunkPlanningSnapshot(a, io, manifest, @splat(0));
+    try std.testing.expectEqual(legacy.digest, same_legacy.digest);
+    try std.testing.expectEqual(legacy.signature, same_legacy.signature);
+}
+
+test "memory encoder recipe identity includes managed manifest prefix and EOS bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const weights = "identical fake BF16 weights";
+    const memory = @import("../registry/qwen3_embedding_catalog.zig").memorilla_bundle_model_manifest;
+    const other_eos = try std.mem.replaceOwned(u8, a, memory, "151643", "151645");
+    defer a.free(other_eos);
+    const retrieval = @import("../registry/qwen3_embedding_catalog.zig").safetensors_4b_model_manifest;
+    var identities: [3][32]u8 = undefined;
+    for ([_][]const u8{ memory, other_eos, retrieval }, 0..) |body, index| {
+        const leaf = try std.fmt.allocPrint(a, "recipe-{d}", .{index});
+        defer a.free(leaf);
+        try tmp.dir.createDirPath(io, leaf);
+        var dir = try tmp.dir.openDir(io, leaf, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = weights });
+        try dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = body });
+        var weight_digest: [32]u8 = undefined;
+        var manifest_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(weights, &weight_digest, .{});
+        std.crypto.hash.sha2.Sha256.hash(body, &manifest_digest, .{});
+        const weight_hex = std.fmt.bytesToHex(weight_digest, .lower);
+        const manifest_hex = std.fmt.bytesToHex(manifest_digest, .lower);
+        const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .version = 2, .artifacts = &.{ .{ .path = "model.safetensors", .size = weights.len, .sha256 = &weight_hex }, .{ .path = "model_manifest.json", .size = body.len, .sha256 = &manifest_hex } } }, .{});
+        defer a.free(receipt);
+        try dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+        const path = try dir.realPathFileAlloc(io, ".", a);
+        defer a.free(path);
+        identities[index] = try modelIdentity(a, io, path, .{ .allocator = a });
+    }
+    try std.testing.expect(!std.mem.eql(u8, &identities[0], &identities[1]));
+    try std.testing.expect(!std.mem.eql(u8, &identities[0], &identities[2]));
 }
 
 test "chunk planning survives metadata-only re-pulls and rejects changed tokenizer bytes" {

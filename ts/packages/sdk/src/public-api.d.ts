@@ -5168,6 +5168,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/memorilla/generate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Generate a memory answer with optional source verification
+         * @description Requires inference.memorilla.enabled and an administrator-configured
+         *     profile. Runs the native question encoder, released memory module, and
+         *     decoder with the qualified F32 CUDA arithmetic and fresh F32 KV.
+         *     Responses are buffered. Streaming, sampling, caller-selected assets,
+         *     prefix caches, and speculative decoding are not accepted by this route.
+         *     Caller-supplied embeddings are a compatibility-bound model input, not
+         *     proof of database authorization, freshness, provenance, or coverage.
+         *     Explicit context_mode=source_verified also requires aligned document_texts.
+         *     An independent source answer is generated without showing the memory
+         *     candidate and must pass the model entailment check. The memory candidate
+         *     can be published only if it agrees exactly after boundary whitespace
+         *     trimming; otherwise the supported source answer is used. Incomplete,
+         *     truncated or unsupported source answers cause abstention.
+         *     Responses identify the final answer path and account
+         *     for all internal generation and verification calls. A model support
+         *     judgment is not a formal proof, and text/vector pairing is caller-supplied.
+         */
+        post: operations["generateMemorilla"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/generate": {
         parameters: {
             query?: never;
@@ -23732,6 +23767,8 @@ export interface components {
             reason?: string;
             wait?: components["schemas"]["ResolverWait"];
         };
+        InferenceMemorillaGenerateRequest: components["schemas"]["MemorillaGenerateRequest"];
+        InferenceMemorillaGenerateResponse: components["schemas"]["MemorillaGenerateResponse"];
         /** @description One loading or loaded incarnation of a model in this inference server. Backend session and composite-cache implementation details are private. */
         InferenceModelInstance: {
             /** @description Opaque incarnation identifier; changes after eviction and reload. */
@@ -23785,7 +23822,7 @@ export interface components {
              * @description Machine-readable capacity source when the failure is retryable
              * @enum {string}
              */
-            reason?: "inference_capacity" | "inference_admission";
+            reason?: "inference_capacity" | "inference_admission" | "model_publication";
             /** @description Whether retrying the request may succeed */
             retryable?: boolean;
             /** @description Minimum retry delay in milliseconds */
@@ -23805,7 +23842,7 @@ export interface components {
              * @description Machine-readable capacity source
              * @enum {string}
              */
-            reason: "inference_capacity" | "inference_admission";
+            reason: "inference_capacity" | "inference_admission" | "model_publication";
             /**
              * @description Always true for a transient-capacity response
              * @enum {boolean}
@@ -30552,6 +30589,92 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /**
+         * @description Generate a buffered answer over caller-supplied stored document embeddings.
+         *     Features must be full-width normalized outputs of the configured encoder
+         *     execution profile. The server applies the pinned FP16-storage/BF16-readout
+         *     conversion. The identity pins compatibility; it does not authenticate the
+         *     origin, authorization, or collection coverage of caller-supplied vectors.
+         *     The first release supports greedy decoding with fresh F32 KV only.
+         *     context_mode=source_verified generates an independent source answer and
+         *     checks its support. A memory candidate requires exact agreement with that
+         *     supported answer; otherwise the source answer or abstention is returned.
+         *     This explicit mode does not establish
+         *     source truth, authorization, or text/vector association cryptographically.
+         */
+        MemorillaGenerateRequest: {
+            /** @description Name from inference.memorilla.profiles. Requests cannot override the bound model assets or memory module. */
+            model: string;
+            /** @description A nonempty question admitted to the configured encoder's 256-token limit after canonical whitespace normalization. */
+            question: string;
+            document_embeddings: number[][];
+            /** @description Exact model_identity returned by the qualified encoder. Ordinary mixed-precision encoder identities are incompatible. */
+            encoder_execution_identity: string;
+            /**
+             * @description Maximum tokens for each answer candidate. Source-verified mode generates a memory candidate and an independent source answer, plus at most one verifier call of eight tokens; usage reports all phases. Every phase also respects profile and operator ceilings.
+             * @default 64
+             */
+            max_new_tokens?: number;
+            /**
+             * @description Latent uses stored features alone. Source-verified mode requires document_texts and explicitly checks or replaces the memory candidate using their contents.
+             * @default latent
+             * @enum {string}
+             */
+            context_mode?: "latent" | "source_verified";
+            /** @description Required only for source_verified and rejected in latent mode. One nonblank UTF-8 source text per embedding row, in the same order; at most 8192 bytes each and 32768 source bytes total. The complete rendered prompt must fit the 1024-token internal bound and operator limits, without truncation. Pairing is asserted by the caller, not recomputed or authenticated. */
+            document_texts?: string[];
+        };
+        MemorillaGenerateUsage: {
+            encoder_query_tokens: number;
+            prompt_tokens: number;
+            completion_tokens: number;
+            /** @description Source-verified mode only. Decoder prompt tokens across memory, independent source answering and verification phases, regardless of the final answer path. */
+            total_prompt_tokens?: number;
+            /** @description Source-verified mode only. Actual decoder output tokens across every phase, including discarded candidates and verifier labels. */
+            total_completion_tokens?: number;
+            verification_calls?: number;
+            /** @description Source-verified mode only. True when the final selection uses the source-answer or abstention path, false for memory_verified. Independent source-answer work occurs even for memory_verified and is included in total token usage. */
+            source_fallback_used?: boolean;
+        };
+        MemorillaGenerateResponse: {
+            model: string;
+            text: string;
+            token_ids: number[];
+            /**
+             * @description Abstained is a policy-produced UNKNOWN answer with empty token_ids and zero final completion tokens. Source-verified mode never publishes a truncated factual answer.
+             * @enum {string}
+             */
+            finish_reason: "eos" | "length" | "abstained";
+            input_documents: number;
+            /**
+             * @description Memory slots used by the published answer. Sixteen for latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-verified mode still evaluates an initial memory candidate.
+             * @enum {integer}
+             */
+            memory_tokens: 0 | 16;
+            /** @enum {string} */
+            context_source: "supplied_embeddings" | "supplied_embeddings_and_documents";
+            /**
+             * @description Present in source-verified mode and identifies the actual published answer path.
+             * @enum {string}
+             */
+            answer_path?: "memory_verified" | "source_fallback_verified" | "abstained";
+            /**
+             * @description Model-supported means a completed verifier emitted the exact positive support label. It is a model judgment, not a formal entailment proof or a guarantee that caller-provided source facts are true.
+             * @enum {string}
+             */
+            verification_status?: "model_supported" | "abstained";
+            /**
+             * @description Source text and embedding row association was supplied by the caller; native embeddings are not recomputed to certify it.
+             * @enum {string}
+             */
+            source_alignment?: "caller_supplied";
+            /** @description Source-verified mode only. SHA256 of each original UTF-8 source text, preserving row order; identifies supplied bytes, not source authority or selected supporting citations. */
+            document_text_sha256s?: string[];
+            encoder_execution_identity: string;
+            decoder_execution_identity: string;
+            memory_module_sha256: string;
+            usage: components["schemas"]["MemorillaGenerateUsage"];
+        };
         /** @description Content part supported by chunking requests. */
         InferenceChunkContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["MediaContentPart"] | components["schemas"]["ChunkSourceReference"];
         /** @description Options for Voice Activity Detection (VAD) based audio segmentation. */
@@ -30923,6 +31046,26 @@ export interface components {
                 request_limits?: components["schemas"]["InferenceRequestLimitsConfig"];
             };
         };
+        /** @description An administrator-configured, immutable Memorilla model composition. Only the qualified Qwen3 F32 CUDA profiles are supported. */
+        MemorillaProfileConfig: {
+            name: string;
+            /** @description Managed encoder reference using the qwen3_encoder_f32_v1 execution profile. */
+            encoder: string;
+            /** @description Managed decoder reference using the qwen3_decoder_f32_kv_f32_v1 execution profile. */
+            decoder: string;
+            /** @description Local exported released-checkpoint bundle directory. This path is configured by the administrator and cannot be supplied by an inference request. */
+            memory_module_path: string;
+            /** @default 64 */
+            max_documents?: number;
+            /** @default 128 */
+            max_new_tokens?: number;
+        };
+        MemorillaRuntimeConfig: {
+            /** @default false */
+            enabled?: boolean;
+            /** @default [] */
+            profiles?: components["schemas"]["MemorillaProfileConfig"][];
+        };
         /**
          * @description Low-level content download policy. File downloads always require an
          *     explicit nonempty `allowed_paths` list. In the generic scraper, omitted
@@ -31168,6 +31311,8 @@ export interface components {
             style?: components["schemas"]["Style"];
         };
         RuntimeConfig: {
+            /** @description Disabled-by-default native memory generation over supplied stored features. Profiles bind all model assets administratively; existing resource policy remains authoritative. */
+            memorilla?: components["schemas"]["MemorillaRuntimeConfig"];
             /**
              * @description Encoded HTTP inference body ceiling in MiB, independent of decoded-media resource policy.
              * @default 10
@@ -43539,6 +43684,122 @@ export interface operations {
             };
             /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: components["responses"]["TransientCapacity"];
+        };
+    };
+    generateMemorilla: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceMemorillaGenerateRequest"];
+            };
+        };
+        responses: {
+            /** @description Buffered answer and actual model usage */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceMemorillaGenerateResponse"];
+                };
+            };
+            /** @description Invalid features or unsupported request options */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Feature disabled or configured profile not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Request cancelled before publication */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Encoder execution identity or model publication changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Request exceeds the declared collection, token, or resource limits */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Native execution or configured artifact failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Shared capacity, changing model publication, or required worker unavailable; inspect retryable before retrying. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    /** @description Minimum retry delay in seconds when the failure is transient */
+                    "Retry-After"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference deadline expired before publication */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Request exceeds its finite working-memory budget */
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
         };
     };
     generateContent: {

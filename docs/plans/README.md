@@ -14,6 +14,7 @@ linking back to the current documentation. See [placement rules](../README.md#pl
 
 ## Proposed work
 
+- [Memorilla native inference and Gemma memory training](memorilla-native-memory.md)
 - [Native video inference and EmbeddingGemma 2](native-video-inference.md)
 - [Model-aware media chunking and optional embeddings](model-aware-media-chunking.md)
 - [Lake ingestion, change capture, and publication](lake-ingestion-and-publication.md)

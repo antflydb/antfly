@@ -735,6 +735,9 @@ pub const Session = struct {
         hasLayaDecisions: ?*const fn (ptr: *anyopaque) bool = null,
         runLayaDecisions: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror!?[]Tensor = null,
         run: *const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor,
+        /// Optional physical allocation fence for a forward whose admission
+        /// lease is already held. Null keeps the existing backend entry points.
+        runAdmitted: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, amounts: ?memory.AdmissionAmounts) anyerror![]Tensor = null,
         inputInfo: *const fn (ptr: *anyopaque) []const TensorInfo,
         outputInfo: *const fn (ptr: *anyopaque) []const TensorInfo,
         /// Explicit stage-level row independence for multi-entry-point sessions
@@ -775,7 +778,7 @@ pub const Session = struct {
         else
             null;
         errdefer if (resource_lease) |*lease| lease.release();
-        const outputs = try self.vtable.run(self.ptr, inputs, allocator);
+        const outputs = try self.runAdmitted(inputs, allocator, null, if (resource_lease) |lease| lease.amounts else null);
         errdefer deinitTensorSlice(outputs, allocator);
         return attachOutputAdmission(outputs, allocator, &resource_lease);
     }
@@ -800,10 +803,16 @@ pub const Session = struct {
             resource_lease = null;
             return err;
         };
-        const outputs = try self.vtable.runWithControl(self.ptr, inputs, allocator, active);
+        const outputs = try self.runAdmitted(inputs, allocator, active, if (resource_lease) |lease| lease.amounts else null);
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
         return attachOutputAdmission(outputs, allocator, &resource_lease);
+    }
+
+    fn runAdmitted(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, amounts: ?memory.AdmissionAmounts) ![]Tensor {
+        if (self.vtable.runAdmitted) |run_admitted| return run_admitted(self.ptr, inputs, allocator, control, amounts);
+        if (control) |active| return self.vtable.runWithControl(self.ptr, inputs, allocator, active);
+        return self.vtable.run(self.ptr, inputs, allocator);
     }
 
     /// Optional typed-decision route. Only an unsupported/disabled capability
@@ -1270,7 +1279,7 @@ pub const RunPermit = struct {
     ) ![]Tensor {
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) return self.runWithControl(inputs, allocator, null);
-        return self.session.vtable.run(self.session.ptr, inputs, allocator);
+        return self.session.runAdmitted(inputs, allocator, null, if (self.lease) |lease| lease.amounts else null);
     }
 
     pub fn runWithControl(
@@ -1291,11 +1300,11 @@ pub const RunPermit = struct {
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
-        const outputs = try self.session.vtable.runWithControl(
-            self.session.ptr,
+        const outputs = try self.session.runAdmitted(
             inputs,
             allocator,
             active,
+            if (self.lease) |lease| lease.amounts else null,
         );
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
@@ -1613,6 +1622,51 @@ const DeadlineProbeSession = struct {
         .runWithControl = runWithControl,
     };
 };
+
+test "Memorilla admitted forward receives only its held execution lease" {
+    const Probe = struct {
+        controller: *memory.AdmissionController,
+        calls: usize = 0,
+        expected_backend: usize = 0,
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) BackendType {
+            return .native;
+        }
+        fn admitted(ptr: *anyopaque, _: []const Tensor, allocator: std.mem.Allocator, _: ?InferenceExecutionControl, amounts: ?memory.AdmissionAmounts) anyerror![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const held = amounts orelse return error.MemorillaAdmissionRequired;
+            try std.testing.expectEqual(self.expected_backend, held.backend_scratch_bytes);
+            try std.testing.expectEqualDeep(held, self.controller.snapshot());
+            self.calls += 1;
+            return allocator.alloc(Tensor, 0);
+        }
+    };
+    var controller = memory.AdmissionController{};
+    var probe = Probe{ .controller = &controller, .expected_backend = 128 };
+    const session = Session{ .ptr = &probe, .vtable = &.{ .run = undefined, .runAdmitted = Probe.admitted, .inputInfo = Probe.info, .outputInfo = Probe.info, .backend = Probe.backend, .close = undefined }, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .gpu,
+        .limits = .{ .backend_limit_bytes = 1024 },
+        .static_workspace_bytes = 128,
+        .check_live_memory = false,
+    } };
+    const direct = try session.runWithControl(&.{}, std.testing.allocator, .{});
+    std.testing.allocator.free(direct);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+    probe.expected_backend = 256;
+    var permit = try session.admit(.{ .workspace_bytes = 256, .workspace_planned = true });
+    const permitted = try permit.runWithControl(&.{}, std.testing.allocator, .{});
+    std.testing.allocator.free(permitted);
+    try std.testing.expectEqual(@as(usize, 256), controller.snapshot().backend_scratch_bytes);
+    permit.deinit();
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+    var unadmitted = session;
+    unadmitted.run_admission = null;
+    try std.testing.expectError(error.MemorillaAdmissionRequired, unadmitted.run(&.{}, std.testing.allocator));
+}
 
 test "laya decision permit reuses admission and releases yielded output leases" {
     const Probe = struct {

@@ -26,7 +26,36 @@ pub const source_media = @import("inference_source.zig");
 const empty_registry = registry.Registry.init(std.heap.page_allocator);
 const generating = sources.generating_mod;
 
-pub const public_paths: []const []const u8 = &.{ "/ai/v1/models", "/ai/v1/chat/completions", "/ai/v1/embeddings", "/ai/v1/decisions", "/ai/v1/read", "/ai/v1/extract", "/ai/v1/rewrite", "/ai/v1/rerank", "/ai/v1/chunk", "/ai/v1/dictate", "/ai/v1/synthesize", "/ai/v1/embed", "/ai/v1/generate", "/ai/v1/generate/batch", "/ml/v1/predict", "/ml/v1/predictors", "/ml/v1/models", "/ai/v1/transcription/sessions", "/ai/v1/transcription/sessions/:session_id", "/ai/v1/transcription/sessions/:session_id/audio", "/ai/v1/transcription/sessions/:session_id/events", "/ai/v1/transcription/sessions/:session_id/stream", "/ai/v1/read/jobs", "/ai/v1/read/jobs/:job_id", "/ai/v1/read/jobs/:job_id/result", "/ai/v1/read/jobs/:job_id/events", "/ai/v1/read/jobs/:job_id/resume", "/ai/v1/read/jobs/:job_id/cancel", "/ai/v1/extract/jobs", "/ai/v1/extract/jobs/:job_id", "/ai/v1/extract/jobs/:job_id/result", "/ai/v1/extract/jobs/:job_id/events", "/ai/v1/extract/jobs/:job_id/resume", "/ai/v1/extract/jobs/:job_id/cancel" };
+pub const public_paths: []const []const u8 = &.{ "/ai/v1/models", "/ai/v1/chat/completions", "/ai/v1/embeddings", "/ai/v1/decisions", "/ai/v1/read", "/ai/v1/extract", "/ai/v1/rewrite", "/ai/v1/rerank", "/ai/v1/chunk", "/ai/v1/dictate", "/ai/v1/synthesize", "/ai/v1/embed", "/ai/v1/generate", "/ai/v1/generate/batch", "/ai/v1/memorilla/generate", "/ml/v1/predict", "/ml/v1/predictors", "/ml/v1/models", "/ai/v1/transcription/sessions", "/ai/v1/transcription/sessions/:session_id", "/ai/v1/transcription/sessions/:session_id/audio", "/ai/v1/transcription/sessions/:session_id/events", "/ai/v1/transcription/sessions/:session_id/stream", "/ai/v1/read/jobs", "/ai/v1/read/jobs/:job_id", "/ai/v1/read/jobs/:job_id/result", "/ai/v1/read/jobs/:job_id/events", "/ai/v1/read/jobs/:job_id/resume", "/ai/v1/read/jobs/:job_id/cancel", "/ai/v1/extract/jobs", "/ai/v1/extract/jobs/:job_id", "/ai/v1/extract/jobs/:job_id/result", "/ai/v1/extract/jobs/:job_id/events", "/ai/v1/extract/jobs/:job_id/resume", "/ai/v1/extract/jobs/:job_id/cancel" };
+
+/// Forward an administrator-bound composition without resolving its profile
+/// name through the ordinary generator registry. Authentication and public
+/// inference policy are applied by the HTTP adapter before this call.
+pub fn memorilla(server: anytype, ctx: *httpx.Context) !httpx.Response {
+    const body = (try ctx.body()) orelse return error.InvalidInferenceRequest;
+    var parsed = std.json.parseFromSlice(Json, ctx.allocator, body, .{}) catch return error.InvalidInferenceRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidInferenceRequest;
+    const model = parsed.value.object.get("model") orelse return error.ModelRequired;
+    if (model != .string or model.string.len == 0 or model.string.len > 128) return error.InvalidInferenceRequest;
+    const connection = if (server.cfg.local_inference_connection_target != null)
+        sources.common_config.local_inference_connection_id
+    else
+        sources.common_config.default_inference_connection_id;
+    var observation = tasks.Observation{
+        .allocator = ctx.allocator,
+        .request_id = ctx.response.headers.get("x-request-id") orelse try requestId(server, ctx, ctx.allocator),
+        .requested = model.string,
+        .resolved = model.string,
+        .executor = "antfly",
+        .connection = connection,
+        .task = "memorilla.generate",
+        .attempt = 1,
+        .started_ns = @import("antfly_platform").time.monotonicNs(),
+    };
+    defer observation.finish();
+    return forward(server, ctx, connection, "memorilla/generate", body, false, &observation, .{ .response_delivery = .buffered });
+}
 
 pub fn taskForOperation(operation: []const u8) ?gateway.Task {
     const Pair = struct { []const u8, gateway.Task };
@@ -2102,6 +2131,15 @@ test "httpx inference gateway physical decision catalogs apply connection image 
     try std.testing.expectEqual(gateway.Support.supported, connectionCatalogCapabilities(named, "generators", "vendor", "vision").images);
     config.connections.getPtr("vendor").?.inference.?.max_image_input_tokens = 8192;
     try std.testing.expectEqual(gateway.Support.supported, connectionCatalogCapabilities(named, "deciders", "vendor", "vision").images);
+}
+
+test "httpx inference gateway Memorilla owns normalized execution paths without generator resolution" {
+    try std.testing.expect(ownsPath("/ai/v1/memorilla/generate"));
+    try std.testing.expect(ownsPath("/ai//v1/memorilla//generate/"));
+    try std.testing.expect(!ownsPath("/ai/v1/memorilla/generate/other"));
+    try std.testing.expect(!isDiscoveryPath("/ai/v1/memorilla/generate"));
+    // Profile names must not be adapted through ordinary generator bindings.
+    try std.testing.expect(taskForOperation("memorilla/generate") == null);
 }
 
 test "httpx inference gateway admission translates the ingress executor clock" {

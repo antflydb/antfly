@@ -32067,6 +32067,10 @@ pub const InferenceKvCachePolicy = struct {
 
 pub const InferenceMediaContentPart = MediaContentPart;
 
+pub const InferenceMemorillaGenerateRequest = MemorillaGenerateRequest;
+
+pub const InferenceMemorillaGenerateResponse = MemorillaGenerateResponse;
+
 /// Inference memory ceilings in bytes. Omitted or zero values select automatic policy; physical capacity and the process envelope remain authoritative.
 pub const InferenceMemoryConfig = struct {
     /// Host memory ceiling.
@@ -36621,6 +36625,304 @@ pub const MediaOutputCoverageValues = struct {
         }
         if (self.degraded) |value| {
             try jw.objectField("degraded");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Generate a buffered answer over caller-supplied stored document embeddings. Features must be full-width normalized outputs of the configured encoder execution profile. The server applies the pinned FP16-storage/BF16-readout conversion. The identity pins compatibility; it does not authenticate the origin, authorization, or collection coverage of caller-supplied vectors. The first release supports greedy decoding with fresh F32 KV only. context_mode=source_verified generates an independent source answer and checks its support. A memory candidate requires exact agreement with that supported answer; otherwise the source answer or abstention is returned. This explicit mode does not establish source truth, authorization, or text/vector association cryptographically.
+pub const MemorillaGenerateRequest = struct {
+    /// Name from inference.memorilla.profiles. Requests cannot override the bound model assets or memory module.
+    model: []const u8,
+    /// A nonempty question admitted to the configured encoder's 256-token limit after canonical whitespace normalization.
+    question: []const u8,
+    document_embeddings: []const []const f32,
+    /// Exact model_identity returned by the qualified encoder. Ordinary mixed-precision encoder identities are incompatible.
+    encoder_execution_identity: []const u8,
+    /// Maximum tokens for each answer candidate. Source-verified mode generates a memory candidate and an independent source answer, plus at most one verifier call of eight tokens; usage reports all phases. Every phase also respects profile and operator ceilings.
+    max_new_tokens: ?i64 = null,
+    /// Latent uses stored features alone. Source-verified mode requires document_texts and explicitly checks or replaces the memory candidate using their contents.
+    context_mode: ?[]const u8 = null,
+    /// Required only for source_verified and rejected in latent mode. One nonblank UTF-8 source text per embedding row, in the same order; at most 8192 bytes each and 32768 source bytes total. The complete rendered prompt must fit the 1024-token internal bound and operator limits, without truncation. Pairing is asserted by the caller, not recomputed or authenticated.
+    document_texts: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "question", "question", false },
+        .{ "document_embeddings", "document_embeddings", false },
+        .{ "encoder_execution_identity", "encoder_execution_identity", false },
+        .{ "max_new_tokens", "max_new_tokens", true },
+        .{ "context_mode", "context_mode", true },
+        .{ "document_texts", "document_texts", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("question");
+        try jw.write(self.question);
+        try jw.objectField("document_embeddings");
+        try jw.write(self.document_embeddings);
+        try jw.objectField("encoder_execution_identity");
+        try jw.write(self.encoder_execution_identity);
+        if (self.max_new_tokens) |value| {
+            try jw.objectField("max_new_tokens");
+            try jw.write(value);
+        }
+        if (self.context_mode) |value| {
+            try jw.objectField("context_mode");
+            try jw.write(value);
+        }
+        if (self.document_texts) |value| {
+            try jw.objectField("document_texts");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const MemorillaGenerateResponse = struct {
+    model: []const u8,
+    text: []const u8,
+    token_ids: []const i64,
+    /// Abstained is a policy-produced UNKNOWN answer with empty token_ids and zero final completion tokens. Source-verified mode never publishes a truncated factual answer.
+    finish_reason: []const u8,
+    input_documents: i64,
+    /// Memory slots used by the published answer. Sixteen for latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-verified mode still evaluates an initial memory candidate.
+    memory_tokens: i64,
+    context_source: []const u8,
+    /// Present in source-verified mode and identifies the actual published answer path.
+    answer_path: ?[]const u8 = null,
+    /// Model-supported means a completed verifier emitted the exact positive support label. It is a model judgment, not a formal entailment proof or a guarantee that caller-provided source facts are true.
+    verification_status: ?[]const u8 = null,
+    /// Source text and embedding row association was supplied by the caller; native embeddings are not recomputed to certify it.
+    source_alignment: ?[]const u8 = null,
+    /// Source-verified mode only. SHA256 of each original UTF-8 source text, preserving row order; identifies supplied bytes, not source authority or selected supporting citations.
+    document_text_sha256s: ?[]const []const u8 = null,
+    encoder_execution_identity: []const u8,
+    decoder_execution_identity: []const u8,
+    memory_module_sha256: []const u8,
+    usage: MemorillaGenerateUsage,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "text", "text", false },
+        .{ "token_ids", "token_ids", false },
+        .{ "finish_reason", "finish_reason", false },
+        .{ "input_documents", "input_documents", false },
+        .{ "memory_tokens", "memory_tokens", false },
+        .{ "context_source", "context_source", false },
+        .{ "answer_path", "answer_path", true },
+        .{ "verification_status", "verification_status", true },
+        .{ "source_alignment", "source_alignment", true },
+        .{ "document_text_sha256s", "document_text_sha256s", true },
+        .{ "encoder_execution_identity", "encoder_execution_identity", false },
+        .{ "decoder_execution_identity", "decoder_execution_identity", false },
+        .{ "memory_module_sha256", "memory_module_sha256", false },
+        .{ "usage", "usage", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("token_ids");
+        try jw.write(self.token_ids);
+        try jw.objectField("finish_reason");
+        try jw.write(self.finish_reason);
+        try jw.objectField("input_documents");
+        try jw.write(self.input_documents);
+        try jw.objectField("memory_tokens");
+        try jw.write(self.memory_tokens);
+        try jw.objectField("context_source");
+        try jw.write(self.context_source);
+        if (self.answer_path) |value| {
+            try jw.objectField("answer_path");
+            try jw.write(value);
+        }
+        if (self.verification_status) |value| {
+            try jw.objectField("verification_status");
+            try jw.write(value);
+        }
+        if (self.source_alignment) |value| {
+            try jw.objectField("source_alignment");
+            try jw.write(value);
+        }
+        if (self.document_text_sha256s) |value| {
+            try jw.objectField("document_text_sha256s");
+            try jw.write(value);
+        }
+        try jw.objectField("encoder_execution_identity");
+        try jw.write(self.encoder_execution_identity);
+        try jw.objectField("decoder_execution_identity");
+        try jw.write(self.decoder_execution_identity);
+        try jw.objectField("memory_module_sha256");
+        try jw.write(self.memory_module_sha256);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        try jw.endObject();
+    }
+};
+
+pub const MemorillaGenerateUsage = struct {
+    encoder_query_tokens: i64,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    /// Source-verified mode only. Decoder prompt tokens across memory, independent source answering and verification phases, regardless of the final answer path.
+    total_prompt_tokens: ?i64 = null,
+    /// Source-verified mode only. Actual decoder output tokens across every phase, including discarded candidates and verifier labels.
+    total_completion_tokens: ?i64 = null,
+    verification_calls: ?i64 = null,
+    /// Source-verified mode only. True when the final selection uses the source-answer or abstention path, false for memory_verified. Independent source-answer work occurs even for memory_verified and is included in total token usage.
+    source_fallback_used: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "encoder_query_tokens", "encoder_query_tokens", false },
+        .{ "prompt_tokens", "prompt_tokens", false },
+        .{ "completion_tokens", "completion_tokens", false },
+        .{ "total_prompt_tokens", "total_prompt_tokens", true },
+        .{ "total_completion_tokens", "total_completion_tokens", true },
+        .{ "verification_calls", "verification_calls", true },
+        .{ "source_fallback_used", "source_fallback_used", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("encoder_query_tokens");
+        try jw.write(self.encoder_query_tokens);
+        try jw.objectField("prompt_tokens");
+        try jw.write(self.prompt_tokens);
+        try jw.objectField("completion_tokens");
+        try jw.write(self.completion_tokens);
+        if (self.total_prompt_tokens) |value| {
+            try jw.objectField("total_prompt_tokens");
+            try jw.write(value);
+        }
+        if (self.total_completion_tokens) |value| {
+            try jw.objectField("total_completion_tokens");
+            try jw.write(value);
+        }
+        if (self.verification_calls) |value| {
+            try jw.objectField("verification_calls");
+            try jw.write(value);
+        }
+        if (self.source_fallback_used) |value| {
+            try jw.objectField("source_fallback_used");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// An administrator-configured, immutable Memorilla model composition. Only the qualified Qwen3 F32 CUDA profiles are supported.
+pub const MemorillaProfileConfig = struct {
+    name: []const u8,
+    /// Managed encoder reference using the qwen3_encoder_f32_v1 execution profile.
+    encoder: []const u8,
+    /// Managed decoder reference using the qwen3_decoder_f32_kv_f32_v1 execution profile.
+    decoder: []const u8,
+    /// Local exported released-checkpoint bundle directory. This path is configured by the administrator and cannot be supplied by an inference request.
+    memory_module_path: []const u8,
+    max_documents: ?i64 = null,
+    max_new_tokens: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "encoder", "encoder", false },
+        .{ "decoder", "decoder", false },
+        .{ "memory_module_path", "memory_module_path", false },
+        .{ "max_documents", "max_documents", true },
+        .{ "max_new_tokens", "max_new_tokens", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("encoder");
+        try jw.write(self.encoder);
+        try jw.objectField("decoder");
+        try jw.write(self.decoder);
+        try jw.objectField("memory_module_path");
+        try jw.write(self.memory_module_path);
+        if (self.max_documents) |value| {
+            try jw.objectField("max_documents");
+            try jw.write(value);
+        }
+        if (self.max_new_tokens) |value| {
+            try jw.objectField("max_new_tokens");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const MemorillaRuntimeConfig = struct {
+    enabled: ?bool = null,
+    profiles: ?[]const MemorillaProfileConfig = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+        .{ "profiles", "profiles", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        if (self.profiles) |value| {
+            try jw.objectField("profiles");
             try jw.write(value);
         }
         try jw.endObject();
@@ -52830,6 +53132,8 @@ pub const RowFilterEntry = struct {
 };
 
 pub const RuntimeConfig = struct {
+    /// Disabled-by-default native memory generation over supplied stored features. Profiles bind all model assets administratively; existing resource policy remains authoritative.
+    memorilla: ?MemorillaRuntimeConfig = null,
     /// Encoded HTTP inference body ceiling in MiB, independent of decoded-media resource policy.
     http_max_body_mb: ?i64 = null,
     /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
@@ -52876,6 +53180,7 @@ pub const RuntimeConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "memorilla", "memorilla", true },
         .{ "http_max_body_mb", "http_max_body_mb", true },
         .{ "api_url", "api_url", true },
         .{ "api_key", "api_key", true },
@@ -52910,6 +53215,10 @@ pub const RuntimeConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.memorilla) |value| {
+            try jw.objectField("memorilla");
+            try jw.write(value);
+        }
         if (self.http_max_body_mb) |value| {
             try jw.objectField("http_max_body_mb");
             try jw.write(value);

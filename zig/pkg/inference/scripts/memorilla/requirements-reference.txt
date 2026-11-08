@@ -1,0 +1,6 @@
+# Install torch==2.7.0 from the official CPU wheel index separately.
+# CPU references do not require vLLM, FlashAttention, or a CUDA PyTorch wheel.
+numpy==2.2.6
+safetensors==0.5.3
+transformers==4.53.3
+pytest==8.3.5

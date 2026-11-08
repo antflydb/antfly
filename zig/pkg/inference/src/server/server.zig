@@ -73,6 +73,8 @@ const BoundedRequestAllocator = @import("../runtime/bounded_allocator.zig").Boun
 const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
 const generation = @import("../pipelines/generation.zig");
+pub const memorilla_service = @import("memorilla_service.zig");
+const memorilla_verified_service = @import("memorilla_verified_service.zig");
 const context_management = @import("context_management.zig");
 const native_kv_wire = @import("native_kv_wire.zig");
 const multimodal_reranker = @import("../pipelines/multimodal_reranker.zig");
@@ -1249,6 +1251,7 @@ pub fn httpBodyLimitBytesFromMib(mib: usize) error{InvalidHttpBodyLimit}!usize {
 pub const RequestLimits = platform.resource_policy.InferenceRequestLimits;
 
 pub const NodeConfig = struct {
+    memorilla: platform.inference_settings.Memorilla = .{},
     audio_readers: []const transcribing_api.NamedConfig = &.{},
     chunking_limits: @import("../pipelines/media_chunk_limits.zig").Limits = .{},
     models_dir: []const u8 = "./models",
@@ -4383,6 +4386,8 @@ pub const Node = struct {
     /// Every executable/host/engine path acquires this before model loading.
     cuda_device_budget_owner: ?*@import("../ops/cuda/device_budget_owner.zig").Owner = null,
     native_checkpoint_active: std.atomic.Value(bool) = .init(false),
+    /// Queue composed requests before acquiring either model or request bytes.
+    memorilla_execution_lane: execution_control_mod.ExecutionLane = .{},
     config: NodeConfig,
     document_artifacts: @import("../documents/artifacts.zig").Store = .{},
     provider_credentials: ?*ProviderCredentials = null,
@@ -4519,6 +4524,7 @@ pub const Node = struct {
         config.chunking_limits = try config.chunking_limits.environment(allocator);
         try config.request_limits.validate();
         try config.cooperative_execution.validate();
+        try config.memorilla.validate();
         if (config.http_max_connections == 0 or config.http_max_request_tasks == 0 or config.http_max_body_bytes == 0)
             return error.InvalidHttpTransportCapacity;
         if (config.kernel_jit.profile_capture_only) {
@@ -6319,6 +6325,7 @@ pub const Node = struct {
         defer direct_generation_slot.release();
         const prompt_cache_requested = prompt_cache_key != null and
             self.config.prompt_cache.enabled and
+            model.manifest.memorilla_profile != .qwen3_decoder_f32_kv_f32_v1 and
             promptCacheBackendEligible(self.config.prompt_cache.mode, backend_kind);
         const use_metal_whole_model = build_options.enable_metal and
             model.session.backend() == .metal and
@@ -14422,7 +14429,7 @@ pub const Node = struct {
         const identity = loaded.embedding_identity orelse std.fmt.bytesToHex(revision, .lower);
         try validateMediaOutputGeneration(resolved.identity, resolved.revision, identity, std.fmt.bytesToHex(revision, .lower));
         if (target.model_identity) |expected| if (!std.mem.eql(u8, expected, &identity)) return error.EmbeddingIdentityMismatch;
-        var config: embedding_mod.EmbeddingConfig = .{ .text_prefix = manifest.embedding_profile.document.prefix, .ensure_trailing_eos_id = if (manifest.isLastTokenDecoderEmbedder() and manifest.embedding_style != .embedding_gemma2 and tokenizer.specialTokens().sep_id >= 0) tokenizer.specialTokens().sep_id else null };
+        var config: embedding_mod.EmbeddingConfig = .{ .text_prefix = manifest.embedding_profile.document.prefix, .ensure_trailing_eos_id = manifest.embeddingTrailingEosId(tokenizer.specialTokens().sep_id) };
         const prefix = try applyDenseEmbeddingConfigRequestOptions(a, &config, manifest, .{ .model = target.model, .input = .null, .encoding_format = null, .dimensions = if (target.dimensions) |d| @intCast(d) else null, .task_type = task });
         defer if (prefix) |value| a.free(value);
         var adapter = ChunkEmbeddingAdapter{ .model = loaded, .manifest = manifest, .tokenizer = tokenizer, .revision = revision, .name = target.model, .identity = identity, .a = a, .control = control, .task = task, .dimensions = target.dimensions orelse if (manifest.embedding_style == .embedding_gemma2) @as(usize, 768) else manifest.hidden_size, .requested_dimensions = target.dimensions, .capacity = capacity, .prefix = config.text_prefix, .trailing_eos = config.ensure_trailing_eos_id, .cache = null, .contract = contract, .prepared_frames = prepared_frames };
@@ -14544,7 +14551,7 @@ pub const Node = struct {
         const tokenizer = if (loaded) |model| model.getTokenizer() else planning_assets.?.tokenizer();
         // Request option resolution only touches config, so planning need not
         // construct a pipeline or inspect backend session input/output shapes.
-        var embedding_config: embedding_mod.EmbeddingConfig = .{ .text_prefix = manifest.embedding_profile.document.prefix, .ensure_trailing_eos_id = if (manifest.isLastTokenDecoderEmbedder() and manifest.embedding_style != .embedding_gemma2 and tokenizer.specialTokens().sep_id >= 0) tokenizer.specialTokens().sep_id else null };
+        var embedding_config: embedding_mod.EmbeddingConfig = .{ .text_prefix = manifest.embedding_profile.document.prefix, .ensure_trailing_eos_id = manifest.embeddingTrailingEosId(tokenizer.specialTokens().sep_id) };
         const owned_prefix = try applyDenseEmbeddingConfigRequestOptions(a, &embedding_config, manifest, .{ .model = target.model, .input = .null, .encoding_format = null, .dimensions = if (target.dimensions) |d| @intCast(d) else null, .task_type = task });
         defer if (owned_prefix) |prefix| a.free(prefix);
         const planning_digest = std.fmt.bytesToHex(if (loaded) |model| try model.chunkPlanningIdentityWithControl(control) else planning_assets.?.planning.digest, .lower);
@@ -15247,6 +15254,7 @@ pub const Node = struct {
 
     fn contextRequestFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
+            error.MemorillaCompositionRequired => ctx.status(400).json(.{ .@"error" = "MEMORILLA_COMPOSITION_REQUIRED", .message = "use /ai/v1/memorilla/generate with a configured profile", .retryable = false }),
             error.StaleCheckpoint => ctx.status(409).json(.{ .@"error" = "CONTEXT_CHECKPOINT_STALE_REVISION", .message = @errorName(err), .retryable = false }),
             error.CheckpointHistoryMismatch,
             error.CheckpointMemoryMismatch,
@@ -15606,6 +15614,104 @@ pub const Node = struct {
         completion.* = .{ .writer = writer, .events = .{ .allocator = ctx.allocator }, .emit_terminal_events = false };
         writer_transferred = true;
         return ctx.response.build();
+    }
+
+    /// Buffered memory generation with an explicitly selected source policy.
+    /// Profile selection is the only caller-controlled model selection.
+    pub fn generateMemorilla(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        if (!self.config.memorilla.enabled) return ctx.status(404).json(.{ .@"error" = "MEMORILLA_DISABLED" });
+        const control = httpInferenceExecutionControl(self, ctx);
+        control.check() catch |err| return inferenceFailureResponse(ctx, err);
+        const body = (try ctx.body()) orelse return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "request body required" });
+        var parsed = std.json.parseFromSlice(MemorillaHttpRequest, ctx.allocator, body, .{}) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid Memorilla request or unsupported option" });
+        defer parsed.deinit();
+        const request = parsed.value;
+        if (request.model.len == 0 or request.model.len > 128 or request.max_new_tokens.value < 1 or request.max_new_tokens.value > 128)
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST" });
+        const profile = self.config.memorilla.find(request.model) catch |err| return switch (err) {
+            error.MemorillaProfileNotFound => ctx.status(404).json(.{ .@"error" = "MEMORILLA_PROFILE_NOT_FOUND" }),
+            else => inferenceFailureResponse(ctx, err),
+        };
+        const max_new_tokens: usize = @intCast(request.max_new_tokens.value);
+        self.config.request_limits.validateItemCount(request.document_embeddings.len) catch |err| return memorillaFailureResponse(ctx, err, true);
+        if (self.config.request_limits.max_output_tokens_per_item) |limit| if (max_new_tokens > limit)
+            return memorillaFailureResponse(ctx, error.InferenceOutputTokensExceeded, true);
+        const scratch = parsed.arena.allocator();
+        const documents = try scratch.alloc([]const f32, request.document_embeddings.len);
+        for (request.document_embeddings, documents) |row, *out| {
+            const values = try scratch.alloc(f32, row.len);
+            for (row, values) |number, *value| value.* = number.value;
+            out.* = values;
+        }
+        memorilla_service.validateInputs(profile, request.question, documents, request.encoder_execution_identity, max_new_tokens) catch |err|
+            return memorillaFailureResponse(ctx, err, true);
+        request.validateSourceContext() catch |err| return memorillaFailureResponse(ctx, err, true);
+        const turn = self.memorilla_execution_lane.acquire(control) catch |err| return inferenceFailureResponse(ctx, err);
+        defer turn.release();
+        if (try self.acquireSlot(ctx)) |response| return response;
+        defer self.releaseSlot();
+        self.metrics.incRequest("generate");
+        defer self.metrics.decActive();
+        control.check() catch |err| return inferenceFailureResponse(ctx, err);
+        const encoder = self.resolveModelSelection(ctx.io, profile.encoder, "embedders") catch |err| return requestModelResolutionError(ctx, err);
+        defer self.allocator.free(encoder.path);
+        const decoder = self.resolveModelSelection(ctx.io, profile.decoder, "generators") catch |err| return requestModelResolutionError(ctx, err);
+        defer self.allocator.free(decoder.path);
+        const limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu));
+        if (request.context_mode == .source_verified) {
+            var verified = memorilla_verified_service.generate(ctx.allocator, ctx.io, &self.model_manager, profile, .{ .encoder = encoder, .decoder = decoder }, request.question, documents, request.document_texts.value.?, request.encoder_execution_identity, max_new_tokens, limits, self.config.request_limits, control) catch |err|
+                return memorillaFailureResponse(ctx, err, false);
+            defer verified.deinit();
+            control.check() catch |err| return inferenceFailureResponse(ctx, err);
+            const abstained = verified.answer_path == .abstained;
+            return ctx.json(.{
+                .model = profile.name,
+                .text = verified.generation.text,
+                .token_ids = verified.generation.token_ids,
+                .finish_reason = if (abstained) @as([]const u8, "abstained") else "eos",
+                .input_documents = verified.document_count,
+                .memory_tokens = verified.memoryTokens(),
+                .context_source = "supplied_embeddings_and_documents",
+                .answer_path = @tagName(verified.answer_path),
+                .verification_status = if (abstained) @as([]const u8, "abstained") else "model_supported",
+                .source_alignment = "caller_supplied",
+                .document_text_sha256s = verified.document_text_sha256s,
+                .encoder_execution_identity = @as([]const u8, &verified.encoder_execution_identity),
+                .decoder_execution_identity = @as([]const u8, &verified.decoder_execution_identity),
+                .memory_module_sha256 = @as([]const u8, &verified.module_sha256),
+                .usage = .{
+                    .encoder_query_tokens = verified.question_tokens,
+                    .prompt_tokens = verified.generation.prompt_tokens,
+                    .completion_tokens = verified.generation.tokens_used,
+                    .total_prompt_tokens = verified.usage.total_prompt_tokens,
+                    .total_completion_tokens = verified.usage.total_completion_tokens,
+                    .verification_calls = verified.usage.verification_calls,
+                    .source_fallback_used = verified.usage.source_fallback_used,
+                },
+            });
+        }
+        var result = memorilla_service.generateWithRequestLimits(ctx.allocator, ctx.io, &self.model_manager, profile, .{ .encoder = encoder, .decoder = decoder }, request.question, documents, request.encoder_execution_identity, max_new_tokens, limits, self.config.request_limits, control) catch |err|
+            return memorillaFailureResponse(ctx, err, false);
+        defer result.deinit();
+        control.check() catch |err| return inferenceFailureResponse(ctx, err);
+        return ctx.json(.{
+            .model = profile.name,
+            .text = result.generation.text,
+            .token_ids = result.generation.token_ids,
+            .finish_reason = if (std.mem.eql(u8, result.generation.finish_reason, "stop")) @as([]const u8, "eos") else "length",
+            .input_documents = result.document_count,
+            .memory_tokens = @as(usize, 16),
+            .context_source = "supplied_embeddings",
+            .encoder_execution_identity = @as([]const u8, &result.encoder_execution_identity),
+            .decoder_execution_identity = @as([]const u8, &result.decoder_execution_identity),
+            .memory_module_sha256 = @as([]const u8, &result.module_sha256),
+            .usage = .{
+                .encoder_query_tokens = result.question_tokens,
+                .prompt_tokens = result.generation.prompt_tokens,
+                .completion_tokens = result.generation.tokens_used,
+            },
+        });
     }
 
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -17110,6 +17216,7 @@ pub const Node = struct {
         var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
         var pool_id: runtime.kv.block.KvPoolId = undefined;
         if (config.prompt_cache_enabled and promptCacheBackendEligible(self.config.prompt_cache.mode, backend_kind) and
+            model.manifest.memorilla_profile != .qwen3_decoder_f32_kv_f32_v1 and
             effective_compiled_partition_backend == null and
             effective_draft_model_name == null and
             config.cache_compaction_ratio == null)
@@ -30568,6 +30675,10 @@ fn validateInferenceExecutorInvocation(
 }
 
 fn resolvedGenerateExecutorContract(node: *Node, manifest: *const manifest_mod.ModelManifest) !ResolvedInferenceExecutorContract {
+    // This profile owns fresh F32 KV and exact transient retirement through
+    // its composition service. Ordinary generation/cache/checkpoint paths
+    // cannot borrow its qualification or residency credit.
+    if (manifest.memorilla_profile == .qwen3_decoder_f32_kv_f32_v1) return error.MemorillaCompositionRequired;
     return resolvedInferenceExecutorContract(node, "generate", manifest);
 }
 
@@ -30650,6 +30761,10 @@ const GenerateExecutorContractFailure = struct {
 };
 
 fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure {
+    if (err == error.MemorillaCompositionRequired) return .{
+        .status = 400,
+        .batch = .{ .code = "MEMORILLA_COMPOSITION_REQUIRED", .message = "use /ai/v1/memorilla/generate with a configured profile", .retryable = false },
+    };
     const invalid_input = err == error.UnsupportedInferenceMimeType or
         err == error.UnsupportedInferenceModality or
         err == error.InvalidInferenceMedia;
@@ -31246,6 +31361,26 @@ test "normalized inference capabilities cover every model family" {
     }
 }
 
+// A plain strict wire struct intentionally rejects null for defaulted limits,
+// duplicate fields, and every unsupported sampling/streaming/asset override.
+const MemorillaHttpRequest = @import("memorilla_request.zig").Request;
+
+fn memorillaFailureResponse(ctx: *httpx.Context, err: anyerror, input_preflight: bool) !httpx.Response {
+    if (err == error.OutstandingMemorillaDeviceAllocation or err == error.OutstandingMemorillaTensor) return modelResourceBusyResponse(ctx);
+    if (err == error.IncompatibleMemorillaProducer) return ctx.status(409).json(.{ .@"error" = "MEMORILLA_IDENTITY_MISMATCH", .message = "stored features require the configured qualified encoder identity" });
+    if (err == error.MemorillaTextLimitExceeded or err == error.EmbeddingInputTooLong or err == error.EmbeddingSequenceTooLong or
+        err == error.InferenceBatchTooLarge or err == error.InferenceInputTokensExceeded or err == error.InferenceOutputTokensExceeded or
+        err == error.MemorillaPromptBudgetExceeded or err == error.MemorillaCollectionBudgetExceeded or
+        err == error.MemorillaSourceTextLimitExceeded)
+        return ctx.status(413).json(.{ .@"error" = "MEMORILLA_INPUT_LIMIT", .message = @errorName(err) });
+    if (input_preflight) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
+    if (err == error.UnsupportedMemorillaArtifact or err == error.MemorillaManagedProducerRequired)
+        return ctx.status(409).json(.{ .@"error" = "INCOMPATIBLE_MEMORILLA_PROFILE", .message = @errorName(err) });
+    if (err == error.MemorillaResourceBudgetExceeded or err == error.MemorillaFiniteBudgetRequired)
+        return ctx.status(400).json(.{ .@"error" = "MODEL_RESOURCE_LIMIT", .message = @errorName(err), .retryable = false });
+    return inferenceFailureResponse(ctx, err);
+}
+
 const InferenceHttpRouteAdmission = enum { none, inference };
 
 /// Every generated inference route must make an explicit admission decision.
@@ -31278,6 +31413,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/extract") or
             std.mem.eql(u8, path, "/generate") or
             std.mem.eql(u8, path, "/generate/batch") or
+            std.mem.eql(u8, path, "/memorilla/generate") or
             std.mem.eql(u8, path, "/models/instances") or
             std.mem.eql(u8, path, "/_antfarm/readers/apple") or
             std.mem.eql(u8, path, "/predict") or
@@ -32301,6 +32437,163 @@ test "generate batch validates sampling and speculative options before execution
     const speculation_reason = Node.generateBatchUnsupportedReasonPreflight(invalid_speculation.value) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("INVALID_REQUEST", speculation_reason.code);
     try std.testing.expectEqualStrings("speculative_k, speculation_policy, and speculation_calibration require draft_model", speculation_reason.message);
+}
+
+test "Memorilla decoder profile requires composition before ordinary generation execution" {
+    var manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .model_type = .generator, .memorilla_profile = .qwen3_decoder_f32_kv_f32_v1 };
+    try std.testing.expectError(error.MemorillaCompositionRequired, resolvedGenerateExecutorContract(undefined, &manifest));
+    const failure = generateExecutorContractError(error.MemorillaCompositionRequired);
+    try std.testing.expectEqual(@as(u16, 400), failure.status);
+    try std.testing.expectEqualStrings("MEMORILLA_COMPOSITION_REQUIRED", failure.batch.code);
+}
+
+test "Memorilla HTTP rejects unsupported and ambiguous wire options" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"model":"p","question":"q","document_embeddings":[[1]],"encoder_execution_identity":"x","stream":false}
+        ,
+        \\{"model":"p","question":"q","document_embeddings":[[1]],"encoder_execution_identity":"x","temperature":0}
+        ,
+        \\{"model":"p","question":"q","document_embeddings":[[1]],"encoder_execution_identity":"x","memory_module_path":"/tmp/override"}
+        ,
+        \\{"model":"p","question":"q","document_embeddings":[[1]],"encoder_execution_identity":"x","max_new_tokens":null}
+        ,
+        \\{"model":"p","model":"other","question":"q","document_embeddings":[[1]],"encoder_execution_identity":"x"}
+        ,
+        \\{"model":"p","question":"q","document_embeddings":[[1]],"encoder_execution_identity":"x","max_new_tokens":"64"}
+        ,
+        \\{"model":"p","question":"q","document_embeddings":[["1"]],"encoder_execution_identity":"x"}
+        ,
+    };
+    for (cases) |body| {
+        if (std.json.parseFromSlice(MemorillaHttpRequest, a, body, .{})) |value| {
+            value.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+    var parsed = try std.json.parseFromSlice(MemorillaHttpRequest, a,
+        \\{"model":"p","question":"q","document_embeddings":[[1]],"encoder_execution_identity":"x"}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 64), parsed.value.max_new_tokens.value);
+}
+
+test "Memorilla HTTP defaults disabled and validates inputs before model admission" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/memorilla/generate");
+    defer request.deinit();
+    request.body = "not JSON";
+    var disabled_ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer disabled_ctx.deinit();
+    var disabled = try node.generateMemorilla(&disabled_ctx);
+    defer disabled.deinit();
+    try std.testing.expectEqual(@as(u16, 404), disabled.status.code);
+    const profile = platform.inference_settings.MemorillaProfile{
+        .name = "p",
+        .encoder = "/missing/encoder",
+        .decoder = "/missing/decoder",
+        .memory_module_path = "/missing/module",
+    };
+    node.config.memorilla = .{ .enabled = true, .profiles = &.{profile} };
+    const cases = [_]struct { body: []const u8, status: u16 }{
+        .{ .body = "not JSON", .status = 400 },
+        .{ .body = "{\"model\":\"p\",\"question\":\"q\",\"document_embeddings\":[[1]],\"encoder_execution_identity\":\"x\"}", .status = 409 },
+        .{ .body = "{\"model\":\"p\",\"question\":\" \",\"document_embeddings\":[[1]],\"encoder_execution_identity\":\"x\"}", .status = 400 },
+        .{ .body = "{\"model\":\"p\",\"question\":\"q\",\"document_embeddings\":[[1]],\"encoder_execution_identity\":\"x\",\"stream\":false}", .status = 400 },
+        .{ .body = "{\"model\":\"missing\",\"question\":\"q\",\"document_embeddings\":[[1]],\"encoder_execution_identity\":\"x\"}", .status = 404 },
+        .{ .body = "{\"model\":\"p\",\"question\":\"q\",\"document_embeddings\":[[1]],\"encoder_execution_identity\":\"x\",\"max_new_tokens\":0}", .status = 400 },
+        .{ .body = "{\"model\":\"p\",\"question\":\"q\",\"document_embeddings\":[[1]],\"encoder_execution_identity\":\"x\",\"max_new_tokens\":129}", .status = 400 },
+    };
+    for (cases) |case| {
+        request.body = case.body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.generateMemorilla(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+        try std.testing.expectEqual(@as(usize, 0), node.memorilla_execution_lane.acquisitions);
+    }
+}
+
+test "Memorilla HTTP operator item and output ceilings precede model admission" {
+    const a = std.testing.allocator;
+    const profile = platform.inference_settings.MemorillaProfile{
+        .name = "p",
+        .encoder = "/missing/encoder",
+        .decoder = "/missing/decoder",
+        .memory_module_path = "/missing/module",
+    };
+    var node = try Node.init(a, .{
+        .memorilla = .{ .enabled = true, .profiles = &.{profile} },
+        .request_limits = .{ .max_items_per_request = 1, .max_output_tokens_per_item = 2 },
+    });
+    defer node.deinit();
+    for ([_][]const u8{
+        \\{"model":"p","question":"q","document_embeddings":[[],[]],"encoder_execution_identity":"x","max_new_tokens":1}
+        ,
+        \\{"model":"p","question":"q","document_embeddings":[[]],"encoder_execution_identity":"x","max_new_tokens":3}
+        ,
+    }) |body| {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/memorilla/generate");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.generateMemorilla(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 413), response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), node.memorilla_execution_lane.acquisitions);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    }
+}
+
+test "Memorilla HTTP source context rejects invalid evidence before queue or model resolution" {
+    const a = std.testing.allocator;
+    const profile = platform.inference_settings.MemorillaProfile{
+        .name = "p",
+        .encoder = "/missing/encoder",
+        .decoder = "/missing/decoder",
+        .memory_module_path = "/missing/module",
+    };
+    var node = try Node.init(a, .{ .memorilla = .{ .enabled = true, .profiles = &.{profile} } });
+    defer node.deinit();
+    var row: [2560]f32 = @splat(0);
+    row[0] = 1;
+    const rows = [_][]const f32{&row};
+    const identity = @import("../models/memorilla_qualification.zig").executionIdentity(.qwen3_encoder_f32_v1);
+    const long: [8193]u8 = @splat('x');
+    const cases = [_]struct { mode: []const u8, texts: []const []const u8, status: u16 }{
+        .{ .mode = "latent", .texts = &.{"A fact."}, .status = 400 },
+        .{ .mode = "source_verified", .texts = &.{}, .status = 400 },
+        .{ .mode = "source_verified", .texts = &.{ "a", "b" }, .status = 400 },
+        .{ .mode = "source_verified", .texts = &.{" \t\n"}, .status = 400 },
+        .{ .mode = "source_verified", .texts = &.{&long}, .status = 413 },
+    };
+    for (cases) |case| {
+        const body = try std.json.Stringify.valueAlloc(a, .{
+            .model = "p",
+            .question = "Who owns the badge?",
+            .document_embeddings = rows,
+            .encoder_execution_identity = @as([]const u8, &identity),
+            .max_new_tokens = 8,
+            .context_mode = case.mode,
+            .document_texts = case.texts,
+        }, .{});
+        defer a.free(body);
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/memorilla/generate");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.generateMemorilla(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), node.memorilla_execution_lane.acquisitions);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    }
 }
 
 test "context policy preflight fails closed before model resolution" {
@@ -35343,6 +35636,7 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embed"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embeddings"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/generate/batch"));
+    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/memorilla/generate"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/generate/context/prepare"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
     try std.testing.expectEqual(@as(usize, 1), server.routeCount(.get, public_api_prefix ++ "/models"));
@@ -38071,6 +38365,10 @@ fn parseRequestedEmbeddingDimensions(dimensions: ?i64) !?usize {
 }
 
 fn validateQwen3EmbeddingDimensions(manifest: *const manifest_mod.ModelManifest, dimensions: ?usize) !void {
+    if (manifest.memorilla_profile == .qwen3_encoder_f32_v1) {
+        if (dimensions) |requested| if (requested != 2560) return error.InvalidMemorillaEmbeddingDimensions;
+        return;
+    }
     if (manifest.embedding_style != .qwen3_embedding) return;
     const requested = dimensions orelse return;
     if (requested < 32 or requested > manifest.hidden_size)
@@ -38842,6 +39140,14 @@ fn applyDenseEmbeddingConfigRequestOptions(
     manifest: *const manifest_mod.ModelManifest,
     request: ParsedEmbedRequest,
 ) !?[]u8 {
+    if (manifest.memorilla_profile == .qwen3_encoder_f32_v1) {
+        if (request.instruction != null) return error.InstructionNotSupportedForModel;
+        const task = request.task_type orelse .RETRIEVAL_DOCUMENT;
+        if (task != .RETRIEVAL_DOCUMENT and task != .RETRIEVAL_QUERY) return error.UnsupportedEmbeddingTaskType;
+        if (request.dimensions) |width| if (width != 2560) return error.InvalidMemorillaEmbeddingDimensions;
+        config.text_prefix = "";
+        return null;
+    }
     if (!manifest.hasEmbeddingTaskProfile()) {
         if (request.instruction != null) return error.InstructionNotSupportedForModel;
         return null;
@@ -38915,6 +39221,7 @@ fn isEmbedRequestOptionError(err: anyerror) bool {
         error.InstructionRequiredForEmbeddingTask,
         error.InstructionRequiresQueryTask,
         error.InvalidEmbeddingDimensions,
+        error.InvalidMemorillaEmbeddingDimensions,
         error.EmbeddingInputTooLong,
         error.InvalidEmbeddingGroup,
         error.InvalidEmbeddingTitle,
@@ -38932,6 +39239,7 @@ fn embedRequestOptionErrorMessage(err: anyerror) []const u8 {
         error.InstructionRequiredForEmbeddingTask => "instruction is required for this embedding task_type because the model has no task-specific default",
         error.InstructionRequiresQueryTask => "instruction requires a query-side task_type (documents are embedded without instructions)",
         error.InvalidQwen3EmbeddingDimensions => "Qwen3-Embedding dimensions must be between 32 and the model embedding size",
+        error.InvalidMemorillaEmbeddingDimensions => "the qualified Memorilla encoder requires its full 2560-dimensional output",
         error.InvalidEmbeddingDimensions => "EmbeddingGemma 2 dimensions must be between 1 and 768",
         error.EmbeddingInputTooLong => "EmbeddingGemma 2 inputs must fit in 8192 tokens including task prompts and special tokens",
         error.InvalidEmbeddingGroup => "embedding groups require 1 to 64 supported, ordered content parts",
@@ -40743,6 +41051,34 @@ fn applyDenseEmbeddingRequestOptionsForTest(
 ) !void {
     const owned = try applyDenseEmbeddingRequestOptions(std.testing.allocator, pipeline, manifest, request);
     try std.testing.expectEqual(@as(?[]u8, null), owned);
+}
+
+test "Memorilla embedding producer rejects request recipe and width overrides" {
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .embedding_style = .qwen3_embedding,
+        .memorilla_profile = .qwen3_encoder_f32_v1,
+        .hidden_size = 2560,
+    };
+    var config = embedding_mod.EmbeddingConfig{};
+    var request = ParsedEmbedRequest{ .model = "encoder", .input = .null, .encoding_format = null, .dimensions = null, .task_type = .RETRIEVAL_DOCUMENT };
+    for ([_]EmbeddingTaskType{ .RETRIEVAL_DOCUMENT, .RETRIEVAL_QUERY }) |task| {
+        request.task_type = task;
+        config.text_prefix = "unqualified-prefix";
+        try std.testing.expectEqual(@as(?[]u8, null), try applyDenseEmbeddingConfigRequestOptions(std.testing.allocator, &config, &manifest, request));
+        try std.testing.expectEqualStrings("", config.text_prefix);
+        request.instruction = "custom instruction";
+        try std.testing.expectError(error.InstructionNotSupportedForModel, applyDenseEmbeddingConfigRequestOptions(std.testing.allocator, &config, &manifest, request));
+        request.instruction = null;
+    }
+    request.task_type = .CLUSTERING;
+    try std.testing.expectError(error.UnsupportedEmbeddingTaskType, applyDenseEmbeddingConfigRequestOptions(std.testing.allocator, &config, &manifest, request));
+    request.task_type = .RETRIEVAL_DOCUMENT;
+    request.dimensions = 128;
+    try std.testing.expectError(error.InvalidMemorillaEmbeddingDimensions, applyDenseEmbeddingConfigRequestOptions(std.testing.allocator, &config, &manifest, request));
+    try validateQwen3EmbeddingDimensions(&manifest, null);
+    try validateQwen3EmbeddingDimensions(&manifest, 2560);
+    try std.testing.expectError(error.InvalidMemorillaEmbeddingDimensions, validateQwen3EmbeddingDimensions(&manifest, 128));
 }
 
 test "qwen3 embedding request options wrap queries with instructions" {

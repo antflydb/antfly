@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.content_security_config import ContentSecurityConfig
     from ..models.credentials import Credentials
     from ..models.kernel_jit_config import KernelJitConfig
+    from ..models.memorilla_runtime_config import MemorillaRuntimeConfig
     from ..models.model_ref import ModelRef
     from ..models.prompt_cache_config import PromptCacheConfig
     from ..models.runtime_config_cooperative_execution import RuntimeConfigCooperativeExecution
@@ -27,6 +28,7 @@ T = TypeVar("T", bound="RuntimeConfig")
 class RuntimeConfig:
     """
     Attributes:
+        memorilla (MemorillaRuntimeConfig | Unset):
         http_max_body_mb (int | Unset): Encoded HTTP inference body ceiling in MiB, independent of decoded-media
             resource policy. Default: 10.
         api_url (str | Unset): URL of an out-of-process Antfly inference service that the Antfly
@@ -132,6 +134,7 @@ class RuntimeConfig:
         log (Config | Unset): Logging configuration for Antfly inference services
     """
 
+    memorilla: MemorillaRuntimeConfig | Unset = UNSET
     http_max_body_mb: int | Unset = 10
     api_url: str | Unset = UNSET
     api_key: str | Unset = UNSET
@@ -157,6 +160,10 @@ class RuntimeConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        memorilla: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.memorilla, Unset):
+            memorilla = self.memorilla.to_dict()
+
         http_max_body_mb = self.http_max_body_mb
 
         api_url = self.api_url
@@ -227,6 +234,8 @@ class RuntimeConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if memorilla is not UNSET:
+            field_dict["memorilla"] = memorilla
         if http_max_body_mb is not UNSET:
             field_dict["http_max_body_mb"] = http_max_body_mb
         if api_url is not UNSET:
@@ -280,6 +289,7 @@ class RuntimeConfig:
         from ..models.content_security_config import ContentSecurityConfig
         from ..models.credentials import Credentials
         from ..models.kernel_jit_config import KernelJitConfig
+        from ..models.memorilla_runtime_config import MemorillaRuntimeConfig
         from ..models.model_ref import ModelRef
         from ..models.prompt_cache_config import PromptCacheConfig
         from ..models.runtime_config_cooperative_execution import RuntimeConfigCooperativeExecution
@@ -287,6 +297,13 @@ class RuntimeConfig:
         from ..models.runtime_config_model_strategies import RuntimeConfigModelStrategies
 
         d = dict(src_dict)
+        _memorilla = d.pop("memorilla", UNSET)
+        memorilla: MemorillaRuntimeConfig | Unset
+        if isinstance(_memorilla, Unset):
+            memorilla = UNSET
+        else:
+            memorilla = MemorillaRuntimeConfig.from_dict(_memorilla)
+
         http_max_body_mb = d.pop("http_max_body_mb", UNSET)
 
         api_url = d.pop("api_url", UNSET)
@@ -379,6 +396,7 @@ class RuntimeConfig:
             log = Config.from_dict(_log)
 
         runtime_config = cls(
+            memorilla=memorilla,
             http_max_body_mb=http_max_body_mb,
             api_url=api_url,
             api_key=api_key,

@@ -1,0 +1,235 @@
+{
+  "schema": "antfly.qwen3-chat-template-parity.v1",
+  "model": "Qwen/Qwen3-8B",
+  "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+  "tokenizer_config_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+  "template_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+  "reference": "transformers 4.53.3 apply_chat_template; local_files_only",
+  "scope": "text and inline reasoning; no tool declaration serialization",
+  "cases": [
+    {
+      "id": "memorilla_short",
+      "variables": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Answer using the provided memory.\nMemory<|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|>Memory"
+          },
+          {
+            "role": "user",
+            "content": "What should the assistant remember?"
+          }
+        ],
+        "add_generation_prompt": true,
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>system\nAnswer using the provided memory.\nMemory<|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|>Memory<|im_end|>\n<|im_start|>user\nWhat should the assistant remember?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "id": "memorilla_unicode",
+      "variables": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Answer using the provided memory.\nMemory<|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|>Memory"
+          },
+          {
+            "role": "user",
+            "content": "What does María prefer for breakfast?"
+          }
+        ],
+        "add_generation_prompt": true,
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>system\nAnswer using the provided memory.\nMemory<|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|>Memory<|im_end|>\n<|im_start|>user\nWhat does María prefer for breakfast?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "id": "memorilla_long_question",
+      "variables": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Answer using the provided memory.\nMemory<|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|>Memory"
+          },
+          {
+            "role": "user",
+            "content": "Explain the evidence. Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter?"
+          }
+        ],
+        "add_generation_prompt": true,
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>system\nAnswer using the provided memory.\nMemory<|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|><|memory|>Memory<|im_end|>\n<|im_start|>user\nExplain the evidence. Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter? Why does this matter?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "id": "single_thinking_None",
+      "variables": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "What does María prefer?"
+          }
+        ],
+        "add_generation_prompt": true
+      },
+      "expected": "<|im_start|>user\nWhat does María prefer?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "single_thinking_False",
+      "variables": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "What does María prefer?"
+          }
+        ],
+        "add_generation_prompt": true,
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>user\nWhat does María prefer?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "id": "single_thinking_True",
+      "variables": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "What does María prefer?"
+          }
+        ],
+        "add_generation_prompt": true,
+        "enable_thinking": true
+      },
+      "expected": "<|im_start|>user\nWhat does María prefer?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "history_reasoning_removed",
+      "variables": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Old question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>\nold plan\n</think>\n\nOld answer"
+          },
+          {
+            "role": "user",
+            "content": "New question"
+          }
+        ],
+        "add_generation_prompt": false,
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>user\nOld question<|im_end|>\n<|im_start|>assistant\nOld answer<|im_end|>\n<|im_start|>user\nNew question<|im_end|>\n"
+    },
+    {
+      "id": "latest_reasoning_retained",
+      "variables": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Old question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>\nold plan\n</think>\n\nOld answer"
+          },
+          {
+            "role": "user",
+            "content": "New question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>\nnew plan\n\n</think>\n\nNew answer\n"
+          }
+        ],
+        "add_generation_prompt": false,
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>user\nOld question<|im_end|>\n<|im_start|>assistant\nOld answer<|im_end|>\n<|im_start|>user\nNew question<|im_end|>\n<|im_start|>assistant\n<think>\nnew plan\n</think>\n\nNew answer\n<|im_end|>\n"
+    },
+    {
+      "id": "wrapped_tool_response_is_not_new_query",
+      "variables": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>\nlookup\n</think>\n\nCalling search"
+          },
+          {
+            "role": "user",
+            "content": "<tool_response>result</tool_response>"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>\nuse result\n</think>\n\nAnswer"
+          }
+        ],
+        "add_generation_prompt": false,
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>user\nQuestion<|im_end|>\n<|im_start|>assistant\n<think>\nlookup\n</think>\n\nCalling search<|im_end|>\n<|im_start|>user\n<tool_response>result</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nuse result\n</think>\n\nAnswer<|im_end|>\n"
+    },
+    {
+      "id": "explicit_reasoning_content",
+      "variables": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Question"
+          },
+          {
+            "role": "assistant",
+            "content": "\nAnswer\n",
+            "reasoning_content": "\n\nReason\n\n"
+          }
+        ],
+        "add_generation_prompt": false,
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>user\nQuestion<|im_end|>\n<|im_start|>assistant\n<think>\nReason\n</think>\n\nAnswer\n<|im_end|>\n"
+    },
+    {
+      "id": "empty_assistant_content",
+      "variables": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Question"
+          },
+          {
+            "role": "assistant",
+            "content": ""
+          }
+        ],
+        "add_generation_prompt": false,
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>user\nQuestion<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|im_end|>\n"
+    },
+    {
+      "id": "newline_only_strip_preserves_unicode_spaces",
+      "variables": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>\n　reason \n</think>\n\n　answer \n"
+          }
+        ],
+        "add_generation_prompt": false,
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>user\nQuestion<|im_end|>\n<|im_start|>assistant\n<think>\n　reason \n</think>\n\n　answer \n<|im_end|>\n"
+    }
+  ]
+}

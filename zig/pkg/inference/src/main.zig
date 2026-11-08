@@ -76,6 +76,7 @@ const InferenceSettings = struct {
     pool_size: ?usize = null,
     generation_batching: ?platform.inference_settings.GenerationBatching = null,
     cooperative_execution: ?platform.inference_settings.CooperativeExecution = null,
+    memorilla: platform.inference_settings.Memorilla = .{},
     kernel_jit: ?inference.graph.kernel_jit.Config = null,
     prompt_cache: ?PromptCacheConfig = null,
 };
@@ -646,6 +647,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
         if (cfg.inference.pool_size) |value| node_cfg.pool_size = value;
         if (cfg.inference.http_max_body_mb) |value| node_cfg.http_max_body_bytes = try inference.server.httpBodyLimitBytesFromMib(value);
         if (cfg.inference.cooperative_execution) |value| node_cfg.cooperative_execution = inference.server.CooperativeExecutionConfig.fromSettings(value);
+        node_cfg.memorilla = cfg.inference.memorilla;
         if (cfg.inference.generation_batching) |value| node_cfg.generation_batching = inference.server.GenerationBatchingConfig.fromSettings(value);
         if (cfg.inference.prompt_cache) |value| node_cfg.prompt_cache = .{
             .enabled = value.enabled,

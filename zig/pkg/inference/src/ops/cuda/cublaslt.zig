@@ -408,13 +408,16 @@ pub const CublasLt = struct {
         };
     }
 
-    pub fn deinit(self: *CublasLt) void {
+    /// Requires the owning model's execution lane and completed device work.
+    /// Retain the library/handle but release shape-dependent host descriptors.
+    pub fn clearCachedPlans(self: *CublasLt) void {
         var attention_plans = self.attention_plans.valueIterator();
         while (attention_plans.next()) |plan| {
             _ = self.fns.cublasLtMatmulDescDestroy(plan.op);
             for ([_]MatrixLayout{ plan.a, plan.b, plan.d }) |layout| _ = self.fns.cublasLtMatrixLayoutDestroy(layout);
         }
         if (self.allocator) |allocator| self.attention_plans.deinit(allocator);
+        self.attention_plans = .empty;
 
         // Like other allocator/driver objects in this backend, deinit requires
         // exclusive ownership. CudaCompute destroys it only after model
@@ -424,6 +427,11 @@ pub const CublasLt = struct {
             while (plans.next()) |plan| self.destroyTensorCorePlan(plan.*);
             self.tensor_core_plans.deinit(allocator);
         }
+        self.tensor_core_plans = .empty;
+    }
+
+    pub fn deinit(self: *CublasLt) void {
+        self.clearCachedPlans();
         if (self.handle != null) {
             _ = self.fns.cublasLtDestroy(self.handle);
             self.handle = null;

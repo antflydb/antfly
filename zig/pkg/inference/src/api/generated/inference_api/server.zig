@@ -63,6 +63,11 @@ pub fn parsePrepareChatContextBody(allocator: std.mem.Allocator, body: []const u
     return std.json.parseFromSlice(types.ContextPrepareRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for generateMemorilla.
+pub fn parseGenerateMemorillaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.MemorillaGenerateRequest) {
+    return std.json.parseFromSlice(types.MemorillaGenerateRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for loadModelInstance.
 pub fn parseLoadModelInstanceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ModelInstanceLoadRequest) {
     return std.json.parseFromSlice(types.ModelInstanceLoadRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -162,6 +167,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/generate/context/checkpoint", .operation_id = "prepareNativeKvCheckpoint", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/generate/context/prepare", .operation_id = "prepareChatContext", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/generate/context/resume", .operation_id = "resumeNativeKvCheckpoint", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "POST", .path = "/memorilla/generate", .operation_id = "generateMemorilla", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/models", .operation_id = "listModels", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/models/instances", .operation_id = "listModelInstances", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/models/instances", .operation_id = "loadModelInstance", .request_body = .buffered, .streaming_response = false },
@@ -204,6 +210,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "prepareNativeKvCheckpoint")) @compileError("ServerRouter: Impl missing required method 'prepareNativeKvCheckpoint'");
         if (!@hasDecl(Impl, "prepareChatContext")) @compileError("ServerRouter: Impl missing required method 'prepareChatContext'");
         if (!@hasDecl(Impl, "resumeNativeKvCheckpoint")) @compileError("ServerRouter: Impl missing required method 'resumeNativeKvCheckpoint'");
+        if (!@hasDecl(Impl, "generateMemorilla")) @compileError("ServerRouter: Impl missing required method 'generateMemorilla'");
         if (!@hasDecl(Impl, "listModels")) @compileError("ServerRouter: Impl missing required method 'listModels'");
         if (!@hasDecl(Impl, "listModelInstances")) @compileError("ServerRouter: Impl missing required method 'listModelInstances'");
         if (!@hasDecl(Impl, "loadModelInstance")) @compileError("ServerRouter: Impl missing required method 'loadModelInstance'");
@@ -244,6 +251,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/generate/context/checkpoint", httpx.Handler.bind(self.impl, prepareNativeKvCheckpoint));
             try server.post("/generate/context/prepare", httpx.Handler.bind(self.impl, prepareChatContext));
             try server.post("/generate/context/resume", httpx.Handler.bind(self.impl, resumeNativeKvCheckpoint));
+            try server.post("/memorilla/generate", httpx.Handler.bind(self.impl, generateMemorilla));
             try server.get("/models", httpx.Handler.bind(self.impl, listModels));
             try server.get("/models/instances", httpx.Handler.bind(self.impl, listModelInstances));
             try server.post("/models/instances", httpx.Handler.bind(self.impl, loadModelInstance));
@@ -338,6 +346,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /generate/context/resume
         fn resumeNativeKvCheckpoint(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.resumeNativeKvCheckpoint(ctx);
+        }
+
+        /// Generate a memory answer with optional source verification
+        /// POST /memorilla/generate
+        fn generateMemorilla(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.generateMemorilla(ctx);
         }
 
         /// List available models
@@ -464,6 +478,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn prepareNativeKvCheckpoint(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn prepareChatContext(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn resumeNativeKvCheckpoint(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn generateMemorilla(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listModels(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listModelInstances(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn loadModelInstance(self: *Impl, ctx: *httpx.Context) !httpx.Response

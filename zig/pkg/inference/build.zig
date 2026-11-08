@@ -1076,6 +1076,138 @@ pub fn build(b: *std.Build) void {
     );
     metal_prefill_bucket_bench_step.dependOn(&run_metal_prefill_bucket_bench.step);
 
+    const memorilla_verify = b.addExecutable(.{
+        .name = "antfly-memorilla-verify",
+        .max_rss = 8 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/memorilla_verify.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    memorilla_verify.root_module.addImport("build_options", build_options_mod);
+    memorilla_verify.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(memorilla_verify.root_module);
+    memorilla_verify.root_module.link_libc = true;
+    b.step("build-memorilla-verify", "Build strict native/CUDA Memorilla module fixture parity verifier")
+        .dependOn(&b.addInstallArtifact(memorilla_verify, .{}).step);
+
+    const memorilla_qwen_verify = b.addExecutable(.{
+        .name = "antfly-memorilla-qwen-verify",
+        .max_rss = 32 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/memorilla_qwen_verify.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    memorilla_qwen_verify.root_module.addImport("build_options", build_options_mod);
+    memorilla_qwen_verify.root_module.addImport("inference_internal", inference_internal_mod);
+    const memorilla_lock_files = b.addWriteFiles();
+    _ = memorilla_lock_files.addCopyFile(b.path("scripts/memorilla/base_models.json"), "base_models.json");
+    memorilla_qwen_verify.root_module.addAnonymousImport("memorilla_base_model_lock", .{
+        .root_source_file = memorilla_lock_files.add("lock.zig", "pub const bytes = @embedFile(\"base_models.json\");\n"),
+    });
+    runtime_graph.identities.addImports(memorilla_qwen_verify.root_module);
+    memorilla_qwen_verify.root_module.link_libc = true;
+    b.step("build-memorilla-qwen-verify", "Build soft-prompt Qwen prefill and paged decode conformance verifier")
+        .dependOn(&b.addInstallArtifact(memorilla_qwen_verify, .{}).step);
+
+    const memorilla_encoder_verify = b.addExecutable(.{
+        .name = "antfly-memorilla-encoder-verify",
+        .max_rss = 32 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/memorilla_encoder_verify.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    memorilla_encoder_verify.root_module.addImport("build_options", build_options_mod);
+    memorilla_encoder_verify.root_module.addImport("inference_internal", inference_internal_mod);
+    memorilla_encoder_verify.root_module.addAnonymousImport("memorilla_base_model_lock", .{
+        .root_source_file = memorilla_lock_files.add("encoder_lock.zig", "pub const bytes = @embedFile(\"base_models.json\");\n"),
+    });
+    runtime_graph.identities.addImports(memorilla_encoder_verify.root_module);
+    memorilla_encoder_verify.root_module.link_libc = true;
+    b.step("build-memorilla-encoder-verify", "Build offline strict-F32 exact 4B encoder diagnostic")
+        .dependOn(&b.addInstallArtifact(memorilla_encoder_verify, .{}).step);
+
+    const memorilla_composed_verify = b.addExecutable(.{
+        .name = "antfly-memorilla-composed-verify",
+        .max_rss = 32 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/memorilla_composed_verify.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    memorilla_composed_verify.root_module.addImport("build_options", build_options_mod);
+    memorilla_composed_verify.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(memorilla_composed_verify.root_module);
+    memorilla_composed_verify.root_module.link_libc = true;
+    b.step("build-memorilla-composed-verify", "Build actual managed memory service numerical and lifecycle qualification")
+        .dependOn(&b.addInstallArtifact(memorilla_composed_verify, .{}).step);
+
+    const source_decoder_verify = b.addExecutable(.{
+        .name = "antfly-source-decoder-verify",
+        .max_rss = 32 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/source_decoder_verify.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    source_decoder_verify.root_module.addImport("build_options", build_options_mod);
+    source_decoder_verify.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(source_decoder_verify.root_module);
+    source_decoder_verify.root_module.link_libc = true;
+    b.step("build-source-decoder-verify", "Build managed F32 source decoder numerical and lifecycle qualification")
+        .dependOn(&b.addInstallArtifact(source_decoder_verify, .{}).step);
+
+    const source_qa_probe = b.addExecutable(.{
+        .name = "antfly-source-qa-probe",
+        .max_rss = 32 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/source_qa_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    source_qa_probe.root_module.addImport("build_options", build_options_mod);
+    source_qa_probe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(source_qa_probe.root_module);
+    source_qa_probe.root_module.link_libc = true;
+    b.step("build-source-qa-probe", "Build DEV-only plain source answer and verifier diagnostic")
+        .dependOn(&b.addInstallArtifact(source_qa_probe, .{}).step);
+
+    const memorilla_soft_input_tests = b.addTest(.{
+        .max_rss = 8 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_memorilla_soft_input.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{"soft prompt"},
+    });
+    var memorilla_soft_input_imports = inference_internal_mod.import_table.iterator();
+    while (memorilla_soft_input_imports.next()) |entry| {
+        memorilla_soft_input_tests.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    memorilla_soft_input_tests.root_module.link_libc = true;
+    b.step("test-memorilla-soft-input", "Check the internal soft-input shape and architecture boundary")
+        .dependOn(&b.addRunArtifact(memorilla_soft_input_tests).step);
+
+    const memorilla_generation_tests = b.addTest(.{
+        .max_rss = 32 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/test_memorilla_generation.zig"), .target = target, .optimize = optimize }),
+        .filters = &.{ "memorilla generation", "CUDA Memorilla request", "Memorilla supplied feature", "Memorilla service", "Memorilla execution proof", "Memorilla admitted forward" },
+    });
+    var memorilla_generation_imports = inference_internal_mod.import_table.iterator();
+    while (memorilla_generation_imports.next()) |entry| memorilla_generation_tests.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    memorilla_generation_tests.root_module.link_libc = true;
+    b.step("test-memorilla-generation", "Check bounded native memory prompt, admission and cancellation contracts")
+        .dependOn(&b.addRunArtifact(memorilla_generation_tests).step);
+
     const embeddinggemma2_bench = b.addExecutable(.{
         .name = "antfly-embeddinggemma2-bench",
         .root_module = b.createModule(.{
@@ -1719,6 +1851,11 @@ pub fn build(b: *std.Build) void {
     });
     const test_bin_step = b.step("test-bin", "Build unit test binary without running");
     test_bin_step.dependOn(&install_tests.step);
+    // Execute this graph's own cache artifact. CPU and CUDA qualification may
+    // share one install prefix without racing over antfly-inference-tests.
+    const run_memorilla_source_tests = b.addRunArtifact(tests);
+    b.step("test-memorilla-source", "Run filtered Memorilla/source tests from their own compiled artifact")
+        .dependOn(&run_memorilla_source_tests.step);
 
     const wasm_compute_tests = b.addTest(.{
         .name = "wasm-compute-tests",

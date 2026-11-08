@@ -1096,6 +1096,17 @@ from .inference_kv_cache_policy_mode import InferenceKvCachePolicyMode
 from .inference_kv_cache_policy_version import InferenceKvCachePolicyVersion
 from .inference_media_content_part import InferenceMediaContentPart
 from .inference_media_content_part_type import InferenceMediaContentPartType
+from .inference_memorilla_generate_request import InferenceMemorillaGenerateRequest
+from .inference_memorilla_generate_request_context_mode import InferenceMemorillaGenerateRequestContextMode
+from .inference_memorilla_generate_response import InferenceMemorillaGenerateResponse
+from .inference_memorilla_generate_response_answer_path import InferenceMemorillaGenerateResponseAnswerPath
+from .inference_memorilla_generate_response_context_source import InferenceMemorillaGenerateResponseContextSource
+from .inference_memorilla_generate_response_finish_reason import InferenceMemorillaGenerateResponseFinishReason
+from .inference_memorilla_generate_response_memory_tokens import InferenceMemorillaGenerateResponseMemoryTokens
+from .inference_memorilla_generate_response_source_alignment import InferenceMemorillaGenerateResponseSourceAlignment
+from .inference_memorilla_generate_response_verification_status import (
+    InferenceMemorillaGenerateResponseVerificationStatus,
+)
 from .inference_memory_config import InferenceMemoryConfig
 from .inference_model_backend import InferenceModelBackend
 from .inference_model_info import InferenceModelInfo
@@ -1293,6 +1304,18 @@ from .media_content_part_type import MediaContentPartType
 from .media_output_config import MediaOutputConfig
 from .media_output_coverage_counts import MediaOutputCoverageCounts
 from .media_output_coverage_values import MediaOutputCoverageValues
+from .memorilla_generate_request import MemorillaGenerateRequest
+from .memorilla_generate_request_context_mode import MemorillaGenerateRequestContextMode
+from .memorilla_generate_response import MemorillaGenerateResponse
+from .memorilla_generate_response_answer_path import MemorillaGenerateResponseAnswerPath
+from .memorilla_generate_response_context_source import MemorillaGenerateResponseContextSource
+from .memorilla_generate_response_finish_reason import MemorillaGenerateResponseFinishReason
+from .memorilla_generate_response_memory_tokens import MemorillaGenerateResponseMemoryTokens
+from .memorilla_generate_response_source_alignment import MemorillaGenerateResponseSourceAlignment
+from .memorilla_generate_response_verification_status import MemorillaGenerateResponseVerificationStatus
+from .memorilla_generate_usage import MemorillaGenerateUsage
+from .memorilla_profile_config import MemorillaProfileConfig
+from .memorilla_runtime_config import MemorillaRuntimeConfig
 from .memory_assertion import MemoryAssertion
 from .memory_assertion_embedding_model_type_0 import MemoryAssertionEmbeddingModelType0
 from .memory_assertion_evidence_item import MemoryAssertionEvidenceItem
@@ -3720,6 +3743,15 @@ __all__ = (
     "InferenceKvCachePolicyVersion",
     "InferenceMediaContentPart",
     "InferenceMediaContentPartType",
+    "InferenceMemorillaGenerateRequest",
+    "InferenceMemorillaGenerateRequestContextMode",
+    "InferenceMemorillaGenerateResponse",
+    "InferenceMemorillaGenerateResponseAnswerPath",
+    "InferenceMemorillaGenerateResponseContextSource",
+    "InferenceMemorillaGenerateResponseFinishReason",
+    "InferenceMemorillaGenerateResponseMemoryTokens",
+    "InferenceMemorillaGenerateResponseSourceAlignment",
+    "InferenceMemorillaGenerateResponseVerificationStatus",
     "InferenceMemoryConfig",
     "InferenceModelBackend",
     "InferenceModelInfo",
@@ -3917,6 +3949,18 @@ __all__ = (
     "MediaOutputConfig",
     "MediaOutputCoverageCounts",
     "MediaOutputCoverageValues",
+    "MemorillaGenerateRequest",
+    "MemorillaGenerateRequestContextMode",
+    "MemorillaGenerateResponse",
+    "MemorillaGenerateResponseAnswerPath",
+    "MemorillaGenerateResponseContextSource",
+    "MemorillaGenerateResponseFinishReason",
+    "MemorillaGenerateResponseMemoryTokens",
+    "MemorillaGenerateResponseSourceAlignment",
+    "MemorillaGenerateResponseVerificationStatus",
+    "MemorillaGenerateUsage",
+    "MemorillaProfileConfig",
+    "MemorillaRuntimeConfig",
     "MemoryAssertion",
     "MemoryAssertionEmbeddingModelType0",
     "MemoryAssertionEvidenceItem",

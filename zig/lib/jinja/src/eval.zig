@@ -346,6 +346,8 @@ pub const Eval = struct {
                     .is_none => Value.bln(val == .none),
                     .is_not_none => Value.bln(val != .none),
                     .is_boolean => Value.bln(val == .boolean),
+                    .is_true => Value.bln(val == .boolean and val.boolean),
+                    .is_false => Value.bln(val == .boolean and !val.boolean),
                 };
             },
             .call => |c| {
@@ -562,27 +564,37 @@ pub const Eval = struct {
             else => return .undefined,
         };
 
-        const len: i64 = @intCast(items.len);
-        var start: i64 = 0;
-        var stop: i64 = len;
+        // Widen arithmetic so even the minimum i64 step cannot overflow.
+        const len: i128 = @intCast(items.len);
+        const step: i128 = if (sl.step) |s| try self.sliceInteger(s) else 1;
+        if (step == 0) return error.InvalidArguments;
+        const reverse = step < 0;
+        const low: i128 = if (reverse) -1 else 0;
+        const high = if (reverse) len - 1 else len;
+        const start = if (sl.start) |s| std.math.clamp(blk: {
+            const value = try self.sliceInteger(s);
+            break :blk if (value < 0) value + len else value;
+        }, low, high) else if (reverse) len - 1 else 0;
+        // Omitted reverse stop is a sentinel before element zero, whereas an
+        // explicit -1 denotes the last element (Python/Jinja slice semantics).
+        const stop = if (sl.stop) |s| std.math.clamp(blk: {
+            const value = try self.sliceInteger(s);
+            break :blk if (value < 0) value + len else value;
+        }, low, high) else if (reverse) -1 else len;
+        const distance = if (reverse) start - stop else stop - start;
+        if (distance <= 0) return .{ .list = &.{} };
+        if (step == 1) return .{ .list = items[@intCast(start)..@intCast(stop)] };
+        const stride = if (reverse) -step else step;
+        const count: usize = @intCast(@divTrunc(distance + stride - 1, stride));
+        const result = try self.arena.alloc(Value, count);
+        for (result, 0..) |*item, i| item.* = items[@intCast(start + @as(i128, @intCast(i)) * step)];
+        return .{ .list = result };
+    }
 
-        if (sl.start) |s| {
-            const sv = try self.evalExpr(s);
-            if (sv == .integer) start = sv.integer;
-        }
-        if (sl.stop) |s| {
-            const sv = try self.evalExpr(s);
-            if (sv == .integer) stop = sv.integer;
-        }
-
-        // Normalize negative indices
-        if (start < 0) start = @max(0, len + start);
-        if (stop < 0) stop = @max(0, len + stop);
-        start = @min(start, len);
-        stop = @min(stop, len);
-        if (start >= stop) return .{ .list = &.{} };
-
-        return .{ .list = items[@intCast(start)..@intCast(stop)] };
+    fn sliceInteger(self: *Eval, expr: *ast.Expr) !i128 {
+        const value = try self.evalExpr(expr);
+        if (value != .integer) return error.InvalidArguments;
+        return value.integer;
     }
 
     fn applyFilter(self: *Eval, val: Value, name: []const u8, args: []const *ast.Expr) !Value {
@@ -742,6 +754,45 @@ pub const Eval = struct {
             return obj.map.get(key.string) orelse if (args.len == 2) try self.evalExpr(args[1]) else .none;
         }
         if (obj == .string) {
+            if (std.mem.eql(u8, method, "startswith") or std.mem.eql(u8, method, "endswith")) {
+                if (args.len != 1) return error.InvalidArguments;
+                const affix = try self.evalExpr(args[0]);
+                if (affix != .string) return error.InvalidArguments;
+                return Value.bln(if (std.mem.eql(u8, method, "startswith"))
+                    std.mem.startsWith(u8, obj.string, affix.string)
+                else
+                    std.mem.endsWith(u8, obj.string, affix.string));
+            }
+            const strip_left = std.mem.eql(u8, method, "strip") or std.mem.eql(u8, method, "lstrip");
+            const strip_right = std.mem.eql(u8, method, "strip") or std.mem.eql(u8, method, "rstrip");
+            if (strip_left or strip_right) {
+                if (args.len > 1) return error.InvalidArguments;
+                // Python's default Unicode whitespace, including C0 separators.
+                var chars: []const u8 = " \t\n\r\x0b\x0c\x1c\x1d\x1e\x1f\u{85}\u{a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+                if (args.len == 1) {
+                    const value = try self.evalExpr(args[0]);
+                    if (value != .string) return error.InvalidArguments;
+                    chars = value.string;
+                }
+                _ = try std.unicode.Utf8View.init(chars);
+                var start: usize = 0;
+                if (strip_left) {
+                    var it = (try std.unicode.Utf8View.init(obj.string)).iterator();
+                    while (it.nextCodepointSlice()) |codepoint| {
+                        if (std.mem.indexOf(u8, chars, codepoint) == null) break;
+                        start = it.i;
+                    }
+                }
+                var end = obj.string.len;
+                if (strip_right) {
+                    end = start;
+                    var it = (try std.unicode.Utf8View.init(obj.string[start..])).iterator();
+                    while (it.nextCodepointSlice()) |codepoint| {
+                        if (std.mem.indexOf(u8, chars, codepoint) == null) end = start + it.i;
+                    }
+                }
+                return Value.str(obj.string[start..end]);
+            }
             if (std.mem.eql(u8, method, "split")) {
                 if (args.len > 0) {
                     const sep_val = try self.evalExpr(args[0]);
@@ -1208,6 +1259,67 @@ test "eval slice" {
     var eval = Eval.init(a, &ctx);
     const result = try eval.exec(nodes);
     try std.testing.expectEqualStrings("bc", result);
+}
+
+test "list slices preserve Python stepped and reverse boundary semantics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const items = [_]Value{ Value.str("a"), Value.str("b"), Value.str("c"), Value.str("d"), Value.str("e") };
+    var ctx = ValueMap{};
+    try ctx.put(a, "items", .{ .list = &items });
+    try ctx.put(a, "empty", .{ .list = &.{} });
+    try ctx.put(a, "minimum", Value.int(std.math.minInt(i64)));
+    const cases = [_]struct { expression: []const u8, expected: []const u8 }{
+        .{ .expression = "items[::-1]", .expected = "edcba" },
+        .{ .expression = "items[::2]", .expected = "ace" },
+        .{ .expression = "items[3:0:-2]", .expected = "db" },
+        .{ .expression = "items[:-1:-1]", .expected = "" },
+        .{ .expression = "items[-1::-1]", .expected = "edcba" },
+        .{ .expression = "items[-100:100:2]", .expected = "ace" },
+        .{ .expression = "items[100:-100:-2]", .expected = "eca" },
+        .{ .expression = "items[-100::-1]", .expected = "" },
+        .{ .expression = "items[::minimum]", .expected = "e" },
+        .{ .expression = "empty[::-1]", .expected = "" },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(a, "{{% for x in {s} %}}{{{{ x }}}}{{% endfor %}}", .{case.expression});
+        const nodes = try parser_mod.Parser.parse(source, a);
+        var eval = Eval.init(a, &ctx);
+        try std.testing.expectEqualStrings(case.expected, try eval.exec(nodes));
+    }
+    for ([_][]const u8{ "items[::0]", "items[::'bad']", "items['bad':]" }) |expression| {
+        const source = try std.fmt.allocPrint(a, "{{{{ {s} }}}}", .{expression});
+        const nodes = try parser_mod.Parser.parse(source, a);
+        var eval = Eval.init(a, &ctx);
+        try std.testing.expectError(error.InvalidArguments, eval.exec(nodes));
+    }
+}
+
+test "string affix and strip methods preserve Qwen reasoning and Unicode content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ctx = ValueMap{};
+    const cases = [_]struct { source: []const u8, expected: []const u8 }{
+        .{ .source = "{{ '<tool_response>x</tool_response>'.startswith('<tool_response>') }}|{{ 'x</tool_response>'.endswith('</tool_response>') }}", .expected = "True|True" },
+        .{ .source = "{{ 'x'.startswith('') }}|{{ 'x'.endswith('xy') }}", .expected = "True|False" },
+        .{ .source = "{{ '\\n\\nreason\\n'.strip('\\n') }}|{{ '\\nanswer\\n'.lstrip('\\n') }}|{{ '\\nreason\\n'.rstrip('\\n') }}", .expected = "reason|answer\n|\nreason" },
+        .{ .source = "{{ '　 María '.strip() }}", .expected = "María" },
+        .{ .source = "{{ 'éñé'.strip('é') }}|{{ 'éñé'.lstrip('é') }}|{{ 'éñé'.rstrip('é') }}", .expected = "ñ|ñé|éñ" },
+        .{ .source = "{{ 'abc'.strip('') }}|{{ '   '.strip() }}", .expected = "abc|" },
+        .{ .source = "{{ false is false }}|{{ true is true }}|{{ 0 is false }}|{{ missing is false }}|{{ false is not true }}", .expected = "True|True|False|False|True" },
+    };
+    for (cases) |case| {
+        const nodes = try parser_mod.Parser.parse(case.source, a);
+        var eval = Eval.init(a, &ctx);
+        try std.testing.expectEqualStrings(case.expected, try eval.exec(nodes));
+    }
+    for ([_][]const u8{ "{{ 'x'.startswith() }}", "{{ 'x'.endswith(1) }}", "{{ 'x'.strip(1) }}", "{{ 'x'.rstrip('a', 'b') }}" }) |source| {
+        const nodes = try parser_mod.Parser.parse(source, a);
+        var eval = Eval.init(a, &ctx);
+        try std.testing.expectError(error.InvalidArguments, eval.exec(nodes));
+    }
 }
 
 test "eval is defined and is not defined" {

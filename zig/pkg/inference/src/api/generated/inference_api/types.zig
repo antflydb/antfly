@@ -3380,6 +3380,10 @@ pub const MediaChunkPolicy = antfly_chunking_api_openapi.MediaChunkPolicy;
 
 pub const MediaContentPart = antfly_generating_openapi.MediaContentPart;
 
+pub const MemorillaGenerateRequest = antfly_inference_config_openapi.MemorillaGenerateRequest;
+
+pub const MemorillaGenerateResponse = antfly_inference_config_openapi.MemorillaGenerateResponse;
+
 /// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
 pub const ModelBackend = enum {
     auto,

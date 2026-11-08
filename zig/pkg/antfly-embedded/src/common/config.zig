@@ -154,6 +154,14 @@ pub const Config = struct {
         return parsed.value;
     }
 
+    fn parseMemorilla(alloc: std.mem.Allocator, raw: ?std.json.Value) !platform.inference_settings.Memorilla {
+        const object = raw orelse return .{};
+        const value = object.object.get("memorilla") orelse return .{};
+        const parsed = try std.json.parseFromValue(platform.inference_settings.Memorilla, alloc, value, .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        return parsed.value.clone(alloc);
+    }
+
     pub const MetadataConfig = struct {
         pub const NodeUrl = struct {
             node_id: u64,
@@ -444,11 +452,13 @@ pub const Config = struct {
         prompt_cache_configured: bool = false,
         generation_batching: platform.inference_settings.GenerationBatching = .{},
         cooperative_execution: platform.inference_settings.CooperativeExecution = .{},
+        memorilla: platform.inference_settings.Memorilla = .{},
         max_loaded_models: ?i64 = null,
         http_max_body_mb: usize = 10,
         pool_size: usize = 2,
 
         pub fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
+            self.memorilla.deinit(alloc);
             if (self.api_url) |value| alloc.free(value);
             if (self.api_key) |value| alloc.free(value);
             if (self.models_dir) |value| alloc.free(value);
@@ -919,6 +929,8 @@ pub const Config = struct {
         else
             Config.InferenceConfig.KernelJitConfig{};
         errdefer kernel_jit.deinit(alloc);
+        var memorilla = try parseMemorilla(alloc, raw_root.get("inference"));
+        errdefer memorilla.deinit(alloc);
         var pgwire: ?PgwireConfig = null;
         if (root.get("pgwire")) |value| {
             try validateObjectMemberFields(root, "pgwire", &.{ "enabled", "bind_host", "bind_port", "max_connections", "externally_protected_transport" });
@@ -993,6 +1005,7 @@ pub const Config = struct {
                 .keep_alive = if (inference.keep_alive) |value| try alloc.dupe(u8, value) else null,
                 .generation_batching = try parseGenerationBatching(alloc, raw_root.get("inference")),
                 .cooperative_execution = try parseCooperativeExecution(alloc, raw_root.get("inference")),
+                .memorilla = memorilla,
                 .max_loaded_models = inference.max_loaded_models,
                 .http_max_body_mb = if (inference.http_max_body_mb) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 10,
                 .pool_size = if (inference.pool_size) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 2,

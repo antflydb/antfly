@@ -1,0 +1,28 @@
+{
+  "source_timing_sha256": "87aec1c67a9943e144f695c19092512a90c31b8c876cbcccd6ef3fc1fa356a15",
+  "source_stderr_sha256": "c4023f538b07962934a7cbedab9b3954fac5221439adf04bcc5ad82df903df89",
+  "timing": {
+    "backend": "cuda",
+    "tokens": 3,
+    "token_ids": null,
+    "finish_reason": "stop",
+    "cuda": {
+      "cross_backend_sync_fallbacks": 0,
+      "bf16_cublaslt_linear_calls": 0,
+      "bf16_cublaslt_qkv_calls": 0,
+      "bf16_cublaslt_activation_staging_calls": 0,
+      "bf16_cublaslt_activation_mirror_hits": 0,
+      "bf16_cublaslt_fallbacks": 0,
+      "bf16_cublaslt_tuning_tuned_calls": 0,
+      "bf16_cublaslt_tuning_heuristic_calls": 0,
+      "bf16_cublaslt_tuning_api_fallbacks": 0,
+      "bf16_scalar_linear_calls": 0,
+      "bf16_scalar_qkv_calls": 0
+    },
+    "cuda_generate": {
+      "kernel_launches": 1815,
+      "cross_backend_sync_fallbacks": 0
+    }
+  },
+  "log": "prompt_token_ids: 151644 8948 198 16141 279 3405 1667 279 3897 4938 624 10642 198 1655 451 3253 8056 11 279 23285 2615 23961 17180 311 350 859 1579 382 1655 451 3253 8056 11 279 14961 2615 23961 17180 311 422 1073 301 382 1655 2521 1037 8056 11 279 23285 2615 23961 17180 311 1863 269 359 624 10642 151645 198 151644 872 198 15191 24256 279 23285 2615 23961 518 451 3253 8056 30 20678 1172 279 829 13 151645 198 151644 77091 198 151667 271 151668 271\ntoken_ids: 51 859 1579\nfinish_reason=stop tokens=3\ncuda_runtime_bytes: h2d=32762942156 d2h=16 d2d=68567052 resident_weights=32762941440 device_allocated=32924935684\ncuda_fallback_counts: host_attention=0 rope=0 rope_per_item=0 gqa_dense=0 paged_attention=0\n"
+}

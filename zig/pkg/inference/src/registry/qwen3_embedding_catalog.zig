@@ -27,6 +27,11 @@
 //! - Qwen/Qwen3-Embedding-0.6B-GGUF     @ 370f27d7550e0def9b39c1f16d3fbaa13aa67728
 //! The GGUF metadata carries `qwen3.pooling_type = 3` (last-token) and
 //! `tokenizer.ggml.add_eos_token = 1` / `add_bos_token = 0`.
+//!
+//! Qwen3-Embedding-4B pinned 2026-11-07 at
+//! 5cf2132abc99cad020ac570b19d031efec650f2b. Its Memorilla variant uses
+//! the same official weights and tokenizer, with no query instruction. This
+//! is a separate executable recipe and install identity from retrieval.
 
 const std = @import("std");
 const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
@@ -37,10 +42,15 @@ pub const gguf_repo = "Qwen/Qwen3-Embedding-0.6B-GGUF";
 pub const gguf_revision = "370f27d7550e0def9b39c1f16d3fbaa13aa67728";
 pub const safetensors_repo = "Qwen/Qwen3-Embedding-0.6B";
 pub const safetensors_revision = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3";
+pub const safetensors_4b_repo = "Qwen/Qwen3-Embedding-4B";
+pub const safetensors_4b_revision = "5cf2132abc99cad020ac570b19d031efec650f2b";
+pub const memorilla_embedding_dimensions: u32 = 2560;
+pub const safetensors_4b_trailing_eos_id: i32 = 151643;
 
 pub const q8_0_bundle_variant = "q8-0-bundle-v1";
 pub const f16_bundle_variant = "f16-bundle-v1";
 pub const safetensors_bundle_variant = "bf16-safetensors-bundle-v1";
+pub const memorilla_bundle_variant = "memorilla-bf16-safetensors-bundle-v1";
 
 /// Generated model_manifest.json for GGUF bundles. GGUF checkpoints carry no
 /// sentence-transformers sidecars, so the embedder contract is declared
@@ -55,6 +65,31 @@ pub const gguf_bundle_model_manifest =
     "\"document\":{\"prefix\":\"\"}}}\n";
 pub const gguf_bundle_model_manifest_sha256 =
     "d07fad596a5839ef429562db9e22f217da17063aa05d4d1b8bfaef0c43557c03";
+
+// The 4B tokenizer's TemplateProcessing appends <|endoftext|> (151643),
+// whereas tokenizer_config.json calls <|im_end|> (151645) its EOS. Pin the
+// embedding identity explicitly to avoid appending a second, different EOS.
+pub const safetensors_4b_model_manifest =
+    "{\"type\":\"embedder\",\"pooling\":\"last\",\"normalize\":true," ++
+    "\"embedding_style\":\"qwen3_embedding\",\"embedding_trailing_eos_id\":151643," ++
+    "\"embedding_profile\":{\"task_contract\":\"profiled\",\"query\":{" ++
+    "\"prefix\":\"Instruct: Given a web search query, retrieve relevant passages that answer the query\\nQuery:\"," ++
+    "\"instruction_template\":\"Instruct: {instruction}\\nQuery:\"}," ++
+    "\"document\":{\"prefix\":\"\"}}}\n";
+
+/// Memorilla's encoder receives raw document and question strings, including
+/// on the query role. Declaring both empty prefixes prevents ordinary Qwen
+/// retrieval instructions from being inferred from the upstream sidecars.
+/// Consumers must additionally pin the full 2560-dimensional output and the
+/// reference FP16-storage/BF16-module cast sequence in their memory bundle.
+pub const memorilla_bundle_model_manifest =
+    "{\"type\":\"embedder\",\"pooling\":\"last\",\"normalize\":true," ++
+    "\"embedding_style\":\"qwen3_embedding\",\"embedding_trailing_eos_id\":151643," ++
+    "\"embedding_profile\":{" ++
+    "\"task_contract\":\"profiled\",\"query\":{\"prefix\":\"\"}," ++
+    "\"document\":{\"prefix\":\"\"}}}\n";
+pub const memorilla_bundle_model_manifest_sha256 =
+    "cde71e9919a43e374ad7aae68f56943f01b9ddd84d26601cf8155a4c123631fa";
 
 const tokenizer_sidecar = Artifact{
     .repo = safetensors_repo,
@@ -156,6 +191,72 @@ const safetensors_artifacts = [_]Artifact{
     },
 };
 
+const safetensors_4b_artifacts = [_]Artifact{
+    .{
+        .repo = safetensors_4b_repo,
+        .revision = safetensors_4b_revision,
+        .path = "model-00001-of-00002.safetensors",
+        .size = 4_965_826_464,
+        .sha256 = "e70bfe3c970523fb7ef4eddffed2254ce3f1e7150c3de2af4342de129dd756f8",
+    },
+    .{
+        .repo = safetensors_4b_repo,
+        .revision = safetensors_4b_revision,
+        .path = "model-00002-of-00002.safetensors",
+        .size = 3_077_765_624,
+        .sha256 = "ed1b87c8e9eb7e535a1a155e4fd00d9f4dba80e58a6db48a4c9f82cede7079c1",
+    },
+    .{
+        .repo = safetensors_4b_repo,
+        .revision = safetensors_4b_revision,
+        .path = "model.safetensors.index.json",
+        .size = 30_431,
+        .sha256 = "9d130c7f24fa1f9a2a7e19fad42c7d6d2d6fea31b180bdf3e8aac1924c26c39a",
+    },
+    .{
+        .repo = safetensors_4b_repo,
+        .revision = safetensors_4b_revision,
+        .path = "config.json",
+        .size = 727,
+        .sha256 = "78d2861cbbfd80eee05839200c5a3b7ed64c789f6c1cab4fbb84cc4eae33eaf5",
+    },
+    .{
+        .repo = safetensors_4b_repo,
+        .revision = safetensors_4b_revision,
+        .path = "tokenizer.json",
+        .size = 11_422_947,
+        .sha256 = "83cdf8c3a34f68862319cb1810ee7b1e2c0a44e0864ae930194ddb76bb7feb8d",
+    },
+    .{
+        .repo = safetensors_4b_repo,
+        .revision = safetensors_4b_revision,
+        .path = "tokenizer_config.json",
+        .size = 7_256,
+        .sha256 = "2f58f4bbd7bbce15d683f525954ef3a92cd82f5e06415a9c513859bf8ab72436",
+    },
+    .{
+        .repo = safetensors_4b_repo,
+        .revision = safetensors_4b_revision,
+        .path = "modules.json",
+        .size = 349,
+        .sha256 = "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+    },
+    .{
+        .repo = safetensors_4b_repo,
+        .revision = safetensors_4b_revision,
+        .path = "1_Pooling/config.json",
+        .size = 313,
+        .sha256 = "0f0ed3380602b252fced3fab6d07c76752c32ffca818ccc61afaf17ae8edd96f",
+    },
+    .{
+        .repo = safetensors_4b_repo,
+        .revision = safetensors_4b_revision,
+        .path = "config_sentence_transformers.json",
+        .size = 215,
+        .sha256 = "10667c72ddb772627bf1780cb7f86af8e2ae0032b8c243c731172064105c6961",
+    },
+};
+
 pub const bundles = [_]EmbeddingBundle{
     .{
         .id = "qwen3-embedding-0.6b-q8-0",
@@ -180,6 +281,20 @@ pub const bundles = [_]EmbeddingBundle{
         // with generic task-only metadata before writing the final receipt.
         .generated_model_manifest = gguf_bundle_model_manifest,
         .artifact_list = &safetensors_artifacts,
+    },
+    .{
+        .id = "qwen3-embedding-4b-bf16-safetensors",
+        .variant = safetensors_bundle_variant,
+        .source_repo = safetensors_4b_repo,
+        .generated_model_manifest = safetensors_4b_model_manifest,
+        .artifact_list = &safetensors_4b_artifacts,
+    },
+    .{
+        .id = "qwen3-embedding-4b-memorilla-bf16-safetensors",
+        .variant = memorilla_bundle_variant,
+        .source_repo = safetensors_4b_repo,
+        .generated_model_manifest = memorilla_bundle_model_manifest,
+        .artifact_list = &safetensors_4b_artifacts,
     },
 };
 
@@ -229,7 +344,7 @@ pub fn validate() !void {
 
 test "Qwen3-Embedding artifact catalog is immutable and internally consistent" {
     try validate();
-    try std.testing.expectEqual(@as(usize, 3), bundles.len);
+    try std.testing.expectEqual(@as(usize, 5), bundles.len);
 
     const q8 = findBundleForHubRef("Qwen", "Qwen3-Embedding-0.6B-GGUF", q8_0_bundle_variant).?;
     try std.testing.expectEqualStrings("Qwen3-Embedding-0.6B-Q8_0.gguf", q8.artifact_list[0].path);
@@ -262,4 +377,38 @@ test "Qwen3-Embedding artifact catalog is immutable and internally consistent" {
     const profile = parsed.value.object.get("embedding_profile").?.object;
     try std.testing.expectEqualStrings("profiled", profile.get("task_contract").?.string);
     try std.testing.expectEqualStrings("", profile.get("document").?.object.get("prefix").?.string);
+}
+
+test "Qwen3-Embedding-4B Memorilla bundle pins shared weights with a distinct no-prefix recipe" {
+    const retrieval = findBundleForHubRef("Qwen", "Qwen3-Embedding-4B", safetensors_bundle_variant).?;
+    const memory = findBundleForHubRef("Qwen", "Qwen3-Embedding-4B", memorilla_bundle_variant).?;
+    try std.testing.expectEqual(@as(usize, 9), memory.artifact_list.len);
+    try std.testing.expect(retrieval.artifact_list.ptr == memory.artifact_list.ptr);
+    try std.testing.expectEqualStrings("model-00001-of-00002.safetensors", memory.artifact_list[0].path);
+    try std.testing.expectEqualStrings("model-00002-of-00002.safetensors", memory.artifact_list[1].path);
+    try std.testing.expectEqualStrings("model.safetensors.index.json", memory.artifact_list[2].path);
+    for (memory.artifact_list) |artifact| {
+        try std.testing.expectEqualStrings(safetensors_4b_repo, artifact.repo);
+        try std.testing.expectEqualStrings(safetensors_4b_revision, artifact.revision);
+    }
+    try std.testing.expect(!std.mem.eql(u8, retrieval.id, memory.id));
+    try std.testing.expect(!std.mem.eql(u8, retrieval.generated_model_manifest.?, memory.generated_model_manifest.?));
+    try std.testing.expect(memory.installedBytes() > 8_043_592_088);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, memory.generated_model_manifest.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("last", parsed.value.object.get("pooling").?.string);
+    try std.testing.expect(parsed.value.object.get("normalize").?.bool);
+    try std.testing.expectEqual(@as(i64, safetensors_4b_trailing_eos_id), parsed.value.object.get("embedding_trailing_eos_id").?.integer);
+    const profile = parsed.value.object.get("embedding_profile").?.object;
+    try std.testing.expectEqualStrings("", profile.get("query").?.object.get("prefix").?.string);
+    try std.testing.expectEqualStrings("", profile.get("document").?.object.get("prefix").?.string);
+    try std.testing.expect(profile.get("query").?.object.get("instruction_template") == null);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(memory.generated_model_manifest.?, &digest, .{});
+    try std.testing.expectEqualStrings(memorilla_bundle_model_manifest_sha256, &std.fmt.bytesToHex(digest, .lower));
+
+    // An ordinary small-model reference must never pick up the memory recipe.
+    try std.testing.expect(findBundleForHubRef("Qwen", "Qwen3-Embedding-0.6B", memorilla_bundle_variant) == null);
+    try std.testing.expect(findBundleForHubRef("Qwen", "Qwen3-Embedding-4B", q8_0_bundle_variant) == null);
 }

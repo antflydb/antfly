@@ -119,6 +119,7 @@ const InferenceRuntimeConfig = struct {
     resources: inference.platform.resource_policy.Resources = .{},
     generation_batching: inference.platform.inference_settings.GenerationBatching = .{},
     cooperative_execution: inference.platform.inference_settings.CooperativeExecution = .{},
+    memorilla: inference.platform.inference_settings.Memorilla = .{},
     kernel_jit: inference.graph.kernel_jit.Config = .{},
     prompt_cache: inference.server.PromptCacheConfig = .{},
 };
@@ -826,6 +827,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
 
     var node_config = inference.server.NodeConfig{
         .audio_readers = runtime_config.value.audio_readers,
+        .memorilla = runtime_config.value.memorilla,
         .models_dir = context.models_dir.slice() orelse owned_models_dir.?,
         .ml_dir = context.ml_dir.slice() orelse owned_ml_dir.?,
         .generation_budget_overrides = .{

@@ -153,6 +153,12 @@ pub const native_compute = struct {
 
 test {
     _ = server;
+    _ = @import("server/source_decoder_service.zig");
+    _ = @import("server/memorilla_verified_service.zig");
+    _ = @import("server/memorilla_artifact_fence.zig");
+    _ = @import("server/memorilla_request.zig");
+    _ = @import("pipelines/memorilla_grounding.zig");
+    _ = @import("pipelines/memorilla_generation.zig");
     _ = @import("documents/sources.zig");
     _ = @import("extractors/gliner_span_long_executor.zig");
     _ = @import("architectures/modern_bert.zig");

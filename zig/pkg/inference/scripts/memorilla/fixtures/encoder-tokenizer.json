@@ -1,0 +1,142 @@
+{
+  "cases": [
+    {
+      "id": "empty_document",
+      "rendered": "",
+      "role": "document",
+      "text": "",
+      "token_ids": [
+        151643
+      ]
+    },
+    {
+      "id": "short_document",
+      "rendered": "Antfly stores immutable source versions.",
+      "role": "document",
+      "text": "Antfly stores immutable source versions.",
+      "token_ids": [
+        17117,
+        21642,
+        10533,
+        51572,
+        2530,
+        10795,
+        13,
+        151643
+      ]
+    },
+    {
+      "id": "unicode_document",
+      "rendered": "Caf\u00e9 notes: Mar\u00eda prefers tea. Her morning meetings start at 09:30; the database keeps corrections and their supporting evidence.",
+      "role": "document",
+      "text": "Caf\u00e9 notes: Mar\u00eda prefers tea. Her morning meetings start at 09:30; the database keeps corrections and their supporting evidence.",
+      "token_ids": [
+        34,
+        2577,
+        963,
+        8388,
+        25,
+        82205,
+        53964,
+        15243,
+        13,
+        6252,
+        6556,
+        16261,
+        1191,
+        518,
+        220,
+        15,
+        24,
+        25,
+        18,
+        15,
+        26,
+        279,
+        4625,
+        13598,
+        50379,
+        323,
+        862,
+        12613,
+        5904,
+        13,
+        151643
+      ]
+    },
+    {
+      "id": "question",
+      "rendered": "What does Antfly preserve when a source changes?",
+      "role": "question",
+      "text": "  What does Antfly preserve when a source changes?  ",
+      "token_ids": [
+        3838,
+        1558,
+        6755,
+        21642,
+        21129,
+        979,
+        264,
+        2530,
+        4344,
+        30,
+        151643
+      ]
+    }
+  ],
+  "model": "Qwen/Qwen3-Embedding-4B",
+  "revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
+  "schema": "antfly.memorilla.encoder-tokenizer.v1",
+  "verified_sidecars": [
+    {
+      "git_blob_sha1": "81de5602eacbce382009c5af7a23085871801d8f",
+      "path": "1_Pooling/config.json",
+      "size_bytes": 313
+    },
+    {
+      "git_blob_sha1": "8b4b87fc69023e7a224eb6563753aaf3223d8b98",
+      "path": "config.json",
+      "size_bytes": 727
+    },
+    {
+      "git_blob_sha1": "76aef3ade63553ebb698fe3c2a3264040ed093f8",
+      "path": "config_sentence_transformers.json",
+      "size_bytes": 215
+    },
+    {
+      "git_blob_sha1": "d46f1983345269c582611bbedb3ca0a13f8e5f7b",
+      "path": "generation_config.json",
+      "size_bytes": 117
+    },
+    {
+      "git_blob_sha1": "31349551d90c7606f325fe0f11bbb8bd5fa0d7c7",
+      "path": "merges.txt",
+      "size_bytes": 1671853
+    },
+    {
+      "git_blob_sha1": "3d736ef26714eee0abde3e05104ee1b3ec26c974",
+      "path": "model.safetensors.index.json",
+      "size_bytes": 30431
+    },
+    {
+      "git_blob_sha1": "952a9b81c0bfd99800fabf352f69c7ccd46c5e43",
+      "path": "modules.json",
+      "size_bytes": 349
+    },
+    {
+      "path": "tokenizer.json",
+      "sha256": "83cdf8c3a34f68862319cb1810ee7b1e2c0a44e0864ae930194ddb76bb7feb8d",
+      "size_bytes": 11422947
+    },
+    {
+      "git_blob_sha1": "df3a9d96759529ca1006eb6db024bbb099a97578",
+      "path": "tokenizer_config.json",
+      "size_bytes": 7256
+    },
+    {
+      "git_blob_sha1": "4783fe10ac3adce15ac8f358ef5462739852c569",
+      "path": "vocab.json",
+      "size_bytes": 2776833
+    }
+  ]
+}

@@ -239,6 +239,7 @@ const InferenceRuntimeConfigWire = struct {
     resources: platform.resource_policy.Resources = .{},
     generation_batching: platform.inference_settings.GenerationBatching = .{},
     cooperative_execution: platform.inference_settings.CooperativeExecution = .{},
+    memorilla: platform.inference_settings.Memorilla = .{},
     kernel_jit: KernelJit = .{},
     prompt_cache: PromptCache = .{},
 };
@@ -5627,6 +5628,7 @@ pub fn runFromIterator(
         .resources = inference_resource_policy,
         .generation_batching = configured_inference.generation_batching,
         .cooperative_execution = configured_inference.cooperative_execution,
+        .memorilla = configured_inference.memorilla,
         .kernel_jit = .{
             .mode = effective_kernel_jit_mode,
             .cache_dir = configured_inference.kernel_jit.cache_dir,

@@ -604,6 +604,7 @@ fn inferenceCapability(operation: []const u8) ?[]const u8 {
         .{ "chat/completions", "models.generate" },
         .{ "decisions", "models.decide" },
         .{ "generate", "models.generate" },
+        .{ "memorilla/generate", "models.generate" },
         .{ "rerank", "models.rerank" },
         .{ "chunk", "models.chunk" },
         .{ "extract", "models.extract" },
@@ -2062,12 +2063,14 @@ test "build response exposes embedded inference as a local connection" {
 
 test "inference connection operations are allowlisted" {
     try std.testing.expectEqualStrings("models.generate", inferenceCapability("generate").?);
+    try std.testing.expectEqualStrings("models.generate", inferenceCapability("memorilla/generate").?);
     try std.testing.expectEqualStrings("models.embed", inferenceCapability("embed").?);
     try std.testing.expect(inferenceCapability("../models") == null);
 
     const embed_only = &.{"models.embed"};
     try requireInferenceCapability(embed_only, inferenceCapability("embed").?);
     try std.testing.expectError(error.ConnectionCapabilityMissing, requireInferenceCapability(embed_only, inferenceCapability("generate").?));
+    try std.testing.expectError(error.ConnectionCapabilityMissing, requireInferenceCapability(embed_only, inferenceCapability("memorilla/generate").?));
 
     const alloc = std.testing.allocator;
     var cfg = try common_config.Config.parseFromSlice(alloc,

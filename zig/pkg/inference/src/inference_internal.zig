@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const pull_diagnostics = @import("registry/pull_diagnostics.zig");
+pub const model_selection = @import("registry/model_selection.zig");
 
 const build_options = @import("build_options");
 pub const gliner_boundary_export = @import("gliner_boundary_export.zig");
@@ -47,8 +48,16 @@ pub const metal_generated_quant_stats = @import("metal_generated_quant_stats.zig
 pub const kernel_jit_profile_output = @import("kernel_jit_profile_output.zig");
 pub const server = struct {
     pub const model_manager = @import("server/model_manager.zig");
+    pub const memorilla_service = @import("server/memorilla_service.zig");
+    pub const source_decoder_service = @import("server/source_decoder_service.zig");
+    pub const memorilla_verified_service = @import("server/memorilla_verified_service.zig");
 };
 pub const pipelines = struct {
+    pub const generation = @import("pipelines/generation.zig");
+    pub const memorilla = @import("pipelines/memorilla.zig");
+    pub const memorilla_encoder = @import("pipelines/memorilla_encoder.zig");
+    pub const memorilla_generation = @import("pipelines/memorilla_generation.zig");
+    pub const memorilla_grounding = @import("pipelines/memorilla_grounding.zig");
     pub const image = @import("pipelines/image.zig");
     pub const media_chunking = @import("pipelines/media_chunking.zig");
     pub const embedding_gemma2 = @import("pipelines/embedding_gemma2.zig");
@@ -127,6 +136,8 @@ pub const finetune = struct {
 pub const RunPermit = @import("backends/session.zig").RunPermit;
 pub const antfly_image = @import("antfly_image");
 pub const architectures = struct {
+    pub const gpt = @import("architectures/gpt.zig");
+    pub const soft_prompt = @import("architectures/soft_prompt.zig");
     pub const gemma4_projector = @import("architectures/gemma4_projector.zig");
     pub const gliner_boundary_engine = @import("architectures/gliner/boundary_engine.zig");
     pub const gliner_boundary_request_device = @import("architectures/gliner/boundary_request_device.zig");
@@ -149,6 +160,10 @@ pub const architectures = struct {
     pub const gliner_head_graph = @import("architectures/gliner_head_graph.zig");
 };
 pub const models = struct {
+    pub const gpt = @import("models/gpt.zig");
+    pub const memorilla = @import("models/memorilla.zig");
+    pub const memorilla_qualification = @import("models/memorilla_qualification.zig");
+    pub const memorilla_runtime = @import("models/memorilla_runtime.zig");
     pub const embedding_gemma2 = @import("models/embedding_gemma2.zig");
     pub const gliner_decide_qualification = @import("models/gliner_decide_qualification.zig");
     pub const gliner_specialty_qualification = @import("models/gliner_specialty_qualification.zig");
@@ -179,6 +194,11 @@ pub const gguf = struct {
 
 // This root also owns the focused test-video-model gate; external module tests
 // are not collected merely by importing a namespace from a separate test root.
+test "Memorilla production encoder declarations" {
+    _ = models.memorilla_qualification;
+    _ = models.memorilla_runtime;
+    _ = pipelines.memorilla_encoder;
+}
 test "embeddinggemma2 video module declarations" {
     _ = pipelines.embedding_gemma2;
     _ = pipelines.embedding_gemma2_video;

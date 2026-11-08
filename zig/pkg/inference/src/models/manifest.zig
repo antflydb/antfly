@@ -28,6 +28,7 @@ const embedding_gemma2 = @import("embedding_gemma2.zig");
 const gliner_boundary = @import("gliner_boundary.zig");
 const gliner_qualification = @import("gliner_boundary_qualification.zig");
 const specialty_qualification = @import("gliner_specialty_qualification.zig");
+const memorilla_qualification = @import("memorilla_qualification.zig");
 const boundary_bundle = @import("gliner_boundary_bundle.zig");
 const compat = @import("../io/compat.zig");
 const c_file = @import("../util/c_file.zig");
@@ -223,6 +224,8 @@ pub const ModelManifestDeclarations = struct {
     embedding_query_prefix: bool = false,
     embedding_document_prefix: bool = false,
     embedding_style: bool = false,
+    embedding_trailing_eos_id: bool = false,
+    memorilla_profile: bool = false,
 };
 
 fn cloneManifestStrings(allocator: std.mem.Allocator, strings: []const []const u8) ![][]const u8 {
@@ -368,6 +371,13 @@ pub const ModelManifest = struct {
     /// Whether prompt/task-prefix tokens participate in mean pooling.
     include_prompt: bool = true,
     embedding_profile: EmbeddingProfile = .{},
+    /// Explicit EOS identity for a last-token embedding recipe. Null retains
+    /// the historical tokenizer SEP fallback. Some upstream tokenizers append
+    /// a different token in TemplateProcessing than tokenizer_config's EOS.
+    embedding_trailing_eos_id: ?i32 = null,
+    /// An explicit, content-pinned execution contract. Null preserves ordinary
+    /// model precision and does not grant the Memorilla production capability.
+    memorilla_profile: ?memorilla_qualification.Profile = null,
     embedding_style: EmbeddingStyle = .none,
     model_manifest_declarations: ModelManifestDeclarations = .{},
     sparse_3d_output_layout: ?Sparse3DOutputLayout = null,
@@ -457,6 +467,7 @@ pub const ModelManifest = struct {
     }
 
     pub fn maxTextSequenceLength(self: *const ModelManifest) usize {
+        if (self.memorilla_profile == .qwen3_encoder_f32_v1) return memorilla_qualification.max_text_tokens;
         if (self.embedding_style == .embedding_gemma2)
             return @min(@as(usize, self.max_position_embeddings), embedding_gemma2.official_max_input_tokens);
         if (self.gliner_boundary_config) |config| return config.max_len;
@@ -592,6 +603,11 @@ pub const ModelManifest = struct {
         // existed: Jina v5's last pooling + document prefix pairing.
         return self.pooling == .last and
             std.mem.eql(u8, self.embedding_profile.document.prefix, "Document: ");
+    }
+
+    pub fn embeddingTrailingEosId(self: *const ModelManifest, tokenizer_sep_id: i32) ?i32 {
+        if (!self.isLastTokenDecoderEmbedder()) return null;
+        return self.embedding_trailing_eos_id orelse if (tokenizer_sep_id >= 0) tokenizer_sep_id else null;
     }
 
     /// Query-side prefix for retrieval-query task types. Qwen3-Embedding
@@ -3544,6 +3560,19 @@ fn applyModelManifestDeclarationFields(manifest: *ModelManifest, allocator: std.
         manifest.embedding_style = try parseEmbeddingStyleJson(v);
         manifest.model_manifest_declarations.embedding_style = true;
     }
+    if (obj.get("embedding_trailing_eos_id")) |v| {
+        if (v != .integer) return error.InvalidEmbeddingTaskProfile;
+        const token_id = std.math.cast(i32, v.integer) orelse return error.InvalidEmbeddingTaskProfile;
+        if (token_id < 0) return error.InvalidEmbeddingTaskProfile;
+        manifest.embedding_trailing_eos_id = token_id;
+        manifest.model_manifest_declarations.embedding_trailing_eos_id = true;
+    }
+    if (obj.get("memorilla_profile")) |v| {
+        if (v != .string) return error.UnsupportedMemorillaArtifact;
+        manifest.memorilla_profile = std.meta.stringToEnum(memorilla_qualification.Profile, v.string) orelse
+            return error.UnsupportedMemorillaArtifact;
+        manifest.model_manifest_declarations.memorilla_profile = true;
+    }
 }
 
 fn parseSparse3DOutputLayout(value: []const u8) ?Sparse3DOutputLayout {
@@ -4381,6 +4410,7 @@ fn markEmbeddingTaskProfileRequired(manifest: *ModelManifest) void {
 fn hasEmbeddingExecutionContract(manifest: *const ModelManifest) bool {
     const declarations = manifest.model_manifest_declarations;
     return declarations.embedding_profile or
+        declarations.embedding_trailing_eos_id or
         declarations.embedding_task_contract or
         declarations.embedding_query_prefix or
         declarations.embedding_document_prefix or
@@ -4393,6 +4423,8 @@ fn hasEmbeddingExecutionContract(manifest: *const ModelManifest) bool {
 }
 
 fn finalizeEmbeddingProfile(manifest: *ModelManifest) !void {
+    if (manifest.embedding_trailing_eos_id != null and !manifest.isLastTokenDecoderEmbedder())
+        return error.InvalidEmbeddingTaskProfile;
     if (manifest.embedding_style == .embedding_gemma2) {
         if ((manifest.embedding_profile.query.declared and !std.mem.eql(u8, manifest.embedding_profile.query.prefix, "task: search result | query: ")) or
             (manifest.embedding_profile.document.declared and !std.mem.eql(u8, manifest.embedding_profile.document.prefix, "title: none | text: ")) or
@@ -4459,6 +4491,7 @@ fn finalizeEmbeddingProfile(manifest: *ModelManifest) !void {
     const template = manifest.embedding_profile.instruction_template;
     if (template.len > 0 and std.mem.count(u8, template, "{instruction}") != 1)
         return error.InvalidEmbeddingTaskProfile;
+    if (manifest.memorilla_profile) |profile| try memorilla_qualification.requireRoleRecipe(profile, manifest.*);
 }
 
 fn parseAddedTokens(manifest: *ModelManifest, json_bytes: []const u8) !void {
@@ -5098,6 +5131,66 @@ fn jsonBool(val: ?std.json.Value) bool {
 }
 
 // -- Tests --
+
+test "Memorilla production manifest profiles are explicit and role fenced" {
+    const a = std.testing.allocator;
+    var encoder = ModelManifest{ .allocator = a };
+    defer encoder.deinit();
+    try std.testing.expect(encoder.memorilla_profile == null);
+    try parseModelManifestJson(&encoder, a, @import("../registry/memorilla_catalog.zig").encoder_manifest);
+    try finalizeEmbeddingProfile(&encoder);
+    try std.testing.expectEqual(memorilla_qualification.Profile.qwen3_encoder_f32_v1, encoder.memorilla_profile.?);
+    var copied = try encoder.clone(a);
+    defer copied.deinit();
+    try std.testing.expectEqual(encoder.memorilla_profile, copied.memorilla_profile);
+    encoder.embedding_profile.instruction_template = try a.dupe(u8, "Instruct: {instruction}");
+    try std.testing.expectError(error.UnsupportedMemorillaArtifact, finalizeEmbeddingProfile(&encoder));
+    var decoder = ModelManifest{ .allocator = a };
+    defer decoder.deinit();
+    try parseModelManifestJson(&decoder, a, @import("../registry/memorilla_catalog.zig").decoder_manifest);
+    try finalizeEmbeddingProfile(&decoder);
+    decoder.model_type = .embedder;
+    try std.testing.expectError(error.UnsupportedMemorillaArtifact, finalizeEmbeddingProfile(&decoder));
+    var unknown = ModelManifest{ .allocator = a };
+    defer unknown.deinit();
+    try std.testing.expectError(error.UnsupportedMemorillaArtifact, parseModelManifestJson(&unknown, a, "{\"memorilla_profile\":\"automatic\"}"));
+}
+
+test "embedding trailing EOS identity is explicit and retains legacy fallback" {
+    const a = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .qwen3_embedding };
+    defer manifest.deinit();
+    try std.testing.expectEqual(@as(?i32, 151645), manifest.embeddingTrailingEosId(151645));
+    try std.testing.expect(manifest.embeddingTrailingEosId(-1) == null);
+    try parseModelManifestJson(&manifest, a,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_trailing_eos_id":151643}
+    );
+    try finalizeEmbeddingProfile(&manifest);
+    try std.testing.expectEqual(@as(?i32, 151643), manifest.embeddingTrailingEosId(151645));
+    try std.testing.expectEqual(@as(?i32, 151643), manifest.embeddingTrailingEosId(-1));
+    var copied = try manifest.clone(a);
+    defer copied.deinit();
+    try std.testing.expectEqual(@as(?i32, 151643), copied.embeddingTrailingEosId(151645));
+
+    var encoder = ModelManifest{ .allocator = a, .model_type = .embedder };
+    defer encoder.deinit();
+    try std.testing.expect(encoder.embeddingTrailingEosId(151645) == null);
+}
+
+test "embedding trailing EOS declarations reject invalid token identities and model roles" {
+    const a = std.testing.allocator;
+    inline for (.{ "null", "true", "\"151643\"", "-1", "2147483648", "1.5" }) |invalid| {
+        var manifest = ModelManifest{ .allocator = a };
+        defer manifest.deinit();
+        try std.testing.expectError(error.InvalidEmbeddingTaskProfile, parseModelManifestJson(&manifest, a, "{\"type\":\"embedder\",\"embedding_style\":\"qwen3_embedding\",\"embedding_trailing_eos_id\":" ++ invalid ++ "}"));
+    }
+    var generator = ModelManifest{ .allocator = a };
+    defer generator.deinit();
+    try parseModelManifestJson(&generator, a,
+        \\{"type":"generator","embedding_trailing_eos_id":151643}
+    );
+    try std.testing.expectError(error.InvalidEmbeddingTaskProfile, finalizeEmbeddingProfile(&generator));
+}
 
 test "manifest from config.json" {
     const allocator = std.testing.allocator;

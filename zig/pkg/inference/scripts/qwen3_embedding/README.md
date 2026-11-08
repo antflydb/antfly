@@ -85,6 +85,60 @@ use `Qwen/Qwen3-Embedding-0.6B-GGUF` or
 backend contract, without requiring a catalog identity or qualification receipt.
 See [model compatibility](../../MODEL_COMPATIBILITY.md).
 
+### Qwen3-Embedding-4B and Memorilla preparation
+
+The immutable catalog also pins the official 4B BF16 safetensors checkpoint at
+`5cf2132abc99cad020ac570b19d031efec650f2b`, including both weight shards,
+their index, tokenizer, config, pooling, normalization, and prompt sidecars:
+
+```bash
+antfly inference pull hf:Qwen/Qwen3-Embedding-4B:bf16-safetensors-bundle-v1
+antfly inference pull hf:Qwen/Qwen3-Embedding-4B:memorilla-bf16-safetensors-bundle-v1
+```
+
+These variants share the official artifact hashes but have separate install and
+executable recipe identities. The ordinary variant applies the standard retrieval
+query instruction. The Memorilla variant declares empty query and document
+prefixes and has no custom instruction template. Memory consumers must request
+the full 2560-dimensional output and separately preserve the reference
+FP16-storage/BF16-readout cast sequence; reduced dimensions are incompatible with
+the released memory module.
+
+Both 4B recipes pin `embedding_trailing_eos_id: 151643`. The pinned tokenizer's
+TemplateProcessing appends `<|endoftext|>` (151643), whereas its tokenizer config
+names `<|im_end|>` (151645) as EOS. The explicit embedding ID prevents the pipeline
+from adding a second, different trailing token. Existing 0.6B recipes retain
+their tokenizer-derived EOS behavior.
+
+Catalog availability is not numerical or CUDA qualification. The 0.6B oracle
+and existing receipts above do not establish 4B parity. The Memorilla milestone
+must compare exact encoded IDs, pooled full-width vectors, and production CUDA
+execution for these pinned artifacts before claiming that qualification.
+
+The offline [Memorilla encoder reference](../memorilla/encoder_reference.py)
+verifies the separate 4B artifact lock, records exact token IDs for a bounded
+ragged batch, compares batched and singleton vectors, and saves both normalized
+features and the FP16-storage/BF16-readout cast. From the repository root:
+
+```bash
+.venv/bin/python zig/pkg/inference/scripts/memorilla/encoder_reference.py \
+  --model-dir .benchmark-assets/memorilla/models/qwen3-embedding-4b \
+  --output .benchmark-results/memorilla/encoder-f32 \
+  --dtype float32 --threads 8 \
+  --prepare-native-manifest \
+  --native-binary /path/to/antfly-inference --backend native
+```
+
+The command never downloads weights. `--prepare-native-manifest` explicitly adds
+the exact catalog memory recipe to an unmanaged local checkout and rejects an
+existing different manifest. The optional native comparison requires the
+standalone inference executable's `embed --diagnostics` support, which records
+actual admitted token IDs and selected backend. Use `--backend cuda` to require
+that backend; separately retain device/kernel execution evidence. Backend
+selection alone does not attest absence of kernel fallback. The default reference
+converts BF16 checkpoint values to F32 for CPU arithmetic; `--dtype bfloat16`
+records a separate precision profile, with explicit numerical thresholds.
+
 For Metal, start the supervised server with a required backend and require the
 resident Qwen embedding route. Use an absolute model root:
 

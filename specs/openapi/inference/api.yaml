@@ -587,6 +587,87 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+  /memorilla/generate:
+    post:
+      operationId: generateMemorilla
+      summary: Generate a memory answer with optional source verification
+      description: |
+        Requires inference.memorilla.enabled and an administrator-configured
+        profile. Runs the native question encoder, released memory module, and
+        decoder with the qualified F32 CUDA arithmetic and fresh F32 KV.
+        Responses are buffered. Streaming, sampling, caller-selected assets,
+        prefix caches, and speculative decoding are not accepted by this route.
+        Caller-supplied embeddings are a compatibility-bound model input, not
+        proof of database authorization, freshness, provenance, or coverage.
+        Explicit context_mode=source_verified also requires aligned document_texts.
+        An independent source answer is generated without showing the memory
+        candidate and must pass the model entailment check. The memory candidate
+        can be published only if it agrees exactly after boundary whitespace
+        trimming; otherwise the supported source answer is used. Incomplete,
+        truncated or unsupported source answers cause abstention.
+        Responses identify the final answer path and account
+        for all internal generation and verification calls. A model support
+        judgment is not a formal proof, and text/vector pairing is caller-supplied.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MemorillaGenerateRequest' }
+      responses:
+        '200':
+          description: Buffered answer and actual model usage
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemorillaGenerateResponse' }
+        '400':
+          description: Invalid features or unsupported request options
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Feature disabled or configured profile not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Encoder execution identity or model publication changed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: Request exceeds the declared collection, token, or resource limits
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '408':
+          description: Request cancelled before publication
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Native execution or configured artifact failure
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Shared capacity, changing model publication, or required worker unavailable; inspect retryable before retrying
+          headers:
+            Retry-After:
+              description: Minimum retry delay in seconds when the failure is transient
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '504':
+          description: Inference deadline expired before publication
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '507':
+          description: Request exceeds its finite working-memory budget
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /generate:
     post:
       summary: Generate text using LLM (OpenAI-compatible)
@@ -1827,6 +1908,10 @@ components:
           schema:
             $ref: '#/components/schemas/TransientCapacityError'
   schemas:
+    MemorillaGenerateRequest:
+      $ref: './config.yaml#/components/schemas/MemorillaGenerateRequest'
+    MemorillaGenerateResponse:
+      $ref: './config.yaml#/components/schemas/MemorillaGenerateResponse'
     NativeKvCheckpointMetadata:
       type: object
       additionalProperties: false
@@ -1979,6 +2064,7 @@ components:
           enum:
             - inference_capacity
             - inference_admission
+            - model_publication
         retryable:
           type: boolean
           x-go-type-skip-optional-pointer: false
@@ -2017,6 +2103,7 @@ components:
           enum:
             - inference_capacity
             - inference_admission
+            - model_publication
         retryable:
           type: boolean
           enum: [true]

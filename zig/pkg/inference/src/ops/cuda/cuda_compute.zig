@@ -476,6 +476,7 @@ pub const CapabilityProfile = enum {
     gemma4,
     gemma4_training,
     qwen3_embedding,
+    qwen3_generation,
     embedding_gemma2,
     qwen3_vl_generation,
     lightonocr3,
@@ -519,6 +520,7 @@ fn jitModelProfile(profile: CapabilityProfile) kernels_mod.JitModelProfile {
         .florence2, .whisper => .florence2,
         .gemma4, .gemma4_training, .embedding_gemma2 => .gemma4,
         .qwen3_embedding => .qwen3_embedding,
+        .qwen3_generation => .qwen3_generation,
         .qwen3_vl_generation, .lightonocr3 => .qwen3_vl_generation,
     };
 }
@@ -527,11 +529,63 @@ fn qwen3VlAutomaticPrefillForProfile(profile: ?CapabilityProfile) bool {
     return profile != null and (profile.? == .qwen3_vl_generation or profile.? == .lightonocr3);
 }
 
+fn profileRequiresDeviceAttention(profile: ?CapabilityProfile) bool {
+    return profile == .qwen3_generation;
+}
+
+test "Qwen3 generation CUDA profile disallows host attention fallback" {
+    try std.testing.expect(profileRequiresDeviceAttention(.qwen3_generation));
+    try std.testing.expect(!profileRequiresDeviceAttention(.qwen3_embedding));
+    try std.testing.expect(!profileRequiresDeviceAttention(.qwen3_vl_generation));
+    try std.testing.expect(!profileRequiresDeviceAttention(null));
+}
+
+test "CUDA Memorilla request cleanup releases transient buffers preserves weights and rejects live tensors" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.strict_f32_weights = true;
+    var values = [_]f32{ 1, 2, 3, 4 };
+    const shape = [_]i64{ 2, 2 };
+    const weight = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(&values), .dtype = .f32, .shape = &shape, .name = "weight", .allocator = a, .owns_data = false, .owns_shape = false };
+    try compute.insertWeightFromTensor(try a.dupe(u8, "weight"), &weight);
+    const cb = compute.computeBackend();
+    for (0..2) |_| {
+        var physical = try compute.beginMemorillaDeviceBudget(32);
+        defer physical.deinit();
+        defer _ = compute.releaseMemorillaRequestResources() catch @panic("test cleanup failed");
+        {
+            const input = try cb.fromFloat32Shape(&values, &.{ 2, 2 });
+            defer cb.free(input);
+            const result = try cb.add(input, input);
+            defer cb.free(result);
+            // The ComputeBackend interface normalizes CUDA allocation denials.
+            try std.testing.expectError(error.ResourceLimitExceeded, cb.fromFloat32Shape(&values, &.{ 2, 2 }));
+        }
+        const released = try compute.releaseMemorillaRequestResources();
+        try std.testing.expectEqual(@as(usize, @sizeOf(@TypeOf(values))), released.resident_weight_bytes);
+        try std.testing.expectEqual(@import("../../models/memorilla_constants.zig").cuda_kernel_workspace_bytes, released.resident_kernel_bytes);
+        try std.testing.expectEqual(released.resident_weight_bytes + released.resident_kernel_bytes, released.device_live_after);
+        try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.bytes);
+        const borrowed = try cb.getWeight("weight");
+        const actual = try cb.toFloat32(borrowed, a);
+        defer a.free(actual);
+        cb.free(borrowed);
+        try std.testing.expectEqualSlices(f32, &values, actual);
+    }
+    const outstanding = try cb.fromFloat32Shape(&values, &.{ 2, 2 });
+    try std.testing.expectError(error.OutstandingMemorillaDeviceAllocation, compute.releaseMemorillaRequestResources());
+    cb.free(outstanding);
+    _ = try compute.releaseMemorillaRequestResources();
+}
+
 test "Qwen3-VL automatic prefill is model scoped" {
     try std.testing.expect(qwen3VlAutomaticPrefillForProfile(.qwen3_vl_generation));
     try std.testing.expect(qwen3VlAutomaticPrefillForProfile(.lightonocr3));
     try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(.gemma4));
     try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(.qwen3_embedding));
+    try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(.qwen3_generation));
     try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(null));
 }
 
@@ -5747,6 +5801,120 @@ pub const CudaCompute = struct {
         return self.ctx.memoryInfo();
     }
 
+    pub const MemorillaReleaseStats = struct {
+        device_live_before: usize,
+        device_live_after: usize,
+        resident_weight_bytes: usize,
+        resident_kernel_bytes: usize,
+    };
+
+    pub const MemorillaDeviceBudgetScope = struct {
+        compute: *CudaCompute,
+        previous_limit: usize,
+        baseline: usize,
+        active: bool = true,
+
+        /// Restore construction policy only after physical request retirement.
+        /// A refund with live request allocations requires worker replacement.
+        pub fn deinit(self: *@This()) void {
+            if (!self.active) return;
+            if (self.compute.ctx.device_allocations.snapshot().live != self.baseline)
+                @panic("Memorilla physical request allocations remain; retain admission and restart worker");
+            self.compute.ctx.device_allocations.setLimit(self.previous_limit) catch
+                @panic("Memorilla physical limit cannot restore; restart worker");
+            self.active = false;
+        }
+    };
+
+    /// Called under exclusive model execution ownership. Unlike a scratch
+    /// estimate, this bounds active, cached, deferred-free and KV DeviceBuffers
+    /// together. Resident eager weights and the fixed kernel workspace remain
+    /// separately admitted, immutable and unavailable for lazy eviction.
+    pub fn beginMemorillaDeviceBudget(self: *CudaCompute, request_bytes: usize) !MemorillaDeviceBudgetScope {
+        if (!self.strict_f32_weights or self.lazy_host_store != null or request_bytes == 0)
+            return error.InvalidMemorillaCleanupState;
+        const kernel_bytes = @import("../../models/memorilla_constants.zig").cuda_kernel_workspace_bytes;
+        const baseline = try std.math.add(usize, self.stats.resident_weight_bytes, kernel_bytes);
+        const before = self.ctx.device_allocations.snapshot();
+        if (before.live != baseline) return error.OutstandingMemorillaDeviceAllocation;
+        const ceiling = @min(before.limit, try std.math.add(usize, baseline, request_bytes));
+        try self.ctx.device_allocations.setLimit(ceiling);
+        return .{ .compute = self, .previous_limit = before.limit, .baseline = baseline };
+    }
+
+    /// The caller owns the complete model execution lane, has released every
+    /// request tensor/KV handle, and retains its admission until this returns.
+    /// A failure is not a refundable request error: retain admission and retire
+    /// the supervised worker. The process ledger retains failed physical frees.
+    pub fn releaseMemorillaRequestResources(self: *CudaCompute) !MemorillaReleaseStats {
+        if (!self.strict_f32_weights or (self.capability_profile != null and
+            self.capability_profile != .qwen3_generation and self.capability_profile != .qwen3_embedding) or
+            self.resident_training_cache or self.execution_scope != null or self.debug_cuda_graph_capture_active or
+            self.ctx.debug_graph_capture_active or self.async_i32_scalar_download.in_use)
+            return error.InvalidMemorillaCleanupState;
+        // These qualified profiles retain exactly the default model-owned
+        // kernel workspace. Operator-selected attention workspaces require a
+        // separate residency profile, rather than an unexplained allowance.
+        if (self.kernels.gqa_decode_profile != .off or
+            self.kernels.gqa_attention_decode_splitk_online_workspace.ptr != 0 or
+            self.kernels.attention_match_repeat_scratch.ptr != 0)
+            return error.InvalidMemorillaCleanupState;
+        const kernel_bytes = self.kernels.gqa_attention_generated_workspace.allocation_bytes;
+        if (kernel_bytes != @import("../../models/memorilla_constants.zig").cuda_kernel_workspace_bytes)
+            return error.InvalidMemorillaCleanupState;
+        for (self.temp_pinned_slots.items) |slot| if (slot.in_use) return error.OutstandingMemorillaTensor;
+        const before = self.ctx.device_allocations.snapshot().live;
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        try resetDebugCudaGraphRequestState(self);
+        while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.temp_buffer_mutex.unlock();
+        for (self.temp_buffers.buffers.items) |*buffer| buffer.free(&self.ctx);
+        self.temp_buffers.deinit(self.allocator);
+        self.deferred_device_frees.deinit(self.allocator);
+        self.deferred_device_frees = .empty;
+        for (self.temp_pinned_slots.items) |*slot| slot.buffer.free(&self.ctx);
+        self.temp_pinned_slots.deinit(self.allocator);
+        self.temp_pinned_slots = .empty;
+        self.temp_arena_planner.deinit(self.allocator);
+        self.temp_trace_seq = 0;
+        self.temp_arena_generation +%= 1;
+        self.generated_gqa_score_prework_templates.deinit(self.allocator);
+        self.generated_gqa_score_prework_templates = .empty;
+        self.temp_ids_masks.deinit(&self.ctx);
+        self.attention_mask_scratch.deinit(&self.ctx);
+        self.attention_mask_cache_host.deinit(self.allocator);
+        self.attention_mask_cache_host = .empty;
+        self.bf16_activation_scratch.deinit(&self.ctx);
+        self.f16_activation_scratch.deinit(&self.ctx);
+        self.cublaslt_workspace_scratch.deinit(&self.ctx);
+        self.debug_cuda_decode_scalars.free(&self.ctx);
+        try self.pinned_scalar_upload_ring.host.freeChecked(&self.ctx);
+        self.pinned_scalar_upload_ring.next_slot = 0;
+        try self.pinned_upload_arena.host.freeChecked(&self.ctx);
+        self.pinned_upload_arena.next_offset = 0;
+        try self.pinned_scalar_download_buffer.host.freeChecked(&self.ctx);
+        try self.pinned_bulk_download_buffer.freeChecked(&self.ctx);
+        self.async_i32_scalar_download.staging.free(&self.ctx);
+        try self.async_i32_scalar_download.host.freeChecked(&self.ctx);
+        self.ctx.destroyEvent(self.async_i32_scalar_download.ready_event);
+        self.ctx.destroyEvent(self.async_i32_scalar_download.event);
+        if (self.async_i32_scalar_download.copy_stream != null)
+            try self.ctx.driver.check(self.ctx.driver.fns.cuStreamDestroy(self.async_i32_scalar_download.copy_stream));
+        self.async_i32_scalar_download = .{};
+        if (self.cublaslt) |*blas| blas.clearCachedPlans();
+        self.decoder_runtime_linear_slots.deinit(self.allocator);
+        self.decoder_runtime_linear_slots = .empty;
+        self.decoder_runtime_rms_norm_slots.deinit(self.allocator);
+        self.decoder_runtime_rms_norm_slots = .empty;
+        self.cooperative_owner.cleanup();
+        const after = self.ctx.device_allocations.snapshot().live;
+        if (after != self.stats.resident_weight_bytes + kernel_bytes) {
+            std.log.warn("memorilla_cleanup: tracked_live={d} resident_weights={d} resident_kernels={d} before={d}", .{ after, self.stats.resident_weight_bytes, kernel_bytes, before });
+            return error.OutstandingMemorillaDeviceAllocation;
+        }
+        return .{ .device_live_before = before, .device_live_after = after, .resident_weight_bytes = self.stats.resident_weight_bytes, .resident_kernel_bytes = kernel_bytes };
+    }
+
     pub fn hasGemma4DecoderPrimitives(self: *const CudaCompute) bool {
         return self.kernels.hasGemma4DecoderPrimitives();
     }
@@ -5775,6 +5943,7 @@ pub const CudaCompute = struct {
                 self.cublaslt != null,
             .embedding_gemma2 => self.ctx.info.compute_major >= 8 and self.cublaslt != null,
             .qwen3_embedding => self.kernels.hasQwen3EmbeddingPrimitives(),
+            .qwen3_generation => self.kernels.hasQwen3GenerationPrimitives(),
             .qwen3_vl_generation => self.kernels.hasQwen3VlGenerationPrimitives(),
             .lightonocr3 => self.ctx.info.compute_major >= 8 and self.kernels.hasQwen3VlGenerationPrimitives(),
         };
@@ -25437,6 +25606,7 @@ fn gqaDenseAttention(
     const bias_mode = try biasModeFor(bias_tensor, batch, num_heads, q_seq_len, kv_seq_len);
     const bias_buffer = if (bias_tensor) |bt| bt.buffer else buffer_mod.DeviceBuffer{};
     if (cudaForceHostGqaAttention()) {
+        if (profileRequiresDeviceAttention(self.capability_profile)) return error.CudaHostAttentionForbidden;
         return gqaDenseAttentionHostFallback(
             self,
             q_tensor,
@@ -25516,7 +25686,7 @@ fn gqaDenseAttention(
             bias_mode,
         );
     } catch |err| {
-        if (err == error.CudaKernelUnavailable and cudaAllowHostAttentionFallback()) {
+        if (err == error.CudaKernelUnavailable and !profileRequiresDeviceAttention(self.capability_profile) and cudaAllowHostAttentionFallback()) {
             return gqaDenseAttentionHostFallback(
                 self,
                 q_tensor,
@@ -25740,7 +25910,7 @@ fn gqaPagedAttentionWithHostKv(
         error.DeviceWriteUnsupported,
         error.DeviceWriteFormatUnsupported,
         error.CudaPagedKvUnsupported,
-        => {},
+        => if (profileRequiresDeviceAttention(self.capability_profile)) return err,
         else => return err,
     }
 
@@ -27797,7 +27967,7 @@ fn rope(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: u
     else
         self.kernels.launchRopeF32(&self.ctx, device, input_tensor.buffer, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs);
     launch_result catch |err| {
-        if (err == error.CudaKernelUnavailable and cudaAllowHostAttentionFallback()) {
+        if (err == error.CudaKernelUnavailable and !profileRequiresDeviceAttention(self.capability_profile) and cudaAllowHostAttentionFallback()) {
             return ropeHostFallback(self, input_tensor, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
         }
         return err;
@@ -28066,7 +28236,7 @@ fn ropePerItem(ctx: *anyopaque, input: CT, batch: usize, max_seq_len: usize, hea
     var rope_profile_scope = beginPrefillProfile(self, .rope, row_count);
     defer if (rope_profile_scope) |*scope| scope.end();
     self.kernels.launchRopePerItemF32(&self.ctx, device, input_tensor.buffer, params_device.first, params_device.second, batch, max_seq_len, num_heads, head_dim, rope_dim, theta, freq_scale, consecutive_pairs) catch |err| {
-        if (err == error.CudaKernelUnavailable and cudaAllowHostAttentionFallback()) {
+        if (err == error.CudaKernelUnavailable and !profileRequiresDeviceAttention(self.capability_profile) and cudaAllowHostAttentionFallback()) {
             return ropePerItemHostFallback(self, input_tensor, batch, max_seq_len, head_dim, rope_dim, theta, freq_scale, query_lengths, position_offsets, consecutive_pairs);
         }
         return err;
