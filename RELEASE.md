@@ -57,6 +57,21 @@ platform archive, and run `./install.sh --prefix "$HOME/.local"`. The installer
 copies only grep and its supporting assets; no Antfly server or libantfly is
 required. Add the selected prefix's `bin` directory to `PATH`.
 
+### Native Apple providers in Mac archives
+
+Source build contract 7 enables Vision OCR, speech transcription, and generation
+as one default macOS capability. A small `xcode-27` job builds the Swift bridge
+from the exact release source; existing Linux cross-build jobs verify its commit,
+source hash, binary hash, architecture and ABI, then include it in both server
+and embedded archives. No complete Antfly build moves to a Mac runner.
+Older source contracts keep their previous packaging behavior.
+
+The CLI and library retain their macOS 15 deployment target. The bridge is lazy
+loaded only on macOS 26+, and actual model/locale/Apple Intelligence readiness
+remains independent of build inclusion. `-Dapple-providers=false` disables OCR,
+transcription and generation together; `-Dapple-ocr` is no longer a separate knob.
+See the [Apple provider guide](docs/guides/providers/apple.mdx).
+
 ## Release Artifacts
 
 The canonical Zig runtime artifacts are tarballs named:

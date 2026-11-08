@@ -25,7 +25,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 CONTRACT_PATH = "scripts/release/build-contract.json"
-SUPPORTED_SCHEMAS = (1, 2, 3, 4, 5, 6)
+SUPPORTED_SCHEMAS = (1, 2, 3, 4, 5, 6, 7)
 LEGACY_REQUIRED_PATHS = {
     "zig/build.zig",
     "scripts/install.sh",
@@ -79,6 +79,16 @@ REQUIRED_PATHS = PKGCONFIG_REQUIRED_PATHS | {
 }
 
 
+APPLE_PROVIDER_PATHS = REQUIRED_PATHS | {
+    "scripts/packaging/verify_native_archives.py",
+    "scripts/packaging/apple_bridge.py",
+    "zig/lib/apple_native/build_support.zig",
+    "zig/lib/apple_native/src/bridge.swift",
+    "zig/lib/apple_native/src/loader.c",
+    "zig/lib/apple_native/src/loader.h",
+}
+
+
 def runtime_products(schema: int) -> tuple[str, ...]:
     if type(schema) is not int or schema not in SUPPORTED_SCHEMAS:
         raise SystemExit("unsupported release build contract schema")
@@ -89,6 +99,7 @@ def runtime_products(schema: int) -> tuple[str, ...]:
         4: ("server", "embedded"),
         5: ("server", "embedded"),
         6: ("server", "embedded"),
+        7: ("server", "embedded"),
     }[schema]
 
 
@@ -132,6 +143,7 @@ def validate(repo_root: Path, commit: str) -> int:
         4: PKGCONFIG_REQUIRED_PATHS,
         5: REQUIRED_PATHS,
         6: REQUIRED_PATHS,
+        7: APPLE_PROVIDER_PATHS,
     }[schema]
     paths = contract.get("required_source_paths")
     if not isinstance(paths, list) or not paths:
@@ -166,6 +178,7 @@ def main() -> int:
         with args.github_output.open("a", encoding="utf-8") as output:
             output.write(f"build_contract_schema={schema}\n")
             output.write(f"runtime_products={json.dumps(products)}\n")
+            output.write(f"apple_provider_bundle={str(schema >= 7).lower()}\n")
             output.write(
                 f"embedded_zig_source={str(requires_embedded_zig_source(schema)).lower()}\n"
             )

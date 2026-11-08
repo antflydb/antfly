@@ -51,6 +51,7 @@ pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
     });
     const library_step = b.step("libantfly", "Build the embedding library, public header, and pkg-config metadata");
     library_step.dependOn(embedded.install_libantfly);
+    if (shared.apple_bridge) |install| library_step.dependOn(&install.step);
     library_step.dependOn(&embedded.install_capi_header.step);
     library_step.dependOn(&b.top_level_steps.get("licenses-libantfly").?.step);
     b.getInstallStep().dependOn(library_step);

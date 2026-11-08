@@ -25,17 +25,40 @@ None. Everything runs on the device.
 
 ## Enable It
 
-macOS server release archives include Vision OCR. For source builds, run this
-from the repository's `zig` directory with Zig 0.17:
+Native macOS CLI and embedded-library builds enable **Vision OCR, speech
+transcription, and Foundation Models generation together by default**. One
+`apple-providers` switch controls all three; there is no separate OCR toggle.
+From the repository's `zig` directory with Zig 0.17:
 
 ```bash
-zig build antfly -Dapple-ocr=true          # OCR only
-zig build antfly -Dapple-providers=true    # OCR, transcription, and generation
+zig build antfly capi                     # All Apple providers, default on macOS
+zig build antfly -Dapple-providers=false  # Disable all three, for example with an older SDK
+```
+
+Release build contract 7 includes the bridge in both macOS server and embedded
+archives. Existing older releases are unchanged. The release workflow compiles
+only the small Swift bridge on a Mac with the macOS 27 SDK, binds it to the
+release source commit, and verifies its source hash, binary hash, architecture,
+and ABI before the Linux macOS cross-build packages it. CLI and SDK packages
+retain the adjacent bridge; users do not compile or install it separately.
+
+A manual macOS cross-build can supply a bridge built from the same source:
+
+```bash
+# On a Mac (this builds only the Swift bridge):
+python3 scripts/packaging/apple_bridge.py build --directory dist/apple-bridge \
+  --source-commit "$(git rev-parse HEAD)" --architecture arm64
+# On the cross-build host, after copying that verified directory:
+python3 scripts/packaging/apple_bridge.py verify --directory dist/apple-bridge \
+  --source-commit "$(git rev-parse HEAD)" --architecture arm64
+cd zig
+zig build antfly -Dtarget=aarch64-macos.15.0 \
+  -Dapple-bridge-path="$PWD/../dist/apple-bridge/libantfly-apple.dylib"
 ```
 
 The build needs the macOS 27 SDK and the Swift 6 command-line toolchain.
-Transcription and generation live in `lib/libantfly-apple.dylib`, which both the
-`antfly` and `capi` steps install. Keep it in the `lib/` directory beside
+Transcription and generation live in `lib/libantfly-apple.dylib`, which the
+`antfly`, `capi`, and independent `libantfly` steps install. Keep it in the `lib/` directory beside
 `libantfly`, or beside the CLI's installation. For a custom Lite layout, set
 `ANTFLY_APPLE_BRIDGE_PATH` to the library's absolute path. The CLI and `libantfly`
 can target older macOS releases:

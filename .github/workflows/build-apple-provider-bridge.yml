@@ -1,0 +1,33 @@
+name: Build Apple provider bridge
+
+on:
+  workflow_call:
+    inputs:
+      source_commit:
+        required: true
+        type: string
+      artifact_name:
+        type: string
+        default: antfly-apple-bridge
+
+permissions:
+  contents: read
+
+jobs:
+  bridge:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - name: Compile and verify the source-bound Swift bridge
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: python3 scripts/packaging/apple_bridge.py build --directory dist/apple-bridge --source-commit "$SOURCE_COMMIT" --architecture arm64
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: dist/apple-bridge/
+          if-no-files-found: error

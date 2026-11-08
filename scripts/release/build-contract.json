@@ -1,5 +1,5 @@
 {
-  "schema_version": 6,
+  "schema_version": 7,
   "runtime_products": [
     "server",
     "embedded"
@@ -12,6 +12,7 @@
     "scripts/apache_engine_files.txt",
     "scripts/embedded_asset_licenses.json",
     "scripts/install.sh",
+    "scripts/packaging/apple_bridge.py",
     "scripts/packaging/build_zig_release_archive.sh",
     "scripts/packaging/embedded-release-README.md",
     "scripts/packaging/package_cli_release.py",
@@ -23,6 +24,7 @@
     "scripts/packaging/test_release_licenses.py",
     "scripts/packaging/test_reproducible_tar.py",
     "scripts/packaging/verify_lite_release.py",
+    "scripts/packaging/verify_native_archives.py",
     "scripts/release/build_cli_snapshot.py",
     "scripts/release/lite_snapshot.py",
     "scripts/release/platforms.json",
@@ -36,6 +38,10 @@
     "zig/build.zig",
     "zig/build_support/embedded/embedded.zig",
     "zig/embedded.build.zig",
+    "zig/lib/apple_native/build_support.zig",
+    "zig/lib/apple_native/src/bridge.swift",
+    "zig/lib/apple_native/src/loader.c",
+    "zig/lib/apple_native/src/loader.h",
     "zig/pkg/antfly-embedded/LICENSE",
     "zig/pkg/antfly-embedded/README.md",
     "zig/pkg/antfly-embedded/build.zig",
