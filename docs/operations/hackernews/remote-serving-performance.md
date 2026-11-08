@@ -989,3 +989,49 @@ owner replacement with loss of local cache. Full-archive query diversity and
 cache pressure must be measured before making archive-wide latency claims. Real
 S3 qualification remains waived for this task. Keep compact new results here;
 the November 8 baseline above does not need duplicated artifacts or reruns.
+
+### Reset-socket recovery and original-settings check
+
+Local syscall tracing identified the intermittent HN transport failure:
+Darwin returns `EINVAL` when setting a valid timeout on a TCP socket made
+defunct by a peer reset. The observed value was 25 ms on a live socket
+descriptor. An independent loopback reproduction confirmed both timeout
+options fail this way even after `recv` consumes `SO_ERROR`; `getpeername`
+still identifies the disconnected socket. Timeout setup now reports
+`ConnectionResetByPeer` for this state. Invalid descriptors and option errors
+on connected sockets retain their existing diagnostics. Healthy timeout setup
+performs no additional syscall.
+
+Buffered and streaming HTTP/1 pool admission replace at most one such reset
+connection before publishing the request socket or transmitting headers/body.
+The replacement shares the request's cancellation and deadline. Existing
+method-aware replay rules continue to govern failures during transmission or
+response delivery. A deterministic loopback regression seeds a reset pooled
+connection, consumes its socket error, then sends a POST with retries disabled
+through each response API and verifies exactly one server-side request and one
+response body. Disabling the fix reproduces `InvalidSocketOption`; restoring it
+passes. The HTTP library gate passed 619 tests with eight platform skips.
+
+The original-settings check used the same previously recorded engine binary
+and corpus, `database` with highlights, a 64 MiB cache, zero additional pending
+rows and five warm samples. It isolates the preparation/warming changes from
+the subsequent transport correction. Results against the earlier recorded
+baseline were:
+
+| Mode / measurement | Earlier baseline | Original-settings candidate |
+|---|---:|---:|
+| Stored-source warm median | 8.90 ms | 7.47 ms |
+| Parquet-hydration warm median | 7.51 ms | 9.04 ms |
+| Stored-source first after restart | 2,345 ms | 2,764 ms |
+| Parquet-hydration first after restart | 832 ms | 720 ms |
+| Stored-source cache-cleared query | 6,207 ms | 7,360 ms |
+| Parquet-hydration cache-cleared query | 8,207 ms | 7,823 ms |
+
+Both cases passed and again recorded two preparations across three leaf calls.
+Stored-source/hydration sampled peak RSS was 202/291 MiB and footprint was
+174/267 MiB. One-minute host loads were 15.0/9.7 with three/four concurrent Zig
+compilers. These reuse the original workload settings; they are not a matched
+host experiment. Warm latency remains approximately 7–9 ms, and cold queries
+remain dominated by seconds-scale setup. This establishes no material cold
+speedup. The demonstrated improvement is bounded memory and successful retained
+pagination/publication with the larger pending overlay described above.

@@ -651,6 +651,66 @@ test "busy H1 pool admission cancels before a socket exists" {
     try cancel.await(std.testing.io);
 }
 
+// A pooled peer can reset between checkout and timeout setup. Replace at most
+// one such connection before publishing the request socket. No headers, body,
+// output or attempt-cancellation pointer have been exposed at this point.
+fn acquirePreparedConnection(comptime Entry: type, pool: anytype, io: Io, host: []const u8, port: u16, deadline_ms: ?i64, interrupt: *const RequestInterrupt, recv_ms: u64, send_ms: u64) !*Entry {
+    var replaced = false;
+    while (true) {
+        const entry = try acquirePooledConnection(Entry, pool, io, host, port, deadline_ms, interrupt);
+        Client.applyTimeouts(&entry.socket, recv_ms, send_ms, deadline_ms) catch |err| {
+            pool.evictConnection(entry);
+            try io.checkCancel();
+            if (interrupt.isCancellationRequested()) return error.Cancelled;
+            try ensureRequestDeadline(io, deadline_ms);
+            if (err == error.ConnectionResetByPeer and !replaced) {
+                replaced = true;
+                continue;
+            }
+            return err;
+        };
+        return entry;
+    }
+}
+
+test "H1 reset pooled sockets reconnect before buffered and writer POST transmission" {
+    if (!@import("builtin").os.tag.isDarwin()) return error.SkipZigTest;
+    const TestServer = @import("../testing.zig").TestServer;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |streamed| {
+        var server = try TestServer.start(a, io, &.{.{ .method = .POST, .path = "/", .respond = .{ .body = "once" } }});
+        defer server.deinit();
+        var client = Client.initWithConfig(a, io, .{ .keep_alive = true });
+        defer client.deinit();
+        const stale = try client.pool.getConnection("127.0.0.1", server.port);
+        var peer = try server.listener.accept();
+        peer.socket.abortRequest();
+        peer.socket.close();
+        var byte: [1]u8 = undefined;
+        try std.testing.expectError(error.ConnectionResetByPeer, std.posix.read(stale.socket.handle, &byte));
+        // SO_ERROR was consumed by recv; timeout setup must still recognize
+        // the defunct socket instead of reporting an invalid option.
+        try std.testing.expectError(error.ConnectionResetByPeer, stale.socket.setRecvTimeout(25));
+        try std.testing.expectError(error.ConnectionResetByPeer, stale.socket.setSendTimeout(25));
+        client.pool.releaseConnection(stale);
+        var serving = try io.concurrent(TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        const options: RequestOptions = .{ .body = "mutation", .max_retries = 0, .timeout_ms = 3000 };
+        var response = if (streamed)
+            try client.requestToWriter(.POST, server.baseUrl(), options, arrayListWriter(&out, a), null, null)
+        else
+            try client.request(.POST, server.baseUrl(), options);
+        defer response.deinit();
+        try serving.await(io);
+        try std.testing.expectEqualStrings("once", if (streamed) out.items else response.body.?);
+        try std.testing.expectEqualSlices(usize, &.{1}, server.route_hits);
+        try std.testing.expectEqual(@as(usize, 0), client.pool.active_count);
+    }
+}
+
 fn isSafeUnsentRetryError(err: anyerror) bool {
     return switch (err) {
         error.GoawayRefused,
@@ -2056,13 +2116,12 @@ pub const Client = struct {
 
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
-                var tls_conn = try acquirePooledConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt);
+                var tls_conn = try acquirePreparedConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt, timeout_ms, write_timeout_ms);
                 var ok = false;
                 defer {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
                 }
 
-                try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
                 try interrupt.publish(&tls_conn.socket, self.io);
                 defer interrupt.clear(&tls_conn.socket, self.io);
                 errdefer if (interrupt.isCancellationRequested()) (&tls_conn.socket).abortRequest();
@@ -2080,13 +2139,12 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
-            var conn = try acquirePooledConnection(@import("pool.zig").Connection, &self.pool, self.io, host, port, deadline_ms, interrupt);
+            var conn = try acquirePreparedConnection(@import("pool.zig").Connection, &self.pool, self.io, host, port, deadline_ms, interrupt, timeout_ms, write_timeout_ms);
             var ok = false;
             defer {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
             }
 
-            try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
             try interrupt.publish(&conn.socket, self.io);
             defer interrupt.clear(&conn.socket, self.io);
             errdefer if (interrupt.isCancellationRequested()) (&conn.socket).abortRequest();
@@ -2161,13 +2219,12 @@ pub const Client = struct {
 
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
-                var tls_conn = try acquirePooledConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt);
+                var tls_conn = try acquirePreparedConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt, timeout_ms, write_timeout_ms);
                 var ok = false;
                 defer {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
                 }
 
-                try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
                 try interrupt.publish(&tls_conn.socket, self.io);
                 defer interrupt.clear(&tls_conn.socket, self.io);
                 errdefer if (interrupt.isCancellationRequested()) (&tls_conn.socket).abortRequest();
@@ -2184,13 +2241,12 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
-            var conn = try acquirePooledConnection(@import("pool.zig").Connection, &self.pool, self.io, host, port, deadline_ms, interrupt);
+            var conn = try acquirePreparedConnection(@import("pool.zig").Connection, &self.pool, self.io, host, port, deadline_ms, interrupt, timeout_ms, write_timeout_ms);
             var ok = false;
             defer {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
             }
 
-            try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
             try interrupt.publish(&conn.socket, self.io);
             defer interrupt.clear(&conn.socket, self.io);
             errdefer if (interrupt.isCancellationRequested()) (&conn.socket).abortRequest();
