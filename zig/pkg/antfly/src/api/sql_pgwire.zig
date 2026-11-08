@@ -690,6 +690,8 @@ const OwnedRead = struct {
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
         const parameters = if (request.parameter_cells != null) request.parameters else try normalizeParameters(arena, request.parameters, request.parameter_types);
+        self.native_adapter.graph_parameters = parameters;
+        self.native_adapter.graph_parameter_cells = request.parameter_cells;
         var stream_backend = self.guarded.backend();
         stream_backend.statement_clock = try cursorStatementClock(statement_source, statement_instant, transaction_start_ns);
         stream_backend.transaction_start = stream_backend.statement_clock.?.transaction;
@@ -717,6 +719,11 @@ const OwnedRead = struct {
         self.stream = opened.?;
         self.native_adapter.collect_view_authorities = null;
         self.native_adapter.collect_prepared_bindings = null;
+        // Future lazy graph opens borrow the stream-owned canonical frame,
+        // rather than the request's transient native cell slice.
+        if (self.stream.parameter_invocation) |invocation| if (invocation.frame) |frame| {
+            self.native_adapter.graph_parameter_cells = frame.values;
+        };
         errdefer self.stream.close();
         var view_bindings: std.ArrayListUnmanaged(@import("sql_prepared.zig").Binding) = .empty;
         for (captured_bindings.items) |binding| {
@@ -1827,8 +1834,46 @@ const GuardedCatalog = struct {
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
-        result.vtable = &.{ .resolve_read = resolveRead, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .open_mutation_preparation = openMutationPreparation, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
+        result.vtable = &.{ .resolve_read = resolveRead, .resolve_graph = resolveGraph, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .open_mutation_preparation = openMutationPreparation, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
         return result;
+    }
+    fn resolveGraph(raw: *anyopaque, alloc: std.mem.Allocator, definition: ast.GraphTable) !catalog.Table {
+        const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
+        try checkpoint(raw);
+        const resolve_graph = self.native.vtable.resolve_graph orelse return error.UnsupportedSqlExecution;
+        const table = try resolve_graph(self.native.ptr, alloc, definition);
+        if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
+        try self.checkTableRead(table);
+        return table;
+    }
+    fn checkTableRead(self: *GuardedCatalog, table: catalog.Table) !void {
+        if (table.graph) |binding| {
+            try checkpoint(self);
+            if (!try http.resourcePermissionCurrentlyAllowed(self.authority.identity.*, .graph, binding.graph.name, .read)) return error.Forbidden;
+            for (binding.dependencies) |dependency| try self.checkRead(dependency);
+        } else try self.checkRead(table);
+    }
+    fn copyDependencies(alloc: std.mem.Allocator, tables: []const catalog.Table) ![]catalog.Table {
+        if (tables.len == 0) return &.{};
+        const copied = try alloc.alloc(catalog.Table, tables.len);
+        errdefer alloc.free(copied);
+        var count: usize = 0;
+        errdefer for (copied[0..count]) |table| alloc.free(table.physical_name);
+        for (tables, copied) |table, *out| {
+            out.* = table;
+            out.physical_name = try alloc.dupe(u8, table.physical_name);
+            count += 1;
+        }
+        return copied;
+    }
+    fn dependencies(alloc: std.mem.Allocator, table: catalog.Table) ![]catalog.Table {
+        const binding = table.graph orelse return &.{};
+        return copyDependencies(alloc, binding.dependencies);
+    }
+    fn freeDependencies(alloc: std.mem.Allocator, tables: []catalog.Table) void {
+        if (tables.len == 0) return;
+        for (tables) |table| alloc.free(table.physical_name);
+        alloc.free(tables);
     }
     fn generateRowId(raw: *anyopaque, alloc: std.mem.Allocator) ![]const u8 {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
@@ -1838,7 +1883,7 @@ const GuardedCatalog = struct {
     }
     fn resolveConflictOwners(raw: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        try self.checkRead(table);
+        try self.checkTableRead(table);
         if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
         const resolve_owners = self.native.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlShape;
         return resolve_owners(self.native.ptr, alloc, scratch_alloc, table, target, mutations);
@@ -1867,7 +1912,7 @@ const GuardedCatalog = struct {
     }
     fn scan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        try self.checkRead(table);
+        try self.checkTableRead(table);
         return self.native.vtable.scan(self.native.ptr, alloc, table, request);
     }
     fn checkRead(self: *GuardedCatalog, table: catalog.Table) !void {
@@ -1880,31 +1925,69 @@ const GuardedCatalog = struct {
         alloc: std.mem.Allocator,
         guard: *GuardedCatalog,
         table: catalog.Table,
+        is_graph: bool = false,
+        graph_dependencies: []catalog.Table = &.{},
         inner: catalog.Cursor,
 
+        fn checkAuthority(self: *@This()) !void {
+            if (!self.is_graph) return self.guard.checkRead(self.table);
+            try GuardedCatalog.checkpoint(self.guard);
+            if (!try http.resourcePermissionCurrentlyAllowed(self.guard.authority.identity.*, .graph, self.table.physical_name, .read)) return error.Forbidden;
+            for (self.graph_dependencies) |table| try self.guard.checkRead(table);
+        }
+        fn releaseFields(self: *@This()) void {
+            self.alloc.free(self.table.physical_name);
+            GuardedCatalog.freeDependencies(self.alloc, self.graph_dependencies);
+        }
         fn next(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             return self.inner.next(self.inner.ptr, alloc, limit);
         }
         fn nextColumns(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             return self.inner.next_columns.?(self.inner.ptr, alloc, limit);
         }
         fn countRows(raw: *anyopaque) !?u64 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             return self.inner.count_rows.?(self.inner.ptr);
+        }
+        fn enableWeights(raw: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.checkAuthority();
+            const enabled = try self.inner.enable_weights.?(self.inner.ptr, multiplicity);
+            try self.checkAuthority();
+            return enabled;
+        }
+        fn checkGroups(ptr: *anyopaque, _: std.mem.Allocator) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.checkAuthority();
+        }
+        fn enableGroups(ptr: *anyopaque, requests: []const catalog.AggregateWeight, orders: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *@import("antfly_local_sources").sql_operators.Grouped) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.checkAuthority();
+            const enabled = try self.inner.enable_groups.?(self.inner.ptr, requests, orders, grouped);
+            if (enabled) try @import("sql_group_guard.zig").wrap(self.alloc, grouped, .{ .ptr = self, .call = checkGroups });
+            try self.checkAuthority();
+            return enabled;
+        }
+        fn enableAggregateWeights(raw: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.checkAuthority();
+            const enabled = try self.inner.enable_aggregate_weights.?(self.inner.ptr, requests);
+            try self.checkAuthority();
+            return enabled;
         }
         fn wantsExactFilter(raw: *anyopaque, columns: []const @import("antfly_local_sources").sql_dynamic_filter.Column) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             return self.inner.wants_exact_filter.?(self.inner.ptr, columns);
         }
         fn setDynamicFilter(raw: *anyopaque, filter: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             return self.inner.set_dynamic_filter.?(self.inner.ptr, filter);
         }
         fn splitScan(raw: *anyopaque, alloc: std.mem.Allocator, workers: usize) !?[]catalog.Cursor {
@@ -1915,7 +1998,7 @@ const GuardedCatalog = struct {
         }
         fn splitImpl(raw: *anyopaque, alloc: std.mem.Allocator, workers: usize, ordered: bool) !?[]catalog.Cursor {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             const split = if (ordered) self.inner.split_ordered.? else self.inner.split_scan.?;
             const children = (try split(self.inner.ptr, alloc, workers)) orelse return null;
             defer alloc.free(children);
@@ -1929,8 +2012,10 @@ const GuardedCatalog = struct {
                 errdefer alloc.free(name);
                 var table = self.table;
                 table.physical_name = name;
+                const deps = try GuardedCatalog.copyDependencies(alloc, self.graph_dependencies);
+                errdefer GuardedCatalog.freeDependencies(alloc, deps);
                 const owner = try alloc.create(ReadCursor);
-                owner.* = .{ .alloc = alloc, .guard = self.guard, .table = table, .inner = child };
+                owner.* = .{ .alloc = alloc, .guard = self.guard, .table = table, .is_graph = self.is_graph, .graph_dependencies = deps, .inner = child };
                 out.* = owner.cursor(close);
                 wrapped += 1;
             }
@@ -1947,6 +2032,9 @@ const GuardedCatalog = struct {
                 .close = release,
                 .next_columns = if (self.inner.next_columns != null) nextColumns else null,
                 .count_rows = if (self.inner.count_rows != null) countRows else null,
+                .enable_weights = if (self.inner.enable_weights != null) enableWeights else null,
+                .enable_groups = if (self.inner.enable_groups != null) enableGroups else null,
+                .enable_aggregate_weights = if (self.inner.enable_aggregate_weights != null) enableAggregateWeights else null,
                 .set_dynamic_filter = if (self.inner.set_dynamic_filter != null) setDynamicFilter else null,
                 .wants_exact_filter = if (self.inner.wants_exact_filter != null) wantsExactFilter else null,
                 .split_scan = if (self.inner.split_scan != null) splitScan else null,
@@ -1956,13 +2044,13 @@ const GuardedCatalog = struct {
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.inner.close(self.inner.ptr);
-            self.alloc.free(self.table.physical_name);
+            self.releaseFields();
             self.alloc.destroy(self);
         }
     };
     fn openScan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        try self.checkRead(table);
+        try self.checkTableRead(table);
         const open = self.native.vtable.open_scan orelse return null;
         const inner = (try open(self.native.ptr, alloc, table, request)) orelse return null;
         errdefer inner.close(inner.ptr);
@@ -1970,8 +2058,10 @@ const GuardedCatalog = struct {
         errdefer alloc.free(name);
         var retained = table;
         retained.physical_name = name;
+        const deps = try dependencies(alloc, table);
+        errdefer freeDependencies(alloc, deps);
         const cursor = try alloc.create(ReadCursor);
-        cursor.* = .{ .alloc = alloc, .guard = self, .table = retained, .inner = inner };
+        cursor.* = .{ .alloc = alloc, .guard = self, .table = retained, .is_graph = table.graph != null, .graph_dependencies = deps, .inner = inner };
         // Materialized execution closes before returning; streaming execution
         // retains the heap-owned guard and authority in its OwnedRead capsule.
         return cursor.cursor(ReadCursor.close);
@@ -2049,7 +2139,7 @@ const GuardedCatalog = struct {
         fn close(raw: *anyopaque) void {
             const self: *StatementRead = @ptrCast(@alignCast(raw));
             self.inner.close(self.inner.ptr);
-            for (self.wrappers) |wrapper| self.alloc.free(wrapper.table.physical_name);
+            for (self.wrappers) |*wrapper| wrapper.releaseFields();
             self.alloc.free(self.wrappers);
             self.alloc.free(self.cursors);
             self.alloc.destroy(self);
@@ -2058,7 +2148,7 @@ const GuardedCatalog = struct {
 
     fn openStatement(raw: *anyopaque, alloc: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        for (scans) |scan_request| try self.checkRead(scan_request.table);
+        for (scans) |scan_request| try self.checkTableRead(scan_request.table);
         const open = self.native.vtable.open_statement orelse return error.SqlStatementSnapshotRequired;
         const inner = try open(self.native.ptr, alloc, scans);
         errdefer inner.close(inner.ptr);
@@ -2070,11 +2160,13 @@ const GuardedCatalog = struct {
         const cursors = try alloc.alloc(catalog.Cursor, scans.len);
         errdefer alloc.free(cursors);
         var count: usize = 0;
-        errdefer for (wrappers[0..count]) |wrapper| alloc.free(wrapper.table.physical_name);
+        errdefer for (wrappers[0..count]) |*wrapper| wrapper.releaseFields();
         for (scans, inner.cursors, wrappers, cursors) |scan_request, cursor, *wrapper, *out| {
-            var table = scan_request.table;
-            table.physical_name = try alloc.dupe(u8, table.physical_name);
-            wrapper.* = .{ .alloc = alloc, .guard = self, .table = table, .inner = cursor };
+            const deps = try dependencies(alloc, scan_request.table);
+            errdefer freeDependencies(alloc, deps);
+            var retained = scan_request.table;
+            retained.physical_name = try alloc.dupe(u8, retained.physical_name);
+            wrapper.* = .{ .alloc = alloc, .guard = self, .table = retained, .is_graph = scan_request.table.graph != null, .graph_dependencies = deps, .inner = cursor };
             count += 1;
             out.* = wrapper.cursor(StatementRead.borrowedClose);
         }

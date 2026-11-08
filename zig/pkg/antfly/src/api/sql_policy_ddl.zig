@@ -228,6 +228,7 @@ test "SQL policy DDL writes a durable draft only and never publishes it" {
                     defer encoded.deinit();
                     var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
                     try @import("antfly_local_sources").storage_db_relational_integrity_json.write(command, &stream);
+                    try std.testing.expect(encoded.written().len > 0);
                     self.mutation_calls += 1;
                     break :blk alloc.dupe(u8, "{\"revision\":8}");
                 },

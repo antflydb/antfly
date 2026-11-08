@@ -515,18 +515,117 @@ pub fn ensureDistinctValueCapacity(
 const MatchState = struct {
     bindings: []PatternBinding,
     path: []paths_mod.PathEdge,
+    relationships: RelationshipSet = .{},
 
     pub fn deinit(self: *MatchState, alloc: Allocator) void {
         for (self.bindings) |*binding| binding.deinit(alloc);
         if (self.bindings.len > 0) alloc.free(self.bindings);
         freePathEdges(alloc, self.path);
+        self.relationships.deinit(alloc);
         self.* = undefined;
     }
 };
 
 const PathAncestry = struct {
     node: node_identity.Ref,
+    relationship: ?RelationshipIdentity = null,
     parent: ?*const PathAncestry,
+};
+
+/// Physical relationship identity is independent of traversal direction and
+/// endpoint alias names. The owning table separates equal edge IDs in distinct
+/// tables; tuple identities remain valid for indexes without explicit IDs.
+const RelationshipIdentity = struct {
+    table: ?[]const u8,
+    source: []const u8,
+    target: []const u8,
+    kind: []const u8,
+    id: []const u8,
+    owner: []const u8,
+
+    fn eql(left: @This(), right: @This()) bool {
+        return optionalTableEql(left.table, right.table) and
+            std.mem.eql(u8, left.source, right.source) and
+            std.mem.eql(u8, left.target, right.target) and
+            std.mem.eql(u8, left.kind, right.kind) and
+            std.mem.eql(u8, left.id, right.id) and
+            std.mem.eql(u8, left.owner, right.owner);
+    }
+    fn bytes(self: @This()) usize {
+        return @sizeOf(@This()) + (if (self.table) |t| t.len else 0) + self.source.len + self.target.len + self.kind.len + self.id.len + self.owner.len;
+    }
+    fn clone(self: @This(), a: Allocator) !@This() {
+        const table = if (self.table) |t| try a.dupe(u8, t) else null;
+        errdefer if (table) |t| a.free(t);
+        const source = try a.dupe(u8, self.source);
+        errdefer a.free(source);
+        const target = try a.dupe(u8, self.target);
+        errdefer a.free(target);
+        const kind = try a.dupe(u8, self.kind);
+        errdefer a.free(kind);
+        const id = try a.dupe(u8, self.id);
+        errdefer a.free(id);
+        const owner = try a.dupe(u8, self.owner);
+        return .{ .table = table, .source = source, .target = target, .kind = kind, .id = id, .owner = owner };
+    }
+    fn deinit(self: @This(), a: Allocator) void {
+        if (self.table) |t| a.free(t);
+        a.free(self.source);
+        a.free(self.target);
+        a.free(self.kind);
+        a.free(self.id);
+        a.free(self.owner);
+    }
+};
+
+const RelationshipSet = struct {
+    items: []RelationshipIdentity = &.{},
+    budget: ?*WorkBudget = null,
+    retained_bytes: usize = 0,
+
+    fn deinit(self: *@This(), a: Allocator) void {
+        for (self.items) |r| r.deinit(a);
+        if (self.items.len > 0) a.free(self.items);
+        if (self.budget) |budget| budget.releaseStateBytes(self.retained_bytes);
+        self.* = .{};
+    }
+    fn contains(self: @This(), r: RelationshipIdentity) bool {
+        for (self.items) |prior| if (prior.eql(r)) return true;
+        return false;
+    }
+    fn append(self: *@This(), a: Allocator, budget: *WorkBudget, r: RelationshipIdentity) !void {
+        const bytes = r.bytes();
+        try budget.retainStateBytes(bytes);
+        errdefer budget.releaseStateBytes(bytes);
+        const owned = try r.clone(a);
+        errdefer owned.deinit(a);
+        const items = try a.alloc(RelationshipIdentity, self.items.len + 1);
+        @memcpy(items[0..self.items.len], self.items);
+        items[self.items.len] = owned;
+        if (self.items.len > 0) a.free(self.items);
+        self.items = items;
+        self.budget = budget;
+        self.retained_bytes += bytes;
+    }
+    fn clone(self: @This(), a: Allocator) !@This() {
+        var out: @This() = .{};
+        errdefer out.deinit(a);
+        for (self.items) |r| try out.append(a, self.budget.?, r);
+        return out;
+    }
+    fn appendAncestry(self: *@This(), a: Allocator, budget: *WorkBudget, ancestry: *const PathAncestry) !bool {
+        // Check the entire path before modifying the scope. Each path already
+        // prevents internal reuse; this enforces reuse across comma patterns.
+        var cursor: ?*const PathAncestry = ancestry;
+        while (cursor) |entry| : (cursor = entry.parent) {
+            if (entry.relationship) |r| if (self.contains(r)) return false;
+        }
+        cursor = ancestry;
+        while (cursor) |entry| : (cursor = entry.parent) {
+            if (entry.relationship) |r| try self.append(a, budget, r);
+        }
+        return true;
+    }
 };
 
 /// Request-local ancestry storage. Every expanded state owns only its newest
@@ -557,10 +656,13 @@ const ReachabilityAncestry = struct {
         key: []const u8,
         table: ?[]const u8,
         parent: ?*const PathAncestry,
+        relationship: ?RelationshipIdentity,
     ) !*const PathAncestry {
         var added = std.math.add(usize, @sizeOf(PathAncestry), key.len) catch
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
         if (table) |value| added = std.math.add(usize, added, value.len) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        if (relationship) |r| added = std.math.add(usize, added, r.bytes()) catch
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
         try self.work_budget.retainStateBytes(added);
         errdefer self.work_budget.releaseStateBytes(added);
@@ -571,6 +673,7 @@ const ReachabilityAncestry = struct {
         const ancestry = try arena_alloc.create(PathAncestry);
         ancestry.* = .{
             .node = .{ .key = owned_key, .table = owned_table },
+            .relationship = if (relationship) |r| try r.clone(arena_alloc) else null,
             .parent = parent,
         };
         self.retained_bytes += added;
@@ -594,7 +697,7 @@ const Frontier = struct {
 const ReachableObserver = struct {
     ctx: *anyopaque,
     full_fn: *const fn (*anyopaque) bool,
-    observe_fn: *const fn (*anyopaque, node_identity.Ref, u32, []const paths_mod.PathEdge) anyerror!void,
+    observe_fn: *const fn (*anyopaque, node_identity.Ref, u32, []const paths_mod.PathEdge, *const PathAncestry) anyerror!void,
 
     fn full(self: ReachableObserver) bool {
         return self.full_fn(self.ctx);
@@ -605,8 +708,9 @@ const ReachableObserver = struct {
         node: node_identity.Ref,
         depth: u32,
         path: []const paths_mod.PathEdge,
+        ancestry: *const PathAncestry,
     ) !void {
-        return self.observe_fn(self.ctx, node, depth, path);
+        return self.observe_fn(self.ctx, node, depth, path, ancestry);
     }
 };
 
@@ -615,11 +719,13 @@ const ReachableNode = struct {
     table: ?[]u8 = null,
     depth: u32,
     path: []paths_mod.PathEdge,
+    relationships: RelationshipSet = .{},
 
     pub fn deinit(self: *ReachableNode, alloc: Allocator) void {
         alloc.free(self.key);
         if (self.table) |table| alloc.free(table);
         freePathEdges(alloc, self.path);
+        self.relationships.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -628,6 +734,7 @@ const ReachableCollector = struct {
     alloc: Allocator,
     results: *std.ArrayListUnmanaged(ReachableNode),
     limit: usize,
+    work_budget: *WorkBudget,
 
     fn observer(self: *ReachableCollector) ReachableObserver {
         return .{
@@ -647,11 +754,13 @@ const ReachableCollector = struct {
         node: node_identity.Ref,
         depth: u32,
         path: []const paths_mod.PathEdge,
+        ancestry: *const PathAncestry,
     ) !void {
         const self: *ReachableCollector = @ptrCast(@alignCast(ctx));
         if (self.results.items.len >= self.limit) return;
         var reached = try initReachableNode(self.alloc, node.key, node.table, depth, path);
         errdefer reached.deinit(self.alloc);
+        _ = try reached.relationships.appendAncestry(self.alloc, self.work_budget, ancestry);
         try self.results.append(self.alloc, reached);
     }
 };
@@ -801,8 +910,8 @@ pub fn matchPatternFromRefsWithEdgeReader(
         return error.InvalidArgument;
     }
     for (pattern[1..]) |step| {
-        const min_hops = if (step.edge.min_hops == 0) @as(u32, 1) else step.edge.min_hops;
-        const max_hops = if (step.edge.max_hops == 0) @as(u32, 1) else step.edge.max_hops;
+        const min_hops = step.edge.min_hops;
+        const max_hops = step.edge.max_hops;
         if (min_hops > max_hops or max_hops > max_pattern_hops)
             return error.InvalidArgument;
     }
@@ -948,6 +1057,12 @@ pub fn matchPatternFromRefsWithEdgeReader(
             }
 
             for (reachable) |reached| {
+                var reuses = false;
+                for (reached.relationships.items) |r| if (match.relationships.contains(r)) {
+                    reuses = true;
+                    break;
+                };
+                if (reuses) continue;
                 if (cycle_binding) |existing| {
                     if (!std.mem.eql(u8, reached.key, existing.key) or
                         !optionalTableEql(reached.table, existing.table)) continue;
@@ -981,9 +1096,13 @@ pub fn matchPatternFromRefsWithEdgeReader(
                 else
                     @constCast((&[_]paths_mod.PathEdge{})[0..]);
                 errdefer if (state_owned) freePathEdges(alloc, new_path);
+                var used = try match.relationships.clone(alloc);
+                errdefer if (state_owned) used.deinit(alloc);
+                for (reached.relationships.items) |r| try used.append(alloc, work_budget, r);
                 try next.append(alloc, .{
                     .bindings = new_bindings,
                     .path = new_path,
+                    .relationships = used,
                 });
                 state_owned = false;
 
@@ -1069,8 +1188,8 @@ fn matchExactTwoEdgePattern(
     }
     for (pattern[1..]) |step| {
         if (step.edge.types.len != 1 or step.edge.direction == .both) return null;
-        const min_hops = if (step.edge.min_hops == 0) @as(u32, 1) else step.edge.min_hops;
-        const max_hops = if (step.edge.max_hops == 0) @as(u32, 1) else step.edge.max_hops;
+        const min_hops = step.edge.min_hops;
+        const max_hops = step.edge.max_hops;
         if (min_hops != 1 or max_hops != 1) return null;
     }
 
@@ -1217,9 +1336,10 @@ fn matchExactTwoEdgePattern(
                 return null;
             }
             if (!try edgeMatchesBudgeted(alloc, backward_edge, prepared_steps[2].edge, work_budget)) continue;
+            const forward_edge = forward_edges[candidate.forward_edge_index];
+            if (physicalRelationship(edge_reader, null, forward_edge, .{ .step = pattern[1].edge }).eql(physicalRelationship(edge_reader, null, backward_edge, .{ .step = pattern[2].edge }))) continue;
             exact_edge_matches += 1;
             if (matches.items.len >= result_limit) continue;
-            const forward_edge = forward_edges[candidate.forward_edge_index];
             const middle_key = candidate.middle_key;
 
             var all_bindings = try alloc.alloc(PatternBinding, 3);
@@ -1311,6 +1431,7 @@ fn findReachableNodes(
         .alloc = alloc,
         .results = &results,
         .limit = result_limit,
+        .work_budget = work_budget,
     };
     try streamReachableNodes(
         alloc,
@@ -1354,13 +1475,10 @@ fn streamReachableNodes(
     defer if (traversal.step.edge_filter.prepared == null) edge.edge_filter.releasePrepared(alloc);
     var filter_lease = try @import("work_budget.zig").RetainedLease.init(work_budget, edge.edge_filter.retainedBytes());
     defer filter_lease.deinit();
-    const min_hops = if (edge.min_hops == 0) @as(u32, 1) else edge.min_hops;
-    const max_hops = if (edge.max_hops == 0) @as(u32, 1) else edge.max_hops;
-    // A fixed relationship is not a variable-length path: a physical
-    // self-loop may bind two distinct aliases to the same node. Multi-hop
-    // expansion remains node-simple, apart from an explicit already-bound
-    // cycle target.
-    const fixed_single_hop = min_hops == 1 and max_hops == 1;
+    const min_hops = edge.min_hops;
+    const max_hops = edge.max_hops;
+    // Cypher trails may revisit nodes, including self-loops, but may not
+    // traverse the same physical relationship twice in this path.
     // The endpoint declaration determines only the first incoming source
     // table. Unnamed intermediate sources may live anywhere in the catalog, so
     // a cross-table reverse variable path cannot be proven from this plan.
@@ -1374,9 +1492,14 @@ fn streamReachableNodes(
         current.deinit(alloc);
     }
     {
-        var initial = try initFrontier(&ancestry, start_key, start_table, &.{}, null, 0);
+        var initial = try initFrontier(&ancestry, start_key, start_table, &.{}, null, 0, null);
         errdefer initial.deinit(alloc);
         try current.append(alloc, initial);
+    }
+    if (min_hops == 0 and targetNodeMatches(.{ .key = start_key, .table = start_table }, target_nodes, target_required) and
+        try passesNodeFilter(.{ .key = start_key, .table = start_table }, node_filter, evaluator))
+    {
+        try observer.observe(.{ .key = start_key, .table = start_table }, 0, &.{}, current.items[0].ancestry);
     }
     while (current.items.len > 0 and !observer.full()) {
         var next = std.ArrayListUnmanaged(Frontier).empty;
@@ -1434,13 +1557,7 @@ fn streamReachableNodes(
                         if (!endpoint.connected) continue;
                         const target_key = endpoint.key;
                         const target_table = endpoint.table;
-                        if (shouldRejectPathRevisit(
-                            frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }),
-                            .{ .table = target_table, .key = target_key },
-                            target_nodes,
-                            target_required,
-                            fixed_single_hop,
-                        )) continue;
+                        if (frontierContainsRelationship(frontier.*, physicalRelationship(edge_reader, frontier.table, graph_edge, traversal))) continue;
                         candidate_indexes.appendAssumeCapacity(edge_index);
                         candidate_nodes.appendAssumeCapacity(.{
                             .key = target_key,
@@ -1474,13 +1591,7 @@ fn streamReachableNodes(
                         if (!endpoint.connected) continue;
                         const target_key = endpoint.key;
                         const target_table = endpoint.table;
-                        if (shouldRejectPathRevisit(
-                            frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }),
-                            .{ .table = target_table, .key = target_key },
-                            target_nodes,
-                            target_required,
-                            fixed_single_hop,
-                        )) continue;
+                        if (frontierContainsRelationship(frontier.*, physicalRelationship(edge_reader, frontier.table, graph_edge, traversal))) continue;
                         const new_hops = frontier.hops + 1;
                         if (new_hops < min_hops or
                             !targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, target_required)) continue;
@@ -1500,21 +1611,13 @@ fn streamReachableNodes(
                     if (!endpoint.connected) continue;
                     const target_key = endpoint.key;
                     const target_table = endpoint.table;
-                    const revisits_path = frontierContainsNode(
-                        frontier.*,
-                        .{ .table = target_table, .key = target_key },
-                    );
+                    const relationship = physicalRelationship(edge_reader, frontier.table, graph_edge, traversal);
+                    if (frontierContainsRelationship(frontier.*, relationship)) continue;
                     if (admitted_edges) |mask| {
                         if (!mask[edge_index]) continue;
                     } else {
                         if (!try edgeMatchesBudgeted(alloc, graph_edge, edge, work_budget)) continue;
-                        if (shouldRejectPathRevisit(
-                            revisits_path,
-                            .{ .table = target_table, .key = target_key },
-                            target_nodes,
-                            target_required,
-                            fixed_single_hop,
-                        )) continue;
+                        if (frontierContainsRelationship(frontier.*, physicalRelationship(edge_reader, frontier.table, graph_edge, traversal))) continue;
                     }
                     const new_hops = frontier.hops + 1;
                     const new_path = if (include_paths)
@@ -1523,6 +1626,7 @@ fn streamReachableNodes(
                         @constCast((&[_]paths_mod.PathEdge{})[0..]);
                     var new_path_owned = true;
                     errdefer if (new_path_owned) freePathEdges(alloc, new_path);
+                    const reached_ancestry = try ancestry.append(target_key, target_table, frontier.ancestry, relationship);
 
                     if (new_hops >= min_hops and
                         targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, target_required) and
@@ -1532,6 +1636,7 @@ fn streamReachableNodes(
                             .{ .key = target_key, .table = target_table },
                             new_hops,
                             new_path,
+                            reached_ancestry,
                         );
                         if (observer.full()) {
                             freePathEdges(alloc, new_path);
@@ -1540,17 +1645,8 @@ fn streamReachableNodes(
                         }
                     }
 
-                    // A repeated node is permitted only to materialize an explicit
-                    // cycle-closing target. Do not expand it into non-simple paths.
-                    if (new_hops < max_hops and !revisits_path) {
-                        var next_item = try initFrontier(
-                            &ancestry,
-                            target_key,
-                            target_table,
-                            new_path,
-                            frontier.ancestry,
-                            new_hops,
-                        );
+                    if (new_hops < max_hops) {
+                        var next_item: Frontier = .{ .key = reached_ancestry.node.key, .table = reached_ancestry.node.table, .path = new_path, .ancestry = reached_ancestry, .hops = new_hops };
                         new_path_owned = false;
                         errdefer next_item.deinit(alloc);
                         try work_budget.checkIntermediateStates(next.items.len + 1, max_intermediate_states);
@@ -1747,12 +1843,14 @@ fn effectiveAlias(alias: []const u8, step_idx: usize, buf: []u8) []const u8 {
 const ConjunctiveState = struct {
     bindings: []PatternBinding,
     null_aliases: [][]u8 = &.{},
+    relationships: RelationshipSet = .{},
 
     pub fn deinit(self: *ConjunctiveState, alloc: Allocator) void {
         for (self.bindings) |*binding| binding.deinit(alloc);
         if (self.bindings.len > 0) alloc.free(self.bindings);
         for (self.null_aliases) |alias| alloc.free(alias);
         if (self.null_aliases.len > 0) alloc.free(self.null_aliases);
+        self.relationships.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1794,7 +1892,9 @@ pub fn matchConjunctivePatternWithEdgeReader(
 
     var local_output_work_budget = WorkBudget.init(opts.max_explored_nodes, opts.max_explored_edges);
     const output_work_budget = opts.work_budget orelse &local_output_work_budget;
-    var current = try buildConjunctiveStates(alloc, edge_reader, start_keys, pattern, opts);
+    var execution_opts = opts;
+    execution_opts.work_budget = output_work_budget;
+    var current = try buildConjunctiveStates(alloc, edge_reader, start_keys, pattern, execution_opts);
     defer freeConjunctiveStates(alloc, &current);
 
     const result_len = if (opts.max_results == 0) current.items.len else @min(current.items.len, opts.max_results);
@@ -1942,7 +2042,9 @@ fn buildConjunctiveStates(
         for (current.items) |state| {
             var correlated = std.ArrayListUnmanaged(ConjunctiveState).empty;
             errdefer freeConjunctiveStates(alloc, &correlated);
-            try correlated.append(alloc, try cloneConjunctiveState(alloc, state));
+            var scoped = try cloneConjunctiveState(alloc, state);
+            scoped.relationships.deinit(alloc);
+            try correlated.append(alloc, scoped);
             try expandConjunctiveGroup(
                 alloc,
                 edge_reader,
@@ -2380,6 +2482,9 @@ fn streamConjunctiveOptionalGroups(
     }
 
     const group = pattern.optional[optional_index];
+    var scoped = try cloneConjunctiveState(alloc, state);
+    defer scoped.deinit(alloc);
+    scoped.relationships.deinit(alloc);
     const processed = try alloc.alloc(bool, group.edges.len);
     defer alloc.free(processed);
     @memset(processed, false);
@@ -2391,7 +2496,7 @@ fn streamConjunctiveOptionalGroups(
         group.nodes,
         group.edges,
         group.predicates,
-        state,
+        scoped,
         processed,
         0,
         optional_index,
@@ -2580,6 +2685,7 @@ fn streamReachableIntoConjunctiveGroup(
             reached: node_identity.Ref,
             depth: u32,
             _: []const paths_mod.PathEdge,
+            ancestry: *const PathAncestry,
         ) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.sink.full()) return;
@@ -2588,6 +2694,7 @@ fn streamReachableIntoConjunctiveGroup(
             }
             var expanded = try cloneConjunctiveState(self.alloc, self.state);
             defer expanded.deinit(self.alloc);
+            if (!try expanded.relationships.appendAncestry(self.alloc, self.work_budget, ancestry)) return;
             if (!self.target_bound) {
                 try appendConcreteBindingRef(self.alloc, &expanded, self.new_alias, reached, depth);
             }
@@ -2822,8 +2929,8 @@ fn validateMatchEdge(nodes: []const MatchNode, edge: MatchEdge) !void {
 }
 
 fn validateEdgeHops(edge: MatchEdge) !void {
-    const min_hops = if (edge.step.min_hops == 0) 1 else edge.step.min_hops;
-    const max_hops = if (edge.step.max_hops == 0) 1 else edge.step.max_hops;
+    const min_hops = edge.step.min_hops;
+    const max_hops = edge.step.max_hops;
     if (min_hops > max_hops or max_hops > max_pattern_hops) return error.InvalidArgument;
 }
 
@@ -2961,8 +3068,15 @@ fn expandConjunctiveEdge(
         }
         for (reachable) |reached| {
             if (new_node) |node| if (!declaredNodeTableMatches(edge_reader, reached.table, node.table)) continue;
+            var reuses = false;
+            for (reached.relationships.items) |r| if (state.relationships.contains(r)) {
+                reuses = true;
+                break;
+            };
+            if (reuses) continue;
             var expanded = try cloneConjunctiveState(alloc, state);
             errdefer expanded.deinit(alloc);
+            for (reached.relationships.items) |r| try expanded.relationships.append(alloc, work_budget, r);
             if (target == null) try appendConcreteBinding(alloc, &expanded, new_alias, reached);
             try out.append(alloc, expanded);
         }
@@ -3036,7 +3150,7 @@ fn planPhysicalEdgeTraversals(
     if (optionalTableEql(canonical_start, canonical_reached)) {
         storage[0] = .{ .step = step };
     } else {
-        const max_hops = if (step.max_hops == 0) @as(u32, 1) else step.max_hops;
+        const max_hops = step.max_hops;
         if (max_hops > 1 and step.direction != .out)
             return error.GraphReverseVariablePathUnsupported;
 
@@ -3111,7 +3225,7 @@ fn cloneConjunctiveState(alloc: Allocator, state: ConjunctiveState) !Conjunctive
         null_aliases[i] = try alloc.dupe(u8, alias);
         initialized += 1;
     }
-    return .{ .bindings = bindings, .null_aliases = null_aliases };
+    return .{ .bindings = bindings, .null_aliases = null_aliases, .relationships = try state.relationships.clone(alloc) };
 }
 
 fn appendConcreteBinding(alloc: Allocator, state: *ConjunctiveState, alias: []const u8, reached: ReachableNode) !void {
@@ -3373,8 +3487,9 @@ fn initFrontier(
     path: []paths_mod.PathEdge,
     parent: ?*const PathAncestry,
     hops: u32,
+    relationship: ?RelationshipIdentity,
 ) !Frontier {
-    const ancestry = try ancestry_store.append(key, table, parent);
+    const ancestry = try ancestry_store.append(key, table, parent, relationship);
     return .{
         .key = ancestry.node.key,
         .table = ancestry.node.table,
@@ -3384,24 +3499,18 @@ fn initFrontier(
     };
 }
 
-fn frontierContainsNode(frontier: Frontier, node: node_identity.Ref) bool {
-    var ancestry: ?*const PathAncestry = frontier.ancestry;
-    while (ancestry) |entry| : (ancestry = entry.parent) {
-        if (optionalTableEql(entry.node.table, node.table) and
-            std.mem.eql(u8, entry.node.key, node.key)) return true;
-    }
-    return false;
+fn physicalRelationship(edge_reader: anytype, current_table: ?[]const u8, edge: graph_mod.Edge, traversal: PhysicalEdgeTraversal) RelationshipIdentity {
+    const route = if (traversal.incoming_source) |source| source.table else current_table;
+    const table = if (comptime @hasDecl(@TypeOf(edge_reader), "routingIndexTable")) edge_reader.routingIndexTable(route) else route;
+    return .{ .table = canonicalizeNodeTable(edge_reader, table), .source = edge.source, .target = edge.target, .kind = edge.edge_type, .id = edge.edge_id, .owner = edge.owner_document };
 }
 
-fn shouldRejectPathRevisit(
-    revisits_path: bool,
-    node: node_identity.Ref,
-    target_nodes: []const node_identity.Ref,
-    target_required: bool,
-    fixed_single_hop: bool,
-) bool {
-    if (!revisits_path or fixed_single_hop) return false;
-    return !(target_required and targetNodeMatches(node, target_nodes, true));
+fn frontierContainsRelationship(frontier: Frontier, relationship: RelationshipIdentity) bool {
+    var ancestry: ?*const PathAncestry = frontier.ancestry;
+    while (ancestry) |entry| : (ancestry = entry.parent) {
+        if (entry.relationship) |prior| if (prior.eql(relationship)) return true;
+    }
+    return false;
 }
 
 fn initReachableNode(
@@ -3887,7 +3996,55 @@ test "conjunctive cross-table directions use physical source routing in every ex
     try std.testing.expectEqual(@as(usize, 0), anti_matches.len);
 }
 
-test "conjunctive fixed edges preserve self loops while variable paths remain node simple" {
+test "Cypher JSON MATCH scopes relationship uniqueness and permits node revisits and zero hops" {
+    const alloc = std.testing.allocator;
+    const Reader = struct {
+        const stored = [_]graph_mod.Edge{
+            .{ .edge_id = "ab1", .source = "a", .target = "b", .edge_type = "LINK", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .edge_id = "ab2", .source = "a", .target = "b", .edge_type = "LINK", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .edge_id = "ba", .source = "b", .target = "a", .edge_type = "LINK", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+        };
+        pub fn getEdges(_: @This(), a: Allocator, _: ?[]const u8, key: []const u8, _: []const []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            var edges = std.ArrayListUnmanaged(graph_mod.Edge).empty;
+            errdefer edges.deinit(a);
+            for (stored) |edge| if ((direction != .in and std.mem.eql(u8, edge.source, key)) or (direction != .out and std.mem.eql(u8, edge.target, key))) try edges.append(a, edge);
+            return edges.toOwnedSlice(a);
+        }
+        pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
+            a.free(edges);
+        }
+    };
+    const nodes = [_]MatchNode{ .{ .alias = "a" }, .{ .alias = "b" }, .{ .alias = "c" } };
+    const edges = [_]MatchEdge{
+        .{ .from = "a", .to = "b", .step = .{ .types = &.{"LINK"} } },
+        .{ .from = "a", .to = "c", .step = .{ .types = &.{"LINK"} } },
+    };
+    // Exercise both the streaming limited sink and complete materialization.
+    for ([_]u32{ 0, 20 }) |limit| {
+        var budget = WorkBudget.init(1000, 1000);
+        const matches = try matchConjunctivePatternWithEdgeReader(alloc, Reader{}, &.{"a"}, .{ .anchor_alias = "a", .nodes = &nodes, .edges = &edges }, .{ .max_results = limit, .work_budget = &budget });
+        try std.testing.expectEqual(@as(usize, 2), matches.len);
+        freeMatches(alloc, matches);
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    }
+    const cycle_edges = [_]MatchEdge{.{ .from = "a", .to = "a", .step = .{ .types = &.{"LINK"}, .min_hops = 2, .max_hops = 2 } }};
+    const cycles = try matchConjunctivePatternWithEdgeReader(alloc, Reader{}, &.{"a"}, .{ .anchor_alias = "a", .nodes = nodes[0..1], .edges = &cycle_edges }, .{ .max_results = 20 });
+    defer freeMatches(alloc, cycles);
+    try std.testing.expectEqual(@as(usize, 2), cycles.len);
+    const zero_edges = [_]MatchEdge{.{ .from = "a", .to = "b", .step = .{ .min_hops = 0, .max_hops = 0 } }};
+    const zero = try matchConjunctivePatternWithEdgeReader(alloc, Reader{}, &.{"a"}, .{ .anchor_alias = "a", .nodes = nodes[0..2], .edges = &zero_edges }, .{ .max_results = 20 });
+    defer freeMatches(alloc, zero);
+    try std.testing.expectEqual(@as(usize, 1), zero.len);
+    try std.testing.expectEqualStrings("a", findBinding(zero[0].bindings, "b").?.key);
+    const optional_nodes = [_]MatchNode{.{ .alias = "c" }};
+    const optional_edges = [_]MatchEdge{edges[1]};
+    const optional = [_]OptionalPattern{.{ .nodes = &optional_nodes, .edges = &optional_edges }};
+    const separate = try matchConjunctivePatternWithEdgeReader(alloc, Reader{}, &.{"a"}, .{ .anchor_alias = "a", .nodes = nodes[0..2], .edges = edges[0..1], .optional = &optional }, .{ .max_results = 20 });
+    defer freeMatches(alloc, separate);
+    try std.testing.expectEqual(@as(usize, 4), separate.len);
+}
+
+test "conjunctive fixed and variable edges preserve self loops without reusing relationships" {
     const alloc = std.testing.allocator;
     const Reader = struct {
         const stored = [_]graph_mod.Edge{.{
@@ -3953,7 +4110,7 @@ test "conjunctive fixed edges preserve self loops while variable paths remain no
         .{ .max_results = 10 },
     );
     defer freeMatches(alloc, variable_matches);
-    try std.testing.expectEqual(@as(usize, 0), variable_matches.len);
+    try std.testing.expectEqual(@as(usize, 1), variable_matches.len);
 }
 
 test "conjunctive match supports branches anti joins inequality and optional nulls" {

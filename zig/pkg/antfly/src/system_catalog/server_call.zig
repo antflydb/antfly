@@ -144,6 +144,10 @@ pub const SqlSnapshotCohort = struct {
     },
 };
 
+/// An authoritative binding check for a graph already admitted by ingress.
+/// Each call observes a fresh catalog cut, including projection replacement.
+pub const GraphAuthority = struct { name: []const u8, graph_id: u64 };
+pub const GraphAuthorityResult = struct { present: bool };
 pub const Call = union(enum) {
     sql_snapshot_cohort: SqlSnapshotCohortRequest,
     resolver_authority_mutate: @import("../metadata/resolver_authority.zig").Write,
@@ -226,6 +230,7 @@ pub const Call = union(enum) {
     list_tables: TableList,
     export_snapshot: void,
     read: Read,
+    graph_authority: GraphAuthority,
     snapshot: void,
     resolve: Target,
     resolve_many: ResolveMany,

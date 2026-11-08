@@ -18,10 +18,17 @@
 const callbacks = @import("../runtime_callback_abi.zig");
 const std = @import("std");
 const types = @import("db/types.zig");
-pub const GraphRead = @import("graph_read_snapshot.zig");
+pub const RetainedGraphRead = @import("graph_read_snapshot.zig");
 const View = @import("relational_read_view.zig").View;
+pub const GraphInput = @import("cypher_read.zig").Input;
+pub const GraphRead = @import("cypher_read.zig").Read;
+pub const GraphStatement = @import("cypher_read.zig").Statement;
+pub const GraphTable = @import("cypher_read.zig").Table;
 
 pub const Fence = struct {
+    /// Opt in only when a deferred graph cut's validate operation finalizes
+    /// this fence's admission proof. Custom fences retain explicit validation.
+    graph_finalizes_validation: bool = false,
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,
@@ -32,6 +39,7 @@ pub const Fence = struct {
         open: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, types.ScanOptions) anyerror!View,
         capture_snapshot: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!Snapshot = null,
         capture_snapshot_with_graphs: ?*const fn (*anyopaque, std.mem.Allocator, []const []const u8) anyerror!Snapshot = null,
+        capture_graph: ?*const fn (*anyopaque, std.mem.Allocator, @import("cypher_read.zig").Input) anyerror!@import("cypher_read.zig").Read = null,
         release: *const fn (*anyopaque) void,
     };
     const Abi = callbacks.Boundary(VTable);
@@ -57,6 +65,10 @@ pub const Fence = struct {
         const capture = self.vtable.capture_snapshot orelse return error.SqlStatementSnapshotRequired;
         return Abi.call("capture_snapshot", self.boundary_dispatch, capture, .{ self.ptr, alloc });
     }
+    pub fn captureGraph(self: Fence, alloc: std.mem.Allocator, input: @import("cypher_read.zig").Input) !@import("cypher_read.zig").Read {
+        const capture = self.vtable.capture_graph orelse return error.CypherSnapshotRequired;
+        return Abi.call("capture_graph", self.boundary_dispatch, capture, .{ self.ptr, alloc, input });
+    }
 
     pub fn captureSnapshotWithGraphs(self: Fence, alloc: std.mem.Allocator, indexes: []const []const u8) !Snapshot {
         if (indexes.len == 0) return self.captureSnapshot(alloc);
@@ -76,7 +88,7 @@ pub const Snapshot = struct {
 
     pub const VTable = struct {
         renew: ?*const fn (*anyopaque, ?u64) anyerror!void = null,
-        graph_page: ?*const fn (*anyopaque, std.mem.Allocator, GraphRead.Request) anyerror!GraphRead.Page = null,
+        graph_page: ?*const fn (*anyopaque, std.mem.Allocator, RetainedGraphRead.Request) anyerror!RetainedGraphRead.Page = null,
         open: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, types.ScanOptions) anyerror!View,
         release: *const fn (*anyopaque) void,
     };
@@ -86,7 +98,7 @@ pub const Snapshot = struct {
         return SnapshotAbi.call("open", self.boundary_dispatch, self.vtable.open, .{ self.ptr, alloc, from, to, opts });
     }
 
-    pub fn graphPage(self: Snapshot, alloc: std.mem.Allocator, request: GraphRead.Request) !GraphRead.Page {
+    pub fn graphPage(self: Snapshot, alloc: std.mem.Allocator, request: RetainedGraphRead.Request) !RetainedGraphRead.Page {
         try request.check();
         const callback = self.vtable.graph_page orelse return error.SqlStatementSnapshotRequired;
         var page = try SnapshotAbi.call("graph_page", self.boundary_dispatch, callback, .{ self.ptr, alloc, request });

@@ -29,9 +29,9 @@ def reference():
     import psycopg
 
     inventory = json.loads((FIXTURES / "sql_parity_inventory.json").read_text())
-    source_bytes = subprocess.check_output([
-        "git", "show", inventory["source_commit"] + ":" + inventory["source_path"]
-    ])
+    source_bytes = subprocess.check_output(
+        ["git", "show", inventory["source_commit"] + ":" + inventory["source_path"]]
+    )
     if hashlib.sha256(source_bytes).hexdigest() != inventory["source_sha256"]:
         raise RuntimeError("immutable source corpus digest mismatch")
     entry = json.loads(source_bytes)["entries"][1456]
@@ -54,8 +54,12 @@ def reference():
     def checks(db):
         reject(db, original, "22P02")
         reject(db, corrected, "42809")
-        row = db.execute("SELECT id::text,sku,valid_time::text,price::text FROM prices").fetchall()
-        assert row == [("00000000-0000-0000-0000-000000000001", "sku:a", "[0,10)", "10")]
+        row = db.execute(
+            "SELECT id::text,sku,valid_time::text,price::text FROM prices"
+        ).fetchall()
+        assert row == [
+            ("00000000-0000-0000-0000-000000000001", "sku:a", "[0,10)", "10")
+        ]
         return "|".join(row[0])
 
     with postgres() as db:
@@ -66,8 +70,16 @@ def reference():
         db.execute(seed)
         db.execute(defaults_create)
         db.execute("INSERT INTO temporal_defaults DEFAULT VALUES")
-        defaults = db.execute("SELECT id::text,valid_num::text,valid_date::text FROM temporal_defaults").fetchall()
-        assert defaults == [("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "[5,15)", "[2026-01-01,2026-01-04)")]
+        defaults = db.execute(
+            "SELECT id::text,valid_num::text,valid_date::text FROM temporal_defaults"
+        ).fetchall()
+        assert defaults == [
+            (
+                "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+                "[5,15)",
+                "[2026-01-01,2026-01-04)",
+            )
+        ]
         row = checks(db)
         # The shared helper verified this connection against its own temporary
         # cluster. Restart only that same data directory and reconnect exactly
@@ -77,14 +89,37 @@ def reference():
             raise RuntimeError("refusing restart outside the owned oracle cluster")
         connection = db.info.dsn
         db.close()
-        subprocess.run([postgres_binary_dir() / "pg_ctl", "-D", data, "-m", "fast", "-w", "restart", "-l", data.parent / "restart.log"], check=True, capture_output=True, timeout=30)
+        subprocess.run(
+            [
+                postgres_binary_dir() / "pg_ctl",
+                "-D",
+                data,
+                "-m",
+                "fast",
+                "-w",
+                "restart",
+                "-l",
+                data.parent / "restart.log",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
         with psycopg.connect(connection, autocommit=True) as cold:
-            assert Path(cold.execute("SHOW data_directory").fetchone()[0]).resolve() == data
+            assert (
+                Path(cold.execute("SHOW data_directory").fetchone()[0]).resolve()
+                == data
+            )
             assert cold.execute("SHOW listen_addresses").fetchone()[0] == ""
             cold.execute("SET statement_timeout='2s'")
             cold.execute("SET lock_timeout='250ms'")
             assert checks(cold) == row
-            assert cold.execute("SELECT id::text,valid_num::text,valid_date::text FROM temporal_defaults").fetchall() == defaults
+            assert (
+                cold.execute(
+                    "SELECT id::text,valid_num::text,valid_date::text FROM temporal_defaults"
+                ).fetchall()
+                == defaults
+            )
     return {
         "format": 1,
         "postgres_version": version,
@@ -110,7 +145,12 @@ def reference():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", type=Path)
-    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[1] / "zig/pkg/antfly/src/api/fixtures/sql_temporal_conflict_reference.json")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path(__file__).resolve().parents[1]
+        / "zig/pkg/antfly/src/api/fixtures/sql_temporal_conflict_reference.json",
+    )
     args = parser.parse_args()
     actual = reference()
     if args.check:

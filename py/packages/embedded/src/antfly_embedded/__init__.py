@@ -47,6 +47,7 @@ from .errors import (
     AntflyError,
     BusyError,
     CancelledError,
+    GraphError,
     IntentConflictError,
     InternalError,
     InvalidArgumentError,
@@ -62,6 +63,7 @@ from .errors import (
 )
 
 __all__ = [
+    "GraphError",
     "__version__",
     "Database",
     "WriteIntent",

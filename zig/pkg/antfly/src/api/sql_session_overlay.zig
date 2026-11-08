@@ -53,7 +53,19 @@ pub fn openAuthorized(alloc: std.mem.Allocator, native: catalog.Cursor, staged: 
 
 /// The serialized session supplies the same durable stamp as RETURNING.
 /// Preserve the observed primary fence independently of this SQL projection.
+pub const Projection = struct {
+    ptr: *anyopaque,
+    permits: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, std.json.Value, []const []const u8) anyerror!bool,
+};
 pub fn openAtVersion(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const transactions.OwnedTransactionCommitRequest, table: catalog.Table, request: catalog.Scan, row_filter_json: ?[]const u8, policy: ?Policy, write_version: ?u64) !catalog.Cursor {
+    return openWithGuards(alloc, native, staged, table, request, row_filter_json, policy, null, write_version);
+}
+
+pub fn openWithProjection(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const transactions.OwnedTransactionCommitRequest, table: catalog.Table, request: catalog.Scan, row_filter_json: ?[]const u8, projection: ?Projection) !catalog.Cursor {
+    return openWithGuards(alloc, native, staged, table, request, row_filter_json, null, projection, null);
+}
+
+fn openWithGuards(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const transactions.OwnedTransactionCommitRequest, table: catalog.Table, request: catalog.Scan, row_filter_json: ?[]const u8, policy: ?Policy, projection: ?Projection, write_version: ?u64) !catalog.Cursor {
     const cursor = try alloc.create(Cursor);
     cursor.* = .{ .alloc = alloc, .native = native, .arena = std.heap.ArenaAllocator.init(alloc), .page_arena = std.heap.ArenaAllocator.init(alloc) };
     errdefer {
@@ -91,6 +103,7 @@ pub fn openAtVersion(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *
             if (value != .object) return error.InvalidSqlBackendResponse;
             if (row_filter) |*filter| if (!try filter.matchesJson(arena, write.key, value)) continue;
             if (policy) |check| if (!try check.permits(check.ptr, write.key, value, write.json_null_fields)) continue;
+            if (projection) |guard| if (!try guard.permits(guard.ptr, arena, table.physical_name, write.key, value, write.json_null_fields)) continue;
             var object: std.json.ObjectMap = .empty;
             var nulls: std.ArrayList(bool) = .empty;
             for (full_projection.columns) |column| {

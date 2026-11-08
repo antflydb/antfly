@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Apply checked SQL operation hooks after oapi-codegen. Fail closed if an
+// Apply checked SQL and graph operation hooks after oapi-codegen. Fail closed if an
 // upstream generator changes the expected functions instead of silently
 // dropping transport safety from regenerated clients.
 package main
@@ -41,6 +41,20 @@ func main() {
 		{`func \(c \*Client\) GetSQLCatalogOperation\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
 		{`func NewGetSQLCatalogOperationRequest\(`, "json.Marshal(body)", "marshalSQLRequest(body)"},
 		{`func ParseGetSQLCatalogOperationResponse\(`, "io.ReadAll(rsp.Body)", "readSQLResponseBody(rsp.Body)"},
+		{`func \(c \*Client\) ExecuteGraphQueryWithBody\(`, "return c.Client.Do(req)", "return executeGraphRequest(c.Client, req)"},
+		{`func \(c \*Client\) ExecuteGraphQuery\(`, "return c.Client.Do(req)", "return executeGraphRequest(c.Client, req)"},
+		{`func NewExecuteGraphQueryRequest\(`, "json.Marshal(body)", "marshalGraphRequest(body)"},
+		{`func ParseExecuteGraphQueryResponse\(`, "io.ReadAll(rsp.Body)", "readGraphResponseBody(rsp.Body)"},
+		{`func \(c \*Client\) CreateGraphWithBody\(`, "return c.Client.Do(req)", "return executeGraphCatalogRequest(c.Client, req)"},
+		{`func \(c \*Client\) CreateGraph\(`, "return c.Client.Do(req)", "return executeGraphCatalogRequest(c.Client, req)"},
+		{`func NewCreateGraphRequest\(`, "json.Marshal(body)", "marshalGraphCatalogRequest(body)"},
+		{`func ParseCreateGraphResponse\(`, "io.ReadAll(rsp.Body)", "readGraphResponseBody(rsp.Body)"},
+		{`func \(c \*Client\) UpdateGraphWithBody\(`, "return c.Client.Do(req)", "return executeGraphCatalogRequest(c.Client, req)"},
+		{`func \(c \*Client\) UpdateGraph\(`, "return c.Client.Do(req)", "return executeGraphCatalogRequest(c.Client, req)"},
+		{`func NewUpdateGraphRequest\(`, "json.Marshal(body)", "marshalGraphCatalogRequest(body)"},
+		{`func ParseUpdateGraphResponse\(`, "io.ReadAll(rsp.Body)", "readGraphResponseBody(rsp.Body)"},
+		{`func \(c \*Client\) DropGraph\(`, "return c.Client.Do(req)", "return executeGraphCatalogRequest(c.Client, req)"},
+		{`func ParseDropGraphResponse\(`, "io.ReadAll(rsp.Body)", "readGraphResponseBody(rsp.Body)"},
 		{`func \(c \*Client\) ExecuteSQLWithBody\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
 		{`func \(c \*Client\) ExecuteSQL\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
 		{`func NewExecuteSQLRequest\(`, "json.Marshal(body)", "marshalSQLRequest(body)"},

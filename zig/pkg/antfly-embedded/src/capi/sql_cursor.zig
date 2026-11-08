@@ -128,7 +128,7 @@ fn prepare(cursor: *Cursor, handle: *h.Handle, table_name: []const u8, request_j
     if (cursor.compiled.statement != .select) return error.UnsupportedSqlExecution;
     try api.requireEmbeddedSqlCatalogOwnership(handle, cursor.compiled.statement);
     if (session) |value| if (value.failed) return error.SqlTransactionAborted;
-    cursor.adapter = .{ .transaction = session, .handle = handle, .db = &handle.db, .table_name = try a.dupe(u8, table_name), .read_only = !h.liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
+    cursor.adapter = .{ .graph_parameters = request.parameters, .transaction = session, .handle = handle, .db = &handle.db, .table_name = try a.dupe(u8, table_name), .read_only = !h.liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     return request;
 }
 pub fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.Slice, out_id: *u64, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {

@@ -643,7 +643,7 @@ fn decodeVisibilitySummary(raw: []const u8) !VisibilitySummary {
     };
 }
 
-fn readVisibilitySummaryTxn(txn: anytype) !?VisibilitySummary {
+pub fn readVisibilitySummaryTxn(txn: anytype) !?VisibilitySummary {
     const mutable_txn = txn;
     const raw = mutable_txn.get(internal_keys.identity_visibility_summary_key[0..]) catch |err| switch (err) {
         error.NotFound => return null,

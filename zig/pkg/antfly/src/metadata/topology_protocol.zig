@@ -173,7 +173,9 @@ pub const sql_extension_version: u16 = 178;
 /// restartable cleanup frontier, including the composed-cursor row. This
 /// branch's earlier v83 and complete v178 SQL decoder do not decode that work.
 /// Require the unified v179 profile before admitting either ownership cut.
-pub const current_version: u16 = 179;
+/// The combined SQL and published graph cohort preserves main transition tag82,
+/// moves the unreleased index-completion tag, and admits both catalog families.
+pub const current_version: u16 = 180;
 /// Immutable, pre-executed statement trigger receipts/results on SQL TRUNCATE.
 pub const sql_truncate_preparation_version: u16 = 177;
 /// Atomically acknowledged trigger-schema and active row-policy pairs.
@@ -289,7 +291,7 @@ pub const index_publication_release_version: u16 = 116;
 pub const index_publication_installation_version: u16 = 116;
 pub const index_publication_decision_version: u16 = 116;
 pub const index_publication_head_version: u16 = 116;
-pub const index_delivery_version: u16 = 116;
+pub const index_delivery_version: u16 = 180;
 /// Metadata replicas must validate ASCH/reader profile 34 before admitting it.
 pub const clock_defaults_reader_version: u16 = 110;
 pub const schema_reader_publication_version: u16 = 84;
@@ -319,6 +321,11 @@ pub fn usesResolverRecords(indexes_json: []const u8) bool {
 pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
 }
+
+/// The combined v180 decoder adds graph definitions and main's transaction
+/// sessions alongside SQL controls, preserving published main tags 0..82.
+pub const transaction_sessions_version: u16 = 180;
+pub const graph_definition_version: u16 = 180;
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;

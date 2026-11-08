@@ -97,6 +97,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&producer_receipt_run.step);
     const relationship_identity_filters = [_][]const u8{
         "db graph endpoint cleanup pages",
+        "db graph endpoint cleanup transaction graph effects",
+        "db graph endpoint cleanup graph-only prepares reserve source ranges across reopen",
+        "db external lake rejects native mutations before and after cold reopen",
         "derived worker pause",
         "graph endpoint cleanup byte admission",
         "bulk append index",
@@ -119,7 +122,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "graph maintenance prune retires private ttl state",
         "graph split prune preserves a retained owner",
         "graph document clear",
-        "portable graph retirements are primary and require reader version four",
+        "portable backup graph retirements are primary and require reader version four",
         "graph relationship bulk ingestion preserves direct append and retirement",
         "docstore relational bulk appends retain direct ingest and atomic dirty tokens",
         "docstore backend adapters expose txn cursor and batch operations",
@@ -136,7 +139,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "graph pattern path conversion releases partial relationship allocations",
         "graph replay truncated relationship fields release all allocations",
         "db algebraic path conversion preserves provenance under allocation failures",
-        "portable relationships preserve parallel identities and arbitrary endpoints",
+        "portable backup relationships preserve parallel identities and arbitrary endpoints",
         "relationship predicate roots reject every nonobject JSON type",
         "db graph stale generation cleanup retires the exact fact identity",
         "db graph fact documents project arbitrary endpoints and retain parallel facts",

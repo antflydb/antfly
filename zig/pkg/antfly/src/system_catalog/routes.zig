@@ -41,6 +41,10 @@ pub const Route = struct {
 pub fn parseAlloc(alloc: std.mem.Allocator, path: []const u8) !?Route {
     var parts = std.mem.splitScalar(u8, std.mem.trimStart(u8, path, "/"), '/');
     const first = parts.next() orelse return null;
+    if (std.mem.eql(u8, first, "graphs")) {
+        const raw = parts.next() orelse return .{ .kind = .graph };
+        return .{ .kind = .graph, .name = try nameAlloc(alloc, raw), .suffix = parts.rest() };
+    }
     if (std.mem.eql(u8, first, "sources")) {
         const raw = parts.next() orelse return .{ .kind = .query_source };
         return .{ .kind = .query_source, .name = try nameAlloc(alloc, raw), .suffix = parts.rest() };
@@ -89,6 +93,7 @@ pub fn permissionKind(kind: domain.Kind) @import("../usermgr/mod.zig").ResourceT
         .cast, .extension, .database => .database,
         .tablespace => .tablespace,
         .role => .user,
+        .graph => .graph,
     };
 }
 
@@ -97,7 +102,7 @@ pub fn resourceNameAlloc(alloc: std.mem.Allocator, route: Route) ![]u8 {
     return switch (route.kind) {
         .named_type => std.fmt.allocPrint(alloc, "{s}.{s}", .{ route.database, route.namespace }),
         .cast, .extension => alloc.dupe(u8, route.database),
-        .database, .tablespace, .query_source, .role => alloc.dupe(u8, name),
+        .database, .tablespace, .query_source, .role, .graph => alloc.dupe(u8, name),
         .namespace => std.fmt.allocPrint(alloc, "{s}.{s}", .{ route.database, name }),
         .table, .view, .sequence, .routine => (domain.TableScope{ .database = route.database, .namespace = route.namespace, .table = route.name }).keyAlloc(alloc),
     };

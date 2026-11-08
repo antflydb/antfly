@@ -1276,6 +1276,9 @@ const RaftTableApplyStateMachine = struct {
         ArtifactCatalogEpochChanged,
         ArtifactCatalogScopeChanged,
         RowPolicyTopologyUnsupported,
+        RowPolicyDenied,
+        RowPolicyAuthenticationRequired,
+        RowPolicyCatalogChanged,
         OnlineMergeArtifactTailsUnsupported,
         OnlineSourceScopeChanged,
         InvalidSourceSnapshot,
@@ -1345,9 +1348,6 @@ const RaftTableApplyStateMachine = struct {
         SqlFeatureNotSupported,
         SqlArraySubscriptError,
         Forbidden,
-        RowPolicyAuthenticationRequired,
-        RowPolicyCatalogChanged,
-        RowPolicyDenied,
         RowPolicyMutationUnsupported,
         RowPolicyUnsupported,
         RelationalCheckViolation,
@@ -1389,6 +1389,9 @@ const RaftTableApplyStateMachine = struct {
                 error.ArtifactCatalogEpochChanged => .ArtifactCatalogEpochChanged,
                 error.ArtifactCatalogScopeChanged => .ArtifactCatalogScopeChanged,
                 error.RowPolicyTopologyUnsupported => .RowPolicyTopologyUnsupported,
+                error.RowPolicyDenied => .RowPolicyDenied,
+                error.RowPolicyAuthenticationRequired => .RowPolicyAuthenticationRequired,
+                error.RowPolicyCatalogChanged => .RowPolicyCatalogChanged,
                 error.OnlineMergeArtifactTailsUnsupported => .OnlineMergeArtifactTailsUnsupported,
                 error.InvalidMergePage => .InvalidMergePage,
                 error.MergePageSequenceGap => .MergePageSequenceGap,
@@ -1442,6 +1445,9 @@ const RaftTableApplyStateMachine = struct {
                 .ArtifactCatalogEpochChanged => error.ArtifactCatalogEpochChanged,
                 .ArtifactCatalogScopeChanged => error.ArtifactCatalogScopeChanged,
                 .RowPolicyTopologyUnsupported => error.RowPolicyTopologyUnsupported,
+                .RowPolicyDenied => error.RowPolicyDenied,
+                .RowPolicyAuthenticationRequired => error.RowPolicyAuthenticationRequired,
+                .RowPolicyCatalogChanged => error.RowPolicyCatalogChanged,
                 .OnlineMergeArtifactTailsUnsupported => error.OnlineMergeArtifactTailsUnsupported,
                 .InvalidMergePage => error.InvalidMergePage,
                 .MergePageSequenceGap => error.MergePageSequenceGap,
@@ -1478,6 +1484,11 @@ const RaftTableApplyStateMachine = struct {
                 @import("../usermgr/mod.zig").row_policy_authority.mutationRejection(err) != null) if (req.transaction) |control|
             {
                 if (control == .resolve and control.resolve.status == .committed) return null;
+            };
+            if (req.transaction) |control| if (control == .resolve and control.resolve.status == .committed) {
+                inline for (@typeInfo(@import("../api/relational_row_errors.zig").PolicyError).error_set.error_names.?) |field| {
+                    if (err == @field(@import("../api/relational_row_errors.zig").PolicyError, field)) return null;
+                }
             };
             return fromError(err);
         }
@@ -6449,13 +6460,19 @@ pub const DataServer = struct {
         owner_source.row_policy_authority_secret = self.api_server_cfg.trusted_principal_secret;
         owner_source.row_policy_authority_issuer = self.api_server_cfg.trusted_principal_issuer;
         _ = owner_source.withRuntimeStatusCache(&self.provisioned_storage.runtime_status_cache);
+        owner_source.runtime_status_change_hook = self.localChangeHook();
         _ = owner_source.withNativeMigrationPolicy(self.provisioned_storage.denseNativeMigrationPolicySource());
         _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
         _ = owner_source.withTransactionRecoverySource(self.write_source.transactionRecoverySource());
         _ = owner_source.withRestoreDescriptorRecovery(.{ .ptr = self, .recover_fn = recoverRestoreDescriptor });
         _ = owner_source.withRemoteContent(self.api_server_cfg.remote_content);
         _ = owner_source.withCoordinatedTtl(.{ .ptr = self, .expire_fn = expireRelationalRows });
-        _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication });
+        // This dispatcher publishes through Data-Raft. Native standalone
+        // owners use their local producer/coverage protocol; installing the
+        // dispatcher there fences local production behind an unavailable
+        // replicated authority, even for an empty index.
+        if (owner_source.online_source_authority == .raft)
+            _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication });
         owner_source.schema_snapshot_retention = .{ .ptr = self, .retain = retainSchemaSnapshot, .reopen = reopenSchemaSnapshot, .release = releaseSchemaSnapshot };
         _ = owner_source.withSecretStore(self.api_server_cfg.secret_store);
         if (comptime linked_storage) {
@@ -8615,8 +8632,13 @@ pub const DataServer = struct {
         const io = runtime.io() orelse return error.ArtifactCatalogDrift;
         if (self.hotStandbyWriteGate()) |gate| try gate.check();
         if (self.group_leadership_source) |leadership| if (!leadership.isLocalLeader(group_id)) return error.NotLeader;
+        if (@import("antfly_local_sources").storage_db_artifact_catalog_proposal.isProposal(command)) {
+            var catalog = try @import("antfly_local_sources").storage_db_artifact_catalog_proposal.decode(self.alloc, command);
+            defer catalog.deinit();
+            if (!std.mem.eql(u8, &catalog.value.namespace, &namespace)) return error.IdentityNamespaceMismatch;
+        }
         const recovery = try @import("antfly_local_sources").storage_db_artifact_publication_transport.RecoveryHint.decode(command);
-        const class: artifact_publication_dispatch.Queue.Class = if (std.mem.startsWith(u8, command, "ACP1") or recovery != null or @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.controlAdmissionHint(command)) .control else .producer;
+        const class: artifact_publication_dispatch.Queue.Class = if (@import("antfly_local_sources").storage_db_artifact_catalog_proposal.isProposal(command) or recovery != null or @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.controlAdmissionHint(command)) .control else .producer;
         const proposal = (try self.artifact_publication_queue.reserveClass(io, self.alloc, group_id, namespace, command, class)) orelse return;
         errdefer self.artifact_publication_queue.release(io, proposal);
         const job = try self.alloc.create(ArtifactPublicationJob);
@@ -8637,6 +8659,14 @@ pub const DataServer = struct {
     };
 
     fn runArtifactPublicationJob(ptr: *anyopaque) !void {
+        return runArtifactPublicationJobInner(ptr) catch |err| {
+            const job: *ArtifactPublicationJob = @ptrCast(@alignCast(ptr));
+            std.log.debug("artifact publication proposal deferred group_id={d} chunk={d} error={s}", .{ job.proposal.group_id, job.next_chunk, @errorName(err) });
+            return err;
+        };
+    }
+
+    fn runArtifactPublicationJobInner(ptr: *anyopaque) !void {
         const job: *ArtifactPublicationJob = @ptrCast(@alignCast(ptr));
         const self = job.server;
         if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
@@ -8687,6 +8717,16 @@ pub const DataServer = struct {
         if (try transport.RecoveryHint.decode(job.proposal.command)) |hint| {
             if (!std.mem.eql(u8, &hint.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
             try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = hint.request(), .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            return;
+        }
+        if (@import("antfly_local_sources").storage_db_artifact_catalog_proposal.isProposal(job.proposal.command)) {
+            var catalog = try @import("antfly_local_sources").storage_db_artifact_catalog_proposal.decode(self.alloc, job.proposal.command);
+            defer catalog.deinit();
+            if (!std.mem.eql(u8, &catalog.value.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_catalog = catalog.value, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.value.namespace, .authority_epoch = catalog.value.binding.epoch, .catalog_digest = catalog.value.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+            activation.publication_digest = activation.digest();
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = activation, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
             return;
         }
         const count = (job.proposal.command.len + codec.chunk_bytes - 1) / codec.chunk_bytes;
@@ -14637,15 +14677,22 @@ pub const DataServer = struct {
         // immutable metadata decision itself. The canonical bytes then travel
         // in the data Raft entry: follower apply must never depend on metadata
         // IO, its current availability, or a different metadata read cut.
-        const snapshot = try fetchRowPolicyInstallSnapshot(self, scratch, request);
+        const snapshot = fetchRowPolicyInstallSnapshot(self, scratch, request) catch |err| {
+            std.log.warn("row policy owner snapshot failed table_id={} err={s}", .{ request.table_id, @errorName(err) });
+            return err;
+        };
         var bundle_digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(snapshot, &bundle_digest, .{});
         const read_source = self.read_source.source();
         const Probe = struct {
+            var receipt_mismatch_logs: std.atomic.Value(usize) = .init(0);
             fn run(source: @TypeOf(read_source), a: std.mem.Allocator, group: u64, name: []const u8, req: antfly.public_api.row_policy_install.Request, expected_digest: [32]u8) !?Receipt {
                 var response = (source.lookupGroupLocal(a, group, name, "", .{ .row_policy_receipt = .{ .generation = req.expected_generation, .phase = req.expected_phase } }, .read_index) catch |err| switch (err) {
                     error.RowPolicyReceiptNotFound, error.NotFound => return null,
-                    else => return err,
+                    else => {
+                        std.log.warn("row policy owner receipt probe failed table_id={} err={s}", .{ req.table_id, @errorName(err) });
+                        return err;
+                    },
                 }) orelse return null;
                 defer response.deinit(a);
                 const receipt = try std.json.parseFromSliceLeaky(Receipt, a, response.json, .{});
@@ -14654,7 +14701,11 @@ pub const DataServer = struct {
                     !std.mem.eql(u8, &receipt.descriptor_digest, &req.expected_descriptor_digest) or
                     !std.mem.eql(u8, &receipt.bundle_digest, &expected_digest) or
                     receipt.applied_term == 0 or receipt.applied_index == 0)
+                {
+                    if (receipt_mismatch_logs.fetchAdd(1, .monotonic) < 4)
+                        std.log.warn("row policy owner receipt mismatch table_id={} group={} phase={s} received_phase={s} generation={} received_generation={} bundle_matches={} descriptor_matches={}", .{ req.table_id, group, @tagName(req.expected_phase), @tagName(receipt.phase), req.expected_generation, receipt.generation, std.mem.eql(u8, &receipt.bundle_digest, &expected_digest), std.mem.eql(u8, &receipt.descriptor_digest, &req.expected_descriptor_digest) });
                     return error.RowPolicyCatalogChanged;
+                }
                 return receipt;
             }
         };
@@ -14701,10 +14752,13 @@ pub const DataServer = struct {
                 .disabled => 6,
             };
             const index = try std.math.add(u64, try std.math.mul(u64, request.expected_generation, 8), phase_ordinal);
-            _ = (try self.write_source.source().replicatedBatchGroupLocal(alloc, group_id, table_name, .{
+            _ = (self.write_source.source().replicatedBatchGroupLocal(alloc, group_id, table_name, .{
                 .row_policy_publication = request,
                 .row_policy_install_bundle = snapshot,
-            }, false, .{ .term = 1, .index = index })) orelse return error.RowPolicyUnsupported;
+            }, false, .{ .term = 1, .index = index }) catch |err| {
+                std.log.warn("row policy owner phase apply failed table_id={} err={s}", .{ request.table_id, @errorName(err) });
+                return err;
+            }) orelse return error.RowPolicyUnsupported;
         }
         return (try Await.run(read_source, scratch, group_id, table_name, request, bundle_digest)) orelse error.RowPolicyReceiptNotFound;
     }
@@ -26874,6 +26928,7 @@ pub const DataServer = struct {
         if (status.stats.async_indexing.dense_catch_up.active) return true;
         if (status.stats.async_indexing.bulk_coalescing.active_session) return true;
         for (status.stats.indexes) |index| {
+            for (index.source_replay) |source| if (!source.producer_complete) return true;
             if (index.dense_vector_projection_pending) return true;
             if (index.dense_native_storage_phase == .native_building or
                 index.dense_native_storage_phase == .native_validating) return true;
@@ -27887,6 +27942,12 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
             const classified = Failure.forRequest(reason, .{}) orelse return error.TestExpectedSemanticRejection;
             try std.testing.expectEqual(reason, classified.toError());
             try std.testing.expectEqual(@as(?Failure, null), Failure.forRequest(reason, committed));
+        }
+        inline for (@typeInfo(@import("../api/relational_row_errors.zig").PolicyError).error_set.error_names.?) |field| {
+            const reason = @field(@import("../api/relational_row_errors.zig").PolicyError, field);
+            const classified = Failure.forRequest(reason, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 1 } } }) orelse return error.TestExpectedSemanticRejection;
+            try std.testing.expectEqual(reason, classified.toError());
+            try std.testing.expect(Failure.forRequest(reason, .{ .transaction = .{ .resolve = .{ .txn_id = @splat(1), .status = .committed, .commit_version = 2 } } }) == null);
         }
         inline for (.{ error.OutOfMemory, error.ResourceBudgetExceeded, error.Corrupted }) |reason|
             try std.testing.expectEqual(@as(?Failure, null), Failure.fromError(reason));
@@ -46872,6 +46933,34 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 0), legacy.timestamp_ns);
             const negotiated = DataServer.raftBatchRequestForProtocol(explicit, true, 456);
             try std.testing.expectEqual(@as(u64, 123), negotiated.timestamp_ns);
+
+            // Policy phases are isolated control entries. A timestamp adjunct
+            // makes their strict decoder reject the committed Raft command.
+            for ([_]@import("antfly_local_sources").system_catalog_policies.Publication.Phase{ .pending_install, .serving_install, .active, .pending_disable, .serving_disable, .disabled }) |phase| {
+                const policy_request: antfly.db.types.BatchRequest = .{ .row_policy_publication = .{
+                    .table_id = 7,
+                    .owner_group_id = 11,
+                    .expected_generation = 3,
+                    .expected_catalog_epoch = 19,
+                    .expected_phase = phase,
+                    .expected_descriptor_digest = @splat(9),
+                }, .row_policy_install_bundle = "{\"table_id\":7}" };
+                for ([_]bool{ false, true }) |timestamp_protocol| {
+                    const proposal = DataServer.raftBatchRequestForProtocol(policy_request, timestamp_protocol, 999);
+                    try std.testing.expectEqual(@as(u64, 0), proposal.timestamp_ns);
+                    const policy_encoded = try data_raft_batch.encode(alloc, "docs", proposal);
+                    defer alloc.free(policy_encoded);
+                    var phase_decoded = try data_raft_batch.decode(alloc, policy_encoded);
+                    defer phase_decoded.deinit(alloc);
+                    try std.testing.expectEqualDeep(policy_request.row_policy_publication.?, phase_decoded.batch.req.row_policy_publication.?);
+                    try std.testing.expectEqualStrings(policy_request.row_policy_install_bundle, phase_decoded.batch.req.row_policy_install_bundle);
+                    const forwarded = try data_raft_batch.encode(alloc, "docs", phase_decoded.batch.req);
+                    defer alloc.free(forwarded);
+                    var forwarded_decoded = try data_raft_batch.decode(alloc, forwarded);
+                    defer forwarded_decoded.deinit(alloc);
+                    try std.testing.expectEqualDeep(policy_request.row_policy_publication.?, forwarded_decoded.batch.req.row_policy_publication.?);
+                }
+            }
 
             const pages = @import("antfly_local_sources").storage_db_merge_page_contract;
             var page_request: antfly.db.types.BatchRequest = .{

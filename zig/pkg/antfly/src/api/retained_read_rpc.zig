@@ -90,7 +90,7 @@ test "retained read admission is independent of RLS primary lookup and fails clo
 
 pub const max_response_bytes = 32 << 20;
 pub const max_lease_ms: u32 = 30_000;
-const GraphRead = @import("antfly_local_sources").storage_statement_read_fence.GraphRead;
+const GraphRead = @import("antfly_local_sources").storage_statement_read_fence.RetainedGraphRead;
 pub const GraphRequest = struct {
     index: []const u8,
     key: []const u8,
@@ -99,11 +99,54 @@ pub const GraphRequest = struct {
     cursor: ?GraphRead.graph.EdgeScanCursor = null,
     limits: GraphRead.graph.EdgePageLimits = .{ .max_edges = 128, .max_owned_bytes = 4 << 20 },
 };
+/// Stable graph-owner failures cross retained transport without becoming a
+/// cursor restart. Both ingress and the client consume this one vocabulary.
+pub const graph_errors = std.StaticStringMap(anyerror).initComptime(.{
+    .{ "CypherAnchorBudgetExceeded", error.CypherAnchorBudgetExceeded },
+    .{ "CypherEdgeBudgetExceeded", error.CypherEdgeBudgetExceeded },
+    .{ "CypherStateBudgetExceeded", error.CypherStateBudgetExceeded },
+    .{ "CypherMemoryBudgetExceeded", error.CypherMemoryBudgetExceeded },
+    .{ "CypherResponseTooLarge", error.CypherResponseTooLarge },
+    .{ "CypherTypeMismatch", error.CypherTypeMismatch },
+    .{ "CypherInvalidPropertyValue", error.CypherInvalidPropertyValue },
+    .{ "CypherNumericOverflow", error.CypherNumericOverflow },
+    .{ "CypherValueDepthExceeded", error.CypherValueDepthExceeded },
+    .{ "CypherLabelPredicateMismatch", error.CypherLabelPredicateMismatch },
+    .{ "CypherInvalidDocument", error.CypherInvalidDocument },
+    .{ "CypherInvalidRelationshipMetadata", error.CypherInvalidRelationshipMetadata },
+    .{ "CypherRowPolicyUnsupported", error.CypherRowPolicyUnsupported },
+    .{ "CypherSearchUnavailable", error.CypherSearchUnavailable },
+    .{ "CypherSnapshotRequired", error.CypherSnapshotRequired },
+    .{ "CypherSnapshotNotReady", error.CypherSnapshotNotReady },
+    .{ "EnrichmentRetryInProgress", error.EnrichmentRetryInProgress },
+    .{ "RowPolicyDenied", error.RowPolicyDenied },
+    .{ "RowPolicyAuthenticationRequired", error.RowPolicyAuthenticationRequired },
+    .{ "RowPolicyCatalogChanged", error.RowPolicyCatalogChanged },
+    .{ "CatalogGenerationChanged", error.CatalogGenerationChanged },
+    .{ "SchemaVersionChanged", error.SchemaVersionChanged },
+    .{ "Forbidden", error.Forbidden },
+    .{ "Canceled", error.Canceled },
+    .{ "DeadlineExceeded", error.DeadlineExceeded },
+});
+
+pub fn errorStatus(err: anyerror) u16 {
+    if (graph_errors.has(@errorName(err))) return @import("graph_execution.zig").httpStatus(err);
+    return switch (err) {
+        error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
+        error.RetainedReadAdmissionExceeded, error.RetainedReadBusy => 429,
+        error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired => 409,
+        else => 503,
+    };
+}
+
 pub const Request = struct {
-    operation: enum { admit, capture, validate, snapshot, open, open_snapshot, next, normalize, range_proofs, close, cancel, renew_snapshot, graph_page },
+    operation: enum { admit, capture, validate, snapshot, open, open_snapshot, next, normalize, range_proofs, close, cancel, renew_snapshot, graph_page, graph_snapshot, graph_invoke, admit_graph, graph_open },
     schema_version: u32,
     graph_indexes: []const []const u8 = &.{},
-    graph: ?GraphRequest = null,
+    graph_page_request: ?GraphRequest = null,
+    graph: ?@import("antfly_local_sources").storage_statement_read_fence.GraphInput = null,
+    graph_body: []const u8 = "",
+    graph_table: []const u8 = "",
     token: ?registry.Token = null,
     connection: u128 = 0,
     lease_ms: u32 = 5000,
@@ -127,7 +170,8 @@ pub const Request = struct {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
             const omit = (comptime std.mem.eql(u8, field, "graph_indexes")) and self.graph_indexes.len == 0 or
-                (comptime std.mem.eql(u8, field, "graph")) and self.graph == null;
+                (comptime std.mem.eql(u8, field, "graph")) and self.graph == null or
+                (comptime std.mem.eql(u8, field, "graph_page_request")) and self.graph_page_request == null;
             if (!omit) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
@@ -197,6 +241,14 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
             // This establishes only quorum/topology readiness. Row-policy
             // proofs belong to open; admission must never perform a raw read.
             try owner.source.admitStatementReadGroupLocal(alloc, scope.group_id, table);
+        },
+        .admit_graph => {
+            // A bounded point probe establishes the owner read-index barrier
+            // without retaining any mutation fence or row data.
+            if (try owner.source.lookupGroupLocal(alloc, scope.group_id, table, "", .{ .cypher_prepare = input.operation == .admit_graph, .execution_deadline_ns = deadline }, .read_index)) |value| {
+                var found = value;
+                found.deinit(alloc);
+            }
             return encode(alloc, .{});
         },
         .capture => {
@@ -218,7 +270,7 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
             return encode(alloc, .{ .token = token });
         },
         .graph_page => {
-            const graph = input.graph orelse return error.InvalidRetainedReadQuery;
+            const graph = input.graph_page_request orelse return error.InvalidRetainedReadQuery;
             var page = try owner.graphPage(alloc, scope, input.token orelse return error.InvalidRetainedReadToken, .{
                 .index = graph.index,
                 .key = graph.key,
@@ -240,6 +292,14 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
             try owner.registry.renewSnapshot(input.token orelse return error.InvalidRetainedReadToken, scope, input.connection, time.monotonicNs(), deadline);
             return response;
         },
+        .graph_snapshot => {
+            const graph = input.graph orelse return error.InvalidRetainedReadQuery;
+            if (!std.mem.eql(u8, graph.table, table)) return error.RetainedReadScopeChanged;
+            const token = try owner.captureGraph(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, graph, deadline);
+            errdefer owner.registry.close(token, scope) catch {};
+            return encode(alloc, .{ .token = token });
+        },
+        .graph_invoke => return owner.invokeGraph(scope, input.token orelse return error.InvalidRetainedReadToken, alloc, input.graph_body),
         .open => {
             const opened = try owner.openQualified(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{
                 .privacy_policy_version = input.privacy_policy_version,
@@ -260,6 +320,22 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
         .open_snapshot => {
             const token = try owner.openSnapshot(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{
                 .privacy_policy_version = input.privacy_policy_version,
+                .relational_query = input.query orelse return error.InvalidRetainedReadQuery,
+                .filter_query_json = input.filter_query_json,
+                .inclusive_from = input.inclusive_from,
+                .exclusive_to = input.exclusive_to,
+                .sql_document_preimage = input.sql_document_preimage,
+                .include_content_hashes = input.include_content_hashes,
+                .include_range_proofs = input.include_range_proofs,
+                .row_policy_principal_proof = input.row_policy_principal_proof,
+                .row_policy_database = input.row_policy_database,
+            }, deadline);
+            errdefer owner.registry.close(token, scope) catch {};
+            return encode(alloc, .{ .token = token });
+        },
+        .graph_open => {
+            if (!std.mem.eql(u8, input.graph_table, table)) return error.Forbidden;
+            const token = try owner.openGraph(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, table, input.from, input.to, .{
                 .relational_query = input.query orelse return error.InvalidRetainedReadQuery,
                 .filter_query_json = input.filter_query_json,
                 .inclusive_from = input.inclusive_from,

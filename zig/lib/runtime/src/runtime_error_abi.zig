@@ -22,7 +22,15 @@
 
 const std = @import("std");
 
-pub const abi_version: u32 = 1;
+// The merged graph/document detail inventories share the original prefix and
+// append both extensions under one new independently compiled boundary.
+pub const abi_version: u32 = 2;
+
+test "proved aborted graph policy denial retains its stable boundary identity" {
+    const value = statusFromError(error.TransactionPrepareAbortedRowPolicyDenied);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), value.code);
+    try std.testing.expectEqual(error.TransactionPrepareAbortedRowPolicyDenied, errorFromStatus(value));
+}
 
 test "OCR truncation preserves terminal identity across runtime callbacks" {
     const transported = statusFromError(error.ReadOutputTruncated);
@@ -1011,129 +1019,206 @@ pub const Detail = enum(c_int) {
     unknown_privacy_category,
     sql_statement_read_unavailable,
     unsupported_sql_execution,
-    // Append-only SQL additions follow every published main Detail identity.
-    sql_index_already_exists = 891,
-    sql_constraint_already_exists = 892,
-    program_limit_exceeded = 893,
-    catalog_occupancy_not_ready = 894,
-    unsupported_native_index_owner = 895,
-    invalid_private_index_claim_inventory = 896,
-    invalid_private_index_claim_receipt = 897,
-    private_index_owner_job_changed = 898,
-    private_index_publication_canceled = 899,
-    private_index_job_required = 900,
-    private_index_publication_required = 901,
-    invalid_private_index_owner_job = 902,
-    invalid_private_index_inputs = 903,
-    relational_index_catalog_schema_mismatch = 904,
-    invalid_index_publication_candidate = 905,
-    immutable_relational_index_definition_conflict = 906,
-    private_index_cancellation_pending = 907,
-    private_index_cancellation_required = 908,
-    invalid_private_index_cancellation = 909,
-    invalid_private_index_native_receipt = 910,
-    invalid_relational_index_progress = 911,
-    missing_relational_index_definitions = 912,
-    index_owner_receipt_changed = 913,
-    invalid_index_owner_receipt = 914,
-    sql_invalid_power_argument = 915,
-    invalid_schema_reader_requirements = 916,
-    private_index_root_recovery_required = 917,
-    invalid_relational_index_budget = 918,
-    private_index_claim_backlog_full = 919,
-    partial_index_predicate_not_implied = 920,
-    relational_check_violation = 921,
-    row_policy_denied = 922,
-    row_policy_authentication_required = 923,
-    check_constraint_validation_required = 924,
-    foreign_key_match_full_violation = 925,
-    invalid_schema_validation_job = 926,
-    invalid_schema_validation_page_command = 927,
-    invalid_schema_validation_token = 928,
-    schema_validation_canceled = 929,
-    schema_validation_cancellation_required = 930,
-    schema_validation_command_rejected = 931,
-    schema_validation_inputs_required = 932,
-    schema_validation_job_changed = 933,
-    schema_validation_job_required = 934,
-    schema_validation_not_ready = 935,
-    schema_validation_preparation_changed = 936,
-    schema_validation_publication_required = 937,
-    schema_validation_runtime_recovery_required = 938,
-    store_registration_required = 939,
-    catalog_publication_fence_unavailable = 940,
-    undefined_column = 941,
-    foreign_key_validation_required = 942,
-    materialized_view_read_only = 943,
-    raft_apply_writer_unavailable = 944,
-    // Append-only scope lifecycle identities; preserve published callback values.
-    sql_database_in_use = 945,
-    invalid_scope_retirement = 946,
-    scope_retirement_changed = 947,
-    sequence_admission_conflict = 948,
-    invalid_table_retirement_manifest = 949,
-    sql_program_limit_exceeded = 950,
-    snapshot_build_cancelled = 951,
-    catalog_generation_exhausted = 952,
-    invalid_sql_relation_persistence = 961,
-    sql_relation_owner_changed = 962,
-    sql_temporary_relation_not_owned = 963,
-    invalid_sql_temporary_namespace = 964,
-    sql_relation_persistence_foreign_key_mismatch = 965,
-    sql_relation_recovery_incomplete = 966,
-    sql_relation_owner_unavailable = 967,
-    invalid_sql_trigger_definition = 953,
-    invalid_sql_trigger_manifest = 954,
-    sql_trigger_context_required = 955,
-    sql_trigger_returned_no_value = 956,
-    sql_trigger_return_value_required = 957,
-    sql_trigger_declared_arguments = 958,
-    sql_trigger_sql_language = 959,
-    sql_trigger_coordination_required = 960,
-    invalid_generation_transaction = 968,
-    generation_transaction_changed = 969,
-    generation_transaction_decision_required = 970,
-    invalid_prepared_graph_effects = 971,
-    sql_prepared_durability_unavailable = 972,
-    invalid_participant = 973,
-    catalog_revision_exhausted = 974,
-    duplicate_sql_extension_export = 975,
-    duplicate_sql_extension_version = 976,
-    inconsistent_sql_extension_control = 977,
-    invalid_package_digest = 978,
-    invalid_sql_extension_artifact = 979,
-    invalid_sql_extension_control = 980,
-    invalid_sql_extension_dependency = 981,
-    invalid_sql_extension_record = 982,
-    invalid_sql_extension_runtime = 983,
-    invalid_sql_extension_package_mutation = 984,
-    duplicate_sql_extension_control = 985,
-    sql_dependent_extension_object = 986,
-    sql_duplicate_extension = 987,
-    sql_duplicate_function = 988,
-    sql_extension_control_conflict = 989,
-    sql_extension_dependency_cycle = 990,
-    sql_extension_promotion_nonce_conflict = 991,
-    sql_extension_schema_mismatch = 992,
-    sql_extension_unavailable = 993,
-    sql_extension_update_path_unavailable = 994,
-    sql_extension_version_unavailable = 995,
-    sql_function_return_type_changed = 996,
-    sql_required_extension_not_installed = 997,
-    sql_undefined_extension = 998,
-    unsupported_sql_extension_object = 999,
-    sql_extension_owned_object = 1000,
-    duplicate_shape_name = 1001,
-    generated_artifact_shape_required = 1002,
-    no_supported_scopes = 1003,
-    scope_must_not_name_table = 1004,
-    unknown_shape_reference = 1005,
+    // Append-only Cypher details preserve graph errors across owner callbacks.
+    cypher_aggregate_scope,
+    cypher_aggregate_wildcard,
+    cypher_ambiguous_search_table,
+    cypher_anchor_budget_exceeded,
+    cypher_create_requires_label,
+    cypher_deleted_entity,
+    cypher_derived_relationship_mutation,
+    cypher_division_by_zero,
+    cypher_duplicate_identity,
+    cypher_edge_budget_exceeded,
+    cypher_exists_mutation,
+    cypher_function_arity,
+    cypher_invalid_assignment,
+    cypher_invalid_backend_cursor,
+    cypher_invalid_backend_page,
+    cypher_invalid_backend_relationship,
+    cypher_invalid_create_relationship,
+    cypher_invalid_document,
+    cypher_invalid_grouping,
+    cypher_invalid_owner,
+    cypher_invalid_property_value,
+    cypher_invalid_range,
+    cypher_invalid_relationship,
+    cypher_invalid_relationship_metadata,
+    cypher_invalid_search_limit,
+    cypher_invalid_search_result,
+    cypher_invalid_shortest_path,
+    cypher_invalid_substring,
+    cypher_label_predicate_mismatch,
+    cypher_label_predicate_violation,
+    cypher_legacy_id_unavailable,
+    cypher_limit_exceeded,
+    cypher_memory_budget_exceeded,
+    cypher_mutations_unavailable,
+    cypher_node_has_relationships,
+    cypher_numeric_overflow,
+    cypher_observations_unavailable,
+    cypher_overlapping_owners,
+    cypher_owner_budget_exceeded,
+    cypher_path_budget_exceeded,
+    cypher_query_requires_return,
+    cypher_recursion_budget_exceeded,
+    cypher_regex_unavailable,
+    cypher_relationship_endpoint_mismatch,
+    cypher_remove_requires_property,
+    cypher_request_too_large,
+    cypher_response_too_large,
+    cypher_return_must_be_last,
+    cypher_return_predicate,
+    cypher_row_policy_unsupported,
+    cypher_search_after_write,
+    cypher_search_preparation_required,
+    cypher_search_table_outside_graph,
+    cypher_search_unavailable,
+    cypher_snapshot_not_ready,
+    cypher_snapshot_required,
+    cypher_state_budget_exceeded,
+    cypher_transaction_already_active,
+    cypher_transaction_conflict,
+    cypher_transaction_required,
+    cypher_type_mismatch,
+    cypher_union_column_mismatch,
+    cypher_value_depth_exceeded,
+    cypher_variable_conflict,
+    cypher_variable_type_conflict,
+    cypher_write_union_unsupported,
+    row_policy_unsupported,
+    row_policy_denied,
+    row_policy_authentication_required,
+    row_policy_authority_unavailable,
+    transaction_prepare_aborted_row_policy_denied,
+    retained_read_restart_required,
+    row_policy_mutation_unsupported,
+    cypher_invalid_regex,
+    schema_version_changed,
+    cypher_write_request_already_used,
+    invalid_cypher_parameters,
+    missing_cypher_parameter,
+    sql_write_capacity_unavailable,
+    // Unreleased SQL identities append after every published main identity.
+    sql_index_already_exists = 970,
+    sql_constraint_already_exists = 971,
+    program_limit_exceeded = 972,
+    catalog_occupancy_not_ready = 973,
+    unsupported_native_index_owner = 974,
+    invalid_private_index_claim_inventory = 975,
+    invalid_private_index_claim_receipt = 976,
+    private_index_owner_job_changed = 977,
+    private_index_publication_canceled = 978,
+    private_index_job_required = 979,
+    private_index_publication_required = 980,
+    invalid_private_index_owner_job = 981,
+    invalid_private_index_inputs = 982,
+    relational_index_catalog_schema_mismatch = 983,
+    invalid_index_publication_candidate = 984,
+    immutable_relational_index_definition_conflict = 985,
+    private_index_cancellation_pending = 986,
+    private_index_cancellation_required = 987,
+    invalid_private_index_cancellation = 988,
+    invalid_private_index_native_receipt = 989,
+    invalid_relational_index_progress = 990,
+    missing_relational_index_definitions = 991,
+    index_owner_receipt_changed = 992,
+    invalid_index_owner_receipt = 993,
+    sql_invalid_power_argument = 994,
+    invalid_schema_reader_requirements = 995,
+    private_index_root_recovery_required = 996,
+    invalid_relational_index_budget = 997,
+    private_index_claim_backlog_full = 998,
+    partial_index_predicate_not_implied = 999,
+    relational_check_violation = 1000,
+    check_constraint_validation_required = 1001,
+    foreign_key_match_full_violation = 1002,
+    invalid_schema_validation_job = 1003,
+    invalid_schema_validation_page_command = 1004,
+    invalid_schema_validation_token = 1005,
+    schema_validation_canceled = 1006,
+    schema_validation_cancellation_required = 1007,
+    schema_validation_command_rejected = 1008,
+    schema_validation_inputs_required = 1009,
+    schema_validation_job_changed = 1010,
+    schema_validation_job_required = 1011,
+    schema_validation_not_ready = 1012,
+    schema_validation_preparation_changed = 1013,
+    schema_validation_publication_required = 1014,
+    schema_validation_runtime_recovery_required = 1015,
+    store_registration_required = 1016,
+    catalog_publication_fence_unavailable = 1017,
+    undefined_column = 1018,
+    foreign_key_validation_required = 1019,
+    materialized_view_read_only = 1020,
+    raft_apply_writer_unavailable = 1021,
+    sql_database_in_use = 1022,
+    invalid_scope_retirement = 1023,
+    scope_retirement_changed = 1024,
+    sequence_admission_conflict = 1025,
+    invalid_table_retirement_manifest = 1026,
+    sql_program_limit_exceeded = 1027,
+    snapshot_build_cancelled = 1028,
+    catalog_generation_exhausted = 1029,
+    invalid_sql_relation_persistence = 1030,
+    sql_relation_owner_changed = 1031,
+    sql_temporary_relation_not_owned = 1032,
+    invalid_sql_temporary_namespace = 1033,
+    sql_relation_persistence_foreign_key_mismatch = 1034,
+    sql_relation_recovery_incomplete = 1035,
+    sql_relation_owner_unavailable = 1036,
+    invalid_sql_trigger_definition = 1037,
+    invalid_sql_trigger_manifest = 1038,
+    sql_trigger_context_required = 1039,
+    sql_trigger_returned_no_value = 1040,
+    sql_trigger_return_value_required = 1041,
+    sql_trigger_declared_arguments = 1042,
+    sql_trigger_sql_language = 1043,
+    sql_trigger_coordination_required = 1044,
+    invalid_generation_transaction = 1045,
+    generation_transaction_changed = 1046,
+    generation_transaction_decision_required = 1047,
+    invalid_prepared_graph_effects = 1048,
+    sql_prepared_durability_unavailable = 1049,
+    invalid_participant = 1050,
+    catalog_revision_exhausted = 1051,
+    duplicate_sql_extension_export = 1052,
+    duplicate_sql_extension_version = 1053,
+    inconsistent_sql_extension_control = 1054,
+    invalid_package_digest = 1055,
+    invalid_sql_extension_artifact = 1056,
+    invalid_sql_extension_control = 1057,
+    invalid_sql_extension_dependency = 1058,
+    invalid_sql_extension_record = 1059,
+    invalid_sql_extension_runtime = 1060,
+    invalid_sql_extension_package_mutation = 1061,
+    duplicate_sql_extension_control = 1062,
+    sql_dependent_extension_object = 1063,
+    sql_duplicate_extension = 1064,
+    sql_duplicate_function = 1065,
+    sql_extension_control_conflict = 1066,
+    sql_extension_dependency_cycle = 1067,
+    sql_extension_promotion_nonce_conflict = 1068,
+    sql_extension_schema_mismatch = 1069,
+    sql_extension_unavailable = 1070,
+    sql_extension_update_path_unavailable = 1071,
+    sql_extension_version_unavailable = 1072,
+    sql_function_return_type_changed = 1073,
+    sql_required_extension_not_installed = 1074,
+    sql_undefined_extension = 1075,
+    unsupported_sql_extension_object = 1076,
+    sql_extension_owned_object = 1077,
+    duplicate_shape_name = 1078,
+    generated_artifact_shape_required = 1079,
+    no_supported_scopes = 1080,
+    scope_must_not_name_table = 1081,
+    unknown_shape_reference = 1082,
 };
 
 test "SQL relation persistence callback failures preserve exact identity and behavior" {
     const errors = [_]anyerror{ error.InvalidSqlRelationPersistence, error.SqlRelationOwnerChanged, error.SqlTemporaryRelationNotOwned, error.InvalidSqlTemporaryNamespace, error.SqlRelationPersistenceForeignKeyMismatch, error.SqlRelationRecoveryIncomplete, error.SqlRelationOwnerUnavailable };
     const codes = [_]Code{ .invalid_argument, .conflict, .forbidden, .invalid_argument, .invalid_argument, .unavailable, .unavailable };
-    for (errors, codes, 961..) |err, code, detail| {
+    for (errors, codes, 1030..) |err, code, detail| {
         const wire = statusFromError(err);
         try std.testing.expectEqual(@backingInt(code), wire.code);
         try std.testing.expectEqual(@as(c_int, @intCast(detail)), wire.detail);
@@ -1354,6 +1439,86 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedConstrainedProbabilities => status(.unsupported, .unsupported_constrained_probabilities),
         error.UnsupportedConstrainedSchema => status(.unsupported, .unsupported_constrained_schema),
         error.UnsupportedGeneratedExtractionSchema => status(.unsupported, .unsupported_generated_extraction_schema),
+        error.SchemaVersionChanged => status(.conflict, .schema_version_changed),
+        error.CypherWriteRequestAlreadyUsed => status(.conflict, .cypher_write_request_already_used),
+        error.InvalidCypherParameters => status(.invalid_argument, .invalid_cypher_parameters),
+        error.MissingCypherParameter => status(.invalid_argument, .missing_cypher_parameter),
+        error.SqlWriteCapacityUnavailable => status(.unavailable, .sql_write_capacity_unavailable),
+        error.CypherAggregateScope => status(.invalid_argument, .cypher_aggregate_scope),
+        error.CypherAggregateWildcard => status(.invalid_argument, .cypher_aggregate_wildcard),
+        error.CypherAmbiguousSearchTable => status(.invalid_argument, .cypher_ambiguous_search_table),
+        error.RowPolicyUnsupported => status(.invalid_argument, .row_policy_unsupported),
+        error.RowPolicyMutationUnsupported => status(.invalid_argument, .row_policy_mutation_unsupported),
+        error.CypherInvalidRegex => status(.invalid_argument, .cypher_invalid_regex),
+        error.RowPolicyDenied => status(.forbidden, .row_policy_denied),
+        error.RowPolicyAuthenticationRequired => status(.unauthorized, .row_policy_authentication_required),
+        error.RowPolicyAuthorityUnavailable => status(.unavailable, .row_policy_authority_unavailable),
+        error.TransactionPrepareAbortedRowPolicyDenied => status(.forbidden, .transaction_prepare_aborted_row_policy_denied),
+        error.RetainedReadRestartRequired => status(.retryable, .retained_read_restart_required),
+        error.CypherAnchorBudgetExceeded => status(.invalid_argument, .cypher_anchor_budget_exceeded),
+        error.CypherCreateRequiresLabel => status(.invalid_argument, .cypher_create_requires_label),
+        error.CypherDeletedEntity => status(.invalid_argument, .cypher_deleted_entity),
+        error.CypherDerivedRelationshipMutation => status(.invalid_argument, .cypher_derived_relationship_mutation),
+        error.CypherDivisionByZero => status(.invalid_argument, .cypher_division_by_zero),
+        error.CypherDuplicateIdentity => status(.invalid_argument, .cypher_duplicate_identity),
+        error.CypherEdgeBudgetExceeded => status(.invalid_argument, .cypher_edge_budget_exceeded),
+        error.CypherExistsMutation => status(.invalid_argument, .cypher_exists_mutation),
+        error.CypherFunctionArity => status(.invalid_argument, .cypher_function_arity),
+        error.CypherInvalidAssignment => status(.invalid_argument, .cypher_invalid_assignment),
+        error.CypherInvalidBackendCursor => status(.invalid_argument, .cypher_invalid_backend_cursor),
+        error.CypherInvalidBackendPage => status(.invalid_argument, .cypher_invalid_backend_page),
+        error.CypherInvalidBackendRelationship => status(.invalid_argument, .cypher_invalid_backend_relationship),
+        error.CypherInvalidCreateRelationship => status(.invalid_argument, .cypher_invalid_create_relationship),
+        error.CypherInvalidDocument => status(.invalid_argument, .cypher_invalid_document),
+        error.CypherInvalidGrouping => status(.invalid_argument, .cypher_invalid_grouping),
+        error.CypherInvalidOwner => status(.invalid_argument, .cypher_invalid_owner),
+        error.CypherInvalidPropertyValue => status(.invalid_argument, .cypher_invalid_property_value),
+        error.CypherInvalidRange => status(.invalid_argument, .cypher_invalid_range),
+        error.CypherInvalidRelationship => status(.invalid_argument, .cypher_invalid_relationship),
+        error.CypherInvalidRelationshipMetadata => status(.invalid_argument, .cypher_invalid_relationship_metadata),
+        error.CypherInvalidSearchLimit => status(.invalid_argument, .cypher_invalid_search_limit),
+        error.CypherInvalidSearchResult => status(.invalid_argument, .cypher_invalid_search_result),
+        error.CypherInvalidShortestPath => status(.invalid_argument, .cypher_invalid_shortest_path),
+        error.CypherInvalidSubstring => status(.invalid_argument, .cypher_invalid_substring),
+        error.CypherLabelPredicateMismatch => status(.invalid_argument, .cypher_label_predicate_mismatch),
+        error.CypherLabelPredicateViolation => status(.invalid_argument, .cypher_label_predicate_violation),
+        error.CypherLegacyIdUnavailable => status(.invalid_argument, .cypher_legacy_id_unavailable),
+        error.CypherLimitExceeded => status(.invalid_argument, .cypher_limit_exceeded),
+        error.CypherMemoryBudgetExceeded => status(.invalid_argument, .cypher_memory_budget_exceeded),
+        error.CypherMutationsUnavailable => status(.unavailable, .cypher_mutations_unavailable),
+        error.CypherNodeHasRelationships => status(.invalid_argument, .cypher_node_has_relationships),
+        error.CypherNumericOverflow => status(.invalid_argument, .cypher_numeric_overflow),
+        error.CypherObservationsUnavailable => status(.invalid_argument, .cypher_observations_unavailable),
+        error.CypherOverlappingOwners => status(.invalid_argument, .cypher_overlapping_owners),
+        error.CypherOwnerBudgetExceeded => status(.invalid_argument, .cypher_owner_budget_exceeded),
+        error.CypherPathBudgetExceeded => status(.invalid_argument, .cypher_path_budget_exceeded),
+        error.CypherQueryRequiresReturn => status(.invalid_argument, .cypher_query_requires_return),
+        error.CypherRecursionBudgetExceeded => status(.invalid_argument, .cypher_recursion_budget_exceeded),
+        error.CypherRegexUnavailable => status(.invalid_argument, .cypher_regex_unavailable),
+        error.CypherRelationshipEndpointMismatch => status(.invalid_argument, .cypher_relationship_endpoint_mismatch),
+        error.CypherRemoveRequiresProperty => status(.invalid_argument, .cypher_remove_requires_property),
+        error.CypherRequestTooLarge => status(.invalid_argument, .cypher_request_too_large),
+        error.CypherResponseTooLarge => status(.invalid_argument, .cypher_response_too_large),
+        error.CypherReturnMustBeLast => status(.invalid_argument, .cypher_return_must_be_last),
+        error.CypherReturnPredicate => status(.invalid_argument, .cypher_return_predicate),
+        error.CypherRowPolicyUnsupported => status(.invalid_argument, .cypher_row_policy_unsupported),
+        error.CypherSearchAfterWrite => status(.invalid_argument, .cypher_search_after_write),
+        error.CypherSearchPreparationRequired => status(.invalid_argument, .cypher_search_preparation_required),
+        error.CypherSearchTableOutsideGraph => status(.invalid_argument, .cypher_search_table_outside_graph),
+        error.CypherSearchUnavailable => status(.unavailable, .cypher_search_unavailable),
+        error.CypherSnapshotNotReady => status(.unavailable, .cypher_snapshot_not_ready),
+        error.CypherSnapshotRequired => status(.unavailable, .cypher_snapshot_required),
+        error.CypherStateBudgetExceeded => status(.invalid_argument, .cypher_state_budget_exceeded),
+        error.CypherTransactionAlreadyActive => status(.invalid_argument, .cypher_transaction_already_active),
+        error.CypherTransactionConflict => status(.conflict, .cypher_transaction_conflict),
+        error.CypherTransactionRequired => status(.invalid_argument, .cypher_transaction_required),
+        error.CypherTypeMismatch => status(.invalid_argument, .cypher_type_mismatch),
+        error.CypherUnionColumnMismatch => status(.invalid_argument, .cypher_union_column_mismatch),
+        error.CypherValueDepthExceeded => status(.invalid_argument, .cypher_value_depth_exceeded),
+        error.CypherVariableConflict => status(.invalid_argument, .cypher_variable_conflict),
+        error.CypherVariableTypeConflict => status(.invalid_argument, .cypher_variable_type_conflict),
+        error.CypherWriteUnionUnsupported => status(.invalid_argument, .cypher_write_union_unsupported),
+
         error.ChunkWorkingBudgetExceeded => status(.invalid_argument, .model_chunk_working_budget),
         error.ChunkDependencyBudgetExceeded => status(.invalid_argument, .model_chunk_dependency_budget),
         error.ChunkCodedWindowBudgetExceeded => status(.invalid_argument, .model_chunk_coded_window_budget),
@@ -1676,8 +1841,6 @@ pub fn statusFromError(err: anyerror) Status {
         error.ForeignKeyMatchFullViolation => status(.conflict, .foreign_key_match_full_violation),
         error.UniqueConstraintViolation => status(.conflict, .unique_constraint_violation),
         error.RelationalCheckViolation => status(.invalid_argument, .relational_check_violation),
-        error.RowPolicyDenied => status(.forbidden, .row_policy_denied),
-        error.RowPolicyAuthenticationRequired => status(.forbidden, .row_policy_authentication_required),
         error.UnsupportedNativeIndexOwner => status(.unsupported, .unsupported_native_index_owner),
         error.InvalidPrivateIndexClaimInventory => status(.invalid_argument, .invalid_private_index_claim_inventory),
         error.InvalidPrivateIndexClaimReceipt => status(.corrupt, .invalid_private_index_claim_receipt),
@@ -1789,7 +1952,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
         error.Forbidden => status(.forbidden, .forbidden),
-        error.Unavailable => status(.unavailable, .unavailable),
+        // Capability barriers can be unavailable during provisioning or a
+        // rolling upgrade. They fail before batch proposal admission.
+        error.Unavailable, error.RaftBatchMergeProtocolUnavailable, error.RaftBatchSplitDeltaProtocolUnavailable => status(.unavailable, .unavailable),
         error.WriteUnavailable => status(.unavailable, .write_unavailable),
         error.ReadUnavailable => status(.unavailable, .read_unavailable),
         error.ReadRequiresPrimary => status(.unavailable, .read_requires_primary),
@@ -2229,7 +2394,13 @@ pub fn statusFromError(err: anyerror) Status {
         // apart by name.
         error.EmbedAdmissionRefused => status(.retryable, .embed_admission_refused),
         error.ReadOutputTruncated => status(.invalid_argument, .read_output_truncated),
-        else => status(.internal, .none),
+        else => blk: {
+            // Private error identities cannot cross this stable ABI. Retain
+            // the owning side's name in diagnostics instead of leaving an
+            // otherwise opaque RuntimeBoundaryFailure impossible to trace.
+            if (!@inComptime()) std.log.debug("runtime boundary unclassified error={s}", .{@errorName(err)});
+            break :blk status(.internal, .none);
+        },
     };
 }
 
@@ -2256,7 +2427,7 @@ fn status(code: Code, detail: Detail) Status {
 }
 
 pub fn errorFromStatus(value: Status) anyerror {
-    @setEvalBranchQuota(10_000);
+    @setEvalBranchQuota(30_000);
     const code = std.enums.fromInt(Code, value.code) orelse return error.RuntimeBoundaryFailure;
     if (code == .ok) return error.RuntimeBoundaryFailure;
     const detail = std.enums.fromInt(Detail, value.detail) orelse return error.RuntimeBoundaryFailure;
@@ -2274,8 +2445,6 @@ pub fn errorFromStatus(value: Status) anyerror {
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
         .relational_check_violation => "RelationalCheckViolation",
-        .row_policy_denied => "RowPolicyDenied",
-        .row_policy_authentication_required => "RowPolicyAuthenticationRequired",
         .invalid_document_source => "InvalidDocumentSource",
         .unsupported_document_format => "UnsupportedDocumentFormat",
         .document_source_limit_exceeded => "DocumentSourceLimitExceeded",
@@ -2438,6 +2607,85 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .ambiguous_gcs_connection => "AmbiguousGcsConnection",
         .invalid_connection_credentials => "InvalidConnectionCredentials",
 
+        .schema_version_changed => "SchemaVersionChanged",
+        .cypher_write_request_already_used => "CypherWriteRequestAlreadyUsed",
+        .invalid_cypher_parameters => "InvalidCypherParameters",
+        .missing_cypher_parameter => "MissingCypherParameter",
+        .sql_write_capacity_unavailable => "SqlWriteCapacityUnavailable",
+        .cypher_aggregate_scope => "CypherAggregateScope",
+        .cypher_aggregate_wildcard => "CypherAggregateWildcard",
+        .cypher_ambiguous_search_table => "CypherAmbiguousSearchTable",
+        .row_policy_unsupported => "RowPolicyUnsupported",
+        .row_policy_mutation_unsupported => "RowPolicyMutationUnsupported",
+        .cypher_invalid_regex => "CypherInvalidRegex",
+        .row_policy_denied => "RowPolicyDenied",
+        .row_policy_authentication_required => "RowPolicyAuthenticationRequired",
+        .row_policy_authority_unavailable => "RowPolicyAuthorityUnavailable",
+        .transaction_prepare_aborted_row_policy_denied => "TransactionPrepareAbortedRowPolicyDenied",
+        .retained_read_restart_required => "RetainedReadRestartRequired",
+        .cypher_anchor_budget_exceeded => "CypherAnchorBudgetExceeded",
+        .cypher_create_requires_label => "CypherCreateRequiresLabel",
+        .cypher_deleted_entity => "CypherDeletedEntity",
+        .cypher_derived_relationship_mutation => "CypherDerivedRelationshipMutation",
+        .cypher_division_by_zero => "CypherDivisionByZero",
+        .cypher_duplicate_identity => "CypherDuplicateIdentity",
+        .cypher_edge_budget_exceeded => "CypherEdgeBudgetExceeded",
+        .cypher_exists_mutation => "CypherExistsMutation",
+        .cypher_function_arity => "CypherFunctionArity",
+        .cypher_invalid_assignment => "CypherInvalidAssignment",
+        .cypher_invalid_backend_cursor => "CypherInvalidBackendCursor",
+        .cypher_invalid_backend_page => "CypherInvalidBackendPage",
+        .cypher_invalid_backend_relationship => "CypherInvalidBackendRelationship",
+        .cypher_invalid_create_relationship => "CypherInvalidCreateRelationship",
+        .cypher_invalid_document => "CypherInvalidDocument",
+        .cypher_invalid_grouping => "CypherInvalidGrouping",
+        .cypher_invalid_owner => "CypherInvalidOwner",
+        .cypher_invalid_property_value => "CypherInvalidPropertyValue",
+        .cypher_invalid_range => "CypherInvalidRange",
+        .cypher_invalid_relationship => "CypherInvalidRelationship",
+        .cypher_invalid_relationship_metadata => "CypherInvalidRelationshipMetadata",
+        .cypher_invalid_search_limit => "CypherInvalidSearchLimit",
+        .cypher_invalid_search_result => "CypherInvalidSearchResult",
+        .cypher_invalid_shortest_path => "CypherInvalidShortestPath",
+        .cypher_invalid_substring => "CypherInvalidSubstring",
+        .cypher_label_predicate_mismatch => "CypherLabelPredicateMismatch",
+        .cypher_label_predicate_violation => "CypherLabelPredicateViolation",
+        .cypher_legacy_id_unavailable => "CypherLegacyIdUnavailable",
+        .cypher_limit_exceeded => "CypherLimitExceeded",
+        .cypher_memory_budget_exceeded => "CypherMemoryBudgetExceeded",
+        .cypher_mutations_unavailable => "CypherMutationsUnavailable",
+        .cypher_node_has_relationships => "CypherNodeHasRelationships",
+        .cypher_numeric_overflow => "CypherNumericOverflow",
+        .cypher_observations_unavailable => "CypherObservationsUnavailable",
+        .cypher_overlapping_owners => "CypherOverlappingOwners",
+        .cypher_owner_budget_exceeded => "CypherOwnerBudgetExceeded",
+        .cypher_path_budget_exceeded => "CypherPathBudgetExceeded",
+        .cypher_query_requires_return => "CypherQueryRequiresReturn",
+        .cypher_recursion_budget_exceeded => "CypherRecursionBudgetExceeded",
+        .cypher_regex_unavailable => "CypherRegexUnavailable",
+        .cypher_relationship_endpoint_mismatch => "CypherRelationshipEndpointMismatch",
+        .cypher_remove_requires_property => "CypherRemoveRequiresProperty",
+        .cypher_request_too_large => "CypherRequestTooLarge",
+        .cypher_response_too_large => "CypherResponseTooLarge",
+        .cypher_return_must_be_last => "CypherReturnMustBeLast",
+        .cypher_return_predicate => "CypherReturnPredicate",
+        .cypher_row_policy_unsupported => "CypherRowPolicyUnsupported",
+        .cypher_search_after_write => "CypherSearchAfterWrite",
+        .cypher_search_preparation_required => "CypherSearchPreparationRequired",
+        .cypher_search_table_outside_graph => "CypherSearchTableOutsideGraph",
+        .cypher_search_unavailable => "CypherSearchUnavailable",
+        .cypher_snapshot_not_ready => "CypherSnapshotNotReady",
+        .cypher_snapshot_required => "CypherSnapshotRequired",
+        .cypher_state_budget_exceeded => "CypherStateBudgetExceeded",
+        .cypher_transaction_already_active => "CypherTransactionAlreadyActive",
+        .cypher_transaction_conflict => "CypherTransactionConflict",
+        .cypher_transaction_required => "CypherTransactionRequired",
+        .cypher_type_mismatch => "CypherTypeMismatch",
+        .cypher_union_column_mismatch => "CypherUnionColumnMismatch",
+        .cypher_value_depth_exceeded => "CypherValueDepthExceeded",
+        .cypher_variable_conflict => "CypherVariableConflict",
+        .cypher_variable_type_conflict => "CypherVariableTypeConflict",
+        .cypher_write_union_unsupported => "CypherWriteUnionUnsupported",
         .crc_mismatch => "CrcMismatch",
         .invalid_data => "InvalidData",
         .mapped_artifact_unsupported => "MappedArtifactUnsupported",
@@ -3586,6 +3834,13 @@ test "external lake and spill errors retain exact identity across runtime archiv
     }
 }
 
+test "Cypher errors retain stable callback details" {
+    inline for (.{ error.CypherAnchorBudgetExceeded, error.CypherTransactionConflict, error.CypherMemoryBudgetExceeded, error.CypherObservationsUnavailable, error.SchemaVersionChanged, error.CypherWriteRequestAlreadyUsed, error.InvalidCypherParameters, error.MissingCypherParameter, error.SqlWriteCapacityUnavailable }) |err| {
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+}
+
 test "external lake evaluation limits retain their exact boundary identity" {
     const value = statusFromError(error.DecisionLimitExceeded);
     try std.testing.expectEqual(@backingInt(Code.invalid_argument), value.code);
@@ -3604,6 +3859,24 @@ test "storage callback boundaries retain capability integrity and bounded-read o
         const encoded = statusFromError(err);
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(encoded));
+    }
+}
+
+test "temporary SQL statement capture failure preserves retryable boundary identity" {
+    const transported = statusFromError(error.SqlStatementReadUnavailable);
+    try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
+    try std.testing.expectEqual(error.SqlStatementReadUnavailable, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.SqlStatementReadUnavailable));
+}
+
+test "provisioning races retain metadata identity and canonical protocol availability" {
+    const metadata = statusFromError(error.MetadataSnapshotHeadMismatch);
+    try std.testing.expectEqual(@backingInt(Code.retryable), metadata.code);
+    try std.testing.expectEqual(error.MetadataSnapshotHeadMismatch, errorFromStatus(metadata));
+    for ([_]anyerror{ error.RaftBatchMergeProtocolUnavailable, error.RaftBatchSplitDeltaProtocolUnavailable }) |err| {
+        const wire = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.unavailable), wire.code);
+        try std.testing.expectEqual(error.Unavailable, errorFromStatus(wire));
     }
 }
 
@@ -3661,7 +3934,7 @@ test "native normalization failures retain exact stable identities without accep
     }
     try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.RelationalCheckViolation).code);
     try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.RowPolicyDenied).code);
-    try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.RowPolicyAuthenticationRequired).code);
+    try std.testing.expectEqual(@backingInt(Code.unauthorized), statusFromError(error.RowPolicyAuthenticationRequired).code);
     try std.testing.expectEqual(@backingInt(Detail.partial_index_predicate_not_implied) + 1, @backingInt(Detail.relational_check_violation));
     for ([_][]const u8{ "RelationalCheckViolation\n", "relationalcheckviolation", "PrivateProviderSecret", "RuntimeBoundaryFailure" }) |name| try std.testing.expect(errorFromStableName(name) == null);
 }
@@ -3831,6 +4104,24 @@ test "merged runtime error details preserve main wire identifiers" {
     try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
     try std.testing.expectEqual(@as(c_int, 676), @backingInt(Detail.model_chunk_audio_too_large));
     try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.decision_limit_exceeded));
+    try std.testing.expectEqual(@as(c_int, 778), @backingInt(Detail.invalid_embedding_identity));
+    try std.testing.expectEqual(@as(c_int, 779), @backingInt(Detail.graph_start_identity_required));
+    try std.testing.expectEqual(@as(c_int, 780), @backingInt(Detail.metadata_snapshot_head_mismatch));
+    try std.testing.expectEqual(@as(c_int, 781), @backingInt(Detail.inference_endpoint_access_denied));
+    try std.testing.expectEqual(@as(c_int, 782), @backingInt(Detail.document_storage_not_configured));
+    try std.testing.expectEqual(@as(c_int, 825), @backingInt(Detail.document_token_limit_exceeded));
+    try std.testing.expectEqual(@as(c_int, 826), @backingInt(Detail.hierarchy_cursor_stale));
+    try std.testing.expectEqual(@as(c_int, 827), @backingInt(Detail.read_transient_failure));
+    try std.testing.expectEqual(@as(c_int, 832), @backingInt(Detail.invalid_connection_credentials));
+    try std.testing.expectEqual(@as(c_int, 833), @backingInt(Detail.pioneer_credential_missing));
+    try std.testing.expectEqual(@as(c_int, 835), @backingInt(Detail.unsupported_pioneer_input));
+    try std.testing.expectEqual(@as(c_int, 836), @backingInt(Detail.standalone_replication_sources_unsupported));
+    try std.testing.expectEqual(@as(c_int, 837), @backingInt(Detail.ha_catalog_replication_sources_unsupported));
+    try std.testing.expectEqual(@as(c_int, 838), @backingInt(Detail.embed_admission_refused));
+    try std.testing.expectEqual(@as(c_int, 839), @backingInt(Detail.read_output_truncated));
+    try std.testing.expectEqual(@as(c_int, 840), @backingInt(Detail.invalid_document_extraction_config));
+    try std.testing.expectEqual(@as(c_int, 841), @backingInt(Detail.document_extraction_model_required));
+    try std.testing.expectEqual(@as(c_int, 891), @backingInt(Detail.cypher_aggregate_scope));
 }
 
 test "logical query work and scan policy failures retain their identities" {
@@ -3935,7 +4226,7 @@ test "native locking callback admission preserves retryable ordered apply identi
     const transported = statusFromError(error.RaftApplyWriterUnavailable);
     try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
     try std.testing.expectEqual(error.RaftApplyWriterUnavailable, errorFromStatus(transported));
-    try std.testing.expectEqual(@as(c_int, 944), @backingInt(Detail.raft_apply_writer_unavailable));
+    try std.testing.expectEqual(@as(c_int, 1021), @backingInt(Detail.raft_apply_writer_unavailable));
 }
 
 test "scope retirement callback descriptors preserve exact lifecycle conflict and limit identities" {
@@ -3958,9 +4249,9 @@ test "scope retirement callback descriptors preserve exact lifecycle conflict an
         try std.testing.expect(errorHasStableDetail(entry[0]));
     }
     // Public enum numbers remain independent from the embedded owner ABI.
-    try std.testing.expectEqual(@as(c_int, 944), @backingInt(Detail.raft_apply_writer_unavailable));
-    try std.testing.expectEqual(@as(c_int, 945), @backingInt(Detail.sql_database_in_use));
-    try std.testing.expectEqual(@as(c_int, 952), @backingInt(Detail.catalog_generation_exhausted));
+    try std.testing.expectEqual(@as(c_int, 1021), @backingInt(Detail.raft_apply_writer_unavailable));
+    try std.testing.expectEqual(@as(c_int, 1022), @backingInt(Detail.sql_database_in_use));
+    try std.testing.expectEqual(@as(c_int, 1029), @backingInt(Detail.catalog_generation_exhausted));
     try std.testing.expect(errorFromStableName("SqlDatabaseInUse\n") == null);
     try std.testing.expect(errorFromStableName("ScopeRetirementChangedPrivate") == null);
 }
@@ -3977,7 +4268,7 @@ test "generation graph and durability errors survive an actual C callback status
     const callback: Callback = State.invoke;
     const failures = [_]anyerror{ error.InvalidGenerationTransaction, error.GenerationTransactionChanged, error.GenerationTransactionDecisionRequired, error.InvalidPreparedGraphEffects, error.SqlPreparedDurabilityUnavailable };
     const codes = [_]Code{ .invalid_argument, .conflict, .conflict, .invalid_argument, .invalid_argument };
-    for (failures, codes, 968..) |failure, code, detail| {
+    for (failures, codes, 1045..) |failure, code, detail| {
         var state: State = .{ .failure = failure };
         const transported = callback(&state);
         try std.testing.expectEqual(@backingInt(code), transported.code);
@@ -4019,7 +4310,7 @@ test "external terminal membership failure crosses callbacks without retry promo
 test "SQL extension lifecycle callback identities retain exact behavior" {
     const errors = [_]anyerror{ error.CatalogRevisionExhausted, error.DuplicateSqlExtensionExport, error.DuplicateSqlExtensionVersion, error.InconsistentSqlExtensionControl, error.InvalidPackageDigest, error.InvalidSqlExtensionArtifact, error.InvalidSqlExtensionControl, error.InvalidSqlExtensionDependency, error.InvalidSqlExtensionRecord, error.InvalidSqlExtensionRuntime, error.InvalidSqlExtensionPackageMutation, error.DuplicateSqlExtensionControl, error.SqlDependentExtensionObject, error.SqlDuplicateExtension, error.SqlDuplicateFunction, error.SqlExtensionControlConflict, error.SqlExtensionDependencyCycle, error.SqlExtensionPromotionNonceConflict, error.SqlExtensionSchemaMismatch, error.SqlExtensionUnavailable, error.SqlExtensionUpdatePathUnavailable, error.SqlExtensionVersionUnavailable, error.SqlFunctionReturnTypeChanged, error.SqlRequiredExtensionNotInstalled, error.SqlUndefinedExtension, error.UnsupportedSqlExtensionObject, error.SqlExtensionOwnedObject, error.DuplicateShapeName, error.GeneratedArtifactShapeRequired, error.NoSupportedScopes, error.ScopeMustNotNameTable, error.UnknownShapeReference };
     const codes = [_]Code{ .invalid_argument, .invalid_argument, .invalid_argument, .corrupt, .corrupt, .unsupported, .invalid_argument, .invalid_argument, .corrupt, .unsupported, .invalid_argument, .invalid_argument, .conflict, .already_exists, .already_exists, .conflict, .invalid_argument, .conflict, .invalid_argument, .unsupported, .invalid_argument, .not_found, .invalid_argument, .not_found, .not_found, .unsupported, .conflict, .invalid_argument, .invalid_argument, .invalid_argument, .invalid_argument, .invalid_argument };
-    for (errors, codes, 974..) |err, code, ordinal| {
+    for (errors, codes, 1051..) |err, code, ordinal| {
         const wire = statusFromError(err);
         try std.testing.expectEqual(@backingInt(code), wire.code);
         try std.testing.expectEqual(@as(c_int, @intCast(ordinal)), wire.detail);
@@ -4028,4 +4319,64 @@ test "SQL extension lifecycle callback identities retain exact behavior" {
     for ([_]anyerror{ error.UnsupportedManifestApiVersion, error.UnsupportedPackageKind }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
+}
+
+test "merged runtime error details preserve the common prefix under ABI two" {
+    try std.testing.expectEqual(@as(u32, 2), abi_version);
+    try std.testing.expectEqual(@as(c_int, 674), @backingInt(Detail.inference_worker_executable_not_configured));
+    try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
+    try std.testing.expectEqual(@as(c_int, 676), @backingInt(Detail.model_chunk_audio_too_large));
+    try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.decision_limit_exceeded));
+    try std.testing.expectEqual(@as(c_int, 778), @backingInt(Detail.invalid_embedding_identity));
+    try std.testing.expectEqual(@as(c_int, 779), @backingInt(Detail.graph_start_identity_required));
+    try std.testing.expectEqual(@as(c_int, 780), @backingInt(Detail.metadata_snapshot_head_mismatch));
+    try std.testing.expectEqual(@as(c_int, 781), @backingInt(Detail.inference_endpoint_access_denied));
+    try std.testing.expectEqual(@as(c_int, 782), @backingInt(Detail.document_storage_not_configured));
+    try std.testing.expectEqual(@as(c_int, 825), @backingInt(Detail.document_token_limit_exceeded));
+    try std.testing.expectEqual(@as(c_int, 826), @backingInt(Detail.hierarchy_cursor_stale));
+    try std.testing.expectEqual(@as(c_int, 827), @backingInt(Detail.read_transient_failure));
+    try std.testing.expectEqual(@as(c_int, 832), @backingInt(Detail.invalid_connection_credentials));
+    try std.testing.expectEqual(@as(c_int, 833), @backingInt(Detail.pioneer_credential_missing));
+    try std.testing.expectEqual(@as(c_int, 835), @backingInt(Detail.unsupported_pioneer_input));
+    try std.testing.expectEqual(@as(c_int, 836), @backingInt(Detail.standalone_replication_sources_unsupported));
+    try std.testing.expectEqual(@as(c_int, 837), @backingInt(Detail.ha_catalog_replication_sources_unsupported));
+    try std.testing.expectEqual(@as(c_int, 838), @backingInt(Detail.embed_admission_refused));
+    try std.testing.expectEqual(@as(c_int, 839), @backingInt(Detail.read_output_truncated));
+    try std.testing.expectEqual(@as(c_int, 840), @backingInt(Detail.invalid_document_extraction_config));
+    try std.testing.expectEqual(@as(c_int, 841), @backingInt(Detail.document_extraction_model_required));
+    try std.testing.expectEqual(@as(c_int, 891), @backingInt(Detail.cypher_aggregate_scope));
+}
+
+test "latest main error detail prefix remains append only across graph integration" {
+    @setEvalBranchQuota(30000);
+    var hash: u64 = 14695981039346656037;
+    var count: usize = 0;
+    inline for (@typeInfo(Detail).@"enum".field_names, @typeInfo(Detail).@"enum".field_values) |name, value| {
+        if (value <= 890) {
+            for (name) |byte| hash = (hash ^ byte) *% 1099511628211;
+            var encoded: [4]u8 = undefined;
+            std.mem.writeInt(u32, &encoded, @intCast(value), .little);
+            for (encoded) |byte| hash = (hash ^ byte) *% 1099511628211;
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 891), count);
+    try std.testing.expectEqual(@as(u64, 16819601552131841023), hash);
+}
+
+test "published main Detail inventory remains stable after SQL integration" {
+    @setEvalBranchQuota(100000);
+    var hash: u64 = 14695981039346656037;
+    var count: usize = 0;
+    inline for (@typeInfo(Detail).@"enum".field_names, @typeInfo(Detail).@"enum".field_values) |field_name, value| {
+        if (value <= 969) {
+            for (field_name) |byte| hash = (hash ^ byte) *% 1099511628211;
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, @intCast(value), .little);
+            for (bytes) |byte| hash = (hash ^ byte) *% 1099511628211;
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 970), count);
+    try std.testing.expectEqual(@as(u64, 16056847732095885735), hash);
 }

@@ -229,6 +229,9 @@ pub const Graph = struct {
 };
 
 pub const Search = struct { request: Value, limit: ?Value = null };
+/// Native graph relation, sharing source-spanned graph IR with standalone
+/// Cypher. SQL output aliases retain SQL identifier folding and scope.
+pub const GraphTable = struct { name: Name, query: @import("cypher").ast.Query, parameters: []const []const u8 };
 pub const Relation = union(enum) {
     /// FROM UNNEST expands typed arrays in storage order, zipping multiple
     /// arguments with SQL NULL padding. Function inputs are implicitly lateral.
@@ -242,7 +245,8 @@ pub const Relation = union(enum) {
     table: struct {
         name: Name,
         search: ?*const Search = null,
-        graph: ?*const Graph = null,
+        graph: ?*const GraphTable = null,
+        graph_search: ?*const Graph = null,
         alias: ?[]const u8 = null,
         mutation_target: bool = false,
         mutation_document: bool = false,

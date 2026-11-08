@@ -151,9 +151,10 @@ pub fn forgetNamespace(fs: *Fs, scope: api.UploadScope) !void {
     var threaded = std.Io.Threaded.init(fs.alloc, .{});
     defer threaded.deinit();
     std.Io.Dir.cwd().deleteFile(threaded.io(), path) catch |err| switch (err) {
-        error.FileNotFound => {},
+        error.FileNotFound => return,
         else => return err,
     };
+    try @import("antfly_runtime_fs").fs_paths.syncDirPortable(threaded.io(), std.fs.path.dirname(path).?);
 }
 pub fn forget(fs: *Fs, id: []const u8) !void {
     const path = try pathAlloc(fs, fs.alloc, id);

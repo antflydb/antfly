@@ -320,7 +320,8 @@ pub const ReadScope = struct {
         return self.vtable.visit_prepared_scores != null;
     }
     pub fn visitPreparedScores(self: *@This(), plan: *@import("prepared_score_plan.zig").PreparedScorePlan, sink: backend_types.CompleteScoreSink) !void {
-        return BoundaryAbi.call("visit_prepared_scores", self.boundary_dispatch, self.vtable.visit_prepared_scores orelse return error.Unsupported, .{ self.ptr, plan, sink });
+        const visit = self.vtable.visit_prepared_scores orelse return error.Unsupported;
+        return BoundaryAbi.call("visit_prepared_scores", self.boundary_dispatch, visit, .{ self.ptr, plan, sink });
     }
     pub fn get(self: *@This(), key: []const u8) ![]const u8 {
         return BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });

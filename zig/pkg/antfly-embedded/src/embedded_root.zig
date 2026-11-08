@@ -13,6 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const cypher = @import("cypher");
+pub const single_source_cypher = @import("storage/single_source_cypher.zig");
+
 pub const backend_adapter = @import("storage/backend_adapter.zig");
 pub const backend_types = @import("storage/backend_types.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");

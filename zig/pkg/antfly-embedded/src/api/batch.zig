@@ -173,6 +173,26 @@ test "row policy publication Raft codec carries immutable owner-fetched bytes pr
     mixed.relational_schema_version = 0;
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, mixed));
     try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"inserts\":{},\"deletes\":[],\"_row_policy_publication\":{\"table_id\":7,\"expected_generation\":11,\"expected_catalog_epoch\":13,\"expected_phase\":\"pending_install\"},\"sync_level\":\"write\",\"_schema_version\":1}"));
+    const reencoded = try encodeBatchRequest(alloc, parsed.req);
+    defer alloc.free(reencoded);
+    var reparsed = try parseInternalBatchRequest(alloc, reencoded);
+    defer reparsed.deinit(alloc);
+    try std.testing.expectEqualDeep(request.row_policy_publication.?, reparsed.req.row_policy_publication.?);
+    var timestamped = request;
+    timestamped.timestamp_ns = 123;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, timestamped));
+    var normalized = request;
+    normalized.normalized_graph_rows = true;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, normalized));
+    var fenced = request;
+    fenced.schema_version = 1;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, fenced));
+    var adjunct = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer adjunct.deinit();
+    try adjunct.value.object.put(adjunct.arena.allocator(), "_schema_version", .{ .integer = 1 });
+    const adjunct_bytes = try std.json.Stringify.valueAlloc(alloc, adjunct.value, .{});
+    defer alloc.free(adjunct_bytes);
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, adjunct_bytes));
 }
 
 test "signed write admission is internal-only and survives the replicated batch codec" {
@@ -899,6 +919,10 @@ noinline fn parseBatchRowsAndControls(alloc: std.mem.Allocator, root: std.json.O
             return error.InvalidBatchRequest;
         break :bundle try alloc.dupe(u8, value.string);
     } else null;
+    out.req.normalized_graph_rows = if (root.get("_normalized_graph_rows")) |value| blk: {
+        if (!allow_internal or value != .bool) return error.InvalidBatchRequest;
+        break :blk value.bool;
+    } else false;
     out.row_policy_principal_proof = if (root.get("_row_policy_principal_proof")) |value| blk: {
         if (!allow_internal or value != .string or value.string.len == 0 or
             value.string.len > @import("../usermgr/row_policy_authority.zig").maximum_token_bytes)
@@ -2042,6 +2066,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
         try writer.writeAll(",\"_row_policy_install_bundle\":");
         try writer.print("{f}", .{std.json.fmt(req.row_policy_install_bundle, .{})});
     }
+    if (req.normalized_graph_rows) try writer.writeAll(",\"_normalized_graph_rows\":true");
     if (req.row_policy_principal_proof.len != 0) {
         if (req.row_policy_database.len == 0 or req.row_policy_admitted_at_seconds <= 0)
             return error.InvalidBatchRequest;

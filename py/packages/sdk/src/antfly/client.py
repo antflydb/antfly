@@ -826,6 +826,15 @@ def _sql_catalog_receipt(body: dict[str, Any]) -> SQLCatalogOperationReceipt:
     return SQLCatalogOperationReceipt.from_dict(body)
 
 
+class GraphExecutionError(AntflyException):
+    """Cypher diagnostic with UTF-8 spans and a server-confirmed write outcome."""
+
+    def __init__(self, status_code: int, diagnostic: dict[str, Any]) -> None:
+        self.status_code = status_code
+        self.diagnostic = diagnostic
+        super().__init__(f"Graph query failed ({diagnostic.get('code')}): {diagnostic.get('message')}")
+
+
 class SQLExecutionError(AntflyException):
     """SQLSTATE diagnostic and optional native transaction reconciliation receipt."""
 
@@ -912,6 +921,9 @@ class AntflyClient:
 
         self.memory = MemoryOperations(self)
         self.indexes = IndexOperations(self)
+        from .cypher import GraphOperations
+
+        self.graphs = GraphOperations(self)
         from .resolvers import CurationProposalOperations, EntityOperations, ResolverOperations
 
         self.resolvers = ResolverOperations(self)
@@ -988,6 +1000,8 @@ class AntflyClient:
                                 raise SQLExecutionError(
                                     response.status_code, SQLDiagnostic.from_dict(diagnostic_body), receipt
                                 )
+                    if path.startswith("/db/v1/graphs/") and path.endswith("/query") and error_body is not None:
+                        raise GraphExecutionError(response.status_code, error_body)
                     if (
                         (path == "/db/v1/sql" or path.startswith("/db/v1/sql/"))
                         and error_body is not None

@@ -32,7 +32,7 @@ pub const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {
-    kind: enum { table, view, sequence, function, procedure, operator, aggregate, cast, named_type } = .table,
+    kind: enum { table, view, sequence, function, procedure, operator, aggregate, cast, named_type, graph } = .table,
     /// A prepared cast retains identity independently of namespace spelling.
     /// Executable enum generations are append-only, so additive generations
     /// may advance while drop/recreate and catalog replacement remain fenced.
@@ -52,6 +52,7 @@ pub const Binding = struct {
     /// have no spelling and never participate in overload selection.
     routine_lookup: ?[]const u8 = null,
     definition_digest: ?[32]u8 = null,
+    graph_pattern_hash: u64 = 0,
     database: []const u8,
     namespace: []const u8,
     name: []const u8,
@@ -76,13 +77,13 @@ pub const Binding = struct {
 
     pub fn from(table: catalog.Table) !Binding {
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
-        return .{ .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical_name = table.physical_name, .id = table.id, .schema_version = table.schema_version, .revision = scope.revision, .sql_persistence_fingerprint = if (table.sql_persistence) |descriptor| try descriptor.fingerprint() else null };
+        return .{ .kind = if (table.graph != null) .graph else .table, .graph_pattern_hash = if (table.graph) |graph| std.hash.Wyhash.hash(0x67726170685f7371, graph.definition.query.source) else 0, .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical_name = table.physical_name, .id = table.id, .schema_version = table.schema_version, .revision = scope.revision, .sql_persistence_fingerprint = if (table.sql_persistence) |descriptor| try descriptor.fingerprint() else null };
     }
 
     pub fn verify(bindings: []const Binding, table: catalog.Table) !void {
         const current = try from(table);
         for (bindings) |entry| {
-            if (entry.kind != .table) continue;
+            if (entry.kind != current.kind or entry.graph_pattern_hash != current.graph_pattern_hash) continue;
             if (!std.mem.eql(u8, entry.database, current.database) or !std.mem.eql(u8, entry.namespace, current.namespace) or !std.mem.eql(u8, entry.name, current.name)) continue;
             if (entry.id != current.id or entry.schema_version != current.schema_version or entry.revision != current.revision or !std.meta.eql(entry.sql_persistence_fingerprint, current.sql_persistence_fingerprint) or !std.mem.eql(u8, entry.physical_name, current.physical_name)) return error.CatalogGenerationChanged;
             return;

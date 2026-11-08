@@ -95,8 +95,15 @@ test "distributed txn range guard wire preserves absent and exact counters" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
+const PrepareExtensions = struct {
+    normalized_graph_rows: bool = false,
+    graph_writes: []const db_mod.types.GraphEdgeWrite = &.{},
+    graph_deletes: []const db_mod.types.GraphEdgeDelete = &.{},
+};
+
 pub const TxnPrepareRequest = struct {
     trigger_batch_owner: ?*@import("antfly_local_sources").api_batch.OwnedBatchRequest = null,
+    extensions_owner: ?std.json.Parsed(PrepareExtensions) = null,
     route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
     range_guards_owner: ?std.json.Parsed([]const @import("antfly_local_sources").storage_range_protection.Proof) = null,
     txn_id: db_mod.types.TxnId,
@@ -1800,6 +1807,7 @@ pub fn executeCrossGroup(
         .row_policy_principal_proof = req.row_policy_principal_proof,
         .row_policy_database = req.row_policy_database,
         .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+        .normalized_graph_rows = req.normalized_graph_rows,
         .writes = req.writes,
         .deletes = req.deletes,
         .transforms = req.transforms,
@@ -1975,6 +1983,16 @@ fn buildParticipantTxns(alloc: std.mem.Allocator, catalog: table_catalog.Catalog
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.deletes.append(alloc, key);
         }
+        for (table.graph_writes) |edge| {
+            const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            try participant.graph_writes.append(alloc, edge);
+        }
+        for (table.graph_deletes) |edge| {
+            const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            try participant.graph_deletes.append(alloc, edge);
+        }
         for (table.predicates) |predicate| {
             const group_id = routing.resolveGroupForKey(predicate.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
@@ -2050,6 +2068,7 @@ fn buildParticipantTxns(alloc: std.mem.Allocator, catalog: table_catalog.Catalog
             participant.row_policy_principal_proof = table.row_policy_principal_proof;
             participant.row_policy_database = table.row_policy_database;
             participant.row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds;
+            participant.normalized_graph_rows = table.normalized_graph_rows;
             if (participant.relational_schema_version) |existing| {
                 if (table.relational_schema_version) |requested| {
                     if (existing != requested) return error.InvalidTxnRequest;
@@ -2315,6 +2334,7 @@ fn executeMultiTableCommitOnce(
                     // Preserve a typed retryable result without claiming
                     // not-proposed for the individual participant RPC. An
                     // uncertain abort above retains AbortDecisionNotDurable.
+                    if (err == error.RowPolicyDenied) return error.TransactionPrepareAbortedRowPolicyDenied;
                     return if (err == error.StorageReadTemporarilyUnavailable or err == error.ConstraintActivationInProgress or err == error.IntegrityTopologyBusy)
                         error.TransactionPrepareAbortedUnavailable
                     else
@@ -2659,6 +2679,7 @@ const ParticipantTxn = struct {
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    normalized_graph_rows: bool = false,
     route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
     range_guards: std.ArrayListUnmanaged(@import("antfly_local_sources").storage_range_protection.Proof) = .empty,
     schema_version: ?u32 = null,
@@ -2688,6 +2709,7 @@ const ParticipantTxn = struct {
             .row_policy_principal_proof = self.row_policy_principal_proof,
             .row_policy_database = self.row_policy_database,
             .row_policy_admitted_at_seconds = self.row_policy_admitted_at_seconds,
+            .normalized_graph_rows = self.normalized_graph_rows,
             .writes = self.writes.items,
             .deletes = self.deletes.items,
             .transforms = self.transforms.items,
@@ -3108,7 +3130,7 @@ pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]
 
 pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest) ![]u8 {
     if (req.req.trigger_receipts.len != 0) return encodeTriggerPrepare(alloc, req);
-    if (req.req.graph_preparation != null or req.req.graph_writes.len != 0 or req.req.graph_deletes.len != 0) return error.InvalidTxnRequest;
+    if (req.req.graph_preparation != null) return error.InvalidTxnRequest;
     try validateRestorePlan(req.req.restore_staging_scope, req.req.restore_staging_plan_id);
     if (req.req.external_decision_owner) |owner| try owner.validate();
     if (req.req.external_activation and req.req.external_decision_owner == null) return error.InvalidTxnRequest;
@@ -3251,6 +3273,12 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         const field = try std.fmt.allocPrint(alloc, ",\"relational_schema_version\":{d}", .{version});
         defer alloc.free(field);
         try out.appendSlice(alloc, field);
+    }
+    inline for (.{ "normalized_graph_rows", "graph_writes", "graph_deletes" }) |field| {
+        try out.appendSlice(alloc, ",\"" ++ field ++ "\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, @field(req.req, field), .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
     }
     if (req.req.schema_version) |version| try out.print(alloc, ",\"schema_version\":{d}", .{version});
     if (req.req.relational_repair) try out.appendSlice(alloc, ",\"relational_repair\":true");
@@ -3592,6 +3620,9 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     errdefer alloc.free(owned_proof);
     const owned_database = try alloc.dupe(u8, database);
     errdefer alloc.free(owned_database);
+    var extensions = try std.json.parseFromValue(PrepareExtensions, alloc, root, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    errdefer extensions.deinit();
+    const ext = extensions.value;
     const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
     const writes = try parseTxnWrites(alloc, obj.get("writes") orelse return error.InvalidTxnRequest);
     errdefer freeTxnWrites(alloc, writes);
@@ -3646,6 +3677,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     if (wrapped and !external and !row_semantics and !has_guards) return error.InvalidTxnRequest;
     if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
     return .{
+        .extensions_owner = extensions,
         .route_fence = if (route_fence) |fence| fence.value else null,
         .txn_id = txn_id,
         .topology_epoch = try optionalU64(obj, "topology_epoch"),
@@ -3656,6 +3688,9 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
             .row_policy_principal_proof = owned_proof,
             .row_policy_database = owned_database,
             .row_policy_admitted_at_seconds = admitted_at,
+            .normalized_graph_rows = ext.normalized_graph_rows,
+            .graph_writes = ext.graph_writes,
+            .graph_deletes = ext.graph_deletes,
             .writes = writes,
             .deletes = deletes,
             .transforms = transforms,
@@ -3692,6 +3727,7 @@ pub fn freeTxnPrepareRequest(alloc: std.mem.Allocator, req: *TxnPrepareRequest) 
     if (req.prepared_domain_owner) |*owner| owner.deinit();
     alloc.free(req.req.row_policy_principal_proof);
     alloc.free(req.req.row_policy_database);
+    if (req.extensions_owner) |*owner| owner.deinit();
     if (req.range_guards_owner) |*owner| owner.deinit();
     freeTxnWrites(alloc, req.req.writes);
     freeTxnDeletes(alloc, req.req.deletes);
@@ -8883,4 +8919,21 @@ test "SQL relation lifetime local participant seals trigger effects before actua
     missing.route_fence.?.admission_trigger_minter = null;
     try std.testing.expectError(error.SqlTriggerContextRequired, worker.worker().prepareGroup(a, 11, "docs", missing));
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "distributed txn prepare retains signed graph mutations and normalized rows" {
+    const alloc = std.testing.allocator;
+    const request: TxnPrepareRequest = .{ .txn_id = @splat(1), .req = .{
+        .row_policy_principal_proof = "signed-admission",
+        .row_policy_database = "default",
+        .row_policy_admitted_at_seconds = 1800000000,
+        .normalized_graph_rows = true,
+        .graph_writes = &.{.{ .index_name = "links", .source = "a", .target = "b", .edge_type = "CITES", .edge_id = "edge", .metadata_json = "{}" }},
+        .graph_deletes = &.{.{ .index_name = "links", .source = "a", .target = "c", .edge_type = "CITES", .edge_id = "old" }},
+    } };
+    const encoded = try encodeTxnPrepareRequest(alloc, request);
+    defer alloc.free(encoded);
+    var decoded = try parseTxnPrepareRequest(alloc, encoded);
+    defer freeTxnPrepareRequest(alloc, &decoded);
+    try std.testing.expectEqualDeep(request.req, decoded.req);
 }

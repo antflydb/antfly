@@ -6084,6 +6084,7 @@ pub const Node = struct {
         prompt_tokens: usize,
         completion_tokens: usize,
         truncated: bool,
+        naturally_completed: bool = false,
         /// Prompt tokens served from the model's prefix KV cache.
         cached_prompt_tokens: usize = 0,
         silent_audio: bool = false,
@@ -6627,6 +6628,7 @@ pub const Node = struct {
             .prompt_tokens = result.prompt_tokens,
             .completion_tokens = result.tokens_used,
             .truncated = std.mem.eql(u8, result.finish_reason, "length"),
+            .naturally_completed = std.mem.eql(u8, result.finish_reason, "stop"),
             .cached_prompt_tokens = result.cached_prompt_tokens,
         };
     }
@@ -23004,6 +23006,10 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
+        if (body.transcript_text != null) return ctx.status(400).json(.{
+            .@"error" = "UNSUPPORTED_FEATURE",
+            .message = "text cleanup requires a named transcriber advertising text_cleanup",
+        });
         const model_name = std.mem.trim(u8, body.model, " \t\r\n");
         if (model_name.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
@@ -23268,7 +23274,11 @@ pub const Node = struct {
                 writer.close() catch {};
                 return ctx.response.build();
             }
-            const cleaned = try dictation_mod.normalizeOutput(ctx.allocator, generated.text);
+            const cleaned = normalizeDirectDictationOutput(ctx.allocator, generated) catch |err| {
+                writeGenerationStreamError(&writer, err);
+                writer.close() catch {};
+                return ctx.response.build();
+            };
             defer ctx.allocator.free(cleaned);
             writeDictationEvent(&writer, &payload, .{
                 .type = "dictation.completed",
@@ -23304,7 +23314,7 @@ pub const Node = struct {
             execution_control,
         ) catch |err| return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(generated.text);
-        const cleaned = try dictation_mod.normalizeOutput(ctx.allocator, generated.text);
+        const cleaned = normalizeDirectDictationOutput(ctx.allocator, generated) catch |err| return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(cleaned);
         return ctx.json(api.DictateResponse{
             .object = "dictation",
@@ -23315,6 +23325,14 @@ pub const Node = struct {
             .transcript = api_transcript,
             .text = cleaned,
             .usage = tokenUsageWithCachedPrompt(generated.prompt_tokens, generated.completion_tokens, generated.cached_prompt_tokens),
+        });
+    }
+
+    fn normalizeDirectDictationOutput(allocator: std.mem.Allocator, generated: DirectGenerateOutput) ![]u8 {
+        return @import("antfly_generating").dictation.normalizeCleanupOutput(allocator, .{
+            .finish_reason = @as(?api.FinishReason, if (generated.naturally_completed) .stop else .length),
+            .tool_calls = @as([]const u8, &.{}),
+            .content = generated.text,
         });
     }
 
@@ -51689,4 +51707,17 @@ test "model selection compatibility signature tracks selected Jina adapter files
     try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_model.safetensors", .data = "bbbbb" });
     const weights_changed = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
     try std.testing.expect(!std.mem.eql(u8, &config_changed, &weights_changed));
+}
+
+test "direct dictation cleanup rejects unfinished and normalized empty text" {
+    const a = std.testing.allocator;
+    const output = Node.DirectGenerateOutput{ .text = @constCast("Hello."), .prompt_tokens = 1, .completion_tokens = 1, .truncated = false };
+    try std.testing.expectError(error.InferenceOutputIncomplete, Node.normalizeDirectDictationOutput(a, output));
+    var complete = output;
+    complete.naturally_completed = true;
+    const text = try Node.normalizeDirectDictationOutput(a, complete);
+    defer a.free(text);
+    try std.testing.expectEqualStrings("Hello.", text);
+    complete.text = @constCast("\"\"");
+    try std.testing.expectError(error.InferenceOutputIncomplete, Node.normalizeDirectDictationOutput(a, complete));
 }

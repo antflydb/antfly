@@ -21,11 +21,12 @@ class GraphMatchEdge:
     """Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse
     the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop
     relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-
-    length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge
-    path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless
-    execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes
-    cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias
-    at each table boundary.
+    length expansion uses Cypher relationship-simple trails: nodes may repeat, but the same physical relationship cannot
+    be reused anywhere within one MATCH group. Each optional group has its own relationship scope. Parallel relationship
+    IDs remain distinct. A zero-hop path binds both endpoints to the same node identity without reading an edge. Exact
+    distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of
+    unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges
+    with a table-qualified alias at each table boundary.
 
         Attributes:
             from_ (str): User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0).

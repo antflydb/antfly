@@ -1883,7 +1883,7 @@ const Parser = struct {
         }
         const graph = try self.alloc.create(ast.Graph);
         graph.* = .{ .index = index, .start = start, .aliases = try aliases.toOwnedSlice(self.alloc), .edge_types = try types.toOwnedSlice(self.alloc) };
-        const source = try self.relationNode(.{ .table = .{ .name = table_name, .graph = graph } });
+        const source = try self.relationNode(.{ .table = .{ .name = table_name, .graph_search = graph } });
         return self.selectFinish(.{ .source = source, .columns = try columns.toOwnedSlice(self.alloc) });
     }
 
@@ -1996,6 +1996,50 @@ const Parser = struct {
             }
             return self.relationNode(.{ .unnest = .{ .args = try args.toOwnedSlice(self.alloc), .alias = alias, .columns = try columns.toOwnedSlice(self.alloc), .ordinality = ordinality, .qualified = name_value.namespace != null } });
         }
+        if (name_value.database == null and name_value.namespace == null and std.mem.eql(u8, name_value.table, "graph_table") and self.take(.lparen)) {
+            const graph_name = try self.tableReferenceName();
+            try self.expectKeyword(.match);
+            const pattern_start = self.pos;
+            var nesting: usize = 0;
+            while (self.pos < self.tokens.len) : (self.pos += 1) {
+                const t = self.tokens[self.pos];
+                if (nesting == 0 and t.kind == .identifier and !t.owned and std.ascii.eqlIgnoreCase(t.text, "COLUMNS")) break;
+                if (t.kind == .lparen) nesting += 1;
+                if (t.kind == .rparen) {
+                    if (nesting == 0) return self.fail(error.InvalidSqlSyntax, "GRAPH_TABLE requires COLUMNS");
+                    nesting -= 1;
+                }
+            }
+            const pattern_end = self.pos;
+            if (self.pos == self.tokens.len) return self.fail(error.InvalidSqlSyntax, "GRAPH_TABLE requires COLUMNS");
+            self.pos += 1;
+            try self.expect(.lparen);
+            const columns_start = self.pos;
+            nesting = 1;
+            while (self.pos < self.tokens.len) : (self.pos += 1) {
+                const t = self.tokens[self.pos];
+                if (t.kind == .lparen) nesting += 1;
+                if (t.kind == .rparen) {
+                    nesting -= 1;
+                    if (nesting == 0) break;
+                }
+            }
+            const columns_end = self.pos;
+            try self.expect(.rparen);
+            try self.expect(.rparen);
+            const graph = try self.alloc.create(ast.GraphTable);
+            var graph_diagnostic: @import("cypher").compiler.Diagnostic = .{};
+            graph.* = @import("graph_table.zig").lower(self.alloc, graph_name, self.tokens[pattern_start..pattern_end], self.tokens[columns_start..columns_end], &graph_diagnostic) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return self.fail(error.InvalidSqlSyntax, if (graph_diagnostic.message.len != 0) graph_diagnostic.message else "invalid GRAPH_TABLE pattern or columns");
+            };
+            for (graph.parameters) |parameter| {
+                const index = std.fmt.parseInt(u32, parameter, 10) catch return self.fail(error.InvalidSqlParameter, "GRAPH_TABLE requires SQL positional parameters");
+                if (index == 0 or index > self.limits.max_parameters) return self.fail(error.InvalidSqlParameter, "GRAPH_TABLE parameter exceeds configured bound");
+                self.parameter_count = @max(self.parameter_count, index);
+            }
+            return self.relationNode(.{ .table = .{ .name = graph_name, .graph = graph, .alias = (try self.sourceAlias()) orelse "graph_table" } });
+        }
         if (lateral) return self.fail(error.InvalidSqlSyntax, "LATERAL requires a derived query or table function");
         if (name_value.database == null and name_value.namespace == null and std.ascii.eqlIgnoreCase(name_value.table, "antfly_search") and self.take(.lparen)) {
             const table_value = try self.value();
@@ -2079,7 +2123,7 @@ const Parser = struct {
         } else return self.fail(error.InvalidSqlSyntax, "graph_match return binding is absent from its pattern");
         const graph = try self.alloc.create(ast.Graph);
         graph.* = .{ .index = arguments[1].?.string, .start = arguments[2].?, .aliases = try aliases.toOwnedSlice(self.alloc), .edge_types = try edges.toOwnedSlice(self.alloc), .hit_alias = hit_alias };
-        return self.relationNode(.{ .table = .{ .name = .{ .table = arguments[0].?.string }, .graph = graph, .alias = (try self.sourceAlias()) orelse "graph_match" } });
+        return self.relationNode(.{ .table = .{ .name = .{ .table = arguments[0].?.string }, .graph_search = graph, .alias = (try self.sourceAlias()) orelse "graph_match" } });
     }
 
     fn relation(self: *Parser) Error!*const ast.Relation {
@@ -7464,7 +7508,7 @@ test "compiler original canonical MATCH retains native graph aliases before SQL 
     var compiled = try compile(std.testing.allocator, (try corpus.get("sql-1209")).sql, .{});
     defer compiled.deinit();
     const select = compiled.statement.select;
-    const graph = select.source.?.table.graph.?;
+    const graph = select.source.?.table.graph_search.?;
     try std.testing.expectEqualStrings("usage_records", select.source.?.table.name.table);
     try std.testing.expectEqualStrings("docs_edge_graph", graph.index);
     try std.testing.expectEqualStrings("doc:root", graph.start.string);
@@ -7473,7 +7517,7 @@ test "compiler original canonical MATCH retains native graph aliases before SQL 
     try std.testing.expectEqualStrings("cites", graph.edge_types[0]);
     var mixed = try compile(std.testing.allocator, "SELECT * FROM antfly.graph_match(table_name=>'t',index=>'g',start=>'r',pattern=>'(A)-[:Cites]->(B)',return=>'B')", .{});
     defer mixed.deinit();
-    const native = mixed.statement.select.source.?.table.graph.?;
+    const native = mixed.statement.select.source.?.table.graph_search.?;
     try std.testing.expectEqualStrings("A", native.aliases[0]);
     try std.testing.expectEqualStrings("B", native.hit_alias.?);
     try std.testing.expectEqualStrings("Cites", native.edge_types[0]);
@@ -7487,7 +7531,7 @@ test "SQL native graph table function preserves typed hit relation through CTE a
     const cte = "WITH gm AS (SELECT * FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b')) SELECT d.id AS doc_id, gm.score AS graph_score FROM usage_records AS d JOIN gm ON d.id = gm.id WHERE gm.graph_name = 'graph_match' ORDER BY graph_score DESC LIMIT 5";
     var compiled = try compile(std.testing.allocator, cte, .{});
     defer compiled.deinit();
-    const graph = compiled.statement.select.ctes[0].query.source.?.table.graph.?;
+    const graph = compiled.statement.select.ctes[0].query.source.?.table.graph_search.?;
     try std.testing.expectEqualStrings("b", graph.hit_alias.?);
     try std.testing.expectEqualStrings("docs_edge_graph", graph.index);
     try std.testing.expectEqualStrings("doc:root", graph.start.string);
@@ -7496,7 +7540,7 @@ test "SQL native graph table function preserves typed hit relation through CTE a
     defer standalone.deinit();
     try std.testing.expectEqual(@as(u32, 1), standalone.parameter_count);
     try std.testing.expectEqualStrings("gm", standalone.statement.select.source.?.table.alias.?);
-    try std.testing.expect(standalone.statement.select.source.?.table.graph.?.start == .parameter);
+    try std.testing.expect(standalone.statement.select.source.?.table.graph_search.?.start == .parameter);
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "SELECT * FROM antfly.graph_match(table_name=>'t',index=>'g',start=>'r',pattern=>'(a)-[:cites]->(b) trailing',return=>'b')", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "SELECT * FROM antfly.graph_match(table_name=>'t',index=>'g',start=>'r',pattern=>'(a)-[:cites]->(b)',return=>'missing')", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "SELECT * FROM antfly.graph_match(table_name=>'t',index=>'g',start=>'r',start=>'again',pattern=>'(a)-[:cites]->(b)',return=>'b')", .{}));
@@ -7582,4 +7626,15 @@ test "SQL original temporal conflict setup rejects PERIOD syntax before catalog 
     try std.testing.expectEqualStrings("PERIOD", sql[diagnostic.start..diagnostic.end]);
     var valid = try compile(std.testing.allocator, "CREATE TABLE t(\"period\" numeric,valid_time numrange,UNIQUE(valid_time WITHOUT OVERLAPS))", .{});
     defer valid.deinit();
+}
+
+test "SQL GRAPH_TABLE lowers native graph patterns into shared IR" {
+    _ = @import("graph_relation.zig");
+    var compiled = try compile(std.testing.allocator, "SELECT g.target_id FROM GRAPH_TABLE(knowledge MATCH (a IS Document)-[r IS CITES]->(b IS Document) WHERE a.id = $1 COLUMNS (b.id AS target_id, b.title AS title)) AS g", .{});
+    defer compiled.deinit();
+    const graph = compiled.statement.select.source.?.table.graph.?;
+    try std.testing.expectEqual(@as(u32, 1), compiled.parameter_count);
+    try std.testing.expectEqualStrings("Document", graph.query.clauses[0].operation.match.paths[0].nodes[0].labels[0]);
+    try std.testing.expectEqualStrings("CITES", graph.query.clauses[0].operation.match.paths[0].edges[0].types[0]);
+    try std.testing.expectEqualStrings("target_id", graph.query.clauses[1].operation.project.value.items[0].alias.?);
 }

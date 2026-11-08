@@ -1429,7 +1429,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             .tablespace => error.SqlDuplicateTablespace,
             .role => error.SqlDuplicateRole,
             .extension => error.SqlDuplicateExtension,
-            .table, .query_source, .view, .sequence, .routine, .cast, .named_type => err,
+            .table, .query_source, .graph, .view, .sequence, .routine, .cast, .named_type => err,
         };
         if (err == error.CatalogNotFound) return switch (kind) {
             .database => error.DatabaseNotFound,
@@ -1437,7 +1437,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             .tablespace => error.TablespaceNotFound,
             .role => error.SqlRoleNotFound,
             .extension => error.SqlUndefinedExtension,
-            .table, .query_source, .view, .sequence, .routine, .cast, .named_type => err,
+            .table, .query_source, .graph, .view, .sequence, .routine, .cast, .named_type => err,
         };
         return err;
     };

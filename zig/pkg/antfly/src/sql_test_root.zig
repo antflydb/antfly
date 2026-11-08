@@ -18,6 +18,7 @@ test {
     _ = @import("api/sql_statistics_cache.zig");
     _ = @import("api/sql_persisted_expressions.zig");
     _ = @import("antfly_local_sources").api_sql_maintenance_contract;
+    _ = @import("api/sql_group_guard.zig");
     _ = @import("sql/test_root.zig");
     _ = @import("sql/subquery_shape_test.zig");
     _ = @import("sql/joined_mutation_test.zig");

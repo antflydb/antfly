@@ -183,6 +183,9 @@ pub fn reconcileDbIndexTargetWithOptions(
         dedupeDesiredEnrichments(alloc, &target_enrichments);
         try indexes_api.sortArtifactEnrichmentsByDependency(alloc, target_enrichments.items);
     }
+    const target_json = if (target_value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null;
+    defer if (target_json) |json| alloc.free(json);
+    if (target_json) |json| try stored_destination_authorization.authorizeIndexesJson(alloc, json, options.source_table, options.destination_authorizer);
     const enrichment_summary = try ensureEnrichments(db, target_enrichments.items);
 
     if (target_value) |value| {
@@ -199,13 +202,25 @@ pub fn reconcileDbIndexTargetWithOptions(
     } else {
         if (try db.deleteIndex(index_name)) target_summary.removed += 1;
     }
+    // Inline resolvers belong to this index's activation, just like its asset
+    // producers. Restrict reconciliation to the target declaration and retain
+    // sibling/table resolvers; a target-only retry must not publish their changes.
+    const resolver_summary: ResolverReconcileSummary = if (target_json) |json| blk: {
+        break :blk try ensureResolversWithOptions(alloc, db, json, .{
+            .drain_backfill = options.drain_resolver_backfill,
+            .source_table = options.source_table,
+            .destination_authorizer = options.destination_authorizer,
+            .remove_absent = false,
+            .inline_managed = true,
+        });
+    } else .{};
     // Removing every persisted enrichment absent from the current catalog is
     // target-safe: it never applies a sibling addition or update, while also
     // making deletion retryable after a crash between index and enrichment
     // retirement. Definitions still referenced by another index or by the
     // table-level enrichment catalog remain in desired_enrichments.
     const enrichments_removed = try removeAbsentEnrichments(alloc, db, desired_enrichments.items);
-    if (target_summary.added > 0 or target_summary.removed > 0 or enrichment_summary.changed() or enrichments_removed > 0) {
+    if (target_summary.added > 0 or target_summary.removed > 0 or enrichment_summary.changed() or enrichments_removed > 0 or resolver_summary.changed()) {
         const pending = db.pendingWorkStats();
         // Targeted DDL cannot wait on checkpoints or maintenance owned by a
         // sibling index. Deletion already retires its durable generation; only
@@ -220,6 +235,9 @@ pub fn reconcileDbIndexTargetWithOptions(
         .enrichments_added = enrichment_summary.added,
         .enrichments_updated = enrichment_summary.updated,
         .enrichments_removed = enrichments_removed,
+        .resolvers_added = resolver_summary.added,
+        .resolvers_updated = resolver_summary.updated,
+        .resolvers_removed = resolver_summary.removed,
     };
 }
 
@@ -283,6 +301,48 @@ pub fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []c
         try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false);
     }
     return summary;
+}
+
+/// A committed graph entry may need an index absent from an older physical
+/// catalog. Admit missing graph namespaces only; never replace a newer schema,
+/// producer configuration, or an unrelated durable index during catch-up.
+pub fn ensureGraphReplayIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !void {
+    if (indexes_json.len == 0) return;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    const current = try db.listIndexes(alloc);
+    defer db_mod.types.freeIndexConfigs(alloc, current);
+    var summary: IndexEnsureSummary = .{};
+    if (object.get("indexes")) |value| {
+        const items = switch (value) {
+            .array => |array| array.items,
+            else => return error.InvalidTableIndexMetadata,
+        };
+        for (items) |item| {
+            if (try parseIndexKind(item) != .graph) continue;
+            const name = try indexDefinitionName(item);
+            if (findIndexConfig(current, name) == null)
+                try ensureIndexDefinition(alloc, db, current, &summary, name, .graph, indexDefinitionConfigValue(item), true);
+            if (db.core.index_manager.graphIndex(name) == null) return error.StorageBusy;
+        }
+    } else {
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            if (indexes_api.isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
+            if (try parseIndexKind(entry.value_ptr.*) != .graph) continue;
+            if (findIndexConfig(current, entry.key_ptr.*) == null)
+                try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, .graph, entry.value_ptr.*, false);
+            if (db.core.index_manager.graphIndex(entry.key_ptr.*) == null) return error.StorageBusy;
+        }
+    }
+    if (summary.added != 0) try db.syncIndexes(true);
+    // Apply needs the write plan, not a queryable rebuilt projection. Waiting
+    // for backfill here can deadlock the producer publications behind this entry.
+
 }
 
 pub fn ensureIndexDefinition(
@@ -610,6 +670,8 @@ pub const ResolverReconcileSummary = struct {
 
 pub const EnsureResolverOptions = struct {
     drain_backfill: bool = true,
+    remove_absent: bool = true,
+    inline_managed: bool = false,
     source_table: []const u8 = "",
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 };
@@ -659,6 +721,7 @@ pub fn ensureResolversWithOptions(
             next = try curation.overlayMetadataCached(curation_arena.allocator(), cfg, identity, &validation_profiles);
             break;
         };
+        if (options.inline_managed) next.inline_managed = true;
         const result = try db.upsertResolverWithResultOptions(next, .{
             .migrate_namespace = next.namespace_generation > (generations.get(next.name) orelse 0),
             .drain_backfill = options.drain_backfill,
@@ -670,6 +733,7 @@ pub fn ensureResolversWithOptions(
         }
     }
 
+    if (!options.remove_absent) return summary;
     const existing = try db.listResolverStaticDescriptors(alloc);
     defer {
         for (existing) |*cfg| cfg.deinit(alloc);

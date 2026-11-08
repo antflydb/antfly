@@ -73,6 +73,9 @@ The embedded API currently exposes:
 - `listIndexesJson`
 - `listEnrichmentsJson`
 - `openHosted`
+- `graphCatalogJson`
+- `cypherJson` / `cypherJsonWithDiagnostic`
+- `graphWriteStatusJson`
 
 `src/engine/db.zig` has two execution profiles:
 
@@ -98,6 +101,50 @@ It wraps the exported function-call ABI and provides:
 - `pendingWorkStats`
 - `capabilities`
 - `listIndexes` / `listEnrichments`
+- `addIndex` / `addIndexJson`
+- `graphCatalog` / `graphCatalogJson`
+- `cypher` / `cypherJson`
+- `graphWriteStatus` / `graphWriteStatusJson`
+
+## Cypher
+
+Hosted Zig and WASM use the shared Cypher compiler, typed value format,
+immutable graph materialization, postimage planner, and native transaction
+ledger. A hosted graph maps labels and relationship indexes to the configured
+single table. Native C/Lite can map multiple local tables; distributed graphs
+use the authenticated server API.
+
+The `antfly.search` Cypher seed procedure uses authenticated server execution.
+Hosted graph calls report `CypherSearchUnavailable` for this procedure. The
+ordinary hosted `search` API remains available separately.
+
+```js
+api.addIndex({ name: "links", kind: "graph", config_json: "{}" });
+api.graphCatalog({
+  action: "put", name: "knowledge",
+  definition: {
+    labels: [{ name: "Document", table: "docs" }],
+    relationships: [{ name: "LINKS", source_label: "Document",
+      target_label: "Document", index: "links", stored_type: "links" }],
+  },
+});
+const result = api.cypher("knowledge", {
+  query: "MATCH (n:Document) RETURN n LIMIT 20",
+});
+```
+
+Writes require a UUID in `write_request_id`. The JavaScript helper supplies
+one with `crypto.randomUUID()` when the caller omits it; direct Zig callers
+supply their own. Retain this ID and consult `graphWriteStatus(id)` when a
+diagnostic reports an unknown outcome. Reusing an admitted ID rejects the
+query rather than executing it again. Errors expose `diagnostic.code`, a
+source span, the write outcome, and the transaction ID when available.
+
+Catalog replacements and drops require the current decimal
+`expected_revision`. Graph bindings pin table and index identities across
+reopen. Raw embedded calls reject protected tables because these entry points
+do not carry authenticated principal authority. Hosts drive graph indexing
+with `runUntilIdle()` alongside other derived indexes.
 
 ## Host Storage Contracts
 

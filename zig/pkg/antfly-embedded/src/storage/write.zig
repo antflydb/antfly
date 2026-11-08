@@ -1745,7 +1745,7 @@ pub fn configureStorageKernelOwnerDb(
     installed: ?*OwnerManagedConfig,
 ) !void {
     if (comptime storage_engine.enabled) return storage_engine.call("writeConfigureStorageKernelOwnerDb", .{ alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed });
-    _ = try configureStorageKernelOwnerDbAtOpen(alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed, false);
+    _ = try configureStorageKernelOwnerDbAtOpen(alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed, 0);
 }
 
 /// A pinned Raft descriptor is write-admission history, not current catalog
@@ -1763,10 +1763,10 @@ pub fn configureStorageKernelOwnerDbAtOpen(
     remote_content: ?*const scraping.RemoteContentConfig,
     inference: InferenceDefaults,
     installed: ?*OwnerManagedConfig,
-    historical_ordered_apply: bool,
+    historical_ordered_apply: u8,
 ) !bool {
     if (comptime storage_engine.enabled) return storage_engine.call("writeConfigureStorageKernelOwnerDbAtOpen", .{ alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed, historical_ordered_apply });
-    const schema_policy = try db.schemaOwnerCatalogPolicy(schema_json, historical_ordered_apply);
+    const schema_policy = try db.schemaOwnerCatalogPolicy(schema_json, historical_ordered_apply != 0);
     if (schema_policy != .unprotected) {
         if (schema_policy == .deferred) return true;
         const durable = (try loadOwnerCatalogContract(alloc, db)) orelse return true;
@@ -1781,7 +1781,8 @@ pub fn configureStorageKernelOwnerDbAtOpen(
         if (installed) |state| state.publish(durable);
         return false;
     }
-    if (historical_ordered_apply) {
+    if (historical_ordered_apply != 0) {
+        if (historical_ordered_apply == 2) try metadata_table_provisioner.ensureGraphReplayIndexes(alloc, db, indexes_json);
         const stored = try loadOwnerCatalogContract(alloc, db);
         defer if (stored) |value| alloc.free(value);
         if (stored) |value| {
@@ -1870,7 +1871,7 @@ test "fenced owner reopen defers index deletion until exact cancellation" {
     var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = namespace, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(alloc, schema_json);
-    try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(alloc, &db, "rows", schema_json, old_indexes, null, null, null, null, .{}, null, false)));
+    try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(alloc, &db, "rows", schema_json, old_indexes, null, null, null, null, .{}, null, 0)));
     try std.testing.expect(db.hasIndex("old"));
     const catalog = try db.core.store.get(alloc, @import("db/relational_integrity_catalog.zig").key);
     defer alloc.free(catalog);
@@ -1886,7 +1887,7 @@ test "fenced owner reopen defers index deletion until exact cancellation" {
         .catalog_digest = catalog_digest,
     };
     try db.batch(.{ .relational_topology = .{ .action = .begin, .fence = fence } });
-    try std.testing.expect(try configureStorageKernelOwnerDbAtOpen(alloc, &db, "rows", schema_json, "{}", null, null, null, null, .{}, null, false));
+    try std.testing.expect(try configureStorageKernelOwnerDbAtOpen(alloc, &db, "rows", schema_json, "{}", null, null, null, null, .{}, null, 0));
     try std.testing.expect(db.hasIndex("old"));
     const pinned_contract = (try loadOwnerCatalogContract(alloc, &db)).?;
     defer alloc.free(pinned_contract);
@@ -2439,7 +2440,7 @@ test "owner configuration preserves the prior excluded source epoch bytes" {
     defer a.free(historical);
     var reopened = try db_mod.DB.open(a, path, .{ .start_optional_runtimes = false });
     defer reopened.close();
-    try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(a, &reopened, "docs", json, "{}", null, null, null, null, .{}, null, false)));
+    try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(a, &reopened, "docs", json, "{}", null, null, null, null, .{}, null, 0)));
     try std.testing.expect(try reopened.rehydrateSchemaJson(json));
     const encoded = try reopened.core.store.get(a, storage_schema.schema_key);
     defer a.free(encoded);

@@ -951,7 +951,7 @@ fn mutateOrPrepare(svc: anytype, alloc: std.mem.Allocator, context: operation.Re
     else
         null;
     const object_create = if (create_req) |req| (req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{}).engine == .object else false;
-    const ordinary_version = if (request.mutation.action == .comment) protocol.sql_resource_comments_version else if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
+    const ordinary_version = if (request.mutation.kind == .graph) protocol.graph_definition_version else if (request.mutation.action == .comment) protocol.sql_resource_comments_version else if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
     var resolver_create = false;
     if (create_req) |req| {
         resolver_create = protocol.usesResolverNamespaces(req.indexes_json orelse tables_api.default_indexes_json);
@@ -2883,6 +2883,11 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.exportSystemCatalog(alloc, svc.metadata_group_id);
+        },
+        .graph_authority => |request| blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk std.json.Stringify.valueAlloc(alloc, try store.graphAuthority(alloc, svc.metadata_group_id, request), .{});
         },
         .read => |request| blk: {
             try svc.ensureLinearizableReadWithContext(context);

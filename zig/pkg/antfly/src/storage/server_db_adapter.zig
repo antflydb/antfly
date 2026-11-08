@@ -32,6 +32,14 @@ pub fn applyOrdered(
 ) anyerror!void {
     if (req.relational_index_owner_control != null) return error.InvalidBatchRequest;
     const db = physicalOwner(owner);
+    if (req.row_policy_publication) |publication| {
+        // Policy phases have their own durable bundle/receipt transaction.
+        // The ordinary batch path deliberately rejects these commands. Run
+        // the dedicated apply before the generic receipt fast path so replay
+        // can also finish a policy receipt whose store commit already landed.
+        _ = try db.applyReplicatedRowPolicyPublication(req.row_policy_install_bundle, publication, identity);
+        return;
+    }
     const mirror_scoped_restore = requiresDurableLifecycleReplication(req) and db.local_execution.replication_async_batch_mirror != null;
     // Hot standby is process-local and includes this node's Raft follower roots.
     // Recover the local committed obligation before a Raft receipt can

@@ -25,6 +25,7 @@ pub fn isRetryableError(err: anyerror) bool {
         error.LeaderTransferInProgress,
         error.MetadataLinearizableReadTimeout,
         error.MetadataSnapshotHeadMismatch,
+        error.MetadataSnapshotUnavailable,
         error.ReconcileLeaseNotHeld,
         error.NativeRestoreIdentityProtocolUnavailable,
         => true,
@@ -64,6 +65,8 @@ test "metadata authority retry classification is fail closed" {
     try std.testing.expect(isRetryableError(error.LeaderTransferInProgress));
     try std.testing.expect(isRetryableError(error.MetadataLinearizableReadTimeout));
     try std.testing.expect(isRetryableError(error.MetadataSnapshotHeadMismatch));
+    try std.testing.expect(isRetryableError(error.MetadataSnapshotUnavailable));
+    try std.testing.expect(!isMutationNotAdmittedError(error.MetadataSnapshotUnavailable));
     try std.testing.expect(isRetryableError(error.ReconcileLeaseNotHeld));
     try std.testing.expect(isRetryableError(error.NativeRestoreIdentityProtocolUnavailable));
     try std.testing.expect(!isRetryableError(error.InvalidArguments));

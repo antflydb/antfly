@@ -41,6 +41,8 @@ test {
     _ = @import("api/sql_command_mutations.zig");
     _ = @import("api/sql_execution.zig");
     _ = transactions;
+    _ = @import("api/graph_execution.zig");
+    _ = @import("api/http_server.zig");
 }
 
 /// Implementation source choices for this compilation root.
