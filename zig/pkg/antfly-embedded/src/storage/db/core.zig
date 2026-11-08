@@ -2324,6 +2324,24 @@ pub const DBCore = struct {
         return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
     }
 
+    /// Staged counterpart of `resolveTransactionIntentsWithExtraBatch`: see
+    /// `TxnManager.resolveIntentsWithExtraBatchStaged`'s doc comment.
+    /// `manager.deinit()` only frees this call's lightweight erased-`Store`
+    /// adapter (see `backend_erased.storeFrom`'s `deinit`), never the
+    /// underlying native handle the returned ticket owns, so it is safe to
+    /// run before the caller waits on that ticket.
+    pub fn resolveTransactionIntentsWithExtraBatchStaged(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+        extra_batch: transactions_mod.ResolutionExtraBatch,
+    ) !transactions_mod.StagedResolutionOutcome {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.resolveIntentsWithExtraBatchStaged(txn_id, status, commit_version, extra_batch);
+    }
+
     pub fn collectTransactionIntentBatch(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) !transactions_mod.IntentBatch {
         var manager = try self.initTxnManager();
         defer manager.deinit();

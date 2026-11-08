@@ -739,6 +739,332 @@ fn measureConcurrentVector(alloc: std.mem.Allocator, comptime name: []const u8, 
 }
 
 // ---------------------------------------------------------------------------
+// Relational write-surface modes (lite-single-commit-write-path.md §3.3c):
+// secondary indexes, unique constraints, foreign keys, and SQL INSERT/UPDATE
+// all run through `antfly_db_sql_json`, the same embedded SQL seam the
+// Go/Python/Rust/TS SDKs' SQL surface reaches, matching how a real relational
+// write gets its unique/FK coordination (`sql.zig`'s `Adapter.mutate`
+// routes a table with `hasCoordinatedConstraints()` through
+// `beginTransaction`/`writeTransaction`/`commitTransaction` --
+// `opts.transaction_resolution` in `mutation_commit.zig` -- the exact path
+// this harness's modes below exercise for `unique_index`/`foreign_key`/
+// `transaction`; `secondary_index` and `plain` have no coordinated
+// constraint and so stay on the plain batch path,
+// `trackedBatchWithWriterLaneHook`).
+// ---------------------------------------------------------------------------
+
+const relational_cardinality: usize = 128;
+const relational_fk_child_cardinality: usize = 32;
+const relational_fk_parent_cardinality: usize = 16;
+
+fn execSql(alloc: std.mem.Allocator, handle: *anyopaque, statement: []const u8) !void {
+    try execSqlSession(alloc, handle, statement, null);
+}
+
+fn execSqlSession(alloc: std.mem.Allocator, handle: *anyopaque, statement: []const u8, session_id: ?u64) !void {
+    const stmt_json = try jsonString(alloc, statement);
+    defer alloc.free(stmt_json);
+    const body = if (session_id) |id|
+        try std.fmt.allocPrint(alloc, "{{\"statement\":{s},\"session_id\":{d}}}", .{ stmt_json, id })
+    else
+        try std.fmt.allocPrint(alloc, "{{\"statement\":{s}}}", .{stmt_json});
+    defer alloc.free(body);
+    var output: capi_types.Buffer = .{};
+    defer api.antfly_buffer_free(&output);
+    const code = api.antfly_db_sql_json(handle, .fromSlice(body), &output);
+    if (code != .ok) {
+        std.debug.print("lite-write-amp relational SQL failed ({s}): {s}\n", .{
+            statement,
+            if (output.ptr) |p| p[0..output.len] else "<no output>",
+        });
+        return error.RelationalSqlExecFailed;
+    }
+}
+
+const RelationalKind = enum { plain, secondary_index, unique_index, foreign_key };
+
+/// A relational SQL Fixture: the primary-only Fixture (no default full-text
+/// index, isolating this mode's own write cost) plus DDL for `kind`, run
+/// once through the same `antfly_db_sql_json` seam the measured writes use.
+fn openRelationalFixture(alloc: std.mem.Allocator, comptime name: []const u8, kind: RelationalKind) !Fixture {
+    var fixture = try Fixture.open(alloc, name, .primary_only);
+    errdefer fixture.close();
+    switch (kind) {
+        .plain => try execSql(alloc, fixture.handle, "CREATE TABLE items (label TEXT)"),
+        .secondary_index => {
+            try execSql(alloc, fixture.handle, "CREATE TABLE items (label TEXT)");
+            try execSql(alloc, fixture.handle, "CREATE INDEX items_label ON items (label)");
+        },
+        .unique_index => {
+            try execSql(alloc, fixture.handle, "CREATE TABLE items (label TEXT)");
+            try execSql(alloc, fixture.handle, "CREATE UNIQUE INDEX items_label_unique ON items (label)");
+        },
+        .foreign_key => {
+            try execSql(alloc, fixture.handle, "CREATE TABLE parents (id BIGINT PRIMARY KEY)");
+            try execSql(alloc, fixture.handle, "CREATE TABLE children (id BIGINT, parent_id BIGINT REFERENCES parents (id))");
+            for (0..relational_fk_parent_cardinality) |p| {
+                var stmt_buf: [128]u8 = undefined;
+                const stmt = try std.fmt.bufPrint(&stmt_buf, "INSERT INTO parents (_id, id) VALUES ('parent-{d}', {d})", .{ p, p });
+                try execSql(alloc, fixture.handle, stmt);
+            }
+        },
+    }
+    return fixture;
+}
+
+/// One relational write to the `items` table: INSERT the first time a given
+/// key is written, UPDATE every later time -- mirroring `insertOne`'s/
+/// `insertEdge`'s add-then-change shape, and literally exercising "SQL
+/// INSERT/UPDATE via the C API". `label_seed` is always a value this call
+/// has never used before, so a `unique_index` fixture's uniqueness check
+/// scans the whole live set on every write, not a repeated no-op value.
+fn writeRelationalRow(alloc: std.mem.Allocator, handle: *anyopaque, key: []const u8, is_first: bool, label_seed: usize) !void {
+    var stmt_buf: [192]u8 = undefined;
+    const stmt = if (is_first)
+        try std.fmt.bufPrint(&stmt_buf, "INSERT INTO items (_id, label) VALUES ('{s}', 'label-{d}')", .{ key, label_seed })
+    else
+        try std.fmt.bufPrint(&stmt_buf, "UPDATE items SET label = 'label-{d}' WHERE _id = '{s}'", .{ label_seed, key });
+    try execSql(alloc, handle, stmt);
+}
+
+/// One foreign-key write to the `children` table: the first
+/// `relational_fk_child_cardinality` occurrences INSERT a new child row
+/// referencing a parent (round-robin); every later occurrence UPDATEs an
+/// existing child's `parent_id`, so FK re-validation runs on every write,
+/// not just the first.
+fn writeRelationalChild(alloc: std.mem.Allocator, handle: *anyopaque, key: []const u8, index: usize) !void {
+    const child_ordinal = index % relational_fk_child_cardinality;
+    const parent_ordinal = index % relational_fk_parent_cardinality;
+    var stmt_buf: [192]u8 = undefined;
+    const stmt = if (index < relational_fk_child_cardinality)
+        try std.fmt.bufPrint(&stmt_buf, "INSERT INTO children (_id, id, parent_id) VALUES ('{s}', {d}, {d})", .{ key, child_ordinal, parent_ordinal })
+    else
+        try std.fmt.bufPrint(&stmt_buf, "UPDATE children SET parent_id = {d} WHERE _id = '{s}'", .{ parent_ordinal, key });
+    try execSql(alloc, handle, stmt);
+}
+
+fn measureSingleWriterRelational(alloc: std.mem.Allocator, comptime name: []const u8, kind: RelationalKind, updates: usize) !ModeReport {
+    var fixture = try openRelationalFixture(alloc, name, kind);
+    defer fixture.close();
+
+    var key_buffer: [32]u8 = undefined;
+    wal_trace.reset();
+    wal_trace.registerCallingThread();
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    for (0..updates) |i| {
+        if (kind == .foreign_key) {
+            const key = try std.fmt.bufPrint(&key_buffer, "child-{d}", .{i % relational_fk_child_cardinality});
+            try writeRelationalChild(alloc, fixture.handle, key, i);
+        } else {
+            const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i % relational_cardinality});
+            try writeRelationalRow(alloc, fixture.handle, key, i < relational_cardinality, i);
+        }
+    }
+    const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    return .{ .updates = updates, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
+}
+
+/// Explicit multi-document SQL transaction mode: each "update" is one
+/// `BEGIN`/2x `INSERT-or-UPDATE`/`COMMIT` transaction touching two distinct
+/// rows of a `plain` table (no coordinated constraint, isolating the
+/// transaction-resolution commit's own cost from unique/FK re-validation,
+/// which the modes above already measure separately). Exercises
+/// `opts.transaction_resolution` in `mutation_commit.zig` exactly like
+/// `commitTransaction` on any multi-statement SQL session.
+fn measureSingleWriterRelationalTransaction(alloc: std.mem.Allocator, comptime name: []const u8, updates: usize) !ModeReport {
+    var fixture = try openRelationalFixture(alloc, name, .plain);
+    defer fixture.close();
+
+    var session_id: u64 = 0;
+    try std.testing.expectEqual(capi_types.ErrorCode.ok, @import("../../capi/sql_session.zig").antfly_db_sql_session_open(fixture.handle, &session_id));
+    defer _ = @import("../../capi/sql_session.zig").antfly_db_sql_session_close(fixture.handle, session_id);
+
+    var key_buffer_a: [32]u8 = undefined;
+    var key_buffer_b: [32]u8 = undefined;
+    wal_trace.reset();
+    wal_trace.registerCallingThread();
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    for (0..updates) |i| {
+        const first = i < relational_cardinality;
+        const key_a = try std.fmt.bufPrint(&key_buffer_a, "doc-{d}-a", .{i % relational_cardinality});
+        const key_b = try std.fmt.bufPrint(&key_buffer_b, "doc-{d}-b", .{i % relational_cardinality});
+        try execSqlSession(alloc, fixture.handle, "BEGIN", session_id);
+        var stmt_buf_a: [160]u8 = undefined;
+        const stmt_a = if (first)
+            try std.fmt.bufPrint(&stmt_buf_a, "INSERT INTO items (_id, label) VALUES ('{s}', 'label-{d}')", .{ key_a, i })
+        else
+            try std.fmt.bufPrint(&stmt_buf_a, "UPDATE items SET label = 'label-{d}' WHERE _id = '{s}'", .{ i, key_a });
+        try execSqlSession(alloc, fixture.handle, stmt_a, session_id);
+        var stmt_buf_b: [160]u8 = undefined;
+        const stmt_b = if (first)
+            try std.fmt.bufPrint(&stmt_buf_b, "INSERT INTO items (_id, label) VALUES ('{s}', 'label-{d}')", .{ key_b, i })
+        else
+            try std.fmt.bufPrint(&stmt_buf_b, "UPDATE items SET label = 'label-{d}' WHERE _id = '{s}'", .{ i, key_b });
+        try execSqlSession(alloc, fixture.handle, stmt_b, session_id);
+        try execSqlSession(alloc, fixture.handle, "COMMIT", session_id);
+    }
+    const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    return .{ .updates = updates, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
+}
+
+const ConcurrentRelationalWorker = struct {
+    alloc: std.mem.Allocator,
+    handle: *anyopaque,
+    worker: usize,
+    updates_per_writer: usize,
+    kind: RelationalKind,
+    barrier: *Barrier,
+    err: ?anyerror = null,
+
+    fn run(self: *ConcurrentRelationalWorker) void {
+        wal_trace.registerCallingThread();
+        var key_buffer: [32]u8 = undefined;
+        for (0..self.updates_per_writer) |i| {
+            self.barrier.wait();
+            if (self.kind == .foreign_key) {
+                const key = std.fmt.bufPrint(&key_buffer, "w{d}-child-{d}", .{ self.worker, i % relational_fk_child_cardinality }) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                writeRelationalChild(self.alloc, self.handle, key, i) catch |err| {
+                    self.err = err;
+                    return;
+                };
+            } else {
+                const key = std.fmt.bufPrint(&key_buffer, "w{d}-doc-{d}", .{ self.worker, i % relational_cardinality }) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                const label_seed = self.worker * 1_000_003 + i;
+                writeRelationalRow(self.alloc, self.handle, key, i < relational_cardinality, label_seed) catch |err| {
+                    self.err = err;
+                    return;
+                };
+            }
+        }
+    }
+};
+
+/// Real concurrent threads issuing relational SQL writes, mirroring
+/// `measureConcurrent`'s/`measureConcurrentGraph`'s barrier-synchronized
+/// contention shape. Each worker uses its own key (and, for `foreign_key`,
+/// its own child-row) namespace, like every other concurrent mode here.
+fn measureConcurrentRelational(alloc: std.mem.Allocator, comptime name: []const u8, kind: RelationalKind, writers: usize, updates_per_writer: usize) !ModeReport {
+    var fixture = try openRelationalFixture(alloc, name, kind);
+    defer fixture.close();
+
+    wal_trace.reset();
+    var barrier = Barrier{ .participants = writers };
+    var workers = try alloc.alloc(ConcurrentRelationalWorker, writers);
+    defer alloc.free(workers);
+    var threads = try alloc.alloc(std.Thread, writers);
+    defer alloc.free(threads);
+    for (0..writers) |w| workers[w] = .{
+        .alloc = alloc,
+        .handle = fixture.handle,
+        .worker = w,
+        .updates_per_writer = updates_per_writer,
+        .kind = kind,
+        .barrier = &barrier,
+    };
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    for (0..writers) |w| threads[w] = try std.Thread.spawn(.{}, ConcurrentRelationalWorker.run, .{&workers[w]});
+    for (threads) |thread| thread.join();
+    const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    for (workers) |worker| if (worker.err) |err| return err;
+    return .{ .updates = writers * updates_per_writer, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
+}
+
+/// Concurrent counterpart to `measureSingleWriterRelationalTransaction`:
+/// `writers` real OS threads, each with its own SQL session, each running
+/// its own 2-document transactions against its own key namespace.
+fn measureConcurrentRelationalTransaction(alloc: std.mem.Allocator, comptime name: []const u8, writers: usize, updates_per_writer: usize) !ModeReport {
+    var fixture = try openRelationalFixture(alloc, name, .plain);
+    defer fixture.close();
+
+    const sql_session = @import("../../capi/sql_session.zig");
+    const sessions = try alloc.alloc(u64, writers);
+    defer alloc.free(sessions);
+    for (sessions) |*session_id| try std.testing.expectEqual(capi_types.ErrorCode.ok, sql_session.antfly_db_sql_session_open(fixture.handle, session_id));
+    defer {
+        for (sessions) |session_id| _ = sql_session.antfly_db_sql_session_close(fixture.handle, session_id);
+    }
+
+    wal_trace.reset();
+    var barrier = Barrier{ .participants = writers };
+    const Worker = struct {
+        alloc: std.mem.Allocator,
+        handle: *anyopaque,
+        worker: usize,
+        session_id: u64,
+        updates_per_writer: usize,
+        barrier: *Barrier,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            wal_trace.registerCallingThread();
+            var key_buffer_a: [40]u8 = undefined;
+            var key_buffer_b: [40]u8 = undefined;
+            for (0..self.updates_per_writer) |i| {
+                self.barrier.wait();
+                const first = i < relational_cardinality;
+                const key_a = std.fmt.bufPrint(&key_buffer_a, "w{d}-doc-{d}-a", .{ self.worker, i % relational_cardinality }) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                const key_b = std.fmt.bufPrint(&key_buffer_b, "w{d}-doc-{d}-b", .{ self.worker, i % relational_cardinality }) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                execSqlSession(self.alloc, self.handle, "BEGIN", self.session_id) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                var stmt_buf: [160]u8 = undefined;
+                for ([_][]const u8{ key_a, key_b }) |key| {
+                    const stmt = if (first)
+                        std.fmt.bufPrint(&stmt_buf, "INSERT INTO items (_id, label) VALUES ('{s}', 'label-{d}')", .{ key, i }) catch |err| {
+                            self.err = err;
+                            return;
+                        }
+                    else
+                        std.fmt.bufPrint(&stmt_buf, "UPDATE items SET label = 'label-{d}' WHERE _id = '{s}'", .{ i, key }) catch |err| {
+                            self.err = err;
+                            return;
+                        };
+                    execSqlSession(self.alloc, self.handle, stmt, self.session_id) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                }
+                execSqlSession(self.alloc, self.handle, "COMMIT", self.session_id) catch |err| {
+                    self.err = err;
+                    return;
+                };
+            }
+        }
+    };
+    var workers = try alloc.alloc(Worker, writers);
+    defer alloc.free(workers);
+    var threads = try alloc.alloc(std.Thread, writers);
+    defer alloc.free(threads);
+    for (0..writers) |w| workers[w] = .{
+        .alloc = alloc,
+        .handle = fixture.handle,
+        .worker = w,
+        .session_id = sessions[w],
+        .updates_per_writer = updates_per_writer,
+        .barrier = &barrier,
+    };
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    for (0..writers) |w| threads[w] = try std.Thread.spawn(.{}, Worker.run, .{&workers[w]});
+    for (threads) |thread| thread.join();
+    const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    for (workers) |worker| if (worker.err) |err| return err;
+    return .{ .updates = writers * updates_per_writer, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
+}
+
+// ---------------------------------------------------------------------------
 // JSON report
 // ---------------------------------------------------------------------------
 
@@ -1410,6 +1736,69 @@ test "lite write amplification: mixed text+sparse write engages both inline fast
     // update (doc-0's very first write touches both), so this stays at
     // the single-index ceiling, not double it.
     try expectAtMost(mixed.durableCommitsPerWrite(), 1.25, "mixed text+sparse durable commits/write (workers on)");
+}
+
+// lite-single-commit-write-path.md §3.3c: the relational write surface --
+// secondary indexes, unique constraints, foreign keys, SQL INSERT/UPDATE
+// through the C API, and multi-document transactions. A fresh schema/table
+// per mode isolates each concern's own cost, exactly like the graph/dense/
+// sparse sections above isolate theirs.
+test "lite write amplification report: relational write surface" {
+    const alloc = std.testing.allocator;
+    const updates = default_updates;
+
+    const secondary_index = try measureSingleWriterRelational(alloc, "lite-write-amp-rel-secondary", .secondary_index, updates);
+    const secondary_index_concurrent = try measureConcurrentRelational(alloc, "lite-write-amp-rel-secondary-concurrent", .secondary_index, default_writers, updates / default_writers);
+    const unique_index = try measureSingleWriterRelational(alloc, "lite-write-amp-rel-unique", .unique_index, updates);
+    const unique_index_concurrent = try measureConcurrentRelational(alloc, "lite-write-amp-rel-unique-concurrent", .unique_index, default_writers, updates / default_writers);
+    const foreign_key = try measureSingleWriterRelational(alloc, "lite-write-amp-rel-fk", .foreign_key, updates);
+    const foreign_key_concurrent = try measureConcurrentRelational(alloc, "lite-write-amp-rel-fk-concurrent", .foreign_key, default_writers, updates / default_writers);
+    const sql_insert_update = try measureSingleWriterRelational(alloc, "lite-write-amp-rel-sql", .plain, updates);
+    const sql_insert_update_concurrent = try measureConcurrentRelational(alloc, "lite-write-amp-rel-sql-concurrent", .plain, default_writers, updates / default_writers);
+    const transaction = try measureSingleWriterRelationalTransaction(alloc, "lite-write-amp-rel-txn", updates);
+    const transaction_concurrent = try measureConcurrentRelationalTransaction(alloc, "lite-write-amp-rel-txn-concurrent", default_writers, updates / default_writers);
+
+    std.debug.print("lite write amplification report, relational write surface (updates={d}):\n", .{updates});
+    printStageTable("relational secondary-index", secondary_index);
+    printStageTable("relational secondary-index, 8 writers", secondary_index_concurrent);
+    printStageTable("relational unique-constraint", unique_index);
+    printStageTable("relational unique-constraint, 8 writers", unique_index_concurrent);
+    printStageTable("relational foreign-key child insert/update", foreign_key);
+    printStageTable("relational foreign-key child insert/update, 8 writers", foreign_key_concurrent);
+    printStageTable("SQL INSERT/UPDATE via C API", sql_insert_update);
+    printStageTable("SQL INSERT/UPDATE via C API, 8 writers", sql_insert_update_concurrent);
+    printStageTable("2-document SQL transaction", transaction);
+    printStageTable("2-document SQL transaction, 8 writers", transaction_concurrent);
+
+    const RelationalReportJson = struct {
+        updates: usize,
+        secondary_index: ModeJson,
+        secondary_index_8_writers: ModeJson,
+        unique_index: ModeJson,
+        unique_index_8_writers: ModeJson,
+        foreign_key: ModeJson,
+        foreign_key_8_writers: ModeJson,
+        sql_insert_update: ModeJson,
+        sql_insert_update_8_writers: ModeJson,
+        transaction_2doc: ModeJson,
+        transaction_2doc_8_writers: ModeJson,
+    };
+    const report: RelationalReportJson = .{
+        .updates = updates,
+        .secondary_index = modeJson(secondary_index),
+        .secondary_index_8_writers = modeJson(secondary_index_concurrent),
+        .unique_index = modeJson(unique_index),
+        .unique_index_8_writers = modeJson(unique_index_concurrent),
+        .foreign_key = modeJson(foreign_key),
+        .foreign_key_8_writers = modeJson(foreign_key_concurrent),
+        .sql_insert_update = modeJson(sql_insert_update),
+        .sql_insert_update_8_writers = modeJson(sql_insert_update_concurrent),
+        .transaction_2doc = modeJson(transaction),
+        .transaction_2doc_8_writers = modeJson(transaction_concurrent),
+    };
+    const json_text = try std.json.Stringify.valueAlloc(alloc, report, .{ .whitespace = .indent_2 });
+    defer alloc.free(json_text);
+    std.debug.print("lite_write_amplification_relational_json_begin\n{s}\nlite_write_amplification_relational_json_end\n", .{json_text});
 }
 
 fn expectAtMost(actual: f64, ceiling: f64, comptime label: []const u8) !void {

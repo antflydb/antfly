@@ -3672,8 +3672,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // concurrent writers can share one group-commit fsync instead of
             // serializing behind each other's durability wait.
             var primary_ticket: ?docstore_mod.DocStore.StagedDocBatch = null;
+            // WS3 (relational/transactional surface): like `primary_ticket`
+            // above, staged but not yet durable. Only the transaction-
+            // resolution branch below ever populates this; see its own
+            // `errdefer`/wait pairing further down, mirrored from
+            // `primary_ticket`'s.
+            var txn_ticket: ?@import("../backend_erased.zig").Ticket = null;
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
-                const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
+                const staged = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatchStaged(
                     resolution.txn_id,
                     resolution.status,
                     resolution.commit_version,
@@ -3689,10 +3695,28 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .resolved_participant = resolution.resolved_participant,
                     },
                 );
-                if (outcome.applied) {
+                if (staged.outcome.applied) {
+                    // Hot path (every ordinary commitTransaction/SQL DML
+                    // commit on a fresh, not-yet-resolved transaction takes
+                    // this branch -- see `TxnManager.resolveIntentsWithExtraBatchStaged`'s
+                    // `was_terminal` branches for the only other case).
+                    // Defer the wait to the same point `primary_ticket`'s
+                    // wait happens, below, so this commit's fsync can share
+                    // a group-commit window instead of blocking under the
+                    // apply lock and the capi writer lane.
+                    txn_ticket = staged.ticket;
                     if (replay_append) |entry| S.ownerField(self, "core").*.store.observeExternalReplayCommit(entry.sequence);
+                } else if (staged.ticket) |ticket| {
+                    // Rare terminal-retry path (this transaction was already
+                    // resolved by an earlier attempt): wait immediately,
+                    // exactly like this call did before staging existed.
+                    // Not performance sensitive -- no new commit happens on
+                    // the common case here, only idempotent completion
+                    // writes/deletes, if any.
+                    var owned = ticket;
+                    try owned.wait();
                 }
-                break :blk outcome;
+                break :blk staged.outcome;
             } else blk: {
                 if (durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null)
                     S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
@@ -3715,6 +3739,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // the ticket's heap state is freed and the apply order this
             // write was assigned is honored, surfacing the later error above it.
             errdefer if (primary_ticket) |*ticket| ticket.wait() catch {};
+            // Same reasoning as `primary_ticket`'s errdefer immediately
+            // above, for the transaction-resolution commit's own ticket.
+            errdefer if (txn_ticket) |*ticket| ticket.wait() catch {};
             local_coverage_guard.release();
             if (opts.primary_committed) |committed| committed.* = true;
             if (graph_publication) |*lease| lease.release();
@@ -3793,9 +3820,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // apply lock release above already let another thread start its
             // own staging; this lets it finish entering (admission, refresh)
             // while this call's ticket is still pending. Only called when a
-            // ticket is actually outstanding: the transaction-resolution
-            // commit path above never populates `primary_ticket`.
-            if (primary_ticket != null) {
+            // ticket is actually outstanding: `primary_ticket` xor
+            // `txn_ticket` (never both -- the transaction-resolution branch
+            // above never populates `primary_ticket`, and vice versa).
+            if (primary_ticket != null or txn_ticket != null) {
                 if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
             }
             // WS3: wait for the primary write's durability only now, with the
@@ -3811,6 +3839,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // `wait` frees the ticket's owned heap state unconditionally
                 // the first time (success or failure).
                 primary_ticket = null;
+                var owned_ticket = ticket;
+                try owned_ticket.wait();
+            }
+            // Relational/transactional surface counterpart: the hot-path
+            // transaction-resolution commit (every ordinary commitTransaction/
+            // SQL DML commit) staged its native transaction above, under the
+            // apply lock, exactly like the primary path. Wait for it now,
+            // with every lock already released, so it too can share a
+            // group-commit fsync instead of blocking other writers behind it.
+            if (txn_ticket) |ticket| {
+                txn_ticket = null;
                 var owned_ticket = ticket;
                 try owned_ticket.wait();
             }
