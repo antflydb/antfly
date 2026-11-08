@@ -18,14 +18,14 @@ const std = @import("std");
 const t = @import("types.zig");
 const schema = @import("schema.zig");
 
-pub const Action = enum { evaluation_results, put_evaluation_dataset, evaluation_dataset, evaluation_cases, start_evaluation, evaluation_run, evaluation_tasks, evaluation_verdict, lineage, fork_lineage, checkpoint_lineage, revert_lineage, supersession_candidates, propose_supersession, supersession_proposals, supersession_proposal, review_supersession, changes, create, inspect, configure, observe, assertions, recall, get, history, correct, forget, outcome, operation, advance, list, entities, curate_entity, resolve_entity, evidence, stage_embeddings, configuration, explain, entity_candidates, propose_entity, entity_proposals, entity_proposal, review_entity, entity_view, episodes, episode, propose_relationship, relationship_proposal, review_relationship, brief, consolidate, pin };
+pub const Action = enum { evaluation_results, put_evaluation_dataset, evaluation_dataset, evaluation_cases, start_evaluation, evaluation_run, evaluation_tasks, evaluation_verdict, lineage, fork_lineage, checkpoint_lineage, revert_lineage, supersession_candidates, propose_supersession, supersession_proposals, supersession_proposal, review_supersession, changes, create, inspect, configure, observe, assertions, recall, get, history, correct, forget, outcome, operation, advance, list, entities, curate_entity, resolve_entity, evidence, stage_embeddings, configuration, explain, entity_candidates, propose_entity, entity_proposals, entity_proposal, review_entity, entity_view, episodes, episode, propose_relationship, relationship_proposal, review_relationship, brief, consolidate, pin, access, usage, prepare_consolidation };
 pub const Configure = struct { expected_revision: u64, config: t.Config };
 pub const Page = struct { cursor: ?[]const u8 = null, limit: u16 = 64 };
 pub const EvaluationResultRequest = struct { cursor: ?[]const u8 = null, limit: u16 = 8 };
 
 pub fn mutates(action: Action) bool {
     return switch (action) {
-        .evaluation_results, .evaluation_dataset, .evaluation_cases, .evaluation_run, .evaluation_tasks, .lineage, .supersession_candidates, .supersession_proposals, .supersession_proposal, .changes, .inspect, .recall, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal, .brief, .consolidate => false,
+        .evaluation_results, .evaluation_dataset, .evaluation_cases, .evaluation_run, .evaluation_tasks, .lineage, .supersession_candidates, .supersession_proposals, .supersession_proposal, .changes, .inspect, .recall, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal, .brief, .consolidate, .usage => false,
         else => true,
     };
 }
@@ -35,8 +35,8 @@ pub fn mutates(action: Action) bool {
 /// small ingestion budget never locks out inspection, erasure or recovery.
 pub fn usesInputBudget(action: Action) bool {
     return switch (action) {
-        .put_evaluation_dataset, .evaluation_verdict, .propose_supersession, .review_supersession, .observe, .assertions, .correct, .outcome, .curate_entity, .stage_embeddings, .recall, .propose_entity, .review_entity, .propose_relationship, .review_relationship, .pin => true,
-        .evaluation_results, .evaluation_dataset, .evaluation_cases, .start_evaluation, .evaluation_run, .evaluation_tasks, .lineage, .fork_lineage, .checkpoint_lineage, .revert_lineage, .supersession_candidates, .supersession_proposals, .supersession_proposal, .changes, .create, .configure, .forget, .advance, .inspect, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal, .brief, .consolidate => false,
+        .put_evaluation_dataset, .evaluation_verdict, .propose_supersession, .review_supersession, .observe, .assertions, .correct, .outcome, .curate_entity, .stage_embeddings, .recall, .propose_entity, .review_entity, .propose_relationship, .review_relationship, .pin, .access, .prepare_consolidation => true,
+        .evaluation_results, .evaluation_dataset, .evaluation_cases, .start_evaluation, .evaluation_run, .evaluation_tasks, .lineage, .fork_lineage, .checkpoint_lineage, .revert_lineage, .supersession_candidates, .supersession_proposals, .supersession_proposal, .changes, .create, .configure, .forget, .advance, .inspect, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal, .brief, .consolidate, .usage => false,
     };
 }
 
@@ -76,15 +76,17 @@ pub fn Body(comptime action: Action) type {
         .review_entity => t.EntityVerdict,
         .entity_proposals => Page,
         .brief => t.BriefRequest,
-        .consolidate => t.ConsolidationRequest,
+        .consolidate, .prepare_consolidation => t.ConsolidationRequest,
         .pin => t.Pin,
+        .access => t.Access,
+        .inspect => Page,
         else => struct {},
     };
 }
 
 pub fn idRequired(action: Action) bool {
     return switch (action) {
-        .evaluation_results, .evaluation_dataset, .evaluation_cases, .evaluation_run, .evaluation_tasks, .evaluation_verdict, .supersession_candidates, .supersession_proposal, .review_supersession, .get, .history, .operation, .resolve_entity, .evidence, .configuration, .entity_candidates, .entity_proposal, .review_entity, .entity_view, .episode, .relationship_proposal, .review_relationship => true,
+        .evaluation_results, .evaluation_dataset, .evaluation_cases, .evaluation_run, .evaluation_tasks, .evaluation_verdict, .supersession_candidates, .supersession_proposal, .review_supersession, .get, .history, .operation, .resolve_entity, .evidence, .configuration, .entity_candidates, .entity_proposal, .review_entity, .entity_view, .episode, .relationship_proposal, .review_relationship, .usage => true,
         else => false,
     };
 }
@@ -143,6 +145,9 @@ pub fn description(action: Action) []const u8 {
         .explain => "Explain a memory id or body.resource through a bounded provenance graph with authorization, retention and known_at applied.",
         .brief => "Load the small session-start brief: pinned and highest-signal current memories within a token budget, with ids for deeper recall.",
         .consolidate => "Review memory health without changing it: duplicates, disputes, unordered or unverified claims, outcome-harmful claims, dangling links, orphan entities and pin candidates, each with a suggested reviewed action.",
+        .prepare_consolidation => "Create bounded supersession proposals from a consolidation page. A curator must review each proposal; beliefs are never changed by this operation.",
+        .access => "Record an explicit retrieval access event. Reuse the operation key to deduplicate retries; reads themselves remain side-effect free.",
+        .usage => "Read the caller's retrieval counts, last access, verification time and retained outcome utility for one memory.",
         .pin => "Pin or unpin a memory in the session-start brief of the selected branch. Pinning team-visible memory requires curator access.",
     };
 }

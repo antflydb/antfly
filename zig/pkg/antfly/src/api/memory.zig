@@ -35,6 +35,7 @@ pub fn route(method: []const u8, path: []const u8) !Route {
         if (id == null) return .{ .space = space, .action = .list };
         if (parts.next()) |suffix| {
             if (parts.next() != null) return error.MemoryRouteNotFound;
+            if (std.mem.eql(u8, suffix, "usage") and std.mem.eql(u8, method, "GET")) return .{ .space = space, .id = id.?, .action = .usage };
             if (std.mem.eql(u8, suffix, "explain") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .id = id.?, .action = .explain };
             if (std.mem.eql(u8, suffix, "supersession-candidates") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .id = id.?, .action = .supersession_candidates };
             if (!std.mem.eql(u8, suffix, "history") or !std.mem.eql(u8, method, "GET")) return error.MemoryRouteNotFound;
@@ -134,7 +135,7 @@ pub fn route(method: []const u8, path: []const u8) !Route {
     if (std.mem.eql(u8, resource, "entities") and std.mem.eql(u8, method, "GET")) return .{ .space = space, .action = .entities };
     if (std.mem.eql(u8, resource, "brief")) return .{ .space = space, .action = if (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "POST")) .brief else return error.MethodNotAllowed };
     if (!std.mem.eql(u8, method, "POST")) return error.MethodNotAllowed;
-    inline for (.{ .{ "explain", memory.Action.explain }, .{ "embeddings", memory.Action.stage_embeddings }, .{ "observations", memory.Action.observe }, .{ "assertions", memory.Action.assertions }, .{ "recall", memory.Action.recall }, .{ "corrections", memory.Action.correct }, .{ "forget", memory.Action.forget }, .{ "outcomes", memory.Action.outcome }, .{ "maintenance", memory.Action.advance }, .{ "consolidation", memory.Action.consolidate }, .{ "pins", memory.Action.pin } }) |entry| {
+    inline for (.{ .{ "explain", memory.Action.explain }, .{ "embeddings", memory.Action.stage_embeddings }, .{ "observations", memory.Action.observe }, .{ "assertions", memory.Action.assertions }, .{ "recall", memory.Action.recall }, .{ "corrections", memory.Action.correct }, .{ "forget", memory.Action.forget }, .{ "outcomes", memory.Action.outcome }, .{ "maintenance", memory.Action.advance }, .{ "consolidation", memory.Action.consolidate }, .{ "pins", memory.Action.pin }, .{ "accesses", memory.Action.access }, .{ "consolidation-proposals", memory.Action.prepare_consolidation } }) |entry| {
         if (std.mem.eql(u8, resource, entry[0])) return .{ .space = space, .action = entry[1] };
     }
     return error.MemoryRouteNotFound;
@@ -211,3 +212,12 @@ pub const Request = struct {
     body: std.json.Value = .{ .object = .empty },
     idempotency_key: []const u8 = "",
 };
+
+test "native memory routes expose access usage and reviewed consolidation" {
+    try std.testing.expectEqual(memory.Action.access, (try route("POST", "/memory/v1/spaces/team/accesses")).action);
+    const usage = try route("GET", "/memory/v1/spaces/team/memories/a/usage");
+    try std.testing.expectEqual(memory.Action.usage, usage.action);
+    try std.testing.expectEqualStrings("a", usage.id);
+    try std.testing.expectEqual(memory.Action.prepare_consolidation, (try route("POST", "/memory/v1/spaces/team/consolidation-proposals")).action);
+    try std.testing.expectError(error.MethodNotAllowed, route("GET", "/memory/v1/spaces/team/accesses"));
+}

@@ -219,7 +219,8 @@ func (s *MemorySpace) Remember(ctx context.Context, text string, opts ...MemoryC
 		id = hex.EncodeToString(digest[:])
 	}
 	return s.observe(ctx, oapi.MemoryObservationRequest{
-		Evidence: []oapi.MemoryEvidence{{Id: id, SourceId: call.sourceID, Text: text}},
+		Evidence:          []oapi.MemoryEvidence{{Id: id, SourceId: call.sourceID, Text: text}},
+		ScopedEvidenceIds: boolPtr(call.evidenceID == ""),
 	}, call)
 }
 
@@ -236,6 +237,47 @@ func (s *MemorySpace) Outcome(ctx context.Context, outcome oapi.MemoryOutcome, o
 		XAntflyDatabase: s.database, XAntflyNamespace: s.namespace, XAntflyMemoryBranch: s.branch,
 		IdempotencyKey: call.idempotencyKey,
 	}, outcome)
+	if err != nil {
+		return nil, err
+	}
+	return memoryResult(resp.HTTPResponse, resp.Body, resp.JSON200)
+}
+
+// Access records IDs consumed by an agent. Reuse the call key on retries.
+func (s *MemorySpace) Access(ctx context.Context, ids []string, opts ...MemoryCallOption) (*oapi.MemoryOperation, error) {
+	call, err := newMemoryCall(opts)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := s.api.RecordMemoryAccessWithResponse(ctx, s.space, &oapi.RecordMemoryAccessParams{
+		XAntflyDatabase: s.database, XAntflyNamespace: s.namespace, XAntflyMemoryBranch: s.branch, IdempotencyKey: call.idempotencyKey,
+	}, oapi.MemoryAccess{MemoryIds: ids})
+	if err != nil {
+		return nil, err
+	}
+	return memoryResult(resp.HTTPResponse, resp.Body, resp.JSON200)
+}
+
+// Usage reads the caller's access counts, timestamps and retained utility.
+func (s *MemorySpace) Usage(ctx context.Context, id string) (*oapi.MemoryUsage, error) {
+	resp, err := s.api.GetMemoryUsageWithResponse(ctx, s.space, id, &oapi.GetMemoryUsageParams{
+		XAntflyDatabase: s.database, XAntflyNamespace: s.namespace, XAntflyMemoryBranch: s.branch,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return memoryResult(resp.HTTPResponse, resp.Body, resp.JSON200)
+}
+
+// PrepareConsolidation creates proposals for the existing curator verdict flow.
+func (s *MemorySpace) PrepareConsolidation(ctx context.Context, req oapi.MemoryConsolidationRequest, opts ...MemoryCallOption) (*oapi.MemoryOperation, error) {
+	call, err := newMemoryCall(opts)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := s.api.PrepareMemoryConsolidationWithResponse(ctx, s.space, &oapi.PrepareMemoryConsolidationParams{
+		XAntflyDatabase: s.database, XAntflyNamespace: s.namespace, XAntflyMemoryBranch: s.branch, IdempotencyKey: call.idempotencyKey,
+	}, req)
 	if err != nil {
 		return nil, err
 	}
@@ -351,3 +393,5 @@ func nonEmpty(value string) *string {
 	}
 	return &value
 }
+
+func boolPtr(value bool) *bool { return &value }

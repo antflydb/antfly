@@ -203,12 +203,16 @@ def main():
             "MemorySupersessionCandidateRequest",
         ),
         ("MemoryEvaluationPolicyInput", "recall", "MemoryRecallRequest"),
+        ("MemoryEvaluationPolicyInput", "brief", "MemoryBriefRequest"),
         ("MemoryStoredEvidence", "evidence", "MemoryEvidence"),
         ("MemoryStoredEvidence", "materialization", "MemoryIntakeMaterialization"),
         ("MemoryResolvedEntity", "entity", "MemoryEntity"),
         ("MemoryResolvedEntity", "resource_ref", "ResourceReference"),
         ("MemoryBriefItem", "utility", "MemoryUtility"),
         ("MemoryConsolidation", "stats", "MemorySpaceStats"),
+        ("MemoryInspection", "statistics", "MemoryStatistics"),
+        ("MemoryStatistics", "stats", "MemorySpaceStats"),
+        ("MemoryUsage", "utility", "MemoryUtility"),
     ):
         schemas[owner]["properties"][field] = ref(target)
     for owner, field, target in (
@@ -308,6 +312,7 @@ def main():
             "listMemoryEpisodes",
             "getMemoryEpisode",
             "getMemoryBrief",
+            "getMemorySpace",
         ):
             fields = {
                 "cursor": {"type": "string"},
@@ -429,6 +434,7 @@ def main():
         mutation=True,
     )
     operation(prefix + "/{space}", "get", "getMemorySpace", response="MemoryInspection")
+    operation(prefix + "/{space}/memories/{id}/usage", "get", "getMemoryUsage", response="MemoryUsage")
     operation(
         prefix + "/{space}",
         "patch",
@@ -444,6 +450,8 @@ def main():
         ("forget", "forgetMemory", "MemoryForgetRequest"),
         ("outcomes", "recordMemoryOutcome", "MemoryOutcome"),
         ("pins", "pinMemory", "MemoryPin"),
+        ("accesses", "recordMemoryAccess", "MemoryAccess"),
+        ("consolidation-proposals", "prepareMemoryConsolidation", "MemoryConsolidationRequest"),
     ):
         operation(prefix + "/{space}/" + suffix, "post", name, request, mutation=True)
     operation(

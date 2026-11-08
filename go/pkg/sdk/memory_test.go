@@ -272,3 +272,22 @@ func TestMemoryRememberExplicitKeyRetryHasIdenticalBody(t *testing.T) {
 		t.Fatalf("retry changed the immutable evidence: %s vs %s", first, retry)
 	}
 }
+
+func TestMemoryUsageAndReviewProposalTransport(t *testing.T) {
+	server, requests := newMemoryTestServer(t, http.StatusOK, memoryOperationJSON)
+	space := newMemoryTestClient(t, server.URL).MemorySpace("agent", WithMemoryBranch("feature"))
+	ctx := context.Background()
+	if _, err := space.Access(ctx, []string{"a"}, WithIdempotencyKey("retrieval")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := space.PrepareConsolidation(ctx, oapi.MemoryConsolidationRequest{}, WithIdempotencyKey("prepare")); err != nil {
+		t.Fatal(err)
+	}
+	seen := requests()
+	if seen[0].path != "/memory/v1/spaces/agent/accesses" || seen[1].path != "/memory/v1/spaces/agent/consolidation-proposals" {
+		t.Fatalf("unexpected routes: %+v", seen)
+	}
+	if seen[0].header.Get("Idempotency-Key") != "retrieval" || seen[1].header.Get("X-Antfly-Memory-Branch") != "feature" {
+		t.Fatalf("missing keys or scope: %+v", seen)
+	}
+}

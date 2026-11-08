@@ -213,3 +213,31 @@ fn remember_explicit_key_retries_send_identical_evidence() {
     assert_eq!(requests[0].header("idempotency-key"), Some("retry"));
     assert_eq!(requests[1].header("idempotency-key"), Some("retry"));
 }
+
+#[test]
+fn access_and_review_proposals_reuse_authenticated_scope_and_operation_keys() {
+    let (url, seen) = serve(200, OPERATION);
+    let client = antfly_sdk::new_client(&url, reqwest::Client::new());
+    let space = client.memory_space("agent").branch("feature");
+    block_on(async {
+        space
+            .access(vec!["a".into()], Some("retrieval"))
+            .await
+            .unwrap();
+        let request: types::MemoryConsolidationRequest =
+            serde_json::from_value(serde_json::json!({"cursor":"next"})).unwrap();
+        space
+            .prepare_consolidation(&request, Some("prepare"))
+            .await
+            .unwrap();
+    });
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].path, "/memory/v1/spaces/agent/accesses");
+    assert_eq!(seen[0].header("idempotency-key"), Some("retrieval"));
+    assert_eq!(
+        seen[1].path,
+        "/memory/v1/spaces/agent/consolidation-proposals"
+    );
+    assert_eq!(seen[1].header("x-antfly-memory-branch"), Some("feature"));
+    assert_eq!(seen[1].body["cursor"], "next");
+}

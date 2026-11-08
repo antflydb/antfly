@@ -1,5 +1,5 @@
-import { encodeGraphParameter } from "./graph-wire.js";
 import { AntflyHTTPError, AntflyResponseError } from "./errors.js";
+import { encodeGraphParameter } from "./graph-wire.js";
 /**
  * Antfly SDK Client
  * Provides a high-level interface for interacting with the Antfly API
@@ -745,9 +745,13 @@ export class AntflyClient {
         body: config,
         params: { path: { space }, header: memoryMutationHeaders(options) },
       }),
-    inspect: (space: string, options?: MemoryScopeOptions) =>
+    inspect: (space: string, options?: MemoryScopeOptions & { cursor?: string; limit?: number }) =>
       this.memoryApi.GET("/memory/v1/spaces/{space}", {
-        params: { path: { space }, header: memoryScopeHeaders(options) },
+        params: {
+          path: { space },
+          query: { cursor: options?.cursor, limit: options?.limit },
+          header: memoryScopeHeaders(options),
+        },
       }),
     /** Replace the space configuration at `expected_revision`. */
     configure: (
@@ -796,6 +800,7 @@ export class AntflyClient {
         space,
         {
           ...observation,
+          ...(id === undefined ? { scoped_evidence_ids: true } : {}),
           evidence: [
             {
               ...evidence,
@@ -818,7 +823,7 @@ export class AntflyClient {
           idempotencyKey: headers["Idempotency-Key"],
         }
       );
-      return { ...result, evidenceId };
+      return { ...result, evidenceId: result.data?.evidence_ids?.[0] ?? evidenceId };
     },
     assertions: (
       space: string,
@@ -857,6 +862,26 @@ export class AntflyClient {
       this.memoryApi.POST("/memory/v1/spaces/{space}/consolidation", {
         body,
         params: { path: { space }, header: memoryScopeHeaders(options) },
+      }),
+    /** Record memory IDs actually consumed; reuse idempotencyKey on retries. */
+    access: (space: string, memoryIds: string[], options?: string | MemoryCallOptions) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/accesses", {
+        body: { memory_ids: memoryIds },
+        params: { path: { space }, header: memoryMutationHeaders(options) },
+      }),
+    usage: (space: string, id: string, options?: MemoryScopeOptions) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/memories/{id}/usage", {
+        params: { path: { space, id }, header: memoryScopeHeaders(options) },
+      }),
+    /** Create review proposals, leaving acceptance to the curator verdict flow. */
+    prepareConsolidation: (
+      space: string,
+      body: MemorySchemas["MemoryConsolidationRequest"] = {},
+      options?: string | MemoryCallOptions
+    ) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/consolidation-proposals", {
+        body,
+        params: { path: { space }, header: memoryMutationHeaders(options) },
       }),
     /** Prioritize a memory in the brief within its item and byte limits. */
     pin: (space: string, id: string, options?: MemoryCallOptions & { reason?: string }) =>

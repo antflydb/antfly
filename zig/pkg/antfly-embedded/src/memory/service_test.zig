@@ -81,15 +81,16 @@ const Store = struct {
         while (it.next()) |entry| {
             if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
             if (cursor) |after| if (!std.mem.lessThan(u8, after, entry.key_ptr.*)) continue;
-            try rows.append(a, .{ .key = try a.dupe(u8, entry.key_ptr.*), .json = try a.dupe(u8, entry.value_ptr.*) });
+            var position: usize = 0;
+            while (position < rows.items.len and std.mem.lessThan(u8, rows.items[position].key, entry.key_ptr.*)) : (position += 1) {}
+            if (position > limit) continue;
+            try rows.insert(a, position, .{ .key = entry.key_ptr.*, .json = entry.value_ptr.* });
+            if (rows.items.len > @as(usize, limit) + 1) _ = rows.pop();
         }
-        std.mem.sort(m.Row, rows.items, {}, struct {
-            fn less(_: void, left: m.Row, right: m.Row) bool {
-                return std.mem.lessThan(u8, left.key, right.key);
-            }
-        }.less);
         const count = @min(rows.items.len, limit);
-        return .{ .rows = rows.items[0..count], .next = if (rows.items.len > count) rows.items[count - 1].key else null };
+        const next = if (rows.items.len > count) try a.dupe(u8, rows.items[count - 1].key) else null;
+        for (rows.items[0..count]) |*row| row.* = .{ .key = try a.dupe(u8, row.key), .json = try a.dupe(u8, row.json) };
+        return .{ .rows = rows.items[0..count], .next = next };
     }
     fn commit(ptr: *anyopaque, _: A, expected: ?m.Row, changes: []const m.Change) !void {
         const self: *Store = @ptrCast(@alignCast(ptr));
@@ -8370,4 +8371,382 @@ test "review first agent write to a legacy space replays after initializing its 
     const revision = store.revision;
     try std.testing.expectEqualStrings(result, try svc.execute(a, .observe, "", source, "agent:legacy-first-write"));
     try std.testing.expectEqual(revision, store.revision);
+}
+
+// SECOND REVIEW REPRODUCTIONS: intentionally fail on PR head d4fc4775ee.
+test "second review reverification should reset consolidation staleness" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", helm, "claim", 3);
+    var svc = store.service("alice", true, 1000);
+    const old = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, "helm", "{}", ""), .{});
+    _ = try svc.execute(a, .correct, "", try std.json.Stringify.valueAlloc(a, m.types.Correction{ .id = "helm", .expected_revision = old.revision, .lifecycle = .active, .stability = .settled, .reason = "Reverified against source", .evidence = &.{.{ .id = "e1" }} }, .{}), "verify");
+    svc.context.now_ms = 1001;
+    const report = try std.json.parseFromSliceLeaky(m.types.Consolidation, a, try svc.execute(a, .consolidate, "", "{\"stale_after_ms\":100}", ""), .{});
+    for (report.findings) |finding| try std.testing.expect(finding.kind != .stale);
+}
+
+test "second review consolidation should inspect alternative support dependencies" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    const svc = store.service("alice", true, 10);
+    const parent: m.types.Assertion = .{ .id = "parent", .subject = "p", .predicate = "fact", .value = "p", .statement = "Parent fact", .evidence = &.{.{ .id = "e1" }} };
+    const child: m.types.Assertion = .{ .id = "child", .subject = "c", .predicate = "fact", .value = "c", .statement = "Child fact", .evidence = &.{.{ .id = "e1" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "e1" }}, .depends_on = &.{"parent"} }} };
+    _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{ parent, child } }, .{}), "claims");
+    _ = try svc.execute(a, .forget, "", "{\"assertion_ids\":[\"parent\"]}", "forget");
+    _ = try svc.execute(a, .get, "child", "{}", "");
+    const report = try std.json.parseFromSliceLeaky(m.types.Consolidation, a, try svc.execute(a, .consolidate, "", "{}", ""), .{});
+    for (report.findings) |finding| if (finding.kind == .dangling_link and finding.target_id != null and std.mem.eql(u8, finding.target_id.?, "parent")) return;
+    return error.TestExpectedDanglingAlternative;
+}
+
+test "second review utility feedback should fence in-progress policy evaluation" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", layered_claims, "claims", 3);
+    const svc = store.service("alice", true, 10);
+    const case: m.types.evaluation.Case = .{ .id = "query", .task = .retrieval, .input = .null, .policy = .{ .recall = .{ .utility_weight = 1, .token_budget = 8192 } }, .relevant_ids = &.{"z-ticket"} };
+    _ = try svc.execute(a, .put_evaluation_dataset, "", try std.json.Stringify.valueAlloc(a, m.types.evaluation.DatasetRequest{ .id = "labels", .expected_revision = try SupersessionFixture.revision(svc, a), .cases = &.{case} }, .{}), "dataset");
+    const start = try EvaluationFixture.start(svc, a, .policy, null);
+    _ = try svc.execute(a, .outcome, "", "{\"id\":\"feedback\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[\"z-ticket\"]}", "outcome");
+    _ = try svc.execute(a, .advance, start.id, "{}", "advance");
+    const status = try std.json.parseFromSliceLeaky(m.types.evaluation.Status, a, try svc.execute(a, .evaluation_run, "run", "{}", ""), .{});
+    try std.testing.expectEqual(@as(@FieldType(m.types.evaluation.Run, "phase"), .cancelled), status.run.phase);
+}
+
+test "second review SDK deterministic ids should respect per-principal keys" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const alice = store.service("alice", true, 1);
+    _ = try alice.execute(a, .create, "", "{}", "create");
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("antfly-memory-remember:retry", &digest, .{});
+    const id = std.fmt.bytesToHex(digest, .lower);
+    const first: m.types.ObservationRequest = .{ .scoped_evidence_ids = true, .evidence = &.{.{ .id = &id, .text = "Alice note" }} };
+    const second: m.types.ObservationRequest = .{ .scoped_evidence_ids = true, .evidence = &.{.{ .id = &id, .text = "Bob note" }} };
+    _ = try alice.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, first, .{}), "retry");
+    _ = try store.service("bob", false, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, second, .{}), "retry");
+}
+
+test "second review explicit entity graph recall should apply utility weighting" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    const svc = store.service("alice", true, 10);
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"graph-note\",\"text\":\"Graph notes\"}],\"entities\":[{\"id\":\"entity\",\"name\":\"Entity\",\"type\":\"entity\",\"evidence\":[{\"id\":\"e1\"}]}],\"assertions\":[{\"id\":\"a\",\"subject\":\"entity\",\"predicate\":\"fact\",\"value\":\"a\",\"statement\":\"First fact\",\"evidence\":[{\"id\":\"e1\"}]},{\"id\":\"b\",\"subject\":\"entity\",\"predicate\":\"fact\",\"value\":\"b\",\"statement\":\"Second fact\",\"evidence\":[{\"id\":\"e1\"}]}]}", "observe");
+    const body = "{\"graph\":{\"entity_seeds\":[\"entity\"],\"include_episodes\":false},\"utility_weight\":1,\"token_budget\":8192}";
+    const before = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try svc.execute(a, .recall, "", body, ""), .{});
+    _ = try svc.execute(a, .outcome, "", "{\"id\":\"feedback\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[\"b\"]}", "outcome");
+    const after = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try svc.execute(a, .recall, "", body, ""), .{});
+    var prior_score: ?f64 = null;
+    var next_score: ?f64 = null;
+    for (before.items) |hit| if (std.mem.eql(u8, hit.memory.assertion.id, "b")) {
+        prior_score = hit.score;
+    };
+    for (after.items) |hit| if (std.mem.eql(u8, hit.memory.assertion.id, "b")) {
+        next_score = hit.score;
+    };
+    try std.testing.expect(prior_score != null and next_score != null);
+    try std.testing.expect(next_score.? > prior_score.?);
+}
+
+test "second review measure brief feedback detail hydration amplification" {
+    var baseline: usize = 0;
+    for ([_]usize{ 0, 16 * 1024 }) |detail_size| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try setup(&store);
+        const svc = store.service("alice", true, 10);
+        const claims = try a.alloc(m.types.Assertion, 16);
+        for (claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = "service", .predicate = "fact", .value = try std.fmt.allocPrint(a, "value-{d}", .{i}), .statement = "A small useful fact", .evidence = &.{.{ .id = "e1" }} };
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = claims }, .{}), "claims");
+        const detail = try a.alloc(u8, detail_size);
+        @memset(detail, 'x');
+        for (claims, 0..) |claim, i| for (0..16) |j| {
+            const id = try std.fmt.allocPrint(a, "outcome-{d}-{d}", .{ i, j });
+            const outcome: m.types.Outcome = .{ .id = id, .task_id = id, .success = true, .used_memory_ids = &.{claim.id}, .detail = detail };
+            _ = try svc.execute(a, .outcome, "", try std.json.Stringify.valueAlloc(a, outcome, .{}), id);
+        };
+        const storage = try std.testing.allocator.alloc(u8, 64 * 1024 * 1024);
+        defer std.testing.allocator.free(storage);
+        var request = std.heap.FixedBufferAllocator.init(storage);
+        const before_reads = store.reads;
+        const brief = try svc.execute(request.allocator(), .brief, "", "{}", "");
+        std.debug.print("SECOND REVIEW BRIEF claims=16 outcomes=256 detail_bytes={d} response_bytes={d} allocator_bytes={d} backend_gets={d}\n", .{ detail_size * 256, brief.len, request.end_index, store.reads - before_reads });
+        try std.testing.expect(brief.len <= 1024);
+        if (detail_size == 0) baseline = request.end_index else try std.testing.expectEqual(baseline, request.end_index);
+    }
+}
+
+test "completion usage is durable idempotent private and does not mutate reads" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", helm, "claim", 3);
+    const svc = store.service("alice", true, 500);
+    const body = "{\"memory_ids\":[\"helm\",\"helm\"]}";
+    _ = try svc.execute(a, .access, "", body, "retrieval-1");
+    _ = try svc.execute(a, .access, "", body, "retrieval-1");
+    const revision = store.revision;
+    const usage = try std.json.parseFromSliceLeaky(m.types.Usage, a, try svc.execute(a, .usage, "helm", "{}", ""), .{});
+    try std.testing.expectEqual(@as(u64, 1), usage.recalls);
+    try std.testing.expectEqual(@as(?i64, 500), usage.last_recalled_at);
+    _ = try svc.execute(a, .recall, "", "{}", "");
+    try std.testing.expectEqual(revision, store.revision);
+    try std.testing.expectError(error.Forbidden, store.service("bob", false, 500).execute(a, .usage, "helm", "{}", ""));
+    _ = try svc.execute(a, .forget, "", "{\"assertion_ids\":[\"helm\"]}", "forget");
+    try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .usage, "helm", "{}", ""));
+}
+
+test "completion consolidation pages all findings and creates reviewed proposals" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    var svc = store.service("alice", true, 1000);
+    const claims = "{\"assertions\":[{\"id\":\"z\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"same\",\"statement\":\"Same fact\",\"stability\":\"provisional\",\"evidence\":[{\"id\":\"e1\"}]},{\"id\":\"a\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"same\",\"statement\":\"Same fact\",\"stability\":\"provisional\",\"evidence\":[{\"id\":\"e1\"}]}]}";
+    const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .assertions, "", claims, "claims"), .{});
+    try std.testing.expect(receipt.duplicate_ids.len > 0);
+    svc.context.now_ms += 1;
+    var cursor: ?[]const u8 = null;
+    var stale: usize = 0;
+    var unverified: usize = 0;
+    var duplicates: usize = 0;
+    var memories: u32 = 0;
+    var pages: usize = 0;
+    while (true) {
+        const request: m.types.ConsolidationRequest = .{ .limit = 1, .stale_after_ms = 1, .cursor = cursor };
+        const page = try std.json.parseFromSliceLeaky(m.types.Consolidation, a, try svc.execute(a, .consolidate, "", try std.json.Stringify.valueAlloc(a, request, .{}), ""), .{});
+        for (page.findings) |finding| switch (finding.kind) {
+            .stale => stale += 1,
+            .unverified => unverified += 1,
+            .duplicate => duplicates += 1,
+            else => {},
+        };
+        memories += page.stats.memories;
+        pages += 1;
+        try std.testing.expect(pages < 20);
+        if (page.complete) break;
+        cursor = page.next_cursor orelse return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(usize, 2), stale);
+    try std.testing.expectEqual(@as(usize, 2), unverified);
+    try std.testing.expectEqual(@as(usize, 1), duplicates);
+    try std.testing.expectEqual(@as(u32, 2), memories);
+    const operation = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .prepare_consolidation, "", "{}", "prepare"), .{});
+    try std.testing.expectEqual(@as(usize, 1), operation.proposal_ids.len);
+    const proposal_id = operation.proposal_ids[0];
+    const verdict: m.types.SupersessionVerdict = .{ .expected_revision = try SupersessionFixture.revision(svc, a), .verdict = .restates };
+    _ = try svc.execute(a, .review_supersession, proposal_id, try std.json.Stringify.valueAlloc(a, verdict, .{}), "review");
+    const proposal = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalDetail, a, try svc.execute(a, .supersession_proposal, proposal_id, "{}", ""), .{});
+    try std.testing.expectEqual(@as(?m.types.SupersessionRelation, .restates), proposal.proposal.verdict);
+}
+
+test "completion inspection statistics continue without repeating records" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", layered_claims, "claims", 3);
+    const svc = store.service("alice", true, 10);
+    var cursor: ?[]const u8 = null;
+    var total: u32 = 0;
+    var pages: usize = 0;
+    while (true) {
+        const body = try std.json.Stringify.valueAlloc(a, .{ .limit = 1, .cursor = cursor }, .{});
+        const info = try std.json.parseFromSliceLeaky(m.types.Inspection, a, try svc.execute(a, .inspect, "", body, ""), .{});
+        total += info.statistics.stats.memories;
+        pages += 1;
+        try std.testing.expect(pages < 10);
+        if (info.statistics.complete) break;
+        cursor = info.statistics.next_cursor orelse return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(u32, 4), total);
+}
+
+test "completion native evaluation supports brief and zero memory policies" {
+    for ([_]m.types.evaluation.RetrievalPolicy{ .brief, .none }) |policy| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try setup(&store);
+        try discard(&store, .assertions, "", helm, "claim", 3);
+        const svc = store.service("alice", true, 500);
+        const case: m.types.evaluation.Case = .{ .id = "query", .task = .retrieval, .input = .null, .policy = .{ .retrieval = policy }, .relevant_ids = &.{"helm"} };
+        _ = try svc.execute(a, .put_evaluation_dataset, "", try std.json.Stringify.valueAlloc(a, m.types.evaluation.DatasetRequest{ .id = "labels", .expected_revision = try SupersessionFixture.revision(svc, a), .cases = &.{case} }, .{}), "dataset");
+        const start = try EvaluationFixture.start(svc, a, .policy, null);
+        for (0..4) |i| _ = try svc.execute(a, .advance, start.id, "{}", try std.fmt.allocPrint(a, "advance-{d}", .{i}));
+        const status = try std.json.parseFromSliceLeaky(m.types.evaluation.Status, a, try svc.execute(a, .evaluation_run, "run", "{}", ""), .{});
+        try std.testing.expectEqual(@as(u64, 1), status.retrieval.counts.cases);
+        if (policy == .none) {
+            try std.testing.expectEqual(@as(u64, 0), status.retrieval.counts.tokens);
+            try std.testing.expectEqual(@as(u64, 1), status.retrieval.counts.false_negative);
+        } else {
+            try std.testing.expect(status.retrieval.counts.tokens > 0);
+            try std.testing.expectEqual(@as(u64, 1), status.retrieval.counts.true_positive);
+        }
+    }
+}
+
+// Seed primary rows directly so this regression measures review paging, rather
+// than thousands of independent admission/receipt transactions.
+test "completion consolidation continues beyond the former 4096 claim ceiling" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    for (0..4100) |i| {
+        const id = try std.fmt.allocPrint(a, "claim-{d}", .{i});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, id, .{}), &digest, .{});
+        const path = try std.fmt.allocPrint(a, "assertion/{s}", .{std.fmt.bytesToHex(digest, .lower)});
+        const record: m.types.StoredAssertion = .{ .assertion = .{ .id = id, .subject = id, .predicate = "p", .value = "v", .statement = "A current fact", .evidence = &.{.{ .id = "e1" }} }, .owner = "alice", .recorded_from = 3, .revision = 3, .config_generation = 1 };
+        try store.values.put(a, path, try std.json.Stringify.valueAlloc(a, record, .{}));
+    }
+    const svc = store.service("alice", true, 10);
+    const twins = try a.alloc(m.types.Assertion, 2);
+    for (twins, 0..) |*claim, i| claim.* = .{ .id = if (i == 0) "duplicate-a" else "duplicate-z", .subject = "s", .predicate = "p", .value = "same", .statement = "Same fact", .evidence = &.{.{ .id = "e1" }} };
+    _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = twins }, .{}), "twins");
+    var cursor: ?[]const u8 = null;
+    var total: u32 = 0;
+    var pages: usize = 0;
+    var duplicates: usize = 0;
+    while (true) {
+        // Each call owns an arena, as the real request path does.
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const request: m.types.ConsolidationRequest = .{ .limit = 256, .cursor = cursor };
+        const page = try std.json.parseFromSliceLeaky(m.types.Consolidation, scratch, try svc.execute(scratch, .consolidate, "", try std.json.Stringify.valueAlloc(scratch, request, .{}), ""), .{});
+        total += page.stats.memories;
+        for (page.findings) |finding| if (finding.kind == .duplicate) {
+            duplicates += 1;
+        };
+        pages += 1;
+        try std.testing.expect(pages < 100);
+        try std.testing.expect(page.scanned <= 128);
+        if (page.complete) break;
+        cursor = try a.dupe(u8, page.next_cursor orelse return error.TestUnexpectedResult);
+    }
+    try std.testing.expectEqual(@as(u32, 4102), total);
+    try std.testing.expect(pages > 1);
+    try std.testing.expectEqual(@as(usize, 1), duplicates);
+}
+
+test "completion legacy compact feedback backfills through bounded maintenance" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", helm, "claim", 3);
+    const svc = store.service("alice", true, 500);
+    _ = try svc.execute(a, .outcome, "", "{\"id\":\"out\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[\"helm\"]}", "outcome");
+    var paths: std.ArrayList([]const u8) = .empty;
+    var it = store.values.keyIterator();
+    while (it.next()) |path| if (std.mem.startsWith(u8, path.*, "outcome-signal/") or std.mem.startsWith(u8, path.*, "restatement/")) {
+        try paths.append(a, path.*);
+    };
+    for (paths.items) |path| _ = store.values.remove(path);
+    var state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    state.restates_ready = false;
+    state.restates_cursor = null;
+    try store.values.put(a, "control", try std.json.Stringify.valueAlloc(a, state, .{}));
+    const before = try std.json.parseFromSliceLeaky(m.types.Usage, a, try svc.execute(a, .usage, "helm", "{}", ""), .{});
+    try std.testing.expect(!before.utility.complete);
+    try std.testing.expectError(error.MemoryCapabilityUnavailable, svc.execute(a, .consolidate, "", "{}", ""));
+    try std.testing.expect(try @import("scheduling.zig").retentionDue(svc.backend, a, 500, state));
+    for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "backfill-{d}", .{i}));
+    const after = try std.json.parseFromSliceLeaky(m.types.Usage, a, try svc.execute(a, .usage, "helm", "{}", ""), .{});
+    try std.testing.expect(after.utility.complete);
+    try std.testing.expectEqual(@as(u32, 1), after.utility.successes);
+    _ = try svc.execute(a, .consolidate, "", "{}", "");
+}
+
+test "completion writes signal lexical near duplicates without changing beliefs" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    const svc = store.service("alice", true, 10);
+    const claims: []const m.types.Assertion = &.{
+        .{ .id = "a", .subject = "s", .predicate = "p", .value = "Helm deploy", .statement = "Production deployments use Helm charts with reviewed releases", .evidence = &.{.{ .id = "e1" }} },
+        .{ .id = "b", .subject = "s", .predicate = "p", .value = "Helm charts", .statement = "Production deployments use Helm charts with reviewed releases today", .evidence = &.{.{ .id = "e1" }} },
+    };
+    const operation = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = claims }, .{}), "claims"), .{});
+    try std.testing.expect(operation.near_duplicate_ids.len > 0);
+    for (claims) |claim| {
+        const record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, claim.id, "{}", ""), .{});
+        try std.testing.expectEqual(m.types.Lifecycle.active, record.lifecycle);
+    }
+}
+
+test "completion reviewed consolidation replacement resolves its disputed pair" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    const svc = store.service("alice", true, 10);
+    const claims: []const m.types.Assertion = &.{
+        .{ .id = "a", .subject = "production", .predicate = "deploys_with", .value = "Helm", .statement = "Use Helm", .evidence = &.{.{ .id = "e1" }} },
+        .{ .id = "b", .subject = "production", .predicate = "deploys_with", .value = "Terraform", .statement = "Use Terraform", .evidence = &.{.{ .id = "e1" }} },
+    };
+    _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = claims }, .{}), "claims");
+    const operation = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .prepare_consolidation, "", "{}", "prepare"), .{});
+    try std.testing.expectEqual(@as(usize, 1), operation.proposal_ids.len);
+    const proposal = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalDetail, a, try svc.execute(a, .supersession_proposal, operation.proposal_ids[0], "{}", ""), .{});
+    try std.testing.expectEqual(m.types.Lifecycle.disputed, proposal.incoming.memory.lifecycle);
+    const verdict: m.types.SupersessionVerdict = .{ .expected_revision = try SupersessionFixture.revision(svc, a), .verdict = .supersedes, .reason = "Verified the replacement" };
+    _ = try svc.execute(a, .review_supersession, operation.proposal_ids[0], try std.json.Stringify.valueAlloc(a, verdict, .{}), "review");
+    const winner = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, proposal.proposal.incoming.id, "{}", ""), .{});
+    const loser = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, proposal.proposal.previous.id, "{}", ""), .{});
+    try std.testing.expectEqual(m.types.Lifecycle.active, winner.lifecycle);
+    try std.testing.expectEqual(@as(usize, 0), winner.conflicts_with.len);
+    try std.testing.expectEqual(m.types.Lifecycle.superseded, loser.lifecycle);
+}
+
+test "completion consolidation covers all entities and ignores untyped literal references" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    const svc = store.service("alice", true, 10);
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"entity-note\",\"text\":\"Orphan entity\"}],\"entities\":[{\"id\":\"orphan\",\"name\":\"Orphan\",\"evidence\":[{\"id\":\"e1\"}]}],\"assertions\":[{\"id\":\"literal\",\"subject\":\"s\",\"predicate\":\"label\",\"value\":\"orphan\",\"statement\":\"The label is orphan\",\"evidence\":[{\"id\":\"e1\"}]}]}", "observe");
+    for (0..1025) |i| {
+        const id = try std.fmt.allocPrint(a, "entity-{d}", .{i});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, id, .{}), &digest, .{});
+        const path = try std.fmt.allocPrint(a, "entity/{s}", .{std.fmt.bytesToHex(digest, .lower)});
+        const record: m.types.EntityRecord = .{ .entity = .{ .id = id, .name = id, .evidence = &.{.{ .id = "e1" }} }, .owner = "alice", .revision = 3 };
+        try store.values.put(a, path, try std.json.Stringify.valueAlloc(a, record, .{}));
+    }
+    var cursor: ?[]const u8 = null;
+    var total: usize = 0;
+    var orphan_found = false;
+    var pages: usize = 0;
+    while (true) {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const page = try std.json.parseFromSliceLeaky(m.types.Consolidation, scratch, try svc.execute(scratch, .consolidate, "", try std.json.Stringify.valueAlloc(scratch, m.types.ConsolidationRequest{ .limit = 256, .cursor = cursor }, .{}), ""), .{});
+        for (page.findings) |finding| if (finding.kind == .orphan_entity) {
+            total += 1;
+            if (std.mem.eql(u8, finding.entity_id.?, "orphan")) orphan_found = true;
+        };
+        pages += 1;
+        try std.testing.expect(pages < 30);
+        if (page.complete) break;
+        cursor = try a.dupe(u8, page.next_cursor orelse return error.TestUnexpectedResult);
+    }
+    try std.testing.expectEqual(@as(usize, 1026), total);
+    try std.testing.expect(orphan_found);
 }

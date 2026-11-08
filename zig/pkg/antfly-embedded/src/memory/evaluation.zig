@@ -109,6 +109,7 @@ pub const Run = struct {
     visibility: t.Visibility,
     mode: @FieldType(Start, "mode"),
     knowledge_revision: u64,
+    feedback_revision: u64 = 0,
     config_generation: u64,
     config_fingerprint: []const u8,
     source_config_fingerprint: []const u8,
@@ -129,7 +130,28 @@ pub const Status = struct { run: Run, identity: Report, relationship: Report, su
 pub const JudgeTask = struct { case_id: []const u8, case_revision: u64, input_fingerprint: []const u8, input: JudgeInput };
 pub const TaskPage = struct { items: []const JudgeTask, next_cursor: ?[]const u8, complete: bool, run_fingerprint: []const u8 };
 pub const CasePage = struct { items: []const StoredCase, next_cursor: ?[]const u8, complete: bool, revision: u64 };
-pub const PolicyInput = struct { seed: []const u8 = "", target: []const u8 = "", entity_candidates: t.EntityCandidateRequest = .{}, supersession_candidates: t.SupersessionCandidateRequest = .{}, recall: t.Recall = .{} };
+pub const RetrievalPolicy = enum { recall, brief, none };
+pub const PolicyInput = struct {
+    retrieval: RetrievalPolicy = .recall,
+    brief: t.BriefRequest = .{},
+    seed: []const u8 = "",
+    target: []const u8 = "",
+    entity_candidates: t.EntityCandidateRequest = .{},
+    supersession_candidates: t.SupersessionCandidateRequest = .{},
+    recall: t.Recall = .{},
+
+    pub fn jsonStringify(self: PolicyInput, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(PolicyInput).@"struct".field_names) |field| {
+            const skip = if (comptime std.mem.eql(u8, field, "retrieval")) self.retrieval == .recall else if (comptime std.mem.eql(u8, field, "brief")) self.retrieval != .brief else false;
+            if (!skip) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+};
 
 /// Encode a struct, omitting the named optional-or-zero fields when unset, so
 /// additive metrics never change bytes of results recorded before them.

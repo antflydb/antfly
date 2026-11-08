@@ -175,6 +175,7 @@ impl<'a> MemorySpace<'a> {
         );
         let request: types::MemoryObservationRequest = serde_json::from_value(serde_json::json!({
             "evidence": [{"id": evidence_id, "text": text}],
+            "scoped_evidence_ids": true,
         }))
         .map_err(|error| Error::InvalidRequest(error.to_string()))?;
         self.observe(&request, Some(&key)).await
@@ -191,6 +192,49 @@ impl<'a> MemorySpace<'a> {
         Ok(self
             .client
             .record_memory_outcome(&self.space, &key, db, branch, ns, outcome)
+            .await?
+            .into_inner())
+    }
+
+    /// Records memory IDs consumed by an agent; reuse the operation key on retries.
+    pub async fn access(
+        &self,
+        memory_ids: Vec<String>,
+        key: Option<&str>,
+    ) -> MemoryResult<types::MemoryOperation> {
+        let key: types::RecordMemoryAccessIdempotencyKey = idempotency_key(key)?;
+        let request: types::MemoryAccess =
+            serde_json::from_value(serde_json::json!({"memory_ids": memory_ids}))
+                .map_err(|error| Error::InvalidRequest(error.to_string()))?;
+        let (db, branch, ns) = self.scope();
+        Ok(self
+            .client
+            .record_memory_access(&self.space, &key, db, branch, ns, &request)
+            .await?
+            .into_inner())
+    }
+
+    /// Reads the caller's access counts, timestamps and retained utility.
+    pub async fn usage(&self, id: &str) -> MemoryResult<types::MemoryUsage> {
+        let (db, branch, ns) = self.scope();
+        Ok(self
+            .client
+            .get_memory_usage(&self.space, id, db, branch, ns)
+            .await?
+            .into_inner())
+    }
+
+    /// Creates proposals for the existing curator verdict flow.
+    pub async fn prepare_consolidation(
+        &self,
+        request: &types::MemoryConsolidationRequest,
+        key: Option<&str>,
+    ) -> MemoryResult<types::MemoryOperation> {
+        let key: types::PrepareMemoryConsolidationIdempotencyKey = idempotency_key(key)?;
+        let (db, branch, ns) = self.scope();
+        Ok(self
+            .client
+            .prepare_memory_consolidation(&self.space, &key, db, branch, ns, request)
             .await?
             .into_inner())
     }

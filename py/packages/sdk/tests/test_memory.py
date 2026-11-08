@@ -299,7 +299,12 @@ def test_simple_path_mutations_generate_or_pass_through_keys() -> None:
     assert first["evidence"][0]["text"] == "Production deploys with Terraform."
     assert first["evidence"][0]["source_id"] == "agent"
     assert len(first["evidence"][0]["id"]) == 32
-    assert set(first) == {"evidence"} and set(first["evidence"][0]) == {"id", "source_id", "text"}
+    assert first["scoped_evidence_ids"] is True
+    assert set(first) == {"evidence", "scoped_evidence_ids"} and set(first["evidence"][0]) == {
+        "id",
+        "source_id",
+        "text",
+    }
     assert json.loads(seen[1].content) == {
         "evidence": [
             {"id": "runbook-2", "source_id": "runbook", "text": "Runbook v2", "thread_id": "t1", "visibility": "team"}
@@ -339,7 +344,6 @@ def test_generated_client_exposes_brief_consolidation_and_pins() -> None:
     assert MemoryBriefRequest(limit=4).to_dict()["limit"] == 4
 
 
-
 def test_remember_explicit_key_retries_send_identical_evidence_and_fill_citations() -> None:
     client, seen, http = _recording_client()
     with http:
@@ -351,3 +355,36 @@ def test_remember_explicit_key_retries_send_identical_evidence_and_fill_citation
     body = json.loads(seen[0].content)
     assert body["assertions"][0]["evidence"] == [{"id": body["evidence"][0]["id"]}]
     assert body["evidence"][0]["id"] != json.loads(seen[2].content)["evidence"][0]["id"]
+
+
+def test_access_usage_statistics_and_review_proposals_share_scope() -> None:
+    client = AntflyClient("http://memory.test", token="scoped-token")
+    seen: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={})
+
+    with httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(respond)) as http:
+        client._client.set_httpx_client(http)
+        scope: dict[str, str] = {"database": "db", "namespace": "ns", "branch": "feature"}
+        client.memory.access("team", ["a"], idempotency_key="retrieval", **scope)
+        client.memory.usage("team", "a", **scope)
+        client.memory.execute("team", "inspect", body={"cursor": "next", "limit": 7}, **scope)
+        client.memory.consolidate("team", cursor="next-review", database="db", namespace="ns", branch="feature")
+        client.memory.prepare_consolidation(
+            "team", cursor="review", idempotency_key="prepare", database="db", namespace="ns", branch="feature"
+        )
+    assert [request.url.path.rsplit("/", 1)[-1] for request in seen] == [
+        "accesses",
+        "usage",
+        "team",
+        "consolidation",
+        "consolidation-proposals",
+    ]
+    assert all(request.headers["x-antfly-memory-branch"] == "feature" for request in seen)
+    assert seen[0].headers["idempotency-key"] == "retrieval"
+    assert "idempotency-key" not in seen[1].headers
+    assert seen[2].url.params["cursor"] == "next"
+    assert json.loads(seen[3].content)["cursor"] == "next-review"
+    assert json.loads(seen[4].content)["cursor"] == "review"

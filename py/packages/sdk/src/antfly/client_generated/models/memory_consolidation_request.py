@@ -16,10 +16,12 @@ class MemoryConsolidationRequest:
     Attributes:
         limit (int | Unset):  Default: 32.
         stale_after_ms (int | None | Unset):
+        cursor (None | str | Unset):
     """
 
     limit: int | Unset = 32
     stale_after_ms: int | None | Unset = UNSET
+    cursor: None | str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         limit = self.limit
@@ -30,6 +32,12 @@ class MemoryConsolidationRequest:
         else:
             stale_after_ms = self.stale_after_ms
 
+        cursor: None | str | Unset
+        if isinstance(self.cursor, Unset):
+            cursor = UNSET
+        else:
+            cursor = self.cursor
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
@@ -37,6 +45,8 @@ class MemoryConsolidationRequest:
             field_dict["limit"] = limit
         if stale_after_ms is not UNSET:
             field_dict["stale_after_ms"] = stale_after_ms
+        if cursor is not UNSET:
+            field_dict["cursor"] = cursor
 
         return field_dict
 
@@ -54,9 +64,19 @@ class MemoryConsolidationRequest:
 
         stale_after_ms = _parse_stale_after_ms(d.pop("stale_after_ms", UNSET))
 
+        def _parse_cursor(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        cursor = _parse_cursor(d.pop("cursor", UNSET))
+
         memory_consolidation_request = cls(
             limit=limit,
             stale_after_ms=stale_after_ms,
+            cursor=cursor,
         )
 
         return memory_consolidation_request

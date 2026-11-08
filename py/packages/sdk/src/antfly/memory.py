@@ -134,6 +134,9 @@ class MemoryOperations:
             "evaluation_tasks": ("POST", "/evaluations/" + quote(id, safe="") + "/tasks"),
             "evaluation_verdict": ("POST", "/evaluations/" + quote(id, safe="") + "/verdicts"),
             "inspect": ("GET", ""),
+            "access": ("POST", "/accesses"),
+            "usage": ("GET", "/memories/" + quote(id, safe="") + "/usage"),
+            "prepare_consolidation": ("POST", "/consolidation-proposals"),
             "configure": ("PATCH", ""),
             "observe": ("POST", "/observations"),
             "assertions": ("POST", "/assertions"),
@@ -259,6 +262,7 @@ class MemoryOperations:
         for model extraction derive them). ``evidence_id`` is generated when omitted;
         evidence IDs name immutable source versions.
         """
+        generated_evidence_id = evidence_id is None
         evidence_id = evidence_id or (
             hashlib.sha256(("antfly-memory-remember:" + idempotency_key).encode()).hexdigest()
             if idempotency_key
@@ -273,6 +277,8 @@ class MemoryOperations:
             visibility=visibility,
         )
         body: dict[str, Any] = {"evidence": [evidence]}
+        if generated_evidence_id:
+            body["scoped_evidence_ids"] = True
         if assertions is not None:
             body["assertions"] = [
                 {**assertion, "evidence": assertion.get("evidence", [{"id": evidence_id}])} for assertion in assertions
@@ -325,6 +331,7 @@ class MemoryOperations:
         *,
         limit: int | None = None,
         stale_after_ms: int | None = None,
+        cursor: str | None = None,
         database: str = "default",
         namespace: str = "public",
         branch: str = "",
@@ -334,8 +341,20 @@ class MemoryOperations:
         Findings carry a ``suggested_action``; apply them with ``correct``, ``pin``
         or ``forget``.
         """
-        body = _compact(limit=limit, stale_after_ms=stale_after_ms)
+        body = _compact(limit=limit, stale_after_ms=stale_after_ms, cursor=cursor)
         return self.execute(space, "consolidate", body=body, database=database, namespace=namespace, branch=branch)
+
+    def access(self, space: str, memory_ids: list[str], **options: Any) -> Any:
+        """Record consumed recall/brief IDs; reuse idempotency_key on retries."""
+        return self.execute(space, "access", body={"memory_ids": memory_ids}, **options)
+
+    def usage(self, space: str, id: str, **options: Any) -> Any:
+        """Read your access counts, timestamps and retained outcome utility."""
+        return self.execute(space, "usage", id=id, **options)
+
+    def prepare_consolidation(self, space: str, *, cursor: str | None = None, limit: int = 32, **options: Any) -> Any:
+        """Create review proposals without changing beliefs; continue with review_cursor."""
+        return self.execute(space, "prepare_consolidation", body=_compact(cursor=cursor, limit=limit), **options)
 
     def pin(
         self,

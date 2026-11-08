@@ -266,6 +266,7 @@ it("remembers text as one evidence item cited by evidence-less assertions", asyn
   expect(first.headers.get("Idempotency-Key")).toMatch(UUID);
   expect(generated.evidenceId).toMatch(UUID);
   expect(JSON.parse(await first.text())).toEqual({
+    scoped_evidence_ids: true,
     evidence: [
       {
         author: "alice",
@@ -293,4 +294,39 @@ it("replays remember with the same evidence when an explicit operation key is re
   expect(await sent[0]?.text()).toBe(await sent[1]?.text());
   expect(sent[0]?.headers.get("Idempotency-Key")).toBe("retry");
   expect(sent[1]?.headers.get("Idempotency-Key")).toBe("retry");
+});
+
+it("scopes access, usage, inspection pages and reviewed consolidation proposals", async () => {
+  const sent: Request[] = [];
+  vi.stubGlobal("fetch", async (request: Request) => {
+    sent.push(request.clone());
+    return new Response("{}", { headers: { "Content-Type": "application/json" } });
+  });
+  const client = new AntflyClient({ baseUrl: "http://memory.test" });
+  const scope = { database: "db", namespace: "ns", branch: "feature" };
+  await client.memory.access("team", ["a"], { ...scope, idempotencyKey: "retrieval" });
+  await client.memory.usage("team", "a", scope);
+  await client.memory.inspect("team", { ...scope, cursor: "next", limit: 7 });
+  await client.memory.prepareConsolidation(
+    "team",
+    { cursor: "review" },
+    { ...scope, idempotencyKey: "prepare" }
+  );
+  expect(sent.map((r) => new URL(r.url).pathname)).toEqual([
+    "/memory/v1/spaces/team/accesses",
+    "/memory/v1/spaces/team/memories/a/usage",
+    "/memory/v1/spaces/team",
+    "/memory/v1/spaces/team/consolidation-proposals",
+  ]);
+  for (const request of sent) {
+    expect(request.headers.get("X-Antfly-Database")).toBe("db");
+    expect(request.headers.get("X-Antfly-Memory-Branch")).toBe("feature");
+  }
+  expect(sent[0]?.headers.get("Idempotency-Key")).toBe("retrieval");
+  expect(sent[1]?.headers.has("Idempotency-Key")).toBe(false);
+  const inspection = sent[2];
+  const preparation = sent[3];
+  if (!inspection || !preparation) throw new Error("Missing memory requests");
+  expect(new URL(inspection.url).searchParams.get("cursor")).toBe("next");
+  expect(JSON.parse(await preparation.text())).toEqual({ cursor: "review" });
 });

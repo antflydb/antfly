@@ -210,6 +210,25 @@ curl -X POST http://127.0.0.1:8080/memory/v1/spaces/agent/consolidation   -H 'Co
 }
 ```
 
+Follow `next_cursor` until `complete` is true, including pages with no findings. Keep `stale_after_ms` unchanged across pages and sum each page's statistics; writes invalidate the cursor.
+
+```python
+cursor = None
+while True:
+    page = client.memory.consolidate("agent", cursor=cursor, limit=32)
+    for finding in page["findings"]:
+        print(finding["kind"], finding["memory_ids"])
+    if page["complete"]:
+        break
+    cursor = page["next_cursor"]
+```
+
+A curator can create reviewable work with `memory.prepare_consolidation("agent", idempotency_key="review-2026-01")`. The receipt contains `proposal_ids` for the supersession verdict flow and `review_cursor` for the next preparation request. Proposal creation leaves beliefs unchanged. Verifying a claim with `correct` to active/settled records `last_verified_at` and resets staleness.
+
+After consuming recall or brief results, call `memory.access("agent", ["deploy-helm"], idempotency_key="session-42-recall-1")`. Reuse the key on retries. `memory.usage("agent", "deploy-helm")` returns your branch-local count, last access, verification time and utility. Reads themselves do not create access events. Inspection includes paged `statistics` for retained space growth; continue with `memory.execute("agent", "inspect", body={"cursor": next_cursor})` and sum counts.
+
+Retrieval evaluation cases compare `policy.retrieval="recall"`, `"brief"` or `"none"`. Brief cases accept session-brief filters and budgets; no-memory cases use zero context tokens.
+
 Each finding carries a `suggested_action` that maps to an existing reviewed write:
 
 | Finding | Meaning | Suggested action |
@@ -218,7 +237,7 @@ Each finding carries a `suggested_action` that maps to an existing reviewed writ
 | `dispute` | Conflicting current claims | `review_supersession` |
 | `unordered` | Single-valued claim without `valid_from` | `add_valid_from` |
 | `unverified` | Provisional, inferred or hypothesized claim | `verify`, then `correct` to settle or retract |
-| `stale` | Single-valued or provisional claim not updated within `stale_after_ms` | `verify` |
+| `stale` | Single-valued or provisional claim not verified within `stale_after_ms` | `verify` |
 | `harmful` | Used mostly in failed tasks | `correct` |
 | `dangling_link` | Links to a memory that was retired | `fix_link` |
 | `orphan_entity` | Entity no current claim mentions | `curate_entity` |

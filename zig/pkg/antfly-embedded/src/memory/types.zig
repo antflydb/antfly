@@ -217,7 +217,7 @@ pub const Assertion = struct {
     embedding_model: ?Model = null,
     reconciliation_reason: ?[]const u8 = null,
 };
-pub const ObservationRequest = struct { origin: ?provenance.Origin = null, context_evidence_ids: []const []const u8 = &.{}, evidence: []const Evidence, assertions: []const Assertion = &.{}, entities: []const Entity = &.{}, mentions: []const EntityMention = &.{} };
+pub const ObservationRequest = struct { scoped_evidence_ids: bool = false, origin: ?provenance.Origin = null, context_evidence_ids: []const []const u8 = &.{}, evidence: []const Evidence, assertions: []const Assertion = &.{}, entities: []const Entity = &.{}, mentions: []const EntityMention = &.{} };
 pub const AssertionRequest = struct { assertions: []const Assertion };
 pub const Correction = struct {
     id: []const u8,
@@ -242,6 +242,8 @@ pub const Outcome = struct {
 };
 /// Outcome-derived usefulness, counted only from outcomes the caller may read.
 /// `score` is (successes - failures) / (successes + failures + 2), in (-1, 1).
+pub const Access = struct { memory_ids: []const []const u8 };
+pub const Usage = struct { recalls: u64 = 0, last_recalled_at: ?i64 = null, last_verified_at: ?i64 = null, utility: Utility = .{} };
 pub const Utility = struct { successes: u32 = 0, failures: u32 = 0, score: f64 = 0, complete: bool = true };
 pub const max_utility_outcomes = 64;
 /// Brief pins promote a memory into the session-start brief of one branch.
@@ -286,7 +288,7 @@ pub const Brief = struct {
 };
 /// Read-only consolidation ("dreaming") review. Findings are suggestions for
 /// existing reviewed write paths; similarity never authorizes a change.
-pub const ConsolidationRequest = struct { limit: u16 = 32, stale_after_ms: ?u64 = null };
+pub const ConsolidationRequest = struct { limit: u16 = 32, stale_after_ms: ?u64 = null, cursor: ?[]const u8 = null };
 pub const max_consolidation_findings = 256;
 pub const FindingKind = enum { duplicate, dispute, unordered, unverified, harmful, stale, dangling_link, orphan_entity, promote };
 pub const SuggestedAction = enum { propose_supersession, review_supersession, correct, add_valid_from, verify, fix_link, curate_entity, pin };
@@ -309,6 +311,7 @@ pub const SpaceStats = struct {
     entities: u32 = 0,
 };
 pub const Consolidation = struct {
+    next_cursor: ?[]const u8 = null,
     findings: []const Finding,
     stats: SpaceStats,
     scanned: usize,
@@ -363,6 +366,9 @@ pub const State = struct {
     input_digest_key: []const u8 = &.{},
     persistent_roots: bool = false,
     knowledge_revision: u64 = 0,
+    feedback_revision: u64 = 0,
+    restates_ready: bool = false,
+    restates_cursor: ?[]const u8 = null,
     change_floor: []const u8 = "",
     next_change_expiry_at: ?i64 = null,
     change_min_recorded_at: i64 = std.math.minInt(i64),
@@ -421,6 +427,7 @@ pub const StoredAssertion = struct {
     owner: []const u8,
     recorded_from: i64,
     recorded_at: i64 = 0,
+    last_verified_at: ?i64 = null,
     revision: u64,
     lifecycle: Lifecycle = .active,
     // Explicit semantic invalidation of a derived artifact. Time-qualified
@@ -461,6 +468,11 @@ pub const Operation = struct {
     next_retry_at: ?i64 = null,
     inputs: []const []const u8 = &.{},
     context_inputs: []const []const u8 = &.{},
+    evidence_ids: []const []const u8 = &.{},
+    duplicate_ids: []const []const u8 = &.{},
+    near_duplicate_ids: []const []const u8 = &.{},
+    proposal_ids: []const []const u8 = &.{},
+    review_cursor: ?[]const u8 = null,
     cursor: ?[]const u8 = null,
 };
 pub const Entity = struct { visibility: Visibility = .private, evidence: []const EvidenceRef = &.{}, id: []const u8, name: []const u8, type: []const u8 = "concept", aliases: []const []const u8 = &.{}, distinct_from: []const []const u8 = &.{} };
@@ -499,6 +511,11 @@ pub const EmbeddingBatch = struct {
 
 /// Public receipts contain no durable execution grants or worker cursors.
 pub const OperationStatus = struct {
+    evidence_ids: []const []const u8 = &.{},
+    duplicate_ids: []const []const u8 = &.{},
+    near_duplicate_ids: []const []const u8 = &.{},
+    proposal_ids: []const []const u8 = &.{},
+    review_cursor: ?[]const u8 = null,
     evaluation_id: ?[]const u8 = null,
     branch: []const u8 = "",
     intake_screening: IntakeScreeningReport = .{},
@@ -549,7 +566,9 @@ pub const SpaceInfo = struct {
     owner: []const u8,
     created_at: i64,
 };
+pub const Statistics = struct { stats: SpaceStats = .{}, next_cursor: ?[]const u8 = null, complete: bool = true, scanned: usize = 0 };
 pub const Inspection = struct {
+    statistics: Statistics = .{},
     state: SpaceInfo,
     capabilities: struct { native: bool, model_free: bool, generator_available: bool, embedder_available: bool },
 };

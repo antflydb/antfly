@@ -6454,6 +6454,22 @@ export interface paths {
         patch: operations["configureMemorySpace"];
         trace?: never;
     };
+    "/memory/v1/spaces/{space}/memories/{id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getMemoryUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/memory/v1/spaces/{space}/embeddings": {
         parameters: {
             query?: never;
@@ -6560,6 +6576,38 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["pinMemory"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/memory/v1/spaces/{space}/accesses": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["recordMemoryAccess"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/memory/v1/spaces/{space}/consolidation-proposals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["prepareMemoryConsolidation"];
         delete?: never;
         options?: never;
         head?: never;
@@ -26886,6 +26934,11 @@ export interface components {
             mode: "external" | "managed" | "policy";
             /** Format: uint64 */
             knowledge_revision: number;
+            /**
+             * Format: uint64
+             * @default 0
+             */
+            feedback_revision?: number;
             /** Format: uint64 */
             config_generation: number;
             config_fingerprint: string;
@@ -27119,6 +27172,12 @@ export interface components {
             invalid_output?: boolean;
         };
         MemoryEvaluationPolicyInput: {
+            /**
+             * @default recall
+             * @enum {string}
+             */
+            retrieval?: "recall" | "brief" | "none";
+            brief?: components["schemas"]["MemoryBriefRequest"];
             seed?: string;
             target?: string;
             entity_candidates?: components["schemas"]["MemoryEntityCandidateRequest"];
@@ -27662,6 +27721,8 @@ export interface components {
             reconciliation_reason?: string | null;
         };
         MemoryObservationRequest: {
+            /** @default false */
+            scoped_evidence_ids?: boolean;
             /** @default null */
             origin?: {
                 /** @default null */
@@ -27932,6 +27993,12 @@ export interface components {
             utility_weight?: number;
         };
         MemoryOperation: {
+            evidence_ids?: string[];
+            duplicate_ids?: string[];
+            near_duplicate_ids?: string[];
+            proposal_ids?: string[];
+            /** @default null */
+            review_cursor?: string | null;
             /** @default null */
             evaluation_id?: string | null;
             branch?: string;
@@ -28102,6 +28169,11 @@ export interface components {
              * @default 0
              */
             recorded_at?: number;
+            /**
+             * Format: int64
+             * @default null
+             */
+            last_verified_at?: number | null;
             /** Format: uint64 */
             revision: number;
             /**
@@ -29343,6 +29415,11 @@ export interface components {
                      * @default 0
                      */
                     recorded_at?: number;
+                    /**
+                     * Format: int64
+                     * @default null
+                     */
+                    last_verified_at?: number | null;
                     /** Format: uint64 */
                     revision: number;
                     /**
@@ -29761,6 +29838,11 @@ export interface components {
                  * @default 0
                  */
                 recorded_at?: number;
+                /**
+                 * Format: int64
+                 * @default null
+                 */
+                last_verified_at?: number | null;
                 /** Format: uint64 */
                 revision: number;
                 /**
@@ -29833,6 +29915,7 @@ export interface components {
             complete: boolean;
         };
         MemoryInspection: {
+            statistics?: components["schemas"]["MemoryStatistics"];
             state: {
                 /**
                  * Format: uint64
@@ -30243,6 +30326,39 @@ export interface components {
                 embedder_available: boolean;
             };
         };
+        MemoryStatistics: {
+            stats?: components["schemas"]["MemorySpaceStats"];
+            /** @default null */
+            next_cursor?: string | null;
+            /** @default true */
+            complete?: boolean;
+            /**
+             * Format: uint64
+             * @default 0
+             */
+            scanned?: number;
+        };
+        MemoryAccess: {
+            memory_ids: string[];
+        };
+        MemoryUsage: {
+            /**
+             * Format: uint64
+             * @default 0
+             */
+            recalls?: number;
+            /**
+             * Format: int64
+             * @default null
+             */
+            last_recalled_at?: number | null;
+            /**
+             * Format: int64
+             * @default null
+             */
+            last_verified_at?: number | null;
+            utility?: components["schemas"]["MemoryUtility"];
+        };
         MemoryStoredEvidence: {
             materialization?: components["schemas"]["MemoryIntakeMaterialization"];
             /** @default false */
@@ -30365,6 +30481,8 @@ export interface components {
              * @default null
              */
             stale_after_ms?: number | null;
+            /** @default null */
+            cursor?: string | null;
         };
         MemoryFinding: {
             /** @enum {string} */
@@ -30400,6 +30518,8 @@ export interface components {
             entities?: number;
         };
         MemoryConsolidation: {
+            /** @default null */
+            next_cursor?: string | null;
             findings: components["schemas"]["MemoryFinding"][];
             stats: components["schemas"]["MemorySpaceStats"];
             /** Format: uint64 */
@@ -46875,7 +46995,10 @@ export interface operations {
     };
     getMemorySpace: {
         parameters: {
-            query?: never;
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
             header?: {
                 /** @description Catalog scope for this memory space. */
                 "X-Antfly-Database"?: string;
@@ -47130,6 +47253,117 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MemoryOperation"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
+    getMemoryUsage: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Memory-Branch"?: string;
+            };
+            path: {
+                space: string;
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryUsage"];
                 };
             };
             /** @description Memory validation, authorization, concurrency, capability, or execution error. */
@@ -47932,6 +48166,238 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["MemoryPin"];
+            };
+        };
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryOperation"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
+    recordMemoryAccess: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Memory-Branch"?: string;
+                /** @description Stable per-principal operation key. Conflicting reuse returns 409. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                space: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryAccess"];
+            };
+        };
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryOperation"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
+    prepareMemoryConsolidation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Memory-Branch"?: string;
+                /** @description Stable per-principal operation key. Conflicting reuse returns 409. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                space: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryConsolidationRequest"];
             };
         };
         responses: {

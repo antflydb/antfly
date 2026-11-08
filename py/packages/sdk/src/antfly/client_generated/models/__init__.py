@@ -1325,6 +1325,7 @@ from .media_content_part_type import MediaContentPartType
 from .media_output_config import MediaOutputConfig
 from .media_output_coverage_counts import MediaOutputCoverageCounts
 from .media_output_coverage_values import MediaOutputCoverageValues
+from .memory_access import MemoryAccess
 from .memory_assertion import MemoryAssertion
 from .memory_assertion_embedding_model_type_0 import MemoryAssertionEmbeddingModelType0
 from .memory_assertion_evidence_item import MemoryAssertionEvidenceItem
@@ -1519,6 +1520,7 @@ from .memory_evaluation_judge_output import MemoryEvaluationJudgeOutput
 from .memory_evaluation_judge_output_label import MemoryEvaluationJudgeOutputLabel
 from .memory_evaluation_judge_task import MemoryEvaluationJudgeTask
 from .memory_evaluation_policy_input import MemoryEvaluationPolicyInput
+from .memory_evaluation_policy_input_retrieval import MemoryEvaluationPolicyInputRetrieval
 from .memory_evaluation_prediction import MemoryEvaluationPrediction
 from .memory_evaluation_prediction_label import MemoryEvaluationPredictionLabel
 from .memory_evaluation_report import MemoryEvaluationReport
@@ -1956,6 +1958,7 @@ from .memory_space_config_processing import MemorySpaceConfigProcessing
 from .memory_space_config_semantic_discovery import MemorySpaceConfigSemanticDiscovery
 from .memory_space_config_source_rules_item import MemorySpaceConfigSourceRulesItem
 from .memory_space_stats import MemorySpaceStats
+from .memory_statistics import MemoryStatistics
 from .memory_stored_evidence import MemoryStoredEvidence
 from .memory_subject_count import MemorySubjectCount
 from .memory_supersession_candidate import MemorySupersessionCandidate
@@ -1977,6 +1980,7 @@ from .memory_supersession_verdict_evidence_item import MemorySupersessionVerdict
 from .memory_supersession_verdict_evidence_item_span_type_0 import MemorySupersessionVerdictEvidenceItemSpanType0
 from .memory_supersession_verdict_model_type_0 import MemorySupersessionVerdictModelType0
 from .memory_supersession_verdict_verdict import MemorySupersessionVerdictVerdict
+from .memory_usage import MemoryUsage
 from .memory_utility import MemoryUtility
 from .merge_config import MergeConfig
 from .merge_config_weights import MergeConfigWeights
@@ -3998,6 +4002,7 @@ __all__ = (
     "MediaOutputConfig",
     "MediaOutputCoverageCounts",
     "MediaOutputCoverageValues",
+    "MemoryAccess",
     "MemoryAssertion",
     "MemoryAssertionEmbeddingModelType0",
     "MemoryAssertionEvidenceItem",
@@ -4148,6 +4153,7 @@ __all__ = (
     "MemoryEvaluationJudgeOutputLabel",
     "MemoryEvaluationJudgeTask",
     "MemoryEvaluationPolicyInput",
+    "MemoryEvaluationPolicyInputRetrieval",
     "MemoryEvaluationPrediction",
     "MemoryEvaluationPredictionLabel",
     "MemoryEvaluationReport",
@@ -4419,6 +4425,7 @@ __all__ = (
     "MemorySpaceConfigSemanticDiscovery",
     "MemorySpaceConfigSourceRulesItem",
     "MemorySpaceStats",
+    "MemoryStatistics",
     "MemoryStoredEvidence",
     "MemorySubjectCount",
     "MemorySupersessionCandidate",
@@ -4440,6 +4447,7 @@ __all__ = (
     "MemorySupersessionVerdictEvidenceItemSpanType0",
     "MemorySupersessionVerdictModelType0",
     "MemorySupersessionVerdictVerdict",
+    "MemoryUsage",
     "MemoryUtility",
     "MergeConfig",
     "MergeConfigWeights",

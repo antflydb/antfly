@@ -269,6 +269,18 @@ paths:
           default: ''
           x-go-type-skip-optional-pointer: false
         description: Catalog scope for this memory space.
+      - name: cursor
+        in: query
+        schema:
+          type: string
+          x-go-type-skip-optional-pointer: false
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 256
+          x-go-type-skip-optional-pointer: false
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -454,6 +466,113 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/MemoryConfigureRequest'
+  /memory/v1/spaces/{space}/memories/{id}/usage:
+    get:
+      operationId: getMemoryUsage
+      tags:
+      - memory
+      parameters:
+      - name: space
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: X-Antfly-Database
+        in: header
+        schema:
+          type: string
+          default: default
+          x-go-type-skip-optional-pointer: false
+        description: Catalog scope for this memory space.
+      - name: X-Antfly-Namespace
+        in: header
+        schema:
+          type: string
+          default: public
+          x-go-type-skip-optional-pointer: false
+        description: Catalog scope for this memory space.
+      - name: X-Antfly-Memory-Branch
+        in: header
+        schema:
+          type: string
+          default: ''
+          x-go-type-skip-optional-pointer: false
+        description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryUsage'
+        '400':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
   /memory/v1/spaces/{space}/embeddings:
     post:
       operationId: stageMemoryEmbeddings
@@ -1266,6 +1385,238 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/MemoryPin'
+  /memory/v1/spaces/{space}/accesses:
+    post:
+      operationId: recordMemoryAccess
+      tags:
+      - memory
+      parameters:
+      - name: space
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: X-Antfly-Database
+        in: header
+        schema:
+          type: string
+          default: default
+          x-go-type-skip-optional-pointer: false
+        description: Catalog scope for this memory space.
+      - name: X-Antfly-Namespace
+        in: header
+        schema:
+          type: string
+          default: public
+          x-go-type-skip-optional-pointer: false
+        description: Catalog scope for this memory space.
+      - name: X-Antfly-Memory-Branch
+        in: header
+        schema:
+          type: string
+          default: ''
+          x-go-type-skip-optional-pointer: false
+        description: Catalog scope for this memory space.
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          maxLength: 256
+        description: Stable per-principal operation key. Conflicting reuse returns
+          409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryAccess'
+  /memory/v1/spaces/{space}/consolidation-proposals:
+    post:
+      operationId: prepareMemoryConsolidation
+      tags:
+      - memory
+      parameters:
+      - name: space
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: X-Antfly-Database
+        in: header
+        schema:
+          type: string
+          default: default
+          x-go-type-skip-optional-pointer: false
+        description: Catalog scope for this memory space.
+      - name: X-Antfly-Namespace
+        in: header
+        schema:
+          type: string
+          default: public
+          x-go-type-skip-optional-pointer: false
+        description: Catalog scope for this memory space.
+      - name: X-Antfly-Memory-Branch
+        in: header
+        schema:
+          type: string
+          default: ''
+          x-go-type-skip-optional-pointer: false
+        description: Catalog scope for this memory space.
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          maxLength: 256
+        description: Stable per-principal operation key. Conflicting reuse returns
+          409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryConsolidationRequest'
   /memory/v1/spaces/{space}/memories/{id}/supersession-candidates:
     post:
       operationId: getMemorySupersessionCandidates
@@ -8794,6 +9145,14 @@ components:
           maximum: 18446744073709551615
           format: uint64
           x-go-type: uint64
+        feedback_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
         config_generation:
           type: integer
           minimum: 0
@@ -9330,6 +9689,16 @@ components:
     MemoryEvaluationPolicyInput:
       type: object
       properties:
+        retrieval:
+          type: string
+          enum:
+          - recall
+          - brief
+          - none
+          default: recall
+          x-go-type-skip-optional-pointer: false
+        brief:
+          $ref: '#/components/schemas/MemoryBriefRequest'
         seed:
           type: string
         target:
@@ -10554,6 +10923,10 @@ components:
     MemoryObservationRequest:
       type: object
       properties:
+        scoped_evidence_ids:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
         origin:
           type: object
           properties:
@@ -11197,6 +11570,27 @@ components:
     MemoryOperation:
       type: object
       properties:
+        evidence_ids:
+          type: array
+          items:
+            type: string
+        duplicate_ids:
+          type: array
+          items:
+            type: string
+        near_duplicate_ids:
+          type: array
+          items:
+            type: string
+        proposal_ids:
+          type: array
+          items:
+            type: string
+        review_cursor:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
         evaluation_id:
           type: string
           default: null
@@ -11664,6 +12058,15 @@ components:
           default: 0
           x-go-type-skip-optional-pointer: false
           x-go-type: int64
+        last_verified_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
         revision:
           type: integer
           minimum: 0
@@ -14823,6 +15226,15 @@ components:
                     default: 0
                     x-go-type-skip-optional-pointer: false
                     x-go-type: int64
+                  last_verified_at:
+                    type: integer
+                    minimum: -9223372036854775808
+                    maximum: 9223372036854775807
+                    format: int64
+                    x-go-type: int64
+                    default: null
+                    nullable: true
+                    x-go-type-skip-optional-pointer: false
                   revision:
                     type: integer
                     minimum: 0
@@ -15928,6 +16340,15 @@ components:
                 default: 0
                 x-go-type-skip-optional-pointer: false
                 x-go-type: int64
+              last_verified_at:
+                type: integer
+                minimum: -9223372036854775808
+                maximum: 9223372036854775807
+                format: int64
+                x-go-type: int64
+                default: null
+                nullable: true
+                x-go-type-skip-optional-pointer: false
               revision:
                 type: integer
                 minimum: 0
@@ -16114,6 +16535,8 @@ components:
     MemoryInspection:
       type: object
       properties:
+        statistics:
+          $ref: '#/components/schemas/MemoryStatistics'
         state:
           type: object
           properties:
@@ -16923,6 +17346,71 @@ components:
       - state
       - capabilities
       additionalProperties: false
+    MemoryStatistics:
+      type: object
+      properties:
+        stats:
+          $ref: '#/components/schemas/MemorySpaceStats'
+        next_cursor:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        complete:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        scanned:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+      additionalProperties: false
+    MemoryAccess:
+      type: object
+      properties:
+        memory_ids:
+          type: array
+          items:
+            type: string
+      required:
+      - memory_ids
+      additionalProperties: false
+    MemoryUsage:
+      type: object
+      properties:
+        recalls:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        last_recalled_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        last_verified_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        utility:
+          $ref: '#/components/schemas/MemoryUtility'
+      additionalProperties: false
     MemoryStoredEvidence:
       type: object
       properties:
@@ -17236,6 +17724,11 @@ components:
           default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
+        cursor:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
       additionalProperties: false
     MemoryFinding:
       type: object
@@ -17331,6 +17824,11 @@ components:
     MemoryConsolidation:
       type: object
       properties:
+        next_cursor:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
         findings:
           type: array
           items:
