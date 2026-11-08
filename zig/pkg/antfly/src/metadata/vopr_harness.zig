@@ -6908,6 +6908,7 @@ pub const MetadataAdminVoprSource = struct {
             // VOPR's public catalog façade does not own the private
             // publication/coordination protocols. Keep these explicit so a
             // newly added Call remains visible to exhaustive compilation.
+            .lake_source_owner_read,
             .lake_index_lifecycle_read,
             .lake_index_lifecycle_work,
             .lake_index_lifecycle_mutate,

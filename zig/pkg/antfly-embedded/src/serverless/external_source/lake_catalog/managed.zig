@@ -30,6 +30,7 @@ pub const ReferenceRequest = struct {
 pub const Retirement = struct { id: []const u8, expected_metadata_location: []const u8, expected_version: []const u8, objects: []const []const u8 };
 
 pub const Record = struct {
+    native_owner: ?[16]u8 = null,
     retirement_root: ?retired.Digest = null,
     format: u8 = 1,
     commit_id: []const u8,
@@ -41,6 +42,7 @@ pub const Record = struct {
     previous_version: ?[]const u8 = null,
 };
 pub const Managed = struct {
+    native_owner: ?[16]u8 = null,
     client: storage.Client,
     bucket: []const u8,
     prefix: []const u8,
@@ -384,7 +386,7 @@ pub const Managed = struct {
         const uri = try std.fmt.allocPrint(a, "{s}/{s}", .{ std.mem.trimEnd(u8, self.source_uri, "/"), relative });
         defer a.free(uri);
         try self.immutable(a, data_key, bytes);
-        const r: Record = .{ .format = if (previous != null and previous.?.retirement_root != null) 2 else 1, .retirement_root = if (previous) |p| p.retirement_root else null, .commit_id = c.id, .request_hash = &types.commitHash(c), .metadata_location = uri, .metadata_key = data_key, .metadata_hash = &types.digestHex(bytes), .previous_record = if (previous) |p| p.record_key else null, .previous_version = if (previous) |p| p.version else null };
+        const r: Record = .{ .native_owner = self.native_owner, .format = if (previous != null and previous.?.retirement_root != null) 2 else 1, .retirement_root = if (previous) |p| p.retirement_root else null, .commit_id = c.id, .request_hash = &types.commitHash(c), .metadata_location = uri, .metadata_key = data_key, .metadata_hash = &types.digestHex(bytes), .previous_record = if (previous) |p| p.record_key else null, .previous_version = if (previous) |p| p.version else null };
         const record_bytes = try std.json.Stringify.valueAlloc(a, r, .{ .emit_null_optional_fields = false });
         errdefer a.free(record_bytes);
         const record_key = try self.recordKey(a, record_bytes);
@@ -395,6 +397,36 @@ pub const Managed = struct {
         try self.immutable(a, intent, record_bytes);
         return record_bytes;
     }
+    pub fn claimNativeOwner(self: *const Managed, a: A, owner: [16]u8) !void {
+        if (std.mem.allEqual(u8, &owner, 0)) return error.InvalidLakeCatalog;
+        const head_key = try self.catalogKey(a, "head.json");
+        defer a.free(head_key);
+        for (0..8) |_| {
+            var current = (try self.get(a, head_key, 64 * 1024)) orelse return error.LakeTableNotFound;
+            defer current.deinit(a);
+            var parsed = try record(a, current.body);
+            defer parsed.deinit();
+            if (parsed.value.native_owner) |previous| {
+                if (!std.mem.eql(u8, &previous, &owner)) return error.LakeSourceOwnerRequired;
+                return;
+            }
+            parsed.value.native_owner = owner;
+            const bytes = try std.json.Stringify.valueAlloc(a, parsed.value, .{ .emit_null_optional_fields = false });
+            defer a.free(bytes);
+            const record_key = try self.recordKey(a, bytes);
+            defer a.free(record_key);
+            try self.immutable(a, record_key, bytes);
+            var client = self.client;
+            client.allocator = a;
+            var result = client.compareAndPut(self.bucket, head_key, bytes, current.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .content_type = "application/json", .cancellation = self.token() }) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => return err,
+            };
+            result.deinit(a);
+            return;
+        }
+        return error.LakeCommitConflict;
+    }
     fn publish(self: *const Managed, a: A, bytes: []const u8) !void {
         const p = try record(a, bytes);
         defer p.deinit();
@@ -403,6 +435,20 @@ pub const Managed = struct {
         defer a.free(head);
         var current = try self.get(a, head, 64 * 1024);
         defer if (current) |*value| value.deinit(a);
+        if (current) |value| {
+            var bound = try record(a, value.body);
+            defer bound.deinit();
+            if (!std.meta.eql(bound.value.native_owner, self.native_owner)) return error.LakeSourceOwnerRequired;
+        }
+        if (!std.meta.eql(r.native_owner, self.native_owner)) {
+            // Activation may follow an already committed legacy intent. Its
+            // authenticated retry is safe; an uncommitted old intent cannot
+            // acquire the new writer's authority or publish through its fence.
+            switch (try self.resolve(a, r.commit_id, r.request_hash)) {
+                .committed => return,
+                else => return error.LakeSourceOwnerRequired,
+            }
+        }
         const expected_matches = if (current) |value| if (r.previous_version) |expected| if (value.metadata.writeRevision()) |actual| std.mem.eql(u8, expected, actual.token()) else false else false else r.previous_version == null;
         if (!expected_matches) switch (try self.resolve(a, r.commit_id, r.request_hash)) {
             .committed => return,
