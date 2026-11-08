@@ -40,5 +40,12 @@ ditto "$framework" "$app/Contents/Frameworks/Sparkle.framework"
 cp .build/checkouts/Sparkle/LICENSE "$app/Contents/Resources/.Sparkle-LICENSE.next"
 chmod 644 "$app/Contents/Resources/.Sparkle-LICENSE.next"
 mv -f "$app/Contents/Resources/.Sparkle-LICENSE.next" "$app/Contents/Resources/Sparkle-LICENSE.txt"
+if [[ "${BUNDLE_RUNTIME:-${RELEASE_TAG:+1}}" == 1 ]]; then
+  bash release/build-runtime.sh
+  rm -rf "$app/Contents/Resources/Runtime"
+  ditto .build/runtime/universal "$app/Contents/Resources/Runtime"
+else
+  rm -rf "$app/Contents/Resources/Runtime"
+fi
 bash release/sign-app.sh "$app"
 printf 'Built %s\n' "$app"

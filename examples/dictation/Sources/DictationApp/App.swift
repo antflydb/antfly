@@ -5,7 +5,18 @@ import AppKit
 import DictationCore
 import SwiftUI
 
-@main struct DictationApp: App {
+@main enum DictationLauncher {
+  static func main() {
+    if ["--managed-runtime", "--managed-runtime-pull"].contains(
+      CommandLine.arguments.dropFirst().first ?? "")
+    {
+      exit(superviseManagedRuntime(arguments: CommandLine.arguments))
+    }
+    DictationApp.main()
+  }
+}
+
+struct DictationApp: App {
   @NSApplicationDelegateAdaptor(DictationLifecycle.self) private var lifecycle
   @StateObject private var store = Store()
   @StateObject private var updates = AppUpdates()
@@ -133,10 +144,24 @@ struct SettingsView: View {
     ScrollView {
       Form {
         Section("Connection — audio is processed on this server") {
-          TextField("Server origin", text: $store.config.server).onChange(of: store.config.server) {
-            _, _ in store.connectionChanged()
+          Picker(
+            "Processing location",
+            selection: Binding(
+              get: { store.config.connectionMode ?? .external },
+              set: { store.config.connectionMode = $0 })
+          ) {
+            Text("On this Mac (bundled Antfly)").tag(ConnectionMode.managed)
+            Text("External Antfly server").tag(ConnectionMode.external)
+          }.onChange(of: store.config.connectionMode) { _, _ in store.runtimeModeChanged() }
+          if store.config.usesManagedRuntime {
+            RuntimeControls(store: store, runtime: store.runtime)
+          } else {
+            TextField("Server origin", text: $store.config.server).onChange(of: store.config.server)
+            {
+              _, _ in store.connectionChanged()
+            }
+            SecureField("Bearer token (Keychain only)", text: $store.token)
           }
-          SecureField("Bearer token (Keychain only)", text: $store.token)
           HStack {
             Button("Discover models") { store.discover() }
             Button("Create storage table") { store.setup() }
@@ -373,5 +398,24 @@ struct SettingsView: View {
     text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter {
       !$0.isEmpty
     }
+  }
+}
+
+private struct RuntimeControls: View {
+  @ObservedObject var store: Store
+  @ObservedObject var runtime: ManagedRuntime
+  var body: some View {
+    Text(runtime.status).font(.callout)
+    HStack {
+      Button("Start / retry local engine") { runtime.start() }.disabled(
+        runtime.busy || runtime.ready)
+      Button("Download Whisper Tiny…") { store.installLocalWhisper() }.disabled(
+        !runtime.ready || runtime.busy)
+      Button("Use Apple speech") { store.useLocalApple() }.disabled(!runtime.ready || runtime.busy)
+      Button("Open engine log") { NSWorkspace.shared.open(runtime.logURL) }
+    }
+    Text(
+      "Whisper requires a model download. Apple speech requires macOS 26; selecting it allows Apple speech asset downloads. Model discovery shows readiness. No cleanup model is selected automatically."
+    ).font(.caption)
   }
 }

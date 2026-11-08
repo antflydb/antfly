@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Default-branch release controller for Antfly Dictation. No third-party Python dependencies."""
+"""Default-branch release controller for Antfly Dictation. Uses the shared release storage adapters."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ import os
 import plistlib
 import re
 import subprocess
+import sys
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -36,6 +37,13 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 POLICY = json.loads((HERE / "policy.json").read_text())
+SHARED_RELEASE_DIR = HERE.parents[2] / "scripts/release"
+sys.path.append(str(SHARED_RELEASE_DIR))
+from verify_release_ledger import verify_payload  # noqa: E402 — anchored repository imports
+from download_objectstorage import PublicReader, restore_payload  # noqa: E402 — anchored repository imports
+from objectstore_channel import ConditionalWriteConflict  # noqa: E402 — anchored repository imports
+from create_github_release import get_release_by_tag, with_complete_assets  # noqa: E402 — anchored repository imports
+
 SPARKLE = "http://www.andymatuschak.org/xml-namespaces/sparkle"
 ET.register_namespace("sparkle", SPARKLE)
 TAG = re.compile(
@@ -77,7 +85,7 @@ def version(tag):
 def feed_url(channel):
     if channel not in {"stable", "beta"}:
         raise ValueError("Invalid channel")
-    return f"https://raw.githubusercontent.com/{POLICY['repository']}/{POLICY['feed_branch']}/{channel}/appcast.xml"
+    return f"{POLICY['public_base_url']}/channels/{channel}/appcast.xml"
 
 
 def public_key(value):
@@ -198,6 +206,39 @@ def verify_bundle(bundle, identity, key):
             "App binary requires a newer macOS than the update feed advertises"
         )
 
+    runtime = bundle / "Contents/Resources/Runtime"
+    source = json.loads((runtime / "source.json").read_bytes())
+    if source != {"schema_version": 1, "source_commit": identity["source_commit"]}:
+        raise ValueError("Bundled runtime source differs from the app")
+    executable = runtime / "antfly"
+    bridge = runtime / "lib/libantfly-apple.dylib"
+    for path in (executable, bridge):
+        for arch in ("arm64", "x86_64"):
+            run("lipo", "-verify_arch", arch, str(path))
+        for dependency in run("otool", "-L", str(path)).splitlines()[1:]:
+            linked = dependency.strip().split(" ", 1)[0]
+            if linked.startswith("/") and not linked.startswith(
+                ("/System/Library/", "/usr/lib/")
+            ):
+                raise ValueError(
+                    "Bundled runtime has an external library dependency: " + linked
+                )
+    commands = run("xcrun", "vtool", "-show-build", str(executable))
+    minimums = re.findall(r"\bminos\s+(\d+(?:\.\d+)+)", commands)
+    if len(minimums) != 2 or any(
+        components(m) > components(POLICY["minimum_system_version"]) for m in minimums
+    ):
+        raise ValueError("Bundled runtime requires a newer macOS than the app")
+    # Apple bridge is deliberately lazy loaded only on supported macOS versions.
+    run(
+        "env",
+        "-i",
+        "HOME=" + str(Path.home()),
+        "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+        str(executable),
+        "--version",
+    )
+
 
 def verify_unsigned_zip(archive):
     total = 0
@@ -261,7 +302,7 @@ def gh_api(path, method="GET", payload=None):
     return json.loads(response.stdout) if response.stdout.strip() else None
 
 
-def verify_source(identity):
+def validate_identity(identity):
     if not SHA.fullmatch(identity["source_commit"]) or not SHA.fullmatch(
         identity["controller_commit"]
     ):
@@ -281,6 +322,13 @@ def verify_source(identity):
         for key in ("version", "bundle_version", "channel")
     ):
         raise ValueError("Release version mismatch")
+
+
+def verify_source(identity):
+    validate_identity(identity)
+    controller = os.environ.get("GITHUB_SHA", identity["controller_commit"])
+    if not SHA.fullmatch(controller):
+        raise ValueError("Invalid executing controller")
     comparison = gh_api(
         f"repos/{POLICY['repository']}/compare/{identity['source_commit']}...{os.environ['DEFAULT_BRANCH']}"
     )
@@ -301,13 +349,22 @@ def verify_source(identity):
     for path in (
         "examples/dictation/release",
         ".github/workflows/dictation-release.yml",
+        ".github/workflows/dictation-release-recovery.yml",
+        "scripts/release/objectstore_channel.py",
+        "scripts/release/publish_objectstorage.py",
+        "scripts/release/download_objectstorage.py",
+        "scripts/release/verify_release_ledger.py",
+        "scripts/release/create_github_release.py",
+        "scripts/release/release_channels.py",
+        "scripts/release/release_lines.py",
+        "scripts/release/requirements.lock",
     ):
         encoded = urllib.parse.quote(path, safe="/")
         current = gh_api(
             f"repos/{POLICY['repository']}/contents/{encoded}?ref={os.environ['DEFAULT_BRANCH']}"
         )
         pinned = gh_api(
-            f"repos/{POLICY['repository']}/contents/{encoded}?ref={identity['controller_commit']}"
+            f"repos/{POLICY['repository']}/contents/{encoded}?ref={controller}"
         )
         if current != pinned:
             # Contents API URLs differ by ref; compare only immutable object IDs.
@@ -348,10 +405,8 @@ def appcast(identity, archive, signature):
     ET.SubElement(
         item, "description"
     ).text = f"Antfly Dictation {identity['version']}. Settings and retained data are preserved."
-    url = f"https://github.com/{POLICY['repository']}/releases/download/{identity['tag']}/{archive.name}"
-    ET.SubElement(
-        item, "link"
-    ).text = f"https://github.com/{POLICY['repository']}/releases/tag/{identity['tag']}"
+    url = f"{POLICY['public_base_url']}/releases/{identity['version']}/{archive.name}"
+    ET.SubElement(item, "link").text = url
     ET.SubElement(
         item,
         "enclosure",
@@ -379,7 +434,9 @@ def verify_feed(identity, directory):
         raise ValueError("Appcast release version mismatch")
     archive = directory / ("Antfly-Dictation-" + identity["version"] + "-universal.zip")
     enclosure = item.find("enclosure")
-    expected_url = f"https://github.com/{POLICY['repository']}/releases/download/{identity['tag']}/{archive.name}"
+    expected_url = (
+        f"{POLICY['public_base_url']}/releases/{identity['version']}/{archive.name}"
+    )
     if (
         enclosure is None
         or enclosure.get("url") != expected_url
@@ -398,86 +455,229 @@ def verify_feed(identity, directory):
     return feed
 
 
-def update_feed(tree, channel, incoming):
-    """One latest signed feed per channel; never downgrade or rewrite a version."""
-    path = channel + "/appcast.xml"
-    previous = tree.get(path)
-    if previous:
+def public_signing_key():
+    reader = PublicReader(POLICY["public_base_url"], max_bytes=4096)
+    body = reader.read_optional("signing/public-key.json")
+    if body is None:
+        # A missing trust record is not permission to bootstrap over an existing feed.
+        for channel in ("stable", "beta"):
+            if (
+                PublicReader(POLICY["public_base_url"]).read_optional(
+                    f"channels/{channel}/appcast.xml"
+                )
+                is not None
+            ):
+                raise ValueError(
+                    "R2 update feed exists without its signing identity; restore the original trust record"
+                )
+        return None
+    document = json.loads(body)
+    if document.get("schema_version") != 1 or set(document) != {
+        "schema_version",
+        "public_key",
+    }:
+        raise ValueError("Invalid R2 signing identity")
+    return public_key(document["public_key"])
 
-        def release(data):
-            return ET.fromstring(data).findtext(
-                f"channel/item/{{{SPARKLE}}}shortVersionString"
-            )
 
-        old = version("dictation/v" + release(previous))["order"]
-        new = version("dictation/v" + release(incoming))["order"]
-        if new < old:
-            return
-        if new == old:
-            if previous != incoming:
-                raise ValueError("Conflicting bytes for an existing feed version")
-            return
-    tree[path] = incoming
+def release_prefix(identity):
+    validate_identity(identity)
+    return f"{POLICY['storage_prefix']}/releases/{identity['version']}"
 
 
-def publish_feed(identity, feed):
-    repo = POLICY["repository"]
-    branch = POLICY["feed_branch"]
-    refs = gh_api(f"repos/{repo}/git/matching-refs/heads/{branch}")
-    refs = [r for r in refs if r["ref"] == "refs/heads/" + branch]
-    head = refs[0]["object"]["sha"] if refs else None
-    tree = {}
-    base_tree = None
-    if head:
-        commit = gh_api(f"repos/{repo}/git/commits/{head}")
-        base_tree = commit["tree"]["sha"]
-        for item in gh_api(f"repos/{repo}/git/trees/{base_tree}?recursive=1")["tree"]:
-            if item["path"] in {"stable/appcast.xml", "beta/appcast.xml"}:
-                blob = gh_api(f"repos/{repo}/git/blobs/{item['sha']}")
-                tree[item["path"]] = base64.b64decode(blob["content"])
-    original = dict(tree)
-    update_feed(tree, identity["channel"], feed)
-    if identity["channel"] == "stable":
-        update_feed(tree, "beta", feed)
-    changed = {p: data for p, data in tree.items() if original.get(p) != data}
-    if not changed:
-        return
-    entries = []
-    for path, data in changed.items():
-        blob = gh_api(
-            f"repos/{repo}/git/blobs",
-            "POST",
-            {"content": base64.b64encode(data).decode(), "encoding": "base64"},
+def write_manifest(identity, directory, key):
+    validate_identity(identity)
+    names = {
+        "Antfly-Dictation-" + identity["version"] + "-universal.zip",
+        "appcast.xml",
+        "SHA256SUMS",
+    }
+    if {p.name for p in directory.iterdir()} != names:
+        raise ValueError(
+            "Release directory must contain exactly the signed app, feed, and checksums"
         )
-        entries.append(
-            {"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]}
-        )
-    payload = {"tree": entries}
-    if base_tree:
-        payload["base_tree"] = base_tree
-    new_tree = gh_api(f"repos/{repo}/git/trees", "POST", payload)
-    commit = gh_api(
-        f"repos/{repo}/git/commits",
-        "POST",
-        {
-            "message": "Publish Antfly Dictation " + identity["version"],
-            "tree": new_tree["sha"],
-            "parents": [head] if head else [],
-        },
+    document = {
+        "schema_version": 2,
+        "product": "antfly-dictation",
+        "tag": identity["tag"],
+        "commit": identity["source_commit"],
+        "identity": identity,
+        "signing_public_key": public_key(key),
+        "artifacts": [
+            {
+                "name": name,
+                "sha256": digest(directory / name),
+                "size": (directory / name).stat().st_size,
+                "scope": "support",
+            }
+            for name in sorted(names)
+        ],
+    }
+    (directory / "artifacts.json").write_text(
+        json.dumps(document, sort_keys=True, indent=2) + "\n"
     )
-    if head:
-        # Fast-forward only; a concurrent publication fails instead of losing data.
-        gh_api(
-            f"repos/{repo}/git/refs/heads/{branch}",
-            "PATCH",
-            {"sha": commit["sha"], "force": False},
+
+
+def validate_payload(identity, directory, ledger_sha256=None):
+    validate_identity(identity)
+    ledger_path = directory / "artifacts.json"
+    expected_digest = ledger_sha256 or digest(ledger_path)
+    verify_payload(
+        ledger_path,
+        directory,
+        identity["tag"],
+        identity["source_commit"],
+        expected_digest,
+    )
+    document = json.loads(ledger_path.read_bytes())
+    expected_names = {
+        "Antfly-Dictation-" + identity["version"] + "-universal.zip",
+        "appcast.xml",
+        "SHA256SUMS",
+    }
+    if (
+        document.get("schema_version") != 2
+        or document.get("product") != "antfly-dictation"
+        or document.get("identity") != identity
+        or {entry["name"] for entry in document["artifacts"]} != expected_names
+    ):
+        raise ValueError("Dictation release ledger identity or member set differs")
+    public_key(document["signing_public_key"])
+    verify_feed(identity, directory)
+    return document
+
+
+def promote_feed(storage, channel, identity, feed):
+    if channel not in {"stable", "beta"}:
+        raise ValueError("Invalid dictation update channel")
+    store = storage.channel_store(
+        f"{POLICY['storage_prefix']}/channels/{channel}/appcast.xml"
+    )
+    for attempt in range(3):
+        previous = store.load_bytes(max_bytes=256 * 1024)
+        if previous.body is not None:
+            root = ET.fromstring(previous.body)
+            old_version = root.findtext(f"channel/item/{{{SPARKLE}}}shortVersionString")
+            if old_version is None:
+                raise ValueError("Current R2 feed has no release identity")
+            old = version("dictation/v" + old_version)["order"]
+            new = version(identity["tag"])["order"]
+            if new < old:
+                return "superseded"
+            if new == old:
+                if previous.body != feed:
+                    raise ValueError(
+                        "Conflicting signed feed bytes for an existing version"
+                    )
+                return "committed"
+        try:
+            store.compare_and_swap_bytes(
+                previous, feed, "application/xml", "no-cache, no-transform"
+            )
+            return "committed"
+        except ConditionalWriteConflict:
+            if attempt == 2:
+                raise
+    raise AssertionError("Unreachable feed publication state")
+
+
+def publish(identity, directory, storage, source_verifier=None):
+    source_verifier = source_verifier or verify_source
+    source_verifier(identity)
+    ledger = validate_payload(identity, directory)
+    ledger_path = directory / "artifacts.json"
+    ledger_digest = digest(ledger_path)
+    prefix = release_prefix(identity)
+    # Reserve both long-lived signing trust and version identity before writing
+    # the release prefix. Neither can be silently replaced by a competing build.
+    import tempfile
+
+    with tempfile.TemporaryDirectory(
+        dir=directory.parent, prefix="dictation-seal-"
+    ) as temporary:
+        temporary = Path(temporary)
+        trust = temporary / "public-key.json"
+        trust.write_text(
+            json.dumps(
+                {"schema_version": 1, "public_key": ledger["signing_public_key"]},
+                sort_keys=True,
+            )
+            + "\n"
         )
-    else:
-        gh_api(
-            f"repos/{repo}/git/refs",
-            "POST",
-            {"ref": "refs/heads/" + branch, "sha": commit["sha"]},
+        storage.upload_immutable(
+            trust, f"{POLICY['storage_prefix']}/signing/public-key.json"
         )
+        reservation = temporary / "identity.json"
+        reservation.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "identity": identity,
+                    "ledger_sha256": ledger_digest,
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        storage.upload_immutable(
+            reservation,
+            f"{POLICY['storage_prefix']}/identities/{identity['version']}.json",
+        )
+    members = {entry["name"] for entry in ledger["artifacts"]} | {"artifacts.json"}
+    existing = set(storage.reader.list_names(prefix))
+    if existing - members:
+        raise ValueError("Unexpected objects in immutable release prefix")
+    for name in sorted(members - {"artifacts.json"}) + ["artifacts.json"]:
+        if name == "artifacts.json":
+            # Never seal a prefix with extra/missing members.
+            current = set(storage.reader.list_names(prefix))
+            if current - {"artifacts.json"} != members - {"artifacts.json"}:
+                raise ValueError("Release prefix is incomplete before sealing")
+        path = directory / name
+        storage.upload_immutable(
+            path, f"{POLICY['storage_prefix']}/artifacts/sha256/{digest(path)}/{name}"
+        )
+        # The ledger is the final commit marker for an exact immutable prefix.
+        storage.upload_immutable(path, f"{prefix}/{name}")
+    storage.exact(prefix, members)
+    source_verifier(identity)
+    feed = (directory / "appcast.xml").read_bytes()
+    channels = (
+        [identity["channel"]] if identity["channel"] == "beta" else ["stable", "beta"]
+    )
+    return {
+        channel: promote_feed(storage, channel, identity, feed) for channel in channels
+    }
+
+
+def recover(storage, tag, commit, ledger_sha256, out_dir):
+    identity_version = version(tag)
+    prefix = f"{POLICY['storage_prefix']}/releases/{identity_version['version']}"
+    import tempfile
+
+    if out_dir.exists():
+        raise ValueError("Recovery output must not already exist")
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=out_dir.parent, prefix="dictation-recover-"
+    ) as temporary:
+        stage = Path(temporary) / "payload"
+        restore_payload(storage.reader, prefix, stage, tag, commit, ledger_sha256)
+        document = json.loads((stage / "artifacts.json").read_bytes())
+        identity = document["identity"]
+        validate_payload(identity, stage, ledger_sha256)
+        trust = storage.reader.read_optional(
+            f"{POLICY['storage_prefix']}/signing/public-key.json"
+        )
+        if trust is None or json.loads(trust) != {
+            "schema_version": 1,
+            "public_key": document["signing_public_key"],
+        }:
+            raise ValueError(
+                "Recovered release differs from the established R2 signing identity"
+            )
+        stage.rename(out_dir)
+    return identity
 
 
 def inspect_release_assets(release, identity, expected, sizes):
@@ -575,7 +775,13 @@ def upload_release_assets(identity, directory, release, expected):
             error = mutation_error
         # A failed response can still mean GitHub accepted some/all bytes.
         # Always reconcile before retrying; complete uploads are never repeated.
-        release = gh_api(f"repos/{repo}/releases/tags/{identity['tag']}")
+        release_id = release["id"]
+        release = gh_api(f"repos/{repo}/releases/{release_id}")
+        release = with_complete_assets(
+            repo,
+            release,
+            os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", ""),
+        )
         present, _ = inspect_release_assets(release, identity, expected, sizes)
         if present == set(expected):
             return release
@@ -591,31 +797,16 @@ def upload_release_assets(identity, directory, release, expected):
     raise AssertionError("Unreachable upload retry state")
 
 
-def publish(identity, directory):
+def publish_github_mirror(identity, directory):
     verify_source(identity)
-    manifest = json.loads((directory / "release.json").read_text())
-    if manifest.get("schema_version") != 1:
-        raise ValueError("Unsupported release manifest")
-    if manifest["identity"] != identity:
-        raise ValueError("Artifact identity mismatch")
-    expected = {
-        "Antfly-Dictation-" + identity["version"] + "-universal.zip",
-        "appcast.xml",
-        "SHA256SUMS",
-    }
-    if set(manifest["sha256"]) != expected:
-        raise ValueError("Unexpected release payload")
-    for name, checksum in manifest["sha256"].items():
-        if digest(directory / name) != checksum:
-            raise ValueError("Artifact digest mismatch")
-    feed = verify_feed(identity, directory)
+    ledger = validate_payload(identity, directory)
+    expected_digests = {entry["name"]: entry["sha256"] for entry in ledger["artifacts"]}
+    expected_digests["artifacts.json"] = digest(directory / "artifacts.json")
     repo = POLICY["repository"]
-    try:
-        release = gh_api(f"repos/{repo}/releases/tags/{identity['tag']}")
-    except GitHubError as error:
-        if error.status != 404:
-            raise
-        release = None
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise ValueError("A GitHub token is required for the optional mirror")
+    release = get_release_by_tag(repo, identity["tag"], token)
     if release is None:
         args = [
             "gh",
@@ -637,9 +828,10 @@ def publish(identity, directory):
         if identity["channel"] == "beta":
             args.append("--prerelease")
         run(*args)
-        release = gh_api(f"repos/{repo}/releases/tags/{identity['tag']}")
-    expected_digests = dict(manifest["sha256"])
-    expected_digests["release.json"] = digest(directory / "release.json")
+        release = get_release_by_tag(repo, identity["tag"], token)
+        if release is None:
+            raise ValueError("Created GitHub mirror draft could not be resolved")
+    release = with_complete_assets(repo, release, token)
     release = upload_release_assets(identity, directory, release, expected_digests)
     verify_source(identity)
     if release["draft"]:
@@ -653,8 +845,7 @@ def publish(identity, directory):
             "--draft=false",
             "--latest=false",
         )
-    # The feed moves only after every immutable download is available.
-    publish_feed(identity, feed)
+    # The optional mirror never controls the canonical R2 update channel.
 
 
 def main():
@@ -674,15 +865,30 @@ def main():
     p = sub.add_parser("manifest")
     p.add_argument("identity", type=Path)
     p.add_argument("directory", type=Path)
+    p.add_argument("--key")
     p = sub.add_parser("verify-bundle")
     p.add_argument("identity", type=Path)
     p.add_argument("bundle", type=Path)
     p.add_argument("--key", required=True)
     p = sub.add_parser("verify-zip")
     p.add_argument("archive", type=Path)
-    p = sub.add_parser("publish")
+    p = sub.add_parser("mirror")
     p.add_argument("identity", type=Path)
     p.add_argument("directory", type=Path)
+    for command in ("publish", "recover"):
+        p = sub.add_parser(command)
+        if command == "publish":
+            p.add_argument("identity", type=Path)
+            p.add_argument("directory", type=Path)
+        else:
+            p.add_argument("--tag", required=True)
+            p.add_argument("--commit", required=True)
+            p.add_argument("--ledger-sha256", required=True)
+            p.add_argument("--out-dir", type=Path, required=True)
+            p.add_argument("--identity-output", type=Path, required=True)
+        p.add_argument("--provider", choices=("s3", "local"), default="s3")
+        p.add_argument("--endpoint", default=os.environ.get("AWS_ENDPOINT_URL"))
+        p.add_argument("--local-root", type=Path, default=Path("dist/objectstorage"))
     args = parser.parse_args()
     if args.command == "stamp":
         stamp(args.plist, args.tag, args.key)
@@ -705,29 +911,42 @@ def main():
             ).decode()
         )
     elif args.command == "manifest":
-        files = sorted(
-            p
-            for p in args.directory.iterdir()
-            if p.name != "release.json" and p.is_file()
-        )
-        (args.directory / "release.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "identity": json.loads(args.identity.read_text()),
-                    "sha256": {p.name: digest(p) for p in files},
-                },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n"
+        write_manifest(
+            json.loads(args.identity.read_text()),
+            args.directory,
+            args.key or os.environ.get("SPARKLE_PUBLIC_KEY"),
         )
     elif args.command == "verify-bundle":
         verify_bundle(args.bundle, json.loads(args.identity.read_text()), args.key)
     elif args.command == "verify-zip":
         verify_unsigned_zip(args.archive)
-    elif args.command == "publish":
-        publish(json.loads(args.identity.read_text()), args.directory)
+    elif args.command == "mirror":
+        publish_github_mirror(json.loads(args.identity.read_text()), args.directory)
+    elif args.command in {"publish", "recover"}:
+        from storage import ObjectStorage
+
+        storage = (
+            ObjectStorage.s3(args.endpoint, POLICY["bucket"])
+            if args.provider == "s3"
+            else ObjectStorage.local(args.local_root, POLICY["bucket"])
+        )
+        if args.command == "publish":
+            publish(
+                json.loads(args.identity.read_text()),
+                args.directory,
+                storage,
+                source_verifier=(lambda identity: None)
+                if args.provider == "local"
+                else verify_source,
+            )
+        else:
+            identity = recover(
+                storage, args.tag, args.commit, args.ledger_sha256, args.out_dir
+            )
+            args.identity_output.parent.mkdir(parents=True, exist_ok=True)
+            args.identity_output.write_text(
+                json.dumps(identity, sort_keys=True, indent=2) + "\n"
+            )
 
 
 if __name__ == "__main__":

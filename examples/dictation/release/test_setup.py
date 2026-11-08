@@ -37,6 +37,23 @@ PACKAGE = Path(__file__).resolve().parents[1]
 
 
 class SigningIdentityTests(unittest.TestCase):
+    def setUp(self):
+        reader = patch.object(setup, "public_signing_key", return_value=None)
+        self.public_reader = reader.start()
+        self.addCleanup(reader.stop)
+
+    def test_r2_identity_cannot_be_replaced_by_a_conflicting_github_variable(self):
+        self.public_reader.return_value = OTHER_KEY
+        with patch.object(setup, "gh_api", return_value={"value": KEY}):
+            with self.assertRaisesRegex(ValueError, "identities differ"):
+                setup.existing_signing_key()
+
+    def test_missing_github_variable_does_not_bootstrap_over_r2(self):
+        self.public_reader.return_value = KEY
+        with patch.object(setup, "gh_api", side_effect=self.missing_variable()):
+            with self.assertRaisesRegex(ValueError, "existing R2"):
+                setup.existing_signing_key()
+
     def test_matching_key_is_reused_without_generating_or_overwriting_it(self):
         with (
             patch.object(setup, "existing_signing_key", return_value=KEY),
@@ -200,7 +217,7 @@ class SigningIdentityTests(unittest.TestCase):
             "gh_api",
             side_effect=[
                 self.missing_variable(),
-                [{"ref": "refs/heads/" + r.POLICY["feed_branch"]}],
+                [{"ref": "refs/heads/dictation-updates"}],
             ],
         ):
             with self.assertRaisesRegex(ValueError, "existing update feed"):

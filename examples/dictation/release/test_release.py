@@ -100,30 +100,13 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(
                 enclosure.attrib["{" + r.SPARKLE + "}edSignature"], SIGNATURE
             )
-            self.assertIn("/dictation/v1.0.0/", enclosure.attrib["url"])
+            self.assertIn("/antfly-dictation/releases/1.0.0/", enclosure.attrib["url"])
 
     def feed(self, tag):
         with tempfile.TemporaryDirectory() as d:
             archive = Path(d) / "app.zip"
             archive.write_bytes(b"archive")
             return r.appcast(r.version(tag) | {"tag": tag}, archive, SIGNATURE)
-
-    def test_feeds_do_not_downgrade(self):
-        latest = self.feed("dictation/v2.0.0")
-        tree = {"stable/appcast.xml": latest}
-        r.update_feed(tree, "stable", self.feed("dictation/v1.0.0"))
-        self.assertEqual(tree["stable/appcast.xml"], latest)
-        r.update_feed(tree, "stable", latest)
-        with self.assertRaises(ValueError):
-            r.update_feed(tree, "stable", latest + b"\n")
-
-    def test_stable_can_supersede_beta(self):
-        tree = {"beta/appcast.xml": self.feed("dictation/v1.0.0-rc.1")}
-        stable = self.feed("dictation/v1.0.0")
-        r.update_feed(tree, "beta", stable)
-        self.assertEqual(tree["beta/appcast.xml"], stable)
-        r.update_feed(tree, "beta", self.feed("dictation/v1.0.0-beta.2"))
-        self.assertEqual(tree["beta/appcast.xml"], stable)
 
     def test_rejects_archive_traversal_and_external_symlinks(self):
         for name, target in [
@@ -217,84 +200,6 @@ class PublicationTests(unittest.TestCase):
             "source_commit": "a" * 40,
             "controller_commit": "c" * 40,
         }
-
-    def test_feed_commit_is_fast_forward_only_and_stable_updates_both_channels(self):
-        calls = []
-
-        def api(path, method="GET", payload=None):
-            calls.append((path, method, payload))
-            if "/matching-refs/" in path:
-                return [
-                    {"ref": "refs/heads/dictation-updates", "object": {"sha": "d" * 40}}
-                ]
-            if method == "GET" and "/git/commits/" in path:
-                return {"tree": {"sha": "e" * 40}}
-            if "?recursive=" in path:
-                return {"tree": []}
-            if method == "POST":
-                return {"sha": "f" * 40}
-            return {}
-
-        with patch.object(r, "gh_api", side_effect=api):
-            r.publish_feed(self.identity(), b"new signed feed")
-        entries = next(
-            payload["tree"]
-            for _, method, payload in calls
-            if method == "POST" and isinstance(payload.get("tree"), list)
-        )
-        self.assertEqual(
-            {v["path"] for v in entries}, {"stable/appcast.xml", "beta/appcast.xml"}
-        )
-        self.assertEqual(calls[-1][1], "PATCH")
-        self.assertFalse(calls[-1][2]["force"])
-        commit = next(
-            payload
-            for path, method, payload in calls
-            if "/git/commits" in path and method == "POST"
-        )
-        self.assertEqual(commit["parents"], ["d" * 40])
-
-    def test_beta_publication_does_not_touch_stable(self):
-        identity = self.identity() | {"channel": "beta"}
-        calls = []
-
-        def api(path, method="GET", payload=None):
-            calls.append((path, method, payload))
-            if "/matching-refs/" in path:
-                return []
-            return {"sha": "f" * 40}
-
-        with patch.object(r, "gh_api", side_effect=api):
-            r.publish_feed(identity, b"new signed feed")
-        entries = next(
-            payload["tree"]
-            for _, method, payload in calls
-            if method == "POST" and isinstance(payload.get("tree"), list)
-        )
-        self.assertEqual([v["path"] for v in entries], ["beta/appcast.xml"])
-
-    def test_modified_signed_artifact_is_rejected_before_any_release_write(self):
-        with tempfile.TemporaryDirectory() as d:
-            directory = Path(d)
-            identity = self.identity()
-            files = {
-                "Antfly-Dictation-1.0.0-universal.zip": b"archive",
-                "appcast.xml": b"feed",
-                "SHA256SUMS": b"sums",
-            }
-            for name, data in files.items():
-                (directory / name).write_bytes(data)
-            manifest = {
-                "schema_version": 1,
-                "identity": identity,
-                "sha256": {name: r.digest(directory / name) for name in files},
-            }
-            (directory / "release.json").write_text(json.dumps(manifest))
-            (directory / "appcast.xml").write_bytes(b"modified")
-            with patch.object(r, "verify_source"), patch.object(r, "gh_api") as api:
-                with self.assertRaisesRegex(ValueError, "digest mismatch"):
-                    r.publish(identity, directory)
-                api.assert_not_called()
 
     def test_feed_download_identity_is_verified(self):
         with tempfile.TemporaryDirectory() as d:

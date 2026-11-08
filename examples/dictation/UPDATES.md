@@ -1,12 +1,13 @@
 # App updates and releases
 
 Antfly Dictation uses Sparkle 2 for signed, independent macOS app updates.
-The Antfly server and its models have their own lifecycle. Updating the app does
-not update a server, download models, or change the configured connection.
+Official apps include a universal Antfly runtime built from the same source
+commit. Sparkle replaces that runtime with the app. User-selected external
+servers and downloaded models have independent lifecycles.
 
 ## Installation and everyday updates
 
-Download the universal ZIP from an official `dictation/v…` GitHub Release, quit
+Download the official universal ZIP from `releases.antfly.io/antfly-dictation` (or the optional GitHub mirror), quit
 any development copy, and move **Antfly Dictation.app** into `/Applications`
 (or your user account's `~/Applications`). Launch that installed copy. The first
 migration from an ad hoc development build to Developer ID signing may require
@@ -157,43 +158,74 @@ and the app requires signed feed metadata and verification before extraction.
 The Sparkle release tools are downloaded by exact version and SHA-256 from
 `release/policy.json`; the Swift package is pinned in `Package.resolved`.
 
-A separate publication job consumes the exact signed artifact, rechecks the tag
-and current controller policy, verifies payload digests, and creates/verifies
-immutable GitHub Release assets. Existing uploads are verified by their reported
-SHA-256 digests and exact byte lengths, avoiding repeated full archive downloads.
-The release tag, recorded source commit, and stable/prerelease classification
-must match. It never overwrites a completed asset or takes the repository-wide
-Latest marker from Antfly. A published release must already have its complete
-verified asset set; recovery does not add or remove its downloads.
-Only after the downloads are published does it atomically fast-forward the
-`dictation-updates` feed branch. Feed publication refuses version regression,
-conflicting bytes at the same version, or concurrent lost updates.
+A separate publication job uses the existing **release-promotion** environment
+and `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_ENDPOINT_URL` secrets.
+The canonical bucket is **antfly-releases**. Apple credentials remain isolated
+in **dictation-release**. Python storage dependencies come from the repository's
+hash-locked `scripts/release/requirements.lock`.
+
+All app objects live under `antfly-dictation/`, outside the server's `antfly/`
+namespace. The app reuses the server release infrastructure's S3 immutable
+publisher, verified recovery reader, schema-2 `artifacts.json` ledger validator,
+and conditional-write transport. It has its own stable/beta product policy;
+server npm/container/Homebrew promotions do not apply to a macOS app.
+
+Publication first reserves a create-only signing identity at
+`signing/public-key.json` and a create-only version identity at
+`identities/<version>.json`. Changed keys or different builds of the same version
+fail instead of replacing deployed bytes. Every signed member is stored both at
+`artifacts/sha256/<digest>/<name>` and `releases/<version>/<name>`.
+The exact member set is checked before uploading `artifacts.json` last as the
+immutable seal, and checked again before publishing a channel.
 
 Feed URLs:
 
-- `https://raw.githubusercontent.com/antflydb/antfly/dictation-updates/stable/appcast.xml`
-- `https://raw.githubusercontent.com/antflydb/antfly/dictation-updates/beta/appcast.xml`
+- `https://releases.antfly.io/antfly-dictation/channels/stable/appcast.xml`
+- `https://releases.antfly.io/antfly-dictation/channels/beta/appcast.xml`
 
-These URLs become available after the first corresponding release. No release
-or feed is created just by running the setup helper.
+Archive URL:
+`https://releases.antfly.io/antfly-dictation/releases/<version>/Antfly-Dictation-<version>-universal.zip`
 
-Transient upload and placeholder-deletion failures have at most three attempts
-with bounded backoff. After every mutation response, including failures, the
-publisher re-reads remote state: bytes already accepted by GitHub are not uploaded
-again. Only verified zero-byte `starter` placeholders on a matching draft can be
-removed. The complete snapshot is checked before any deletion, so conflicting
-bytes, unexpected assets, malformed placeholders, or release-identity mismatches
-stop publication without removing data. Permission and validation errors stop
-without automatic retry. A feed advances only after every asset is verified and
-the draft has been published; retrying a feed failure can reuse a complete
-published release without modifying its downloads.
+The signed XML feed is the channel's atomic commit point. Conditional R2 writes
+use the previous ETag (or create-only on first publication), with up to three
+reconciliation attempts. Feeds use `Cache-Control: no-cache, no-transform`; do
+not configure a CDN rule that overrides this or transforms the signed bytes.
+Older releases cannot downgrade a channel; different signed bytes at the same
+version are an error. Stable advances stable and beta independently. If only one
+write succeeds, retry completes the other without replacing immutable assets.
+A lost response is resolved by reading the exact existing bytes on retry.
 
-If publication still fails after signing, use **Re-run failed jobs** on that run,
-so publication reuses the signed artifact. Do not re-run signing to replace an
-already-published version: notarization timestamps can produce different bytes.
-Do not move release tags. A correction is a new version. If the controller policy
-changes while a release is queued, release from a new tag containing the reviewed
-policy instead of bypassing its identity checks.
+Set repository variable `DICTATION_GITHUB_MIRROR=true` to enable a separate
+GitHub mirror job **after** canonical R2 publication. Mirror failures cannot block
+R2 feeds. Draft lookup includes the paginated releases listing because GitHub's
+by-tag endpoint excludes drafts. Reconciliation reads assets by numeric release
+ID, preserves verified uploads, and removes only empty matching draft placeholders.
+GitHub does not own the app channel or Antfly's Latest release marker.
+
+If signing succeeded but publication failed, use **Re-run failed jobs** to reuse
+the signed artifact. Never re-sign an already reserved version: timestamps can
+change its bytes. Once the R2 prefix is sealed, **Dictation release recovery**
+can restore it using the exact tag, source commit, and trusted SHA-256 of its
+`artifacts.json`. Recovery runs only from the default branch, under
+release-promotion. It stages the downloads, checks the exact member set, hashes,
+original identity, and established signing key, then finishes channel promotion
+without signing credentials or rebuilding. Equivalent local CLI:
+
+```sh
+python3 examples/dictation/release/release.py recover \
+  --tag dictation/v0.1.0-beta.1 --commit SOURCE_COMMIT \
+  --ledger-sha256 TRUSTED_LEDGER_SHA256 \
+  --out-dir dist/recovered --identity-output dist/identity.json
+DEFAULT_BRANCH=main python3 examples/dictation/release/release.py publish \
+  dist/identity.json dist/recovered
+```
+
+The ledger digest is printed during publication. Record it with the release run;
+recovery requires a trusted digest, not one supplied by an untrusted mirror.
+Unsealed prefixes cannot be recovered through this workflow; retry the original
+signed artifact instead. Existing sealed app versions are retained indefinitely.
+Server release garbage collection and aliases never touch the app namespace.
+No production object is created by running the setup helper.
 
 Qualify the first real signed release on a Mac: install in Applications, grant
 microphone/Accessibility, dictate into another app, upgrade to a second signed
@@ -216,25 +248,54 @@ The native signing regression uses random synthetic keys via stdin to verify
 archive and feed signatures and reject tampered payloads. It never accesses the
 organization's signing key. Non-macOS policy tests skip that native regression.
 
-## Should the app also distribute Antfly?
+## Managed runtime for downloaded apps
 
-Offer an **optional managed local runtime download** in a future local-server
-setup flow. Keep the desktop ZIP and server releases independent. Do not bundle
-model weights or silently upgrade an existing server.
+New installations default to **On this Mac (bundled Antfly)**. Existing settings
+without `connectionMode` retain their external server; users can switch explicitly.
+The external server field and credentials remain available and are preserved
+when switching. Remote settings replacement cannot change the connection mode.
 
-The managed-runtime design should verify pinned release provenance and hashes,
-install versioned binaries under Application Support, bind only to loopback,
-use a Keychain-backed per-install credential, and own only its own process. Keep
-an existing working runtime until a replacement passes health/capability checks.
-Models need explicit size, download, and storage controls. A user-supplied local
-or remote server must remain an equally supported choice.
+The unsigned build compiles the engine and Apple sidecar for ARM64 and Intel
+from the app's exact source commit, using worktree-local Zig caches, then combines
+the slices. Release verification requires both architectures, matching source
+metadata, portable library dependencies, and a macOS-14-compatible engine.
+The Apple bridge is loaded only on macOS 26 or newer. The signer signs both
+nested binaries before signing and notarizing the complete app. No Homebrew,
+Node, Zig, terminal setup, or standalone Antfly installation is required by users.
 
-Current Antfly macOS runtime releases are ARM64. Intel Macs can run this universal
-app against a remote server; an Intel managed runtime needs its own qualified
-server build before being offered. This update implementation does not yet
-install, launch, update, or bundle an Antfly server. Existing model discovery and
-processing capability checks continue to determine what the configured server
-can do.
+The app launches a headless copy of itself as a supervisor. An exclusive lock
+protects the runtime data directory. Its Antfly child binds only to
+127.0.0.1 on ports 47831 and 47832. Occupied ports block startup; the app never
+attaches to or kills an unrelated server. A private pipe ties the supervisor's
+lifetime to the app: EOF on quit, update, or app crash terminates the owned child,
+with a ten-second grace period before killing only that still-owned process.
+Unexpected exits get at most three retries with exponential backoff. Startup
+has a one-minute readiness deadline, and Settings provides status, retry, and
+bounded diagnostics. Startup does not imply a transcription model is ready.
+
+A random per-install administrator password stays in Keychain and travels to
+the supervisor through the private pipe. Antfly's initial auth bootstrap reads it
+from its environment; it never appears in arguments, configuration, or logs.
+Public inference and table APIs require authentication. Missing credentials for
+existing data cause a recoverable error; the app does not reset the database.
+The supervised environment excludes developer DYLD overrides and provider keys.
+
+Models and data live in `~/Library/Application Support/AntflyDictation/Runtime`,
+outside the app. **Download Whisper Tiny…** explicitly downloads the transcription
+model and restarts the engine to discover it. Downloads have their own supervisor
+and stop when the app exits. **Use Apple speech** selects native recognition and
+allows Apple's asset setup; locale, OS, hardware, and Apple Intelligence readiness
+remain visible through model discovery. Both choices select recognition without
+cleanup. Users can choose a discovered cleanup generator explicitly. An existing
+server configuration is never edited or upgraded by this flow.
+
+App updates wait for model setup through the normal working-state gate, stop the
+supervisor before replacement, and restart it if Sparkle installation is canceled
+or fails. Runtime data, models, credentials, and presets survive app replacement.
+For local development without a bundled engine, choose External Antfly server.
+Use `BUNDLE_RUNTIME=1 UNIVERSAL_BUILD=1 examples/dictation/build-app.sh` to exercise
+the complete bundled path. Building the Apple bridge requires a macOS 27 SDK and
+Swift 6; official release builders must provide that toolchain.
 
 References: [Sparkle setup](https://sparkle-project.org/documentation/),
 [manual nested signing](https://sparkle-project.org/documentation/sandboxing/),

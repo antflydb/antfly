@@ -3,6 +3,8 @@
 
 import Foundation
 
+public enum ConnectionMode: String, Codable, Sendable { case managed, external }
+
 public enum TranscriberRoute: String, Codable, Sendable { case gateway, runtime }
 
 public enum DictationError: Error, LocalizedError {
@@ -74,6 +76,9 @@ extension Preset {
 public struct Configuration: Codable, Equatable, Sendable {
   public static let maxEncodedBytes = 1_048_576
   public var version = 1
+  /// Missing in older settings: preserve the user’s existing external server.
+  public var connectionMode: ConnectionMode? = .managed
+  public var usesManagedRuntime: Bool { connectionMode == .managed }
   public var server = "http://localhost:8080"
   public var table = "dictation"
   public var profile = "default"

@@ -457,3 +457,14 @@ replace the configured Antfly server or models.
 See the [release setup guide](https://github.com/antflydb/antfly/blob/main/examples/dictation/UPDATES.md)
 for organization signing, notarization, release qualification, and the separate
 optional managed-local-runtime design.
+
+## Downloaded macOS app
+
+Official Antfly Dictation builds include a managed local engine. New installs
+start it automatically; Settings offers an explicit Whisper Tiny download or
+Apple speech selection on supported Macs. Existing external-server settings
+are preserved. The app and compatible engine update together using signed
+Sparkle feeds and immutable downloads on `releases.antfly.io/antfly-dictation`.
+Models and user data remain in Application Support; server credentials stay in
+Keychain. External Antfly servers remain supported and are updated separately.
+See the example's `UPDATES.md` for packaging and recovery details.

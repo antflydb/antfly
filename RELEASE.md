@@ -645,3 +645,12 @@ lifecycle decision.
 
 Package registries are immutable. If an RC publish reaches npm or PyPI, the same
 version cannot be republished after recreating the tag; cut the next RC instead.
+
+## Dictation desktop releases
+
+The independent `dictation/v…` product publishes signed app downloads and Sparkle
+feeds through the same R2 bucket and shared immutable storage/CAS infrastructure,
+under `antfly-dictation/`. The universal app includes its compatible managed
+Antfly runtime. Server aliases, registries, and garbage collection remain scoped
+to `antfly/`. See [Dictation updates](examples/dictation/UPDATES.md) for signing,
+protected environments, optional GitHub mirroring, and sealed-payload recovery.

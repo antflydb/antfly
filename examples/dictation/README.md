@@ -82,6 +82,16 @@ transcribers accept named cleanup generators,
 including Apple or hosted generators. The gateway preserves Whisper dictionary
 hints and decoding options on the recognition stage.
 
+## Downloaded apps and local engine
+
+Official downloads include a supervised Antfly runtime for Apple Silicon and
+Intel. New installations use **On this Mac** by default. In Settings, explicitly
+download Whisper Tiny or select Apple speech (macOS 26+). The app handles startup,
+authentication, model discovery, and shutdown. No separate server install is needed.
+Existing configurations keep their chosen external server. See [updates and
+managed runtime](UPDATES.md#managed-runtime-for-downloaded-apps) for lifecycle,
+packaging, data retention, and troubleshooting.
+
 ## Presets and shortcuts
 
 Each preset stores an output mode (Verbatim, Clean, or Rewrite), processing strategy

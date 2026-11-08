@@ -6,21 +6,28 @@ import Foundation
 public actor AntflyClient {
   let origin: URL
   let token: String
+  private let basicPassword: String?
   private let inferenceGate: InferenceGate
   let session: URLSession
   public init(
-    server: String, token: String = "", session: URLSession? = nil, maxConcurrentRequests: Int = 1
+    server: String, token: String = "", basicPassword: String? = nil, session: URLSession? = nil,
+    maxConcurrentRequests: Int = 1
   ) throws {
     var config = Configuration()
     config.server = server
     config.concurrentRequests = maxConcurrentRequests
-    try self.init(configuration: config, token: token, session: session)
+    try self.init(
+      configuration: config, token: token, basicPassword: basicPassword, session: session)
   }
-  public init(configuration: Configuration, token: String = "", session: URLSession? = nil) throws {
+  public init(
+    configuration: Configuration, token: String = "", basicPassword: String? = nil,
+    session: URLSession? = nil
+  ) throws {
     let config = try configuration.validated()
     inferenceGate = InferenceGate(capacity: config.concurrentRequests ?? 1)
     origin = URL(string: config.server)!
     self.token = token
+    self.basicPassword = basicPassword
     let settings = URLSessionConfiguration.ephemeral
     settings.timeoutIntervalForRequest = 120
     settings.timeoutIntervalForResource = 300
@@ -31,7 +38,12 @@ public actor AntflyClient {
     request.httpMethod = method
     request.httpBody = body
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    if !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+    if let basicPassword {
+      let encoded = Data(("admin:" + basicPassword).utf8).base64EncodedString()
+      request.setValue("Basic " + encoded, forHTTPHeaderField: "Authorization")
+    } else if !token.isEmpty {
+      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
     return request
   }
   private func json(

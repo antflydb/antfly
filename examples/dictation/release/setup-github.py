@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from release import GitHubError, POLICY, gh_api, public_key
+from release import GitHubError, POLICY, gh_api, public_key, public_signing_key
 
 
 def gh(*args, data=None):
@@ -41,15 +41,25 @@ KEY_ACCOUNT = "antflydb-dictation"
 def existing_signing_key():
     """Missing configuration is bootstrap only if no release identity exists."""
     repo = POLICY["repository"]
+    deployed = public_signing_key()
     try:
-        return public_key(
+        configured = public_key(
             gh_api(f"repos/{repo}/actions/variables/{KEY_VARIABLE}")["value"]
         )
+        if deployed is not None and deployed != configured:
+            raise ValueError(
+                "GitHub and R2 signing identities differ; restore the original key"
+            )
+        return configured
     except GitHubError as error:
         if error.status != 404:
             raise
-    refs = gh_api(f"repos/{repo}/git/matching-refs/heads/{POLICY['feed_branch']}")
-    if any(ref["ref"] == "refs/heads/" + POLICY["feed_branch"] for ref in refs):
+    if deployed is not None:
+        raise ValueError(
+            "Signing configuration is missing for an existing R2 identity; restore its original public key"
+        )
+    refs = gh_api(f"repos/{repo}/git/matching-refs/heads/dictation-updates")
+    if any(ref["ref"] == "refs/heads/dictation-updates" for ref in refs):
         raise ValueError(
             "Signing configuration is missing for an existing update feed. Restore its original public key; do not bootstrap a replacement."
         )

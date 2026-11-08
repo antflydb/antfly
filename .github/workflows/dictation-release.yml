@@ -50,7 +50,7 @@ jobs:
   build:
     needs: resolve
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -58,6 +58,12 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.source_commit }}
           persist-credentials: false
+      - id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
       - name: Test app and release policy
         run: |
           bash examples/dictation/release/fetch-tools.sh
@@ -129,7 +135,44 @@ jobs:
     needs: [resolve, sign]
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: dictation-release
+    environment: release-promotion
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dictation-identity
+          path: dist/identity
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dictation-signed
+          path: dist/signed
+      - id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ steps.toolchain.outputs.python_build }}
+      - name: Install locked release dependencies
+        run: python3 -m pip install --require-hashes -r scripts/release/requirements.lock
+      - name: Publish immutable downloads, then advance signed channel feeds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+        run: python3 examples/dictation/release/release.py publish dist/identity/identity.json dist/signed
+
+  github-mirror:
+    if: ${{ vars.DICTATION_GITHUB_MIRROR == 'true' }}
+    needs: [resolve, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release-promotion
     permissions:
       contents: write
       actions: read
@@ -146,7 +189,7 @@ jobs:
         with:
           name: dictation-signed
           path: dist/signed
-      - name: Publish immutable downloads, then advance signed channel feeds
+      - name: Mirror sealed downloads without controlling the update channel
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 examples/dictation/release/release.py publish dist/identity/identity.json dist/signed
+        run: python3 examples/dictation/release/release.py mirror dist/identity/identity.json dist/signed

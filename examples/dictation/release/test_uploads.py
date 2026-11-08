@@ -17,7 +17,6 @@
 
 import copy
 import hashlib
-import json
 import subprocess
 import tempfile
 import unittest
@@ -29,6 +28,11 @@ import release as r
 
 class UploadRecoveryTests(unittest.TestCase):
     def setUp(self):
+        assets = patch.object(
+            r, "with_complete_assets", side_effect=lambda repo, release, token: release
+        )
+        assets.start()
+        self.addCleanup(assets.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
@@ -40,7 +44,7 @@ class UploadRecoveryTests(unittest.TestCase):
             "bundle_version": "1.0.0",
             "controller_commit": "b" * 40,
         }
-        for name in ("app.zip", "appcast.xml", "SHA256SUMS", "release.json"):
+        for name in ("app.zip", "appcast.xml", "SHA256SUMS", "artifacts.json"):
             (self.directory / name).write_bytes(("synthetic " + name).encode())
         self.expected = {p.name: r.digest(p) for p in self.directory.iterdir()}
         self.remote = {
@@ -320,15 +324,9 @@ class UploadRecoveryTests(unittest.TestCase):
             r.appcast(self.identity, archive, base64.b64encode(bytes(64)).decode())
         )
         (self.directory / "app.zip").unlink()
-        hashes = {
-            p.name: r.digest(p)
-            for p in self.directory.iterdir()
-            if p.name != "release.json"
-        }
-        (self.directory / "release.json").write_text(
-            json.dumps(
-                {"schema_version": 1, "identity": self.identity, "sha256": hashes}
-            )
+        (self.directory / "artifacts.json").unlink()
+        r.write_manifest(
+            self.identity, self.directory, base64.b64encode(bytes(range(32))).decode()
         )
         self.expected = {p.name: r.digest(p) for p in self.directory.iterdir()}
         for name in self.expected:
@@ -338,12 +336,43 @@ class UploadRecoveryTests(unittest.TestCase):
             patch.object(r, "verify_source"),
             patch.object(r, "gh_api", side_effect=self.api),
             patch.object(r, "run", side_effect=self.command),
-            patch.object(r, "publish_feed") as feed,
+            patch.object(r, "get_release_by_tag", return_value=self.remote),
+            patch.dict(r.os.environ, {"GH_TOKEN": "fixture"}),
         ):
-            r.publish(self.identity, self.directory)
-            feed.assert_called_once()
+            r.publish_github_mirror(self.identity, self.directory)
         self.assertEqual(self.uploads, [])
         self.assertFalse(any(method != "GET" for _, method in self.requests))
+
+
+class DraftLookupContractTests(unittest.TestCase):
+    def test_draft_tag_404_falls_back_to_listing_and_numeric_paginated_assets(self):
+        import create_github_release as github
+
+        calls = []
+        draft = {"id": 42, "tag_name": "dictation/v1.0.0", "draft": True}
+
+        def api(method, repo, path, token, body=None):
+            calls.append(path)
+            if path.startswith("/releases/tags/"):
+                raise github.GitHubError("GET fixture failed with 404")
+            if path == "/releases?per_page=100&page=1":
+                return [{"tag_name": "other/v1"}] * 100
+            if path == "/releases?per_page=100&page=2":
+                return [draft]
+            if path == "/releases/42/assets?per_page=100&page=1":
+                return [{"id": n} for n in range(100)]
+            if path == "/releases/42/assets?per_page=100&page=2":
+                return [{"id": 100}]
+            raise AssertionError(path)
+
+        with patch.object(github, "github_api", side_effect=api):
+            found = r.get_release_by_tag(
+                "antflydb/antfly", draft["tag_name"], "fixture"
+            )
+            complete = github.with_complete_assets("antflydb/antfly", found, "fixture")
+        self.assertTrue(complete["draft"])
+        self.assertEqual(len(complete["assets"]), 101)
+        self.assertEqual(calls[-1], "/releases/42/assets?per_page=100&page=2")
 
 
 if __name__ == "__main__":

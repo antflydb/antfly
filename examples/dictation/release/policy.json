@@ -3,6 +3,8 @@
   "sparkle_tools_sha256": "1a856d2a9edb8e628de88121d7be04cf0e2167f8641650b78fca00b14244cf27",
   "repository": "antflydb/antfly",
   "bundle_id": "dev.antfly.dictation",
-  "feed_branch": "dictation-updates",
-  "minimum_system_version": "14.0"
+  "minimum_system_version": "14.0",
+  "bucket": "antfly-releases",
+  "storage_prefix": "antfly-dictation",
+  "public_base_url": "https://releases.antfly.io/antfly-dictation"
 }
