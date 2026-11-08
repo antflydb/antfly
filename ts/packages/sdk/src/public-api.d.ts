@@ -26784,6 +26784,16 @@ export interface components {
              * @default 0
              */
             true_negative?: number;
+            /**
+             * Format: uint64
+             * @default 0
+             */
+            tokens?: number;
+            /**
+             * Format: uint64
+             * @default 0
+             */
+            token_cases?: number;
         };
         MemoryEvaluationReport: {
             counts: components["schemas"]["MemoryEvaluationCounts"];
@@ -26797,6 +26807,11 @@ export interface components {
             coverage: number | null;
             /** Format: double */
             accuracy: number | null;
+            /**
+             * Format: double
+             * @default null
+             */
+            mean_tokens?: number | null;
         };
         MemoryEvaluationJudgeTask: {
             case_id: string;
@@ -26822,6 +26837,11 @@ export interface components {
             /** @default null */
             ranking?: string[] | null;
             reason?: string;
+            /**
+             * Format: uint64
+             * @default null
+             */
+            token_upper_bound?: number | null;
         };
         MemoryEvaluationJudgeOutput: {
             /**

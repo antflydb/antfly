@@ -59835,6 +59835,22 @@ components:
           default: 0
           x-go-type-skip-optional-pointer: false
           x-go-type: uint64
+        tokens:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        token_cases:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
       additionalProperties: false
     MemoryEvaluationReport:
       type: object
@@ -59864,6 +59880,12 @@ components:
         accuracy:
           type: number
           format: double
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        mean_tokens:
+          type: number
+          format: double
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
       required:
@@ -59942,6 +59964,15 @@ components:
           nullable: true
         reason:
           type: string
+        token_upper_bound:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
       additionalProperties: false
     MemoryEvaluationJudgeOutput:
       type: object

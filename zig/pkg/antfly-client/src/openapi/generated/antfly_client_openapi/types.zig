@@ -38890,6 +38890,8 @@ pub const MemoryEvaluationCounts = struct {
     false_positive: ?u64 = null,
     false_negative: ?u64 = null,
     true_negative: ?u64 = null,
+    tokens: ?u64 = null,
+    token_cases: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -38904,6 +38906,8 @@ pub const MemoryEvaluationCounts = struct {
         .{ "false_positive", "false_positive", true },
         .{ "false_negative", "false_negative", true },
         .{ "true_negative", "true_negative", true },
+        .{ "tokens", "tokens", true },
+        .{ "token_cases", "token_cases", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -38958,6 +38962,14 @@ pub const MemoryEvaluationCounts = struct {
         }
         if (self.true_negative) |value| {
             try jw.objectField("true_negative");
+            try jw.write(value);
+        }
+        if (self.tokens) |value| {
+            try jw.objectField("tokens");
+            try jw.write(value);
+        }
+        if (self.token_cases) |value| {
+            try jw.objectField("token_cases");
             try jw.write(value);
         }
         try jw.endObject();
@@ -39223,6 +39235,7 @@ pub const MemoryEvaluationPrediction = struct {
     label: OpenApiOptionalNullable([]const u8) = .absent,
     ranking: OpenApiOptionalNullable([]const []const u8) = .absent,
     reason: ?[]const u8 = null,
+    token_upper_bound: OpenApiOptionalNullable(u64) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -39230,6 +39243,7 @@ pub const MemoryEvaluationPrediction = struct {
         .{ "label", "label", false },
         .{ "ranking", "ranking", false },
         .{ "reason", "reason", true },
+        .{ "token_upper_bound", "token_upper_bound", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -39279,6 +39293,17 @@ pub const MemoryEvaluationPrediction = struct {
             try jw.objectField("reason");
             try jw.write(value);
         }
+        switch (self.token_upper_bound) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("token_upper_bound");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("token_upper_bound");
+                try jw.write(value);
+            },
+        }
         try jw.endObject();
     }
 };
@@ -39290,6 +39315,7 @@ pub const MemoryEvaluationReport = struct {
     f1: ?f64,
     coverage: ?f64,
     accuracy: ?f64,
+    mean_tokens: OpenApiOptionalNullable(f64) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -39299,6 +39325,7 @@ pub const MemoryEvaluationReport = struct {
         .{ "f1", "f1", false },
         .{ "coverage", "coverage", false },
         .{ "accuracy", "accuracy", false },
+        .{ "mean_tokens", "mean_tokens", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -39323,6 +39350,17 @@ pub const MemoryEvaluationReport = struct {
         try jw.write(self.coverage);
         try jw.objectField("accuracy");
         try jw.write(self.accuracy);
+        switch (self.mean_tokens) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("mean_tokens");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("mean_tokens");
+                try jw.write(value);
+            },
+        }
         try jw.endObject();
     }
 };
