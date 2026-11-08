@@ -234,3 +234,71 @@ private actor SlowAudio {
   #expect(await audio.clips == [1])
   #expect(try Data(contentsOf: path.appendingPathComponent("last-recording.wav")) == Data([1]))
 }
+
+@Test(arguments: [false, true], [false, true]) @MainActor
+func repeatedCancellationCannotResurrectAnAudioArchive(existingArchive: Bool, quit: Bool)
+  async throws
+{
+  let path = try directory()
+  defer { try? FileManager.default.removeItem(at: path) }
+  let file = path.appendingPathComponent("last-recording.wav")
+  if existingArchive { try Data([99]).write(to: file) }
+  let audio = SlowAudio()
+  let store = Store(
+    directory: path, registerHotkey: false,
+    audioArchiveStage: { try await audio.stage($0, directory: $1) },
+    credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  store.archiveAudio(Task { Data([1]) }, run: store.generation)
+  await audio.began.wait()
+  store.state = .processing
+  store.cancel()
+  for clip in UInt8(2)...3 {
+    store.archiveAudio(Task { Data([clip]) }, run: store.generation)
+    store.state = .processing
+    store.cancel()
+  }
+  await audio.release.send()
+  if quit { await store.prepareToQuit() } else { await store.audioArchiveTask?.value }
+  #expect(await audio.clips == [1])
+  #expect(await audio.maximum == 1)
+  if existingArchive {
+    #expect(try Data(contentsOf: file) == Data([99]))
+  } else {
+    #expect(!FileManager.default.fileExists(atPath: file.path))
+  }
+  #expect(
+    try FileManager.default.contentsOfDirectory(atPath: path.path).allSatisfy {
+      !$0.hasPrefix(".recording-")
+    })
+}
+
+@Test @MainActor func canceledEncodingCannotRegainArchiveEligibility() async throws {
+  let path = try directory()
+  defer { try? FileManager.default.removeItem(at: path) }
+  let began = Signal()
+  let release = Signal()
+  let store = Store(
+    directory: path, registerHotkey: false,
+    audioArchiveStage: { _, _ in
+      Issue.record("Canceled encoding reached disk staging")
+      throw CancellationError()
+    }, credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  store.archiveAudio(
+    Task {
+      await began.send()
+      await release.wait()
+      return Data([1])
+    }, run: store.generation)
+  await began.wait()
+  // Let the archive worker acquire the encoding before replacing its request.
+  for _ in 0..<50 { await Task.yield() }
+  store.state = .processing
+  store.cancel()
+  store.archiveAudio(Task { Data([2]) }, run: store.generation)
+  store.state = .processing
+  store.cancel()
+  await release.send()
+  await store.prepareToQuit()
+  #expect(
+    !FileManager.default.fileExists(atPath: path.appendingPathComponent("last-recording.wav").path))
+}

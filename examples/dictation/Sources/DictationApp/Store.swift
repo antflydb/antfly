@@ -85,11 +85,20 @@ import SwiftUI
   private var audioRetentionEpoch = UUID()
   private var audioArchiveID: UUID?
   private var audioArchiveRun: UUID?
-  private struct AudioArchiveRequest {
-    var id: UUID
-    var run: UUID
-    var epoch: UUID
-    var encoding: Task<Data, Error>
+  @MainActor private final class AudioArchiveRequest {
+    let id = UUID()
+    let run: UUID
+    let epoch: UUID
+    let encoding: Task<Data, Error>
+    // Eligibility belongs to the request, independently of the current selection.
+    // Once canceled, an older writer must never regain publication rights.
+    private(set) var eligible = true
+    func invalidate() { eligible = false }
+    init(run: UUID, epoch: UUID, encoding: Task<Data, Error>) {
+      self.run = run
+      self.epoch = epoch
+      self.encoding = encoding
+    }
   }
   private var activeAudioArchive: AudioArchiveRequest?
   private var pendingAudioArchive: AudioArchiveRequest?
@@ -846,15 +855,24 @@ import SwiftUI
     } catch { return error.localizedDescription }
   }
   func cancel() {
-    if state != .idle, audioArchiveRun == generation {
-      if pendingAudioArchive?.run == generation { pendingAudioArchive = nil }
-      // Cancel only this recording's publication. An older completed archive
-      // may still own the one disk writer and must remain eligible to finish.
-      if let activeAudioArchive, activeAudioArchive.run != generation {
-        audioArchiveID = activeAudioArchive.id
-        audioArchiveRun = activeAudioArchive.run
-      } else {
-        audioArchiveID = nil
+    if state != .idle {
+      if activeAudioArchive?.run == generation { activeAudioArchive?.invalidate() }
+      if pendingAudioArchive?.run == generation {
+        pendingAudioArchive?.invalidate()
+        pendingAudioArchive = nil
+      }
+      if audioArchiveRun == generation {
+        // A completed older clip may resume ownership, but cancellation and
+        // retention changes permanently revoke that request's eligibility.
+        if let activeAudioArchive, activeAudioArchive.eligible,
+          activeAudioArchive.epoch == audioRetentionEpoch, config.retainAudio
+        {
+          audioArchiveID = activeAudioArchive.id
+          audioArchiveRun = activeAudioArchive.run
+        } else {
+          audioArchiveID = nil
+          audioArchiveRun = nil
+        }
       }
     }
     generation = UUID()
@@ -1255,7 +1273,7 @@ import SwiftUI
   func archiveAudio(_ encoding: Task<Data, Error>, run: UUID) {
     guard generation == run, !terminating else { return }
     let request = AudioArchiveRequest(
-      id: UUID(), run: run, epoch: audioRetentionEpoch, encoding: encoding)
+      run: run, epoch: audioRetentionEpoch, encoding: encoding)
     audioArchiveID = request.id
     audioArchiveRun = request.run
     // One active write plus only the newest pending clip. Cancellation cannot
@@ -1274,11 +1292,13 @@ import SwiftUI
       activeAudioArchive = request
       do {
         let data = try await request.encoding.value
-        guard audioArchiveID == request.id, audioRetentionEpoch == request.epoch, config.retainAudio
+        guard request.eligible, audioArchiveID == request.id,
+          audioRetentionEpoch == request.epoch, config.retainAudio
         else { continue }
         let candidate = try await audioArchiveStage(data, directory)
         defer { try? FileManager.default.removeItem(at: candidate) }
-        guard audioArchiveID == request.id, audioRetentionEpoch == request.epoch, config.retainAudio
+        guard request.eligible, audioArchiveID == request.id,
+          audioRetentionEpoch == request.epoch, config.retainAudio
         else { continue }
         let file = directory.appendingPathComponent("last-recording.wav")
         if FileManager.default.fileExists(atPath: file.path) {
@@ -1288,7 +1308,7 @@ import SwiftUI
         }
       } catch is CancellationError {
       } catch {
-        guard generation == request.run, audioArchiveID == request.id,
+        guard request.eligible, generation == request.run, audioArchiveID == request.id,
           audioRetentionEpoch == request.epoch, config.retainAudio
         else { continue }
         processingWarning = "Audio archive unavailable: " + error.localizedDescription
@@ -1299,6 +1319,9 @@ import SwiftUI
   private func removeAudio() throws {
     audioRetentionEpoch = UUID()
     audioArchiveID = nil
+    audioArchiveRun = nil
+    activeAudioArchive?.invalidate()
+    pendingAudioArchive?.invalidate()
     pendingAudioArchive = nil
     // The active writer remains owned until it returns and removes its candidate.
     // Retention fencing prevents publication, including during normal shutdown.

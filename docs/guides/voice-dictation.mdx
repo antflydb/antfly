@@ -440,6 +440,7 @@ never waits for the restoration timer, and user clipboard changes retain ownersh
 Audio retention admits one active writer and only the newest pending clip, so a
 write that cannot observe cancellation does not accumulate parallel staging work. Completed audio has ownership separate from the active
 recording generation; active recording cancellation and retention changes still
-prevent later publication. Both native and TypeScript stream clients treat
+prevent later publication. A canceled clip permanently loses publication eligibility;
+canceling a newer queued clip cannot restore it. Both native and TypeScript stream clients treat
 completion as terminal for transcript and delta events, rejecting late mutations
 and duplicate completions rather than accepting unvalidated text.

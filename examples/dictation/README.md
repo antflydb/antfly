@@ -279,7 +279,9 @@ History and audio retention are off by default:
   warning. One writer stages audio, with only the newest pending clip retained while
   disk I/O is busy. Starting another recording does not invalidate an older completed
   archive; a newer finished clip can supersede it. Normal Quit drains the writer. Canceling active processing and retention changes
-  still fence its pending archive writes. Saving
+  still fence its pending archive writes. Cancellation permanently revokes that
+  clip's publication rights, including when newer queued clips are also canceled.
+  An eligible older completed clip can still finish. Saving
   settings with retention disabled deletes retained local data; remote transcripts
   require explicit deletion. Inference providers have their own retention policy.
 - Missing or invalid settings preserve retained audio/history and pause uploads.
