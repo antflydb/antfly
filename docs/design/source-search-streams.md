@@ -1,0 +1,235 @@
+# Source search streams and native processing
+
+A source owns acquired v3 parent records. Native enrichments own derived artifacts;
+indexes consume those artifacts. Source management declares discovery bindings,
+not an alternate processing engine. The same Go contract is used by standalone
+`antfly-source` and Colony. Provider connectors never run inference.
+
+## Wire versions and compatibility
+
+`search_version` absent or 1 keeps the legacy `TextStream` contract: textual
+`field`, optional artifact/full-text `index` pair, and exact-search `default`.
+`search_version: 2` uses `SearchStream.retrieval`, per-mode defaults, optional
+`resource_field`, and generic `artifacts`. Management capabilities advertise
+`search_versions: [1,2]` and `artifact_discovery`. Unsupported versions fail
+explicitly. Source record v3, file catalog v2, catalog row v1 and search binding
+v2 are independent versions.
+
+The Go `TextStream` and `TextStreamBoundary` names remain compatibility aliases.
+Native grep adapts only exact-enabled streams. A semantic-only image is not
+silently replaced by caption text or accepted as an empty exact result. Existing
+v1 exact scanners keep their exhaustive snapshot/budget behavior.
+
+## Declare a representation once
+
+```json
+{
+  "search_version": 2,
+  "streams": [
+    {
+      "name": "transcript",
+      "artifact": "transcript_chunks",
+      "field": "text",
+      "purpose": "transcription",
+      "location_field": "provenance",
+      "boundary": "unit",
+      "retrieval": {
+        "exact": {"default": true},
+        "full_text": {"index": "transcript_text", "default": true},
+        "semantic": {
+          "index": "transcript_vectors",
+          "member_artifacts": ["transcript_dense"],
+          "query_inputs": ["text", "vector"],
+          "vector_space": {
+            "id": "research-text-v1", "dimension": 768, "metric": "cosine",
+            "model": "PINNED_MODEL_ID", "revision": "IMMUTABLE_REVISION",
+            "query_preprocessing": "query-recipe-v1",
+            "document_preprocessing": "document-recipe-v1",
+            "query_modality": "text", "document_modality": "text"
+          }
+        }
+      }
+    }
+  ],
+  "artifacts": [
+    {"name": "facts", "artifact": "facts_v1", "content_type": "application/json", "purpose": "structured_extraction"}
+  ]
+}
+```
+
+Model identifiers above are placeholders, not a configured model. Use the actual
+pinned model and preprocessing recipes. Native embedding enrichments declare
+`vector_space: sources.VectorSpaceIdentity(recipe)`, binding the complete recipe
+into native producer identity. The shared observer verifies index type, dimension,
+metric, member lineage, native vector-space identity and the installed query model.
+Original media uses `resource_field: content.resource` and may declare only
+semantic retrieval. Query input support is explicit: indexing media does not
+advertise an image-query HTTP route. This contract supports server-embedded text
+and supplied dense vectors. Direct image queries can use compatible client vectors.
+
+A generic artifact need not contain text or have an index. Generic artifact
+inspection uses native document artifact APIs. The source status reports
+`unsupported/per_artifact_coverage_not_observed` when no safe aggregate observation
+is available; it never fabricates corpus-wide artifact completion from declaration
+presence. Index-backed stream readiness is observed independently.
+
+## Configure native processing
+
+Management Source and standalone profile Source accept `processing.indexes`, an
+array of `{name, config}` ordinary native IndexConfig declarations. Models,
+prompts, output schemas, dependencies and native secret references remain native
+configuration. Raw credential literals are rejected for credential fields.
+
+`BuildTextProcessing` builds asset/chunk/full-text and optional embedding branches.
+Native chunk fanout consumes extraction units and explicitly typed text/JSON
+assets, including summaries, captions and transcripts. Ordered chunk publication
+retains the accepted upstream's causal proof and current-parent guards. Binary
+assets are never implicitly decoded as text. Recipe changes version the affected
+artifact descendants, while compatible acquisition and producer branches remain reusable.
+Pass explicit native copy, document-extraction, transcriber, reader or generator
+producer configuration for content, OCR, transcripts, captions or summaries.
+Generated representations are not selected by default. Locations and generated
+labels stay on stream bindings; generated text is not original-source evidence.
+
+`NativeIndexName` content-addresses recipes containing write-only producer
+configuration, which native readback redacts. Reconciliation creates missing
+indexes, starts native backfill, and refuses to overwrite existing conflicting
+names. Change a recipe/model by building a new index name, wait for its readiness,
+and switch the binding. Shared table owners are not silently migrated. Native
+readback is the source of operational truth; local declarations grant no access.
+
+Standalone and Colony reconcile processing during source runs and management PUT.
+Desired state is persisted before native effects; a failed PUT may have saved the
+configuration. Read it back and retry PUT to resume reconciliation. There is no
+provider download in processing-only reconciliation. Source acquisition hashes
+exclude processing, streams, artifacts and search_version, so these changes do
+not invalidate original byte references or acquisition checkpoints. Standalone
+management PUT also republishes the existing portable catalog binding under the
+runner state lock, preserving the acquired revision and access expiry. Changed
+acquisition configurations require a normal source run. CLI processing can do
+the same with `--state EXISTING_RUNNER_STATE_DIR`.
+
+Colony requires **table.admin** to install native processing, including through
+legacy import-job creation. Binding-only edits keep the existing table-write
+requirement. Source detail's **Search and processing** panel shows observed
+representation states and applies declarations without queuing a provider sync.
+Native index backfill is durable; cancellation/reprocessing of artifact jobs uses
+the existing native job APIs rather than the provider sync cancellation API.
+
+## External vectors
+
+`ExternalVectorIndex` creates an external dense index with an
+`external_vector_space` compatibility identity. `WithExternalVector` attaches
+finite, dimension-checked vectors and `metadata.embedding_spaces[index]` to a
+revision-bound v3 parent. Native write admission independently rejects missing or
+mismatched identities for supplied vectors. Legacy external indexes without the
+new declaration retain their existing behavior. This is an authored assertion:
+vector values cannot prove which model generated them. External writers retain
+responsibility for refreshing or explicitly deleting their vectors when their
+input representation changes; omission retains native external-vector semantics.
+Ranked source queries require the current parent's authored embedding receipt.
+Canonical provider publication replaces metadata without that receipt, hiding
+retained old vectors until an external writer publishes the new representation.
+Custom external writers must likewise clear receipts when changing their input;
+the receipt cannot prove which model computed the asserted vector.
+
+External discovery advertises supplied-vector input only. A native declaration
+must match the full recipe hash before it is treated as compatible. Provider
+acquisition never generates external vectors on the caller's behalf.
+
+## Query and evidence
+
+`BuildSearchQuery` emits ordinary bounded native table queries. `Publisher.Search`
+validates the installed binding/readiness before and after retrieval, rejects a
+changed generation, and returns the native response. Client vectors must match the
+entire advertised recipe, dimensions and finite-value constraints. Requests return
+at most 100 parents and 1,000 bounded members, using hierarchy source grouping and
+explicit parent/member field projection. Original media evidence is a parent
+resource projection; passage text is optional.
+
+The current helper requires a stream's index to cover its explicit member set;
+it rejects an index with undeclared extra members rather than returning another
+representation's evidence. A semantic union can declare all compatible members
+with a common ancestor representation. Native multi-index queries remain
+available for explicit RRF fusion.
+
+Native `_score`, `_distance`, `_index_scores` and hierarchy artifact/member
+identity retain their native semantics. Raw scores are not comparable across
+streams. An index-to-stream mapping is insufficient for multi-artifact indexes;
+retain matched artifact/member identity and fusion provenance. Clients can rerank
+text passages or authorized media evidence with a compatible reranker. Summary
+matches are exact within the summary, not exhaustive original coverage.
+
+The runtime's authenticated gateway/native policy authorizes sources, parents,
+artifacts and snapshots. Discovery filters only narrow scope; they confer no
+permission. Do not turn a native index-metadata preflight into a replacement for
+query-time authorization or derive public access from producer credentials.
+
+## Consistency and readiness
+
+Management `search_status` is read-only, bounded to five seconds and caches each
+native index lookup within the request. It is advisory, not a snapshot lease.
+It never turns a successful acquisition into an inference completion receipt.
+
+Native query responses describe actual operation consistency through
+`remote_snapshot` or `live_read`. `SearchConsistency` interprets those markers.
+Unordered relevance responses without either marker are explicitly `unretained`;
+this makes no claim that candidate and projection reads shared a retained cut.
+The helper preserves native responses and adds `source_search` with source,
+stream, index, purpose/generated labels and operation consistency.
+`SearchRequest.require_snapshot` rejects live-only or unretained observations. Lite
+live reads do not prove absence while indexing is pending. Existing source
+publication/retirement and authoritative cleanup retain their full-index/scoped
+merge barriers. Snapshot-dependent traversal must fail closed when unavailable;
+current access still applies to historical snapshots. Permission validity,
+acquisition completion and producer/index readiness are distinct clocks.
+
+## Local fixture and CLI
+
+With an isolated loopback server built from the same revision:
+
+```sh
+GOWORK=off go -C go/pkg/sources run ./examples/search-streams \
+  --endpoint http://127.0.0.1:8080/db/v1 --directory .source-search-fixture
+```
+
+The process acquires real local text and a tiny image through the source service,
+installs native copy/full-text processing, and supplies clearly labeled
+three-dimensional synthetic vectors. It prints the catalog path and keeps the
+revision-enforcing original-media service alive. No Colony or model deployment
+is required. Tables remain for inspection after Ctrl-C; use a disposable server.
+Fixture output establishes integration, not model quality or GPU performance.
+
+```sh
+GOWORK=off go -C go/pkg/sources run ./cmd/antfly-source processing \
+  --config PROFILE --source SOURCE_ID --apply
+GOWORK=off go -C go/pkg/sources run ./cmd/antfly-source search \
+  --catalog CATALOG --source SOURCE_ID --stream STREAM --mode full_text --query launch
+```
+
+`search --vector FILE` accepts a JSON SearchRequest containing the vector and its
+complete vector_space. It emits ordinary native grouped results. Provider and
+inference credentials are never copied into the catalog.
+
+New source tables declare `source_id` and `doc_type` as exact keyword predicates.
+Ranked clients lower legacy catalog ownership filters to native canonical terms;
+Colony likewise lowers its injected access predicates before ranked execution.
+Existing tables are never silently migrated. For legacy tables without indexed
+scope predicates, the CLI can explicitly request bounded value verification with
+`--allow-scan --max-verify-documents 10000 --max-verify-bytes 67108864`.
+Budget exhaustion fails rather than returning an apparently complete result.
+
+Run the native contract regression against a dedicated server:
+
+```sh
+ANTFLY_SOURCES_E2E_URL=http://127.0.0.1:8080/db/v1 \
+  GOWORK=off go -C go/pkg/sources test -run TestNativeSourceSearchStreams -timeout 3m
+```
+
+It checks raw-asset grouped evidence, media-only supplied-vector retrieval,
+source isolation and rejection of unavailable snapshot guarantees.
+
+This implementation reuses native artifact repair/reprocess job APIs for retries,
+rebuilds and cancellation; those operations are separate from source sync runs.
+It does not claim model quality, GPU throughput, or media-query routes beyond the
+advertised text/vector inputs. Qualify deployed models and hardware separately.

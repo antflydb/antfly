@@ -5022,7 +5022,7 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
     if (hit.stored_data) |stored_data| {
         const match_projection_configured = !req.hierarchy_match_include_all_fields;
         const source = if (req.defer_stored_projection or match_projection_configured)
-            try projectPublicStoredSourceValue(alloc, stored_data, .{
+            try projectHierarchyMemberSource(alloc, stored_data, .{
                 .fields = if (match_projection_configured) req.hierarchy_match_fields else req.fields,
                 .include_all_fields = if (match_projection_configured) false else req.include_all_fields,
             })
@@ -5046,6 +5046,31 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
     }
 
     return .{ .object = obj };
+}
+
+// Copy/text assets retain raw UTF-8, whereas chunks and extraction units are
+// JSON objects. Apply the same explicit projection to a synthetic text field
+// instead of feeding raw bytes into the JSON-only document projector.
+fn projectHierarchyMemberSource(alloc: std.mem.Allocator, raw: []const u8, options: db_mod.types.LookupOptions) !std.json.Value {
+    var value = try parseStoredSourceValue(alloc, raw);
+    defer db_mod.types.deinitJsonValue(alloc, &value);
+    if (value != .object) {
+        var object = std.json.ObjectMap.empty;
+        try object.put(alloc, try alloc.dupe(u8, "text"), try db_mod.types.cloneJsonValue(alloc, value));
+        db_mod.types.deinitJsonValue(alloc, &value);
+        value = .{ .object = object };
+    }
+    return try document_query.projectLookupValue(alloc, value, options);
+}
+
+test "api query contract projects raw text asset evidence without exposing unrequested fields" {
+    const a = std.testing.allocator;
+    var projected = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"text"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &projected);
+    try std.testing.expectEqualStrings("launch at 04:12", projected.object.get("text").?.string);
+    var hidden = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"provenance"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &hidden);
+    try std.testing.expectEqual(@as(usize, 0), hidden.object.count());
 }
 
 fn hierarchyAncestorsJsonValue(

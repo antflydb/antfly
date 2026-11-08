@@ -42694,6 +42694,14 @@ components:
           default: false
           description: When true, embeddings are supplied externally via _embeddings and the index does
             not derive prompts from a field or template.
+        external_vector_space:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Optional immutable compatibility declaration for an external dense index. Only
+            valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName]
+            with this exact identity; dimensions and finite values are checked independently. This is
+            an assertion by the writer, not proof of the generating model.
         sparse:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -45453,6 +45461,8 @@ components:
         external:
           type: boolean
           default: false
+        external_vector_space:
+          type: string
         sparse:
           type: boolean
           default: false

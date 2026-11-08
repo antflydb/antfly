@@ -70,7 +70,7 @@ func (r CatalogRecord) Validate() error {
 		if err := r.Source.Fields.Validate(); err != nil {
 			return err
 		}
-		if err := ValidateTextStreams(r.Source.Streams); err != nil {
+		if err := ValidateSearchBindings(r.Source.SearchVersion, r.Source.Streams, r.Source.Artifacts); err != nil {
 			return err
 		}
 	}

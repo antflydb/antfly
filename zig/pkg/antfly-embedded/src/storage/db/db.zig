@@ -149529,3 +149529,78 @@ test "privacy protected hit hydration bounds row scratch and retains only select
         std.debug.print("\nPrivacy projected hydration rows={d} peak_bytes={d}\n", .{ count, budget.peak_live_bytes });
     }
 }
+
+test "external vector compatibility declaration rejects missing and mismatched writer identity" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(path);
+    var db = try DB.open(alloc, path, .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "external_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"external_vector_space\":\"recipe-v1\"}",
+    });
+    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+        .writes = &.{.{ .key = "missing", .value = "{\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+        .sync_level = .full_index,
+    }));
+    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+        .writes = &.{.{ .key = "wrong", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"other\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+        .sync_level = .full_index,
+    }));
+    try db.batch(.{
+        .writes = &.{.{ .key = "matched", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+        .sync_level = .full_index,
+    });
+}
+
+test "scalar text asset chunks track parent updates and retirement" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-scalar-chunks");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addEnrichment(.{ .name = "summary_chunks", .kind = .chunk, .source_artifact_name = "summary", .field = "text", .chunk_size = 512, .chunk_overlap = 32 });
+    try db.addIndex(.{ .name = "summary_text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"summary_chunks\",\"field\":\"text\"}]}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"silver submarine\"}" }}, .sync_level = .full_index });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    {
+        const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "summary");
+        defer a.free(key);
+        const value = try db.core.store.get(a, key);
+        defer a.free(value);
+        try std.testing.expectEqualStrings("silver submarine", value);
+        const chunk = try internal_keys.chunkArtifactKeyAlloc(a, "doc", "summary_chunks", 0);
+        defer a.free(chunk);
+        const member = try db.core.store.get(a, chunk);
+        defer a.free(member);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, member, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("silver submarine", parsed.value.object.get("text").?.string);
+    }
+    {
+        var result = try db.search(a, .{ .index_name = "summary_text", .full_text = .{ .match = .{ .field = "text", .text = "silver" } }, .limit = 10 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"gold submarine\"}" }}, .sync_level = .full_index });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    {
+        var old = try db.search(a, .{ .index_name = "summary_text", .full_text = .{ .match = .{ .field = "text", .text = "silver" } }, .limit = 10 });
+        defer old.deinit();
+        try std.testing.expectEqual(@as(usize, 0), old.hits.len);
+        var current = try db.search(a, .{ .index_name = "summary_text", .full_text = .{ .match = .{ .field = "text", .text = "gold" } }, .limit = 10 });
+        defer current.deinit();
+        try std.testing.expectEqual(@as(usize, 1), current.hits.len);
+    }
+    try db.batch(.{ .deletes = &.{"doc"}, .sync_level = .full_index });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    var retired = try db.search(a, .{ .index_name = "summary_text", .full_text = .{ .match = .{ .field = "text", .text = "gold" } }, .limit = 10 });
+    defer retired.deinit();
+    try std.testing.expectEqual(@as(usize, 0), retired.hits.len);
+}

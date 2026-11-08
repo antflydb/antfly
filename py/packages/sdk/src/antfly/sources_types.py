@@ -28,6 +28,8 @@ class Capabilities(TypedDict):
     purge_sources: NotRequired[bool]
     media_proxy: NotRequired[bool]
     serialized_runs: NotRequired[bool]
+    search_versions: NotRequired[list[int]]
+    artifact_discovery: NotRequired[bool]
 
 
 class SourceIdentity(TypedDict):
@@ -46,7 +48,11 @@ class Source(TypedDict):
     identity: NotRequired[SourceIdentity]
     rekeys: NotRequired[bool]
     permission_ttl_seconds: NotRequired[int]
-    streams: NotRequired[list[TextStream]]
+    streams: NotRequired[list[SearchStream]]
+    search_version: NotRequired[int]
+    artifacts: NotRequired[list[ArtifactBinding]]
+    search_status: NotRequired[SearchStatus]
+    processing: NotRequired[ProcessingDeclaration]
 
 
 class Run(TypedDict):
@@ -91,13 +97,87 @@ class RunInput(TypedDict):
     operation: NotRequired[Literal["sync", "purge"]]
 
 
-class TextStream(TypedDict):
+class SearchStream(TypedDict):
     name: str
     artifact: NotRequired[str]
     index: NotRequired[str]
-    field: str
+    field: NotRequired[str]
     purpose: NotRequired[str]
     location_field: NotRequired[str]
-    default: bool
+    default: NotRequired[bool]
     generated: NotRequired[bool]
     boundary: NotRequired[Literal["record", "unit"]]
+    resource_field: NotRequired[str]
+    retrieval: NotRequired[RetrievalBindings]
+
+
+TextStream = SearchStream
+
+
+class RetrievalBindings(TypedDict):
+    exact: NotRequired[ExactRetrieval]
+    full_text: NotRequired[FullTextRetrieval]
+    semantic: NotRequired[SemanticRetrieval]
+
+
+class ExactRetrieval(TypedDict):
+    default: NotRequired[bool]
+
+
+class FullTextRetrieval(TypedDict):
+    index: str
+    default: NotRequired[bool]
+
+
+class VectorSpace(TypedDict):
+    id: str
+    dimension: int
+    metric: Literal["cosine", "inner_product", "l2_squared"]
+    model: str
+    revision: str
+    query_preprocessing: str
+    document_preprocessing: str
+    query_modality: Literal["text", "image", "audio", "multimodal"]
+    document_modality: Literal["text", "image", "audio", "multimodal"]
+
+
+class SemanticRetrieval(TypedDict):
+    index: str
+    member_artifacts: NotRequired[list[str]]
+    vector_space: VectorSpace
+    query_inputs: list[Literal["text", "vector"]]
+    default: NotRequired[bool]
+    external: NotRequired[bool]
+
+
+class ArtifactBinding(TypedDict):
+    name: str
+    artifact: str
+    purpose: NotRequired[str]
+    content_type: str
+    schema_uri: NotRequired[str]
+    location_field: NotRequired[str]
+    generated: NotRequired[bool]
+
+
+class RepresentationStatus(TypedDict):
+    name: str
+    state: Literal["disabled", "building", "ready", "partial", "failed", "unsupported"]
+    reason: NotRequired[str]
+
+
+class SearchStatus(TypedDict):
+    version: int
+    streams: list[RepresentationStatus]
+    artifacts: list[RepresentationStatus]
+    observed_at: int
+    consistency: Literal["retained_snapshot", "live_read", "unknown"]
+
+
+class NativeIndexDeclaration(TypedDict):
+    name: str
+    config: dict[str, Any]
+
+
+class ProcessingDeclaration(TypedDict):
+    indexes: NotRequired[list[NativeIndexDeclaration]]

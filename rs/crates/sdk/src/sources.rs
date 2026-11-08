@@ -321,7 +321,9 @@ impl SourcesClient {
         &self,
         source: &types::Source,
     ) -> Result<types::Source, SourceServiceError> {
-        let body = serde_json::to_value(source)
+        let mut desired = source.clone();
+        desired.search_status = None;
+        let body = serde_json::to_value(desired)
             .map_err(|_| SourceServiceError::InvalidConfiguration("invalid source"))?;
         self.request(Method::PUT, &["sources", &source.id], Some(&body))
             .await

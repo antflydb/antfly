@@ -26,7 +26,11 @@ export interface SourceDefinition {
   config: Record<string, unknown>;
   permissions: { public: boolean; readers: string[] };
   permission_ttl_seconds?: number;
-  publication?: "text" | "media";
+  publication?: "native" | "text" | "media";
+  search_version?: 1 | 2;
+  streams?: SearchStream[];
+  artifacts?: ArtifactBinding[];
+  processing?: ProcessingDeclaration;
   identity?: { namespace?: string };
 }
 
@@ -219,6 +223,13 @@ export type {
   RunPage,
   Source,
   SourcePage,
+  SearchStream,
+  TextStream,
+  ArtifactBinding,
+  RetrievalBindings,
+  VectorSpace,
+  ProcessingDeclaration,
+  SearchStatus,
 } from "./sources-types.js";
 
 import type {
@@ -229,6 +240,13 @@ import type {
   RunPage,
   Source,
   SourcePage,
+  SearchStream,
+  TextStream,
+  ArtifactBinding,
+  RetrievalBindings,
+  VectorSpace,
+  ProcessingDeclaration,
+  SearchStatus,
 } from "./sources-types.js";
 
 /** Common management API. baseUrl includes the runtime's /sources/v1 mount. */
@@ -248,7 +266,8 @@ export class SourcesClient extends SourceTransport {
     return this.request("GET", `/sources/${encodeURIComponent(id)}`, undefined, signal);
   }
   putSource(source: Source, signal?: AbortSignal): Promise<Source> {
-    return this.request("PUT", `/sources/${encodeURIComponent(source.id)}`, source, signal);
+    const { search_status: _observed, ...desired } = source;
+    return this.request("PUT", `/sources/${encodeURIComponent(source.id)}`, desired, signal);
   }
   removeSource(
     id: string,

@@ -91,6 +91,17 @@ def render(language):
         ],
     }[language]
     for name, schema in SCHEMAS.items():
+        if "$ref" in schema:
+            target = typ(schema, language)
+            lines.append(
+                {
+                    "ts": f"export type {name} = {target};",
+                    "py": f"{name} = {target}",
+                    "rs": f"pub type {name} = {target};",
+                }[language]
+            )
+            lines.append("")
+            continue
         if language == "py":
             lines.append("")
         required = set(schema.get("required", []))

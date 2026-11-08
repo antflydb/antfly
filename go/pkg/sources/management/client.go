@@ -102,6 +102,7 @@ func (c *Client) GetSource(ctx context.Context, id string) (out Source, err erro
 	return
 }
 func (c *Client) PutSource(ctx context.Context, source Source) (out Source, err error) {
+	source.SearchStatus = nil // GET observations are never submitted as desired state.
 	err = c.call(ctx, "PUT", "/sources/"+url.PathEscape(source.Id), "", source, &out)
 	return
 }

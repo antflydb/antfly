@@ -18300,7 +18300,7 @@ pub const IndexManager = struct {
         const config = self.getEnrichment(.asset, name) orelse return false;
         var producer = asset_producer_mod.parseProducerConfig(self.alloc, config.producer_json) catch return false;
         defer producer.deinit(self.alloc);
-        return producer.type == .media_output;
+        return asset_producer_mod.supportsScalarTextProjection(producer.type, config.content_type);
     }
 
     fn artifactSourceSupportsUnitGrouping(self: *const IndexManager, artifact_name: []const u8) bool {
@@ -19837,6 +19837,34 @@ pub const IndexManager = struct {
             return entry.managed_direct_field;
         }
         return false;
+    }
+
+    /// Caller holds the catalog read/apply fence. Compatibility identity is an
+    /// authored assertion; vector shape is independently validated by admission.
+    pub fn validateExternalVectorSpaces(self: *const IndexManager, alloc: Allocator, embeddings: []const mapper.DenseEmbeddingWrite, document_json: []const u8) !void {
+        var document: ?std.json.Parsed(std.json.Value) = null;
+        defer if (document) |*parsed| parsed.deinit();
+        for (embeddings) |embedding| {
+            for (self.dense_indexes.items) |entry| {
+                if (!entry.external or !std.mem.eql(u8, entry.config.name, embedding.index_name)) continue;
+                // Legacy external indexes retain their original admission path.
+                if (std.mem.indexOf(u8, entry.config.config_json, "external_vector_space") == null) break;
+                const config = try std.json.parseFromSlice(std.json.Value, alloc, entry.config.config_json, .{});
+                defer config.deinit();
+                const expected = config.value.object.get("external_vector_space") orelse break;
+                if (expected != .string or expected.string.len == 0) return error.InvalidEmbedding;
+                if (document == null) document = std.json.parseFromSlice(std.json.Value, alloc, document_json, .{}) catch return error.InvalidEmbedding;
+                const root = document.?.value;
+                if (root != .object) return error.InvalidEmbedding;
+                const metadata = root.object.get("metadata") orelse return error.InvalidEmbedding;
+                if (metadata != .object) return error.InvalidEmbedding;
+                const spaces = metadata.object.get("embedding_spaces") orelse return error.InvalidEmbedding;
+                if (spaces != .object) return error.InvalidEmbedding;
+                const supplied = spaces.object.get(embedding.index_name) orelse return error.InvalidEmbedding;
+                if (supplied != .string or !std.mem.eql(u8, supplied.string, expected.string)) return error.InvalidEmbedding;
+                break;
+            }
+        }
     }
 
     pub fn denseIndexUsesExternalCoverage(self: *const IndexManager, index_name: []const u8) bool {

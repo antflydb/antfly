@@ -51,6 +51,18 @@ pub const InvocationContext = struct {
     }
 };
 
+// Generic text/JSON assets can feed native chunks without pretending to be
+// document-extraction manifests. Binary media still requires an explicit text
+// producer; ordered document extraction keeps its unit publication protocol.
+pub fn supportsScalarTextProjection(kind: ProducerType, content_type: []const u8) bool {
+    if (kind == .media_output) return true;
+    if (!std.mem.eql(u8, content_type, "text/plain") and !std.mem.eql(u8, content_type, "application/json")) return false;
+    return switch (kind) {
+        .copy, .generator, .extractor, .decision, .reader, .transcriber => true,
+        else => false,
+    };
+}
+
 pub const ProducerType = enum {
     copy,
     document_extraction,

@@ -127,7 +127,11 @@ class SourcesClient(_SourceTransport):
         return self._request("GET", f"/sources/{quote(source_id, safe='')}")
 
     def put_source(self, source: dict[str, Any]) -> dict[str, Any]:
-        return self._request("PUT", f"/sources/{quote(source['id'], safe='')}", source)
+        return self._request(
+            "PUT",
+            f"/sources/{quote(source['id'], safe='')}",
+            {key: value for key, value in source.items() if key != "search_status"},
+        )
 
     def remove_source(self, source_id: str, *, purge: bool = False) -> dict[str, Any]:
         return self._request("DELETE", f"/sources/{quote(source_id, safe='')}?purge={str(purge).lower()}")

@@ -729,6 +729,7 @@ impl Default for types::CreateEmbeddingsIndexRequest {
             enrichments: Vec::new(),
             execution: None,
             external: false,
+            external_vector_space: None,
             field: None,
             leann: None,
             mem_only: None,

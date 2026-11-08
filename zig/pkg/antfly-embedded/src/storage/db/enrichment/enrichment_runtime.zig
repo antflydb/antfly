@@ -6070,7 +6070,7 @@ fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enric
         var producer = try asset_producer_mod.parseProducerConfig(runtime.alloc, upstream.producer_json);
         defer producer.deinit(runtime.alloc);
         const privacy_source = @import("../../../privacy/document.zig").isProtectedArtifactName(upstream.name) or @import("../../../privacy/document.zig").consumerPolicyVersion(upstream.name) != null;
-        if (!privacy_source and (producer.type != .media_output or !std.mem.eql(u8, request.source_field, "text") or request.source_template.len != 0)) return error.InvalidEnrichmentConfig;
+        if (!privacy_source and (!asset_producer_mod.supportsScalarTextProjection(producer.type, upstream.content_type) or request.source_field.len == 0 or request.source_template.len != 0)) return error.InvalidEnrichmentConfig;
         const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", upstream.name);
         defer runtime.alloc.free(key);
         upstream_raw = try storeGetOptionalAllocWithRetry(runtime, key);
@@ -6137,6 +6137,31 @@ fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enric
                 try runtime.alloc.dupe(u8, bytes);
             defer runtime.alloc.free(sanitized);
             const text = if (request.source_field.len == 0 and request.source_template.len == 0) try runtime.alloc.dupe(u8, sanitized) else try extractSourceText(runtime.alloc, runtime.config, sanitized, request);
+            defer if (text) |value| runtime.alloc.free(value);
+            const chunks = if (text) |value|
+                if (request.chunker_json.len > 0)
+                    try chunker_mod.chunkTextWithConfigJsonAndProvider(runtime.alloc, value, request.chunker_json, runtime.config.chunk_provider)
+                else
+                    try chunker_mod.chunkText(runtime.alloc, value, request.chunk_size, request.chunk_overlap)
+            else
+                try runtime.alloc.alloc(chunker_mod.Chunk, 0);
+            errdefer chunker_mod.freeChunks(runtime.alloc, chunks);
+            try cache.append(runtime.alloc, .{ .key = cache_key, .chunks = chunks, .source_record_digest = source_digest });
+            return .{ .chunks = chunks, .source_record_digest = source_digest };
+        }
+        const upstream = runtime.index_manager.getEnrichment(.asset, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
+        var producer = try asset_producer_mod.parseProducerConfig(runtime.alloc, upstream.producer_json);
+        defer producer.deinit(runtime.alloc);
+        if (producer.type != .media_output) {
+            // The accepted upstream bytes stay guarded by readUpstream's causal
+            // proof at publication. Only explicit text/JSON representations are
+            // admitted; a raw binary result never becomes synthetic text.
+            const document = if (std.mem.eql(u8, upstream.content_type, "text/plain"))
+                try std.json.Stringify.valueAlloc(runtime.alloc, .{ .text = bytes }, .{})
+            else
+                try runtime.alloc.dupe(u8, bytes);
+            defer runtime.alloc.free(document);
+            const text = try extractSourceText(runtime.alloc, runtime.config, document, request);
             defer if (text) |value| runtime.alloc.free(value);
             const chunks = if (text) |value|
                 if (request.chunker_json.len > 0)
@@ -30889,7 +30914,7 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
             const upstream = runtime.index_manager.getEnrichment(.asset, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
             var producer = try asset_producer_mod.parseProducerConfig(runtime.alloc, upstream.producer_json);
             defer producer.deinit(runtime.alloc);
-            if (producer.type != .media_output and !@import("../../../privacy/document.zig").isProtectedArtifactName(upstream.name) and @import("../../../privacy/document.zig").consumerPolicyVersion(upstream.name) == null) return error.OnlineMergeArtifactTailsUnsupported;
+            if (!asset_producer_mod.supportsScalarTextProjection(producer.type, upstream.content_type) and !@import("../../../privacy/document.zig").isProtectedArtifactName(upstream.name) and @import("../../../privacy/document.zig").consumerPolicyVersion(upstream.name) == null) return error.OnlineMergeArtifactTailsUnsupported;
         }
         var plan = try runtime.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
