@@ -220,6 +220,21 @@ class ApacheBoundaryTests(unittest.TestCase):
         )
         self.assertTrue(any("unreviewed module" in error for error in errors))
 
+    def test_cypher_modules_traverse_regex_and_reject_server_dependencies(self):
+        graph = "zig/lib/cypher/root.zig"
+        regex = "zig/lib/regex/src/captures.zig"
+        sources = {
+            graph: 'const regex = @import("cypher_regex_capture");',
+            regex: "",
+        }
+        seen, errors = self.check_fixture('const graph = @import("cypher");', sources)
+        self.assertIn(graph, seen)
+        self.assertIn(regex, seen)
+        self.assertEqual([], errors)
+        sources[regex] = 'const server = @import("../../../pkg/antfly/src/main.zig");'
+        _, errors = self.check_fixture('const graph = @import("cypher");', sources)
+        self.assertTrue(any("server dependency" in error for error in errors))
+
     def test_rejects_server_only_generated_api(self):
         for module in (
             "antfly_admin_openapi",

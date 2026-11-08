@@ -112,6 +112,7 @@ fn appendGraphFieldTargets(
 ) !void {
     const field = root.get(field_name) orelse return;
     switch (field) {
+        .null => {},
         .string => try appendUniqueOwnedKey(alloc, targets, field.string),
         .array => {
             for (field.array.items) |item| {
@@ -211,13 +212,13 @@ const FailureFixture = struct {
         try std.testing.expectEqualStrings("existing", extracted.graph_writes[0].target);
         try std.testing.expectEqual(@as(usize, 1), extracted.mentioned_graph_indexes.len);
         try std.testing.expectEqualStrings("graph", extracted.mentioned_graph_indexes[0]);
-        const expected: usize = if (root.object.get("links").? == .string) 2 else if (root.object.get("links").?.array.items.len == 0) 1 else 3;
+        const expected: usize = if (root.object.get("links").? == .null) 1 else if (root.object.get("links").? == .string) 2 else if (root.object.get("links").?.array.items.len == 0) 1 else 3;
         try std.testing.expectEqual(expected, extracted.graph_writes.len);
     }
 };
 
 test "graph field plans publish atomically across every allocation failure for live and snapshot catalogs" {
-    for ([_][]const u8{ "{\"links\":[]}", "{\"links\":\"target\"}", "{\"links\":[\"one\",\"two\",\"one\"]}" }) |json| {
+    for ([_][]const u8{ "{\"links\":null}", "{\"links\":[]}", "{\"links\":\"target\"}", "{\"links\":[\"one\",\"two\",\"one\"]}" }) |json| {
         var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
         defer parsed.deinit();
         for ([_]bool{ false, true }) |snapshot| try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureFixture.run, .{ parsed.value, snapshot });

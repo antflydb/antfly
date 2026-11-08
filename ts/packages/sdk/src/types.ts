@@ -6,6 +6,35 @@
 import type { components, operations } from "./public-api.js";
 import type { components as QueryComponents } from "./query.js";
 
+export type GraphQueryRequest = Omit<
+  components["schemas"]["GraphQueryRequest"],
+  "parameters" | "typed_parameters"
+> & {
+  parameters?: Record<string, import("./graph-wire.js").GraphData>;
+  typed_parameters?: import("./graph-wire.js").GraphValue;
+};
+export type GraphQueryResult = Omit<components["schemas"]["GraphQueryResult"], "rows" | "stats"> & {
+  rows: import("./graph-wire.js").GraphValue[][];
+  stats: {
+    scanned_anchors?: number;
+    explored_edges?: number;
+    intermediate_states?: number;
+    mutations?: number;
+    search_calls?: number;
+    search_candidates?: number;
+    search_approximate?: boolean;
+    memory_bytes?: number;
+  };
+};
+
+export type GraphWriteReceipt = components["schemas"]["GraphWriteReceipt"];
+export type GraphWriteStatus = components["schemas"]["TransactionSessionStatus"];
+export type GraphQueryStats = components["schemas"]["GraphQueryStats"];
+export type GraphCatalogEntry = components["schemas"]["GraphCatalogEntry"];
+export type GraphDefinition = components["schemas"]["GraphDefinition"];
+export type GraphLabelMapping = components["schemas"]["GraphLabelMapping"];
+export type GraphRelationshipMapping = components["schemas"]["GraphRelationshipMapping"];
+
 // Antfly Query type for type-safe query construction
 export type AntflyQuery = QueryComponents["schemas"]["Query"];
 

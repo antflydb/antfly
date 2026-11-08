@@ -15,6 +15,7 @@ lake = ["pyarrow>=18", "psycopg[binary]>=3.2"]
 
 [tool.pytest.ini_options]
 testpaths = ["."]
+pythonpath = ["../../scripts"]
 addopts = "-v --durations=50 --durations-min=1.0 --dist=loadgroup"
 markers = [
     "e2e_isolation(policy, group=None): declares test- or module-level scheduling isolation",
