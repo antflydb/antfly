@@ -125,7 +125,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                     "parameters": [key],
                 },
             )
-            assert sql_point["rows"] == [[int(key[1:])]], sql_point
+            assert sql_point["rows"] == [[key[1:]]], sql_point
         key_union = call(
             f"/graphs/{graph}/query",
             {
@@ -3439,7 +3439,7 @@ def test_authenticated_cypher_certified_point_domains_across_owners(monkeypatch)
     binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
     if not Path(binary).exists():
         pytest.skip("native Antfly binary is unavailable")
-    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port())
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port(), pgwire=True)
     try:
         script = (
             Path(__file__).resolve().parents[2] / "scripts" / "verify_cypher_http.py"
