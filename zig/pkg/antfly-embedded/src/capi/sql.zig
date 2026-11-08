@@ -1003,14 +1003,13 @@ pub fn Adapter(comptime native: type) type {
             projection: dependencies.sql_document_row.Projection,
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
-                var page = try self.session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
+                var page = try self.session.nextViewPage(alloc, limit);
                 errdefer page.deinit();
                 const owned = page.arena.allocator();
                 const rows = try owned.alloc(catalog.Row, page.rows.len);
                 const layout = try self.projection.pageLayout(owned);
-                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, .{ .id = row.key, .version = row.version, .value = row.typed orelse .null, .typed_cells = row.typed_cells, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest });
-                const after = if (page.more) try owned.dupe(u8, self.session.reader.after.items) else null;
-                return .{ .rows = rows, .after = after, .owned_arena = page.arena };
+                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, row.sqlRow());
+                return .{ .rows = rows, .after = page.after, .storage_page = page };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
@@ -1029,7 +1028,7 @@ pub fn Adapter(comptime native: type) type {
                 errdefer page.deinit();
                 const rows = try page.arena.allocator().alloc(catalog.Row, page.rows.len);
                 for (page.rows, rows) |row, *out| out.* = .{ .id = row.id, .version = row.version, .value = row.value, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document };
-                return .{ .rows = rows, .after = page.after, .owned_arena = page.arena };
+                return .{ .rows = rows, .after = page.after, .storage_page = page };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));

@@ -51,6 +51,11 @@ def verify(directory: Path, platform: dict, products: list[str]) -> None:
             }
             library = "lib/libantfly.dylib" if darwin else "lib/libantfly.so"
             binaries = ["antfly"] if product == "server" else []
+            apple_bridge = (
+                ["lib/libantfly-apple.dylib"]
+                if darwin and platform.get("apple_providers", False)
+                else []
+            )
             if product == "embedded":
                 for name in (
                     "antfly",
@@ -66,6 +71,7 @@ def verify(directory: Path, platform: dict, products: list[str]) -> None:
             for name in [
                 *binaries,
                 library,
+                *apple_bridge,
                 "include/antfly.h",
                 "lib/pkgconfig/libantfly.pc",
                 "README.md",
@@ -75,7 +81,7 @@ def verify(directory: Path, platform: dict, products: list[str]) -> None:
                 member = members.get(name)
                 if member is None or not member.isfile() or member.size == 0:
                     raise ValueError(f"{path.name}: missing or empty {name}")
-                if name not in [*binaries, library]:
+                if name not in [*binaries, library, *apple_bridge]:
                     continue
                 if name in binaries and not member.mode & 0o111:
                     raise ValueError(f"{path.name}: {name} is not executable")

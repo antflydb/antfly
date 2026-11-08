@@ -25,6 +25,7 @@ pub const local_write = handles.local_write;
 pub const capi = handles.capi;
 pub const kernel_owner_abi = handles.kernel_owner_abi;
 pub const local_query_client = handles.local_query_client;
+pub const storageQueryExecutionIssue = @import("../storage/local_query_provider.zig").issue;
 pub const capi_build_options = handles.capi_build_options;
 pub const db_mod = handles.db_mod;
 pub const read_consistency = handles.read_consistency;
@@ -33,7 +34,7 @@ pub const aggregations_mod = handles.aggregations_mod;
 pub const search_agg_mod = handles.search_agg_mod;
 pub const geo_mod = handles.geo_mod;
 pub const lite_backend = handles.lite_backend;
-pub const batch_api = handles.batch_api;
+pub const batch_api = antfly.capi_dependencies.api_internal_batch;
 pub const query_api = handles.query_api;
 pub const tables_api = handles.tables_api;
 pub const table_reads_api = handles.table_reads_api;
@@ -4323,6 +4324,80 @@ pub fn storageOwnerBatchJson(
     return .ok;
 }
 
+pub fn storageOwnerBatchBorrowedDocuments(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.BorrowedDocumentBatchRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    var operation: kernel_owner_abi.BorrowedBatchOperation = .validate;
+    borrowedDocumentBatch(owner, request, out_response, &operation) catch |err| {
+        out_failure.* = kernel_error_identity.failureFromError(err, .storage_owner, kernel_owner_abi.abi_version, @backingInt(operation));
+        return out_failure.status;
+    };
+    return .ok;
+}
+
+fn borrowedBytesValid(bytes: kernel_owner_abi.BorrowedBytes) bool {
+    return bytes.len <= std.math.maxInt(usize) and (bytes.len == 0 or bytes.ptr != null);
+}
+
+fn borrowedDocumentBatch(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.BorrowedDocumentBatchRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    operation: *kernel_owner_abi.BorrowedBatchOperation,
+) !void {
+    if (request.version != kernel_owner_abi.abi_version) return error.InvalidAbiVersion;
+    const handle = asHandle(owner) orelse return error.InvalidArgument;
+    if (!borrowedBytesValid(request.table_name)) return error.InvalidArgument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return error.InvalidArgument;
+    if (request.write_count > std.math.maxInt(u32) or request.delete_count > std.math.maxInt(u32)) return error.InvalidArgument;
+    if ((request.write_count != 0 and request.writes == null) or (request.delete_count != 0 and request.deletes == null)) return error.InvalidArgument;
+    const sync_level: db_mod.types.SyncLevel = switch (request.sync_level) {
+        .propose => .propose,
+        .write => .write,
+        .full_text => .full_text,
+        .enrichments => .enrichments,
+        .full_index => .full_index,
+        _ => return error.InvalidArgument,
+    };
+    const writes = try handle.alloc.alloc(db_mod.types.BatchWrite, @intCast(request.write_count));
+    defer handle.alloc.free(writes);
+    for (writes, 0..) |*write, i| {
+        const input = request.writes.?[i];
+        if (!borrowedBytesValid(input.key) or !borrowedBytesValid(input.document_json)) return error.InvalidArgument;
+        // Validate ordinary documents without copying keys or their numeric
+        // spellings into a serialized enclosing batch. Nothing mutates until
+        // every descriptor and document has been validated.
+        var parsed = std.json.parseFromSlice(std.json.Value, handle.alloc, input.document_json.slice(), .{
+            .parse_numbers = false,
+            .max_value_len = @import("antfly_public_limits").max_json_value_len,
+        }) catch |err| switch (err) {
+            error.ValueTooLong => return error.ValueTooLong,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidBatchRequest,
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidBatchRequest;
+        write.* = .{ .key = input.key.slice(), .value = input.document_json.slice() };
+    }
+    const deletes = try handle.alloc.alloc([]const u8, @intCast(request.delete_count));
+    defer handle.alloc.free(deletes);
+    for (deletes, 0..) |*key, i| {
+        const input = request.deletes.?[i];
+        if (!borrowedBytesValid(input)) return error.InvalidArgument;
+        key.* = input.slice();
+    }
+    operation.* = .commit;
+    try handle.db.batch(.{ .writes = writes, .deletes = deletes, .sync_level = sync_level, .timestamp_ns = request.timestamp_ns });
+    operation.* = .response;
+    const response = try batch_api.encodeBatchResponse(std.heap.c_allocator, .{ .inserted = @intCast(writes.len), .deleted = @intCast(deletes.len) });
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+}
+
 pub fn storageOwnerReplicatedBatchJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
@@ -5538,21 +5613,7 @@ pub const StorageRelationalRead = struct {
 
     pub fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !View.Page {
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
-        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
-        errdefer page.deinit();
-        const owned = page.arena.allocator();
-        const rows = try owned.alloc(View.Row, page.rows.len);
-        for (page.rows, rows) |row, *out| out.* = .{
-            .id = row.key,
-            .version = row.version,
-            .schema_version = session.reader.active.version(),
-            .value = row.typed orelse .null,
-            .typed_cells = row.typed_cells,
-            .sql_nulls = row.sql_nulls,
-            .expected_content_digest = row.expected_content_digest,
-        };
-        const after = if (page.more) try owned.dupe(u8, session.reader.after.items) else null;
-        return .{ .arena = page.arena, .rows = rows, .after = after };
+        return session.nextViewPage(alloc, limit);
     }
 
     pub fn close(ptr: *anyopaque) void {
@@ -5791,7 +5852,7 @@ pub fn executeStorageOwnerCompiledQueryOperation(
     const response = local_query_client.executeControlledJsonAlloc(
         std.heap.c_allocator,
         kind,
-        @ptrCast(&handle.db),
+        &handle.db,
         table_name,
         request_json,
         null,
@@ -5960,7 +6021,7 @@ pub fn executeStorageOwnerCompiledGraph(
     const response = local_query_client.executeControlledJsonAlloc(
         std.heap.c_allocator,
         kind,
-        @ptrCast(&handle.db),
+        &handle.db,
         table_name,
         request.request_json.slice(),
         if (request.has_execution_deadline != 0) request.execution_deadline_ns else null,
@@ -6491,7 +6552,7 @@ pub fn searchStorageKernelQueryJson(
         };
         const response = local_query_client.executeJsonAlloc(
             std.heap.c_allocator,
-            @ptrCast(&handle.db),
+            &handle.db,
             table_name,
             request_json.bytes(),
             .internal,
@@ -6616,7 +6677,7 @@ pub fn storageOwnerRestoreControlJson(owner_ptr: ?*anyopaque, request: *const ke
             var scoped = batch;
             scoped.restore_staging_scope = self.scope;
             scoped.restore_staging_plan_id = self.plan_id;
-            self.batch_json = try antfly.capi_dependencies.api_batch.encodeBatchRequest(self.alloc, scoped);
+            self.batch_json = try antfly.capi_dependencies.api_internal_batch.encodeBatchRequest(self.alloc, scoped);
         }
     };
     var capture: Capture = .{ .alloc = handle.alloc, .scope = input.value.scope.digest(), .plan_id = input.value.scope.plan_id };

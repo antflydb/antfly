@@ -89,7 +89,7 @@ test "privacy receivers fence legacy lookups and reject superseded assertions be
 
 test "privacy routed scans accept the public range response envelope and own cursors" {
     const a = std.testing.allocator;
-    var result = try @import("table_writes.zig").parseStorageKernelDocumentArtifactTableReprocessResult(a, "{\"reprocess\":\"triggered\",\"reprocess_status\":\"in_progress\",\"artifact_name\":\"_privacy_document\",\"scanned\":0,\"reprocessed\":0,\"skipped\":0,\"failed\":0,\"limit\":100,\"next_key\":\"\",\"pending_shards\":1,\"failures\":[],\"shard_cursors\":[]}");
+    var result = try @import("antfly_source_root").antfly_sources.table_writes.parseStorageKernelDocumentArtifactTableReprocessResult(a, "{\"reprocess\":\"triggered\",\"reprocess_status\":\"in_progress\",\"artifact_name\":\"_privacy_document\",\"scanned\":0,\"reprocessed\":0,\"skipped\":0,\"failed\":0,\"limit\":100,\"next_key\":\"\",\"pending_shards\":1,\"failures\":[],\"shard_cursors\":[]}");
     defer result.deinit(a);
     try std.testing.expect(result.next_key != null);
     try std.testing.expectEqualStrings("", result.next_key.?);
