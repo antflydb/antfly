@@ -150,6 +150,104 @@ the new upstream timing header. This successful observation does not cancel the
 earlier outliers or establish a cold-start percentile. Focused gateway,
 qualification and plan tests passed (24 tests, one optional skip, nine subtests).
 
+### Managed outlier origin correlation
+
+The request at 02:58:17 UTC corresponding to the 21.497-second client observation
+completed in Colony in 2.253 seconds. Google's load balancer recorded 2.293 seconds,
+HTTP 200 and `response_sent_by_backend` for the matching route/window. This places
+the unexplained additional delay beyond the Google origin, on the Cloudflare/client
+delivery or local observation path. It does not identify the specific fault, and
+no original Cloudflare Ray ID or client phase trace was captured for that request.
+
+Twelve additional read-only searches with DNS/TCP/TLS/header/body/close traces
+completed in 2.248–2.788 seconds; the longest body read was 104 ms. None reproduced
+the 21.497-second stall. Three more real managed queries validated the new
+correlation capture: 2.399, 2.518 and 2.421 seconds, with body/decode times of
+3–4 ms. All returned 20 distinct rows and valid UUID response request and
+Cloudflare Ray IDs. The later CLI check below found that those response IDs do
+not match deployed Colony access-log IDs. The updated gateway propagates only
+bounded validated IDs, including on
+upstream errors, and qualification reports retain absolute start and header/body
+and close times. A regression test ensures a delayed connection close remains in
+the total and outside-upstream duration. Focused tests now pass 26 cases, with one
+optional skip and nine subtests.
+The transport fault is not claimed fixed; further attribution requires a
+recurrence with these IDs/timings or Cloudflare-side telemetry.
+
+### Applied hosting probe correction
+
+[Colony #952](https://github.com/antflydb/colony/pull/952), source
+`90d48b808776cf902d9bb4dac2743c0d91763a01`, owns the probe correction. After
+successful infrastructure build/tests and explicit saved-plan approval, the
+documented deploy service account's apply was denied `run.services.update`.
+Read-only inspection confirmed no resource, output or pending-operation changes.
+A fresh preview and explicit retry approval used the verified existing human
+ADC identity; no IAM permissions were added. The retry completed with one HN
+service updated and 67 resources unchanged.
+
+Revision `hackernews-00004-njc` uses the same gateway image and a one-second
+startup probe, one-second timeout and 30 failures. At 03:57:57.580 UTC November 7,
+Cloud Run started its deployment-rollout container; the probe passed at
+03:57:58.888, about 1.31 seconds later, versus about 10.17 seconds in the earlier
+autoscaling observation. These are individual startup events, not matched
+cold-start percentiles. The first post-rollout search-first qualification passed
+its five-second gate: History 0.632 s, Recent 1.049 s, All 2.524 s, with the same
+ranked IDs as the pre-migration golden record for every view. Readiness passed
+after the searches. Private invocation, scale-to-zero, the pinned gateway image,
+67 stored resources, 16 outputs and zero pending operations were verified.
+
+The gateway timing code from merged Antfly #1547 and the correlation additions
+in its follow-up are not yet deployed. This probe-only rollout did not deploy
+that code, change the database image, or optimize existing table schemas. Keep
+those boundaries separate from the verified probe correction.
+
+## Additional CLI transport checks
+
+Twenty further serial `curl` searches compared HTTP/1.1 and HTTP/2 with fresh
+and reused connections. Each returned HTTP 200 and 20 distinct rows:
+
+| Connection mode | Minimum | Median | Maximum |
+| --- | ---: | ---: | ---: |
+| Fresh HTTP/1.1 | 2.370 s | 2.492 s | 2.709 s |
+| Fresh HTTP/2 | 2.292 s | 2.391 s | 2.443 s |
+| Reused HTTP/1.1 | 2.203 s | 2.383 s | 2.613 s |
+| Reused HTTP/2 | 1.941 s | 2.272 s | 2.293 s |
+
+DNS took at most 47 ms, TCP/TLS establishment after DNS at most 76 ms, and body
+transfer at most 8 ms. A local heartbeat's longest scheduling gap was 65 ms.
+Engine cgroup counters showed zero throttled periods/time before and after the
+run; observed engine/API CPU usage was 235m/9m. No host sleep/wake event was found
+in the original outlier's ten-minute window. These checks do not exclude a past
+client scheduling pause or transient packet loss. A forced IPv6 request used
+IPv4-mapped addresses, so it does not qualify a native IPv6 path.
+
+The deployed API response IDs matched none of the 20 Colony log IDs. Origin
+requests were instead paired by the isolated time window and serial order:
+1.850–2.509 seconds at Colony, with at most 231 ms of excess client time. This
+is time/order attribution, not an exact-ID join. The canonical-ID correction is
+already merged in [Colony #947](https://github.com/antflydb/colony/pull/947), but
+the published releases checked predate that merge. A containing Colony release
+and deployment is needed before response/log-ID correlation can be relied on.
+It is an observability correction, not evidence that the transport stall is fixed.
+
+Neither protocol nor connection reuse reproduced the 21.497-second observation.
+The normal baseline in this run was mostly origin processing, while the original
+outlier's unexplained excess remains beyond Google's origin. Cloudflare edge
+telemetry or a fully traced recurrence remains necessary for the specific cause.
+
+An additional three All searches were bracketed by settled engine metrics,
+waiting six seconds on either side for the five-second exposition cache. The
+deltas contained exactly three composed requests and 15 leaf calls. Composed
+execution totaled 6.717 seconds; source setup 3.377 seconds, publication selection
+1.098 seconds, leaf cursor retention 0.605 seconds, WAL-cut work 0.546 seconds,
+composed cursor work 0.327 seconds and ranking 0.074 seconds. Phases nest, so do
+not add every counter. Per search, source/publication averaged 1.492 seconds,
+leaf/composed cursor work 0.311 seconds, WAL work 0.182 seconds and ranking
+0.025 seconds. Client durations were 2.557, 2.407 and 2.240 seconds. These data
+prioritize repeated source/publication setup and durable cursor round trips over
+ranking CPU for the ordinary sample baseline. They do not explain the isolated
+21.497-second excess or establish archive-scale performance.
+
 ## Remaining scope
 
 These are bounded sample checks. Full-archive construction/performance,

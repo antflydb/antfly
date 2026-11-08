@@ -606,6 +606,8 @@ pub const MetadataProjectionKind = enum(u32) {
     job_state = 72,
     job_state_scan = 73,
     job_owner_count = 74,
+    /// Compact lake authority, including an explicit unowned-source record.
+    lake_source_owner = 75,
     /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
     secret_collection = 42,
 };
