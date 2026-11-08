@@ -1642,7 +1642,7 @@ pub const Index = struct {
                         if (!visited.isSet(self.entry)) {
                             visited.set(self.entry);
                             try pending.append(alloc, self.entry);
-                            try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter);
+                            try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter, opts.gate, &stopped);
                             continue;
                         }
                     }
