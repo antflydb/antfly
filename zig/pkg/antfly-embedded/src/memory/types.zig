@@ -440,6 +440,20 @@ pub const StoredAssertion = struct {
     /// Accepted replacement boundary; null means business time is unknown.
     superseded_valid_at: ?i64 = null,
     config_generation: u64,
+
+    // Keep historical claim-view fingerprints stable until verification is
+    // actually recorded. An additive null field must not stale pending pins.
+    pub fn jsonStringify(self: StoredAssertion, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(StoredAssertion).@"struct".field_names) |field| {
+            const skip = if (comptime std.mem.eql(u8, field, "last_verified_at")) self.last_verified_at == null else false;
+            if (!skip) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 pub const Stage = enum { pending, running, succeeded, failed, cancelled };
 pub const RequiredGrant = enum { write, curator, admin };

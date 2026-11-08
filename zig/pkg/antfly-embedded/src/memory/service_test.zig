@@ -8750,3 +8750,23 @@ test "completion consolidation covers all entities and ignores untyped literal r
     try std.testing.expectEqual(@as(usize, 1026), total);
     try std.testing.expect(orphan_found);
 }
+
+test "completion additive verification metadata preserves unverified claim pin bytes" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", helm, "claim", 3);
+    const svc = store.service("alice", true, 500);
+    const raw = try svc.execute(a, .get, "helm", "{}", "");
+    // A pre-upgrade record has exactly this shape: no verification property.
+    const old_shape = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+    try std.testing.expect(!old_shape.object.contains("last_verified_at"));
+    const record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, raw, .{});
+    const reread = try std.json.Stringify.valueAlloc(a, record, .{});
+    try std.testing.expectEqualStrings(raw, reread);
+    const correction: m.types.Correction = .{ .id = "helm", .expected_revision = record.revision, .lifecycle = .active, .stability = .settled, .reason = "Verified", .evidence = &.{.{ .id = "e1" }} };
+    _ = try svc.execute(a, .correct, "", try std.json.Stringify.valueAlloc(a, correction, .{}), "verify");
+    const verified = try std.json.parseFromSliceLeaky(std.json.Value, a, try svc.execute(a, .get, "helm", "{}", ""), .{});
+    try std.testing.expectEqual(@as(i64, 500), verified.object.get("last_verified_at").?.integer);
+}
