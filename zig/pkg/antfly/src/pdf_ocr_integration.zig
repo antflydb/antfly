@@ -72,11 +72,11 @@ pub fn main(init: std.process.Init) !void {
             };
         }
 
-        fn modelCapabilitiesWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, task: inference_work.Task, context: managed_embedder.RequestContext) !inference_work.InferenceCapabilities {
+        fn modelCapabilitiesWithContext(ptr: *anyopaque, result_alloc: std.mem.Allocator, model: []const u8, task: inference_work.Task, context: managed_embedder.RequestContext) !inference_work.InferenceCapabilities {
             try context.check();
-            return modelCapabilities(ptr, alloc, model, task);
+            return modelCapabilities(ptr, result_alloc, model, task);
         }
-        fn readEncodedImagesReportedWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, request: readers.EncodedRequest, context: managed_embedder.RequestContext) !readers.BatchResult {
+        fn readEncodedImagesReportedWithContext(ptr: *anyopaque, result_alloc: std.mem.Allocator, model: []const u8, request: readers.EncodedRequest, context: managed_embedder.RequestContext) !readers.BatchResult {
             try context.check();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.revisioned) {
@@ -90,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
                     @import("antfly_platform").time.yieldNow();
                 }
             }
-            return readEncodedImagesReported(ptr, alloc, model, request);
+            return readEncodedImagesReported(ptr, result_alloc, model, request);
         }
 
         fn modelCapabilities(
