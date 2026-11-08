@@ -176,7 +176,8 @@ class McpSchemaFragmentTests(unittest.TestCase):
         child_mode_rejection = next(
             branch
             for branch in query_schema["not"]["anyOf"]
-            if branch.get("allOf", [{}])[0]
+            if len(branch.get("allOf", [])) == 2
+            and branch["allOf"][0]
             == {
                 "required": ["hierarchy"],
                 "properties": {"hierarchy": {"required": ["children"]}},
@@ -187,6 +188,9 @@ class McpSchemaFragmentTests(unittest.TestCase):
             item["required"][0] for item in child_mode_rejection["allOf"][1]["anyOf"]
         }
         allowed_child_fields = {
+            # Source traversal now permits filtering; unit traversal retains
+            # its separate conditional rejection below.
+            "filter_query",
             "table",
             "table_target",
             "fields",
@@ -199,9 +203,6 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "search_after",
             "read_requirements",
             "remote_snapshot",
-            # Filtering is supported for member-level child navigation; the
-            # dedicated unit-level rejection remains a separate condition.
-            "filter_query",
         }
         self.assertEqual(
             set(query_schema["properties"]),

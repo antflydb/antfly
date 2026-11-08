@@ -43,6 +43,7 @@ fn blocked(err: anyerror) bool {
     };
 }
 pub fn retentionDue(backend: m.Backend, a: A, now: i64, state: m.types.State) !bool {
+    if (!state.restates_ready) return true;
     if (state.persistent_roots) {
         const due = try backend.scan(backend.ptr, a, "lineage-gc/", null, 1);
         if (due.rows.len > 0) {
