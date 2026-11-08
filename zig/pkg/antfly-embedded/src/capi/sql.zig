@@ -551,6 +551,15 @@ pub fn Adapter(comptime native: type) type {
             const io = self.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
             const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
             const outcomes = dependencies.sql_errors;
+            const coordinator = @import("sql_commit.zig");
+            // Nothing committed yet: the equivalent of `sql_commit.zig`'s
+            // `test_before_store` boundary, fired before this write's own
+            // `beginTransaction` instead of before the cross-database
+            // coordinator's recovery-hint record (this path has none).
+            if (comptime @import("builtin").is_test) if (coordinator.test_before_store) |hook| {
+                coordinator.test_before_store = null;
+                hook.run(hook.ptr) catch |err| return outcomes.notApplied(err);
+            };
             const txn_id = self.db.beginTransaction(now) catch |err| return outcomes.notApplied(err);
             self.outcome_transaction_id = txn_id;
             self.db.writeTransaction(txn_id, .{
@@ -570,10 +579,24 @@ pub fn Adapter(comptime native: type) type {
                 if (err == error.VersionConflict) return error.SqlWriteConflict;
                 return outcomes.notApplied(err);
             };
+            // Equivalent of `test_after_prepare`: every participant (here,
+            // the one table) is prepared; about to make the commit decision.
+            // Abandon exactly as the `writeTransaction` failure above does.
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_prepare) |hook| {
+                coordinator.test_after_prepare = null;
+                hook.run(hook.ptr) catch |err| {
+                    self.db.abortTransaction(txn_id, now +| 1) catch {};
+                    self.outcome_transaction_id = null;
+                    return outcomes.notApplied(err);
+                };
+            };
             // Only durable status can classify a failure after commit starts.
             // Never abort/replay a possibly published mutation.
             self.db.commitTransaction(txn_id, now +| 1) catch |err| {
-                const status = self.db.getTransactionStatus(txn_id) catch return error.SqlMutationOutcomeUnknown;
+                const status = self.db.getTransactionStatus(txn_id) catch {
+                    if (self.handle) |handle| handle.sql_decision_uncertain = true;
+                    return error.SqlMutationOutcomeUnknown;
+                };
                 if (status == .committed) return switch (err) {
                     error.EnrichmentWorkerFailed => .committed_repair_required,
                     else => .committed_pending,
@@ -582,7 +605,44 @@ pub fn Adapter(comptime native: type) type {
                     self.outcome_transaction_id = null;
                     return error.SqlWriteConflict;
                 }
+                // `status == .pending`: durability is genuinely unknown only
+                // while the native checkpoint publication might still land
+                // (mirrors `sql_commit.zig`'s `commitLocked`). Otherwise the
+                // decision provably never became durable -- abort it so
+                // recovery can never commit it later, and report "not
+                // applied" instead of an unwarranted "unknown".
+                //
+                // Unlike `commitLocked`'s simple coordinator-decision commit,
+                // this commit also materializes the table's rows inline, and
+                // that path's own reconciliation can already have resolved
+                // (and cleared) `checkpoint_publication_uncertain` by the
+                // time it hands back an already-classified unknown-outcome
+                // error -- checking the flag at that point would wrongly see
+                // "resolved" and report "not applied" for a write whose
+                // recovery has not actually settled from this caller's
+                // perspective.
+                // Trust that classification first; fall back to the flag
+                // only for a plain error the lower layers never classified.
+                if (outcomes.isUnknownOutcome(err)) {
+                    if (self.handle) |handle| handle.sql_decision_uncertain = true;
+                    return error.SqlMutationOutcomeUnknown;
+                }
+                if (self.handle) |handle| {
+                    if (!coordinator.publicationUncertain(handle)) {
+                        self.db.abortTransaction(txn_id, now +| 2) catch {};
+                        self.outcome_transaction_id = null;
+                        return outcomes.notApplied(err);
+                    }
+                    handle.sql_decision_uncertain = true;
+                }
                 return error.SqlMutationOutcomeUnknown;
+            };
+            // Equivalent of `test_after_decision`: the decision is durable;
+            // simulate a post-decision step (participant resolution in the
+            // cross-database protocol) failing without losing the commit.
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_decision) |hook| {
+                coordinator.test_after_decision = null;
+                hook.run(hook.ptr) catch return .committed_pending;
             };
             self.outcome_transaction_id = null;
             return .committed;

@@ -54,13 +54,20 @@ pub const Coordinator = struct {
         return commitLocked(self.handle, requests, &.{}, null, out_id, .sql);
     }
 };
-const TestHook = struct { ptr: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
-var test_after_prepare: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
+pub const TestHook = struct { ptr: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
+/// Shared with `sql.zig`'s `commitCoordinated`: the single-table fast path
+/// has no recovery-hint record or separate participant-resolution step of
+/// its own, but it still honors these at the equivalent boundary (right
+/// before its one `beginTransaction`, right before its `commitTransaction`
+/// decision, and right after that decision durably commits), so a fault
+/// injected here fires the same way regardless of which path a given write
+/// takes (lite-single-commit-write-path.md §3.3c).
+pub var test_after_prepare: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
 /// Runs before the recovery hint is stored; an error fails the commit there.
-var test_before_store: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
+pub var test_before_store: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
 /// Runs after a committed decision, in place of participant resolution
 /// succeeding; an error simulates resolution failing.
-var test_after_decision: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
+pub var test_after_decision: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
 var test_contended_acquire: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
 
 pub fn acquire(handle: *h.Handle) Coordinator {
@@ -172,7 +179,7 @@ pub fn commitWithGraphGuards(handle: *h.Handle, requests: []const contract.Table
 
 /// Whether the native checkpoint publication is in its uncertain window, so a
 /// pending decision may nonetheless be durable. Non-native stores answer yes.
-fn publicationUncertain(handle: *h.Handle) bool {
+pub fn publicationUncertain(handle: *h.Handle) bool {
     const root = handle.parent_handle orelse handle;
     const backend = root.owned_lite_backend orelse return true;
     const docstore = backend.native_docstore orelse return true;
