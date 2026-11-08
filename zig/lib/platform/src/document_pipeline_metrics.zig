@@ -22,15 +22,29 @@ pub const Phase = enum { source_fetch, pdf_prepare, pdf_render, media_encode, re
 const bounds = [_]u64{ 1_000_000, 10_000_000, 100_000_000, 1_000_000_000, 10_000_000_000, 60_000_000_000 };
 const Counter = atomic.Value(u64);
 pub const Histogram = struct {
-    count: Counter = .init(0),
-    total_ns: Counter = .init(0),
-    buckets: [bounds.len]Counter = @splat(.init(0)),
+    // One short lock per phase makes count, sum and cumulative buckets one
+    // observation. Independent atomics can export bucket > count during a scrape.
+    mutex: std.atomic.Mutex = .unlocked,
+    count: u64 = 0,
+    total_ns: u64 = 0,
+    buckets: [bounds.len]u64 = @splat(0),
+    const View = struct { count: u64, total_ns: u64, buckets: [bounds.len]u64 };
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
     pub fn observe(self: *@This(), ns: u64) void {
-        _ = self.total_ns.fetchAdd(ns, .monotonic);
+        self.lock();
+        defer self.mutex.unlock();
+        self.total_ns +|= ns;
         for (&self.buckets, bounds) |*bucket, bound| if (ns <= bound) {
-            _ = bucket.fetchAdd(1, .monotonic);
+            bucket.* +|= 1;
         };
-        _ = self.count.fetchAdd(1, .monotonic);
+        self.count +|= 1;
+    }
+    pub fn capture(self: *@This()) View {
+        self.lock();
+        defer self.mutex.unlock();
+        return .{ .count = self.count, .total_ns = self.total_ns, .buckets = self.buckets };
     }
 };
 pub const PrefetchEvent = enum { started, ready, failed, consumed, reclaimed };
@@ -81,9 +95,10 @@ pub const Snapshot = struct {
 pub fn snapshot() Snapshot {
     var result: Snapshot = .{};
     for (&result.counts, &result.totals_ns, &result.buckets, &phases) |*count, *total, *buckets, *h| {
-        count.* = h.count.load(.monotonic);
-        total.* = h.total_ns.load(.monotonic);
-        for (buckets, &h.buckets) |*out, *in| out.* = in.load(.monotonic);
+        const view = h.capture();
+        count.* = view.count;
+        total.* = view.total_ns;
+        buckets.* = view.buckets;
     }
     for (&result.events, &prefetch_events) |*out, *in| out.* = in.load(.monotonic);
     return result;
@@ -97,9 +112,9 @@ test "pipeline histograms include boundary values and independent phases" {
     h.observe(bounds[0]);
     h.observe(bounds[0] + 1);
     h.observe(bounds[bounds.len - 1] + 1);
-    try std.testing.expectEqual(@as(u64, 3), h.count.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), h.buckets[0].load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 2), h.buckets[bounds.len - 1].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 3), h.capture().count);
+    try std.testing.expectEqual(@as(u64, 1), h.capture().buckets[0]);
+    try std.testing.expectEqual(@as(u64, 2), h.capture().buckets[bounds.len - 1]);
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try writePrometheus(&out.writer);
@@ -121,4 +136,34 @@ test "pipeline metric owner snapshots merge and reject unknown versions" {
     try std.testing.expectEqual(@as(u64, 3), first.events[0]);
     second.version = 2;
     try std.testing.expectError(error.InvalidPipelineMetricsVersion, first.merge(second));
+}
+
+test "pipeline histogram snapshots stay coherent with concurrent writers" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(2) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Worker = struct {
+        histogram: *Histogram,
+        done: atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            for (0..20000) |_| self.histogram.observe(1);
+            self.done.store(true, .release);
+        }
+    };
+    var histogram: Histogram = .{};
+    var first: Worker = .{ .histogram = &histogram };
+    var second: Worker = .{ .histogram = &histogram };
+    var f = try io.concurrent(Worker.run, .{&first});
+    defer f.await(io);
+    var g = try io.concurrent(Worker.run, .{&second});
+    defer g.await(io);
+    while (!first.done.load(.acquire) or !second.done.load(.acquire)) {
+        const view = histogram.capture();
+        try std.testing.expectEqual(view.count, view.total_ns);
+        for (view.buckets) |bucket| try std.testing.expectEqual(view.count, bucket);
+    }
+    const final = histogram.capture();
+    try std.testing.expectEqual(@as(u64, 40000), final.count);
+    try std.testing.expectEqual(final.count, final.total_ns);
+    for (final.buckets) |bucket| try std.testing.expectEqual(final.count, bucket);
 }

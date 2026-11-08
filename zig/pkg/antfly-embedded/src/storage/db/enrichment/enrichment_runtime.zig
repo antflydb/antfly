@@ -13421,7 +13421,7 @@ pub fn runNativeDocumentPreparationIntegration(alloc: Allocator, io: Io, pdf_byt
     // Four independent one-page PDFs exercise refill after the initial pair.
     // Trailing PDF comments give each source a distinct immutable identity.
     const keys = [_][]const u8{ "current", "one", "two", "three", "four" };
-    const producer_json = "{\"type\":\"document_extraction\",\"config\":{\"content_type\":\"application/pdf\",\"ocr\":{\"mode\":\"always\",\"prompt\":\"<OCR>\",\"reader\":{\"provider\":\"antfly\",\"model\":\"multistage-integration\"}}}}";
+    const producer_json = "{\"type\":\"document_extraction\",\"config\":{\"content_type\":\"application/pdf\",\"ocr\":{\"mode\":\"always\",\"prompt\":\"<OCR>\",\"reader\":{\"provider\":\"antfly\",\"model\":\"multistage-integration@1111111111111111111111111111111111111111\"}}}}";
     var descriptions = std.heap.ArenaAllocator.init(alloc);
     defer descriptions.deinit();
     const description = descriptions.allocator();
@@ -13638,18 +13638,6 @@ const DocumentPreparationPipeline = struct {
             }
             try self.computeFirstPage(producer);
         }
-        fn pinnedModelConfig(self: *@This()) !bool {
-            const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator(), document_extraction_mod.effectiveOcrConfigJson(self.config), .{});
-            defer parsed.deinit();
-            if (parsed.value != .object) return false;
-            const model = parsed.value.object.get("model") orelse return false;
-            if (model != .string) return false;
-            const separator = std.mem.lastIndexOfScalar(u8, model.string, '@') orelse return false;
-            const revision = model.string[separator + 1 ..];
-            if (revision.len != 40 and revision.len != 64) return false;
-            for (revision) |c| if (!std.ascii.isHex(c)) return false;
-            return true;
-        }
         fn sameSource(self: *const @This(), bytes: []const u8) bool {
             const source = self.source orelse return false;
             const cached = source.entry().content.data;
@@ -13659,8 +13647,8 @@ const DocumentPreparationPipeline = struct {
         }
         fn computeFirstPage(self: *@This(), producer: asset_producer_mod.Producer) !void {
             const capabilities = self.capabilities orelse return;
-            // An unversioned provider cannot establish reusable model identity.
-            if (capabilities.model_revision == null or (!capabilities.model_revision_pinning and !try self.pinnedModelConfig())) return;
+            // Discovery is an expectation, never proof of actual execution.
+            const expected_revision = capabilities.model_revision orelse return;
             const w = if (self.window) |*window| window else return;
             if (w.unit_indices.len != 1 or w.planned_parts_json.len != 1) return;
             const index = w.unit_indices[0];
@@ -13691,10 +13679,15 @@ const DocumentPreparationPipeline = struct {
                 return error.UnboundedEnrichmentProvider;
             const a = w.allocator();
             {
-                var produced = if (self.raster) try producer.produceBorrowedRasterBatchReported(a, &.{request}, &rasters) else try producer.produceBatchReported(a, &.{request});
+                var execution_context = producer.invocation_context;
+                execution_context.expected_model_revision = expected_revision;
+                const executor = producer.withInvocationContext(execution_context);
+                var produced = if (self.raster) try executor.produceBorrowedRasterBatchReported(a, &.{request}, &rasters) else try executor.produceBatchReported(a, &.{request});
                 defer produced.deinit(a);
                 if (isCancelled(self)) return error.Canceled;
                 try produced.validateForRequests(&.{request});
+                const executed_revision = produced.executed_model_revision orelse return;
+                if (!std.mem.eql(u8, &expected_revision, &executed_revision)) return;
                 const value = switch (produced.items[0].result) {
                     .value => |v| v,
                     .item_error => return,
@@ -46091,13 +46084,15 @@ test "document preparation enforces execution bytes pixels provider guards and O
     const a = std.testing.allocator;
     const Fake = struct {
         calls: usize = 0,
+        executed_revision: ?[32]u8 = @splat(1),
         fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
             return error.UnexpectedSerialCall;
         }
         fn contextual(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request, _: asset_producer_mod.InvocationContext) ![]u8 {
             return produce(ptr, alloc, request);
         }
-        fn rasterContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer_mod.Request, rasters: []const antfly_image.BorrowedRasterAttachment, _: asset_producer_mod.InvocationContext) !asset_producer_mod.ProducedBatch {
+        fn rasterContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer_mod.Request, rasters: []const antfly_image.BorrowedRasterAttachment, context: asset_producer_mod.InvocationContext) !asset_producer_mod.ProducedBatch {
+            try std.testing.expectEqual(@as(?[32]u8, @splat(1)), context.expected_model_revision);
             return raster(ptr, alloc, requests, rasters);
         }
         fn caps(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !?inference_work.InferenceCapabilities {
@@ -46111,7 +46106,7 @@ test "document preparation enforces execution bytes pixels provider guards and O
             self.calls += 1;
             const items = try alloc.alloc(asset_producer_mod.ProducedItem, 1);
             items[0] = .{ .identity = .{ .item_id = requests[0].item_id, .source_fingerprint = requests[0].source_fingerprint, .page_number = requests[0].page_number }, .result = .{ .value = try alloc.dupe(u8, "[{\"text\":\"Invoice reference 12345 and total USD 42.00. This is the complete readable document text needed for the review regression.\"}]") } };
-            return .{ .items = items, .execution = inference_work.ExecutionReport.serial(1) };
+            return .{ .items = items, .execution = inference_work.ExecutionReport.serial(1), .executed_model_revision = self.executed_revision };
         }
     };
     var fake: Fake = .{};
@@ -46166,8 +46161,22 @@ test "document preparation enforces execution bytes pixels provider guards and O
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     job.original_first.?.deinit(owned);
     job.original_first = null;
+    // The provider claims pinning support, but missing or different actual
+    // execution identity must never make speculative output reusable. This
+    // also covers discovery A -> execution B -> discovery A rollback.
+    fake.executed_revision = null;
     try job.computeFirstPage(producer);
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(!job.computed and job.window != null);
+    job.original_first.?.deinit(owned);
+    job.original_first = null;
+    fake.executed_revision = @splat(2);
+    try job.computeFirstPage(producer);
+    try std.testing.expect(!job.computed and job.window != null);
+    job.original_first.?.deinit(owned);
+    job.original_first = null;
+    fake.executed_revision = @splat(1);
+    try job.computeFirstPage(producer);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
     try std.testing.expect(job.computed and job.window == null);
     try std.testing.expectEqual(@as(?u16, 72), units[0].ocr_render_dpi);
     try std.testing.expectEqual(@as(?u16, 72), units[0].ocr_effective_render_dpi);

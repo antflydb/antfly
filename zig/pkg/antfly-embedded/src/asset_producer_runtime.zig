@@ -447,12 +447,47 @@ test "asset producer runtime resolves a plan for a tiny local extractor request"
 /// recording is decoded and windowed; more only adds memory pressure.
 pub const default_local_transcriber_width: usize = 2;
 
+// Invocation-local only: shared Runtime handles never mutate identity state.
+// Mixed revisions (including a retry after a route change) are not reusable.
+const ModelExecutionIdentity = struct {
+    revision: ?[32]u8 = null,
+    invalid: bool = false,
+    expected: ?[32]u8 = null,
+    fn record(self: *@This(), revision: ?[32]u8) !void {
+        if (self.expected) |expected| {
+            const actual = revision orelse return error.ModelExecutionIdentityUnavailable;
+            if (!std.mem.eql(u8, &expected, &actual)) return error.ModelExecutionRevisionChanged;
+        }
+        const value = revision orelse {
+            self.invalid = true;
+            return;
+        };
+        if (self.revision) |prior| {
+            if (!std.mem.eql(u8, &prior, &value)) self.invalid = true;
+        } else self.revision = value;
+    }
+    fn result(self: @This()) ?[32]u8 {
+        return if (self.invalid) null else self.revision;
+    }
+};
+
+fn immutableAntflyModel(model: ?[]const u8) bool {
+    const name = model orelse return false;
+    const separator = std.mem.lastIndexOfScalar(u8, name, '@') orelse return false;
+    if (separator == 0) return false;
+    const revision = name[separator + 1 ..];
+    if (revision.len != 40 and revision.len != 64) return false;
+    for (revision) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
+
 pub const Runtime = struct {
     alloc: Allocator,
     http: *httpx.Client,
     capability_cache: remote_capabilities.Cache,
     execution: execution_context.Context = .{},
     request_progress: ?execution_context.ProgressSink = null,
+    model_execution_identity: ?*ModelExecutionIdentity = null,
     owned_provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,
@@ -1384,7 +1419,10 @@ pub const Runtime = struct {
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
         try scoped.execution.check(platform.time.monotonicNs());
+        var identity: ModelExecutionIdentity = .{ .expected = context.expected_model_revision };
+        scoped.model_execution_identity = &identity;
         var batch = try produceBatchReported(&scoped, alloc, requests);
+        batch.executed_model_revision = identity.result();
         errdefer batch.deinit(alloc);
         try scoped.execution.check(platform.time.monotonicNs());
         return batch;
@@ -1400,7 +1438,10 @@ pub const Runtime = struct {
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
         try scoped.execution.check(platform.time.monotonicNs());
+        var identity: ModelExecutionIdentity = .{ .expected = context.expected_model_revision };
+        scoped.model_execution_identity = &identity;
         var batch = try produceBorrowedRasterBatchReported(&scoped, alloc, requests, rasters);
+        batch.executed_model_revision = identity.result();
         errdefer batch.deinit(alloc);
         try scoped.execution.check(platform.time.monotonicNs());
         return batch;
@@ -2786,6 +2827,7 @@ pub const Runtime = struct {
             self.execution.waitContext(),
         );
         capabilities = capability_lease.capabilities orelse return error.InvalidInferenceCapabilities;
+        try self.recordLeaseExecution(capability_lease);
         if (capability_lease.routing_token) |*value| {
             header_storage[header_count] = .{ remote_capabilities.capability_token_header, value.slice() };
             header_count += 1;
@@ -2930,6 +2972,7 @@ pub const Runtime = struct {
             self.execution.waitContext(),
         );
         try replaceCapabilityLeaseFields(alloc, cfg, lease);
+        try self.recordLeaseExecution(lease);
         return lease.capabilities;
     }
 
@@ -3349,6 +3392,8 @@ pub const Runtime = struct {
             const local = self.antfly_provider.?;
             const capabilities = (try self.linkedModelCapabilities(alloc, local, cfg.model, .generate)) orelse
                 return error.InvalidInferenceCapabilities;
+            if (self.model_execution_identity) |identity|
+                try identity.record(if (immutableAntflyModel(cfg.model)) capabilities.model_revision else null);
             var encoded_bytes: usize = 0;
             var modalities = inference_work.Modalities{ .text = true };
             for (request.media) |media| {
@@ -3618,6 +3663,15 @@ pub const Runtime = struct {
         return try encodeReaderResults(alloc, request.content_type, results);
     }
 
+    fn recordLeaseExecution(self: *Runtime, lease: remote_capabilities.CapabilityLease) !void {
+        const identity = self.model_execution_identity orelse return;
+        const revision = if (lease.routing_token != null and lease.descriptor_revision != null)
+            if (lease.capabilities) |cap| cap.model_revision else null
+        else
+            null;
+        try identity.record(revision);
+    }
+
     fn appleReaderOptions(self: *Runtime) !readers.RemoteOptions {
         return .{
             .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
@@ -3670,6 +3724,7 @@ pub const Runtime = struct {
             );
             capability_lease_fields = CapabilityLeaseFields.init(lease);
             capability_lease_fields.apply(&execution_cfg);
+            try self.recordLeaseExecution(lease);
             break :blk lease.capabilities;
         } else try self.readerCapabilities(alloc, execution_cfg);
         if (discovered_capabilities) |capabilities| {
@@ -3697,6 +3752,8 @@ pub const Runtime = struct {
             return readers.readWithConfigReported(alloc, self.http, execution_cfg, request, try self.appleReaderOptions());
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
+            if (self.model_execution_identity) |identity|
+                try identity.record(if (immutableAntflyModel(execution_cfg.model)) if (discovered_capabilities) |cap| cap.model_revision else null else null);
             const items = if (local.read_images_with_context) |read_images|
                 try managed_embedder.AntflyProviderBoundary.call(
                     "read_images_with_context",
@@ -3806,6 +3863,7 @@ pub const Runtime = struct {
             );
             capability_lease_fields = CapabilityLeaseFields.init(lease);
             capability_lease_fields.apply(&execution_cfg);
+            try self.recordLeaseExecution(lease);
             break :blk lease.capabilities;
         } else try self.readerCapabilities(alloc, execution_cfg);
         var use_framed_transport = false;
@@ -3846,6 +3904,8 @@ pub const Runtime = struct {
             return readers.readEncodedWithConfigReported(alloc, self.http, execution_cfg, request, try self.appleReaderOptions());
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
+            if (self.model_execution_identity) |identity|
+                try identity.record(if (immutableAntflyModel(execution_cfg.model)) if (capabilities) |cap| cap.model_revision else null else null);
             if (local.read_encoded_images_reported_with_context) |read_reported|
                 return try managed_embedder.AntflyProviderBoundary.call(
                     "read_encoded_images_reported_with_context",
@@ -3968,6 +4028,8 @@ pub const Runtime = struct {
         if (execution_cfg.provider == .apple)
             return readers.readRasterWithConfigReported(alloc, execution_cfg, request, try self.appleReaderOptions());
         const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
+        if (self.model_execution_identity) |identity|
+            try identity.record(if (immutableAntflyModel(execution_cfg.model)) capabilities.model_revision else null);
         if (local.read_raster_images_reported == null and
             local.read_raster_images_reported_with_context == null)
             return error.BorrowedRasterUnsupported;
@@ -9794,4 +9856,37 @@ test "decision provider revision discovery matches execution bytes and verifies 
     defer remote_only.deinit();
     try std.testing.expectError(error.CapabilityDiscoveryUnavailable, resolve(scratch, remote_only.producer(), .{ .io = std.testing.io }, probe, 10000));
     try std.testing.expectEqual(probes, fixture.probes);
+}
+
+test "index document checkpoint producer execution identity rejects missing fencing and mixed revisions across retries" {
+    var identity: ModelExecutionIdentity = .{};
+    try std.testing.expect(identity.result() == null);
+    try identity.record(@splat(1));
+    try std.testing.expectEqual(@as(?[32]u8, @splat(1)), identity.result());
+    try identity.record(@splat(2));
+    try identity.record(@splat(1));
+    try std.testing.expect(identity.result() == null);
+    identity = .{};
+    try identity.record(@splat(1));
+    try identity.record(null);
+    try std.testing.expect(identity.result() == null);
+    identity = .{ .expected = @splat(1) };
+    try std.testing.expectError(error.ModelExecutionIdentityUnavailable, identity.record(null));
+    try std.testing.expectError(error.ModelExecutionRevisionChanged, identity.record(@splat(2)));
+    try identity.record(@splat(1));
+    var runtime: Runtime = undefined;
+    runtime.model_execution_identity = &identity;
+    var lease: remote_capabilities.CapabilityLease = .{
+        .capabilities = .{ .model_revision = @splat(1), .model_revision_pinning = true, .task = .read, .input_modalities = .{ .image = true }, .input_granularity = .page, .output = .read_result },
+    };
+    // A catalog support bit without the actual enforced lease is insufficient.
+    try std.testing.expectError(error.ModelExecutionIdentityUnavailable, runtime.recordLeaseExecution(lease));
+    lease.routing_token = try remote_capabilities.RoutingToken.init("route");
+    lease.descriptor_revision = try remote_capabilities.CapabilityRevision.init("1111111111111111111111111111111111111111111111111111111111111111");
+    try runtime.recordLeaseExecution(lease);
+    lease.capabilities.?.model_revision = @splat(2);
+    try std.testing.expectError(error.ModelExecutionRevisionChanged, runtime.recordLeaseExecution(lease));
+    try std.testing.expect(!immutableAntflyModel("alias"));
+    try std.testing.expect(!immutableAntflyModel("model@main"));
+    try std.testing.expect(immutableAntflyModel("model@1111111111111111111111111111111111111111"));
 }

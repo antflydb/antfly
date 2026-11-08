@@ -16,12 +16,17 @@ not trigger speculative OCR. Existing manifests, privacy-managed artifacts, caus
 retain their normal repair and idempotent paths. Equal source URLs are excluded
 from overlap so that mutable PDF sessions are not used concurrently.
 
-With an identifiable model revision, the task can also execute that first page
-through the normal asset producer. Only successful, validated OCR results are
-reused. The owner rechecks source allocation identity, OCR/render/quality policy,
-page identity, native text and current model capabilities before copying the
-selected unit. Unversioned providers retain render-ahead only. Failed speculative
-calls fall back to ordinary owner execution and do not record document retry debt,
+With a model revision, the task can also execute that first page through the
+normal asset producer. Reuse requires a successful result reporting the revision
+actually dispatched, matching the discovery expectation. The native adapter binds
+remote readers and generators to the exact server-enforced capability lease used
+for dispatch; a changed revision is rejected before inference. Linked readers and
+attachment generators require an immutable model reference. A catalog's revision
+or embedding-pinning support flag alone never establishes execution identity.
+Unknown or mixed execution revisions are not reusable. The owner rechecks source
+allocation identity, OCR/render/quality policy, page identity, native text and current model capabilities before copying the
+selected unit. Providers unable to establish execution identity retain render-ahead
+only. Failed speculative calls fall back to ordinary owner execution and do not record document retry debt,
 completion credit, artifacts or replay advancement.
 
 All workers join before source-cache destruction or ownership transfer. Cancellation
@@ -55,7 +60,10 @@ Prepared multimodal and eligible pending-token paths are included. A declined
 direct fast path and its fallback share a single decode-step sample, without
 including a subsequent coordinator wait. Counts describe execution scopes, not
 generated-token counts. GPU utilization and
-memory must still be sampled separately.
+memory must still be sampled separately. Each histogram uses a short per-phase
+critical section for both observation and capture, so count, sum and cumulative
+buckets describe the same observations even during concurrent scrapes. Formatting
+and cross-owner aggregation run outside those critical sections.
 
 `antfly_document_prefetch_events_total` distinguishes started, ready, failed,
 consumed and reclaimed tasks/windows. It has no document, URL or model labels.
