@@ -116,6 +116,38 @@ pub const Stage = enum(u8) {
     // §3.2a's ride-along table ("Catch-up progress"); see
     // `HBCIndex.saveProjectionCheckpointMetadata`'s ride-along durability.
     hbc_checkpoint_commit,
+    // Relational/transactional write-surface attribution (lite-single-
+    // commit-write-path.md §3.2/§3.2a/§3.3c): the two-phase intent
+    // protocol's three durability-bearing steps, each pushed with
+    // `scopeDefault` so a more specific caller tag (none exist on this
+    // path today) would still win. The tag must wrap the eventual
+    // `ticket.wait()`, not just the staged call: a group-commit member is
+    // only applied -- and so only fsynced -- once something drives/waits
+    // its group, not at `enqueue` time, so the blocking wrapper that calls
+    // `wait()` pushes the tag (`storage/transactions.zig`'s
+    // `TxnManager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch`/
+    // `writeIntentsExtraBatch`/`resolveIntentsWithExtraBatch`, and
+    // `storage/db/db.zig`'s `DB.writeTransaction`/
+    // `writeReplicatedTransactionAtOrderedReceipt`, which call the Staged
+    // core/TxnManager primitives directly). `relational_txn_begin` is the
+    // transaction record and participant sidecar; `relational_intent_write`
+    // is intents plus admission/reservation bookkeeping, index-span
+    // reservations, and any FK/unique check records folded into the same
+    // batch; `relational_intent_resolve` is intents replaced by real rows,
+    // the terminal decision, and participant-resolved bookkeeping.
+    relational_txn_begin,
+    relational_intent_write,
+    relational_intent_resolve,
+    // `capi/sql_commit.zig`'s cross-database two-phase commit coordinator:
+    // the root database's own recovery-hint record (`store`, written before
+    // preparing any participant and cleared after every participant
+    // resolves) and the root's own coordinator-role begin/decision
+    // transaction, both distinct from any participant table's own
+    // `relational_txn_begin`/`relational_intent_write`/`relational_intent_resolve`.
+    // Only engaged when a coordinated-constraint write spans more than one
+    // physical store (`sql.zig`'s single-store fast path bypasses this
+    // coordinator entirely for the common single-table case).
+    relational_coordinator_hint,
     other,
 };
 const stage_count = std.meta.tags(Stage).len;

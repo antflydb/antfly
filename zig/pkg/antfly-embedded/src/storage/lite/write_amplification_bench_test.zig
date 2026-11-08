@@ -781,6 +781,45 @@ fn execSqlSession(alloc: std.mem.Allocator, handle: *anyopaque, statement: []con
     }
 }
 
+/// Like `execSql`, but never raises on a non-`ok` result: returns the
+/// result code so a concurrent-conflict test can tell a winner (`.ok`)
+/// from a loser (anything else) without treating the loss itself as a
+/// test failure.
+fn execSqlOutcome(alloc: std.mem.Allocator, handle: *anyopaque, statement: []const u8) !capi_types.ErrorCode {
+    const stmt_json = try jsonString(alloc, statement);
+    defer alloc.free(stmt_json);
+    const body = try std.fmt.allocPrint(alloc, "{{\"statement\":{s}}}", .{stmt_json});
+    defer alloc.free(body);
+    var output: capi_types.Buffer = .{};
+    defer api.antfly_buffer_free(&output);
+    return api.antfly_db_sql_json(handle, .fromSlice(body), &output);
+}
+
+/// Count of rows via `SELECT COUNT(*) ... WHERE ...`-style aggregation is
+/// not exercised elsewhere in this harness; counting matching rows by
+/// scanning the returned array keeps this independent of SQL aggregate
+/// support. Raises on a non-`ok` result: callers use this only for the
+/// post-race assertion, where the SELECT itself is never expected to fail.
+fn countMatchingRows(alloc: std.mem.Allocator, handle: *anyopaque, statement: []const u8) !usize {
+    const stmt_json = try jsonString(alloc, statement);
+    defer alloc.free(stmt_json);
+    const body = try std.fmt.allocPrint(alloc, "{{\"statement\":{s}}}", .{stmt_json});
+    defer alloc.free(body);
+    var output: capi_types.Buffer = .{};
+    defer api.antfly_buffer_free(&output);
+    const code = api.antfly_db_sql_json(handle, .fromSlice(body), &output);
+    if (code != .ok) {
+        std.debug.print("lite-write-amp relational SELECT failed ({s}): {s}\n", .{
+            statement,
+            if (output.ptr) |p| p[0..output.len] else "<no output>",
+        });
+        return error.RelationalSqlExecFailed;
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, output.ptr.?[0..output.len], .{});
+    defer parsed.deinit();
+    return parsed.value.object.get("rows").?.array.items.len;
+}
+
 const RelationalKind = enum { plain, secondary_index, unique_index, foreign_key };
 
 /// A relational SQL Fixture: the primary-only Fixture (no default full-text
@@ -1136,6 +1175,10 @@ const StagesJson = struct {
     graph_reverse_commit: StageJson,
     graph_metric_commit: StageJson,
     graph_artifact: StageJson,
+    relational_txn_begin: StageJson,
+    relational_intent_write: StageJson,
+    relational_intent_resolve: StageJson,
+    relational_coordinator_hint: StageJson,
     other: StageJson,
 };
 
@@ -1207,6 +1250,10 @@ fn modeJson(mode: ModeReport) ModeJson {
             .graph_reverse_commit = stageJson(mode, .graph_reverse_commit),
             .graph_metric_commit = stageJson(mode, .graph_metric_commit),
             .graph_artifact = stageJson(mode, .graph_artifact),
+            .relational_txn_begin = stageJson(mode, .relational_txn_begin),
+            .relational_intent_write = stageJson(mode, .relational_intent_write),
+            .relational_intent_resolve = stageJson(mode, .relational_intent_resolve),
+            .relational_coordinator_hint = stageJson(mode, .relational_coordinator_hint),
             .other = stageJson(mode, .other),
         },
         .background_ops = .{
@@ -1799,6 +1846,150 @@ test "lite write amplification report: relational write surface" {
     const json_text = try std.json.Stringify.valueAlloc(alloc, report, .{ .whitespace = .indent_2 });
     defer alloc.free(json_text);
     std.debug.print("lite_write_amplification_relational_json_begin\n{s}\nlite_write_amplification_relational_json_end\n", .{json_text});
+
+    // Regression gates (lite-single-commit-write-path.md §3.3c). A
+    // single-statement coordinated write (UNIQUE/FK) and an explicit
+    // multi-statement session transaction used to always take the full
+    // cross-database two-phase commit protocol in `sql_commit.zig` --
+    // store the recovery hint, begin the root as coordinator, begin the
+    // one participant, write its intents, decide on the root, resolve the
+    // participant, clear the hint -- about 11-12 native commits for one
+    // write. `sql.zig`'s `mutate`/`sql_session.zig`'s `commit` now route a
+    // write whose prepared plan touches exactly one table on a Lite
+    // single-file store through `commitCoordinated` instead: begin, write
+    // the intents, and resolve them against that one table directly, with
+    // no cross-database decision record. That is 3 native commits, not the
+    // 1 a fully collapsed write would need (`writeIntentsExtraBatch`
+    // reads back the record `beginTransaction` wrote, and `resolveIntents`
+    // reads back the intents `writeIntents` wrote; a group-commit member
+    // is only applied -- and so only readable by the next step -- once
+    // something drives/waits its group, not at `enqueue` time, so these
+    // three steps cannot share one native commit without a combined batch
+    // that skips the durable round trip through "intents" entirely, which
+    // is follow-up work). 5.0 leaves headroom above the measured ~4.2-4.5
+    // (admission retries, background work) while still catching a
+    // regression back toward the ~11-12 two-phase-commit baseline by more
+    // than 2x.
+    try expectAtMost(unique_index.durableCommitsPerWrite(), 5.0, "relational unique-constraint durable commits/write");
+    try expectAtMost(unique_index_concurrent.durableCommitsPerWrite(), 5.0, "relational unique-constraint 8-writer durable commits/write");
+    try expectAtMost(transaction.durableCommitsPerWrite(), 5.0, "2-document SQL transaction durable commits/write");
+    try expectAtMost(transaction_concurrent.durableCommitsPerWrite(), 5.0, "2-document SQL transaction 8-writer durable commits/write");
+    // Unaffected by the above: `secondary_index`/`sql_insert_update` never
+    // had a coordinated constraint to route around `sql_commit.zig` in the
+    // first place (no UNIQUE/FK on this mode's table), so their own,
+    // separate baseline (~1.6-1.9) is gated at its existing level, loosely,
+    // just to catch an unrelated regression.
+    try expectAtMost(secondary_index.durableCommitsPerWrite(), 2.5, "relational secondary-index durable commits/write");
+    try expectAtMost(sql_insert_update.durableCommitsPerWrite(), 2.5, "SQL INSERT/UPDATE via C API durable commits/write");
+    // `foreign_key` still spans two physical tables (the child row plus an
+    // `.attach` inbound-reference record against the parent -- see
+    // `Plan.expand` in `api/relational_integrity.zig`), so it still takes
+    // the full cross-database protocol and is unchanged by this pass
+    // (~16, not yet ~4). Gated loosely to catch a regression, not to claim
+    // this mode improved.
+    try expectAtMost(foreign_key.durableCommitsPerWrite(), 20.0, "relational foreign-key durable commits/write");
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency correctness: the single-store fast path in `sql.zig`'s
+// `mutate`/`sql_session.zig`'s `commit` (lite-single-commit-write-path.md
+// §3.3c) must keep exactly the same OCC/integrity guarantees the full
+// cross-database two-phase commit protocol gave -- it only changes which
+// commit path a single-table coordinated write takes, not the validation
+// itself (`commitCoordinated`'s own begin/writeTransaction/commitTransaction
+// body is untouched). These tests exercise that directly: real concurrent
+// threads racing a UNIQUE value, and a foreign key referencing a parent
+// that was never created.
+// ---------------------------------------------------------------------------
+
+const race_writers: usize = 8;
+
+// `race_writers` real OS threads each try to INSERT a distinct row with
+// the SAME UNIQUE `label` value, all through `commitCoordinated`'s
+// single-store fast path. Exactly one must win; the rest must see a
+// conflict, never a silently-dropped write or a duplicate committed row.
+test "lite write amplification concurrency: concurrent conflicting UNIQUE inserts, exactly one wins" {
+    const alloc = std.testing.allocator;
+    var fixture = try openRelationalFixture(alloc, "lite-write-amp-rel-unique-race", .unique_index);
+    defer fixture.close();
+
+    const Worker = struct {
+        alloc: std.mem.Allocator,
+        handle: *anyopaque,
+        id: usize,
+        outcome: capi_types.ErrorCode = .internal,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var stmt_buf: [160]u8 = undefined;
+            const stmt = std.fmt.bufPrint(&stmt_buf, "INSERT INTO items (_id, label) VALUES ('race-{d}', 'contested')", .{self.id}) catch |err| {
+                self.err = err;
+                return;
+            };
+            self.outcome = execSqlOutcome(self.alloc, self.handle, stmt) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var workers: [race_writers]Worker = undefined;
+    for (&workers, 0..) |*worker, i| worker.* = .{ .alloc = alloc, .handle = fixture.handle, .id = i };
+    var threads: [race_writers]std.Thread = undefined;
+    for (&threads, &workers) |*thread, *worker| thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    for (&threads) |*thread| thread.join();
+
+    var wins: usize = 0;
+    for (workers) |worker| {
+        if (worker.err) |err| return err;
+        if (worker.outcome == .ok) wins += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), wins);
+    try std.testing.expectEqual(@as(usize, 1), try countMatchingRows(alloc, fixture.handle, "SELECT label FROM items WHERE label = 'contested'"));
+}
+
+// `race_writers` real OS threads each try to INSERT a distinct child row
+// referencing a parent that does not exist, all through `commitCoordinated`'s
+// single-store fast path. None may win: a child row must never become
+// durable without its parent foreign-key check holding, concurrently or
+// otherwise.
+test "lite write amplification concurrency: concurrent FK child inserts against a missing parent all fail" {
+    const alloc = std.testing.allocator;
+    var fixture = try openRelationalFixture(alloc, "lite-write-amp-rel-fk-race", .foreign_key);
+    defer fixture.close();
+    const missing_parent: usize = relational_fk_parent_cardinality + 1000;
+
+    const Worker = struct {
+        alloc: std.mem.Allocator,
+        handle: *anyopaque,
+        id: usize,
+        outcome: capi_types.ErrorCode = .internal,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var stmt_buf: [192]u8 = undefined;
+            const stmt = std.fmt.bufPrint(&stmt_buf, "INSERT INTO children (_id, id, parent_id) VALUES ('race-child-{d}', {d}, {d})", .{ self.id, self.id, missing_parent }) catch |err| {
+                self.err = err;
+                return;
+            };
+            self.outcome = execSqlOutcome(self.alloc, self.handle, stmt) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var workers: [race_writers]Worker = undefined;
+    for (&workers, 0..) |*worker, i| worker.* = .{ .alloc = alloc, .handle = fixture.handle, .id = i };
+    var threads: [race_writers]std.Thread = undefined;
+    for (&threads, &workers) |*thread, *worker| thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    for (&threads) |*thread| thread.join();
+
+    var wins: usize = 0;
+    for (workers) |worker| {
+        if (worker.err) |err| return err;
+        if (worker.outcome == .ok) wins += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), wins);
+    try std.testing.expectEqual(@as(usize, 0), try countMatchingRows(alloc, fixture.handle, "SELECT _id FROM children"));
 }
 
 fn expectAtMost(actual: f64, ceiling: f64, comptime label: []const u8) !void {

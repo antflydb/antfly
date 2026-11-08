@@ -524,7 +524,29 @@ pub fn Adapter(comptime native: type) type {
             return output;
         }
 
-        fn commitCoordinated(self: *Self, request: contract.TableCommitRequest) !catalog.MutationOutcome {
+        /// A single-table, single-process coordinated commit: begin, write
+        /// the intents, and resolve them to real rows, all against `self.db`
+        /// directly. `mutate` below routes a coordinated write here instead
+        /// of `sql_commit.zig`'s cross-database two-phase coordinator
+        /// whenever the write touches exactly one table on a Lite single-
+        /// file store, which needs no cross-database decision record (every
+        /// table there already shares one physical commit domain) --
+        /// saving the recovery-hint write/clear, the root's own
+        /// coordinator-role transaction, and the extra per-participant
+        /// recovery round trip (lite-single-commit-write-path.md §3.3c).
+        ///
+        /// This still pays three separate native commits (begin,
+        /// writeTransaction, commitTransaction): each one's group-commit
+        /// batch is only *applied* -- and so only readable by the next
+        /// step's own read -- once something actually drives/waits its
+        /// group (`lite/docstore.zig`'s `MutationPlan.apply` runs inside
+        /// `driveMutationCoordinator`, not at `enqueue` time), and
+        /// `writeTransaction` must read back the record `beginTransaction`
+        /// just wrote. Collapsing these three into one native commit needs
+        /// a combined batch that skips the durable round trip through
+        /// "intents" entirely, not just deferred waits across them; that is
+        /// follow-up work, not done here.
+        pub fn commitCoordinated(self: *Self, request: contract.TableCommitRequest) !catalog.MutationOutcome {
             const io = self.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
             const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
             const outcomes = dependencies.sql_errors;
@@ -1149,7 +1171,27 @@ pub fn Adapter(comptime native: type) type {
                 const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
                 // Preparation only reads: any failure here is not applied.
                 prepared = integrity.prepareWithRepairAdmission(scratch_alloc, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
-                if (self.handle) |handle| return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
+                // A Lite single-file database's "tables" are different
+                // identity namespaces inside the SAME physical native
+                // store (`tables.zig`'s `openTable` opens every table at
+                // `handle.embedded_path` when `owned_lite_backend != null`).
+                // A coordinated write that only ever touches one such table
+                // needs no cross-database two-phase decision: there is only
+                // one participant and one physical commit domain, so the
+                // single-store `commitCoordinated` path below already gives
+                // the same crash semantics without `sql_commit.zig`'s
+                // recovery-hint record, root coordinator-role transaction,
+                // and extra per-participant recovery round trip (lite-
+                // single-commit-write-path.md §3.3c). A write whose prepared
+                // plan spans more than one table (e.g. a cascading FK
+                // bookkeeping write into a different table) still needs the
+                // general cross-database coordinator.
+                if (self.handle) |handle| {
+                    if (handle.owned_lite_backend != null and prepared.?.tables.len == 1 and std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) {
+                        return self.commitCoordinated(prepared.?.tables[0]);
+                    }
+                    return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
+                }
                 if (prepared.?.tables.len != 1 or !std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) return error.UnsupportedSqlExecution;
                 return self.commitCoordinated(prepared.?.tables[0]);
             }
