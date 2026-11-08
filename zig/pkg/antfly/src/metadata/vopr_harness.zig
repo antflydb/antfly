@@ -6942,6 +6942,8 @@ pub const MetadataAdminVoprSource = struct {
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,
             .fk_initial_parent_decision,
+            .resolver_authority_mutate,
+            .native_memory_create,
             => return error.UnsupportedOperation,
             .write_validation_revision => try std.json.Stringify.valueAlloc(alloc, metadata_api.MetadataHead{
                 .metadata_group_id = group_id,
