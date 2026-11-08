@@ -420,3 +420,21 @@ are restored or explicitly saved. Settings validation and persistence share a 1 
 limit, so accepted settings can always be loaded again. Recovery insertion uses the
 same owned cancellation task as normal delivery and checks recording generation
 immediately before sending the paste.
+
+
+Deletion retry plans are persisted separately from retained transcripts and upload
+jobs. The bounded journal contains document IDs, destinations, and acknowledgments;
+it contains no transcript text or credentials. Pending upload jobs are discarded only
+after the complete plan is durable. Startup removes matching queued uploads before dispatch.
+Acknowledged destinations stay acknowledged on retry, and a plan is removed only
+when every destination and local archive cleanup have committed. The History tab
+shows pending deletion count and supports retry after restart or a local clear,
+without adding newer transcripts to the old deletion request.
+If deletion metadata is corrupt, uploads remain paused while local retention stays usable.
+
+Graceful quit waits for explicit local clears and completed audio archives as well
+as transcript persistence. Completed audio has ownership separate from the active
+recording generation; active recording cancellation and retention changes still
+prevent later publication. Both native and TypeScript stream clients treat
+completion as terminal for transcript and delta events, rejecting late mutations
+and duplicate completions rather than accepting unvalidated text.

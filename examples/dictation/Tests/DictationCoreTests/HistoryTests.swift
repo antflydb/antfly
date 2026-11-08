@@ -647,3 +647,247 @@ private actor HistorySignal {
   let saved = try JSONDecoder().decode([HistoryEntry].self, from: data)
   #expect(saved.map(\.id) == store.history.map(\.id))
 }
+
+private final class DeletionRetryProtocol: URLProtocol, @unchecked Sendable {
+  nonisolated(unsafe) static var failB = true
+  nonisolated(unsafe) static var hosts: [String] = []
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+  override func startLoading() {
+    let host = request.url!.host!
+    Self.hosts.append(host)
+    let response = HTTPURLResponse(
+      url: request.url!, statusCode: host == "b.example" && Self.failB ? 503 : 200,
+      httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    client?.urlProtocol(self, didLoad: Data("{}".utf8))
+    client?.urlProtocolDidFinishLoading(self)
+  }
+  override func stopLoading() {}
+}
+@Suite(.serialized) struct DurableDeletionTests {
+  @Test @MainActor func retryAfterRestartAndLocalClearStillDeletesEveryOriginalDestination()
+    async throws
+  {
+    let directory = try testDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    var config = Configuration()
+    config.retainHistory = true
+    try JSONEncoder().encode(config).write(to: directory.appendingPathComponent("settings.json"))
+    let entry = historyEntry()
+    try JSONEncoder().encode([entry]).write(to: directory.appendingPathComponent("history.json"))
+    let pending = try HistoryOutbox(
+      directory: directory.appendingPathComponent("outbox"), paused: true, upload: { _, _ in })
+    for host in ["a", "b"] {
+      try await pending.enqueue(
+        entry, destination: .init(server: "https://\(host).example", table: "dictation"))
+    }
+    let began = HistorySignal()
+    let release = HistorySignal()
+    let options = URLSessionConfiguration.ephemeral
+    options.protocolClasses = [DeletionRetryProtocol.self]
+    let session = URLSession(configuration: options)
+    DeletionRetryProtocol.failB = true
+    DeletionRetryProtocol.hosts = []
+    let store = Store(
+      directory: directory, registerHotkey: false,
+      historyUpload: { _, _ in Issue.record("Deletion dispatched a canceled upload") },
+      historyArchiveBeforeWrite: {
+        await began.send()
+        await release.wait()
+      },
+      clientFactory: { try AntflyClient(configuration: $0, session: session) },
+      credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+    await began.wait()
+    let queue = try #require(store.outbox)
+    let hold = await queue.pause()
+    await release.send()
+    await store.historyPersistenceTask?.value
+    do {
+      try await store.deleteRetainedHistory()
+      Issue.record("Expected partial failure")
+    } catch is ServerFailure {}
+    #expect(store.history.count == 1 && store.pendingHistoryDeletions == 1)
+    #expect(await queue.status().pending == 0)
+    // Dropping local transcripts must not discard the separate deletion intent.
+    store.clearLocalHistory()
+    await store.prepareToQuit()
+    DeletionRetryProtocol.failB = false
+    let restarted = Store(
+      directory: directory, registerHotkey: false,
+      historyUpload: { uploaded, _ in #expect(uploaded.id != entry.id) },
+      clientFactory: { try AntflyClient(configuration: $0, session: session) },
+      credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+    await restarted.historyPersistenceTask?.value
+    #expect(restarted.history.isEmpty && restarted.pendingHistoryDeletions == 1)
+    let newer = historyEntry()
+    await restarted.recordHistory(newer, snapshot: config)
+    await restarted.outbox?.waitUntilIdle()
+    try await restarted.deleteRetainedHistory(retryOnly: true)
+    #expect(restarted.history.map(\.id) == [newer.id])
+    #expect(DeletionRetryProtocol.hosts.filter { $0 == "b.example" }.count == 2)
+    #expect(restarted.pendingHistoryDeletions == 0)
+    #expect(
+      !FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent("history-deletions.json").path))
+    await queue.resume(hold)
+  }
+
+  @Test @MainActor func completeDeletionPlanIsDurableBeforeAnActiveUploadFinishes() async throws {
+    let directory = try testDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    var config = Configuration()
+    config.retainHistory = true
+    try JSONEncoder().encode(config).write(to: directory.appendingPathComponent("settings.json"))
+    var entry = historyEntry()
+    entry.destination = .init(server: "https://a.example", table: "dictation")
+    try JSONEncoder().encode([entry]).write(to: directory.appendingPathComponent("history.json"))
+    let queue = try HistoryOutbox(
+      directory: directory.appendingPathComponent("outbox"), paused: true, upload: { _, _ in })
+    let extra = HistoryDestination(server: "https://b.example", table: "dictation")
+    try await queue.enqueue(entry, destination: extra)
+    let probe = HistoryProbe()
+    let options = URLSessionConfiguration.ephemeral
+    options.protocolClasses = [DeletionRetryProtocol.self]
+    let session = URLSession(configuration: options)
+    DeletionRetryProtocol.failB = false
+    DeletionRetryProtocol.hosts = []
+    let store = Store(
+      directory: directory, registerHotkey: false,
+      historyUpload: { await probe.upload($0, to: $1) },
+      clientFactory: { try AntflyClient(configuration: $0, session: session) },
+      credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+    while await probe.uploads.isEmpty { await Task.yield() }
+    let deletion = Task { try await store.deleteRetainedHistory() }
+    while store.pendingHistoryDeletions == 0 { await Task.yield() }
+    let recovered = try HistoryDeletionJournal(
+      file: directory.appendingPathComponent("history-deletions.json"))
+    #expect(await recovered.pending()[extra] == [entry.id])
+    #expect(DeletionRetryProtocol.hosts.isEmpty)
+    await probe.release()
+    try await deletion.value
+    #expect(Set(DeletionRetryProtocol.hosts) == ["a.example", "b.example"])
+    #expect(store.pendingHistoryDeletions == 0)
+    #expect(await probe.wasCanceled == false)
+  }
+}
+
+@Test @MainActor func restartCancelsJobsWhoseDeletionIntentWasCommittedBeforeQueueDiscard()
+  async throws
+{
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  var config = Configuration()
+  config.retainHistory = true
+  try JSONEncoder().encode(config).write(to: directory.appendingPathComponent("settings.json"))
+  let entry = historyEntry()
+  let destination = HistoryDestination(server: "https://original.example", table: "dictation")
+  let queue = try HistoryOutbox(
+    directory: directory.appendingPathComponent("outbox"), paused: true, upload: { _, _ in })
+  try await queue.enqueue(entry, destination: destination)
+  let journal = try HistoryDeletionJournal(
+    file: directory.appendingPathComponent("history-deletions.json"))
+  try await journal.begin([destination: [entry.id]])
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    historyUpload: { _, _ in Issue.record("Pending deletion was uploaded after restart") },
+    credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  await store.historyPersistenceTask?.value
+  #expect(await store.outbox?.status().pending == 0)
+  #expect(store.pendingHistoryDeletions == 1)
+}
+
+@Test @MainActor func corruptDeletionJournalPausesUploadsWithoutDisablingLocalRetention()
+  async throws
+{
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  var config = Configuration()
+  config.retainHistory = true
+  try JSONEncoder().encode(config).write(to: directory.appendingPathComponent("settings.json"))
+  try Data("{".utf8).write(to: directory.appendingPathComponent("history-deletions.json"))
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    historyUpload: { _, _ in Issue.record("Corrupt journal permitted upload") },
+    credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  await store.historyPersistenceTask?.value
+  let entry = historyEntry()
+  await store.recordHistory(entry, snapshot: config)
+  #expect(store.history.map(\.id) == [entry.id])
+  #expect(await store.outbox?.status().paused == true)
+  let archived = try JSONDecoder().decode(
+    [HistoryEntry].self, from: Data(contentsOf: directory.appendingPathComponent("history.json")))
+  #expect(archived.map(\.id) == [entry.id])
+  do {
+    try await store.deleteRetainedHistory()
+    Issue.record("Corrupt journal allowed deletion")
+  } catch is DictationError {}
+}
+
+@Test @MainActor func normalQuitWaitsForExplicitLocalHistoryClear() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  var config = Configuration()
+  config.retainHistory = true
+  try JSONEncoder().encode(config).write(to: directory.appendingPathComponent("settings.json"))
+  var entry = historyEntry()
+  entry.destination = .init(server: config.server, table: config.table)
+  let file = directory.appendingPathComponent("history.json")
+  try JSONEncoder().encode([entry]).write(to: file)
+  let began = HistorySignal()
+  let release = HistorySignal()
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    historyArchiveBeforeWrite: {
+      await began.send()
+      await release.wait()
+    },
+    credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  await store.historyPersistenceTask?.value
+  store.clearLocalHistory()
+  await began.wait()
+  var quitReady = false
+  let quit = Task {
+    await store.prepareToQuit()
+    quitReady = true
+  }
+  await Task.yield()
+  #expect(!quitReady)
+  await release.send()
+  await quit.value
+  #expect(try JSONDecoder().decode([HistoryEntry].self, from: Data(contentsOf: file)).isEmpty)
+}
+
+@Test func deletionBarrierPreservesDestinationOfAnUploadThatFinishesWhilePausing() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let probe = HistoryProbe()
+  let queue = try HistoryOutbox(
+    directory: directory.appendingPathComponent("outbox"),
+    upload: { await probe.upload($0, to: $1) })
+  let entry = historyEntry()
+  let destination = HistoryDestination(server: "https://extra.example", table: "dictation")
+  try await queue.enqueue(entry, destination: destination)
+  while await probe.uploads.isEmpty { await Task.yield() }
+  let barrier = Task { await queue.pauseForDeletion(ids: [entry.id]) }
+  while !(await queue.status()).paused { await Task.yield() }
+  await probe.release()
+  let held = await barrier.value
+  #expect(held.destinations == [entry.id: [destination]])
+  #expect(await probe.wasCanceled == false)
+  await queue.resume(held.token)
+}
+
+@Test func discardingAnAlreadyUnlinkedJobIsIdempotent() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let queue = try HistoryOutbox(directory: directory, paused: true, upload: { _, _ in })
+  let entry = historyEntry()
+  try await queue.enqueue(
+    entry, destination: .init(server: "https://original.example", table: "dictation"))
+  let file = try #require(
+    FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first)
+  try FileManager.default.removeItem(at: file)
+  try await queue.discard(ids: [entry.id])
+  #expect(await queue.status().pending == 0)
+}

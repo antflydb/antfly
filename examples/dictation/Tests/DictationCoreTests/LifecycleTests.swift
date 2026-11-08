@@ -275,3 +275,65 @@ private final class DiscoveryProtocol: URLProtocol, @unchecked Sendable {
   #expect(try Data(contentsOf: file) == saved)
   #expect(writes == 0)
 }
+
+@Test @MainActor func normalQuitPreservesAnAlreadyCompletedRecordingArchive() async throws {
+  var config = Configuration()
+  config.retainAudio = true
+  let directory = try lifecycleDirectory(config)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let file = directory.appendingPathComponent("last-recording.wav")
+  try Data([1]).write(to: file)
+  let began = LifecycleSignal()
+  let release = LifecycleSignal()
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    audioArchiveStage: { bytes, directory in
+      await began.send()
+      await release.wait()
+      let candidate = directory.appendingPathComponent(".recording-" + UUID().uuidString + ".wav")
+      try bytes.write(to: candidate)
+      return candidate
+    }, credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  store.result = "Completed result"
+  store.phase = .ready
+  store.archiveAudio(Task { Data([2]) }, run: store.generation)
+  await began.wait()
+  var quitReady = false
+  let quit = Task {
+    await store.prepareToQuit()
+    quitReady = true
+  }
+  await Task.yield()
+  #expect(!quitReady)
+  await release.send()
+  await quit.value
+  #expect(try Data(contentsOf: file) == Data([2]))
+}
+
+@Test @MainActor func cancelingActiveProcessingStillFencesItsAudioArchive() async throws {
+  var config = Configuration()
+  config.retainAudio = true
+  let directory = try lifecycleDirectory(config)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let began = LifecycleSignal()
+  let release = LifecycleSignal()
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    audioArchiveStage: { bytes, directory in
+      await began.send()
+      await release.wait()
+      let candidate = directory.appendingPathComponent(".recording-" + UUID().uuidString + ".wav")
+      try bytes.write(to: candidate)
+      return candidate
+    }, credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+  store.state = .processing
+  store.archiveAudio(Task { Data([2]) }, run: store.generation)
+  let archive = store.audioArchiveTask
+  await began.wait()
+  store.cancel()
+  await release.send()
+  await archive?.value
+  #expect(
+    !FileManager.default.fileExists(
+      atPath: directory.appendingPathComponent("last-recording.wav").path))
+}

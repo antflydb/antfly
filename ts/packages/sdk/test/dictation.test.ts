@@ -72,7 +72,10 @@ describe("dictation", () => {
 
   it.each([
     ["data: [DONE]\n\n", "before completion"],
-    ['data: {"type":"dictation.delta","id":"d","delta":"partial"}\n\n', "without [DONE]"],
+    [
+      'data: {"type":"dictation.transcript","id":"d","transcript":{"text":"raw"}}\n\ndata: {"type":"dictation.delta","id":"d","delta":"partial"}\n\n',
+      "without [DONE]",
+    ],
     ['data: {"type":"error","id":"d","message":"Apple busy"}\n\n', "Apple busy"],
   ])("rejects incomplete or failed streams", async (body, message) => {
     vi.stubGlobal(
@@ -86,6 +89,36 @@ describe("dictation", () => {
       }
     };
     await expect(consume()).rejects.toThrow(message);
+  });
+
+  it.each([
+    { type: "dictation.delta", id: "d", delta: "late" },
+    { type: "dictation.transcript", id: "d", transcript: { text: "replacement" } },
+    { type: "dictation.completed", id: "d", text: "duplicate" },
+  ])("rejects text events after completion: $type", async (late) => {
+    const events = [
+      { type: "dictation.transcript", id: "d", transcript: { text: "raw" } },
+      { type: "dictation.completed", id: "d", text: "Clean." },
+      late,
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") +
+              "data: [DONE]\n\n",
+            { headers: { "Content-Type": "text/event-stream" } }
+          )
+      )
+    );
+    const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+    const consume = async () => {
+      for await (const _event of client.dictateStream(request)) {
+        /* consume */
+      }
+    };
+    await expect(consume()).rejects.toThrow("lifecycle");
   });
 
   it("rejects JSON disguised as a successful stream", async () => {

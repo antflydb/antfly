@@ -37,6 +37,7 @@ public actor HistoryOutbox {
   private var uploading = false
   private var enabled: Bool
   private var holds: Set<UUID> = []
+  private var metadataHolds: Set<UUID> = []
   private var paused: Bool { !enabled || !holds.isEmpty }
   private var lastError: String?
   private let archive: HistoryArchive
@@ -133,7 +134,12 @@ public actor HistoryOutbox {
     await notify()
   }
   public func resume(_ token: UUID? = nil) async {
-    if let token { holds.remove(token) } else { enabled = true }
+    if let token {
+      holds.remove(token)
+      metadataHolds.remove(token)
+    } else {
+      enabled = true
+    }
     start()
     await notify()
   }
@@ -148,17 +154,35 @@ public actor HistoryOutbox {
     }
     await notify()
   }
+  public struct Barrier: Sendable {
+    public var token: UUID
+    public var destinations: [String: Set<HistoryDestination>]
+  }
   @discardableResult public func pause() async -> UUID {
+    let barrier = holdForDeletion(ids: [], preserveDestinations: false)
+    await waitForBarrier(barrier.token)
+    return barrier.token
+  }
+  /// Snapshot destinations before awaiting an active upload. Its response may
+  /// finish or another retention transition may purge jobs during that await.
+  public func holdForDeletion(ids: Set<String>, preserveDestinations: Bool = true) -> Barrier {
     let token = UUID()
     holds.insert(token)
+    if preserveDestinations { metadataHolds.insert(token) }
+    let snapshot = destinations(for: ids)
+    if !uploading { worker?.cancel() }
+    return Barrier(token: token, destinations: snapshot)
+  }
+  public func waitForBarrier(_ token: UUID) async {
+    guard holds.contains(token) else { return }
     let active = worker
-    // Cancel retry sleeps, but let a dispatched write receive its response.
-    // Canceling URLSession only stops the client wait: the server could still
-    // commit that upload after a subsequent delete.
-    if !uploading { active?.cancel() }
     await active?.value
     await notify()
-    return token
+  }
+  public func pauseForDeletion(ids: Set<String>) async -> Barrier {
+    let barrier = holdForDeletion(ids: ids)
+    await waitForBarrier(barrier.token)
+    return barrier
   }
   /// Call while paused to synchronize explicit history deletion with pending uploads.
   public func discard(ids: Set<String>, destination: HistoryDestination? = nil) async throws {
@@ -169,10 +193,17 @@ public actor HistoryOutbox {
       ids.contains($0.entry.id) && (destination == nil || $0.destination == destination)
     }
     for job in jobs where matches(job) {
-      try FileManager.default.removeItem(at: path(job))
+      do { try FileManager.default.removeItem(at: path(job)) } catch {
+        let failure = error as NSError
+        guard failure.domain == NSCocoaErrorDomain, failure.code == NSFileNoSuchFileError else {
+          throw error
+        }
+      }
+      // Keep memory consistent after every unlink. A partial disk failure can
+      // be retried without getting stuck on an already removed job file.
       retainedBytes -= jobSizes.removeValue(forKey: job.id) ?? 0
+      jobs.removeAll { $0.id == job.id }
     }
-    jobs.removeAll(where: matches)
     if jobs.isEmpty {
       lastError = nil
       finishWaiters()
@@ -213,6 +244,13 @@ public actor HistoryOutbox {
         try await upload(job.entry, job.destination)
         uploading = false
         try Task.checkCancellation()
+        // A deletion owner may be persisting its intent while this response
+        // arrives. Keep the job's destinations durable until that owner discards
+        // it. Resuming another hold may replay the same idempotent upsert.
+        if !metadataHolds.isEmpty {
+          await notify()
+          return
+        }
         try FileManager.default.removeItem(at: path(job))
         jobs.removeFirst()
         retainedBytes -= jobSizes.removeValue(forKey: job.id) ?? 0

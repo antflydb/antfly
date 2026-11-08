@@ -932,6 +932,7 @@ export class InferenceClient {
       throw new Error("Dictation did not return an event stream");
     }
     if (!response.body) throw new Error("Dictation returned an empty stream");
+    let recognized = false;
     let completed = false;
     for await (const frame of parseSSEFrames(response.body)) {
       if (frame.data.trim() === "[DONE]") {
@@ -942,7 +943,21 @@ export class InferenceClient {
       if (frame.event === "error" || event.type === "error") {
         throw new Error(event.message ?? event.error ?? "Dictation failed");
       }
-      if (event.type === "dictation.completed") completed = true;
+      if (event.type === "dictation.transcript") {
+        if (recognized || completed || typeof event.transcript?.text !== "string") {
+          throw new Error("Invalid dictation transcript lifecycle");
+        }
+        recognized = true;
+      } else if (event.type === "dictation.delta") {
+        if (!recognized || completed || typeof event.delta !== "string") {
+          throw new Error("Invalid dictation delta lifecycle");
+        }
+      } else if (event.type === "dictation.completed") {
+        if (!recognized || completed || typeof event.text !== "string") {
+          throw new Error("Invalid dictation completion lifecycle");
+        }
+        completed = true;
+      }
       yield event;
     }
     throw new Error("Dictation stream closed without [DONE]");

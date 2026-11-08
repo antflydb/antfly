@@ -46,6 +46,10 @@ import SwiftUI
   private var liveFailure: String?
   private var overlayTask: Task<Void, Never>?
   private(set) var outbox: HistoryOutbox?
+  private var deletionJournal: HistoryDeletionJournal?
+  private var deletingIDs: Set<String> = []
+  @Published private(set) var pendingHistoryDeletions = 0
+  private(set) var historyDeletionTask: Task<Void, Never>?
   private var historyRevision: UInt64 = 0
   private var historyEpoch = UUID()
   private var appliedHistoryRetention = false
@@ -79,6 +83,9 @@ import SwiftUI
   private(set) var audioArchiveTask: Task<Void, Never>?
   private let audioArchiveStage: @Sendable (Data, URL) async throws -> URL
   private var audioRetentionEpoch = UUID()
+  private var audioArchiveID: UUID?
+  private var audioArchiveRun: UUID?
+  private var audioArchiveTasks: [UUID: Task<Void, Never>] = [:]
   private var retryRecording: PCMRecording?
   private var retryPreset: Preset?
   private let clientFactory: (@Sendable (Configuration) throws -> AntflyClient)?
@@ -150,7 +157,7 @@ import SwiftUI
         + error.localizedDescription
     }
     if !loadedSettings, settingsLoadError == nil,
-      ["history.json", "last-recording.wav"].contains(where: {
+      ["history.json", "last-recording.wav", "history-deletions.json"].contains(where: {
         FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
       })
         || (try? FileManager.default.contentsOfDirectory(
@@ -192,6 +199,17 @@ import SwiftUI
             entry, table: destination.table)
         }, changed: { [weak self] status in await self?.updateHistoryStatus(status) })
     } catch { historySyncStatus = "History sync unavailable: " + error.localizedDescription }
+    do {
+      let journal = try HistoryDeletionJournal(
+        file: directory.appendingPathComponent("history-deletions.json"))
+      deletionJournal = journal
+      deletingIDs = journal.recoveredIDs
+      pendingHistoryDeletions = deletingIDs.count
+    } catch {
+      historyPersistenceWarning =
+        "History deletion journal unavailable; uploads remain paused. " + error.localizedDescription
+      historySyncStatus = historyPersistenceWarning!
+    }
     if loadedSettings, config.retainHistory, settingsLoadError == nil {
       let legacyDestination = HistoryDestination(server: config.server, table: config.table)
       let epoch = historyEpoch
@@ -366,7 +384,7 @@ import SwiftUI
             legacyDestination: HistoryDestination(
               server: self.config.server, table: self.config.table), epoch: epoch)
         } else {
-          await self.outbox?.resume()
+          try await self.resumeHistoryUploads()
         }
       }
     }
@@ -816,6 +834,10 @@ import SwiftUI
     } catch { return error.localizedDescription }
   }
   func cancel() {
+    if state != .idle, audioArchiveRun == generation {
+      audioArchiveID = nil
+      audioArchiveTask?.cancel()
+    }
     generation = UUID()
     requestTask?.cancel()
     previewTask?.cancel()
@@ -849,7 +871,11 @@ import SwiftUI
     working = true
     hotkey?.unregister()
     cancel()
+    historyDeletionTask?.cancel()
+    await historyDeletionTask?.value
     await historyPersistenceTask?.value
+    let audioTasks = Array(audioArchiveTasks.values)
+    for task in audioTasks { await task.value }
   }
   func retry() {
     guard state == .idle, !working, let recording = retryRecording, let original = retryPreset
@@ -955,7 +981,9 @@ import SwiftUI
   @discardableResult private func scheduleHistory(_ original: HistoryEntry, snapshot: Configuration)
     -> Task<Void, Never>?
   {
-    guard config.retainHistory, settingsLoadError == nil else { return nil }
+    guard config.retainHistory, settingsLoadError == nil,
+      !deletingIDs.contains(original.id)
+    else { return nil }
     var entry = original
     entry.destination =
       entry.destination ?? HistoryDestination(server: snapshot.server, table: snapshot.table)
@@ -999,10 +1027,11 @@ import SwiftUI
       // records coalesce archive rewrites rather than retaining old arrays.
       try await archive.store(history, revision: historyRevision)
       guard historyEpoch == epoch, config.retainHistory else { return }
-      guard let outbox else {
+      guard let outbox, deletionJournal != nil else {
         historySyncStatus = "Transcript saved locally; history sync unavailable."
         return
       }
+      guard !deletingIDs.contains(entry.id) else { return }
       try await outbox.enqueue(entry, destination: entry.destination!)
     }
   }
@@ -1034,12 +1063,14 @@ import SwiftUI
         throw DictationError.invalid(
           "Enable and save history retention before uploading local history.")
       }
-      guard let outbox = self.outbox else {
-        throw DictationError.invalid("History sync unavailable.")
+      guard let outbox = self.outbox, self.deletionJournal != nil else {
+        throw DictationError.invalid(
+          "History sync or deletion journal unavailable. Uploads remain paused.")
       }
       let work = self.enqueueHistoryWork {
         for entry in entries {
           guard self.historyEpoch == epoch, self.config.retainHistory else { return }
+          if self.deletingIDs.contains(entry.id) { continue }
           try await outbox.enqueue(
             entry,
             destination: entry.destination
@@ -1047,60 +1078,118 @@ import SwiftUI
         }
         guard self.historyEpoch == epoch, self.config.retainHistory else { return }
         self.historyPersistenceWarning = nil
-        await outbox.resume()
+        try await self.resumeHistoryUploads()
       }
       await work.value
     }
   }
-  func clearHistory() {
-    runHistory { try await self.deleteRetainedHistory() }
+  func clearHistory(retryOnly: Bool = false) {
+    guard !historyWorking, !terminating else { return }
+    historyWorking = true
+    historyDeletionTask = Task {
+      defer { historyWorking = false }
+      do { try await deleteRetainedHistory(retryOnly: retryOnly) } catch {
+        historySyncStatus = error.localizedDescription
+      }
+    }
   }
   /// Stop uploads before reading queue destinations. Cancel every matching job
   /// before issuing remote deletes, so a partial failure or restart cannot
   /// implicitly upload a transcript that the user asked to delete.
-  func deleteRetainedHistory() async throws {
+  func deleteRetainedHistory(retryOnly: Bool = false) async throws {
     let snapshot = try config.validated()
-    let entries = history
-    let ids = Set(entries.map(\.id))
+    let entries = retryOnly ? [] : history
+    let entryIDs = Set(entries.map(\.id))
+    guard let journal = deletionJournal else {
+      throw DictationError.invalid("History deletion journal unavailable. Uploads remain paused.")
+    }
+    let existingIDs = await journal.ids()
+    let ids = entryIDs.union(existingIDs)
     guard !ids.isEmpty else { return }
     guard let outbox else {
       throw DictationError.invalid(
         "History sync is unavailable. Repair the outbox before deleting remote history; no deletion has been reported as complete."
       )
     }
-    historyEpoch = UUID()
-    await historyPersistenceTask?.value
-    historyRevision += 1
-    try await archive.store(history, revision: historyRevision)
-    let pauseToken = await outbox.pause()
-    do {
-      let pending = await outbox.destinations(for: ids) ?? [:]
-      var groups: [HistoryDestination: Set<String>] = [:]
-      for entry in entries {
-        var destinations = pending[entry.id] ?? []
-        if let original = entry.destination { destinations.insert(original) }
-        if destinations.isEmpty {
-          // Legacy archives have no recoverable destination once an upload has
-          // completed. Bind these once to the configuration that loaded them.
-          destinations.insert(HistoryDestination(server: snapshot.server, table: snapshot.table))
+    if !retryOnly { historyEpoch = UUID() }
+    var barrier: HistoryOutbox.Barrier?
+    var preparationFailure: Error?
+    // Serialize the write-ahead plan with retention changes. Hold the uploader
+    // first, persist every destination, then wait for its dispatched response.
+    let preparation = enqueueHistoryWork { [self] in
+      do {
+        historyRevision += 1
+        try await archive.store(history, revision: historyRevision)
+        let held = await outbox.holdForDeletion(ids: ids)
+        barrier = held
+        var groups: [HistoryDestination: Set<String>] = [:]
+        for entry in entries where !existingIDs.contains(entry.id) {
+          var destinations = held.destinations[entry.id] ?? []
+          if let original = entry.destination { destinations.insert(original) }
+          if destinations.isEmpty {
+            destinations.insert(HistoryDestination(server: snapshot.server, table: snapshot.table))
+          }
+          for destination in destinations { groups[destination, default: []].insert(entry.id) }
         }
-        for destination in destinations { groups[destination, default: []].insert(entry.id) }
+        try await journal.begin(groups)
+        deletingIDs = await journal.ids()
+        pendingHistoryDeletions = deletingIDs.count
+      } catch {
+        preparationFailure = error
+        if let barrier {
+          await outbox.setEnabled(false)
+          await outbox.resume(barrier.token)
+        }
       }
+    }
+    await preparation.value
+    if let preparationFailure { throw preparationFailure }
+    guard let barrier else {
+      throw DictationError.invalid("History deletion could not be prepared.")
+    }
+    let pauseToken = barrier.token
+    await outbox.waitForBarrier(pauseToken)
+    do {
       try await outbox.discard(ids: ids)
-      for (destination, matching) in groups {
+      for (destination, matching) in await journal.pending() {
+        try Task.checkCancellation()
         var connection = snapshot
         connection.server = destination.server
         connection.table = destination.table
         try await client(connection).deleteHistory(
           ids: Array(matching).sorted(), table: destination.table)
+        try await journal.acknowledge(destination, ids: matching)
       }
+      try Task.checkCancellation()
       history.removeAll { ids.contains($0.id) }
       historyRevision += 1
       try await archive.store(history, revision: historyRevision)
+      try await journal.complete(ids)
+      deletingIDs = await journal.ids()
+      pendingHistoryDeletions = deletingIDs.count
       await outbox.resume(pauseToken)
       historySyncStatus = "Matching history deleted from its original destinations."
     } catch {
       await outbox.resume(pauseToken)
+      throw error
+    }
+  }
+  private func resumeHistoryUploads() async throws {
+    guard let journal = deletionJournal else {
+      throw DictationError.invalid("History deletion journal unavailable. Uploads remain paused.")
+    }
+    guard let outbox else { return }
+    let hold = await outbox.pause()
+    do {
+      deletingIDs = await journal.ids()
+      pendingHistoryDeletions = deletingIDs.count
+      try await outbox.discard(ids: deletingIDs)
+      await outbox.resume()
+      await outbox.resume(hold)
+    } catch {
+      // Release only our hold, preserving disabled admission on failure.
+      await outbox.setEnabled(false)
+      await outbox.resume(hold)
       throw error
     }
   }
@@ -1123,30 +1212,35 @@ import SwiftUI
       }
     }
     guard config.retainHistory, historyEpoch == epoch else { return }
-    await outbox?.resume()
+    do { try await resumeHistoryUploads() } catch { historySyncStatus = error.localizedDescription }
   }
   func clearLocalHistory() {
+    guard !terminating else { return }
     history = []
     historyRevision += 1
     let revision = historyRevision
-    Task {
-      do { try await archive.store([], revision: revision) } catch {
-        historySyncStatus = error.localizedDescription
-      }
+    enqueueHistoryWork { [self] in
+      try await archive.store([], revision: revision)
     }
   }
   func archiveAudio(_ encoding: Task<Data, Error>, run: UUID) {
+    guard generation == run, !terminating else { return }
     audioArchiveTask?.cancel()
+    let id = UUID()
+    audioArchiveID = id
+    audioArchiveRun = run
     let epoch = audioRetentionEpoch
     let stage = audioArchiveStage
-    audioArchiveTask = Task { [weak self, directory] in
+    let task = Task { [weak self, directory] in
+      defer { self?.audioArchiveTasks.removeValue(forKey: id) }
       do {
         let data = try await encoding.value
         try Task.checkCancellation()
         let candidate = try await stage(data, directory)
         defer { try? FileManager.default.removeItem(at: candidate) }
         try Task.checkCancellation()
-        guard let self, generation == run, audioRetentionEpoch == epoch, config.retainAudio else {
+        guard let self, audioArchiveID == id, audioRetentionEpoch == epoch, config.retainAudio
+        else {
           return
         }
         let file = directory.appendingPathComponent("last-recording.wav")
@@ -1157,16 +1251,21 @@ import SwiftUI
         }
       } catch is CancellationError {
       } catch {
-        guard let self, generation == run, audioRetentionEpoch == epoch, config.retainAudio else {
+        guard let self, generation == run, audioArchiveID == id, audioRetentionEpoch == epoch,
+          config.retainAudio
+        else {
           return
         }
         processingWarning = "Audio archive unavailable: " + error.localizedDescription
       }
     }
+    audioArchiveTask = task
+    audioArchiveTasks[id] = task
   }
   private func removeAudio() throws {
     audioRetentionEpoch = UUID()
-    audioArchiveTask?.cancel()
+    audioArchiveID = nil
+    for task in audioArchiveTasks.values { task.cancel() }
     audioArchiveTask = nil
     try RecordingArchive.removeStaleCandidates(in: directory)
     let file = directory.appendingPathComponent("last-recording.wav")

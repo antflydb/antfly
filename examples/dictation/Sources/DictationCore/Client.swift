@@ -115,6 +115,7 @@ public actor AntflyClient {
     var done = false
     do {
       let (bytes, response) = try await session.bytes(for: upload)
+      defer { bytes.task.cancel() }
       guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
         var body = Data()
         for try await byte in bytes {
@@ -142,13 +143,21 @@ public actor AntflyClient {
         else { continue }
         switch value["type"] as? String {
         case "dictation.transcript":
-          raw = (value["transcript"] as? [String: Any])?["text"] as? String ?? ""
+          guard recognized == nil, !complete,
+            let transcript = (value["transcript"] as? [String: Any])?["text"] as? String
+          else {
+            throw DictationError.invalid("Invalid dictation transcript lifecycle.")
+          }
+          raw = transcript
           recognized = ProcessInfo.processInfo.systemUptime
           await progress(raw)
           await events(
             DictationProgress(phase: cleanup && !raw.isEmpty ? .cleaning : .transcribing, raw: raw))
         case "dictation.delta":
-          text += value["delta"] as? String ?? ""
+          guard recognized != nil, !complete, let delta = value["delta"] as? String else {
+            throw DictationError.invalid("Invalid dictation delta lifecycle.")
+          }
+          text += delta
           await progress(text)
           await events(
             DictationProgress(phase: cleanup ? .cleaning : .transcribing, raw: raw, draft: text))

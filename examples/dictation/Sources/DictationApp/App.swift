@@ -314,6 +314,11 @@ struct SettingsView: View {
   }
   var history: some View {
     VStack(alignment: .leading) {
+      if store.pendingHistoryDeletions > 0 {
+        Text(
+          "\(store.pendingHistoryDeletions) transcript deletion(s) pending. Retry deletion to finish all original destinations."
+        ).font(.caption)
+      }
       Text(store.historySyncStatus).font(.caption).foregroundStyle(.secondary).textSelection(
         .enabled)
       HStack {
@@ -342,6 +347,9 @@ struct SettingsView: View {
       HStack {
         Button("Clear local history") { store.clearLocalHistory() }
         Button("Delete local history and matching Antfly documents") { store.clearHistory() }
+        if store.pendingHistoryDeletions > 0 {
+          Button("Retry pending deletions") { store.clearHistory(retryOnly: true) }
+        }
       }
     }.padding()
   }

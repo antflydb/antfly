@@ -40,6 +40,28 @@ final class FixtureProtocol: URLProtocol, @unchecked Sendable {
     }
     try await client().saveSettings(Configuration())
   }
+  @Test(arguments: [
+    "data: {\"type\":\"dictation.delta\",\"delta\":\"late\"}\n\n",
+    "data: {\"type\":\"dictation.transcript\",\"transcript\":{\"text\":\"replacement\"}}\n\n",
+    "data: {\"type\":\"dictation.completed\",\"text\":\"duplicate\"}\n\n",
+  ]) func completedTextCannotBeChangedByLaterEvents(late: String) async throws {
+    FixtureProtocol.reply = { _ in
+      (
+        200, "text/event-stream",
+        "data: {\"type\":\"dictation.transcript\",\"transcript\":{\"text\":\"raw\"}}\n\ndata: {\"type\":\"dictation.completed\",\"text\":\"Clean.\"}\n\n"
+          + late + "data: [DONE]\n\n"
+      )
+    }
+    var preset = Configuration().presets[0]
+    preset.cleanupModel = "generators/cleanup"
+    do {
+      _ = try await client().cleanupText("raw", preset: preset, dictionary: [])
+      Issue.record("Accepted a post-completion event")
+    } catch let error as DictationError {
+      #expect(error.rawTranscript == "raw")
+    }
+  }
+
   @Test func serverErrorsAreNotSilentlyAccepted() async throws {
     FixtureProtocol.reply = { _ in (403, "application/json", "{\"error\":\"denied\"}") }
     do {

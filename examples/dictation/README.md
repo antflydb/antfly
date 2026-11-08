@@ -189,6 +189,8 @@ leaves the text available to copy. The menu bar icon indicates recording and
 processing; the overlay shows Listening, Transcribing, Cleaning, and completion.
 The popover and Transcript tab keep raw, cleanup-preview, and final text separate.
 The app pastes once after successful completion, rather than revising text in another app.
+Native and TypeScript clients reject duplicate transcripts/completions and any text
+mutation after completion. The native app waits for complete stream validation before insertion.
 Silence produces no insertion. Expand Processing details for timings and fallback explanations.
 
 Paste temporarily places the text on the clipboard, sends Command-V, then restores
@@ -242,8 +244,9 @@ History and audio retention are off by default:
   The ordered background writer coalesces archive snapshots, bounds pending upload
   work, and limits local history to 500 entries and a conservative 16 MiB JSON byte
   budget. An entry too large for that budget remains available to copy/export.
-  Persistence errors appear in History sync status. Normal Quit drains local work;
-  remote uploads remain durable in the outbox for restart.
+  Persistence errors appear in History sync status. Normal Quit drains local writes,
+  including explicit local clears and completed audio archives; active recording
+  work is canceled. Remote uploads remain durable in the outbox for restart.
 - The table's full-text index searches final transcript text. Search results are
   shown as the server's JSON response, including document IDs and sources.
 - Clear local history removes the local cache. Delete local history and matching
@@ -251,7 +254,13 @@ History and audio retention are off by default:
   all matching pending jobs, and deletes
   the cached entries at their original server/table destinations before resuming.
   A remote deletion failure keeps local entries available for retry, but canceled
-  uploads cannot restart automatically. If the queue cannot be loaded, remote deletion
+  uploads cannot restart automatically. A separate bounded deletion journal stores
+  document IDs, original destinations, and acknowledgments before jobs are removed.
+  It survives restarts, local clears, and retention changes without retaining text
+  or credentials. Retry pending deletions completes the remaining targets without deleting newer transcripts,
+  even when the local history list is empty. Startup cancels matching queued uploads
+  before dispatch; corrupt deletion metadata pauses uploads while local retention
+  remains available. If the queue cannot be loaded, remote deletion
   fails closed and retains local history; it never reports success while unknown jobs
   remain. Turning retention off retires the unavailable queue so it cannot upload on
   restart. Retention changes invalidate and drain older producers, including manual
@@ -263,7 +272,9 @@ History and audio retention are off by default:
   records beyond the local count/byte retention window need normal Antfly table management.
 - Audio retention keeps only `last-recording.wav` locally, never in Antfly. Archival
   runs independently of recognition and insertion; a disk failure produces a separate
-  warning. Canceled recordings and retention changes fence pending archive writes. Saving
+  warning. Completed archives have their own ownership, so a new recording or normal
+  Quit cannot invalidate them. Canceling active processing and retention changes
+  still fence its pending archive writes. Saving
   settings with retention disabled deletes retained local data; remote transcripts
   require explicit deletion. Inference providers have their own retention policy.
 - Missing or invalid settings preserve retained audio/history and pause uploads.
