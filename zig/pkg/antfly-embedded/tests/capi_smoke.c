@@ -183,6 +183,16 @@ static int run_signal_lifetime_smoke(void) {
     snprintf(second_path, sizeof(second_path), "%s/second.aflite.lock", directory);
     remove(first_path);
     remove(second_path);
+    /* Writer queues retain their coordination inode across ordinary close.
+     * Both fixture owners are closed; remove only the known idle tail so an
+     * unexpected live ticket still makes the final directory removal fail. */
+    const char *queue_names[] = {"first.aflite.lock.q", "second.aflite.lock.q"};
+    for (size_t i = 0; i < sizeof(queue_names) / sizeof(queue_names[0]); ++i) {
+        snprintf(first_path, sizeof(first_path), "%s/%s/tail", directory, queue_names[i]);
+        remove(first_path);
+        snprintf(first_path, sizeof(first_path), "%s/%s", directory, queue_names[i]);
+        rmdir(first_path);
+    }
     /* Maintenance leaves this coordination inode in place so concurrent owners
      * cannot acquire different locks. Both owners are closed and this fixture
      * owns the entire directory, so it is now safe to remove the guard. */

@@ -17,6 +17,9 @@
 
 pub const antfly_sources = @import("source_owner_control.zig");
 
+/// Inline compatibility owner; native builds select the separate control root.
+pub const lake_execution_backend = @import("api/lake_execution_build_impl.zig");
+
 const std = @import("std");
 
 const bridge = @import("runtime_bridge.zig");

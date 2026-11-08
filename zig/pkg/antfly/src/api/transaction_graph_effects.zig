@@ -16,7 +16,7 @@
 //! Owned graph deltas for staged transaction merging and savepoint cloning.
 const std = @import("std");
 const local = @import("antfly_local_sources");
-const batch_api = local.api_batch;
+const batch_api = local.api_internal_batch;
 const types = local.storage_db_types;
 fn same(left: anytype, right: anytype) bool {
     inline for (.{ "index_name", "source", "target", "edge_type", "edge_id", "owner_document", "owner" }) |field| if (!std.mem.eql(u8, @field(left, field), @field(right, field))) return false;

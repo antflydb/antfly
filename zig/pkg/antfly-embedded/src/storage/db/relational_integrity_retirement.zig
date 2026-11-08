@@ -96,7 +96,7 @@ pub fn permits(txn: anytype, generation: integrity.Generation, target_schema_dig
 
 pub const Page = struct {
     arena: std.heap.ArenaAllocator,
-    rows: @import("relational_rows.zig").Page,
+    rows: @import("../read_session_values.zig").Page,
     command: Command,
     phase: Phase,
     pub fn deinit(self: *Page) void {
@@ -105,13 +105,13 @@ pub const Page = struct {
         self.* = undefined;
     }
 
-    pub fn prepare(alloc: Allocator, io: ?std.Io, core: anytype, fields: []const []const u8, expected_progress: []const u8, budget: @import("relational_rows.zig").Budget) !?Page {
+    pub fn prepare(alloc: Allocator, io: ?std.Io, core: anytype, fields: []const []const u8, expected_progress: []const u8, budget: @import("../read_session_values.zig").Budget) !?Page {
         var reader = blk: {
             core.lockApplyShared();
             defer core.unlockApplyShared();
             var view = core.acquireSchemaView() orelse return error.RelationalTableRequired;
             defer view.release();
-            break :blk try @import("relational_rows.zig").Reader.open(alloc, core.store, view, null, .{ .fields = fields, .include_primary_digest = true }, 0);
+            break :blk try @import("read_session_backend").RelationalRows.Reader.open(alloc, core.store, view, null, .{ .fields = fields, .include_primary_digest = true }, 0);
         };
         defer reader.deinit();
         try @import("online_integrity_shadow.zig").requireCatalogMutable(&reader.read);
@@ -129,7 +129,7 @@ pub const Page = struct {
         const owned = arena.allocator();
         const expected = try owned.dupe(u8, previous);
         const phase = progress.phase;
-        var page_rows: @import("relational_rows.zig").Page = if (fields.len == 0)
+        var page_rows: @import("../read_session_values.zig").Page = if (fields.len == 0)
             .{ .arena = std.heap.ArenaAllocator.init(alloc), .rows = &.{}, .more = false, .records_examined = 0, .output_bytes = 0 }
         else
             try reader.nextPage(alloc, io, budget);

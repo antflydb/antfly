@@ -19,12 +19,7 @@ const image = @import("antfly_image");
 
 const Allocator = std.mem.Allocator;
 
-pub const PageRotation = enum(u16) {
-    none = 0,
-    clockwise_90 = 90,
-    clockwise_180 = 180,
-    clockwise_270 = 270,
-};
+pub const PageRotation = @import("pdf_values").PageRotation;
 
 pub fn renderTextPreviewPng(alloc: Allocator, text: []const u8) ![]u8 {
     var max_cols: usize = 0;
@@ -3453,28 +3448,9 @@ test "draw axial shading run interpolates colors" {
     try std.testing.expect(canvas[right + 2] > canvas[right + 0]);
 }
 
-fn estimateRunWidth(run: reader.TextRun) f64 {
-    if (run.advance_width > 0) return run.advance_width;
-    return estimateRunWidthFallback(run);
-}
-
-fn estimateRunWidthFallback(run: reader.TextRun) f64 {
-    var width_est: f64 = 0;
-    var it = std.unicode.Utf8View.init(run.text) catch {
-        for (run.text) |ch| width_est += baseRunCodepointAdvance(run, if (ch == ' ') ' ' else 0xfffd);
-        return width_est;
-    };
-    var iter = it.iterator();
-    while (iter.nextCodepoint()) |cp| width_est += baseRunCodepointAdvance(run, cp);
-    return width_est;
-}
-
-fn baseRunCodepointAdvance(run: reader.TextRun, cp: u21) f64 {
-    if (run.vertical) return run.font_size + run.char_spacing;
-    const glyph = run.font_size * 0.6;
-    const spacing = run.char_spacing + if (cp == ' ') run.word_spacing else 0.0;
-    return (glyph + spacing) * run.horizontal_scale;
-}
+const estimateRunWidth = @import("pdf_values").estimateRunWidth;
+const estimateRunWidthFallback = @import("pdf_values").estimateRunWidthFallback;
+const baseRunCodepointAdvance = @import("pdf_values").baseRunCodepointAdvance;
 
 fn estimatedRunAdvanceScale(run: reader.TextRun) f64 {
     const fallback_total = estimateRunWidthFallback(run);
@@ -3488,41 +3464,9 @@ fn estimatedRunCodepointAdvance(run: reader.TextRun, cp: u21, advance_scale: f64
     return baseRunCodepointAdvance(run, cp) * advance_scale;
 }
 
-pub fn textRunBounds(run: reader.TextRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
-    const width_est = estimateRunWidth(run);
-    const ascent = effectiveRunAscent(run);
-    const descent = effectiveRunDescent(run);
-    const local_min_x = if (run.vertical) -run.font_size / 2.0 else 0;
-    const local_max_x = if (run.vertical) run.font_size / 2.0 else width_est;
-    const local_min_y = if (run.vertical) -width_est - descent else -descent;
-    const local_max_y = ascent;
-    const corners = [_][2]f64{
-        .{ run.x + run.a * local_min_x + run.c * local_min_y, run.y + run.b * local_min_x + run.d * local_min_y },
-        .{ run.x + run.a * local_max_x + run.c * local_min_y, run.y + run.b * local_max_x + run.d * local_min_y },
-        .{ run.x + run.a * local_min_x + run.c * local_max_y, run.y + run.b * local_min_x + run.d * local_max_y },
-        .{ run.x + run.a * local_max_x + run.c * local_max_y, run.y + run.b * local_max_x + run.d * local_max_y },
-    };
-
-    var min_x = corners[0][0];
-    var max_x = corners[0][0];
-    var min_y = corners[0][1];
-    var max_y = corners[0][1];
-    for (corners[1..]) |corner| {
-        min_x = @min(min_x, corner[0]);
-        max_x = @max(max_x, corner[0]);
-        min_y = @min(min_y, corner[1]);
-        max_y = @max(max_y, corner[1]);
-    }
-    return .{ .min_x = min_x, .max_x = max_x, .min_y = min_y, .max_y = max_y };
-}
-
-fn effectiveRunAscent(run: reader.TextRun) f64 {
-    return if (run.ascent > 0 or run.descent > 0) run.ascent else run.font_size * 0.8;
-}
-
-fn effectiveRunDescent(run: reader.TextRun) f64 {
-    return if (run.ascent > 0 or run.descent > 0) run.descent else run.font_size * 0.2;
-}
+pub const textRunBounds = @import("pdf_values").renderTextRunBounds;
+const effectiveRunAscent = @import("pdf_values").effectiveRunAscent;
+const effectiveRunDescent = @import("pdf_values").effectiveRunDescent;
 
 test "render text preview writes png signature" {
     const alloc = std.testing.allocator;
