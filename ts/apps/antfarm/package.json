@@ -60,7 +60,7 @@
     "react-router-dom": "^7.17.0",
     "streamdown": "^2.5.0",
     "tailwind-merge": "^3.6.0",
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@chromatic-com/storybook": "^5.2.1",

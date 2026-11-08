@@ -3222,12 +3222,20 @@ pub const Set = struct {
     /// Mutates a request-owned DOM without reparsing it. Generated fields are
     /// output-only: any submitted value is overwritten deterministically.
     pub fn applyJson(self: *const Set, alloc: Allocator, document: *std.json.Value) !void {
+        return self.applyJsonWithPolicy(alloc, document, .apply_to_absent);
+    }
+
+    pub fn applyJsonWithPolicy(self: *const Set, alloc: Allocator, document: *std.json.Value, defaults: DefaultsPolicy) !void {
         var budget: usize = max_allocated_bytes;
         var execution = Execution.init(alloc, &budget);
-        return self.applyJsonWithExecution(&execution, document);
+        return self.applyJsonWithExecutionAndPolicy(&execution, document, defaults);
     }
 
     pub fn applyJsonWithExecution(self: *const Set, execution: *Execution, document: *std.json.Value) !void {
+        return self.applyJsonWithExecutionAndPolicy(execution, document, .apply_to_absent);
+    }
+
+    fn applyJsonWithExecutionAndPolicy(self: *const Set, execution: *Execution, document: *std.json.Value, defaults: DefaultsPolicy) !void {
         execution.numeric.charge(0) catch |err| return executionFailure(err);
         if (document.* != .object) return error.InvalidBatchRequest;
         const alloc = execution.alloc;
@@ -3241,7 +3249,7 @@ pub const Set = struct {
         defer alloc.free(present);
         execution.bytes.* -= staging_bytes;
         try self.readValues(execution, document.*, values, present, true);
-        try self.applyValuesWithExecution(execution, values, present, .apply_to_absent, null);
+        try self.applyValuesWithExecution(execution, values, present, defaults, null);
         for (self.modifier_ordinals) |ordinal| {
             if (self.generated_columns[ordinal]) continue;
             const column = self.table.relational_columns[ordinal];
@@ -3254,6 +3262,7 @@ pub const Set = struct {
         }
         for (self.bindings) |binding| {
             const name = self.table.relational_columns[binding.ordinal].name;
+            if (!binding.generated and !present[binding.ordinal]) continue;
             if (!binding.generated and document.object.contains(name)) continue;
             const value = values[binding.ordinal];
             const key = try allocateOutput(alloc, name.len, execution.bytes);

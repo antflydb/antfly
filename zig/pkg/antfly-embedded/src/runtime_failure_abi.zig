@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 86;
+pub const abi_version: u32 = 87;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -805,6 +805,70 @@ pub const Status = enum(u32) {
     ambiguous_gcs_connection = 846,
     invalid_connection_credentials = 847,
     raft_apply_writer_unavailable = 848,
+    cypher_aggregate_scope = 849,
+    cypher_aggregate_wildcard = 850,
+    cypher_ambiguous_search_table = 851,
+    cypher_anchor_budget_exceeded = 852,
+    cypher_create_requires_label = 853,
+    cypher_deleted_entity = 854,
+    cypher_derived_relationship_mutation = 855,
+    cypher_division_by_zero = 856,
+    cypher_duplicate_identity = 857,
+    cypher_edge_budget_exceeded = 858,
+    cypher_exists_mutation = 859,
+    cypher_function_arity = 860,
+    cypher_invalid_assignment = 861,
+    cypher_invalid_backend_cursor = 862,
+    cypher_invalid_backend_page = 863,
+    cypher_invalid_backend_relationship = 864,
+    cypher_invalid_create_relationship = 865,
+    cypher_invalid_document = 866,
+    cypher_invalid_grouping = 867,
+    cypher_invalid_owner = 868,
+    cypher_invalid_range = 869,
+    cypher_invalid_relationship_metadata = 870,
+    cypher_invalid_search_limit = 871,
+    cypher_invalid_search_result = 872,
+    cypher_invalid_shortest_path = 873,
+    cypher_invalid_substring = 874,
+    cypher_label_predicate_violation = 875,
+    cypher_legacy_id_unavailable = 876,
+    cypher_limit_exceeded = 877,
+    cypher_memory_budget_exceeded = 878,
+    cypher_mutations_unavailable = 879,
+    cypher_node_has_relationships = 880,
+    cypher_numeric_overflow = 881,
+    cypher_observations_unavailable = 882,
+    cypher_overlapping_owners = 883,
+    cypher_owner_budget_exceeded = 884,
+    cypher_path_budget_exceeded = 885,
+    cypher_query_requires_return = 886,
+    cypher_recursion_budget_exceeded = 887,
+    cypher_regex_unavailable = 888,
+    cypher_relationship_endpoint_mismatch = 889,
+    cypher_remove_requires_property = 890,
+    cypher_request_too_large = 891,
+    cypher_response_too_large = 892,
+    cypher_return_must_be_last = 893,
+    cypher_return_predicate = 894,
+    cypher_row_policy_unsupported = 895,
+    cypher_search_after_write = 896,
+    cypher_search_preparation_required = 897,
+    cypher_search_table_outside_graph = 898,
+    cypher_search_unavailable = 899,
+    cypher_snapshot_not_ready = 900,
+    cypher_snapshot_required = 901,
+    cypher_state_budget_exceeded = 902,
+    cypher_transaction_already_active = 903,
+    cypher_transaction_conflict = 904,
+    cypher_transaction_required = 905,
+    cypher_type_mismatch = 906,
+    cypher_union_column_mismatch = 907,
+    cypher_value_depth_exceeded = 908,
+    cypher_variable_conflict = 909,
+    cypher_variable_type_conflict = 910,
+    cypher_write_union_unsupported = 911,
+    cypher_invalid_regex = 912,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
@@ -860,4 +924,22 @@ test "released main Status identifiers retain their exact names and numeric valu
     }
     try std_test.testing.expectEqual(@as(usize, 464), count);
     try std_test.testing.expectEqual(@as(u64, 0x6c3bb5270c6956ea), fingerprint);
+}
+
+test "Cypher statuses append after published upstream statuses" {
+    const testing = @import("std").testing;
+    try testing.expectEqual(@as(u32, 778), @backingInt(Status.seed_replica_policy_mismatch));
+    try testing.expectEqual(@as(u32, 779), @backingInt(Status.document_artifact_publication_failed));
+    try testing.expectEqual(@as(u32, 780), @backingInt(Status.decision_limit_exceeded));
+    try testing.expectEqual(@as(u32, 837), @backingInt(Status.graph_start_identity_required));
+    try testing.expectEqual(@as(u32, 841), @backingInt(Status.hierarchy_cursor_stale));
+    try testing.expectEqual(@as(u32, 842), @backingInt(Status.read_transient_failure));
+    try testing.expectEqual(@as(u32, 843), @backingInt(Status.read_request_failed));
+    try testing.expectEqual(@as(u32, 844), @backingInt(Status.invalid_gcs_url));
+    try testing.expectEqual(@as(u32, 845), @backingInt(Status.gcs_connection_not_found_or_out_of_scope));
+    try testing.expectEqual(@as(u32, 846), @backingInt(Status.ambiguous_gcs_connection));
+    try testing.expectEqual(@as(u32, 847), @backingInt(Status.invalid_connection_credentials));
+    try testing.expectEqual(@as(u32, 848), @backingInt(Status.raft_apply_writer_unavailable));
+    try testing.expectEqual(@as(u32, 849), @backingInt(Status.cypher_aggregate_scope));
+    try testing.expectEqual(@as(u32, 912), @backingInt(Status.cypher_invalid_regex));
 }

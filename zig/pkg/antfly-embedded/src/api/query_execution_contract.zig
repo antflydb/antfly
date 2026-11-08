@@ -3555,6 +3555,7 @@ pub const StorageKernelLookupWireRequest = struct {
     privacy_policy_version: ?[64]u8 = null,
     privacy_original: bool = false,
     key: []const u8,
+    cypher_prepare: bool = false,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_receipt: ?struct {
@@ -3576,6 +3577,7 @@ pub const StorageKernelLookupWireRequest = struct {
 
     pub fn options(self: StorageKernelLookupWireRequest) db_mod.types.LookupOptions {
         return .{
+            .cypher_prepare = self.cypher_prepare,
             .privacy_policy_version = self.privacy_policy_version,
             .privacy_original = self.privacy_original,
             .row_policy_principal_proof = self.row_policy_principal_proof,
@@ -3665,6 +3667,7 @@ pub fn encodeStorageKernelLookupRequest(
         .privacy_policy_version = opts.privacy_policy_version,
         .privacy_original = opts.privacy_original,
         .key = key,
+        .cypher_prepare = opts.cypher_prepare,
         .row_policy_principal_proof = opts.row_policy_principal_proof,
         .row_policy_database = opts.row_policy_database,
         .row_policy_receipt = if (opts.row_policy_receipt) |receipt| .{ .generation = receipt.generation, .phase = receipt.phase } else null,
@@ -3681,6 +3684,17 @@ pub fn encodeStorageKernelLookupRequest(
         .group_source_query_json = opts.group_source_query_json,
         .relational_topology_json = opts.relational_topology_json,
     }, .{});
+}
+
+test "compiled lookup wire preserves private Cypher admission without exposing a row" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeStorageKernelLookupRequest(alloc, "", .{ .cypher_prepare = true });
+    defer alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(StorageKernelLookupWireRequest, alloc, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.options().cypher_prepare);
+    try std.testing.expectEqualStrings("", parsed.value.key);
+    try std.testing.expect(parsed.value.options().row_policy_principal_proof.len == 0);
 }
 
 pub const StorageKernelDocumentArtifactManifestWireRequest = struct {

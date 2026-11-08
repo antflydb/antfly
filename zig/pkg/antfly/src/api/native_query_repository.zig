@@ -524,6 +524,7 @@ pub const Repository = struct {
         try request.validate(cut.nowMs());
         const manifest = std.json.parseFromSliceLeaky(Manifest, a, bytes, .{ .allocate = .alloc_always }) catch return error.CatalogGenerationChanged;
         if (manifest.version != 1 or !manifest.namespace.eql(namespace) or manifest.request.table_id != request.table_id or manifest.request.expires_ms != request.expires_ms or !std.mem.eql(u8, manifest.request.id, request.id) or manifest.files.len > local.storage_db_native_backup_seal.max_files) return error.CatalogGenerationChanged;
+        if (!manifest.request.indexesEqual(request)) return error.CatalogGenerationChanged;
         var total: u64 = 0;
         for (manifest.files, 0..) |file, i| {
             if (!safePath(file.path) or (std.mem.eql(u8, file.path, "query-cut.json") or std.mem.eql(u8, file.path, "query-remote.json"))) return error.CatalogGenerationChanged;
@@ -1038,6 +1039,9 @@ pub const Repository = struct {
             _ = try self.validateManifestAuthority(a, committed, request, namespace);
             return true;
         }
+        // Existing bindings above attest their selection. An unbound remote
+        // checkpoint only attests files, so use normal capture for a subset.
+        if (request.indexes != null) return false;
         const bytes = (try source.nativeCheckpointReferenceAlloc(a)) orelse return false;
         if (bytes.len > max_manifest_bytes) return error.QueryCandidateBudgetExceeded;
         const checkpoint = try std.json.parseFromSliceLeaky(port.CheckpointReference, a, bytes, .{ .allocate = .alloc_always });
@@ -1121,6 +1125,7 @@ pub const Repository = struct {
     }
     fn reuseImpl(raw: *anyopaque, executor: port.Executor, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
         const self = from(raw);
+        if (!previous.indexesEqual(request)) return null;
         try cancellation.check();
         try request.validate(cut.nowMs());
         if (!request.create or !(try request.namespace(namespace)).eql(namespace)) return error.CatalogGenerationChanged;
@@ -2602,6 +2607,9 @@ test "external lake native time series capture remains immutable after preflight
         // The preflight generation reused retained extents without a local pin.
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, cache, .{}));
         stage = "repeated capture";
+        var different_indexes = request;
+        different_indexes.indexes = &.{"other_index"};
+        try std.testing.expectError(error.CatalogGenerationChanged, db.captureQueryCut(different_indexes, .none));
         request.timeout_ms = 55000;
         try db.captureQueryCut(request, .none);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, cache, .{}));

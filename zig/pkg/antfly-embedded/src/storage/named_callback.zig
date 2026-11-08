@@ -17,6 +17,7 @@
 //! Error names are produced in the callback's compilation unit. No foreign
 //! numeric Zig error identity is interpreted in the receiving compilation unit.
 const std = @import("std");
+const builtin = @import("builtin");
 const native = @import("antfly_runtime_abi").native_abi;
 const status = @import("antfly_runtime_abi").error_abi;
 const Failure = struct { name: ?[*:0]const u8 = null };
@@ -42,6 +43,12 @@ pub fn Boundary(comptime VTable: type) type {
             const Args = std.meta.ArgsTuple(Function(Pointer));
             const T = Payload(Pointer);
             var typed_args: Args = args;
+            // Freestanding storage is compiled in the caller's own unit and
+            // has no native error-name registry or foreign owner capability.
+            if (comptime builtin.os.tag == .freestanding) {
+                if (dispatch != local_dispatch) return error.UnsupportedPlatform;
+                return @call(.auto, callback, typed_args);
+            }
             if (dispatch == local_dispatch) return @call(.auto, callback, typed_args);
             var output: Output(T) = undefined;
             const contract = native.CallContract.of(name, Pointer, Args, Output(T));

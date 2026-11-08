@@ -59,6 +59,13 @@ pub fn capture(db: anytype, a: A) !?PolicySnapshot {
     return .{ .producer_json = raw, .artifact_name = if (guard != null) (if (policy.value.mode == .redact_for_search_and_ai) try document.protectedArtifactName(a, prepared.version) else document.artifact_name) else artifact_name, .prepared = prepared, .native = !try db.maintenanceRequiresOrderedApply() };
 }
 
+/// Exact serving identity for a retained statement. Unlike a new read, a
+/// retained cut must also reject an absent-to-protected policy transition.
+pub fn servingVersion(db: anytype, a: A) ![64]u8 {
+    const policy = try capture(db, a);
+    return if (policy != null and policy.?.prepared.policy.mode != .monitor) policy.?.prepared.version else @splat(0);
+}
+
 pub fn requireExpected(a: A, expected: ?[64]u8, actual: ?PolicySnapshot) !void {
     _ = a;
     const version = expected orelse return;

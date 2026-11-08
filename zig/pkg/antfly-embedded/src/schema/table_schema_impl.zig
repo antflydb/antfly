@@ -672,6 +672,16 @@ pub const CompiledValidationPlan = struct {
         for (property.dependent_schemas) |dependency| try self.addProperty(alloc, dependency.schema.*);
     }
 
+    /// Reuse the immutable field-name index at typed query boundaries. This
+    /// avoids walking every declared column for each sparse mutation row.
+    pub fn relationalFieldType(self: *const CompiledValidationPlan, name: []const u8) ?[]const u8 {
+        if (self.schema_mode != .relational) return null;
+        for (self.schema_documents) |document| {
+            if (self.findProperty(document.properties, name)) |property| return property.field_type;
+        }
+        return null;
+    }
+
     fn findProperty(self: *const CompiledValidationPlan, properties: []const DocumentProperty, name: []const u8) ?DocumentProperty {
         if (self.properties.get(@intFromPtr(properties.ptr))) |map| {
             return if (map.get(name)) |index| properties[index] else null;

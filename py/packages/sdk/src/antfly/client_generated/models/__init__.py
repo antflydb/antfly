@@ -771,6 +771,9 @@ from .graph_bindings_result_kind import GraphBindingsResultKind
 from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
+from .graph_catalog_entry import GraphCatalogEntry
+from .graph_definition import GraphDefinition
+from .graph_definition_update import GraphDefinitionUpdate
 from .graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
 from .graph_distinct_budget_exceeded_error_dimension import GraphDistinctBudgetExceededErrorDimension
 from .graph_distinct_budget_exceeded_error_error import GraphDistinctBudgetExceededErrorError
@@ -815,6 +818,8 @@ from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 from .graph_k_shortest_paths import GraphKShortestPaths
 from .graph_k_shortest_paths_query import GraphKShortestPathsQuery
 from .graph_key_node_selector import GraphKeyNodeSelector
+from .graph_label_mapping import GraphLabelMapping
+from .graph_label_mapping_where import GraphLabelMappingWhere
 from .graph_match import GraphMatch
 from .graph_match_edge import GraphMatchEdge
 from .graph_match_node import GraphMatchNode
@@ -875,15 +880,23 @@ from .graph_path_weight_domain_error_violation import GraphPathWeightDomainError
 from .graph_paths_result import GraphPathsResult
 from .graph_paths_result_kind import GraphPathsResultKind
 from .graph_queries import GraphQueries
+from .graph_query_limits import GraphQueryLimits
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
+from .graph_query_request import GraphQueryRequest
+from .graph_query_request_parameters import GraphQueryRequestParameters
+from .graph_query_result import GraphQueryResult
+from .graph_query_result_plan_item import GraphQueryResultPlanItem
+from .graph_query_result_wire_version import GraphQueryResultWireVersion
 from .graph_query_results import GraphQueryResults
+from .graph_query_stats import GraphQueryStats
 from .graph_query_type import GraphQueryType
 from .graph_query_unsupported_error import GraphQueryUnsupportedError
 from .graph_query_unsupported_error_error import GraphQueryUnsupportedErrorError
 from .graph_query_unsupported_error_reason import GraphQueryUnsupportedErrorReason
 from .graph_query_unsupported_error_status import GraphQueryUnsupportedErrorStatus
 from .graph_relationship_filter import GraphRelationshipFilter
+from .graph_relationship_mapping import GraphRelationshipMapping
 from .graph_relationship_property_predicate import GraphRelationshipPropertyPredicate
 from .graph_relationship_property_predicate_op import GraphRelationshipPropertyPredicateOp
 from .graph_relationship_property_predicate_value_type import GraphRelationshipPropertyPredicateValueType
@@ -920,10 +933,15 @@ from .graph_ttl_config import GraphTtlConfig
 from .graph_where_and import GraphWhereAnd
 from .graph_where_not_equal import GraphWhereNotEqual
 from .graph_where_not_exists import GraphWhereNotExists
+from .graph_wire_value import GraphWireValue
+from .graph_wire_value_type import GraphWireValueType
 from .graph_work_budget_exceeded_error import GraphWorkBudgetExceededError
 from .graph_work_budget_exceeded_error_dimension import GraphWorkBudgetExceededErrorDimension
 from .graph_work_budget_exceeded_error_error import GraphWorkBudgetExceededErrorError
 from .graph_work_budget_exceeded_error_status import GraphWorkBudgetExceededErrorStatus
+from .graph_write_receipt import GraphWriteReceipt
+from .graph_write_receipt_outcome_type_0 import GraphWriteReceiptOutcomeType0
+from .graph_write_receipt_status import GraphWriteReceiptStatus
 from .ground_truth import GroundTruth
 from .grouped_artifact_source import GroupedArtifactSource
 from .grouped_artifact_source_filter import GroupedArtifactSourceFilter
@@ -3412,6 +3430,9 @@ __all__ = (
     "GraphBindingsReturn",
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
+    "GraphCatalogEntry",
+    "GraphDefinition",
+    "GraphDefinitionUpdate",
     "GraphDistinctBudgetExceededError",
     "GraphDistinctBudgetExceededErrorDimension",
     "GraphDistinctBudgetExceededErrorError",
@@ -3456,6 +3477,8 @@ __all__ = (
     "GraphKeyNodeSelector",
     "GraphKShortestPaths",
     "GraphKShortestPathsQuery",
+    "GraphLabelMapping",
+    "GraphLabelMappingWhere",
     "GraphMatch",
     "GraphMatchEdge",
     "GraphMatchNode",
@@ -3516,15 +3539,23 @@ __all__ = (
     "GraphPathWeightDomainErrorStatus",
     "GraphPathWeightDomainErrorViolation",
     "GraphQueries",
+    "GraphQueryLimits",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",
+    "GraphQueryRequest",
+    "GraphQueryRequestParameters",
+    "GraphQueryResult",
+    "GraphQueryResultPlanItem",
     "GraphQueryResults",
+    "GraphQueryResultWireVersion",
+    "GraphQueryStats",
     "GraphQueryType",
     "GraphQueryUnsupportedError",
     "GraphQueryUnsupportedErrorError",
     "GraphQueryUnsupportedErrorReason",
     "GraphQueryUnsupportedErrorStatus",
     "GraphRelationshipFilter",
+    "GraphRelationshipMapping",
     "GraphRelationshipPropertyPredicate",
     "GraphRelationshipPropertyPredicateOp",
     "GraphRelationshipPropertyPredicateValueType",
@@ -3561,10 +3592,15 @@ __all__ = (
     "GraphWhereAnd",
     "GraphWhereNotEqual",
     "GraphWhereNotExists",
+    "GraphWireValue",
+    "GraphWireValueType",
     "GraphWorkBudgetExceededError",
     "GraphWorkBudgetExceededErrorDimension",
     "GraphWorkBudgetExceededErrorError",
     "GraphWorkBudgetExceededErrorStatus",
+    "GraphWriteReceipt",
+    "GraphWriteReceiptOutcomeType0",
+    "GraphWriteReceiptStatus",
     "GroundTruth",
     "GroupedArtifactSource",
     "GroupedArtifactSourceFilter",

@@ -109,11 +109,21 @@ pub fn storageSuffixAlloc(alloc: Allocator, id: []const u8) ![]u8 {
 }
 
 pub const ScopedUploadVisitor = struct {
+    pub const Maintenance = enum { inspect, remove };
+    /// Admit provider-owned migration work and physical cleanup before I/O.
+    /// remove consumes both one work unit and one deletion unit. Payload
+    /// deletion remains admitted by visit, including on remote providers.
+    maintenance: ?*const fn (*anyopaque, Maintenance) anyerror!void = null,
     /// Backend-owned durable continuation. Callers persist it only after all
     /// delivered entries have been processed. Lexical providers may ignore it.
     continuation: ?[]const u8 = null,
     /// Remove deterministic local staging files while visiting fenced records.
     cleanup_staging: bool = false,
+    /// Reclaim an empty local attempt and its advisory journal after the
+    /// complete fenced attempt has been visited. Remote providers ignore this.
+    reclaim_retired_inventory: bool = false,
+    /// Report a non-empty attempt whose remaining files still need discovery.
+    retain_scope: ?*const fn (*anyopaque, UploadScope) anyerror!void = null,
     checkpoint: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     after_suffix: ?[]const u8 = null,
     fencing_floor: u64 = 0,
