@@ -44,6 +44,10 @@ pub const Capabilities = struct {
     full_distribution: bool = true,
     embedding_similarity: bool = false,
     generated: bool = false,
+    /// An Antfly Decisions endpoint can resolve a named decider to either
+    /// trained or generated answers. This is a trusted transport capability,
+    /// independent of a locally configured generated producer or cascade.
+    proxied_decisions: bool = false,
     /// Answers come from whichever cascade stage answered last, so each answer
     /// is validated by its own decision method. Only probability kinds apply.
     cascade: bool = false,
@@ -199,6 +203,7 @@ pub const DeciderConfig = struct {
         if (self.decision_method == .cascade) return self.cascadeCapabilities();
         var caps = capabilities(self.provider);
         caps.generated = self.decision_method == .generated;
+        caps.proxied_decisions = self.provider == .antfly and self.decision_method == .typed;
         if (caps.generated) {
             caps.max_levels = 64;
             const generator = self.generator orelse return caps;
@@ -475,6 +480,7 @@ pub fn questionsFor(a: std.mem.Allocator, function: Function, args: []const Json
 }
 pub fn selectResult(function: Function, response: Json) !Json {
     if (function == .ai_decide) return response;
+    if (try cascade_contract.agreementBlocked(response)) return .null;
     const answers = (try object(response)).get("answers") orelse return error.InvalidDecisionOutput;
     if (answers != .array) return error.InvalidDecisionOutput;
     for (answers.array.items) |entry| {
@@ -529,7 +535,9 @@ pub fn normalizeResponseWithConfig(a: std.mem.Allocator, questions: Json, source
 
 pub fn normalizeResponseWithCapabilities(a: std.mem.Allocator, questions: Json, source: Json, caps: Capabilities) !Json {
     const private = try contract.internalResponse(a, source);
-    return contract.publicResponse(a, try normalizeLegacy(a, questions, private, caps));
+    const normalized = try contract.publicResponse(a, try normalizeLegacy(a, questions, private, caps));
+    _ = try cascade_contract.responseAgreement(normalized);
+    return normalized;
 }
 fn normalizeLegacy(a: std.mem.Allocator, questions: Json, source: Json, caps: Capabilities) !Json {
     const bytes = try std.json.Stringify.valueAlloc(a, source, .{});
@@ -553,7 +561,7 @@ fn normalizeLegacy(a: std.mem.Allocator, questions: Json, source: Json, caps: Ca
         if (answer != .object) return error.InvalidDecisionOutput;
         const actual_kind = answer.object.get("type") orelse return error.InvalidDecisionOutput;
         if (actual_kind != .string or !std.mem.eql(u8, actual_kind.string, @tagName(kind))) return error.InvalidDecisionOutput;
-        if (caps.generated or (caps.cascade and generatedAnswer(answer))) {
+        if (caps.generated or ((caps.cascade or caps.proxied_decisions) and generatedAnswer(answer))) {
             try validateGeneratedAnswer(a, spec, kind, answer);
             try put(a, &normalized, q.key_ptr.*, answer);
             continue;
@@ -1038,4 +1046,96 @@ test "decision provider embeddinggemma2 validates multi choice configured margin
     try put(a, answer, "status", .{ .string = "selected" });
     _ = answer.object.swapRemove("abstention_reason");
     _ = try normalizeResponseWithConfig(a, questions, response, cfg);
+}
+
+test "decision scalar functions abstain while ai_decide preserves guarded raw evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        \\{"agreement_status":"disagreed","agreed":false,"disagreed_questions":["answer"]}
+        ,
+        \\{"agreement_status":"unverified"}
+    }) |metadata| {
+        var response = try std.json.parseFromSliceLeaky(Json, a,
+            \\{"model":"raw","answers":[{"name":"answer","choice":"yes","score":5,"probability":0.99}]}
+        , .{});
+        try response.object.put(a, "cascade", try std.json.parseFromSliceLeaky(Json, a, metadata, .{}));
+        for ([_]Function{ .ai_choice, .ai_score, .ai_probability }) |function| try std.testing.expect((try selectResult(function, response)) == .null);
+        try std.testing.expectEqualStrings("raw", (try selectResult(.ai_decide, response)).object.get("model").?.string);
+    }
+}
+
+test "decision provider generated normalization retains sampled choices below the maximum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const questions = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"same":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    const source = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"model":"strong","answers":[{"name":"same","type":"choice","decision_method":"generated","probability_source":"token_logprobs","raw_structured_answer":"different","choice":"different","probabilities":[{"value":"same","probability":0.96},{"value":"different","probability":0.04}]}],"usage":{"input_tokens":10,"output_tokens":1}}
+    , .{});
+    const normalized = try normalizeResponseWithCapabilities(a, questions, source, .{ .generated = true, .max_levels = 64 });
+    try std.testing.expectEqualStrings("different", normalized.object.get("answers").?.array.items[0].object.get("choice").?.string);
+}
+
+test "decision functions typed proxy normalization preserves upstream abstention and rejects malformed gates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const questions = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"answer":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    for ([_][]const u8{ "disagreed", "unverified" }) |status| {
+        var source = try std.json.parseFromSliceLeaky(Json, a,
+            \\{"model":"proxy","answers":[{"name":"answer","type":"choice","decision_method":"typed","choice":"same","probabilities":[{"value":"same","probability":0.97},{"value":"different","probability":0.03}]}],"usage":{"input_tokens":20,"output_tokens":2}}
+        , .{});
+        const metadata = try std.json.parseFromSliceLeaky(Json, a, try std.fmt.allocPrint(a,
+            \\{{"agreement_status":"{s}"{s}}}
+        , .{ status, if (std.mem.eql(u8, status, "disagreed")) ",\"agreed\":false,\"disagreed_questions\":[\"answer\"]" else "" }), .{});
+        try source.object.put(a, "cascade", metadata);
+        const normalized = try normalizeResponse(a, questions, source);
+        try std.testing.expect((try selectResult(.ai_choice, normalized)) == .null);
+        try std.testing.expectEqualStrings(status, (try selectResult(.ai_decide, normalized)).object.get("cascade").?.object.get("agreement_status").?.string);
+        try source.object.getPtr("cascade").?.object.put(a, "agreed", .{ .bool = true });
+        try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponse(a, questions, source));
+    }
+}
+
+test "decision functions Antfly proxy validates generated evidence before honoring agreement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const questions = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"answer":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    for ([_][]const u8{ "disagreed", "unverified", "agreed", "absent" }) |status| {
+        for ([_]bool{ false, true }) |verdict| {
+            var source = try std.json.parseFromSliceLeaky(Json, a, try std.fmt.allocPrint(a,
+                \\{{"model":"remote","answers":[{{"name":"answer","type":"choice","decision_method":"generated","probability_source":"{s}","raw_structured_answer":"different","choice":"different","probabilities":[{{"value":"same","probability":{d}}},{{"value":"different","probability":{d}}}]}}],"usage":{{"input_tokens":20,"output_tokens":2}}}}
+            , .{ if (verdict) "verdict" else "token_logprobs", @as(f64, if (verdict) 0 else 0.97), @as(f64, if (verdict) 1 else 0.03) }), .{});
+            const absent = std.mem.eql(u8, status, "absent");
+            if (!absent) try source.object.put(a, "cascade", try std.json.parseFromSliceLeaky(Json, a, try std.fmt.allocPrint(a,
+                \\{{"agreement_status":"{s}"{s}}}
+            , .{ status, if (std.mem.eql(u8, status, "disagreed")) ",\"agreed\":false,\"disagreed_questions\":[\"answer\"]" else if (std.mem.eql(u8, status, "agreed")) ",\"agreed\":true" else "" }), .{}));
+            const normalized = try normalizeResponseWithConfig(a, questions, source, .{ .provider = .antfly, .model = "deciders/remote" });
+            const blocked = !absent and !std.mem.eql(u8, status, "agreed");
+            try std.testing.expectEqual(blocked, try cascade_contract.agreementBlocked(normalized));
+            const selected = try selectResult(.ai_choice, normalized);
+            if (blocked) try std.testing.expect(selected == .null) else try std.testing.expectEqualStrings("different", selected.string);
+            try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithConfig(a, questions, source, .{ .provider = .jev, .model = "trained" }));
+            try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponse(a, questions, source));
+            const answer = &source.object.getPtr("answers").?.array.items[0];
+            try answer.object.put(a, "raw_structured_answer", .{ .string = "same" });
+            try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithConfig(a, questions, source, .{ .model = "remote" }));
+            try answer.object.put(a, "raw_structured_answer", .{ .string = "different" });
+            try answer.object.put(a, "probability_source", .{ .string = "invented" });
+            try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithConfig(a, questions, source, .{ .model = "remote" }));
+            if (!verdict) {
+                try answer.object.put(a, "probability_source", .{ .string = "verdict" });
+                try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithConfig(a, questions, source, .{ .model = "remote" }));
+            }
+        }
+    }
 }

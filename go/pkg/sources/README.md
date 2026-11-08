@@ -402,7 +402,11 @@ and media protocol as a bucket, so an application keeps the same code when it mo
 to object storage. Objects live at `<local_root>/<prefix>/objects/sha256/<digest>[.ext]`.
 The name is the revision, and the extension selects the MIME type. Go applications
 can write with `PutLocalObject`; others write to a temporary dot-file in that
-directory and rename it. Source config accepts an optional `prefix`.
+directory, fsync the file, and publish it atomically without replacing an existing
+object (for example, link the temporary file to the final name). Verify any
+existing object instead of replacing it, then fsync the containing directories
+before starting sync. Use owner-only directories and files. Source config accepts
+an optional `prefix`.
 
 `ANTFLY_SOURCE_LOCAL_ROOTS` lists the directories a connection may use, separated by
 the platform path-list separator. Unset denies local connections, because whoever can
@@ -422,7 +426,126 @@ fetch: list the listener in `remote_content.security.source_media_base_urls`, su
 `http://127.0.0.1:8082/v1/media/`. This allows that listener without opening other
 private addresses or ports. Run one source with
 `POST /v1/sync` and `{"source_id": "<uuid>"}` to publish a new upload without syncing
-the others. Runs are serialized across the service, so a concurrent run returns 409.
+the others. Upload callers must set `"restart": true` to enumerate newly written
+objects even after a failed pinned inventory. Runs are serialized across the service, so a concurrent run returns 409.
+
+### Moving a local store to a bucket
+
+```sh
+# Against a live "serve" instance -- no delivery downtime; its own admission
+# serializes the repoint with any other run there.
+antfly-source migrate-local --server http://127.0.0.1:8082 --admin-token-env ANTFLY_SOURCE_ADMIN_TOKEN \
+  --source <source-uuid> --from-connection local --from-prefix assets \
+  --to-connection bucket --to-bucket my-bucket --to-prefix migrated \
+  [--dry-run]
+
+# Without --server, in-process against a stopped service's state directory
+# (nothing is being delivered either way, so there's no downtime to protect).
+antfly-source migrate-local --config sources.json --state-dir /var/lib/antfly-sources/runner \
+  --public-url http://127.0.0.1:8082 --admin-token-env ANTFLY_SOURCE_ADMIN_TOKEN --media-key-env ANTFLY_SOURCE_MEDIA_KEY \
+  --source <source-uuid> --from-connection local --from-prefix assets \
+  --to-connection bucket --to-bucket my-bucket --to-prefix migrated \
+  [--dry-run]
+```
+
+This copies one source's objects to an S3-compatible or GCS connection,
+keeping the `objects/sha256/<digest>[.ext]` layout so the digest stays the
+key. Bucket prefixes are literal prefixes: leading slashes in their suffixes
+are significant. The migration configures a trailing-slash destination prefix
+so those suffixes match the local store's relative keys exactly. Every copy
+is verified by an independent read-back and hash of the destination object, whether just uploaded or already there from an earlier
+run, before anything can reference it; a mismatch fails that object and the
+run (GCS gives back CRC32C and MD5, not SHA-256, so this reads the object
+back and hashes it the same way S3 does, rather than trusting either). GCS
+uploads pass `ifGenerationMatch=0`, so two runs (or a run colliding with
+anything else) can never overwrite each other's object at the same
+content-addressed key; S3 has no equivalent atomic precondition, so it relies
+on the existence check before uploading instead. Rerunning only uploads
+what's still missing, and a clean rerun uploads nothing. Every rerun still
+completes a source sync: a committed configuration PUT alone cannot prove
+that a previous run published the new references. A retry after a failed
+sync or an interrupted cutover therefore repairs publication automatically.
+It never deletes or edits the local store; once satisfied, remove
+`<local_root>/<prefix>/objects/sha256` yourself.
+
+Copying and verifying never take any service lock; they only read the local
+store and write the destination bucket. Repointing (the catalog `PUT` and
+resync) is the one step that needs admission, and has two modes:
+
+- **`--server URL`**: sends the same `PUT /v1/sources/{id}` and
+  `POST /v1/sync` an operator would, over real HTTP to that live `serve`
+  instance's own admin API, and polls the job. Its own run admission
+  serializes this with any other run there, so there's no need to stop it
+  and no delivery downtime from this process holding a lock. A live 409 ("a
+  run is already in progress") is retried with bounded backoff before
+  failing clearly.
+- **No `--server`**: repoints in-process against `--state-dir`, exactly like
+  `serve` would, taking that directory's exclusive lock for the repoint step.
+  Use this only with `serve` stopped -- nothing is being delivered either
+  way, so there's no downtime to protect, and `migrate-local` refuses to
+  start if `serve` (or another `migrate-local` run) already holds that
+  directory, rather than racing it.
+
+Live cutover requires a companion advertising conditional source updates
+(`X-Antfly-Source-Preconditions: 1` on `/v1/profile`). Migration re-reads the
+source after copying, preserves concurrent naming, permission and stream edits,
+and rejects concurrent acquisition, identity or transfer-connection changes. Both the source PUT
+and sync admission use an atomic `If-Match` precondition, together with
+configuration digests for both transfer connections; a conflicting edit
+fails cutover without overwriting it. Copied objects remain available for retry.
+Destination copy keys and source selection use the same canonical prefix; `.`
+names the bucket root, just like an empty prefix. Namespace adoption checks provider
+identity outside the service mutex with a bounded deadline. Concurrent source,
+connection or credential changes invalidate that check before the source is written.
+
+Live migration requires companion precondition protocol version 2. Cutover
+atomically persists a migration receipt alongside the source. Every retry must
+match the original local root, prefix, destination connection, bucket, prefix,
+source namespace and table. A different target fails before copying or syncing.
+The receipt survives companion restarts. Bucket-backed sources cut over by older
+versions without a receipt cannot safely infer their original local store;
+automatic mop-up refuses them. Upgrade the companion before the first cutover.
+
+The destination connection must already exist in the repointed-against
+profile (the live server's own, or the one seeded at `--state-dir`); this is
+checked, and fails clearly, before anything is copied. An upload that lands
+in the local store while this runs (or afterward) is simply left there; it is
+never lost, and a later `migrate-local` run copies and publishes it even
+after the source already points at the bucket.
+
+**A reference issued before repointing stops working immediately, not
+gradually.** The signed media URL a client already holds is bound to a hash
+of the source's own connection and config; `PUT`-ing the new connection
+changes that hash before a single byte is re-copied or any resync runs, so
+the very next fetch of an old reference gets `410 Gone`. Local bytes are
+never deleted -- only the reference stops resolving. Measured against a real
+`serve` process and a real MinIO bucket while continuously re-querying the
+catalog and fetching whatever reference it currently returned: delivery
+degraded only in that one window, lasting well under a second between the
+`PUT` and the resync publishing the bucket-backed row (5 of 151 fetch
+attempts, in one run, got `410` there); it never went down because of a held
+lock, and a client that always fetches the current reference (rather than
+holding on to an old one) sees at most that one short gap. Fetching the exact
+URL a client already has, right in that gap, fails with `410`, consistent
+with the reference's own contract that an invalidated URL never serves
+different bytes under the old signature.
+
+**Repointing re-keys every document.** A provider switch changes the item
+identity (`local://...` becomes `s3://...` or `gcs://...`), and the catalog's
+document ID is a hash of that identity, not of the bytes. The resync
+therefore deletes each old row and inserts a new one, even though the digest
+is unchanged. Any derived data attached to the old row -- OCR text, chunks,
+embeddings -- does not carry over and must be recomputed against the new
+row. Only the original content's digest survives unrecomputed; search over
+the migrated content still works once that recomputation finishes (plain
+text and metadata are available immediately). `migrate-local` prints this
+plainly before copying anything, including on a dry run.
+
+A GCS destination uses `GoogleCredentialsForGCSWrite` (read/write scope)
+rather than the read-only scope every other Google connection requests;
+a credential that only has read-only storage access fails the upload itself
+with a clear `HTTP 403` naming the missing scope, rather than failing
+earlier with something more cryptic.
 
 ## Media and runtime source registration
 
@@ -846,3 +969,10 @@ member batch, source-versus-artifact trigram isolation, path/type exclusions and
 retained snapshot completion. Model HTTP replies
 are deterministic fixtures; this validates the integration, not GPU/model quality.
 Private-IP fetching is enabled only in the isolated smoke configuration.
+
+
+Interrupted inventories from older companion versions are upgraded in place:
+local, S3 and GCS relative keys are reconstructed from the pinned item IDs and
+matching source configuration before publication. Namespace adoption therefore
+preserves row IDs on resume without listing the provider again. Inconsistent
+checkpoint identities fail before content publication.

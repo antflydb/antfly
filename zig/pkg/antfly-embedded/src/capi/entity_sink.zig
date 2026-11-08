@@ -458,7 +458,8 @@ fn adjudicationProducer(handle: *h.Handle) !@import("../storage/db/enrichment/as
 fn adjudicate(ptr: *anyopaque, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) anyerror![]u8 {
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     const io = handle.database().backend_runtime.io() orelse return error.MissingAdjudicator;
-    const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, request.timeout_ms) * std.time.ns_per_ms;
+    const now = @import("antfly_platform").time.monotonicNs();
+    const deadline = try request.deadline(now);
     const producer = try adjudicationProducer(handle);
     return producer.withInvocationContext(.{ .io = io, .deadline_ns = deadline }).produce(a, .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint });
 }
