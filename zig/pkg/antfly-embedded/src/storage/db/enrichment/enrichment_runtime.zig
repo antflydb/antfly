@@ -13454,8 +13454,8 @@ pub fn runNativeDocumentPreparationIntegration(alloc: Allocator, io: Io, pdf_byt
     defer if (coordinator) |owner| owner.destroy();
     runtime.document_prefetch = &pipeline;
     defer runtime.document_prefetch = null;
-    try completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(&runtime, alloc, backing, producer, job.config, job.policy, url, source.content.data, &source.content_fingerprint, "pdf", "application/pdf", completed, .ocr, &coordinator, job.pdf.?.session());
-    if (job.window != null) return error.DocumentPreparationNotReused;
+    try completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(&runtime, alloc, backing, producer, job.config, job.requested_policy, url, source.content.data, &source.content_fingerprint, "pdf", "application/pdf", completed, .ocr, &coordinator, job.pdf.?.session());
+    if (!job.consumed or job.window != null) return error.DocumentPreparationNotReused;
     for (completed) |unit| if (!unit.ocr_attempted or unit.ocr_failure_stage != null) return error.DocumentPreparationOcrIncomplete;
     const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "next", "asset", "units");
     defer alloc.free(manifest_key);
@@ -13730,12 +13730,25 @@ const DocumentPreparationPipeline = struct {
             slot.* = null;
         };
     }
+    fn sameExecutionEnvelope(left: GeneratedTextBatchPolicy, right: GeneratedTextBatchPolicy) bool {
+        var a = left;
+        var b = right;
+        // Collection width and retry ownership belong to the foreground
+        // document. Neither changes a successfully computed page's inputs.
+        a.render_items = null;
+        b.render_items = null;
+        a.defer_render_pressure = false;
+        b.defer_render_pressure = false;
+        a.retry_fingerprint = 0;
+        b.retry_fingerprint = 0;
+        return std.meta.eql(a, b);
+    }
     fn restoreComputed(self: *@This(), alloc: Allocator, producer: asset_producer_mod.Producer, config: document_extraction_mod.Config, policy: GeneratedTextBatchPolicy, fingerprint: []const u8, source_bytes: []const u8, units: []document_extraction_mod.Unit) !bool {
         if (units.len == 0) return false;
         for (self.jobs) |maybe| if (maybe) |job| {
             if (job.future != null or !job.sameSource(source_bytes) or !job.computed or job.consumed or job.fingerprint == null or !std.mem.eql(u8, job.fingerprint.?, fingerprint) or
                 !std.mem.eql(u8, document_extraction_mod.effectiveOcrConfigJson(job.config), document_extraction_mod.effectiveOcrConfigJson(config)) or !Job.samePolicy(job.config, config) or
-                !std.meta.eql(job.requested_policy, policy) or
+                !sameExecutionEnvelope(job.requested_policy, policy) or
                 job.original_first == null or !std.mem.eql(u8, job.original_first.?.text, units[0].text) or
                 job.units.items.len == 0 or !std.mem.eql(u8, job.units.items[0].unit_id, units[0].unit_id) or job.units.items[0].page_number != units[0].page_number) continue;
             var cancellation: AssetInvocationCancellation = undefined;
@@ -45925,7 +45938,10 @@ test "document preparation computed reuse requires exact source policy and live 
     job.computed = false;
     try std.testing.expect(!try pipeline.restoreComputed(a, producer, job.config, job.requested_policy, "fingerprint", bytes, &units));
     job.computed = true;
-    try std.testing.expect(try pipeline.restoreComputed(a, producer, job.config, job.requested_policy, "fingerprint", bytes, &units));
+    var foreground_policy = job.requested_policy;
+    foreground_policy.render_items = 4;
+    foreground_policy.retry_fingerprint = 99;
+    try std.testing.expect(try pipeline.restoreComputed(a, producer, job.config, foreground_policy, "fingerprint", bytes, &units));
     try std.testing.expectEqualStrings("selected OCR text", units[0].text);
     try std.testing.expect(units[0].ocr_attempted and job.consumed);
     try std.testing.expect(!try pipeline.restoreComputed(a, producer, job.config, job.requested_policy, "fingerprint", bytes, &units));
