@@ -5853,10 +5853,13 @@ unbounded observation dominates that table's point domains.
 
 Proof construction uses invocation-owned parameters, a bounded analysis budget,
 and request cancellation checkpoints. Prepared SQL statements never cache bound
-keys. Unknown expressions, traversals, procedures, writes, staged graph overlays
-(including READ COMMITTED), empty domains and keysets exceeding 4,096 entries
-retain full-table cohorts and indexes. Empty overlays and staged writes to tables
-outside the referenced graphs preserve point pruning.
+keys. Unknown expressions, traversals, procedures, writes, staged changes to
+tables the graph query reads (including READ COMMITTED), empty domains and
+keysets exceeding 4,096 entries retain full-table cohorts and indexes. Empty
+overlays and staged writes to unreferenced tables preserve point pruning,
+including tables exposed through other labels of the same graph. Overlay
+projection uses the query's read dependencies so it never projects an unrelated
+table against an owner cohort that does not contain that table.
 These fallbacks preserve the runtime's error, empty-input and write semantics.
 
 Every statement attempt acquires one authoritative routing generation before
@@ -5874,8 +5877,30 @@ catalog and privilege validation, policy publication checks, table identity,
 privacy versions, topology validation and retained-cut fences remain mandatory.
 SQL also retains its logical schema/policy catalog-revision fence: concurrent
 catalog DDL can return SQLSTATE `40001` even when graph routing is unchanged.
-This changes private coordinator descriptors (kernel ABI 88 / runtime ABI 88),
-without changing the public JSON contract or shard query protocol.
+The retained generation exposes borrowed table and group range views. Keyspace
+coverage is checked once when building its immutable indexes. Extracting the
+selected owners' full ranges then requires no catalog-sized allocation or scan;
+only the selected range bounds are copied into owner plans. The generation stays
+retained until initial capture completes.
+
+This changes private coordinator descriptors (kernel ABI 88 / runtime ABI 88).
+Native callback ABI 11 independently fences the graph table descriptor stride
+behind `Statement.tables`; older callbacks are rejected before payload access.
+The public JSON contract and shard query protocol are unchanged. Privacy-policy
+capture translates native monotonic deadlines into the catalog's clock domain
+for both compact and compatibility callbacks before opening retained owners.
+Remote text-statistics envelopes also preserve their expected privacy version
+through query, explicit-term and background-term decoding. Conflicting nested
+versions and malformed versions are rejected. Each storage statistics path
+checks the expected policy while holding its read lock, before collecting terms;
+the private envelope never silently drops the coordinator's policy fence.
+Ordered data-Raft application also treats writer contention during receipt
+recovery and lifecycle publication as resumable. It retains completed-entry
+checkpoints, leaves the blocked entry pending and retries its exact term/index
+when ownership becomes available. Replay qualification verifies that a prior
+increment executes only once across changed Ready windows. Mutation
+qualification resolves ambiguous admitted writes through durable receipts and
+never replays them to obtain an immediate response.
 
 Identity-based grouping hashes charge node and relationship table/key bytes,
 and path hashes charge every visited node and edge. Wide byte hashing admits
@@ -5895,3 +5920,12 @@ as though they could introduce graph reads. Regression coverage includes 10,000
 bindings with 4,096 repeated references, bounded indexing refusal, cancellation,
 production generation acquisition before admission, and eager staged-overlay
 capture requirements.
+
+Point domains are unordered identity sets. Key hashing, unions and final
+materialization charge the proof budget and check cancellation; finalization
+exhaustion discards every bound. There is no routing-only key sort. Multiple
+label aliases of one physical table insert an observation's keys only once,
+while distinct-table fanout remains budgeted. Regressions cover 4,096 wide keys,
+64 aliases, physical-table fanout and cancellation during key insertion. Borrowed
+range tests require zero lookup allocations with 1, 1,000 and 10,000 catalog
+tables and verify gaps, overlaps, invalid ranges and expired routing budgets.

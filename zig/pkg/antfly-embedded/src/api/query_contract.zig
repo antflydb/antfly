@@ -3057,17 +3057,21 @@ pub fn parseQueryRequestWithDeadline(
         var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
         defer raw.deinit();
         if (raw.value == .object) if (raw.value.object.get("_privacy_policy_version")) |value| {
-            if (value != .string) return error.InvalidQueryRequest;
-            var version: [64]u8 = @splat(0);
-            if (!std.mem.eql(u8, value.string, "none")) {
-                if (value.string.len != 64) return error.InvalidQueryRequest;
-                for (value.string) |byte| if (!std.ascii.isHex(byte)) return error.InvalidQueryRequest;
-                @memcpy(&version, value.string);
-            }
-            owned.req.privacy_policy_version = version;
+            owned.req.privacy_policy_version = try parsePrivacyPolicyVersion(value);
         };
     }
     return owned;
+}
+
+pub fn parsePrivacyPolicyVersion(value: std.json.Value) ![64]u8 {
+    if (value != .string) return error.InvalidQueryRequest;
+    var version: [64]u8 = @splat(0);
+    if (!std.mem.eql(u8, value.string, "none")) {
+        if (value.string.len != 64) return error.InvalidQueryRequest;
+        for (value.string) |byte| if (!std.ascii.isHex(byte)) return error.InvalidQueryRequest;
+        @memcpy(&version, value.string);
+    }
+    return version;
 }
 
 fn parseQueryRequestWithDeadlineCore(

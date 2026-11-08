@@ -4156,9 +4156,8 @@ pub const ProvisionedTableReadSource = struct {
             try certifyDelayedOwnerCut(owned.group_ids.len);
             try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table.name, owned.group_ids.len);
             owned.releaseActivity();
-            var routing = (try table_catalog.observedTableRoutingSnapshot(alloc, routing_catalog, table.name, routing_budget.deadline_ns)) orelse return error.CatalogGenerationChanged;
-            defer routing.deinit(alloc);
-            if (routing.table_id != owned.table_id or routing.topology_epoch != owned.topology_epoch or !routing.coversKeyspace()) return error.TopologyChanged;
+            const routing = try routing_session.tableRoutingView(table.name, routing_budget);
+            if (routing.table_id != owned.table_id or routing.topology_epoch != owned.topology_epoch or !routing.covers_keyspace) return error.TopologyChanged;
             for (owned.group_ids, 0..) |group, i| {
                 if (plans.items.len >= 1024) return error.CypherOwnerBudgetExceeded;
                 var route: table_router.GroupRoute = if (self.distributed_router) |router|
@@ -4169,31 +4168,23 @@ pub const ProvisionedTableReadSource = struct {
                 const fence = owned.fenceAt(i, input.deadline_ns, input.cancellation);
                 try plans.ensureUnusedCapacity(alloc, 1);
                 try routes.ensureUnusedCapacity(alloc, 1);
-                var ranges: std.ArrayList(@import("cypher").distributed.KeyRange) = .empty;
-                errdefer {
-                    for (ranges.items) |range| {
-                        alloc.free(range.start);
-                        if (range.end) |end| alloc.free(end);
-                    }
-                    ranges.deinit(alloc);
-                }
-                for (routing.ranges) |range| if (range.group_id == group) {
-                    const start = try alloc.dupe(u8, range.start_key);
-                    errdefer alloc.free(start);
-                    const end = if (range.end_key) |end| try alloc.dupe(u8, end) else null;
-                    errdefer if (end) |value| alloc.free(value);
-                    try ranges.append(alloc, .{ .start = start, .end = end });
-                };
-                if (ranges.items.len == 0) return error.TopologyChanged;
+                const range = try routing_session.rangeForGroup(owned.table_id, group, routing_budget);
+                const start = try alloc.dupe(u8, range.start_key);
+                errdefer alloc.free(start);
+                const end = if (range.end_key) |value| try alloc.dupe(u8, value) else null;
+                errdefer if (end) |value| alloc.free(value);
+                const ranges = try alloc.alloc(@import("cypher").distributed.KeyRange, 1);
+                errdefer alloc.free(ranges);
+                ranges[0] = .{ .start = start, .end = end };
                 // Selection keys are no longer needed after routing. Do not
                 // duplicate an entire keyset in every retained owner plan.
                 var owner_table = table;
                 owner_table.keys = null;
-                try plans.append(alloc, .{ .table = owner_table, .fence = fence, .ranges = try ranges.toOwnedSlice(alloc), .route = switch (route) {
+                plans.appendAssumeCapacity(.{ .table = owner_table, .fence = fence, .ranges = ranges, .route = switch (route) {
                     .local => .{ .local = self.groupLocalSourceWithFence(fence) },
                     .remote => |remote| .{ .remote = .{ .executor = self.distributedInternalExecutor(), .base_uri = remote.base_uri } },
                 } });
-                try routes.append(alloc, route);
+                routes.appendAssumeCapacity(route);
             }
         }
         return factory.Statement.create(alloc, input, plans.items, if (self.io_impl) |io| io.io() else null, if (self.io_impl) |io| ioAsyncLimitCap(io) else 1);
@@ -17642,6 +17633,96 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(builtin.is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "certified graph point cohorts borrow ranges without catalog-sized allocations" {
+            const a = std.testing.allocator;
+            for ([_]usize{ 1, 1000, 10000 }) |size| {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const own = arena.allocator();
+                const tables = try own.alloc(metadata_table_manager.TableRecord, size);
+                const ranges = try own.alloc(metadata_table_manager.RangeRecord, size);
+                for (tables, ranges, 0..) |*table, *range, i| {
+                    table.* = .{ .table_id = i + 1, .name = if (i == 0) "docs" else try std.fmt.allocPrint(own, "unrelated_{d}", .{i}) };
+                    range.* = .{ .table_id = i + 1, .group_id = i + 32, .range_id = i + 32, .start_key = "" };
+                }
+                const generation = try table_catalog.RoutingGeneration.create(a, .{ .tables = tables, .ranges = ranges }, .{});
+                var refusing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                var session = generation.session(refusing.allocator(), table_catalog.emptyCatalogSource(), true);
+                defer session.deinit();
+                const view = try session.tableRoutingView("docs", .{});
+                try std.testing.expect(view.covers_keyspace);
+                try std.testing.expectEqual(@as(u64, 1), view.table_id);
+                const range = try session.rangeForGroup(view.table_id, 32, .{});
+                try std.testing.expectEqualStrings("", range.start_key);
+                try std.testing.expect(range.end_key == null);
+                try std.testing.expectEqual(@as(usize, 0), refusing.allocations);
+                try std.testing.expectError(error.TopologyChanged, session.rangeForGroup(2, 32, .{}));
+                try std.testing.expectError(error.TableNotFound, session.tableRoutingView("missing", .{}));
+                try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, session.tableRoutingView("docs", .{ .deadline_ns = 0 }));
+            }
+            var tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 1, .name = "docs" }};
+            var ranges = [_]metadata_table_manager.RangeRecord{
+                .{ .table_id = 1, .group_id = 32, .range_id = 32, .start_key = "", .end_key = "m" },
+                .{ .table_id = 1, .group_id = 33, .range_id = 33, .start_key = "m" },
+            };
+            for (0..4) |step| {
+                ranges[0].end_key = switch (step) {
+                    0 => "m",
+                    1 => "l",
+                    2 => "z",
+                    else => "",
+                };
+                const generation = try table_catalog.RoutingGeneration.create(a, .{ .tables = &tables, .ranges = &ranges }, .{});
+                var session = generation.session(a, table_catalog.emptyCatalogSource(), true);
+                defer session.deinit();
+                const view = try session.tableRoutingView("docs", .{});
+                try std.testing.expectEqual(step == 0, view.covers_keyspace);
+            }
+        }
+
+        test "certified graph point cohorts translate privacy deadlines before retained capture" {
+            const ns = std.time.ns_per_s;
+            const Fixture = struct {
+                now: u64,
+                last: ?u64 = null,
+                fn check(self: *@This(), deadline: ?u64) !void {
+                    self.last = deadline;
+                    if (deadline) |end| {
+                        if (end <= self.now) return error.CatalogRoutingSnapshotTimeout;
+                        try std.testing.expect(end <= self.now + 5 * ns);
+                    }
+                }
+                fn binding(raw: *anyopaque, _: []const u8, deadline: ?u64) !metadata_api.PrivacyPolicyBinding {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.check(deadline);
+                    return .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .policy_version = @splat('a') };
+                }
+                fn snapshot(raw: *anyopaque, _: []const u8, deadline: ?u64) !metadata_api.CatalogRoutingSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.check(deadline);
+                    return .{ .tables = &.{}, .ranges = &.{} };
+                }
+                fn free(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+            };
+            var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = @intCast(platform_time.monotonicNs() + 1000 * ns) });
+            defer clock.deinit();
+            const io = clock.io();
+            var fixture: Fixture = .{ .now = @intCast(clock.monotonic_ns) };
+            const catalog: table_catalog.CatalogSource = .{ .ptr = &fixture, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io), .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .privacy_policy_binding = Fixture.binding } };
+            var provider = ProvisionedTableReadSource.init("unused", catalog, undefined);
+            const source = provider.source();
+            const deadline = platform_time.monotonicNs() + 5 * ns;
+            const version = try source.privacyPolicyVersion(std.testing.allocator, "docs", deadline);
+            try std.testing.expectEqual(@as([64]u8, @splat('a')), version);
+            try std.testing.expect(fixture.last.? > fixture.now);
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.privacyPolicyVersion(std.testing.allocator, "docs", 0));
+            _ = try source.privacyPolicyVersion(std.testing.allocator, "docs", null);
+            try std.testing.expect(fixture.last == null);
+            const compatibility: table_catalog.CatalogSource = .{ .ptr = &fixture, .io = catalog.io, .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .linearizable_table_routing_snapshot = Fixture.snapshot, .free_routing_snapshot = Fixture.free } };
+            _ = try capturePrivacyPolicyVersion(std.testing.allocator, compatibility, "docs", deadline);
+            try std.testing.expect(fixture.last.? > fixture.now);
+        }
+
         test "certified graph point cohorts admit only selected owners before read index" {
             const a = std.testing.allocator;
             var arena = std.heap.ArenaAllocator.init(a);
@@ -36043,15 +36124,18 @@ test "public graph metric borrowed wire scan producer sink preserves bytes and f
 }
 
 fn capturePrivacyPolicyVersion(a: std.mem.Allocator, catalog: table_catalog.CatalogSource, table_name: []const u8, deadline: ?u64) ![64]u8 {
+    // TableReadSource controls use native MONOTONIC; catalog callbacks may use
+    // a borrowed executor's awake clock. Preserve remaining time at the edge.
+    const routing_deadline = catalog.deadlineFrom(.{ .deadline_ns = deadline });
     if (catalog.vtable.privacy_policy_binding) |capture| {
-        const binding = try capture(catalog.ptr, table_name, deadline);
+        const binding = try capture(catalog.ptr, table_name, routing_deadline);
         try binding.validate();
         return binding.policy_version;
     }
     // Foreign/test catalog adapters may only provide the older owned snapshot.
     // First-party adapters use the compact capability above, including remotely.
     const capture = catalog.vtable.linearizable_table_routing_snapshot orelse return error.PrivacyReadFenceUnavailable;
-    var snapshot = try capture(catalog.ptr, table_name, deadline);
+    var snapshot = try capture(catalog.ptr, table_name, routing_deadline);
     defer catalog.vtable.free_routing_snapshot(catalog.ptr, &snapshot);
     const table = for (snapshot.tables) |*entry| {
         if (std.mem.eql(u8, entry.name, table_name)) break entry;

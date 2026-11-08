@@ -2118,7 +2118,7 @@ const LocalStandaloneMetadata = struct {
                     tables[0].indexes_json = indexes;
                 }
             }
-            const refs = if (table) |value| generation.indexed.table_range_refs.get(value.table_id) orelse &.{} else &.{};
+            const refs = if (table) |value| if (generation.indexed.table_range_refs.get(value.table_id)) |entry| entry.ranges else &.{} else &.{};
             const ranges = try self.alloc.alloc(antfly.metadata.RangeRecord, refs.len);
             var copied_ranges: usize = 0;
             errdefer {

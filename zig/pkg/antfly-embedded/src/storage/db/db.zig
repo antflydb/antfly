@@ -45214,6 +45214,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, req);
         return try db_query_search.collectSearchRequestTextStats(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -45303,12 +45304,12 @@ pub const DB = struct {
         return try self.searchLocked(alloc, req);
     }
 
-    pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+    pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest, privacy_policy_version: ?[64]u8) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{});
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{ .privacy_policy_version = privacy_policy_version });
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -45320,12 +45321,13 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
+        privacy_policy_version: ?[64]u8,
     ) ![]const aggregations_mod.DistributedBackgroundTextStats {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{});
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{ .privacy_policy_version = privacy_policy_version });
         return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,

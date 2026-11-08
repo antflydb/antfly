@@ -25,6 +25,9 @@ pub const Effects = struct { table: []const u8, writes: []const types.GraphEdgeW
 pub const View = struct {
     client: *cypher.rpc.Client,
     rows: []const Row,
+    /// Null retains every graph table. Project staged data only within the
+    /// statement's retained physical read dependencies, including during bind.
+    read_tables: ?[]const []const u8 = null,
     effects: []const Effects = &.{},
     limits: cypher.runtime.Limits,
     inner: cypher.transaction.Overlay = undefined,
@@ -78,6 +81,7 @@ pub const View = struct {
         // Relationship masks and staged postimages are sufficient to reconcile
         // native pages on demand; node-only queries never open adjacency.
         for (self.rows) |row| {
+            if (!cypher.dependencies.contains(self.read_tables, row.identity.table)) continue;
             const member = for (graph.labels) |label| {
                 if (std.mem.eql(u8, label.table, row.identity.table)) break true;
             } else false;
@@ -118,6 +122,7 @@ pub const View = struct {
             }
         }
         for (self.effects) |effects| {
+            if (!cypher.dependencies.contains(self.read_tables, effects.table)) continue;
             for (effects.deletes) |edge| for (graph.relationships) |mapping| {
                 if (!matches(graph, effects.table, mapping, edge) or try self.projectedFieldEffect(a, graph, effects.table, mapping, edge)) continue;
                 self.changed = true;

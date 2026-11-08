@@ -111,6 +111,7 @@ pub const BackgroundTextStatsFieldRequestInput = struct {
 };
 
 pub const TextStatsRequestInput = struct {
+    _privacy_policy_version: ?std.json.Value = null,
     _native_cut: ?std.json.Value = null,
     _identity_read_generation: ?u64 = null,
     _resolved_doc_filter: ?std.json.Value = null,
@@ -163,6 +164,7 @@ pub const OwnedAlgebraicTensorExpr = query_contract.OwnedAlgebraicTensorExprEnve
 pub const OwnedAlgebraicTensorProgram = query_contract.OwnedAlgebraicTensorProgramEnvelope;
 
 pub const ParsedExplicitTextStatsRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
     identity_read_generation: ?u64 = null,
     resolved_doc_filter: ?db_mod.doc_filter_wire.ParsedResolvedDocFilter = null,
     items: []OwnedTextStatsFieldRequest = &.{},
@@ -176,6 +178,7 @@ pub const ParsedExplicitTextStatsRequest = struct {
 };
 
 pub const ParsedBackgroundTextStatsRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
     identity_read_generation: ?u64 = null,
     resolved_doc_filter: ?db_mod.doc_filter_wire.ParsedResolvedDocFilter = null,
     items: []OwnedBackgroundTextStatsFieldRequest = &.{},
@@ -230,11 +233,18 @@ pub fn parseTextStatsRequest(
 ) !ParsedTextStatsRequest {
     var parsed = try std.json.parseFromSlice(TextStatsRequestInput, alloc, body, .{});
     defer parsed.deinit();
+    const version = if (parsed.value._privacy_policy_version) |value| try query_contract.parsePrivacyPolicyVersion(value) else null;
     if (parsed.value.query_request) |query_value| {
         if (parsed.value._resolved_doc_filter != null) return error.InvalidQueryRequest;
         const encoded_query = try std.json.Stringify.valueAlloc(alloc, query_value, .{});
         defer alloc.free(encoded_query);
-        return .{ .query_request = try query_api.parseQueryRequest(alloc, null, table_name, encoded_query) };
+        var owned = try query_api.parseQueryRequest(alloc, null, table_name, encoded_query);
+        errdefer owned.deinit(alloc);
+        if (version) |expected| {
+            if (owned.req.privacy_policy_version) |nested| if (!std.mem.eql(u8, &expected, &nested)) return error.InvalidQueryRequest;
+            owned.req.privacy_policy_version = expected;
+        }
+        return .{ .query_request = owned };
     }
     if (parsed.value.fields) |fields_value| {
         var resolved_doc_filter = if (parsed.value._resolved_doc_filter) |filter_value|
@@ -268,6 +278,7 @@ pub fn parseTextStatsRequest(
             initialized += 1;
         }
         return .{ .explicit_fields = .{
+            .privacy_policy_version = version,
             .identity_read_generation = identity_read_generation,
             .resolved_doc_filter = resolved_doc_filter,
             .items = items,
@@ -307,6 +318,7 @@ pub fn parseTextStatsRequest(
             initialized += 1;
         }
         return .{ .background_fields = .{
+            .privacy_policy_version = version,
             .identity_read_generation = identity_read_generation,
             .resolved_doc_filter = resolved_doc_filter,
             .items = items,

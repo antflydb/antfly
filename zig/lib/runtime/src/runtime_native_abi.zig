@@ -22,9 +22,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Tokenizer vtables include additive token-byte decoding. Reject older
-// native handles before interpreting the added callback slot.
-pub const abi_version: u32 = 10;
+// Graph statement table descriptors include certified key domains. The
+// callback's shallow contract cannot detect a stride change behind a slice;
+// reject older callers/providers before interpreting those descriptors.
+pub const abi_version: u32 = 11;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

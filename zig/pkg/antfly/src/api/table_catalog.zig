@@ -407,6 +407,10 @@ pub const RoutingGeneration = struct {
 /// This prevents nested helpers from silently mixing catalog generations or
 /// recovering storage identity from an operational admin snapshot.
 pub const RoutingSession = struct {
+    const TableRangeIndex = struct {
+        ranges: []const *const metadata_table_manager.RangeRecord,
+        covers_keyspace: bool,
+    };
     alloc: std.mem.Allocator,
     base: CatalogSource,
     snapshot: OwnedRoutingSnapshot,
@@ -417,7 +421,7 @@ pub const RoutingSession = struct {
     group_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     topology_epochs: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     range_refs: []const *const metadata_table_manager.RangeRecord = &.{},
-    table_range_refs: std.AutoHashMapUnmanaged(u64, []const *const metadata_table_manager.RangeRecord) = .empty,
+    table_range_refs: std.AutoHashMapUnmanaged(u64, TableRangeIndex) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, base: CatalogSource, deadline_ns: ?u64) !RoutingSession {
         return initWithBudget(alloc, base, base.budget(deadline_ns));
@@ -535,7 +539,10 @@ pub const RoutingSession = struct {
             var end = first + 1;
             while (end < range_refs.len and range_refs[end].table_id == range_refs[first].table_id) : (end += 1) {}
             const table_id = range_refs[first].table_id;
-            self.table_range_refs.putAssumeCapacity(table_id, range_refs[first..end]);
+            self.table_range_refs.putAssumeCapacity(table_id, .{
+                .ranges = range_refs[first..end],
+                .covers_keyspace = try completeKeyspace(range_refs[first..end], budget),
+            });
             const table_index = self.table_id_indexes.get(table_id) orelse return error.InvalidCatalogProjection;
             self.topology_epochs.putAssumeCapacity(
                 table_id,
@@ -575,6 +582,37 @@ pub const RoutingSession = struct {
     }
 
     pub const DocumentKeyRoutes = struct { span: RoutedSpanSnapshot, key_groups: []u64 };
+    pub const TableRoutingView = struct { table_id: u64, topology_epoch: u64, covers_keyspace: bool };
+
+    /// Borrow only the indexed table contract. No wire snapshot or catalog
+    /// bytes are copied; the caller must retain this session through capture.
+    pub fn tableRoutingView(self: *const RoutingSession, table_name: []const u8, budget: RoutingBudget) !TableRoutingView {
+        try budget.checkpoint();
+        const index = self.table_indexes.get(table_name) orelse return error.TableNotFound;
+        const id = self.snapshot.value.tables[index].table_id;
+        return .{ .table_id = id, .topology_epoch = self.topology_epochs.get(id).?, .covers_keyspace = if (self.table_range_refs.get(id)) |entry| entry.covers_keyspace else false };
+    }
+
+    /// A published group identifies exactly one range in a generation; setup
+    /// rejects duplicate group IDs. Keep its complete immutable owner range.
+    pub fn rangeForGroup(self: *const RoutingSession, table_id: u64, group_id: u64, budget: RoutingBudget) !*const metadata_table_manager.RangeRecord {
+        try budget.checkpoint();
+        const index = self.group_indexes.get(group_id) orelse return error.TopologyChanged;
+        const range = &self.snapshot.value.ranges[index];
+        if (range.table_id != table_id) return error.TopologyChanged;
+        return range;
+    }
+
+    fn completeKeyspace(ranges: []const *const metadata_table_manager.RangeRecord, budget: RoutingBudget) !bool {
+        try budget.checkpoint();
+        if (ranges.len == 0 or ranges[0].start_key.len != 0) return false;
+        for (ranges[0 .. ranges.len - 1], ranges[1..], 0..) |left, right, index| {
+            try budget.checkpointIndex(index);
+            const end = left.end_key orelse return false;
+            if (std.mem.order(u8, left.start_key, end) != .lt or !std.mem.eql(u8, end, right.start_key)) return false;
+        }
+        return ranges[ranges.len - 1].end_key == null;
+    }
     pub fn documentKeyRoutes(self: *RoutingSession, alloc: std.mem.Allocator, table_name: []const u8, keys: []const []const u8, deadline: ?u64) !DocumentKeyRoutes {
         return self.documentKeyRoutesWithBudget(alloc, table_name, keys, self.base.budget(deadline));
     }
@@ -583,7 +621,7 @@ pub const RoutingSession = struct {
         try budget.checkpoint();
         const table_index = self.table_indexes.get(table_name) orelse return error.TableNotFound;
         const table = self.snapshot.value.tables[table_index];
-        const ranges = self.table_range_refs.get(table.table_id) orelse return error.TopologyChanged;
+        const ranges = (self.table_range_refs.get(table.table_id) orelse return error.TopologyChanged).ranges;
         const key_groups = try alloc.alloc(u64, keys.len);
         errdefer alloc.free(key_groups);
         var routes: std.ArrayListUnmanaged(CatalogGroupRoute) = .empty;
@@ -741,7 +779,7 @@ pub const RoutingSession = struct {
         try budget.checkpoint();
         const table_index = self.table_indexes.get(table_name) orelse return false;
         const table = self.snapshot.value.tables[table_index];
-        const ranges = self.table_range_refs.get(table.table_id) orelse &.{};
+        const ranges = if (self.table_range_refs.get(table.table_id)) |entry| entry.ranges else &.{};
         return switch (query) {
             .table => true,
             .all_ranges => ranges.len > 0,
@@ -761,7 +799,7 @@ pub const RoutingSession = struct {
         try budget.checkpoint();
         const table_index = self.table_indexes.get(table_name) orelse return null;
         const table = &self.snapshot.value.tables[table_index];
-        const ranges = self.table_range_refs.get(table.table_id) orelse &.{};
+        const ranges = if (self.table_range_refs.get(table.table_id)) |entry| entry.ranges else &.{};
         var one: [1]*const metadata_table_manager.RangeRecord = undefined;
         const selected = switch (query) {
             .table => &.{},

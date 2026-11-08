@@ -27,6 +27,7 @@ pub const Options = struct {
     max_work: usize = 65536,
     checkpoint: ?struct { ptr: *const anyopaque, call: *const fn (*const anyopaque) anyerror!void } = null,
 };
+/// Keys are an unordered physical identity set, never a row ordering promise.
 pub const Domain = struct { table: []const u8, keys: ?[]const []const u8 };
 pub const Plan = struct {
     domains: []const Domain,
@@ -49,6 +50,9 @@ const Builder = struct {
     exhausted: bool = false,
     options: Options,
     remaining: usize,
+    fn checkpoint(self: *Builder) !void {
+        if (self.options.checkpoint) |check| try check.call(check.ptr);
+    }
     fn spend(self: *Builder, amount: usize) !bool {
         if (self.exhausted) return false;
         if (self.options.checkpoint) |check| {
@@ -62,11 +66,16 @@ const Builder = struct {
         return true;
     }
     fn appendKey(self: *Builder, list: *std.ArrayList([]const u8), key: []const u8) !bool {
-        if (!try self.spend(1 + key.len / 64)) return false;
+        // Appending borrows a span; hashing its bytes is charged by add().
+        if (!try self.spend(1)) return false;
         try list.append(self.a, key);
         return true;
     }
     fn add(self: *Builder, table_name: []const u8, keys: ?[]const []const u8) !void {
+        if (!self.exhausted) _ = try self.spend(1 + table_name.len / 64);
+        // Full domains must still be installed after exhaustion, so the
+        // conservative fallback cannot retain partially proved key sets.
+        if (keys != null and self.exhausted) return;
         const slot = try self.tables.getOrPut(self.a, table_name);
         if (!slot.found_existing) slot.value_ptr.* = .{};
         if (keys == null) {
@@ -75,6 +84,7 @@ const Builder = struct {
         }
         if (slot.value_ptr.full) return;
         for (keys.?) |key| {
+            if (!try self.spend(1 + key.len / 64)) return;
             try slot.value_ptr.keys.put(self.a, key, {});
             if (slot.value_ptr.keys.count() > max_keys) {
                 slot.value_ptr.full = true;
@@ -83,7 +93,14 @@ const Builder = struct {
         }
     }
     fn all(self: *Builder) !void {
+        try self.checkpoint();
         for (self.graph.labels) |label| try self.add(label.table, null);
+        try self.checkpoint();
+    }
+    fn addUnique(self: *Builder, seen: *Aliases, table: []const u8, keys: ?[]const []const u8) !void {
+        if (!try self.spend(1 + table.len / 64)) return;
+        const slot = try seen.getOrPut(self.a, table);
+        if (!slot.found_existing) try self.add(table, keys);
     }
     fn node(self: *Builder, n: ast.Node, predicate: ?*const ast.Expr, aliases: Aliases) !void {
         const literal_properties = for (n.properties) |property| {
@@ -94,11 +111,22 @@ const Builder = struct {
         else
             .{ .safe = false };
         const keys = if (bound.safe) bound.keys else null;
-        if (n.labels.len == 0) {
-            for (self.graph.labels) |label| try self.add(label.table, keys);
-        } else for (n.labels) |name| if (self.graph.label(name)) |label| {
-            try self.add(label.table, keys);
-        };
+        if (n.labels.len == 1) {
+            if (!try self.spend(1 + n.labels[0].len / 64)) return;
+            if (self.graph.label(n.labels[0])) |label| try self.add(label.table, keys);
+        } else if (n.labels.len == 0 and self.graph.labels.len == 1) {
+            try self.add(self.graph.labels[0].table, keys);
+        } else {
+            // Several labels can map to the same physical table. The same
+            // node observation must not rehash its whole key set per label.
+            var seen: Aliases = .empty;
+            if (n.labels.len == 0) {
+                for (self.graph.labels) |label| try self.addUnique(&seen, label.table, keys);
+            } else for (n.labels) |name| {
+                if (!try self.spend(1 + name.len / 64)) return;
+                if (self.graph.label(name)) |label| try self.addUnique(&seen, label.table, keys);
+            }
+        }
     }
     fn path(self: *Builder, p: ast.Path, predicate: ?*const ast.Expr, aliases: Aliases) !void {
         // Traversals can fetch unknown endpoints from either orientation.
@@ -339,6 +367,7 @@ const Builder = struct {
                 // Stream and materialized plans can choose different conjuncts.
                 // Keep every possible candidate key, not just the intersection.
                 if (l.keys.?.len + r.keys.?.len > max_keys) return .{ .safe = false };
+                if (!try self.spend(l.keys.?.len + r.keys.?.len)) return .{ .safe = false };
                 var result: std.ArrayList([]const u8) = .empty;
                 try result.appendSlice(self.a, l.keys.?);
                 try result.appendSlice(self.a, r.keys.?);
@@ -363,17 +392,19 @@ pub fn plan(a: A, graph: catalog.Graph, query: ast.Query, parameters: []const v.
         var names: std.ArrayList([]const u8) = .empty;
         if (!entry.value_ptr.full and !builder.writes) {
             var keys = entry.value_ptr.keys.keyIterator();
-            while (keys.next()) |name| try names.append(a, name.*);
-            std.mem.sort([]const u8, names.items, {}, struct {
-                fn less(_: void, l: []const u8, r: []const u8) bool {
-                    return std.mem.order(u8, l, r) == .lt;
-                }
-            }.less);
+            while (keys.next()) |name| {
+                if (!try builder.spend(1)) break;
+                try names.append(a, name.*);
+            }
         }
         // Empty domains conservatively retain a cohort: the runtime still owns
         // empty-input and error semantics, including aggregate defaults.
         result[index] = .{ .table = entry.key_ptr.*, .keys = if (entry.value_ptr.full or builder.writes or names.items.len == 0) null else names.items };
     }
+    if (builder.exhausted) for (result) |*domain| {
+        domain.keys = null;
+    };
+    try builder.checkpoint();
     return .{ .domains = result };
 }
 
@@ -416,7 +447,9 @@ test "point domains compose identity predicates and conservatively retain unknow
         try std.testing.expectEqual(case.keys == null, actual == null);
         if (case.keys) |expected| {
             try std.testing.expectEqual(expected.len, actual.?.len);
-            for (expected, actual.?) |l, r| try std.testing.expectEqualStrings(l, r);
+            for (expected) |key| try std.testing.expect(for (actual.?) |found| {
+                if (std.mem.eql(u8, key, found)) break true;
+            } else false);
         }
     }
 }
@@ -494,4 +527,48 @@ test "point parameter proofs index bindings once and meter indexing before looku
     parameters[0].value = .{ .string = "first" };
     const duplicate = try plan(a, graph, single.query, parameters, .{});
     try std.testing.expectEqualStrings("first", duplicate.table("docs").?.keys.?[0]);
+}
+
+test "point domain materialization meters physical fanout and cancels key hashing" {
+    const compiler = @import("compiler.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const labels = try a.alloc(catalog.Label, 64);
+    for (labels, 0..) |*label, i| label.* = .{ .name = try std.fmt.allocPrint(a, "D{d}", .{i}), .table = "docs" };
+    const values = try a.alloc(v.Value, max_keys);
+    const keys = try a.alloc([]const u8, max_keys);
+    for (values, keys, 0..) |*value, *key, i| {
+        const bytes = try a.alloc(u8, 224);
+        @memset(bytes, 'x');
+        _ = try std.fmt.bufPrint(bytes[216..], "{d:0>8}", .{i});
+        key.* = bytes;
+        value.* = .{ .string = bytes };
+    }
+    const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = labels, .relationships = &.{} };
+    try graph.validate();
+    var diagnostic: compiler.Diagnostic = .{};
+    var compiled = try compiler.compile(a, "MATCH(n) WHERE antfly.documentKey(n) IN $keys RETURN n", .{}, &diagnostic);
+    defer compiled.deinit();
+    const parameters: []const v.Entry = &.{.{ .name = "keys", .value = .{ .list = values } }};
+    const bounded = try plan(a, graph, compiled.query, parameters, .{ .max_work = 17000 });
+    try std.testing.expect(bounded.table("docs").?.keys == null);
+    // Alias labels must not multiply the same physical observation's hashing.
+    const complete = try plan(a, graph, compiled.query, parameters, .{});
+    try std.testing.expectEqual(@as(usize, max_keys), complete.table("docs").?.keys.?.len);
+    for (labels, 0..) |*label, i| label.table = try std.fmt.allocPrint(a, "table{d}", .{i});
+    const fanout = try plan(a, graph, compiled.query, parameters, .{});
+    for (fanout.domains) |domain| try std.testing.expect(domain.keys == null);
+    const Guard = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == 2) return error.Canceled;
+        }
+    };
+    var guard: Guard = .{};
+    var builder: Builder = .{ .a = a, .graph = graph, .parameters = parameters, .remaining = 65536, .options = .{ .checkpoint = .{ .ptr = &guard, .call = Guard.check } } };
+    try std.testing.expectError(error.Canceled, builder.add("docs", keys));
+    try std.testing.expectEqual(@as(usize, 2), guard.calls);
 }

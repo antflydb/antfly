@@ -3484,6 +3484,7 @@ def test_authenticated_cypher_point_cohorts_catalog_churn_and_overlays(monkeypat
     session = requests.Session()
     session.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
     table = "cypher_cohort_" + uuid.uuid4().hex
+    other_table = table + "_other"
     graph = table + "_g"
     try:
 
@@ -3527,9 +3528,19 @@ def test_authenticated_cypher_point_cohorts_catalog_churn_and_overlays(monkeypat
                 "sync_level": "full_index",
             },
         )
+        call("/sql", {"statement": f"CREATE TABLE {other_table} (x BIGINT)"})
+        call(
+            "/sql", {"statement": f"INSERT INTO {other_table}(_id,x) VALUES('other',5)"}
+        )
         call(
             "/graphs/" + graph,
-            {"labels": [{"name": "D", "table": table}], "relationships": []},
+            {
+                "labels": [
+                    {"name": "D", "table": table},
+                    {"name": "O", "table": other_table},
+                ],
+                "relationships": [],
+            },
         )
         count_sql = f"SELECT count(*) FROM GRAPH_TABLE({graph} MATCH(n IS D) WHERE antfly.documentKey(n) IN $1 COLUMNS(n.x AS x)) q"
         start = threading.Barrier(2)
@@ -3597,6 +3608,38 @@ def test_authenticated_cypher_point_cohorts_catalog_churn_and_overlays(monkeypat
             call(
                 "/sql",
                 {
+                    "statement": f"UPDATE {other_table} SET x=55 WHERE _id='other'",
+                    "session_id": transaction,
+                },
+            )
+            point_sql = f"SELECT q.x FROM GRAPH_TABLE({graph} MATCH(n IS D) WHERE antfly.documentKey(n)=$1 COLUMNS(n.x AS x)) q"
+            other_sql = f"SELECT q.x FROM GRAPH_TABLE({graph} MATCH(n IS O) WHERE antfly.documentKey(n)=$1 COLUMNS(n.x AS x)) q"
+            # An unreferenced label's staged rows need no owner projection.
+            # Exercise both point and scan plans before staging any D writes.
+            result = call(
+                "/sql",
+                {
+                    "statement": point_sql,
+                    "parameters": ["a0000"],
+                    "session_id": transaction,
+                },
+            )
+            assert result["rows"] == [["0"]], result
+            all_d = f"SELECT count(*) FROM GRAPH_TABLE({graph} MATCH(n IS D) COLUMNS(n.x AS x)) q"
+            result = call("/sql", {"statement": all_d, "session_id": transaction})
+            assert result["rows"] == [["1001"]], result
+            result = call(
+                "/sql",
+                {
+                    "statement": other_sql,
+                    "parameters": ["other"],
+                    "session_id": transaction,
+                },
+            )
+            assert result["rows"] == [["55"]], result
+            call(
+                "/sql",
+                {
                     "statement": f"UPDATE {table} SET x=77 WHERE _id='β'",
                     "session_id": transaction,
                 },
@@ -3608,7 +3651,6 @@ def test_authenticated_cypher_point_cohorts_catalog_churn_and_overlays(monkeypat
                     "session_id": transaction,
                 },
             )
-            point_sql = f"SELECT q.x FROM GRAPH_TABLE({graph} MATCH(n IS D) WHERE antfly.documentKey(n)=$1 COLUMNS(n.x AS x)) q"
             for key, expected in (("a0000", "0"), ("β", "77"), ("γ", "88")):
                 result = call(
                     "/sql",
@@ -3619,6 +3661,15 @@ def test_authenticated_cypher_point_cohorts_catalog_churn_and_overlays(monkeypat
                     },
                 )
                 assert result["rows"] == [[expected]], result
+            result = call(
+                "/sql",
+                {
+                    "statement": other_sql,
+                    "parameters": ["other"],
+                    "session_id": transaction,
+                },
+            )
+            assert result["rows"] == [["55"]], result
         finally:
             call("/sql", {"statement": "ROLLBACK", "session_id": transaction})
     finally:

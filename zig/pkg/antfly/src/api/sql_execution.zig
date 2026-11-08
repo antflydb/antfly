@@ -2052,16 +2052,19 @@ pub const Adapter = struct {
         }
         return parameters;
     }
-    /// Staged graph postimages and effects are projected eagerly during bind.
-    /// Their reads are outside the AST key proof, including READ COMMITTED.
-    /// Empty overlays and writes to unrelated tables preserve point pruning.
-    fn hasStagedGraphWrites(self: *const Adapter, graph: @import("cypher").catalog.Graph) bool {
+    /// Determine which physical tables can receive staged graph projection.
+    fn graphReadsTable(graph: @import("cypher").catalog.Graph, needed: ?[]const []const u8, table: []const u8) bool {
+        if (!@import("cypher").dependencies.contains(needed, table)) return false;
+        for (graph.labels) |label| if (std.mem.eql(u8, label.table, table)) return true;
+        return false;
+    }
+    fn hasStagedGraphWrites(self: *const Adapter, graph: @import("cypher").catalog.Graph, needed: ?[]const []const u8) bool {
         const staged = self.staged orelse return false;
         for (staged.tables) |entry| {
             const batch = entry.batch;
             if (batch.writes.len == 0 and batch.deletes.len == 0 and batch.graph_writes.len == 0 and batch.graph_deletes.len == 0) continue;
             const physical = staged.physicalName(entry.table_name);
-            for (graph.labels) |label| if (std.mem.eql(u8, label.table, physical)) return true;
+            if (graphReadsTable(graph, needed, physical)) return true;
         }
         return false;
     }
@@ -2078,14 +2081,16 @@ pub const Adapter = struct {
             }
         }
         const graph = first orelse return error.InvalidSqlGraphTable;
-        const prune_cohort = self.range_reads == null and for (requests) |request| {
-            if (request.table.graph) |binding| if (self.hasStagedGraphWrites(binding.graph)) break false;
-        } else true;
         const owner = try a.create(GraphStatement);
         errdefer a.destroy(owner);
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const owned = arena.allocator();
+        const needed_rows = try owned.alloc(?[]const []const u8, requests.len);
+        for (requests, needed_rows) |request, *needed| needed.* = if (request.table.graph) |binding| try cypher.dependencies.required(owned, binding.definition.query, binding.graph) else null;
+        const prune_cohort = self.range_reads == null and for (requests, needed_rows) |request, needed| {
+            if (request.table.graph) |binding| if (self.hasStagedGraphWrites(binding.graph, needed)) break false;
+        } else true;
         var records: std.ArrayList(system_catalog.Resource) = .empty;
         for (requests) |request| if (request.table.graph) |binding| {
             var duplicate = false;
@@ -2096,9 +2101,8 @@ pub const Adapter = struct {
             if (!duplicate) try records.append(owned, try std.json.parseFromSliceLeaky(system_catalog.Resource, owned, binding.catalog_json, .{ .allocate = .alloc_always }));
         };
         var tables: std.ArrayList(catalog.Table) = .empty;
-        for (requests) |request| {
+        for (requests, needed_rows) |request, needed| {
             const dependencies = if (request.table.graph) |binding| binding.dependencies else &.{request.table};
-            const needed = if (request.table.graph) |binding| try cypher.dependencies.required(owned, binding.definition.query, binding.graph) else null;
             for (dependencies) |table| {
                 if (!cypher.dependencies.contains(needed, table.physical_name)) continue;
                 var found = false;
@@ -2253,18 +2257,16 @@ pub const Adapter = struct {
                 graph_client.incarnation = binding.graph.incarnation;
                 graph_client.revision = binding.graph.revision;
                 const parameters = parameter_rows[request_index];
+                const needed = needed_rows[request_index];
                 var changed = for (staged_rows.items) |row| {
-                    const member = for (binding.graph.labels) |label| {
-                        if (std.mem.eql(u8, label.table, row.identity.table)) break true;
-                    } else false;
-                    if (member) break true;
+                    if (graphReadsTable(binding.graph, needed, row.identity.table)) break true;
                 } else false;
-                for (staged_effects.items) |effects| for (binding.graph.labels) |label| {
-                    if (std.mem.eql(u8, label.table, effects.table)) changed = true;
+                for (staged_effects.items) |effects| if (graphReadsTable(binding.graph, needed, effects.table)) {
+                    changed = true;
                 };
                 const graph_limits = @import("graph_execution.zig").limits(self.server);
                 const overlay = try owned.create(graph_overlay.View);
-                overlay.* = .{ .client = graph_client, .rows = staged_rows.items, .effects = staged_effects.items, .limits = graph_limits };
+                overlay.* = .{ .client = graph_client, .rows = staged_rows.items, .effects = staged_effects.items, .read_tables = needed, .limits = graph_limits };
                 break :blk try catalog.graph_relation.Cursor.open(a, binding.*, if (changed) overlay.backend() else graph_client.backend(), parameters, request.request, graph_limits);
             } else blk: {
                 var demanded = request.request;
@@ -4649,8 +4651,10 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
     try std.testing.expectError(error.CypherObservationsUnavailable, adapter.execute(a, &point_query, &.{ .{ .string = "a" }, .{ .string = "b" } }, .{}, null));
     try std.testing.expectEqual(@as(usize, 1), fake.full_overlays);
     fake.expect_full_overlay = false;
-    for (0..2) |step| {
-        if (step == 0) staged_tables[0].table_name = @constCast("unrelated") else {
+    // Neither an unrelated table nor an unreferenced label of this graph
+    // broadens capture. The fake requires the original bounded key union.
+    for (0..3) |step| {
+        if (step < 2) staged_tables[0].table_name = @constCast(if (step == 0) "unrelated" else "other") else {
             staged_tables[0].table_name = @constCast("logical-docs");
             staged_tables[0].batch.deletes = &.{};
         }
@@ -4658,7 +4662,7 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
         defer unaffected.deinit();
         try std.testing.expectEqual(@as(usize, 1), unaffected.output.rows.len);
     }
-    try std.testing.expectEqual(@as(usize, 5), fake.captures);
+    try std.testing.expectEqual(@as(usize, 6), fake.captures);
     try std.testing.expectEqual(fake.captures, fake.releases);
 }
 
