@@ -662,6 +662,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
             .mode = .simple,
         },
     });
+    // Physical C API test consumers do not import the shared storage owner.
+    // Their shared PDF template client still needs its independent compute
+    // provider at the final link, never as a test-object codegen dependency.
+    if (antfly_imports.shared_pdf_templates) {
+        for ([_]linked_tests.Artifact{ memory_capi_check, memory_capi_tests, capi_tests }) |artifact|
+            artifact.executable.root_module.linkLibrary(native_enrichment);
+    }
     // Share compilation and its memory admission between hermetic API contracts
     // and explicit model qualification. Installed models must not silently
     // change the cost or selection of the ordinary unit gate.
@@ -695,13 +702,15 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     run_capi_tests.step.dependOn(&run_maintenance_activity.step);
     b.step("capi-maintenance-activity-test", "Verify manual drains yield admission to detached publishers")
         .dependOn(&run_maintenance_activity.step);
-    const cypher_capi_tests = b.addTest(.{
+    const cypher_capi_tests = linked_tests.add(b, .{
         .root_module = capi_root_mod,
         .filters = &.{ "capi embedded graph", "capi Cypher authority" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    if (antfly_imports.shared_pdf_templates)
+        cypher_capi_tests.executable.root_module.linkLibrary(native_enrichment);
     b.step("capi-cypher-test", "Qualify local graph catalog and retained Cypher queries")
-        .dependOn(&addFilteredTestRunArtifact(b, cypher_capi_tests).step);
+        .dependOn(&cypher_capi_tests.run(b).step);
     const lake_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/lake_test_root.zig"),
         .target = target,
