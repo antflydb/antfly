@@ -5,6 +5,7 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.leann_index_config_media_vectors import LeannIndexConfigMediaVectors
 from ..models.leann_index_config_quantizer import LeannIndexConfigQuantizer
 from ..models.leann_index_config_vector_storage import LeannIndexConfigVectorStorage
 from ..types import UNSET, Unset
@@ -35,6 +36,13 @@ class LeannIndexConfig:
         bound_scale (float | Unset): Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates
             and loses fewer true neighbors. Default: 1.0.
         batch_size (int | Unset): Candidates recomputed per batch. 0 uses k. Default: 0.
+        reembed_budget_ms (int | Unset): Time a query may spend re-embedding candidates whose stored vectors were
+            dropped. Once spent, the remaining candidates are ranked by their code estimates instead, so the query still
+            returns results. 0 means no limit. Default: 0.
+        media_vectors (LeannIndexConfigMediaVectors | Unset): How vectors that cannot be re-embedded from text (images,
+            audio windows, model outputs) are kept once the graph covers them. "full" keeps the stored float32 vector.
+            "int8" replaces it with a stub holding an int8 copy (about a quarter of the size), read back instead of re-
+            embedding. Requires "auto" or "transient" storage. Default: LeannIndexConfigMediaVectors.FULL.
     """
 
     max_degree: int | Unset = 30
@@ -43,6 +51,8 @@ class LeannIndexConfig:
     search_ef: int | Unset = 0
     bound_scale: float | Unset = 1.0
     batch_size: int | Unset = 0
+    reembed_budget_ms: int | Unset = 0
+    media_vectors: LeannIndexConfigMediaVectors | Unset = LeannIndexConfigMediaVectors.FULL
 
     def to_dict(self) -> dict[str, Any]:
         max_degree = self.max_degree
@@ -61,6 +71,12 @@ class LeannIndexConfig:
 
         batch_size = self.batch_size
 
+        reembed_budget_ms = self.reembed_budget_ms
+
+        media_vectors: str | Unset = UNSET
+        if not isinstance(self.media_vectors, Unset):
+            media_vectors = self.media_vectors.value
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
@@ -76,6 +92,10 @@ class LeannIndexConfig:
             field_dict["bound_scale"] = bound_scale
         if batch_size is not UNSET:
             field_dict["batch_size"] = batch_size
+        if reembed_budget_ms is not UNSET:
+            field_dict["reembed_budget_ms"] = reembed_budget_ms
+        if media_vectors is not UNSET:
+            field_dict["media_vectors"] = media_vectors
 
         return field_dict
 
@@ -104,6 +124,15 @@ class LeannIndexConfig:
 
         batch_size = d.pop("batch_size", UNSET)
 
+        reembed_budget_ms = d.pop("reembed_budget_ms", UNSET)
+
+        _media_vectors = d.pop("media_vectors", UNSET)
+        media_vectors: LeannIndexConfigMediaVectors | Unset
+        if isinstance(_media_vectors, Unset):
+            media_vectors = UNSET
+        else:
+            media_vectors = LeannIndexConfigMediaVectors(_media_vectors)
+
         leann_index_config = cls(
             max_degree=max_degree,
             quantizer=quantizer,
@@ -111,6 +140,8 @@ class LeannIndexConfig:
             search_ef=search_ef,
             bound_scale=bound_scale,
             batch_size=batch_size,
+            reembed_budget_ms=reembed_budget_ms,
+            media_vectors=media_vectors,
         )
 
         return leann_index_config

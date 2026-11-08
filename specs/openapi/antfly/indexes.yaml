@@ -3589,6 +3589,28 @@ components:
           maximum: 1024
           default: 0
           description: "Candidates recomputed per batch. 0 uses k."
+        reembed_budget_ms:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          maximum: 600000
+          default: 0
+          description: >-
+            Time a query may spend re-embedding candidates whose stored vectors
+            were dropped. Once spent, the remaining candidates are ranked by
+            their code estimates instead, so the query still returns results.
+            0 means no limit.
+        media_vectors:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum: [full, int8]
+          default: full
+          description: >-
+            How vectors that cannot be re-embedded from text (images, audio
+            windows, model outputs) are kept once the graph covers them.
+            "full" keeps the stored float32 vector. "int8" replaces it with a
+            stub holding an int8 copy (about a quarter of the size), read back
+            instead of re-embedding. Requires "auto" or "transient" storage.
     DistanceMetric:
       x-go-type-skip-optional-pointer: true
       type: string

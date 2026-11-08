@@ -3316,6 +3316,8 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     var search_ef: i64 = 0;
     var bound_scale: f64 = 1.0;
     var batch_size: i64 = 0;
+    var reembed_budget_ms: i64 = 0;
+    var media_vectors: []const u8 = "full";
     var quantization_bits: i64 = 0;
     var vector_storage: ?[]const u8 = null;
     if (root.get("leann")) |leann| {
@@ -3341,6 +3343,12 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
                 if (!(bound_scale >= 0 and bound_scale <= 8)) return error.InvalidCreateTableRequest;
             } else if (std.mem.eql(u8, key, "batch_size")) {
                 batch_size = try jsonIntegerInRange(value, 0, 1024);
+            } else if (std.mem.eql(u8, key, "reembed_budget_ms")) {
+                reembed_budget_ms = try jsonIntegerInRange(value, 0, 600_000);
+            } else if (std.mem.eql(u8, key, "media_vectors")) {
+                if (value != .string) return error.InvalidCreateTableRequest;
+                if (!std.mem.eql(u8, value.string, "full") and !std.mem.eql(u8, value.string, "int8")) return error.InvalidCreateTableRequest;
+                media_vectors = value.string;
             } else if (std.mem.eql(u8, key, "vector_storage")) {
                 if (value != .string) return error.InvalidCreateTableRequest;
                 if (!std.mem.eql(u8, value.string, "auto") and !std.mem.eql(u8, value.string, "transient") and !std.mem.eql(u8, value.string, "persistent")) return error.InvalidCreateTableRequest;
@@ -3364,10 +3372,12 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
         if (std.mem.eql(u8, requested, "auto") and !auto_allowed) return error.InvalidCreateTableRequest;
     }
     const resolved_storage = vector_storage orelse if (auto_allowed) "auto" else "persistent";
+    // int8 copies replace vectors only where vectors are dropped at all.
+    if (std.mem.eql(u8, media_vectors, "int8") and std.mem.eql(u8, resolved_storage, "persistent")) return error.InvalidCreateTableRequest;
     const json = try std.fmt.allocPrint(
         alloc,
-        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"quantization_bits\":{d},\"vector_storage\":\"{s}\",\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d}}}",
-        .{ max_degree, quantizer, quantization_bits, resolved_storage, search_ef, bound_scale, batch_size },
+        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"quantization_bits\":{d},\"vector_storage\":\"{s}\",\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d},\"reembed_budget_ms\":{d},\"media_vectors\":\"{s}\"}}",
+        .{ max_degree, quantizer, quantization_bits, resolved_storage, search_ef, bound_scale, batch_size, reembed_budget_ms, media_vectors },
     );
     defer alloc.free(json);
     try out.appendSlice(alloc, json);
@@ -3404,6 +3414,16 @@ test "managed embedder translates leann algorithm into dense config" {
             \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"persistent"}}
             ,
             "\"vector_storage\":\"persistent\"",
+        },
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"reembed_budget_ms":250}}
+            ,
+            "\"reembed_budget_ms\":250",
+        },
+        .{
+            \\{"template":"{{remoteMedia url=image_url}}","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"media_vectors":"int8"}}
+            ,
+            "\"media_vectors\":\"int8\"",
         },
         // PQ graphs rebuild from vectors, so they keep them.
         .{
@@ -3484,6 +3504,9 @@ test "managed embedder translates leann algorithm into dense config" {
         ,
         // External vectors cannot be re-embedded at all.
         \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"vector_storage":"auto"}}
+        ,
+        // int8 copies need dropped vectors to replace.
+        \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"persistent","media_vectors":"int8"}}
         ,
         \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq","vector_storage":"auto"}}
         ,

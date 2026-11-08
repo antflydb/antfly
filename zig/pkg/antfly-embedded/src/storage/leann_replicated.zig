@@ -37,6 +37,7 @@ const leann = @import("antfly_vectorindex").leann;
 const search_results = @import("antfly_vectorindex").search_results;
 const search_types = @import("antfly_vectorindex").search_types;
 const replica_mod = @import("leann_replica.zig");
+const SearchGate = @import("leann_store.zig").SearchGate;
 
 pub const file_name = "leann.replica";
 const magic = "LEANNRST";
@@ -78,6 +79,9 @@ pub const Options = struct {
     search_ef: u32 = 0,
     bound_scale: f32 = 1.0,
     batch_size: u32 = 0,
+    /// Re-embedding time per query before the rest are ranked by estimate;
+    /// 0 disables the budget.
+    reembed_budget_ms: u32 = 0,
     /// `vector_storage: transient`: stored vectors the graph covers are
     /// replaced by stubs (through elide records), so rebuilds use the
     /// RaBitQ codes instead of loading vectors.
@@ -694,6 +698,7 @@ pub const ReplicatedState = struct {
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         const loader = self.loader orelse return error.MissingVectorLoader;
         var ctx = KeyLoader{ .state = @constCast(self), .loader = loader };
+        const gate = SearchGate.init(req, self.opts.reembed_budget_ms);
         var want: u32 = @intCast(@max(req.k, 1));
         // Id, key and prefix filters go into the graph walk; only distance
         // bounds are applied afterwards, over an enlarged result set.
@@ -710,6 +715,7 @@ pub const ReplicatedState = struct {
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
                 .filter = if (key_filtered) .{ .ctx = &key_filter, .allows_fn = KeyRequestFilter.allows } else null,
+                .gate = gate.recomputeGate(),
             }, ctx.keyLoader());
             defer alloc.free(hits);
             var passed: usize = 0;
