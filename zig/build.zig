@@ -112,7 +112,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("memory-test", "Run native memory policy, temporal, isolation and replay contracts").dependOn(&b.addRunArtifact(memory_tests).step);
+    const memory_run = b.addRunArtifact(memory_tests);
+    addRuntimeTestFilters(b, memory_run, &.{});
+    b.step("memory-test", "Run native memory policy, temporal, isolation and replay contracts").dependOn(&memory_run.step);
     // The dependency slice reuses the complete policy artifact. Keep selection
     // at runtime so requesting both targets never compiles this root twice.
     const memory_dependency_run = b.addRunArtifact(memory_tests);

@@ -704,6 +704,58 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
 /// Domain-specific discovery and sessions; transport remains shared with the
 /// database and extension MCP servers. No memory tools enter their catalogs.
 pub fn executeMemoryMcpRequest(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype) !contextual_operations.OwnedResponse {
+    return executeMemoryMcpProfileRequest(server_ptr, request, authenticated_identity, .full);
+}
+
+pub const MemoryMcpProfile = enum { full, agent };
+
+/// Content-addressed idempotency for agent tools that omit a key: an
+/// identical retry replays the first receipt; any change is a new operation.
+pub fn memoryAgentIdempotencyKey(a: std.mem.Allocator, action: []const u8, space: []const u8, branch: []const u8, id: []const u8, body: std.json.Value) ![]const u8 {
+    const canonical = try canonicalMemoryAgentBody(a, body, 0);
+    return memoryAgentKeyEncoded(a, action, space, branch, id, try @import("antfly-json").stringifyValueAlloc(a, canonical));
+}
+
+// JSON object order is not operation identity. Normalize both the automatic
+// key and the body submitted for the service's byte-exact receipt fingerprint.
+fn canonicalMemoryAgentBody(a: std.mem.Allocator, body: std.json.Value, depth: usize) !std.json.Value {
+    if (depth > 64) return error.InvalidMemoryRequest;
+    return switch (body) {
+        .object => |object| blk: {
+            const keys = try a.dupe([]const u8, object.keys());
+            std.mem.sort([]const u8, keys, {}, struct {
+                fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
+                    return std.mem.lessThan(u8, lhs, rhs);
+                }
+            }.less);
+            var out: std.json.ObjectMap = .empty;
+            for (keys) |key| try out.put(a, key, try canonicalMemoryAgentBody(a, object.get(key).?, depth + 1));
+            break :blk .{ .object = out };
+        },
+        .array => |array| blk: {
+            var out = try std.array_list.Managed(std.json.Value).initCapacity(a, array.items.len);
+            for (array.items) |item| out.appendAssumeCapacity(try canonicalMemoryAgentBody(a, item, depth + 1));
+            break :blk .{ .array = out };
+        },
+        else => body,
+    };
+}
+
+fn memoryAgentKeyEncoded(a: std.mem.Allocator, action: []const u8, space: []const u8, branch: []const u8, id: []const u8, encoded: []const u8) ![]const u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    inline for (.{ action, space, branch, id }) |part| {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, part.len, .little);
+        hasher.update(&length);
+        hasher.update(part);
+    }
+    hasher.update(encoded);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.allocPrint(a, "agent:{s}", .{std.fmt.bytesToHex(digest, .lower)});
+}
+
+pub fn executeMemoryMcpProfileRequest(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype, profile: MemoryMcpProfile) !contextual_operations.OwnedResponse {
     const memory_api = @import("memory.zig");
     const tools = @import("generated/mcp_memory_tools.zig").tools;
     const Context = struct {
@@ -711,6 +763,7 @@ pub fn executeMemoryMcpRequest(server_ptr: anytype, request: McpRequest, authent
         identity: @TypeOf(authenticated_identity),
         request: @import("antfly_local_sources").api_operation.RequestContext,
         action: memory_api.memory.Action,
+        agent: bool,
 
         fn call(ptr: *anyopaque, a: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -725,14 +778,20 @@ pub fn executeMemoryMcpRequest(server_ptr: anytype, request: McpRequest, authent
             };
             const input = std.json.parseFromSliceLeaky(Arguments, a, try @import("antfly-json").stringifyValueAlloc(a, args), .{ .ignore_unknown_fields = false, .parse_numbers = false }) catch return mcpError(a, "invalid memory tool arguments");
             if (memory_api.memory.operations.idRequired(self.action) and input.id.len == 0) return mcpError(a, "missing memory resource id");
+            const derive_key = self.agent and input.idempotency_key.len == 0 and memory_api.memory.mutates(self.action);
+            const admitted_body = if (derive_key) try canonicalMemoryAgentBody(a, input.body, 0) else input.body;
+            const idempotency_key = if (derive_key)
+                try memoryAgentKeyEncoded(a, @tagName(self.action), input.space, input.branch, input.id, try @import("antfly-json").stringifyValueAlloc(a, admitted_body))
+            else
+                input.idempotency_key;
             var response = try self.server.executeMemoryService(input.space, .{
                 .branch = input.branch,
                 .database = input.database,
                 .namespace = input.namespace,
                 .action = self.action,
                 .id = input.id,
-                .body = input.body,
-                .idempotency_key = input.idempotency_key,
+                .body = admitted_body,
+                .idempotency_key = idempotency_key,
             }, self.identity, self.request);
             defer response.deinit(self.server.alloc);
             return mcpResultFromOwnedResponse(a, response);
@@ -740,7 +799,7 @@ pub fn executeMemoryMcpRequest(server_ptr: anytype, request: McpRequest, authent
     };
     var contexts: [tools.len]Context = undefined;
     var protocol_server: mcp.Server = .{
-        .implementation = .{ .name = "antfly-memory", .version = "1.0.0" },
+        .implementation = .{ .name = if (profile == .agent) "antfly-memory-agent" else "antfly-memory", .version = "1.0.0" },
         .session_store = server_ptr.memory_mcp_sessions.iface(),
         .max_tool_result_bytes = server_ptr.cfg.mcp_max_tool_result_bytes,
         .tool_result_too_large_text = "Memory result exceeds the MCP response budget. Reduce limit, token_budget or explanation bounds and retry.",
@@ -748,14 +807,17 @@ pub fn executeMemoryMcpRequest(server_ptr: anytype, request: McpRequest, authent
     defer protocol_server.deinit(server_ptr.alloc);
     inline for (tools, 0..) |tool, i| {
         const action = comptime @field(memory_api.memory.Action, tool.action);
-        contexts[i] = .{ .server = server_ptr, .identity = authenticated_identity, .request = request.context, .action = action };
+        contexts[i] = .{ .server = server_ptr, .identity = authenticated_identity, .request = request.context, .action = action, .agent = profile == .agent };
         const permission: McpToolPermission = switch (memory_api.memory.actionGrant(action)) {
             .admin => .admin,
             .curator => .curator,
             .write => if (memory_api.memory.mutates(action)) .write else .read,
         };
-        if (mcpPermissionVisibleForIdentity(permission, authenticated_identity)) {
-            try protocol_server.addTool(server_ptr.alloc, .{ .name = tool.name, .description = tool.description, .input_schema_json = tool.input_schema_json, .handler = .{ .ptr = &contexts[i], .call_fn = Context.call } });
+        const listed = profile == .full or tool.agent;
+        if (listed and mcpPermissionVisibleForIdentity(permission, authenticated_identity)) {
+            const description = if (profile == .agent) tool.agent_description else tool.description;
+            const input_schema_json = if (profile == .agent) tool.agent_input_schema_json else tool.input_schema_json;
+            try protocol_server.addTool(server_ptr.alloc, .{ .name = tool.name, .description = description, .input_schema_json = input_schema_json, .handler = .{ .ptr = &contexts[i], .call_fn = Context.call } });
         }
     }
     return executeMcpTransport(server_ptr, &protocol_server, request);
