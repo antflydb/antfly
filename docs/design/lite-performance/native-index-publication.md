@@ -230,6 +230,16 @@ Unexpected page failures are counted separately from cooperative yields and rema
 visible without per-operation tracing. Qualification rejects them even if later
 integrity checks succeed.
 
+Path admission can be shared by queued local publishers. Bounded inspection of
+the mutable native header and catalog therefore also takes the Store's physical
+publication mutex. Recovery and actor-opening fallbacks run after releasing that
+mutex. Index-revision cache access has the same exclusion; captured provider
+counters and wake flags use the admission bookkeeping mutex. This preserves
+commit batching while keeping each catalog check on one stable physical cut.
+The [catalog inspection receipt](native-catalog-inspection-debug.json) records
+the observed provider page fault, cold integrity result and component regressions.
+Those component results do not qualify the failed importer run.
+
 Native page failures also retain their identities across the document-provider
 RPC boundary. They stop the provider runtime as storage failures rather than
 entering document retry or isolation policy. The qualification fault marker covers

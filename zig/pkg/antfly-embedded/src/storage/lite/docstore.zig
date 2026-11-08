@@ -2008,6 +2008,28 @@ pub const Store = struct {
             self.maintenance_policy.options.max_storage_bytes == 0 and self.maintenance_policy.options.capacity_probe == null;
     }
 
+    /// Inspect one current checkpoint while excluding native publication.
+    /// The caller retains path admission, which may be shared by queued local
+    /// publishers. That lease alone does not protect a mutable NativeFile's
+    /// header or pages from another local commit. The callback must remain a
+    /// bounded read and must not re-enter this Store or publish any changes.
+    pub fn inspectAdmittedCheckpoint(self: *Store, context: *anyopaque, inspect: *const fn (*anyopaque, *native.NativeFile) anyerror!bool) !bool {
+        lockStore(self);
+        defer self.mutex.unlock();
+        if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+        return inspect(context, &self.file);
+    }
+
+    /// Capture the local index witness under the same publication exclusion.
+    /// NativeFile may initialize a path-cache entry, so this is not a lock-free
+    /// read even when the caller already shares path admission.
+    pub fn admittedIndexPathRevision(self: *Store, path: []const u8) ?[16]u8 {
+        lockStore(self);
+        defer self.mutex.unlock();
+        if (self.secret_store_uncertain) return null;
+        return self.file.loadedIndexPathRevision(path);
+    }
+
     fn currentGenerationHasReaders(self: *Store) bool {
         const io = self.file.runtime();
         self.read_mutex.lockUncancelable(io);
@@ -13273,4 +13295,80 @@ test "lite native explicit atomic publication refuses a consumed member" {
     var read = try store.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("committed", try read.get("row"));
+}
+
+test "lite native admitted checkpoint inspection excludes concurrent publication" {
+    if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "admitted-checkpoint-inspection.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .externally_locked = true, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("row", "before");
+        try write.commit();
+    }
+    const Probe = struct {
+        store: *Store,
+        ready: std.Io.Event = .unset,
+        committed: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        thread: ?std.Thread = null,
+        inspections: usize = 0,
+
+        fn write(self: *@This()) !void {
+            // Establish that this independent publisher encountered actual
+            // physical exclusion before attempting its real mutation.
+            if (self.store.mutex.tryLock()) {
+                self.store.mutex.unlock();
+                return error.TestCheckpointInspectionNotExclusive;
+            }
+            self.ready.set(std.testing.io);
+            var txn = try self.store.beginWrite();
+            errdefer txn.abort();
+            try txn.put("row", "after");
+            try txn.commit();
+            self.committed.store(true, .release);
+        }
+
+        fn run(self: *@This()) void {
+            self.write() catch |err| {
+                self.failure = err;
+                self.ready.set(std.testing.io);
+            };
+        }
+
+        fn inspect(ptr: *anyopaque, file: *native.NativeFile) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.inspections += 1;
+            const checkpoint = file.activeCheckpoint();
+            const before = try file.documentFingerprintAtCheckpoint(checkpoint, "row");
+            self.thread = try std.Thread.spawn(.{}, run, .{self});
+            try self.ready.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+            try std.testing.expect(self.failure == null);
+            try std.testing.expect(!self.committed.load(.acquire));
+            try std.testing.expectEqual(checkpoint.commit_sequence, file.activeCheckpoint().commit_sequence);
+            try std.testing.expectEqualDeep(before, try file.documentFingerprintAtCheckpoint(file.activeCheckpoint(), "row"));
+            return true;
+        }
+    };
+    var probe: Probe = .{ .store = &store };
+    defer if (probe.thread) |thread| thread.join();
+    try std.testing.expect(try store.inspectAdmittedCheckpoint(&probe, Probe.inspect));
+    probe.thread.?.join();
+    probe.thread = null;
+    try std.testing.expect(probe.failure == null);
+    try std.testing.expect(probe.committed.load(.acquire));
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("after", try read.get("row"));
+    store.file.checkpoint_publication_uncertain = true;
+    defer store.file.checkpoint_publication_uncertain = false;
+    try std.testing.expectError(error.OutcomeReconciliationRequired, store.inspectAdmittedCheckpoint(&probe, Probe.inspect));
+    try std.testing.expectEqual(@as(usize, 1), probe.inspections);
 }

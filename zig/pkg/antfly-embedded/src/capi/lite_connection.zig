@@ -523,16 +523,7 @@ pub const PreparedPublication = struct {
             return;
         }
         if (self.catalog) |proof| if (proof.recovery_clean and probe.header.indexed_reclamation) {
-            if (self.snapshot_database.root_incarnation != self.incarnation or
-                !std.meta.eql(self.snapshot_database.core.identity_namespace, self.identity)) return error.EnrichmentSourceChanged;
-            // Check already-loaded name bindings without opening a runtime.
-            // The native proof below independently fences the durable catalog.
-            if (self.owner.current) |root| if (!std.mem.eql(u8, self.name, "default")) {
-                if (root.embedded_table_records.get(self.name)) |id|
-                    if (id != self.identity.table_id) return error.EnrichmentSourceChanged;
-            };
-            try proof.verifyNative(probe);
-            self.owner.publication_stats.storage_guard_validations +|= 1;
+            try self.validateNativeStorage(proof, probe);
             return;
         };
         const root = try self.owner.refresh();
@@ -564,6 +555,57 @@ pub const PreparedPublication = struct {
         }
     }
 
+    fn validateNativeStorage(self: *@This(), proof: *PublicationCatalog, file: *native.NativeFile) !void {
+        if (self.snapshot_database.root_incarnation != self.incarnation or
+            !std.meta.eql(self.snapshot_database.core.identity_namespace, self.identity)) return error.EnrichmentSourceChanged;
+        // Check loaded name bindings without opening a runtime. The native
+        // proof independently fences the durable catalog on this same cut.
+        if (self.owner.current) |root| if (!std.mem.eql(u8, self.name, "default")) {
+            if (root.embedded_table_records.get(self.name)) |id|
+                if (id != self.identity.table_id) return error.EnrichmentSourceChanged;
+        };
+        try proof.verifyNative(file);
+        self.owner.publication_stats.storage_guard_validations +|= 1;
+    }
+
+    fn inspectCapturedNativeStorage(ptr: *anyopaque, file: *native.NativeFile) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const proof = self.catalog orelse return false;
+        if (!proof.recovery_clean or !file.header.indexed_reclamation) return false;
+        try self.validateNativeStorage(proof, file);
+        return true;
+    }
+
+    fn validateCapturedStorageCurrent(self: *@This()) !void {
+        const store = self.snapshot_root.owned_lite_backend.?.native_docstore.?;
+        if (self.shadow_scopes.len == 0 and self.resolver_dependency == null and
+            try store.inspectAdmittedCheckpoint(self, inspectCapturedNativeStorage)) return;
+        // Actor/recovery paths can publish or re-enter storage. They must run
+        // after releasing the physical inspection mutex.
+        try self.validateStorageCurrent(&store.file);
+    }
+
+    const CapturedEvent = enum { attempt, refusal, store, commit };
+
+    fn recordCaptured(self: *@This(), event: CapturedEvent) void {
+        // Compatible local publishers may share path admission. Their owner
+        // counters and wake flags still require explicit mutual exclusion.
+        self.snapshot_root.maintenance_admission_mutex.lockUncancelable(h.handleLockIo());
+        defer self.snapshot_root.maintenance_admission_mutex.unlock(h.handleLockIo());
+        switch (event) {
+            .attempt => self.owner.publication_stats.generated_attempts +|= 1,
+            .refusal => {
+                self.owner.publication_stats.refused +|= 1;
+                self.owner.publication_stats.generated_refused +|= 1;
+            },
+            .store => self.owner.publication_stats.generated_storage_groups +|= 1,
+            .commit => {
+                self.owner.publication_stats.generated_captured_commits +|= 1;
+                self.owner.notifyMutation();
+            },
+        }
+    }
+
     fn commit(ptr: *anyopaque, batch: GeneratedBatch, promotions: Promotions, deletes: []const []const u8, guards: SourceGuards, fence: ?WriteFence) !@typeInfo(@typeInfo(std.meta.Child(@FieldType(PublicationPort, "commit"))).@"fn".return_type.?).error_union.payload {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.owner.options.profile == .native and self.snapshot_root.owned_lite_backend.?.native_docstore.?.file.header.indexed_reclamation and
@@ -576,12 +618,9 @@ pub const PreparedPublication = struct {
                 // commit invalidate that runtime and reopen all of its indexes.
                 const held = try self.acquireCapturedStore(fence, 0);
                 defer held.release(held.ptr);
-                errdefer {
-                    self.owner.publication_stats.refused +|= 1;
-                    self.owner.publication_stats.generated_refused +|= 1;
-                }
+                errdefer self.recordCaptured(.refusal);
                 const database = self.snapshot_database;
-                const file = &self.snapshot_root.owned_lite_backend.?.native_docstore.?.file;
+                const store = self.snapshot_root.owned_lite_backend.?.native_docstore.?;
                 // Admission rebases physical roots, while the DocStore owns
                 // separate committed/reserved sequence caches. Reconcile them
                 // under this same writer lease before allocating a sequence.
@@ -591,7 +630,7 @@ pub const PreparedPublication = struct {
                     const committed = try database.core.store.lastReplaySequenceFromTxn(&head_read, 0);
                     database.core.store.observeExternalReplayCommit(committed);
                 }
-                const index_revision = file.loadedIndexPathRevision(self.index_prefix);
+                const index_revision = store.admittedIndexPathRevision(self.index_prefix);
                 const result = database.enqueuePreparedGeneratedBatch(batch, promotions, deletes, guards, fence) catch |err| switch (err) {
                     error.EnrichmentSourceChanged, error.EnrichmentLeaseFenceLost => return error.EnrichmentWaitCanceled,
                     else => return err,
@@ -600,13 +639,12 @@ pub const PreparedPublication = struct {
                 // mutations. Local path revisions ignore unrelated prefixes,
                 // while failed revision capture conservatively fences indexes.
                 if (index_revision) |before| {
-                    if (file.loadedIndexPathRevision(self.index_prefix)) |after| {
+                    if (store.admittedIndexPathRevision(self.index_prefix)) |after| {
                         if (!std.mem.eql(u8, &before, &after)) self.index_inputs_changed = true;
                     } else self.index_inputs_changed = true;
                 } else self.index_inputs_changed = true;
-                self.owner.publication_stats.generated_captured_commits +|= 1;
                 self.snapshot_database.core.store.observeExternalReplayCommit(result.sequence);
-                self.owner.notifyMutation();
+                self.recordCaptured(.commit);
                 return result;
             };
         }
@@ -679,8 +717,7 @@ pub const PreparedPublication = struct {
             errdefer {
                 if (!held.refusal_recorded) {
                     held.refusal_recorded = true;
-                    held.publication.owner.publication_stats.refused +|= 1;
-                    held.publication.owner.publication_stats.generated_refused +|= 1;
+                    held.publication.recordCaptured(.refusal);
                 }
             }
             try held.publication.guardKey(held.database, key);
@@ -866,7 +903,7 @@ pub const PreparedPublication = struct {
 
     fn groupCommandDatabase(self: *@This()) !*h.db_mod.DB {
         const database = self.snapshot_database;
-        try self.validateStorageCurrent(&self.snapshot_root.owned_lite_backend.?.native_docstore.?.file);
+        try self.validateCapturedStorageCurrent();
         try database.core.store.invalidateDetachedSourceObservations();
         var read = try database.core.store.beginReadTxn();
         const sequence = database.core.store.lastReplaySequenceFromTxn(&read, 0) catch |err| {
@@ -898,13 +935,10 @@ pub const PreparedPublication = struct {
     fn acquireCapturedStore(self: *@This(), fence: ?WriteFence, now_ms: u64) !StoreLease {
         try Owner.enterMaintenanceWriter(self.snapshot_root, .primary);
         errdefer Owner.leaveMaintenanceWriter(self.snapshot_root);
-        self.owner.publication_stats.generated_attempts +|= 1;
-        errdefer {
-            self.owner.publication_stats.refused +|= 1;
-            self.owner.publication_stats.generated_refused +|= 1;
-        }
+        self.recordCaptured(.attempt);
+        errdefer self.recordCaptured(.refusal);
         const database = self.snapshot_database;
-        try self.validateStorageCurrent(&self.snapshot_root.owned_lite_backend.?.native_docstore.?.file);
+        try self.validateCapturedStorageCurrent();
         if (fence) |expected| {
             var ownership = try ProducerLease.init(alloc, database.core.store, expected.lease_key);
             defer ownership.deinit();
@@ -914,7 +948,7 @@ pub const PreparedPublication = struct {
         }
         const held = try alloc.create(HeldStore);
         held.* = .{ .publication = self, .database = database, .native_storage_admission = true };
-        self.owner.publication_stats.generated_storage_groups +|= 1;
+        self.recordCaptured(.store);
         return .{ .store = database.enrichment_runtime.?.store, .ptr = held, .release = HeldStore.release, .guard_key = HeldStore.guardKey };
     }
 
@@ -7894,22 +7928,22 @@ test "capi native allocator proof issue1362 storage publication fences a named t
     const removed = root.embedded_tables.fetchRemove("numbers").?;
     defer root.embedded_tables.put(root.alloc, removed.key, removed.value) catch unreachable;
     const header = root.owned_lite_backend.?.native_docstore.?.file.header;
-    try publication.validateStorageCurrent(&root.owned_lite_backend.?.native_docstore.?.file);
+    try publication.validateCapturedStorageCurrent();
     try std.testing.expect(!root.embedded_tables.contains("numbers"));
     try std.testing.expectEqualDeep(header, root.owned_lite_backend.?.native_docstore.?.file.header);
     const id = root.embedded_table_records.getPtr("numbers").?;
     const original_id = id.*;
     id.* += 1;
-    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent(&root.owned_lite_backend.?.native_docstore.?.file));
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateCapturedStorageCurrent());
     id.* = original_id;
     publication.incarnation +%= 1;
-    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent(&root.owned_lite_backend.?.native_docstore.?.file));
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateCapturedStorageCurrent());
     publication.incarnation -%= 1;
     var txn = try database.core.store.beginWriteTxn();
     errdefer txn.abort();
     try txn.put(keys.public_schema_json_key, "{\"changed\":true}");
     try txn.commit();
-    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent(&root.owned_lite_backend.?.native_docstore.?.file));
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateCapturedStorageCurrent());
     try std.testing.expect(!root.embedded_tables.contains("numbers"));
 }
 
