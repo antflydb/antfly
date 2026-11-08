@@ -53,6 +53,10 @@ pub const RelationSchemaMutation = struct {
     }
 };
 
+/// An authoritative binding check for a graph already admitted by ingress.
+/// Each call observes a fresh catalog cut, including projection replacement.
+pub const GraphAuthority = struct { name: []const u8, graph_id: u64 };
+pub const GraphAuthorityResult = struct { present: bool };
 pub const Call = union(enum) {
     resolver_authority_mutate: @import("../metadata/resolver_authority.zig").Write,
     lake_index_lifecycle_read: u64,
@@ -102,6 +106,7 @@ pub const Call = union(enum) {
     list_tables: TableList,
     export_snapshot: void,
     read: Read,
+    graph_authority: GraphAuthority,
     snapshot: void,
     resolve: Target,
     resolve_many: ResolveMany,
@@ -120,6 +125,7 @@ pub const Call = union(enum) {
     write_validation: []const u8,
     write_validation_revision: void,
     resolver_catalog_read: @import("../metadata/resolver_catalog_read.zig").Request,
+    lake_source_owner_read: u64,
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
@@ -136,6 +142,7 @@ pub const Call = union(enum) {
     pub fn requiresSettingAuthorityReadGrant(self: @This()) bool {
         return switch (self) {
             .lake_index_lifecycle_read,
+            .lake_source_owner_read,
             .lake_index_lifecycle_work,
             .setting_snapshot,
             .policy_snapshot,
@@ -201,6 +208,10 @@ test "native lake lifecycle calls bind private read and mutation grants" {
     const read: Call = .{ .lake_index_lifecycle_read = 4 };
     const write: Call = .{ .lake_index_lifecycle_mutate = .{ .table_id = 4, .expected_revision = 7, .mutation = .{ .release = @splat(9) } } };
     try std.testing.expect(read.requiresSettingAuthorityReadGrant());
+    const owner: Call = .{ .lake_source_owner_read = 4 };
+    try std.testing.expect(owner.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!owner.requiresAdministrativeGrant());
+    try std.testing.expect(!owner.isMutation());
     try std.testing.expect(!read.requiresAdministrativeGrant());
     try std.testing.expect(!read.isMutation());
     try std.testing.expect(write.requiresAdministrativeGrant());

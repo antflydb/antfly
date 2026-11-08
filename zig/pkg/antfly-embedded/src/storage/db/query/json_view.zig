@@ -842,12 +842,22 @@ pub const View = struct {
     /// numeric index. Iterative traversal also handles deeply nested arrays
     /// without turning user data depth into native call-stack depth.
     pub fn collect(self: *View, path: []const []const u8, pointer: bool, out: *std.ArrayListUnmanaged(Value)) !void {
+        _ = try self.collectImpl(path, pointer, out, false);
+    }
+    /// Presence observes a path, including explicit NULL, without decoding its
+    /// payload. Preparation has already validated syntax and duplicate keys.
+    pub fn hasPath(self: *View, path: []const []const u8, pointer: bool) !bool {
+        var unused: std.ArrayListUnmanaged(Value) = .empty;
+        return self.collectImpl(path, pointer, &unused, true);
+    }
+    fn collectImpl(self: *View, path: []const []const u8, pointer: bool, out: *std.ArrayListUnmanaged(Value), comptime presence: bool) !bool {
         const Work = struct { node: *Node, depth: usize };
         var pending = std.ArrayListUnmanaged(Work).empty;
         defer pending.deinit(self.alloc);
         try pending.append(self.alloc, .{ .node = &self.root, .depth = 0 });
         while (pending.pop()) |work| {
             if (work.depth == path.len) {
+                if (presence) return true;
                 try out.append(self.alloc, try self.materialize(work.node));
                 continue;
             }
@@ -872,6 +882,7 @@ pub const View = struct {
                 else => {},
             }
         }
+        return false;
     }
 
     /// Apply one positive projection in caller order. Objects merge, numeric

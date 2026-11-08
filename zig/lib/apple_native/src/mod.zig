@@ -25,6 +25,7 @@ pub const enabled = builtin.os.tag == .macos and options.enabled;
 pub const workspace_bytes: usize = 512 * 1024 * 1024;
 pub const Control = struct {
     timeout_ms: ?u64 = null,
+    require_completion: bool = false,
     cancellation: ?httpx.CancellationToken = null,
 };
 pub const Operation = enum(c_int) { generate = 1, transcribe = 2, availability = 3 };
@@ -111,6 +112,7 @@ pub fn invoke(alloc: std.mem.Allocator, operation: Operation, json: []const u8, 
         12 => return error.AppleNativeBridgeUnavailable,
         14 => return error.AppleSpeechDurationExceeded,
         15 => return error.AppleNativeBridgeIncompatible,
+        16 => return error.InferenceOutputIncomplete,
         else => return error.AppleNativeFailed,
     }
     return invocation.result orelse error.AppleNativeFailed;

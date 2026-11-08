@@ -42,6 +42,17 @@ pub fn loadFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
     return try decode(raw);
 }
 
+/// Missing counters are valid for a fresh empty store. Prove emptiness with
+/// one key-only seek in the caller's pinned revision, never a corpus count or
+/// a second live read. Any user key leaves a missing counter unknown.
+pub fn loadOrProveEmptyFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
+    if (try loadFromTxn(txn)) |count| return count;
+    var cursor = try txn.openPhysicalKeyCursorAdapter();
+    defer cursor.close();
+    const row = (try cursor.seekAtOrAfter(&.{internal_keys.user_namespace})) orelse return 0;
+    return if (std.mem.startsWith(u8, row.key, &.{internal_keys.user_namespace})) null else 0;
+}
+
 /// Read the range-local result after appendIdentityTransitionAlloc, without
 /// confusing retained namespace-wide identities with owned primary rows. This
 /// is the authoritative empty/non-empty input for transactional table metadata.
@@ -64,16 +75,6 @@ pub fn loadOrProveEmpty(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
     var txn = try store.beginReadTxn();
     defer txn.abort();
     return loadOrProveEmptyFromTxn(&txn);
-}
-
-/// Keep absence and the durable range counter on one exact read revision.
-pub fn loadOrProveEmptyFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
-    if (try loadFromTxn(txn)) |count| return count;
-    var cursor = try txn.openPhysicalCursorAdapter();
-    defer cursor.close();
-    const row = try cursor.seekAtOrAfter(&.{internal_keys.user_namespace});
-    const populated = if (row) |entry| entry.key.len != 0 and entry.key[0] == internal_keys.user_namespace else false;
-    return if (populated) null else 0;
 }
 
 pub fn countPrimaryDocuments(

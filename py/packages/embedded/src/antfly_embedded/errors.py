@@ -46,6 +46,7 @@ __all__ = [
     "error_code_name",
     "error_code_description",
     "AntflyError",
+    "GraphError",
     "InvalidArgumentError",
     "NotFoundError",
     "VersionConflictError",
@@ -167,6 +168,15 @@ class AntflyError(Exception):
 
 class InvalidArgumentError(AntflyError):
     CODE = INVALID_ARGUMENT
+
+
+class GraphError(AntflyError):
+    """A graph diagnostic retaining the native code, span, and write outcome."""
+
+    def __init__(self, code: int, diagnostic: dict) -> None:
+        self.diagnostic = diagnostic
+        self.graph_code = diagnostic.get("code")
+        super().__init__(code, diagnostic.get("message"))
 
 
 class NotFoundError(AntflyError):

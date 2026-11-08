@@ -660,6 +660,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/transactions/{transaction_id}/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Inspect your transaction receipt
+         * @description Returns outcome and lease metadata for a transaction bound to the
+         *     authenticated principal. This endpoint never returns staged documents,
+         *     table names, keys, read snapshots, or execution plans. The creator can
+         *     inspect the outcome after table permissions are revoked or a table is
+         *     dropped. A missing, expired, or other principal's receipt returns 404;
+         *     absence does not establish that a mutation aborted or permit replay.
+         */
+        get: operations["getTransactionStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/transactions/{transaction_id}/stage": {
         parameters: {
             query?: never;
@@ -2649,6 +2674,73 @@ export interface paths {
         post: operations["createQuerySource"];
         /** Drop saved query source */
         delete: operations["dropQuerySource"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/graphs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List graphs */
+        get: operations["listGraphs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/graphs/{graphName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        /** Get graph */
+        get: operations["getGraph"];
+        /**
+         * Update graph definition
+         * @description Atomically replaces mappings when expected_revision matches. Requires graph administration and read permission on every new input table. The graph incarnation is preserved and the definition revision advances; stale prepared plans must be prepared again.
+         */
+        put: operations["updateGraph"];
+        /**
+         * Create graph
+         * @description Creates a graph mapping over existing tables and graph indexes. Reads require permission on the graph and every input table. Definition updates use conditional revisions; existing cursors retain their captured definition.
+         */
+        post: operations["createGraph"];
+        /** Drop graph */
+        delete: operations["dropGraph"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/graphs/{graphName}/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute Cypher against a named graph
+         * @description Executes an authenticated statement under the graph definition and each underlying table's permissions and row policies. Resource budgets fail explicitly. EXPLAIN binds without reading rows. Results use the lossless version 1 graph wire format.
+         */
+        post: operations["executeGraphQuery"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -5420,6 +5512,28 @@ export interface paths {
          *     punctuation and paragraphing are added, and preferred spellings from
          *     `dictionary` are applied. Clips longer than the 30 s Whisper window
          *     are transcribed in windows cut at the quietest pause near the boundary.
+         *
+         *     Database nodes also accept named transcribers such as
+         *     `transcribers/apple-speech`. Apple uses the server's native SpeechAnalyzer
+         *     for recorded clips and requires an Apple-provider build, macOS 26+, and
+         *     installed locale assets. Select a named cleanup generator with its bare
+         *     name or `generators/name`; this shares cleanup with named Whisper
+         *     transcribers. The standalone runtime continues to accept local Whisper
+         *     and generator model names.
+         *
+         *     Named non-Whisper providers apply `dictionary` during cleanup; they reject
+         *     Whisper-only `transcript_prompt`, `vad`, and `audio_context` options.
+         *     Apple does not support live transcription sessions. For provider-backed
+         *     cleanup, a delta may contain the entire cleaned result; the raw transcript
+         *     is delivered before cleanup starts. Missing token usage remains absent.
+         *
+         *     Empty recognition is a successful empty result and does not run cleanup.
+         *     Cleanup must confirm a complete text response: token-limited, filtered,
+         *     tool-only, empty, and unconfirmed outputs fail rather than replacing the
+         *     transcript. In streaming mode the error follows `dictation.transcript`
+         *     and no `dictation.completed` event is emitted. Strict Apple cleanup runs
+         *     to natural completion within context, deadline, and bounded output bytes;
+         *     macOS 27+ also verifies measured output tokens against the token budget.
          *
          *     Set `cleanup_model` to the generator that rewrites the transcript.
          *     Without it, or with `style: verbatim`, the response carries the raw
@@ -13911,6 +14025,100 @@ export interface components {
              */
             tombstone_field?: string;
         };
+        /** @description Version 1 graph value. INTEGER payloads are signed decimal strings. Map payloads contain typed values, keeping user keys distinct from type tags. Entity identities are opaque table-qualified handles. */
+        GraphWireValue: {
+            /** @enum {string} */
+            type: "null" | "boolean" | "integer" | "number" | "string" | "list" | "map" | "node" | "relationship" | "path";
+            /** @description Type-specific payload; nested collections and entity properties contain GraphWireValue values. */
+            value: unknown;
+        };
+        GraphQueryLimits: {
+            memory_bytes?: number;
+            scanned_anchors?: number;
+            explored_edges?: number;
+            intermediate_states?: number;
+            path_depth?: number;
+            recursion_depth?: number;
+        };
+        GraphQueryRequest: {
+            query: string;
+            /** @description Client-generated native transaction ID for write recovery after cancellation or a lost response. Reusing an admitted ID is rejected; inspect its transaction status instead of replaying the statement. */
+            write_request_id?: string;
+            /** @description Ordinary JSON parameters. Mutually exclusive with typed_parameters. */
+            parameters?: {
+                [key: string]: unknown;
+            };
+            /** @description A map GraphWireValue containing lossless data parameters; graph entity parameters are rejected. Mutually exclusive with parameters. */
+            typed_parameters?: components["schemas"]["GraphWireValue"];
+            limits?: components["schemas"]["GraphQueryLimits"];
+        };
+        GraphQueryResult: {
+            /** @enum {integer} */
+            wire_version: 1;
+            columns: string[];
+            rows: components["schemas"]["GraphWireValue"][][];
+            plan: {
+                [key: string]: unknown;
+            }[];
+            stats: components["schemas"]["GraphQueryStats"];
+            commit?: components["schemas"]["GraphWriteReceipt"];
+            /** @description Whether the compiled statement has no mutation clauses; EXPLAIN also reports the underlying statement capability. */
+            read_only?: boolean;
+            graph_incarnation: string;
+            graph_revision: string;
+            complete: boolean;
+        };
+        GraphQueryStats: {
+            scanned_anchors?: number;
+            explored_edges?: number;
+            intermediate_states?: number;
+            mutations?: number;
+            memory_bytes?: number;
+            search_calls?: number;
+            search_candidates?: number;
+            search_approximate?: boolean;
+        };
+        GraphWriteReceipt: {
+            /** @description Native durable transaction identity; never replay a statement after an ambiguous write response. */
+            transaction_id: string;
+            /** @enum {string} */
+            status: "committed" | "committed_pending" | "committed_repair_required" | "aborted" | "unknown";
+            outcome?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        GraphCatalogEntry: {
+            /** @description Opaque decimal catalog identity */
+            graph_id: string;
+            /** @description Lossless decimal definition revision used for conditional updates */
+            revision: string;
+            name: string;
+            definition: components["schemas"]["GraphDefinition"];
+        };
+        GraphDefinitionUpdate: {
+            expected_revision: string;
+            definition: components["schemas"]["GraphDefinition"];
+        };
+        GraphDefinition: {
+            labels: components["schemas"]["GraphLabelMapping"][];
+            relationships?: components["schemas"]["GraphRelationshipMapping"][];
+        };
+        GraphLabelMapping: {
+            name: string;
+            /** @description A literal default.public table name or an explicitly scoped table target. Bindings retain the physical table incarnation through renames. */
+            table: string | components["schemas"]["CatalogTableTarget"];
+            /** @description Equality predicates defining this label over stored document properties. */
+            where?: {
+                [key: string]: unknown;
+            };
+        };
+        GraphRelationshipMapping: {
+            name: string;
+            index: string;
+            source_label: string;
+            target_label: string;
+            stored_type: string;
+        };
         SavedQuerySource: {
             /** Format: uint64 */
             source_id: number;
@@ -15469,7 +15677,7 @@ export interface components {
          * @example table
          * @enum {string}
          */
-        ResourceType: "table" | "database" | "namespace" | "tablespace" | "user" | "inference" | "*";
+        ResourceType: "table" | "database" | "namespace" | "tablespace" | "graph" | "user" | "inference" | "*";
         /**
          * @description Type of permission.
          * @example read
@@ -22570,7 +22778,7 @@ export interface components {
             /** Format: double */
             max?: number;
         };
-        /** @description Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
+        /** @description Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses Cypher relationship-simple trails: nodes may repeat, but the same physical relationship cannot be reused anywhere within one MATCH group. Each optional group has its own relationship scope. Parallel relationship IDs remain distinct. A zero-hop path binds both endpoints to the same node identity without reading an edge. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
         GraphMatchEdge: {
             edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             from: components["schemas"]["GraphIdentifier"];
@@ -24518,6 +24726,13 @@ export interface components {
              * @description Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows.
              */
             audio: string;
+            /**
+             * @description Clean an already finalized recognition segment without running recognition
+             *     again. Supported by named transcribers advertising text_cleanup. Set
+             *     audio to the empty string and omit attachments and recognition hints.
+             *     Partial hypotheses must never be submitted as finalized segments.
+             */
+            transcript_text?: string;
             /**
              * @description Force the transcript language (ISO 639-1). Omit for automatic detection.
              * @example en
@@ -33877,6 +34092,31 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    getTransactionStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                transaction_id: components["parameters"]["TransactionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Principal-bound transaction status without row data */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TransactionSessionStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
     stageTransactionSession: {
         parameters: {
             query?: never;
@@ -37142,6 +37382,227 @@ export interface operations {
                 content?: never;
             };
             404: components["responses"]["NotFound"];
+        };
+    };
+    listGraphs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Immutable graph definitions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphCatalogEntry"][];
+                };
+            };
+        };
+    };
+    getGraph: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Graph definition and immutable incarnation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphCatalogEntry"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    updateGraph: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphDefinitionUpdate"];
+            };
+        };
+        responses: {
+            /** @description Graph definition updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphCatalogEntry"];
+                };
+            };
+            /** @description Committed with visibility pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Graph administration or mapped-table read permission denied */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Expected definition revision or dependency incarnation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createGraph: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphDefinition"];
+            };
+        };
+        responses: {
+            /** @description Graph created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphCatalogEntry"];
+                };
+            };
+            /** @description Committed with visibility pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Graph already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropGraph: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Graph dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    executeGraphQuery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphQueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Complete graph query result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphQueryResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Graph or underlying table access denied */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Catalog or policy generation changed, or a write conflicted */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Query capacity or resource budget exhausted */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Required owner unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     listTablespaces: {
@@ -44392,6 +44853,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["InferenceDictateRequest"];
+                "application/vnd.antfly.attachments.v1": string;
             };
         };
         responses: {

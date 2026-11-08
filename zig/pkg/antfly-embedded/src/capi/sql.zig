@@ -127,9 +127,10 @@ pub fn Adapter(comptime native: type) type {
         table_name: []const u8,
         read_only: bool = false,
         outcome_transaction_id: ?types.TxnId = null,
+        graph_parameters: []const std.json.Value = &.{},
 
         pub fn backend(self: *Self) catalog.Backend {
-            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
+            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
         }
 
         fn selected(self: *Self, name: []const u8) !Self {
@@ -592,19 +593,34 @@ pub fn Adapter(comptime native: type) type {
             for (requests, prepared) |request, *out| if (request.request.search) |search| {
                 var selected_adapter = try self.selected(request.table.physical_name);
                 out.* = try selected_adapter.prepareSearch(search_arena.allocator(), search);
+                // A durable SQL commit can precede derived publication. Drain
+                // the selected search owner's indexing before taking cohort
+                // fences, so ranking and row hydration describe the same cut.
+                try selected_adapter.db.waitForCurrentSyncLevel(.full_index);
             };
             var owners: [64]*DB = undefined;
             var owner_count: usize = 0;
+            var has_graph = false;
             for (requests) |request| {
-                const selected_adapter = try self.selected(request.table.physical_name);
-                const exists = for (owners[0..owner_count]) |db| {
-                    if (db == selected_adapter.db) break true;
-                } else false;
-                if (!exists) {
-                    owners[owner_count] = selected_adapter.db;
-                    owner_count += 1;
+                const dependencies_to_capture = if (request.table.graph) |binding| blk: {
+                    has_graph = true;
+                    break :blk binding.dependencies;
+                } else &.{request.table};
+                for (dependencies_to_capture) |table| {
+                    const selected_adapter = try self.selected(table.physical_name);
+                    const exists = for (owners[0..owner_count]) |db| {
+                        if (db == selected_adapter.db) break true;
+                    } else false;
+                    if (!exists) {
+                        if (owner_count == owners.len) return error.SqlProgramLimitExceeded;
+                        owners[owner_count] = selected_adapter.db;
+                        owner_count += 1;
+                    }
                 }
             }
+            if (has_graph) for (owners[0..owner_count]) |db| {
+                if (!self.read_only) _ = try db.lookup(alloc, "", .{ .cypher_prepare = true }) else try db.waitForCurrentSyncLevel(.full_index);
+            };
             std.mem.sort(*DB, owners[0..owner_count], {}, struct {
                 fn less(_: void, a: *DB, b: *DB) bool {
                     return a.core.identity_namespace.table_id < b.core.identity_namespace.table_id;
@@ -648,7 +664,9 @@ pub fn Adapter(comptime native: type) type {
                 if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.SqlStatementReadUnavailable;
             }
             for (requests, prepared, cursors) |request, *search, *cursor| {
-                if (search.*) |*owned| {
+                if (request.table.graph) |binding| {
+                    cursor.* = try @import("sql_graph.zig").open(self, alloc, binding.*, request.request, owners[0..owner_count], fences[0..held]);
+                } else if (search.*) |*owned| {
                     var selected_adapter = try self.selected(request.table.physical_name);
                     cursor.* = try selected_adapter.openSearch(alloc, request.table, request.request, owned.req);
                 } else cursor.* = (try open(ptr, alloc, request.table, request.request)) orelse return error.SqlStatementSnapshotRequired;
@@ -934,6 +952,10 @@ pub fn Adapter(comptime native: type) type {
             return .{ .ptr = cursor, .next = SearchCursor.next, .next_columns = if (reader == null) SearchCursor.nextColumns else null, .close = SearchCursor.close };
         }
 
+        fn resolveGraph(ptr: *anyopaque, alloc: std.mem.Allocator, definition: ast.GraphTable) !catalog.Table {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return @import("sql_graph.zig").resolve(self, alloc, definition);
+        }
         fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
             const adapter_owner: *Self = @ptrCast(@alignCast(ptr));
             if (name.database != null or (name.namespace != null and !std.mem.eql(u8, name.namespace.?, "public"))) return error.UndefinedTable;
@@ -981,14 +1003,13 @@ pub fn Adapter(comptime native: type) type {
             projection: dependencies.sql_document_row.Projection,
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
-                var page = try self.session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
+                var page = try self.session.nextViewPage(alloc, limit);
                 errdefer page.deinit();
                 const owned = page.arena.allocator();
                 const rows = try owned.alloc(catalog.Row, page.rows.len);
                 const layout = try self.projection.pageLayout(owned);
-                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, .{ .id = row.key, .version = row.version, .value = row.typed orelse .null, .typed_cells = row.typed_cells, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest });
-                const after = if (page.more) try owned.dupe(u8, self.session.reader.after.items) else null;
-                return .{ .rows = rows, .after = after, .owned_arena = page.arena };
+                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, row.sqlRow());
+                return .{ .rows = rows, .after = page.after, .storage_page = page };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
@@ -1007,7 +1028,7 @@ pub fn Adapter(comptime native: type) type {
                 errdefer page.deinit();
                 const rows = try page.arena.allocator().alloc(catalog.Row, page.rows.len);
                 for (page.rows, rows) |row, *out| out.* = .{ .id = row.id, .version = row.version, .value = row.value, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document };
-                return .{ .rows = rows, .after = page.after, .owned_arena = page.arena };
+                return .{ .rows = rows, .after = page.after, .storage_page = page };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));

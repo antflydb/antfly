@@ -188,7 +188,7 @@ fn failureResponse(a: A, err: anyerror) !Response {
         // Use the same transport/topology classification as table reads so
         // split races, unavailable peers and new transport aliases do not
         // drift into validation failures. Mutation ambiguity is handled above.
-        else => switch (@import("table_reads.zig").normalizeDistributedQueryOperationalError(err)) {
+        else => switch (@import("read_operational_errors.zig").normalizeDistributedQueryOperationalError(err)) {
             error.DistributedQueryUnavailable, error.StorageReadTemporarilyUnavailable => availabilityResponse(a, "privacy_storage_unavailable", "Privacy dependencies are temporarily unavailable; retry."),
             else => failure(a, 422, @errorName(err), "The privacy operation failed; no clean-scan receipt was created."),
         },

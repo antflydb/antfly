@@ -17,8 +17,8 @@
 //! ancestry and decoded replacements are memoized across page/Form content.
 //! The caller supplies a bounded allocator, including for object resolution.
 const std = @import("std");
-const syntax = @import("syntax.zig");
-const encoding = @import("text_encoding.zig");
+const syntax = @import("pdf_syntax");
+const encoding = @import("pdf_text_encoding");
 const A = std.mem.Allocator;
 const Object = syntax.Object;
 

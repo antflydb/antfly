@@ -84,6 +84,7 @@ pub const Artifacts = struct {
 /// artifacts used by public targets without maintaining a second build graph.
 pub fn create(b: *std.Build) ?Artifacts {
     defer @import("antfly_platform").finalizeMacosSdk(b);
+    defer @import("build_support/test_build_graph.zig").add(b);
     defer @import("build_support/embedded/source_owner.zig").finalize(b);
     const shared = @import("build_support/antfly/dependencies.zig").create(b, @This()) orelse return null;
     @import("build_support/antfly/test_partitions.zig").setMemoryProfile(b, .{
@@ -94,7 +95,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_fixtures = shared.conformance_fixtures;
     const target = shared.target;
     const optimize = shared.optimize;
+    @import("build_support/owner_contract_tests.zig").add(b, target, optimize, shared.production_antfly_imports);
     const memory_tests = b.addTest(.{
+        .name = "memory-policy-tests",
         .root_module = b.createModule(.{
             .root_source_file = b.path("pkg/antfly-embedded/src/memory_policy_test_root.zig"),
             .imports = &.{
@@ -107,14 +110,15 @@ pub fn create(b: *std.Build) ?Artifacts {
             .target = target,
             .optimize = optimize,
         }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("memory-test", "Run native memory policy, temporal, isolation and replay contracts").dependOn(&b.addRunArtifact(memory_tests).step);
-    const memory_dependency_tests = b.addTest(.{
-        .root_module = memory_tests.root_module,
-        .filters = &.{ "resolver curation dependency", "resolver curation incremental repairs" },
-    });
+    // The dependency slice reuses the complete policy artifact. Keep selection
+    // at runtime so requesting both targets never compiles this root twice.
+    const memory_dependency_run = b.addRunArtifact(memory_tests);
+    addRuntimeTestFilters(b, memory_dependency_run, &.{ "resolver curation dependency", "resolver curation incremental repairs" });
     b.step("memory-dependency-test", "Verify bounded resolver dependency repair, read proofs and upgrade recovery")
-        .dependOn(&b.addRunArtifact(memory_dependency_tests).step);
+        .dependOn(&memory_dependency_run.step);
     @import("antfly_media").support.addTests(b, b.path("lib/media"), target, optimize);
     @import("antfly_video").support.addTests(b, b.path("lib/video"), target, optimize);
     const vopr_mod = shared.vopr_mod;
@@ -181,7 +185,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const readers_mod = shared.readers_mod;
     const inference_steps = shared.inference_steps;
     const antfly_imports = shared.antfly_imports;
-    const production_antfly_imports = shared.production_antfly_imports;
+    var production_antfly_imports = shared.production_antfly_imports;
     production_antfly_imports.configureRuntimeContracts(usermgr_mod);
     production_antfly_imports.storage_boundary.configureSources(usermgr_mod, false, false);
     const onnx_build = @import("onnx_graph").support;
@@ -249,6 +253,10 @@ pub fn create(b: *std.Build) ?Artifacts {
             .flags = &.{ "-fobjc-arc", "-fblocks" },
         });
     }
+
+    production_antfly_imports = @import("build_support/antfly/dependencies.zig").finalizeMediaClients(b, production_antfly_imports);
+    @import("pkg/antfly/build/lake_execution_tests.zig").add(b, target, optimize, antfly_imports, vopr_mod, lmdb_engine_mod);
+    @import("pkg/antfly/build/read_session_tests.zig").add(b, target, optimize, antfly_imports, vopr_mod, lmdb_engine_mod);
 
     // The public package has the same storage boundary as the linked server:
     // LMDB is retained only by explicitly configured test/benchmark modules.
@@ -638,6 +646,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     b.step("lib-image-jpeg2000-test", "Run direct JPEG 2000 decoder tests").dependOn(&run_jpeg2000_decode_tests.step);
     const image_test_step = b.step("lib-image-test", "Run shared image tests");
     image_test_step.dependOn(&run_lib_image_tests.step);
+    image_test_step.dependOn(&image_tests.run_processing_tests.step);
     image_test_step.dependOn(&run_png_tests.step);
     image_test_step.dependOn(&run_jpeg_tests.step);
     image_test_step.dependOn(&run_webp_tests.step);
@@ -654,7 +663,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .platform_mod = platform_mod,
     });
     const run_lib_pdf_tests = pdf_tests.run_lib_pdf_tests;
-    const documents_tests = b.addTest(.{ .root_module = b.modules.get("antfly_documents").? });
+    const documents_tests = b.addTest(.{ .root_module = inference_runtime_build.sourceDocumentsModule(b, b.modules.get("antfly_documents").?, shared.pdf_mod) });
     const run_documents_tests = b.addRunArtifact(documents_tests);
     b.step("lib-documents-test", "Run checked OOXML, DrawingML, slide and layout tests without inference").dependOn(&run_documents_tests.step);
     const pdf_integration = antfly_tests_build.createPdfIntegration(b, .{
@@ -690,6 +699,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = .fast,
     });
+    webp_codec_mod.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
+    webp_codec_mod.addImport("image_values", image_mod.import_table.get("image_values").?);
     webp_bench_mod.addImport("antfly_webp", webp_codec_mod);
     const webp_bench = b.addExecutable(.{ .name = "lib-image-webp-bench", .root_module = webp_bench_mod });
     b.step("lib-image-webp-bench", "Build the bounded WebP decode batch benchmark").dependOn(&b.addInstallArtifact(webp_bench, .{}).step);
@@ -838,6 +849,15 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = error_consumer,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }));
+    const graph_reply_provider_mod = b.createModule(.{ .root_source_file = b.path("lib/runtime/src/runtime_graph_reply_roundtrip_test.zig"), .target = target, .optimize = optimize, .link_libc = link_libc });
+    graph_reply_provider_mod.addImport("cypher", antfly_test_mod.import_table.get("cypher").?);
+    const graph_reply_provider = b.addLibrary(.{ .name = "graph-reply-test-provider", .root_module = graph_reply_provider_mod });
+    const graph_reply_consumer = b.createModule(.{ .root_source_file = b.path("lib/runtime/src/runtime_graph_reply_roundtrip_test.zig"), .target = target, .optimize = optimize, .link_libc = link_libc });
+    graph_reply_consumer.addImport("cypher", antfly_test_mod.import_table.get("cypher").?);
+    graph_reply_consumer.linkLibrary(graph_reply_provider);
+    const graph_reply_test = b.addRunArtifact(b.addTest(.{ .root_module = graph_reply_consumer, .filters = &.{"typed graph callback preserves"} }));
+    b.step("cypher-callback-abi-test", "Verify typed graph callbacks across independent native runtimes").dependOn(&graph_reply_test.step);
+    error_identity_step.dependOn(&graph_reply_test.step);
     error_identity_step.dependOn(&error_roundtrip.step);
     model_chunk_step.dependOn(&error_roundtrip.step);
     const error_status_run = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
@@ -879,6 +899,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lib_test_step = b.step("lib-test", "Run default standalone library tests");
     lib_test_step.dependOn(&b.top_level_steps.get("grep-test").?.step);
     dependOnAll(conformance_test_step, &.{ lib_toon_conformance_step, lib_image_conformance_run_step });
+    lib_test_step.dependOn(&b.top_level_steps.get("lib-cypher-test").?.step);
+    lib_test_step.dependOn(&b.top_level_steps.get("cypher-grammar-generated-check").?.step);
     lib_test_step.dependOn(&run_yacc_tests.step);
     lib_test_step.dependOn(&yacc_steps.run_parser_tests.step);
     lib_test_step.dependOn(&run_lib_regex_tests.step);
@@ -1050,12 +1072,12 @@ pub fn create(b: *std.Build) ?Artifacts {
         const entry = linked_consumer_modules.getOrPut(b.allocator, tests.root_module) catch @panic("OOM");
         if (entry.found_existing) continue;
         tests.root_module.addObject(consumer_test_metadata.object);
-        inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+        inline for (.{ .storage_kernel, .local_query, .enrichment_compute, .inference }) |unit|
             tests.root_module.linkLibrary(runtime_library_artifacts[@backingInt(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     }
     const standalone_initial_fk_tests = owner_tests.standalone_initial_fk_tests;
     standalone_initial_fk_tests.root_module.addObject(consumer_test_metadata.object);
-    inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+    inline for (.{ .storage_kernel, .local_query, .enrichment_compute, .inference }) |unit|
         standalone_initial_fk_tests.root_module.linkLibrary(runtime_library_artifacts[@backingInt(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     const run_standalone_initial_fk_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_initial_fk_tests);
     b.step("antfly-standalone-initial-fk-test", "Run linked native standalone initial-FK owner publication tests").dependOn(&run_standalone_initial_fk_tests.step);
@@ -1073,7 +1095,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     // Keep this focused target without compiling a duplicate aggregate image.
     const standalone_policy_ha_tests = owner_tests.standalone_policy_ha_tests;
     standalone_policy_ha_tests.root_module.addObject(consumer_test_metadata.object);
-    inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+    inline for (.{ .storage_kernel, .local_query, .enrichment_compute, .inference }) |unit|
         standalone_policy_ha_tests.root_module.linkLibrary(runtime_library_artifacts[@backingInt(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     const run_standalone_policy_ha_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_policy_ha_tests);
     b.step("antfly-standalone-policy-ha-test", "Run native standalone and HA row-policy publication regressions").dependOn(&run_standalone_policy_ha_tests.step);
@@ -1100,19 +1122,25 @@ pub fn create(b: *std.Build) ?Artifacts {
         const entry = linked_consumer_modules.getOrPut(b.allocator, tests.root_module) catch @panic("OOM");
         if (entry.found_existing) continue;
         tests.root_module.addObject(consumer_test_metadata.object);
-        inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+        inline for (.{ .storage_kernel, .local_query, .enrichment_compute, .inference }) |unit|
             tests.root_module.linkLibrary(runtime_library_artifacts[@backingInt(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     }
 
     const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, lmdb_engine_mod, runtime_library_artifacts);
     b.step("antfly-storage-owner-test", "Run real compiled storage owner ABI regressions").dependOn(&storage_owner_runs.runs[0].step);
     b.step("antfly-storage-owner-source-test", "Run compiled owner source and callback regressions").dependOn(&storage_owner_runs.runs[1].step);
+    owner_tests.storage_test_step.dependOn(&b.top_level_steps.get("local-query-contract-test").?.step);
+    owner_tests.unit_test_step.dependOn(&b.top_level_steps.get("aggregation-plan-test").?.step);
+    owner_tests.unit_test_step.dependOn(&b.top_level_steps.get("query-paging-test").?.step);
+    owner_tests.integration_test_step.dependOn(&b.top_level_steps.get("local-query-contract-test").?.step);
     for (storage_owner_runs.runs) |run| {
         owner_tests.storage_test_step.dependOn(&run.step);
         owner_tests.integration_test_step.dependOn(&run.step);
     }
 
-    b.top_level_steps.get("antfly-storage-bench").?.step.dependOn(&b.addInstallArtifact(storage_owner_runs.benchmark, .{}).step);
+    const install_storage_boundary_bench = b.addInstallArtifact(storage_owner_runs.benchmark, .{});
+    b.top_level_steps.get("antfly-storage-bench").?.step.dependOn(&install_storage_boundary_bench.step);
+    b.step("storage-boundary-bench", "Build only the production storage-owner transport benchmark").dependOn(&install_storage_boundary_bench.step);
 
     const antfly_main_tests = runtime.antfly_main_tests;
     const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);

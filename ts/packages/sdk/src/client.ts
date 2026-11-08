@@ -1,3 +1,4 @@
+import { encodeGraphParameter } from "./graph-wire.js";
 import { AntflyHTTPError, AntflyResponseError } from "./errors.js";
 /**
  * Antfly SDK Client
@@ -60,6 +61,11 @@ import type {
   DocumentArtifactTableReprocessResponse,
   EnrichmentConfig,
   GlobalQueryRequest,
+  GraphCatalogEntry,
+  GraphDefinition,
+  GraphQueryRequest,
+  GraphQueryResult,
+  GraphWriteStatus,
   IndexMaintenanceRequest,
   IndexMaintenanceResponse,
   IndexStatus,
@@ -119,6 +125,25 @@ import type {
 export interface RestoreOptions {
   /** Stable key used to safely retry creation of the same restore job. */
   idempotencyKey?: string;
+}
+
+export interface GraphDiagnostic {
+  /** Server-confirmed write disposition for a failed statement. */
+  write_outcome?: "not_started" | "aborted" | "committed" | "unknown";
+  code: string;
+  message: string;
+  /** UTF-8 byte offsets into the submitted query. */
+  span?: { start: number; end: number };
+}
+
+export class GraphExecutionError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly diagnostic: GraphDiagnostic
+  ) {
+    super(`Graph query failed (${diagnostic.code}): ${diagnostic.message}`);
+    this.name = "GraphExecutionError";
+  }
 }
 
 export class SQLExecutionError extends Error {
@@ -193,7 +218,7 @@ export interface RestoreJobPage {
 }
 
 export interface IndexOperations {
-  list(tableName: string): Promise<IndexStatus[]>;
+  list(tableName: string, scope?: { database: string; namespace: string }): Promise<IndexStatus[]>;
   get(tableName: string, indexName: string): Promise<IndexStatus>;
   create(tableName: string, indexName: string, config: CreateIndexRequest): Promise<CreatedIndex>;
   drop(tableName: string, indexName: string): Promise<true>;
@@ -610,6 +635,11 @@ export class AntflyClient {
     this.client = this.buildClient();
   }
 
+  /** Normalized endpoint used by this client, without credentials. */
+  get baseUrl(): string {
+    return this.config.baseUrl;
+  }
+
   /** Typed ordinary endpoints, including system catalog lifecycle routes. */
   get api(): Client<OrdinaryPaths> {
     return this.client as unknown as Client<OrdinaryPaths>;
@@ -649,7 +679,7 @@ export class AntflyClient {
       headers.Authorization = authHeader;
     }
 
-    return createClient<paths>({
+    const client = createClient<paths>({
       baseUrl: normalizeBaseUrl(this.config.baseUrl),
       headers,
       bodySerializer: (body) => {
@@ -659,6 +689,19 @@ export class AntflyClient {
         return JSON.stringify(body);
       },
     });
+    // A graph query can mutate data. Protect wrappers and the typed API alike,
+    // including catalog mutations, without changing unrelated read requests.
+    client.use({
+      onRequest({ schemaPath, request }) {
+        if (
+          schemaPath === "/db/v1/graphs/{graphName}/query" ||
+          (schemaPath === "/db/v1/graphs/{graphName}" &&
+            ["POST", "PUT", "DELETE"].includes(request.method))
+        )
+          return new Request(request, { redirect: "error" });
+      },
+    });
+    return client;
   }
 
   private requestHeaders(extra?: Record<string, string>): Record<string, string> {
@@ -2334,6 +2377,124 @@ export class AntflyClient {
   /**
    * Table operations
    */
+  /** Named mappings from document tables and graph indexes to Cypher labels and types. */
+  graphs = {
+    execute: async (
+      graphName: string,
+      request: GraphQueryRequest,
+      options: { signal?: AbortSignal } = {}
+    ): Promise<GraphQueryResult> => {
+      if (request.parameters !== undefined && request.typed_parameters !== undefined)
+        throw new Error("Choose parameters or typed_parameters");
+      const { parameters, ...body } = request;
+      const { data, error, response } = await this.client.POST("/db/v1/graphs/{graphName}/query", {
+        params: { path: { graphName } },
+        body: {
+          ...body,
+          ...(parameters !== undefined
+            ? { typed_parameters: encodeGraphParameter(parameters) }
+            : {}),
+        },
+        signal: options.signal,
+      });
+      if (error) {
+        const input = error as unknown as Record<string, unknown>;
+        const raw = input.span as { start?: unknown; end?: unknown } | undefined;
+        const span =
+          raw &&
+          typeof raw.start === "number" &&
+          Number.isSafeInteger(raw.start) &&
+          raw.start >= 0 &&
+          typeof raw.end === "number" &&
+          Number.isSafeInteger(raw.end) &&
+          raw.end >= raw.start
+            ? { start: raw.start, end: raw.end }
+            : undefined;
+        const writeOutcome = ["not_started", "aborted", "committed", "unknown"].includes(
+          String(input.write_outcome)
+        )
+          ? (input.write_outcome as GraphDiagnostic["write_outcome"])
+          : undefined;
+        throw new GraphExecutionError(response.status, {
+          code: typeof input.code === "string" ? input.code : "GraphExecutionFailed",
+          message: apiErrorMessage(error),
+          ...(span ? { span } : {}),
+          ...(writeOutcome ? { write_outcome: writeOutcome } : {}),
+        });
+      }
+      if (data === undefined || data.wire_version !== 1)
+        throw new Error("Graph query returned an unsupported result format");
+      return data as GraphQueryResult;
+    },
+    /** Inspect an admitted graph write after cancellation or a lost response. */
+    writeStatus: async (
+      transactionId: string,
+      options: { signal?: AbortSignal } = {}
+    ): Promise<GraphWriteStatus> => {
+      if (!/^[0-9a-f]{32}$/i.test(transactionId))
+        throw new Error("Invalid graph write transaction ID");
+      const { data, error } = await this.client.GET("/db/v1/transactions/{transaction_id}/status", {
+        params: { path: { transaction_id: transactionId } },
+        signal: options.signal,
+      });
+      if (error) throw new Error(`Failed to inspect graph write: ${apiErrorMessage(error)}`);
+      if (data === undefined) throw new Error("Failed to inspect graph write: empty response");
+      return data;
+    },
+    list: async (): Promise<GraphCatalogEntry[]> => {
+      const { data, error } = await this.client.GET("/db/v1/graphs");
+      if (error) throw new Error(`Failed to list graphs: ${apiErrorMessage(error)}`);
+      if (data === undefined) throw new Error("Failed to list graphs: empty response");
+      return data;
+    },
+    get: async (graphName: string): Promise<GraphCatalogEntry> => {
+      const { data, error } = await this.client.GET("/db/v1/graphs/{graphName}", {
+        params: { path: { graphName } },
+      });
+      if (error) throw new Error(`Failed to get graph: ${apiErrorMessage(error)}`);
+      if (data === undefined) throw new Error("Failed to get graph: empty response");
+      return data;
+    },
+    create: async (
+      graphName: string,
+      definition: GraphDefinition
+    ): Promise<GraphCatalogEntry | CommittedMutationOutcome> => {
+      const { data, error } = await this.client.POST("/db/v1/graphs/{graphName}", {
+        params: { path: { graphName } },
+        body: definition,
+      });
+      if (error) throw new Error(`Failed to create graph: ${apiErrorMessage(error)}`);
+      if (data === undefined) throw new Error("Failed to create graph: empty response");
+      return data;
+    },
+    drop: async (graphName: string): Promise<CommittedMutationOutcome | undefined> => {
+      const { data, error, response } = await this.client.DELETE("/db/v1/graphs/{graphName}", {
+        params: { path: { graphName } },
+      });
+      if (error) throw new Error(`Failed to drop graph: ${apiErrorMessage(error)}`);
+      if (response.status === 202) {
+        if (!data) throw new Error("Failed to drop graph: empty pending response");
+        return data;
+      }
+      return undefined;
+    },
+    update: async (
+      graphName: string,
+      expectedRevision: string,
+      definition: GraphDefinition
+    ): Promise<GraphCatalogEntry | CommittedMutationOutcome> => {
+      const { data, error, response } = await this.client.PUT("/db/v1/graphs/{graphName}", {
+        params: { path: { graphName } },
+        body: { expected_revision: expectedRevision, definition },
+      });
+      if (response.status === 409)
+        throw new Error("Graph definition changed; reload the catalog before saving your edits.");
+      if (error) throw new Error(`Failed to update graph: ${apiErrorMessage(error)}`);
+      if (data === undefined) throw new Error("Failed to update graph: empty response");
+      return data;
+    },
+  };
+
   tables = {
     /**
      * List all tables
@@ -2353,14 +2514,26 @@ export class AntflyClient {
     /**
      * Get table details and status
      */
-    get: async (tableName: string): Promise<Table | undefined> => {
-      const { data, error, response } = await this.client.GET("/db/v1/tables/{tableName}", {
-        params: { path: { tableName } },
-      });
+    get: async (
+      tableName: string,
+      scope?: { database: string; namespace: string }
+    ): Promise<Table | undefined> => {
+      const { data, error, response } = scope
+        ? await this.client.GET(
+            "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}",
+            {
+              params: {
+                path: { tableName, databaseName: scope.database, namespaceName: scope.namespace },
+              },
+            }
+          )
+        : await this.client.GET("/db/v1/tables/{tableName}", {
+            params: { path: { tableName } },
+          });
       if (!response.ok)
         throw new AntflyHTTPError(
           `Failed to get table: ${apiErrorMessage(error)}`,
-          response?.status ?? 0,
+          response.status,
           error
         );
       return data;
@@ -3956,10 +4129,19 @@ export class AntflyClient {
     /**
      * List all indexes for a table
      */
-    list: async (tableName: string) => {
-      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}/indexes", {
-        params: { path: { tableName } },
-      });
+    list: async (tableName: string, scope?: { database: string; namespace: string }) => {
+      const { data, error } = scope
+        ? await this.client.GET(
+            "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes",
+            {
+              params: {
+                path: { tableName, databaseName: scope.database, namespaceName: scope.namespace },
+              },
+            }
+          )
+        : await this.client.GET("/db/v1/tables/{tableName}/indexes", {
+            params: { path: { tableName } },
+          });
       if (error) throw new Error(`Failed to list indexes: ${error.error}`);
       if (!data) throw new Error("Failed to list indexes: unexpected empty response");
       return data;

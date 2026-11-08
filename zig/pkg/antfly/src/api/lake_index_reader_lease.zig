@@ -72,6 +72,18 @@ pub const Handle = struct {
         _ = self.owner.users.fetchAdd(1, .acq_rel);
         return copy;
     }
+    /// Adapt native generation retention to the lake snapshot-protection port.
+    /// Only authenticated native-serving cuts may substitute this for a catalog
+    /// pin; external writers must still honor their own catalog's retention.
+    /// The pin owns a separate handle and checks the same parent cancellation,
+    /// deadline and authoritative lease horizon as all native reader accesses.
+    pub fn snapshotPin(self: *const Handle) !local.serverless_lake_host.SnapshotPin {
+        return .{ .ptr = try self.retain(), .check = checkpoint, .deinit = releaseSnapshotPin };
+    }
+    fn releaseSnapshotPin(raw: *anyopaque) void {
+        const self: *Handle = @ptrCast(@alignCast(raw));
+        self.deinit();
+    }
     pub fn deinit(self: *Handle) void {
         _ = self.owner.users.fetchSub(1, .acq_rel);
         std.heap.page_allocator.destroy(self);
@@ -295,7 +307,13 @@ test "external lake native reader pool amortizes admission and fences every cach
     const short = try pool.acquire(std.testing.io, authority, 4, 1, .{});
     const retained_copy = try short.retain();
     defer retained_copy.deinit();
+    const snapshot_pin = try short.snapshotPin();
+    defer snapshot_pin.deinit(snapshot_pin.ptr);
     short.deinit();
+    try snapshot_pin.check(snapshot_pin.ptr);
+    var expired_parent = first.*;
+    expired_parent.parent.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, expired_parent.snapshotPin());
     // A source can retain authority after its short index cursor closes.
     try retained_copy.readContext().ensureActive();
     try std.testing.expect(first.owner == retained_copy.owner);
@@ -317,6 +335,7 @@ test "external lake native reader pool amortizes admission and fences every cach
     try first.readContext().ensureActive();
     first.owner.authority_deadline.store(0, .release);
     try std.testing.expectError(error.LakeIndexReaderLeaseExpired, first.readContext().ensureActive());
+    try std.testing.expectError(error.LakeIndexReaderLeaseExpired, snapshot_pin.check(snapshot_pin.ptr));
 }
 
 test "external lake cold reader admission retains deadline and cancellation" {

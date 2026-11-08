@@ -635,6 +635,7 @@ pub const ProfiledLock = struct {
 pub const BatchExecutionContext = struct {
     apply_exclusive_held: bool = false,
     alloc: Allocator,
+    ordered_artifact_publication_required: bool = false,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
@@ -1020,6 +1021,22 @@ pub const BatchVisibilityCompletion = struct {
     }
 };
 
+/// One synchronous prepared attempt's irreversible disposition. It is separate
+/// from the caller's cumulative progress marker: optimistic preparation may
+/// retry, while a committed attempt must propagate every later error unchanged.
+pub const PreparedCommitDisposition = struct {
+    pub const State = enum(u8) { preparing, primary_committed };
+    state: State = .preparing,
+
+    pub fn markPrimaryCommitted(self: *@This()) void {
+        self.state = .primary_committed;
+    }
+
+    pub fn permitsPreparationRetry(self: @This(), err: anyerror) bool {
+        return self.state == .preparing and (err == error.PreparedGenerationChanged or err == error.PreparedReadSetChanged);
+    }
+};
+
 pub const BatchExecutionOptions = struct {
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
@@ -1044,6 +1061,9 @@ pub const BatchExecutionOptions = struct {
     /// Internal progress marker; set only after the primary store accepts the
     /// write. Visibility admission errors must not invite replay of transforms.
     primary_committed: ?*bool = null,
+    /// Attempt-local borrow installed by batchInternalWithPreparationAllocator. Never
+    /// retained by asynchronous publication or shared across retries.
+    prepared_commit_disposition: ?*PreparedCommitDisposition = null,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
@@ -1124,6 +1144,7 @@ pub const LocalExecutionState = struct {
     vector_migration_active: std.atomic.Value(bool) = .init(false),
     vector_migration_offline_candidate: bool = false,
     artifact_publication_dispatcher: ?ArtifactPublicationDispatcher = null,
+    producer_catalog_generation: AtomicU64 = .init(0),
     /// Planning and visibility observations have one shared owner.
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     visibility_runtime_stats: VisibilityRuntimeStats = .{},
