@@ -21571,14 +21571,37 @@ pub const ApiHttpServer = struct {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
-            if (phase == .validating and target.empty_generation)
-                (requireEmptyGenerationReceiptAuthority(self.alloc, self.table_reads orelse return zig017_failure: {
-                    zig017_return_error = error.UnsupportedOperation;
-                    break :zig017_failure error.UnsupportedOperation;
-                }, target.table.name, range.start_key, scope.target_namespace, range.group_id, scope.digest(), job.value.plan.id, context, false, (try stages.nativeEmptyOriginForTarget(job.value.plan, job.value.plan_digest, target)) != null) catch |zig017_err| {
-                    zig017_return_error = zig017_err;
-                    return zig017_err;
-                });
+            if (phase == .validating and target.empty_generation) {
+                if ((try stages.nativeEmptyOriginForTarget(job.value.plan, job.value.plan_digest, target)) != null) {
+                    // This exact hidden native owner has no public route yet.
+                    // Reuse its canonical status delivery and retained lease;
+                    // ordinary table reads/privacy remain serving-fenced.
+                    const observed = self.executeRestoreOwner(self.alloc, target.table.name, range.group_id, .{ .scope = scope, .action = .status, .native_execution = target.table.sql_persistence, .native_empty_identity = true }, context) catch |err| {
+                        zig017_return_error = err;
+                        return err;
+                    };
+                    const identity = observed.native_empty_identity orelse return zig017_failure: {
+                        zig017_return_error = error.UnsupportedEmptyGenerationAuthority;
+                        break :zig017_failure error.UnsupportedEmptyGenerationAuthority;
+                    };
+                    if (!identity.namespace.eql(scope.target_namespace)) return zig017_failure: {
+                        zig017_return_error = error.RestoreStagingScopeChanged;
+                        break :zig017_failure error.RestoreStagingScopeChanged;
+                    };
+                    identity.requireGenerationHandoffReceipts() catch |err| {
+                        zig017_return_error = err;
+                        return err;
+                    };
+                } else {
+                    (requireEmptyGenerationReceiptAuthority(self.alloc, self.table_reads orelse return zig017_failure: {
+                        zig017_return_error = error.UnsupportedOperation;
+                        break :zig017_failure error.UnsupportedOperation;
+                    }, target.table.name, range.start_key, scope.target_namespace, range.group_id, scope.digest(), job.value.plan.id, context, false, false) catch |zig017_err| {
+                        zig017_return_error = zig017_err;
+                        return zig017_err;
+                    });
+                }
+            }
             var request: owners.Request = .{ .scope = scope, .action = switch (phase) {
                 .importing => if (target.population != null) .status else if (target.empty_generation) .begin else .import_page,
                 .validating => .validate,

@@ -84,3 +84,21 @@ test "native empty origins distinguish genuine loss from schema-only snapshot wi
     changed.schema_only_snapshot.schema_digest[0] ^= 1;
     try std.testing.expect(!std.mem.eql(u8, &try schema.digest(), &try changed.digest()));
 }
+
+/// Fixed metadata-only control used after exact restore-owner admission.
+/// It cannot carry rows, policy authority, digests, or another control selector.
+pub const identity_selector = "{\"mode\":\"native_empty_identity\"}";
+pub const identity_protocol_version: u16 = 2;
+pub fn identityLookupMatches(key: []const u8, opts: anytype) bool {
+    if (key.len != 0 or !std.mem.eql(u8, opts.relational_topology_json, identity_selector) or opts.restore_staging_scope == null or opts.restore_staging_plan_id == null) return false;
+    const T = @TypeOf(opts);
+    const defaults: T = .{};
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, F| {
+        if (comptime !std.mem.eql(u8, name, "relational_topology_json") and !std.mem.eql(u8, name, "restore_staging_scope") and !std.mem.eql(u8, name, "restore_staging_plan_id") and !std.mem.eql(u8, name, "execution_deadline_ns") and !std.mem.eql(u8, name, "execution_io") and !std.mem.eql(u8, name, "cancellation")) {
+            if (comptime @typeInfo(F) == .pointer and @typeInfo(F).pointer.size == .slice) {
+                if (@field(opts, name).len != 0) return false;
+            } else if (!std.meta.eql(@field(opts, name), @field(defaults, name))) return false;
+        }
+    }
+    return true;
+}

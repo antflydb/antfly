@@ -548,7 +548,11 @@ pub const node_lifecycle_finalizing = "finalizing";
 /// native backup generation without discarding validated generated indexes.
 /// Persisting this per store lets metadata fence restore placement during a
 /// rolling data-plane upgrade instead of relying on the metadata codec level.
-pub const native_generation_restore_protocol_version: u16 = 1;
+/// Version 2 includes fixed native-empty identity projection on an already
+/// initialized private RestoreOwner.status lease; no artifact-repair claim.
+pub const native_generation_restore_protocol_version: u16 = 2;
+/// Published HBC image restoration still requires only its original decoder.
+pub const native_generation_restore_base_protocol_version: u16 = 1;
 
 pub fn nodeLifecycleActive(lifecycle: []const u8) bool {
     return std.mem.eql(u8, lifecycle, node_lifecycle_active);

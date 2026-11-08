@@ -6721,9 +6721,45 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !std.json.Parsed(@import("restore_owner.zig").Prepared) {
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer alloc.free(path);
-        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false, .resident, .{ .execution_deadline_ns = request.deadline_ns, .execution_io = request.deadline_io, .cancellation = request.cancellation, .native_published_restore = if (descriptor.sql_persistence != null) publishedRestoreSelection(group_id, input) else null });
+        var controls: ReadControls = .{ .execution_deadline_ns = request.deadline_ns, .execution_io = request.deadline_io, .cancellation = request.cancellation, .native_published_restore = if (descriptor.sql_persistence != null) publishedRestoreSelection(group_id, input) else null };
+        var identity_proof: ?NativeGroupProof = null;
+        if (input.native_empty_identity) {
+            identity_proof = try self.nativeProofForDescriptor(descriptor, controls);
+            const proof = identity_proof.?;
+            controls.native_initialized = proof.initialized;
+            controls.native_boot_observed = true;
+            if (proof.boot.phase == .recovering) {
+                controls.native_empty_admission = proof.empty_target orelse return error.SqlRelationRecoveryIncomplete;
+                const native = descriptor.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+                controls.native_empty_host = .{ .node_id = native.owner_node_id, .store_id = native.owner_store_id, .execution_instance = proof.boot.instance, .generation_instance = native.generation_instance, .data_generation = native.data_generation };
+            }
+        }
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false, .resident, controls);
         defer lease.deinit();
-        return prepareRestoreOwnerControlOnLease(alloc, &lease, table_name, input, options, request);
+        var ordinary = input;
+        ordinary.native_empty_identity = false;
+        var prepared = try prepareRestoreOwnerControlOnLease(alloc, &lease, table_name, ordinary, options, request);
+        errdefer prepared.deinit();
+        if (input.native_empty_identity) {
+            const native = descriptor.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+            if (native.kind != .unlogged or input.scope.native_empty_origin == null or !input.scope.empty_generation) return error.RestoreStagingScopeChanged;
+            if (prepared.value.batch_json != null) return error.RestoreStagingScopeChanged;
+            // The same acquired owner must still be the initialized physical
+            // image authenticated by the current canonical Boot observation.
+            const proof = identity_proof orelse return error.SqlRelationRecoveryIncomplete;
+            const actual = try lease.owner().nativeRelationBinding(alloc, table_name);
+            if (!native.eql(actual.descriptor) or !(proof.signing.native_pin orelse return error.SqlRelationOwnerChanged).eql(try @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin.fromBinding(actual)) or !std.mem.eql(u8, &actual.native_instance, &proof.boot.instance)) return error.SqlRelationOwnerChanged;
+            const opts: db_types.LookupOptions = .{ .relational_topology_json = @import("antfly_local_sources").storage_db_native_empty_origin.identity_selector, .restore_staging_scope = input.scope.digest(), .restore_staging_plan_id = input.scope.plan_id, .execution_deadline_ns = request.deadline_ns, .execution_io = request.deadline_io, .cancellation = request.cancellation };
+            const encoded = try table_reads.encodeStorageKernelLookupRequest(alloc, "", opts);
+            defer alloc.free(encoded);
+            var identity = try lease.owner().lookupJson(table_name, encoded);
+            defer identity.deinit();
+            const parsed = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, alloc, identity.bytes(), .{});
+            if (!parsed.namespace.eql(input.scope.target_namespace)) return error.RestoreStagingScopeChanged;
+            try parsed.requireGenerationHandoffReceipts();
+            prepared.value.response.native_empty_identity = parsed;
+        }
+        return prepared;
     }
 
     fn prepareRestoreOwnerControlOnLease(alloc: std.mem.Allocator, lease: *Lease, table_name: []const u8, input: @import("restore_owner.zig").Request, options: RestoreOwnerOptions, request: request_operation.RequestContext) !std.json.Parsed(@import("restore_owner.zig").Prepared) {

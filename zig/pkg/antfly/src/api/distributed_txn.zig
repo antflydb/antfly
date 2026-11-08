@@ -1390,8 +1390,11 @@ pub const ExternalPreparation = struct {
             }
             if (entry.route.metadata_group_id != spec.route.metadata_group_id or !std.meta.eql(entry.route.metadata_incarnation, spec.route.metadata_incarnation)) return error.CatalogGenerationChanged;
             var merged_route = spec.route;
-            // Refresh the durable cut without dropping the authenticated,
-            // process-local signers captured for this row preparation. Grants
+            // A lock enrollment stamp identifies its resource, not the row
+            // preparation's authorization cut. Never upgrade OR regress that
+            // captured cut; accepting metadata still checks its exact epoch.
+            merged_route.catalog_revision = entry.route.catalog_revision;
+            // Retain authenticated signers captured for this row preparation. Grants
             // and body digests are minted only after the final body exists.
             if (merged_route.admission_trigger_minter == null) merged_route.admission_trigger_minter = entry.route.admission_trigger_minter;
             if (merged_route.admission_relation_minter == null) {
@@ -8763,12 +8766,27 @@ test "SQL relation lifetime lock refresh preserves exact row trigger authority a
     };
     try preparation.attachLocks(a, spec, admission);
     const merged = preparation.manifest[0].route;
-    try std.testing.expectEqual(@as(u64, 4), merged.catalog_revision);
+    try std.testing.expectEqual(@as(u64, 2), merged.catalog_revision);
     try std.testing.expectEqual(@as(?[32]u8, @splat(22)), merged.admission_relation_minter.?.command_fence_digest);
     try std.testing.expectEqual(@as(?[32]u8, @splat(11)), merged.admission_trigger_minter.?.command_fence_digest);
     try std.testing.expect(merged.admission_relation_grant.len == 0 and merged.admission_trigger_grant.len == 0);
     try std.testing.expect(merged.admission_body_digest == null and merged.admission_command_digest == null);
     try std.testing.expectEqualDeep(merged, preparation.participants.items[0].route_fence.?);
+    // A stale enrollment must not regress the row cohort's cut; a newer
+    // lock snapshot cannot certify authorization or policy changes for it.
+    const encoded_manifest = try std.json.Stringify.valueAlloc(a, preparation.manifest, .{});
+    for ([_]u64{ 1, 19 }) |lock_revision| {
+        spec.route = refreshed;
+        spec.route.catalog_revision = lock_revision;
+        try preparation.attachLocks(a, spec, admission);
+        try std.testing.expectEqualDeep(merged, preparation.manifest[0].route);
+        try std.testing.expectEqualDeep(merged, preparation.participants.items[0].route_fence.?);
+        const after_manifest = try std.json.Stringify.valueAlloc(a, preparation.manifest, .{});
+        try std.testing.expectEqualStrings(encoded_manifest, after_manifest);
+        try std.testing.expectEqualStrings("row", preparation.participants.items[0].writes.items[0].key);
+        try std.testing.expectEqual(@as(u64, 7), preparation.participants.items[0].predicates.items[0].expected_version);
+    }
+    spec.route = refreshed;
     // The preserved trigger callback still produces a real valid native
     // preparation envelope for this exact program/row/predicate image.
     const sealed = try local.sql_catalog.trigger_native_admission.seal(a, merged.admission_trigger_minter.?, 11, 100, preparation.participants.items[0].intent().asBatch(@splat(7), 3));

@@ -46,6 +46,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "pure policy control bypasses only ordinary dense repair writer preflight",
         "native retirement preparation rejects untrusted and malformed requests before metadata or owner access",
         "data runtime native restore phase two rejoins activating descriptor authority",
+        "data runtime native reset generation two births a real owner under the current recovering Boot",
         "pure topology control bypasses only ordinary dense repair writer preflight",
         "data ownership fallback requires a single store across all roles",
         "data relational maintenance yields to raft persistence and follows elections",

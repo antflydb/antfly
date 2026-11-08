@@ -40,6 +40,8 @@ pub const Request = struct {
     /// Routing hint captured from the admitted immutable target. The receiver
     /// rejoins the actual job descriptor before choosing an execution lane.
     native_execution: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = null,
+    /// Read-only fixed capability projection under this exact owner scope.
+    native_empty_identity: bool = false,
     scope: staging.Scope,
     action: enum { begin, import_page, status, validate, install_generation_admissions, publish, cancel, install_native_empty },
     generation_admissions: ?staging.InstallGenerationAdmissions = null,
@@ -53,7 +55,8 @@ pub const Request = struct {
     population_complete: ?@import("antfly_local_sources").storage_db_relational_population_contract.Completion = null,
     max_rows: u16 = 128,
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return ((comptime std.mem.eql(u8, field, "native_execution")) and self.native_execution == null) or
+        return ((comptime std.mem.eql(u8, field, "native_empty_identity")) and !self.native_empty_identity) or
+            ((comptime std.mem.eql(u8, field, "native_execution")) and self.native_execution == null) or
             ((comptime std.mem.eql(u8, field, "native_empty_install")) and self.native_empty_install == null);
     }
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
@@ -66,6 +69,7 @@ pub const Request = struct {
     }
     pub fn validate(self: Request, group_id: u64) !void {
         try self.scope.validate();
+        if (self.native_empty_identity and (self.action != .status or !self.scope.empty_generation or self.scope.native_empty_origin == null or self.source != null or self.source_chunk != null or self.rewrite != null or self.rewrite_tail != null or self.rewrite_finish != null or self.generation_admissions != null or self.native_empty_install != null or self.population_page != null or self.population_complete != null)) return error.InvalidRestoreStagingCommand;
         if (self.native_execution) |native| try native.validate();
         if (self.scope.population) |binding| {
             const fields = @as(u8, @intFromBool(self.population_page != null)) + @intFromBool(self.population_complete != null);
@@ -125,6 +129,7 @@ pub const Request = struct {
     }
 };
 pub const Response = struct {
+    native_empty_identity: ?@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity = null,
     phase: staging.Phase,
     rows: u64,
     receipt: staging.Digest,
@@ -137,7 +142,8 @@ pub const Response = struct {
     tail_next: u32 = 0,
     source_next_offset: u64 = 0,
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return ((comptime std.mem.eql(u8, field, "native_empty_receipt")) and self.native_empty_receipt == null) or
+        return ((comptime std.mem.eql(u8, field, "native_empty_identity")) and self.native_empty_identity == null) or
+            ((comptime std.mem.eql(u8, field, "native_empty_receipt")) and self.native_empty_receipt == null) or
             ((comptime std.mem.eql(u8, field, "native_empty_commit")) and self.native_empty_commit == null) or
             ((comptime std.mem.eql(u8, field, "native_empty_acceptance")) and self.native_empty_acceptance == null);
     }

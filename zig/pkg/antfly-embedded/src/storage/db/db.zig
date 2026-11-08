@@ -22328,6 +22328,7 @@ pub const DB = struct {
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         if (comptime storage_engine.enabled) return storage_engine.call("lookup", .{ self, alloc, key, opts });
         try checkLookupOptionsActive(opts);
+        if (std.mem.eql(u8, opts.relational_topology_json, @import("native_empty_origin.zig").identity_selector) and !@import("native_empty_origin.zig").identityLookupMatches(key, opts)) return error.RestoreStagingScopeChanged;
         if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}") and
             (key.len != 0 or opts.include_primary_digest or opts.relational_integrity_catalog or opts.relational_integrity_action or
                 opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or
@@ -29464,7 +29465,7 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, status, retirement_status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt, schema_owner, sql_relation_binding },
+            mode: enum { identity, native_empty_identity, status, retirement_status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt, schema_owner, sql_relation_binding },
             scope: ?@import("online_source_contract.zig").Scope = null,
         }, alloc, request_json, .{});
         defer request.deinit();
@@ -29474,6 +29475,25 @@ pub const DB = struct {
         var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
         switch (request.value.mode) {
             .identity => try @import("relational_integrity_json.zig").write(try self.relationalTopologyIdentity(), &stream),
+            .native_empty_identity => {
+                if (!@import("native_empty_origin.zig").identityLookupMatches("", opts)) return error.RestoreStagingScopeChanged;
+                const native = self.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+                if (native.kind != .unlogged) return error.InvalidSqlRelationPersistence;
+                {
+                    var read = try self.core.store.beginProbeTxn();
+                    defer read.abort();
+                    const contract = @import("restore_staging_contract.zig");
+                    const raw = read.get(contract.bootstrap_key) catch return error.RestoreStagingScopeChanged;
+                    var bootstrap = try contract.OwnerBootstrap.decode(alloc, raw);
+                    defer bootstrap.deinit();
+                    try bootstrap.value.validate();
+                    if (bootstrap.value.scope.native_empty_origin == null or !bootstrap.value.scope.empty_generation or
+                        !bootstrap.value.scope.target_namespace.eql(self.core.identity_namespace) or
+                        !std.mem.eql(u8, &opts.restore_staging_scope.?, &bootstrap.value.scope.digest()) or
+                        !std.mem.eql(u8, &opts.restore_staging_plan_id.?, &bootstrap.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
+                }
+                try @import("relational_integrity_json.zig").write(try self.relationalTopologyIdentity(), &stream);
+            },
             .generation_handoff_identity => {
                 const scope = opts.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
                 const plan_id = opts.restore_staging_plan_id orelse return error.RestoreStagingScopeChanged;

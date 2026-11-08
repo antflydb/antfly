@@ -50,7 +50,7 @@ test "native restore publication waits for every target store capability" {
         .{ .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 12 }, .store_id = 102 },
     };
     var stores = [_]table_manager.StoreRecord{
-        .{ .store_id = 101, .node_id = 11, .native_generation_restore_version = table_manager.native_generation_restore_protocol_version },
+        .{ .store_id = 101, .node_id = 11, .native_generation_restore_version = table_manager.native_generation_restore_base_protocol_version },
         .{ .store_id = 102, .node_id = 12 },
     };
 
@@ -59,7 +59,7 @@ test "native restore publication waits for every target store capability" {
     try std.testing.expect(!capabilities.rangeTargetsCapable(range));
     try std.testing.expect(!capabilities.placementTargetCapable(placements[1]));
     capabilities.deinit();
-    stores[1].native_generation_restore_version = table_manager.native_generation_restore_protocol_version;
+    stores[1].native_generation_restore_version = table_manager.native_generation_restore_base_protocol_version;
     capabilities = try NativeRestoreCapabilityIndex.init(std.testing.allocator, &stores, &.{range}, &placements);
     try std.testing.expect(capabilities.rangeTargetsCapable(range));
     try std.testing.expect(capabilities.placementTargetCapable(placements[1]));
@@ -1467,7 +1467,7 @@ const NativeRestoreCapabilityIndex = struct {
         errdefer index.deinit();
         for (stores) |store| {
             if (store.native_generation_restore_version <
-                table_manager.native_generation_restore_protocol_version) continue;
+                table_manager.native_generation_restore_base_protocol_version) continue;
             try index.capable_store_ids.put(alloc, store.store_id, {});
             try index.capable_node_ids.put(alloc, store.node_id, {});
         }

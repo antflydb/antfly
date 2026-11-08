@@ -19553,6 +19553,19 @@ pub const RaftApplyStore = struct {
         try advanceStandaloneRevisionWithProjection(txn, true);
     }
 
+    fn standaloneSqlRelationProjectionNeutral(self: *RaftApplyStore, bytes: []const u8) bool {
+        // A signed runtime observation neither publishes a schema/identity nor
+        // changes access policy. Its durable lifetime proof must still invalidate
+        // namespace publication scans: this is deliberately independent of
+        // relationProofNeutralCommand and commitStandaloneTxnWithImpact.
+        var parsed = sql_relation_boot_wire.Request.parse(self.alloc, bytes) catch return false;
+        defer parsed.deinit();
+        return switch (parsed.value.command) {
+            .initialized, .adopted, .group_report => true,
+            .claim, .advance, .begin_drain, .finish_drain, .reserve_empty, .retire_unpublished, .initialized_empty => false,
+        };
+    }
+
     fn standaloneRestoreProgressOnly(self: *RaftApplyStore, bytes: []const u8) bool {
         // Only closed receipt actions are projection-neutral. Reservation,
         // source/fence changes, publication and cancellation stay conservative.
@@ -19694,7 +19707,7 @@ pub const RaftApplyStore = struct {
             // Runtime report timestamps and source watermarks are durable
             // observations, not new table/range/catalog identities. Still
             // invalidate if the accepted receiver emitted a structural change.
-            .apply_sql_relation_boot => !proof_neutral or outcomeChangesCatalog(outcome.projection_signals.items),
+            .apply_sql_relation_boot => |bytes| !self.standaloneSqlRelationProjectionNeutral(bytes) or outcomeChangesCatalog(outcome.projection_signals.items),
             .apply_sql_prepared_transaction, .apply_sql_lock_scope, .apply_sql_graph_preparation, .apply_sql_sequence_counter, .complete_relational_index_source, .accept_relational_index_delivery, .apply_store_root_enrollment => false,
             else => true,
         });
@@ -40041,6 +40054,19 @@ pub const RaftApplyStore = struct {
                 else
                     try self.relationalTopologyStoresAtLeastTxn(txn, group_id, native_version);
                 if (!native_ready) return;
+                // The fixed capability projection is a separate native lane,
+                // not the unqualified artifact-repair data protocol ceiling.
+                for (plan.targets) |target| {
+                    if (target.native_reset == null and target.schema_only_snapshot == null) continue;
+                    const descriptor = target.table.sql_persistence orelse return error.InvalidRestoreStaging;
+                    var store_key: [160]u8 = undefined;
+                    const raw_store = (try stagingGet(txn, try storeKeyForGroup(&store_key, group_id, descriptor.owner_store_id))) orelse return;
+                    const registered = try decodeStoredHeader(self.alloc, raw_store);
+                    defer metadata_table_manager.freeStore(self.alloc, registered);
+                    if (registered.node_id != descriptor.owner_node_id or registered.reporter_incarnation == 0 or
+                        !metadata_table_manager.storeServesTableData(registered.role) or
+                        registered.native_generation_restore_version < @import("antfly_local_sources").storage_db_native_empty_origin.identity_protocol_version) return;
+                }
             }
             self.requireSqlRelationResetPlanTxn(catalog_arena.allocator(), txn, group_id, plan) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -76625,7 +76651,8 @@ test "SQL native runtime reports preserve catalog projection and publication pro
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-report-projection", .{tmp.sub_path});
     const group = group_ids.main_metadata_group_id;
     var store = try RaftApplyStore.init(backing, .{ .root_dir = path });
-    defer store.deinit();
+    var store_open = true;
+    defer if (store_open) store.deinit();
     const incarnation = "07070707070707070707070707070707".*;
     try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
     const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
@@ -76638,7 +76665,7 @@ test "SQL native runtime reports preserve catalog projection and publication pro
     const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 19, .public_key = pair.public_key.toBytes() };
     const boot: sql_relation_boots.Record = .{ .node_id = 1, .identity = .{ .metadata_incarnation = incarnation, .node_id = 1, .store_id = 1, .root_incarnation = root.root_incarnation, .public_key = root.public_key }, .reporter_incarnation = 1, .generation = 2, .instance = @splat(8), .claim_digest = @splat(9), .unclean_restart = false, .phase = .ready };
-    const binding = try (@import("../sql_relation_attestation.zig").SignedBinding{ .kind = .initialized, .metadata_group_id = group, .boot_generation = boot.generation, .identity = boot.identity, .reporter_incarnation = boot.reporter_incarnation, .binding = .{ .descriptor = table.sql_persistence.?, .native_instance = boot.instance, .table_id = table.table_id, .shard_id = 11, .range_id = 11, .physical_root_incarnation = 23, .schema_version = 1, .schema_digest = @splat(4), .catalog_generation = 1, .catalog_fingerprint = @splat(5) } }).sign(root);
+    const binding = try (@import("../sql_relation_attestation.zig").SignedBinding{ .kind = .initialized, .metadata_group_id = group, .boot_generation = boot.generation, .identity = boot.identity, .reporter_incarnation = boot.reporter_incarnation, .binding = .{ .descriptor = table.sql_persistence.?, .native_instance = boot.instance, .table_id = table.table_id, .shard_id = 11, .range_id = 11, .physical_root_incarnation = 23, .schema_version = 1, .schema_digest = try restore_staging.runtimeSchemaDigestForTable(a, table.schema_json), .catalog_generation = 1, .catalog_fingerprint = @splat(5) } }).sign(root);
     {
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
@@ -76649,9 +76676,70 @@ test "SQL native runtime reports preserve catalog projection and publication pro
         const prepared: RaftApplyStore.PreparedTableRecordWrite = .{ .identity = .{ .table_id = table.table_id, .name = table.name }, .value = try encodeTableRecord(a, table), .previous_name = null, .lake_value = null, .column_identity_value = null, .retire_previous_attributes = false, .sequence_defaults = null, .foreign_key_dependencies = null, .object_change = null, .source_changed = false, .fingerprint = policyTableSchemaRecordDigest(table) };
         try store.writePreparedTableRecordTxn(&txn, group, try tableKeyForGroup(&key, group, table.table_id), prepared);
         try txn.put(try sql_relation_boots.key(&key, group, boot.node_id), try std.json.Stringify.valueAlloc(a, boot, .{}));
-        try sql_relation_lifetimes.stageInitialized(a, &txn, group, binding);
         try txn.commit();
     }
+    const Accept = struct {
+        fn bindingObservation(alloc: std.mem.Allocator, target: *RaftApplyStore, proof: @import("../sql_relation_attestation.zig").SignedBinding, signer: @import("antfly_local_sources").storage_db_root_signing_identity.State) !void {
+            const request = try (sql_relation_boot_wire.Request{
+                .metadata_group_id = group_ids.main_metadata_group_id,
+                .identity = proof.identity,
+                .reporter_incarnation = proof.reporter_incarnation,
+                .native_instance = proof.binding.native_instance,
+                .command = if (proof.kind == .initialized) .{ .initialized = proof } else .{ .adopted = proof },
+            }).sign(signer);
+            const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+            const command: TransitionCommand = .{ .apply_sql_relation_boot = bytes };
+            // These writes retain the stronger namespace/source-scan fence;
+            // routing neutrality must not grant publication-proof neutrality.
+            try std.testing.expect(!target.relationProofNeutralCommand(command));
+            try std.testing.expect(target.standaloneSqlRelationProjectionNeutral(bytes));
+            const before = try target.standaloneRevisionState();
+            const definition_before = snapshot: {
+                var read = try target.store.beginReadTxn();
+                defer read.abort();
+                var key: [256]u8 = undefined;
+                break :snapshot .{
+                    try alloc.dupe(u8, try read.get(try tableKeyForGroup(&key, group_ids.main_metadata_group_id, proof.binding.table_id))),
+                    try alloc.dupe(u8, try read.get(try rangeKeyForGroup(&key, group_ids.main_metadata_group_id, proof.binding.range_id))),
+                };
+            };
+            const preview = try target.sqlRelationBootPreflightJson(alloc, group_ids.main_metadata_group_id, bytes);
+            var decoded = try std.json.parseFromSlice(sql_relation_boots.Observation, alloc, preview, .{});
+            defer decoded.deinit();
+            _ = try request.requireApplied(decoded.value);
+            try std.testing.expectEqualDeep(before, try target.standaloneRevisionState());
+            // Actual accepting receiver commit and an exact lost-reply replay.
+            for (0..2) |round| {
+                try target.applyStandaloneCommand(group_ids.main_metadata_group_id, command);
+                const after = try target.standaloneRevisionState();
+                try std.testing.expectEqual(before.revision + round + 1, after.revision);
+                try std.testing.expectEqual(before.projection_revision, after.projection_revision);
+                const observed = try target.sqlRelationBootJson(alloc, group_ids.main_metadata_group_id, request.observationQuery());
+                var result = try std.json.parseFromSlice(sql_relation_boots.Observation, alloc, observed, .{});
+                defer result.deinit();
+                _ = try request.requireApplied(result.value);
+                var read = try target.store.beginReadTxn();
+                defer read.abort();
+                var key: [256]u8 = undefined;
+                try std.testing.expectEqualStrings(definition_before[0], try read.get(try tableKeyForGroup(&key, group_ids.main_metadata_group_id, proof.binding.table_id)));
+                try std.testing.expectEqualStrings(definition_before[1], try read.get(try rangeKeyForGroup(&key, group_ids.main_metadata_group_id, proof.binding.range_id)));
+            }
+        }
+    };
+    // This is a real metadata accepting-receiver regression. Its signed
+    // physical image is fixture input, not evidence of opening a data store.
+    var bad_binding = binding;
+    bad_binding.binding.schema_digest[0] ^= 1;
+    bad_binding = try bad_binding.sign(root);
+    var bad_request = try (sql_relation_boot_wire.Request{ .metadata_group_id = group, .identity = boot.identity, .reporter_incarnation = boot.reporter_incarnation, .native_instance = boot.instance, .command = .{ .initialized = bad_binding } }).sign(root);
+    const refused_cut = try store.standaloneRevisionState();
+    const bad_bytes = try std.json.Stringify.valueAlloc(a, bad_request, .{});
+    try std.testing.expect(store.standaloneSqlRelationProjectionNeutral(bad_bytes));
+    try std.testing.expectError(error.SqlRelationOwnerChanged, store.sqlRelationBootPreflightJson(a, group, bad_bytes));
+    try std.testing.expectEqualDeep(refused_cut, try store.standaloneRevisionState());
+    bad_request.signature[0] ^= 1;
+    try std.testing.expect(!store.standaloneSqlRelationProjectionNeutral(try std.json.Stringify.valueAlloc(a, bad_request, .{})));
+    try Accept.bindingObservation(a, &store, binding, root);
     var runtime: metadata.RuntimeGroupStatusReport = .{ .table_id = table.table_id, .table_name = table.name, .group_id = range.group_id, .store_id = 1, .node_id = 1, .updated_at_ns = 101, .schema_epoch = 1, .source_authority = .{ .kind = .native, .namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(.{ .table_id = table.table_id, .shard_id = 11, .range_id = 11 }), .sequence = 1 } };
     const Submit = struct {
         fn request(alloc: std.mem.Allocator, value: sql_relation_boots.Record, report: metadata.RuntimeGroupStatusReport, signer: @import("antfly_local_sources").storage_db_root_signing_identity.State) ![]const u8 {
@@ -76696,9 +76784,43 @@ test "SQL native runtime reports preserve catalog projection and publication pro
         defer txn.abort();
         try std.testing.expectError(error.SqlRelationOwnerChanged, store.applySqlRelationBootTxn(&txn, group, rejected));
     }
+    // A clean successor is trusted fixture setup; the adoption itself must
+    // pass the actual current-root, prior-receipt and immutable-image guards.
+    var successor = boot;
+    successor.generation += 1;
+    successor.instance = @splat(10);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var key: [256]u8 = undefined;
+        try txn.put(try sql_relation_boots.key(&key, group, successor.node_id), try std.json.Stringify.valueAlloc(a, successor, .{}));
+        try txn.commit();
+    }
+    var adopted = binding;
+    adopted.kind = .adopted;
+    adopted.boot_generation = successor.generation;
+    adopted.binding.native_instance = successor.instance;
+    adopted.previous_descriptor_fingerprint = try binding.binding.descriptor.fingerprint();
+    adopted.previous_binding_digest = try binding.digest();
+    adopted = try adopted.sign(root);
+    try Accept.bindingObservation(a, &store, adopted, root);
+    // Durable binding and distinct routing watermark both survive a real
+    // close/reopen, rather than relying on in-process decoded state.
+    const cold_cut = try store.standaloneRevisionState();
+    store.deinit();
+    store_open = false;
+    store = try RaftApplyStore.init(backing, .{ .root_dir = path });
+    store_open = true;
+    try std.testing.expectEqualDeep(cold_cut, try store.standaloneRevisionState());
+    const observed_adoption = try store.sqlRelationBootJson(a, group, .{ .node = successor.node_id, .binding_table = table.table_id });
+    var cold_adoption = try std.json.parseFromSlice(sql_relation_boots.Observation, a, observed_adoption, .{});
+    defer cold_adoption.deinit();
+    try std.testing.expectEqualSlices(u8, &try adopted.digest(), &try cold_adoption.value.initialized.?.digest());
     const claim = try (sql_relation_boot_wire.Request{ .metadata_group_id = group, .identity = boot.identity, .reporter_incarnation = boot.reporter_incarnation, .native_instance = boot.instance, .command = .{ .claim = .{ .node_id = 1, .instance = boot.instance, .expected_generation = boot.generation, .expected_instance = boot.instance } } }).sign(root);
     try std.testing.expect(!store.relationProofNeutralCommand(.{ .apply_sql_relation_boot = try std.json.Stringify.valueAlloc(a, claim, .{}) }));
     try std.testing.expect(!store.relationProofNeutralCommand(.{ .apply_sql_relation_boot = "{invalid" }));
+    try std.testing.expect(!store.standaloneSqlRelationProjectionNeutral(try std.json.Stringify.valueAlloc(a, claim, .{})));
+    try std.testing.expect(!store.standaloneSqlRelationProjectionNeutral("{invalid"));
 }
 
 test "SQL table trigger source physical query bindings retain incomplete and corrupt coverage refusal" {

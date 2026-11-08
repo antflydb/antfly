@@ -66,6 +66,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     extension_store_audit.addFileArg2(extension_store_inventory.captureStdErr(.{}), .{ .make_absolute = true });
     extension_store_run.step.dependOn(&extension_store_audit.step);
     b.step("antfly-metadata-sql-extension-test", "Verify native extension catalog atomic outcomes and cold membership").dependOn(&extension_store_run.step);
+    const native_routing_filters: []const []const u8 = &.{"SQL native runtime reports preserve catalog projection and publication proofs across observation time"};
+    const native_routing_tests = b.addTest(.{
+        .root_module = options.metadata_storage_test_mod,
+        .filters = native_routing_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const native_routing_run = addFilteredTestRunArtifact(b, native_routing_tests);
+    native_routing_run.addArg("--require-no-skips");
+    const native_routing_inventory = b.addRunArtifact(native_routing_tests);
+    native_routing_inventory.addArg("--list-tests");
+    const native_routing_audit = b.addSystemCommand(&.{"python3"});
+    native_routing_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for (native_routing_filters) |filter| native_routing_audit.addArgs(&.{ "--filter", filter });
+    native_routing_audit.addArg("--inventory");
+    native_routing_audit.addFileArg2(native_routing_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    native_routing_run.step.dependOn(&native_routing_audit.step);
+    b.step("antfly-metadata-native-routing-projection-test", "Verify runtime observations retain routing cuts without weakening publication proofs").dependOn(&native_routing_run.step);
     const scope_retirement_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "SQL scope retirement", "system catalog qualified DROP", "system catalog relation namespace transaction journal", "SQL command fence ordinary catalog DDL journals", "metadata raft apply store snapshot key registry", "relational index publication terminal ACK snapshot key registry", "SQL logical relation native reverse lookup survives cold publication", "SQL relation lifetime retired native group pointers preserve full width namespace and reject noncanonical aliases", "SQL relation lifetime retired native group pointers refuse active journals and never infer retirement from absence", "SQL relation lifetime native restore acceptance binds actual image position attempt and current initialized Boot", "SQL relation lifetime compact scope receipts retain the native decoder requirement", "SQL relation lifetime provisioning head binds native descriptor and preserves permanent legacy bytes", "SQL relation lifetime compact planning preserves native execution class and ordinary omission", "SQL relation lifetime clean adoption binds exact prior receipt and immutable image", "SQL relation lifetime native catalog publication requires data6 and persists the future-owner floor", "SQL relation lifetime native restore authority reads bind exact hidden plan and owner without Raft placement", "SQL relation lifetime lost directory retirement requires the accepting metadata proof", "SQL relation lifetime cached write validation requires current authenticated connection owner", "SQL relation lifetime TEMP source binding preserves exact registration and all Owner fields", "SQL relation lifetime TEMP source binding rejects successor replacement and cold index corruption", "SQL relation lifetime TEMP source cleanup fences only its admitted backend across reincarnation", "SQL relation lifetime abandoned TEMP discovery uses exact completed source and never fences successor", "SQL native generation retirement", "SQL native image", "SQL native empty", "SQL native unpublished", "SQL native prepared", "SQL native restore terminal", "SQL prepared native retirement", "SQL prepared transaction terminal session ACK requires canonical native handoff and retains cold replay outcomes", "SQL prepared transaction named lock participant survives bounded cold handoff and resolution without its source", "native restore capability", "trigger restore cold lease", "SQL table trigger source qualification", "SQL table trigger decoder", "SQL native population cancellation", "metadata module compiles", "metadata storage module compiles" },

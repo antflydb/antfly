@@ -14856,7 +14856,12 @@ pub const DataServer = struct {
         if (input.native_execution) |hint| if (descriptor.sql_persistence == null or !descriptor.sql_persistence.?.eql(hint)) return error.SqlRelationOwnerChanged;
         var initialized_descriptor: ?antfly.public_api.ProvisionedKernelOwnerSource.OwnedRestoreDescriptor = null;
         defer if (initialized_descriptor) |*value| value.deinit(alloc);
-        if (descriptor.sql_persistence != null and local_term == null and progress.state != .published and
+        if (input.native_empty_identity) {
+            if (local_term != null or (progress.state != .importing and progress.state != .validating)) return error.RestoreStagingScopeChanged;
+            initialized_descriptor = try recoverRestoreDescriptor(self, alloc, group_id, table_name, input.scope.digest(), input.scope.plan_id, .read, context);
+            descriptor = initialized_descriptor.?.descriptor;
+        }
+        if (!input.native_empty_identity and descriptor.sql_persistence != null and local_term == null and progress.state != .published and
             (input.scope.empty_generation or input.scope.population != null) and
             input.action != .publish and input.action != .cancel and !descriptor.restore_cancel_recovery)
         {
@@ -33339,7 +33344,7 @@ fn storeNativeGenerationRestoreCapabilityVisible(
     for (stores) |store| {
         if (store.store_id == store_id) {
             return store.native_generation_restore_version >=
-                antfly.metadata.table_manager.native_generation_restore_protocol_version;
+                antfly.metadata.table_manager.native_generation_restore_base_protocol_version;
         }
     }
     return false;
@@ -38054,6 +38059,226 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "data runtime native reset generation two births a real owner under the current recovering Boot" {
+            const a = std.testing.allocator;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const replica_root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/reset-birth-data", .{tmp.sub_path});
+            const metadata_root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/reset-birth-metadata", .{tmp.sub_path});
+            const local = @import("antfly_local_sources");
+            const stages = @import("../metadata/restore_staging.zig");
+            const boots = @import("../metadata/sql_relation_boots.zig");
+            const wire = @import("../metadata/sql_relation_boot_wire.zig");
+            const domain = local.system_catalog_domain;
+            const group = local.common_group_ids.main_metadata_group_id;
+            const incarnation = "07070707070707070707070707070707".*;
+            var store = try antfly.metadata.RaftApplyStore.init(a, .{ .root_dir = metadata_root });
+            defer store.deinit();
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(scratch, @import("../metadata/topology_protocol.zig").Activation{ .version = @import("../metadata/topology_protocol.zig").current_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+            const Provider = struct {
+                store: *antfly.metadata.RaftApplyStore,
+                withhold_shutdown: bool = false,
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return .{ .metadata_group_id = group, .metadata_incarnation = incarnation, .metrics = .{} };
+                }
+                fn identity(_: *anyopaque) !antfly.metadata_api.CatalogIdentity {
+                    return .{ .metadata_group_id = group, .metadata_incarnation = incarnation };
+                }
+                fn noAdmin(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return error.UnexpectedUnscopedCatalogRead;
+                }
+                fn freeAdmin(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn boot(raw: *anyopaque, alloc: std.mem.Allocator, query: boots.Query, _: ?u64) !boots.Observation {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const bytes = try self.store.sqlRelationBootJson(alloc, group, query);
+                    defer alloc.free(bytes);
+                    var parsed = try std.json.parseFromSlice(boots.Observation, alloc, bytes, .{});
+                    defer parsed.deinit();
+                    return parsed.value;
+                }
+                fn catalog(self: *@This()) antfly.public_api.table_catalog.CatalogSource {
+                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = noAdmin, .free_admin_snapshot = freeAdmin, .catalog_identity = identity, .sql_relation_boot = boot } };
+                }
+                fn system(raw: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try context.ensureActive();
+                    return switch (call) {
+                        .sql_relation_boot_read => |query| self.store.sqlRelationBootJson(alloc, group, query),
+                        .sql_relation_boot_submit => |bytes| submission: {
+                            if (self.withhold_shutdown) {
+                                var parsed = try wire.Request.parse(alloc, bytes);
+                                defer parsed.deinit();
+                                if (parsed.value.command == .begin_drain or parsed.value.command == .finish_drain)
+                                    return error.MetadataUnavailable;
+                            }
+                            break :submission @import("../metadata/sql_relation_boot_service.zig").submitStandalone(self.store, alloc, group, context, bytes);
+                        },
+                        else => error.UnexpectedResetBirthCatalogCall,
+                    };
+                }
+                fn job(raw: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, _: antfly.public_api.operation.RequestContext) !?[]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    var value = (try self.store.loadRestoreStaging(alloc, group, id)) orelse return null;
+                    defer value.deinit();
+                    return try std.json.Stringify.valueAlloc(alloc, value.value, .{});
+                }
+                fn progress(raw: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, _: antfly.public_api.operation.RequestContext) !?stages.Progress {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.store.loadRestoreStagingProgress(alloc, group, id);
+                }
+                fn source(self: *@This()) antfly.public_api.http_server.StatusSource {
+                    return .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = system, .get_restore_staging = job, .get_restore_staging_progress = progress } };
+                }
+                fn open(self: *@This(), alloc: std.mem.Allocator, path: []const u8) DataServer {
+                    return DataServer.initFromLocalMetadataSources(alloc, .{ .replica_root_dir = path, .store_registration = .{ .node_id = 9, .store_id = 11, .role = "data" }, .api_server_cfg = .{ .deployment_mode = .standalone } }, self.catalog(), self.source());
+                }
+                fn submit(self: *@This(), alloc: std.mem.Allocator, owner: *antfly.public_api.ProvisionedKernelOwnerSource, root: local.storage_db_root_signing_identity.State, reporter: u64, command: wire.Command) !boots.Observation {
+                    const request = try owner.attestRelationBoot(.{ .metadata_group_id = group, .identity = .{ .metadata_incarnation = incarnation, .node_id = 9, .store_id = 11, .root_incarnation = root.root_incarnation, .public_key = root.public_key }, .reporter_incarnation = reporter, .native_instance = try owner.nativeExecutionInstance(), .command = command }, root);
+                    const bytes = try @import("../metadata/sql_relation_boot_service.zig").submitStandalone(self.store, alloc, group, .{ .setting_admin = true }, try std.json.Stringify.valueAlloc(alloc, request, .{}));
+                    return std.json.parseFromSliceLeaky(boots.Observation, alloc, bytes, .{});
+                }
+                fn register(self: *@This(), alloc: std.mem.Allocator, root: local.storage_db_root_signing_identity.State, reporter: u64) !void {
+                    try self.store.applyStandaloneCommand(group, .{ .upsert_store = .{ .store_id = 11, .node_id = 9, .reporter_incarnation = reporter, .replica_root_incarnation = root.root_incarnation, .replica_root_public_key = root.public_key, .schema_reader = antfly.metadata.table_manager.SchemaReaderCapabilities.current, .role = "data", .live = true, .relational_topology_protocol_version = antfly.metadata.table_manager.native_relation_protocol_version, .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version } });
+                    const identity_value: @import("../metadata/store_root_enrollment.zig").Identity = .{ .metadata_incarnation = incarnation, .node_id = 9, .store_id = 11, .root_incarnation = root.root_incarnation, .public_key = root.public_key };
+                    try self.store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = try std.json.Stringify.valueAlloc(alloc, try @import("../metadata/store_root_enrollment.zig").Request.sign(identity_value, root.seed), .{}) });
+                }
+            };
+            var provider: Provider = .{ .store = &store };
+            var old_table: antfly.metadata.TableRecord = undefined;
+            var before: @import("../metadata/sql_relation_attestation.zig").SignedBinding = undefined;
+            var previous: boots.Record = undefined;
+            var signing_root: local.storage_db_root_signing_identity.State = undefined;
+            const old_range: antfly.metadata.RangeRecord = .{ .table_id = 7, .group_id = 42, .range_id = 42, .doc_identity_shard_id = 42, .doc_identity_range_id = 42, .start_key = "" };
+            const old_binding: domain.Resource = .{ .kind = .table, .id = 7, .sql_relation_id = 41, .parent_id = domain.default_namespace_id, .name = "rows", .storage_name = "rows" };
+            {
+                var first = provider.open(a, replica_root);
+                defer first.deinit();
+                _ = try first.ensureBackendRuntime();
+                const owner = try first.ensureKernelOwnerSource();
+                const instance = try owner.nativeExecutionInstance();
+                signing_root = try local.storage_db_root_signing_identity.loadOrCreate(scratch, std.testing.io, replica_root);
+                try provider.register(scratch, signing_root, 1);
+                const before_claim = try store.standaloneRevisionState();
+                const claimed = try provider.submit(scratch, owner, signing_root, 1, .{ .claim = .{ .node_id = 9, .instance = instance, .expected_generation = 0, .expected_instance = null } });
+                const after_claim = try store.standaloneRevisionState();
+                try std.testing.expectEqual(before_claim.revision + 1, after_claim.revision);
+                try std.testing.expect(after_claim.projection_revision > before_claim.projection_revision);
+                const ready = try provider.submit(scratch, owner, signing_root, 1, .{ .advance = .{ .expected = claimed.record.?, .after = null } });
+                previous = try ready.requireReady();
+                const persistence: local.common_topology_records.RelationPersistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = instance, .data_generation = 1 };
+                old_table = .{ .table_id = 7, .name = "rows", .schema_json = "{}", .sql_persistence = persistence, .desired_replica_count = 1 };
+                const resources = [_]domain.Resource{ .{ .kind = .database, .id = domain.default_database_id, .name = domain.default_database_name }, .{ .kind = .namespace, .id = domain.default_namespace_id, .parent_id = domain.default_database_id, .name = domain.default_namespace_name }, old_binding };
+                try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .tables = &.{old_table}, .ranges = &.{old_range}, .auxiliary_json = "{}", .import_catalog = .{ .revision = 1, .next_id = 42, .resources = &resources } });
+                try owner.admitRelationHost(.{ .node_id = 9, .store_id = 11, .execution_instance = instance, .generation_instance = instance, .data_generation = 1 }, previous.boot());
+                const path = try std.fmt.allocPrint(scratch, "{s}/group-42/table-db", .{replica_root});
+                const old_descriptor: kernel_owner_descriptor.Descriptor = .{ .lsm_root_generation = first.provisioned_storage.groupVisibleRootGenerationSource().visibleRootGenerationForGroup(42), .identity = .{ .table_id = 7, .shard_id = 42, .range_id = 42 }, .schema_json = "{}", .indexes_json = "{}", .table_storage = old_table.storage, .sql_persistence = persistence };
+                const before_initialized = try store.standaloneRevisionState();
+                try first.initializeNativeDescriptor(scratch, group, previous, 42, "rows", path, old_descriptor, null, .{});
+                const after_initialized = try store.standaloneRevisionState();
+                try std.testing.expectEqual(before_initialized.revision + 1, after_initialized.revision);
+                try std.testing.expectEqual(before_initialized.projection_revision, after_initialized.projection_revision);
+                before = (try Provider.boot(&provider, scratch, .{ .node = 9, .binding_table = 7 }, null)).initialized.?;
+                try before.verify();
+                {
+                    // This is actual native-primary user data, committed only
+                    // after the durable initialized-image proof was published.
+                    var row_owner = try owner.leaseTransitionOwner(42, "rows", old_descriptor);
+                    defer row_owner.deinit();
+                    var written = try row_owner.lease.entry.owner.batchJson("rows", "{\"inserts\":{\"old-row\":{\"id\":1}},\"sync_level\":\"write\"}");
+                    written.deinit();
+                    const populated = try row_owner.lease.entry.owner.nativeRelationBinding(scratch, "rows");
+                    try std.testing.expect(populated.has_user_data);
+                }
+                // Withhold the actual shutdown transport before deinit: an
+                // orderly native flush is not itself a metadata clean receipt.
+                provider.withhold_shutdown = true;
+            }
+            provider.withhold_shutdown = false;
+            const retained_boot = (try Provider.boot(&provider, scratch, .{ .node = 9 }, null)).record.?;
+            try std.testing.expectEqualDeep(previous, retained_boot);
+            try std.testing.expectEqual(.ready, retained_boot.phase);
+            // Destroy the first real native context without a metadata clean
+            // receipt. The next claim therefore follows the actual unclean path.
+            var restarted = provider.open(a, replica_root);
+            defer restarted.deinit();
+            _ = try restarted.ensureBackendRuntime();
+            const owner = try restarted.ensureKernelOwnerSource();
+            const instance = try owner.nativeExecutionInstance();
+            try std.testing.expect(!std.mem.eql(u8, &instance, &previous.instance));
+            try provider.register(scratch, signing_root, 2);
+            const before_recovery = try store.standaloneRevisionState();
+            const claimed = try provider.submit(scratch, owner, signing_root, 2, .{ .claim = .{ .node_id = 9, .instance = instance, .expected_generation = previous.generation, .expected_instance = previous.instance } });
+            const after_recovery = try store.standaloneRevisionState();
+            try std.testing.expectEqual(before_recovery.revision + 1, after_recovery.revision);
+            try std.testing.expect(after_recovery.projection_revision > before_recovery.projection_revision);
+            const boot = claimed.record.?;
+            try std.testing.expect(boot.phase == .recovering and boot.unclean_restart);
+            var successor = old_table.sql_persistence.?;
+            successor.data_generation = 2;
+            successor.generation_instance = instance;
+            const target_range: antfly.metadata.RangeRecord = .{ .table_id = 8, .group_id = 43, .range_id = 43, .doc_identity_shard_id = 43, .doc_identity_range_id = 43, .start_key = "" };
+            const target_table: antfly.metadata.TableRecord = .{ .table_id = 8, .name = "rows", .schema_json = "{}", .sql_persistence = successor, .desired_replica_count = 1 };
+            const guard: @import("../metadata/sql_relation_recovery.zig").Guard = .{ .before = before, .source_group_id = 42, .lost_boot_generation = boot.generation, .lost_native_instance = instance, .catalog_revision = (try store.systemCatalogMeta(scratch, group)).revision };
+            const target: stages.Target = .{ .source_table_id = 7, .table = target_table, .ranges = &.{target_range}, .catalog_binding = try old_binding.withPhysicalRelationId(8), .empty_generation = true, .native_reset = guard, .replace = .{ .table = old_table, .ranges = &.{old_range} } };
+            const plan: stages.Plan = .{ .id = @splat(5), .cohort_digest = @splat(6), .targets = &.{target} };
+            try plan.validate(scratch);
+            const digest = try plan.digest(scratch);
+            try store.applyStandaloneCommand(group, .{ .apply_restore_staging = try std.json.Stringify.valueAlloc(scratch, stages.Command{ .id = plan.id, .action = .reserve, .plan = plan }, .{}) });
+            const scope = try stages.ownerScope(scratch, plan, digest, target, target_range);
+            const identity_request: antfly.public_api.restore_owner.Request = .{ .scope = scope, .action = .status, .native_empty_identity = true };
+            // This read-only projection must not initialize a missing image.
+            try std.testing.expectError(error.SqlRelationRecoveryIncomplete, DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, identity_request, .{}));
+            try std.testing.expect((try Provider.boot(&provider, scratch, .{ .node = 9, .binding_table = 8, .creation_scope = .{ .plan_id = plan.id, .plan_digest = digest } }, null)).initialized == null);
+            const request: antfly.public_api.restore_owner.Request = .{ .scope = scope, .action = .begin };
+            // Real compiled receiver -> native context/CABI primary creation ->
+            // actual signing -> real metadata submit. No synthetic owner ACK.
+            const before_birth = try store.standaloneRevisionState();
+            _ = try DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, request, .{ .deadline_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_s });
+            const after_birth = try store.standaloneRevisionState();
+            try std.testing.expectEqual(before_birth.revision + 1, after_birth.revision);
+            try std.testing.expectEqual(before_birth.projection_revision, after_birth.projection_revision);
+            const observed = try Provider.boot(&provider, scratch, .{ .node = 9, .binding_table = 8, .creation_scope = .{ .plan_id = plan.id, .plan_digest = digest } }, null);
+            const initialized = observed.initialized orelse return error.TestExpectedRealInitializedBinding;
+            try initialized.verify();
+            try std.testing.expect(initialized.binding.descriptor.eql(successor));
+            try std.testing.expectEqual(boot.generation, initialized.boot_generation);
+            try std.testing.expectEqual(instance, initialized.binding.native_instance);
+            try std.testing.expectEqual(@as(u64, 8), initialized.binding.table_id);
+            try std.testing.expectEqual(@as(u64, 43), initialized.binding.shard_id);
+            try std.testing.expectEqual(@as(u64, 43), initialized.binding.range_id);
+            try std.testing.expectEqualDeep(@as(?@import("../metadata/sql_relation_attestation.zig").CreationScope, .{ .plan_id = plan.id, .plan_digest = digest }), initialized.creation_scope);
+            try std.testing.expect(!initialized.binding.has_user_data and !initialized.binding.has_transaction_state);
+            const plain_status = try DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, .{ .scope = scope, .action = .status }, .{});
+            try std.testing.expect(plain_status.native_empty_identity == null);
+            const status = try DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, identity_request, .{});
+            const actual_identity = status.native_empty_identity orelse return error.TestExpectedNativeEmptyIdentity;
+            try std.testing.expect(actual_identity.namespace.eql(scope.target_namespace));
+            try actual_identity.requireGenerationHandoffReceipts();
+            try std.testing.expectEqual(.recovering, (try Provider.boot(&provider, scratch, .{ .node = 9 }, null)).record.?.phase);
+            var forbidden = identity_request;
+            forbidden.action = .validate;
+            try std.testing.expectError(error.InvalidRestoreStagingCommand, DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, forbidden, .{}));
+            forbidden = identity_request;
+            forbidden.scope.native_empty_origin = null;
+            try std.testing.expectError(error.InvalidRestoreStagingCommand, DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, forbidden, .{}));
+            forbidden = identity_request;
+            forbidden.scope.plan_digest[0] ^= 1;
+            try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, forbidden, .{}));
+            {
+                var captured = try DataServer.recoverRestoreDescriptor(&restarted, scratch, 43, "rows", scope.digest(), plan.id, .read, .{});
+                defer captured.deinit(scratch);
+                var row_owner = try owner.leaseTransitionOwner(43, "rows", captured.descriptor);
+                defer row_owner.deinit();
+                // The owned status projection is not a user-row read grant.
+                try std.testing.expectError(error.RestoreStagingInProgress, row_owner.lease.entry.owner.lookupJson("rows", "{\"key\":\"old-row\"}"));
+            }
+            try std.testing.expectEqualDeep(before, (try Provider.boot(&provider, scratch, .{ .node = 9, .binding_table = 7 }, null)).initialized.?);
+        }
+
         test "data runtime native restore phase two rejoins activating descriptor authority" {
             const stages = @import("../metadata/restore_staging.zig");
             const a = std.testing.allocator;
