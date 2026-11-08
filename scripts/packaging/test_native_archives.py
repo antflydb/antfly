@@ -69,6 +69,46 @@ class NativeArchivesTests(unittest.TestCase):
                 else:
                     verify(root, platform, ["embedded"])
 
+    def test_apple_enabled_darwin_archive_requires_a_valid_bridge(self):
+        platform = {
+            "archive_os": "Darwin",
+            "archive_arch": "arm64",
+            "archive_suffix": "",
+            "apple_providers": True,
+        }
+        header = b"\xcf\xfa\xed\xfe" + (0x100000C).to_bytes(4, "little") + bytes(12)
+        for bridge in (None, b"wrong binary", header):
+            with (
+                self.subTest(bridge=bridge),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                with tarfile.open(
+                    root / "antfly-embedded_test_Darwin_arm64.tar.gz", "w:gz"
+                ) as archive:
+                    files = {
+                        name: header
+                        for name in (
+                            "lib/libantfly.dylib",
+                            "include/antfly.h",
+                            "lib/pkgconfig/libantfly.pc",
+                            "README.md",
+                            "LICENSE",
+                            "THIRD_PARTY_NOTICES.md",
+                        )
+                    }
+                    if bridge is not None:
+                        files["lib/libantfly-apple.dylib"] = bridge
+                    for name, body in files.items():
+                        member = tarfile.TarInfo(name)
+                        member.size = len(body)
+                        archive.addfile(member, io.BytesIO(body))
+                if bridge == header:
+                    verify(root, platform, ["embedded"])
+                else:
+                    with self.assertRaises(ValueError):
+                        verify(root, platform, ["embedded"])
+
     def test_darwin_size_gate_uses_exact_bytes_and_reports_measured_size(self):
         platform = {
             "archive_os": "Darwin",

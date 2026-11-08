@@ -30968,6 +30968,21 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
     }
+    /// Constant-size serving authority, updated in the lifecycle transaction.
+    /// Old restored checkpoints can reconstruct it on the metadata owner.
+    pub fn getLakeSourceOwner(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
+        const view = @import("../lake_source_owner_view.zig");
+        var buffer: [160]u8 = undefined;
+        return self.store.get(a, try lakeSourceOwnerKeyForGroup(&buffer, group_id, table_id)) catch |err| switch (err) {
+            error.NotFound => fallback: {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const bytes = try self.getLakeIndexLifecycle(arena.allocator(), group_id, table_id);
+                break :fallback try view.encode(a, try view.fromLifecycle(arena.allocator(), bytes));
+            },
+            else => return err,
+        };
+    }
     /// Independent retained rows include DROP tombstones. A single bounded
     /// point-sized page avoids cloning the visible table inventory or losing
     /// collection obligations when their logical table has disappeared.
@@ -31002,6 +31017,12 @@ pub const RaftApplyStore = struct {
         const bytes = try @import("../lake_index_lifecycle.zig").encode(self.alloc, state);
         defer self.alloc.free(bytes);
         try txn.put(try lakeIndexLifecycleKeyForGroup(&buffer, group_id, table_id), bytes);
+        // Materialize absence too: unowned sources must not decode retained
+        // lifecycle history on every query just to discover no native owner.
+        const view = @import("../lake_source_owner_view.zig");
+        const projected = try view.encode(self.alloc, .{ .dropped = state.dropped, .owner = state.source_owner });
+        defer self.alloc.free(projected);
+        try txn.put(try lakeSourceOwnerKeyForGroup(&buffer, group_id, table_id), projected);
     }
     fn prepareLakeIndexLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !?[]u8 {
         // Legacy/native tables without lake state don't create maintenance rows.
@@ -31034,6 +31055,13 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         if (state.revision != revision) return;
+        if (mutation.sourceScope()) |scope| {
+            var key_buffer: [160]u8 = undefined;
+            const bytes = (try stagingGet(txn, try tableKeyForGroup(&key_buffer, group_id, table_id))) orelse return;
+            const table = try decodeTableRecord(a, bytes);
+            if (state.dropped or table.object_storage_generation != scope.object_generation or
+                !std.mem.eql(u8, &@import("antfly_local_sources").metadata_lake_index_catalog.desiredFingerprint(table), &scope.desired)) return;
+        }
         const next = mutation.apply(a, state) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return,
@@ -34512,6 +34540,7 @@ pub const RaftApplyStore = struct {
         schema_validation,
         schema_validation_dependency,
         sql_logical_relations,
+        lake_source_owner,
     };
     const MetadataSnapshotKey = union(enum) {
         prefix: MetadataSnapshotKeyFn,
@@ -34564,6 +34593,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .table, .key = .{ .prefix = tablePrefixForGroup } },
         .{ .projection = .resolver_namespaces, .key = .{ .prefix = resolverNamespacePrefix } },
         .{ .projection = .lake_index_lifecycle, .key = .{ .prefix = lakeIndexLifecyclePrefixForGroup } },
+        .{ .projection = .lake_source_owner, .key = .{ .prefix = lakeSourceOwnerPrefixForGroup } },
         .{ .projection = .table_transition_fence, .key = .{ .prefix = tableTransitionFencePrefixForGroup } },
         .{ .projection = .schema_progress, .key = .{ .prefix = schemaProgressPrefixForGroup } },
         .{ .projection = .restore_progress, .key = .{ .prefix = restoreProgressPrefixForGroup } },
@@ -34736,11 +34766,16 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) | metadataSnapshotProjectionBit(.relation_source)
         else
             mask;
-        // Explicit logical identity and its reverse row share one writer.
-        return if ((expanded & metadataSnapshotProjectionBit(.system_catalog)) != 0)
+        // Logical identity and lake ownership projections are both updated
+        // in the same writer as their respective catalog/lifecycle families.
+        const logical_mask = if ((expanded & metadataSnapshotProjectionBit(.system_catalog)) != 0)
             expanded | metadataSnapshotProjectionBit(.sql_logical_relations)
         else
             expanded;
+        return if ((logical_mask & metadataSnapshotProjectionBit(.lake_index_lifecycle)) != 0)
+            logical_mask | metadataSnapshotProjectionBit(.lake_source_owner)
+        else
+            logical_mask;
     }
 
     const PreparedSnapshot = struct {
@@ -57549,7 +57584,10 @@ test "SQL scope retirement logical relation directory snapshots retain exact OID
     inline for (.{ .apply_system_catalog, .apply_restore_staging, .apply_scope_retirement, .apply_table_topology }) |tag| {
         const mask = RaftApplyStore.transitionCommandProjectionMask(tag);
         try std.testing.expect(mask & RaftApplyStore.metadataSnapshotProjectionBit(.sql_logical_relations) != 0);
+        try std.testing.expect(mask & RaftApplyStore.metadataSnapshotProjectionBit(.lake_source_owner) != 0);
     }
+    const lifecycle_mask = RaftApplyStore.transitionCommandProjectionMask(.mutate_lake_index_lifecycle);
+    try std.testing.expect(lifecycle_mask & RaftApplyStore.metadataSnapshotProjectionBit(.lake_source_owner) != 0);
     const snapshot = try store.snapshotBuilder().buildSnapshot(scratch, group);
     const rows = try decodeMetadataSnapshotAlloc(scratch, snapshot);
     var reverse_count: usize = 0;
@@ -57975,6 +58013,12 @@ fn mergeTransitionKeyForGroup(buf: []u8, group_id: u64, transition_id: u64) ![]c
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_transition:merge:{d}:{d}", .{ group_id, transition_id });
 }
 
+fn lakeSourceOwnerPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:lake_source_owner:{d}:", .{group_id});
+}
+fn lakeSourceOwnerKeyForGroup(buf: []u8, group_id: u64, table_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:lake_source_owner:{d}:{d}", .{ group_id, table_id });
+}
 fn lakeIndexLifecyclePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:lake_index_lifecycle:{d}:", .{group_id});
 }
@@ -67753,6 +67797,17 @@ test "metadata.lake reader authority survives DROP and snapshots without changin
     published.lake_index_catalog_json = try lake.encode(ca, ready);
     try store.applyStandaloneCommand(group_id, .{ .compare_and_replace_table = .{ .expected = building, .replacement = published } });
     var control = try lifecycle.parse(ca, try store.getLakeIndexLifecycle(ca, group_id, 4));
+    const owner_view = @import("../lake_source_owner_view.zig");
+    var owner_key: [160]u8 = undefined;
+    const unowned = try store.store.get(ca, try lakeSourceOwnerKeyForGroup(&owner_key, group_id, 4));
+    try std.testing.expect(unowned.len < 128);
+    try std.testing.expect((try owner_view.parse(ca, unowned)).owner == null);
+    const source_scope: lifecycle.SourceScope = .{ .object_generation = table.object_storage_generation, .desired = signature.desired, .owner = @splat(8) };
+    try store.applyStandaloneCommand(group_id, .{ .mutate_lake_index_lifecycle = .{ .table_id = 4, .expected_revision = control.revision, .mutation = .{ .configure_source = .{ .scope = source_scope, .state = .{ .kind = .managed_iceberg, .owner = source_scope.owner, .signing_key = @splat(9), .object_generation = table.object_storage_generation, .source = @splat(7) } } } } });
+    control = try lifecycle.parse(ca, try store.getLakeIndexLifecycle(ca, group_id, 4));
+    const compact = try store.getLakeSourceOwner(ca, group_id, 4);
+    try std.testing.expect(std.mem.indexOf(u8, compact, "publications") == null);
+    try std.testing.expectEqualSlices(u8, &source_scope.owner, &(try owner_view.parse(ca, compact)).owner.?.owner);
     const command: TransitionCommand = .{ .mutate_lake_index_lifecycle = .{ .table_id = 4, .expected_revision = control.revision, .mutation = .{ .acquire = .{ .token = @splat(9), .generation = 1, .now_ms = 102 } } } };
     const encoded = try encodeTransitionCommand(ca, command);
     var decoded = (try decodeTransitionCommand(a, encoded)).?;
@@ -67785,6 +67840,9 @@ test "metadata.lake reader authority survives DROP and snapshots without changin
     try std.testing.expect(control.dropped);
     try std.testing.expectEqual(@as(usize, 1), control.readers.len);
     try std.testing.expectEqual(@as(usize, 1), control.publications.len);
+    const restored_owner = try owner_view.parse(ca, try store.getLakeSourceOwner(ca, group_id, 4));
+    try std.testing.expect(restored_owner.dropped);
+    try std.testing.expectEqualSlices(u8, &source_scope.owner, &restored_owner.owner.?.owner);
 }
 
 test "metadata runtime index source producer completion uses framed extension and missing proof stays pending" {

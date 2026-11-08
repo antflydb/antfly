@@ -41,6 +41,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
+    pdf_test_mod.addImport("pdf_values", createValuesModule(b, options.root, target, optimize));
+    addSharedNamespaces(b, pdf_test_mod, options.root, target, optimize, pdf_standard_fonts_mod);
     pdf_test_mod.addImport("antfly_image", image_mod);
     pdf_test_mod.addImport("antfly_hash", options.hash_mod);
     pdf_test_mod.addImport("antfly_font", font_mod);
@@ -87,12 +89,18 @@ pub fn addSafetyTests(b: *std.Build, pdf_mod: *std.Build.Module) *std.Build.Step
     });
 }
 
+pub fn createValuesModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = root.path(b, "src/values.zig"), .target = target, .optimize = optimize });
+}
+
 pub fn createModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, image: *std.Build.Module, hash: *std.Build.Module, font: *std.Build.Module, standard_fonts: *std.Build.Module, platform: *std.Build.Module) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = root.path(b, "src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
+    module.addImport("pdf_values", createValuesModule(b, root, target, optimize));
+    addSharedNamespaces(b, module, root, target, optimize, standard_fonts);
     module.addImport("antfly_image", image);
     module.addImport("antfly_hash", hash);
     module.addImport("antfly_font", font);
@@ -104,4 +112,16 @@ pub fn createModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.R
         module.linkFramework("CoreGraphics", .{});
     }
     return module;
+}
+
+/// Keep PDF value namespaces canonical when raw readers and facades coexist.
+fn addSharedNamespaces(b: *std.Build, module: *std.Build.Module, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, standard_fonts: *std.Build.Module) void {
+    const syntax = b.createModule(.{ .root_source_file = root.path(b, "src/syntax.zig"), .target = target, .optimize = optimize });
+    const text = b.createModule(.{ .root_source_file = root.path(b, "src/text_encoding.zig"), .target = target, .optimize = optimize });
+    text.addImport("pdf_standard_fonts", standard_fonts);
+    module.addImport("pdf_syntax", syntax);
+    module.addImport("pdf_text_encoding", text);
+    const structure = b.createModule(.{ .root_source_file = root.path(b, "src/text_structure.zig"), .target = target, .optimize = optimize });
+    structure.addImport("pdf_values", module.import_table.get("pdf_values").?);
+    module.addImport("pdf_text_structure", structure);
 }

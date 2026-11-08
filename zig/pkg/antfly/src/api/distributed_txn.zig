@@ -80,12 +80,12 @@ test "distributed txn range guard wire preserves absent and exact counters" {
                 freeTxnPrepareRequest(alloc, &unexpected);
                 return error.TestExpectedError;
             } else |err| if (err != error.InvalidTxnRequest) return err;
-            const batch_bytes = try @import("antfly_local_sources").api_batch.encodeBatchRequest(alloc, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3 } }, .range_guards = &proofs });
+            const batch_bytes = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3 } }, .range_guards = &proofs });
             defer alloc.free(batch_bytes);
-            var batch = try @import("antfly_local_sources").api_batch.parseInternalBatchRequest(alloc, batch_bytes);
+            var batch = try @import("antfly_local_sources").api_internal_batch.parseInternalBatchRequest(alloc, batch_bytes);
             defer batch.deinit(alloc);
             try std.testing.expectEqualDeep(&proofs, batch.req.range_guards);
-            if (@import("antfly_local_sources").api_batch.parseBatchRequest(alloc, batch_bytes)) |value| {
+            if (@import("antfly_local_sources").api_internal_batch.parseBatchRequest(alloc, batch_bytes)) |value| {
                 var unexpected = value;
                 unexpected.deinit(alloc);
                 return error.TestExpectedError;
@@ -102,7 +102,7 @@ const PrepareExtensions = struct {
 };
 
 pub const TxnPrepareRequest = struct {
-    trigger_batch_owner: ?*@import("antfly_local_sources").api_batch.OwnedBatchRequest = null,
+    trigger_batch_owner: ?*@import("antfly_local_sources").api_internal_batch.OwnedBatchRequest = null,
     extensions_owner: ?std.json.Parsed(PrepareExtensions) = null,
     route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
     range_guards_owner: ?std.json.Parsed([]const @import("antfly_local_sources").storage_range_protection.Proof) = null,
@@ -111,7 +111,7 @@ pub const TxnPrepareRequest = struct {
     req: db_mod.types.TransactionIntentRequest,
     /// Internal parser ownership only; never serialized as a request field.
     integrity_commands_owner: ?std.json.Parsed([]const integrity_wire.Command) = null,
-    prepared_domain_owner: ?@import("antfly_local_sources").api_batch.DomainHandoff.Owned = null,
+    prepared_domain_owner: ?@import("antfly_local_sources").api_internal_batch.DomainHandoff.Owned = null,
     relational_activation_owner: ?std.json.Parsed(integrity_activation.Command) = null,
     relational_retirement_owner: ?std.json.Parsed(integrity_retirement.Command) = null,
     relational_index_maintenance_owner: ?std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Command) = null,
@@ -3139,8 +3139,8 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     const guarded = req.req.range_guards.len != 0;
-    const row_semantics = @import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
-    const handoff = @import("antfly_local_sources").api_batch.DomainHandoff;
+    const row_semantics = @import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
+    const handoff = @import("antfly_local_sources").api_internal_batch.DomainHandoff;
     const domains = handoff.present(req.req.writes);
     try handoff.requireUniqueKeys(alloc, req.req.writes);
     if (req.req.external_decision_owner != null) try out.appendSlice(alloc, "[\"external-prepare-v1\",") else if (domains and policy) try out.appendSlice(alloc, "[\"row-policy-prepare-v2\",") else if (domains) try out.appendSlice(alloc, "[\"row-semantics-prepare-v2\",") else if (policy) try out.appendSlice(alloc, "[\"row-policy-prepare-v1\",") else if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
@@ -3534,7 +3534,7 @@ fn validatePreparePolicyAuthority(proof: []const u8, database: []const u8, admit
 }
 
 fn encodeTriggerPrepare(a: std.mem.Allocator, req: TxnPrepareRequest) ![]u8 {
-    const batch = try @import("antfly_local_sources").api_batch.encodeBatchRequest(a, req.req.asBatch(req.txn_id, req.topology_epoch));
+    const batch = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(a, req.req.asBatch(req.txn_id, req.topology_epoch));
     defer a.free(batch);
     const route = try std.json.Stringify.valueAlloc(a, req.route_fence, .{});
     defer a.free(route);
@@ -3542,9 +3542,9 @@ fn encodeTriggerPrepare(a: std.mem.Allocator, req: TxnPrepareRequest) ![]u8 {
 }
 noinline fn parseTriggerPrepare(a: std.mem.Allocator, value: std.json.Value) !TxnPrepareRequest {
     if (value != .object or value.object.count() != 2) return error.InvalidTxnRequest;
-    const owner = try a.create(@import("antfly_local_sources").api_batch.OwnedBatchRequest);
+    const owner = try a.create(@import("antfly_local_sources").api_internal_batch.OwnedBatchRequest);
     errdefer a.destroy(owner);
-    owner.* = try @import("antfly_local_sources").api_batch.parseInternalBatchValue(a, value.object.get("native_batch") orelse return error.InvalidTxnRequest);
+    owner.* = try @import("antfly_local_sources").api_internal_batch.parseInternalBatchValue(a, value.object.get("native_batch") orelse return error.InvalidTxnRequest);
     errdefer owner.deinit(a);
     const command = owner.req.transaction orelse return error.InvalidTxnRequest;
     if (command != .prepare or owner.req.trigger_receipts.len == 0) return error.InvalidTxnRequest;
@@ -3626,10 +3626,10 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
     const writes = try parseTxnWrites(alloc, obj.get("writes") orelse return error.InvalidTxnRequest);
     errdefer freeTxnWrites(alloc, writes);
-    var prepared_domain_owner: ?@import("antfly_local_sources").api_batch.DomainHandoff.Owned = null;
+    var prepared_domain_owner: ?@import("antfly_local_sources").api_internal_batch.DomainHandoff.Owned = null;
     errdefer if (prepared_domain_owner) |*owner| owner.deinit();
     if (obj.get("_prepared_domain_rows")) |value| {
-        const handoff = @import("antfly_local_sources").api_batch.DomainHandoff;
+        const handoff = @import("antfly_local_sources").api_internal_batch.DomainHandoff;
         var wire = try std.json.parseFromValue(handoff.Wire, alloc, value, .{});
         defer wire.deinit();
         prepared_domain_owner = try handoff.attach(alloc, writes, wire.value);
@@ -3675,7 +3675,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     const has_guards = range_guards_owner != null and range_guards_owner.?.value.len != 0;
     if (has_guards and !wrapped) return error.InvalidTxnRequest;
     if (wrapped and !external and !row_semantics and !has_guards) return error.InvalidTxnRequest;
-    if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
+    if (@import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
     return .{
         .extensions_owner = extensions,
         .route_fence = if (route_fence) |fence| fence.value else null,
@@ -3968,7 +3968,7 @@ test "distributed txn restore plan identity survives begin resolve and private b
     unscoped.restore_staging_plan_id = @splat(0);
     try std.testing.expectError(error.InvalidTxnRequest, encodeTxnBeginRequest(alloc, unscoped));
 
-    const batch = @import("antfly_local_sources").api_batch;
+    const batch = @import("antfly_local_sources").api_internal_batch;
     const mutation: db_mod.types.BatchRequest = .{ .restore_staging_scope = scope, .restore_staging_plan_id = plan, .transaction = .{ .resolve = .{ .txn_id = begin.txn_id, .status = .committed, .commit_version = 2 } } };
     const bytes = try batch.encodeBatchRequest(alloc, mutation);
     defer alloc.free(bytes);
@@ -8069,7 +8069,7 @@ test "distributed txn prepare JSON null and insert preconditions survive allocat
 
 test "SQL domain distributed prepare owns shared handoffs and rejects envelope downgrade" {
     const a = std.testing.allocator;
-    const handoff = @import("antfly_local_sources").api_batch.DomainHandoff;
+    const handoff = @import("antfly_local_sources").api_internal_batch.DomainHandoff;
     const prepared_contract: handoff.Contract = .{ .schema_version = 7, .domain_digest = @splat(8) };
     for ([_]bool{ false, true }) |with_policy| {
         const bytes = try encodeTxnPrepareRequest(a, .{ .txn_id = @splat(1), .req = .{
@@ -8184,7 +8184,7 @@ test "raft batch round trips external transaction enlistment authority without d
             defer freeTxnBeginRequest(a, &parsed);
             try std.testing.expectEqualDeep(request, parsed);
             const batch: db_mod.types.BatchRequest = .{ .transaction = .{ .begin = .{ .txn_id = request.txn_id, .begin_timestamp = 10, .created_at_ns = 11, .topology_epoch = 2, .retain_terminal = true, .participants = request.participants, .external_decision_owner = owner } } };
-            const wire = @import("antfly_local_sources").api_batch;
+            const wire = @import("antfly_local_sources").api_internal_batch;
             const bytes = try wire.encodeBatchRequest(a, batch);
             defer a.free(bytes);
             var decoded = try wire.parseInternalBatchRequest(a, bytes);
@@ -8900,9 +8900,9 @@ test "SQL relation lifetime local participant seals trigger effects before actua
             try std.testing.expect(request.trigger_preparation_proof.len != 0);
             try std.testing.expectEqual(group, request.trigger_preparation_group_id);
             const prepared = request.asBatch(id, epoch);
-            const bytes = try local.api_batch.encodeOwnerBatchRequest(alloc, prepared);
+            const bytes = try local.api_internal_batch.encodeOwnerBatchRequest(alloc, prepared);
             defer alloc.free(bytes);
-            var parsed = try local.api_batch.parseInternalBatchRequest(alloc, bytes);
+            var parsed = try local.api_internal_batch.parseInternalBatchRequest(alloc, bytes);
             defer parsed.deinit(alloc);
             try local.sql_catalog.trigger_native_admission.verify(alloc, self.view, parsed.req, "actual-local-user-key", "local-issuer", @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), false);
             return {};

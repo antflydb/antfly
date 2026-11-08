@@ -67,7 +67,7 @@ const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const connections_api = @import("connections.zig");
 const backups_api = @import("backups.zig");
-const batch_api = @import("antfly_local_sources").api_batch;
+const batch_api = @import("antfly_local_sources").api_internal_batch;
 const restore_jobs = @import("restore_jobs.zig");
 const public_table_http = @import("public_table_http.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
@@ -389,6 +389,8 @@ fn witnessDDLError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         error.SqlNamedTypeNotFound => jsonErrorResponse(ctx, 400, "referenced SQL type does not exist"),
         error.CatalogGenerationChanged => jsonErrorResponse(ctx, 409, "referenced catalog definitions changed; refresh and retry"),
         error.MetadataCapabilityUnavailable => jsonErrorResponse(ctx, 503, "referenced schema capabilities are not active on this deployment"),
+        error.InvalidExternalSourceInventory, error.InvalidExternalSourceSnapshot => jsonErrorResponse(ctx, 400, "invalid lake manifest: files require immutable identity, supported format, positive size, and valid inventory metadata"),
+        error.ExternalSourceSnapshotTooLarge => jsonErrorResponse(ctx, 400, "lake manifest exceeds supported inventory limits"),
         error.UnsupportedExternalLakeSchemaType => jsonErrorResponse(ctx, 400, "automatic lake schema detection requires supported flat scalar columns; unsupported nested or binary types need a compatible source"),
         error.ExternalLakeSchemaMismatch => jsonErrorResponse(ctx, 409, "lake files have incompatible column types or the supplied schema fingerprint does not match the detected schema"),
         error.ExternalLakeSchemaUnavailable => jsonErrorResponse(ctx, 400, "lake schema metadata is unavailable; Parquet inference requires at least one file with a schema"),

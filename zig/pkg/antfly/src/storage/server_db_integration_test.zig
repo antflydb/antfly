@@ -4314,7 +4314,7 @@ test "server index status reports ready for converged plural-source dense artifa
 test "external prepared native owners retain typed MVCC across restart and activate before resolution" {
     const a = std.testing.allocator;
     const dispatch = @import("server_transaction_dispatch.zig");
-    const codec = @import("antfly_local_sources").api_batch;
+    const codec = @import("antfly_local_sources").api_internal_batch;
     const contract = @import("antfly_local_sources").api_local_transaction_contract;
     const admission: transactions_mod.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = @import("antfly_platform").time.realtimeNs() + std.time.ns_per_min };
     const id: types.TxnId = @splat(67);

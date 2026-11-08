@@ -1099,126 +1099,129 @@ pub const Detail = enum(c_int) {
     invalid_cypher_parameters,
     missing_cypher_parameter,
     sql_write_capacity_unavailable,
+    invalid_external_source_inventory,
+    invalid_external_source_snapshot,
+    external_source_snapshot_too_large,
     // Unreleased SQL identities append after every published main identity.
-    sql_index_already_exists = 970,
-    sql_constraint_already_exists = 971,
-    program_limit_exceeded = 972,
-    catalog_occupancy_not_ready = 973,
-    unsupported_native_index_owner = 974,
-    invalid_private_index_claim_inventory = 975,
-    invalid_private_index_claim_receipt = 976,
-    private_index_owner_job_changed = 977,
-    private_index_publication_canceled = 978,
-    private_index_job_required = 979,
-    private_index_publication_required = 980,
-    invalid_private_index_owner_job = 981,
-    invalid_private_index_inputs = 982,
-    relational_index_catalog_schema_mismatch = 983,
-    invalid_index_publication_candidate = 984,
-    immutable_relational_index_definition_conflict = 985,
-    private_index_cancellation_pending = 986,
-    private_index_cancellation_required = 987,
-    invalid_private_index_cancellation = 988,
-    invalid_private_index_native_receipt = 989,
-    invalid_relational_index_progress = 990,
-    missing_relational_index_definitions = 991,
-    index_owner_receipt_changed = 992,
-    invalid_index_owner_receipt = 993,
-    sql_invalid_power_argument = 994,
-    invalid_schema_reader_requirements = 995,
-    private_index_root_recovery_required = 996,
-    invalid_relational_index_budget = 997,
-    private_index_claim_backlog_full = 998,
-    partial_index_predicate_not_implied = 999,
-    relational_check_violation = 1000,
-    check_constraint_validation_required = 1001,
-    foreign_key_match_full_violation = 1002,
-    invalid_schema_validation_job = 1003,
-    invalid_schema_validation_page_command = 1004,
-    invalid_schema_validation_token = 1005,
-    schema_validation_canceled = 1006,
-    schema_validation_cancellation_required = 1007,
-    schema_validation_command_rejected = 1008,
-    schema_validation_inputs_required = 1009,
-    schema_validation_job_changed = 1010,
-    schema_validation_job_required = 1011,
-    schema_validation_not_ready = 1012,
-    schema_validation_preparation_changed = 1013,
-    schema_validation_publication_required = 1014,
-    schema_validation_runtime_recovery_required = 1015,
-    store_registration_required = 1016,
-    catalog_publication_fence_unavailable = 1017,
-    undefined_column = 1018,
-    foreign_key_validation_required = 1019,
-    materialized_view_read_only = 1020,
-    raft_apply_writer_unavailable = 1021,
-    sql_database_in_use = 1022,
-    invalid_scope_retirement = 1023,
-    scope_retirement_changed = 1024,
-    sequence_admission_conflict = 1025,
-    invalid_table_retirement_manifest = 1026,
-    sql_program_limit_exceeded = 1027,
-    snapshot_build_cancelled = 1028,
-    catalog_generation_exhausted = 1029,
-    invalid_sql_relation_persistence = 1030,
-    sql_relation_owner_changed = 1031,
-    sql_temporary_relation_not_owned = 1032,
-    invalid_sql_temporary_namespace = 1033,
-    sql_relation_persistence_foreign_key_mismatch = 1034,
-    sql_relation_recovery_incomplete = 1035,
-    sql_relation_owner_unavailable = 1036,
-    invalid_sql_trigger_definition = 1037,
-    invalid_sql_trigger_manifest = 1038,
-    sql_trigger_context_required = 1039,
-    sql_trigger_returned_no_value = 1040,
-    sql_trigger_return_value_required = 1041,
-    sql_trigger_declared_arguments = 1042,
-    sql_trigger_sql_language = 1043,
-    sql_trigger_coordination_required = 1044,
-    invalid_generation_transaction = 1045,
-    generation_transaction_changed = 1046,
-    generation_transaction_decision_required = 1047,
-    invalid_prepared_graph_effects = 1048,
-    sql_prepared_durability_unavailable = 1049,
-    invalid_participant = 1050,
-    catalog_revision_exhausted = 1051,
-    duplicate_sql_extension_export = 1052,
-    duplicate_sql_extension_version = 1053,
-    inconsistent_sql_extension_control = 1054,
-    invalid_package_digest = 1055,
-    invalid_sql_extension_artifact = 1056,
-    invalid_sql_extension_control = 1057,
-    invalid_sql_extension_dependency = 1058,
-    invalid_sql_extension_record = 1059,
-    invalid_sql_extension_runtime = 1060,
-    invalid_sql_extension_package_mutation = 1061,
-    duplicate_sql_extension_control = 1062,
-    sql_dependent_extension_object = 1063,
-    sql_duplicate_extension = 1064,
-    sql_duplicate_function = 1065,
-    sql_extension_control_conflict = 1066,
-    sql_extension_dependency_cycle = 1067,
-    sql_extension_promotion_nonce_conflict = 1068,
-    sql_extension_schema_mismatch = 1069,
-    sql_extension_unavailable = 1070,
-    sql_extension_update_path_unavailable = 1071,
-    sql_extension_version_unavailable = 1072,
-    sql_function_return_type_changed = 1073,
-    sql_required_extension_not_installed = 1074,
-    sql_undefined_extension = 1075,
-    unsupported_sql_extension_object = 1076,
-    sql_extension_owned_object = 1077,
-    duplicate_shape_name = 1078,
-    generated_artifact_shape_required = 1079,
-    no_supported_scopes = 1080,
-    scope_must_not_name_table = 1081,
-    unknown_shape_reference = 1082,
+    sql_index_already_exists = 973,
+    sql_constraint_already_exists = 974,
+    program_limit_exceeded = 975,
+    catalog_occupancy_not_ready = 976,
+    unsupported_native_index_owner = 977,
+    invalid_private_index_claim_inventory = 978,
+    invalid_private_index_claim_receipt = 979,
+    private_index_owner_job_changed = 980,
+    private_index_publication_canceled = 981,
+    private_index_job_required = 982,
+    private_index_publication_required = 983,
+    invalid_private_index_owner_job = 984,
+    invalid_private_index_inputs = 985,
+    relational_index_catalog_schema_mismatch = 986,
+    invalid_index_publication_candidate = 987,
+    immutable_relational_index_definition_conflict = 988,
+    private_index_cancellation_pending = 989,
+    private_index_cancellation_required = 990,
+    invalid_private_index_cancellation = 991,
+    invalid_private_index_native_receipt = 992,
+    invalid_relational_index_progress = 993,
+    missing_relational_index_definitions = 994,
+    index_owner_receipt_changed = 995,
+    invalid_index_owner_receipt = 996,
+    sql_invalid_power_argument = 997,
+    invalid_schema_reader_requirements = 998,
+    private_index_root_recovery_required = 999,
+    invalid_relational_index_budget = 1000,
+    private_index_claim_backlog_full = 1001,
+    partial_index_predicate_not_implied = 1002,
+    relational_check_violation = 1003,
+    check_constraint_validation_required = 1004,
+    foreign_key_match_full_violation = 1005,
+    invalid_schema_validation_job = 1006,
+    invalid_schema_validation_page_command = 1007,
+    invalid_schema_validation_token = 1008,
+    schema_validation_canceled = 1009,
+    schema_validation_cancellation_required = 1010,
+    schema_validation_command_rejected = 1011,
+    schema_validation_inputs_required = 1012,
+    schema_validation_job_changed = 1013,
+    schema_validation_job_required = 1014,
+    schema_validation_not_ready = 1015,
+    schema_validation_preparation_changed = 1016,
+    schema_validation_publication_required = 1017,
+    schema_validation_runtime_recovery_required = 1018,
+    store_registration_required = 1019,
+    catalog_publication_fence_unavailable = 1020,
+    undefined_column = 1021,
+    foreign_key_validation_required = 1022,
+    materialized_view_read_only = 1023,
+    raft_apply_writer_unavailable = 1024,
+    sql_database_in_use = 1025,
+    invalid_scope_retirement = 1026,
+    scope_retirement_changed = 1027,
+    sequence_admission_conflict = 1028,
+    invalid_table_retirement_manifest = 1029,
+    sql_program_limit_exceeded = 1030,
+    snapshot_build_cancelled = 1031,
+    catalog_generation_exhausted = 1032,
+    invalid_sql_relation_persistence = 1033,
+    sql_relation_owner_changed = 1034,
+    sql_temporary_relation_not_owned = 1035,
+    invalid_sql_temporary_namespace = 1036,
+    sql_relation_persistence_foreign_key_mismatch = 1037,
+    sql_relation_recovery_incomplete = 1038,
+    sql_relation_owner_unavailable = 1039,
+    invalid_sql_trigger_definition = 1040,
+    invalid_sql_trigger_manifest = 1041,
+    sql_trigger_context_required = 1042,
+    sql_trigger_returned_no_value = 1043,
+    sql_trigger_return_value_required = 1044,
+    sql_trigger_declared_arguments = 1045,
+    sql_trigger_sql_language = 1046,
+    sql_trigger_coordination_required = 1047,
+    invalid_generation_transaction = 1048,
+    generation_transaction_changed = 1049,
+    generation_transaction_decision_required = 1050,
+    invalid_prepared_graph_effects = 1051,
+    sql_prepared_durability_unavailable = 1052,
+    invalid_participant = 1053,
+    catalog_revision_exhausted = 1054,
+    duplicate_sql_extension_export = 1055,
+    duplicate_sql_extension_version = 1056,
+    inconsistent_sql_extension_control = 1057,
+    invalid_package_digest = 1058,
+    invalid_sql_extension_artifact = 1059,
+    invalid_sql_extension_control = 1060,
+    invalid_sql_extension_dependency = 1061,
+    invalid_sql_extension_record = 1062,
+    invalid_sql_extension_runtime = 1063,
+    invalid_sql_extension_package_mutation = 1064,
+    duplicate_sql_extension_control = 1065,
+    sql_dependent_extension_object = 1066,
+    sql_duplicate_extension = 1067,
+    sql_duplicate_function = 1068,
+    sql_extension_control_conflict = 1069,
+    sql_extension_dependency_cycle = 1070,
+    sql_extension_promotion_nonce_conflict = 1071,
+    sql_extension_schema_mismatch = 1072,
+    sql_extension_unavailable = 1073,
+    sql_extension_update_path_unavailable = 1074,
+    sql_extension_version_unavailable = 1075,
+    sql_function_return_type_changed = 1076,
+    sql_required_extension_not_installed = 1077,
+    sql_undefined_extension = 1078,
+    unsupported_sql_extension_object = 1079,
+    sql_extension_owned_object = 1080,
+    duplicate_shape_name = 1081,
+    generated_artifact_shape_required = 1082,
+    no_supported_scopes = 1083,
+    scope_must_not_name_table = 1084,
+    unknown_shape_reference = 1085,
 };
 
 test "SQL relation persistence callback failures preserve exact identity and behavior" {
     const errors = [_]anyerror{ error.InvalidSqlRelationPersistence, error.SqlRelationOwnerChanged, error.SqlTemporaryRelationNotOwned, error.InvalidSqlTemporaryNamespace, error.SqlRelationPersistenceForeignKeyMismatch, error.SqlRelationRecoveryIncomplete, error.SqlRelationOwnerUnavailable };
     const codes = [_]Code{ .invalid_argument, .conflict, .forbidden, .invalid_argument, .invalid_argument, .unavailable, .unavailable };
-    for (errors, codes, 1030..) |err, code, detail| {
+    for (errors, codes, 1033..) |err, code, detail| {
         const wire = statusFromError(err);
         try std.testing.expectEqual(@backingInt(code), wire.code);
         try std.testing.expectEqual(@as(c_int, @intCast(detail)), wire.detail);
@@ -1579,6 +1582,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
         error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
         error.ExternalLakeSchemaUnavailable => status(.unavailable, .external_lake_schema_unavailable),
+        error.InvalidExternalSourceInventory => status(.invalid_argument, .invalid_external_source_inventory),
+        error.InvalidExternalSourceSnapshot => status(.invalid_argument, .invalid_external_source_snapshot),
+        error.ExternalSourceSnapshotTooLarge => status(.invalid_argument, .external_source_snapshot_too_large),
         error.ExternalLakeFieldIdentityChanged => status(.conflict, .external_lake_field_identity_changed),
         error.ExternalLakeObjectChanged => status(.conflict, .external_lake_object_changed),
         error.EmptyExternalSourceSnapshot => status(.invalid_argument, .empty_external_source_snapshot),
@@ -2715,6 +2721,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
         .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",
         .external_lake_schema_unavailable => "ExternalLakeSchemaUnavailable",
+        .invalid_external_source_inventory => "InvalidExternalSourceInventory",
+        .invalid_external_source_snapshot => "InvalidExternalSourceSnapshot",
+        .external_source_snapshot_too_large => "ExternalSourceSnapshotTooLarge",
         .external_lake_field_identity_changed => "ExternalLakeFieldIdentityChanged",
         .external_lake_object_changed => "ExternalLakeObjectChanged",
         .empty_external_source_snapshot => "EmptyExternalSourceSnapshot",
@@ -3814,6 +3823,9 @@ test "external lake and spill errors retain exact identity across runtime archiv
         error.ExternalLakeSnapshotMismatch,
         error.ExternalLakeSchemaMismatch,
         error.ExternalLakeSchemaUnavailable,
+        error.InvalidExternalSourceInventory,
+        error.InvalidExternalSourceSnapshot,
+        error.ExternalSourceSnapshotTooLarge,
         error.ExternalLakeFieldIdentityChanged,
         error.ExternalLakeObjectChanged,
         error.EmptyExternalSourceSnapshot,
@@ -4226,7 +4238,7 @@ test "native locking callback admission preserves retryable ordered apply identi
     const transported = statusFromError(error.RaftApplyWriterUnavailable);
     try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
     try std.testing.expectEqual(error.RaftApplyWriterUnavailable, errorFromStatus(transported));
-    try std.testing.expectEqual(@as(c_int, 1021), @backingInt(Detail.raft_apply_writer_unavailable));
+    try std.testing.expectEqual(@as(c_int, 1024), @backingInt(Detail.raft_apply_writer_unavailable));
 }
 
 test "scope retirement callback descriptors preserve exact lifecycle conflict and limit identities" {
@@ -4249,9 +4261,9 @@ test "scope retirement callback descriptors preserve exact lifecycle conflict an
         try std.testing.expect(errorHasStableDetail(entry[0]));
     }
     // Public enum numbers remain independent from the embedded owner ABI.
-    try std.testing.expectEqual(@as(c_int, 1021), @backingInt(Detail.raft_apply_writer_unavailable));
-    try std.testing.expectEqual(@as(c_int, 1022), @backingInt(Detail.sql_database_in_use));
-    try std.testing.expectEqual(@as(c_int, 1029), @backingInt(Detail.catalog_generation_exhausted));
+    try std.testing.expectEqual(@as(c_int, 1024), @backingInt(Detail.raft_apply_writer_unavailable));
+    try std.testing.expectEqual(@as(c_int, 1025), @backingInt(Detail.sql_database_in_use));
+    try std.testing.expectEqual(@as(c_int, 1032), @backingInt(Detail.catalog_generation_exhausted));
     try std.testing.expect(errorFromStableName("SqlDatabaseInUse\n") == null);
     try std.testing.expect(errorFromStableName("ScopeRetirementChangedPrivate") == null);
 }
@@ -4268,7 +4280,7 @@ test "generation graph and durability errors survive an actual C callback status
     const callback: Callback = State.invoke;
     const failures = [_]anyerror{ error.InvalidGenerationTransaction, error.GenerationTransactionChanged, error.GenerationTransactionDecisionRequired, error.InvalidPreparedGraphEffects, error.SqlPreparedDurabilityUnavailable };
     const codes = [_]Code{ .invalid_argument, .conflict, .conflict, .invalid_argument, .invalid_argument };
-    for (failures, codes, 1045..) |failure, code, detail| {
+    for (failures, codes, 1048..) |failure, code, detail| {
         var state: State = .{ .failure = failure };
         const transported = callback(&state);
         try std.testing.expectEqual(@backingInt(code), transported.code);
@@ -4310,7 +4322,7 @@ test "external terminal membership failure crosses callbacks without retry promo
 test "SQL extension lifecycle callback identities retain exact behavior" {
     const errors = [_]anyerror{ error.CatalogRevisionExhausted, error.DuplicateSqlExtensionExport, error.DuplicateSqlExtensionVersion, error.InconsistentSqlExtensionControl, error.InvalidPackageDigest, error.InvalidSqlExtensionArtifact, error.InvalidSqlExtensionControl, error.InvalidSqlExtensionDependency, error.InvalidSqlExtensionRecord, error.InvalidSqlExtensionRuntime, error.InvalidSqlExtensionPackageMutation, error.DuplicateSqlExtensionControl, error.SqlDependentExtensionObject, error.SqlDuplicateExtension, error.SqlDuplicateFunction, error.SqlExtensionControlConflict, error.SqlExtensionDependencyCycle, error.SqlExtensionPromotionNonceConflict, error.SqlExtensionSchemaMismatch, error.SqlExtensionUnavailable, error.SqlExtensionUpdatePathUnavailable, error.SqlExtensionVersionUnavailable, error.SqlFunctionReturnTypeChanged, error.SqlRequiredExtensionNotInstalled, error.SqlUndefinedExtension, error.UnsupportedSqlExtensionObject, error.SqlExtensionOwnedObject, error.DuplicateShapeName, error.GeneratedArtifactShapeRequired, error.NoSupportedScopes, error.ScopeMustNotNameTable, error.UnknownShapeReference };
     const codes = [_]Code{ .invalid_argument, .invalid_argument, .invalid_argument, .corrupt, .corrupt, .unsupported, .invalid_argument, .invalid_argument, .corrupt, .unsupported, .invalid_argument, .invalid_argument, .conflict, .already_exists, .already_exists, .conflict, .invalid_argument, .conflict, .invalid_argument, .unsupported, .invalid_argument, .not_found, .invalid_argument, .not_found, .not_found, .unsupported, .conflict, .invalid_argument, .invalid_argument, .invalid_argument, .invalid_argument, .invalid_argument };
-    for (errors, codes, 1051..) |err, code, ordinal| {
+    for (errors, codes, 1054..) |err, code, ordinal| {
         const wire = statusFromError(err);
         try std.testing.expectEqual(@backingInt(code), wire.code);
         try std.testing.expectEqual(@as(c_int, @intCast(ordinal)), wire.detail);
@@ -4347,6 +4359,15 @@ test "merged runtime error details preserve the common prefix under ABI two" {
     try std.testing.expectEqual(@as(c_int, 891), @backingInt(Detail.cypher_aggregate_scope));
 }
 
+test "manifest client failures append stable details without changing released ordinals" {
+    try std.testing.expectEqual(@backingInt(Detail.sql_write_capacity_unavailable) + 1, @backingInt(Detail.invalid_external_source_inventory));
+    for ([_]anyerror{ error.InvalidExternalSourceInventory, error.InvalidExternalSourceSnapshot, error.ExternalSourceSnapshotTooLarge }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
+        try std.testing.expectEqual(err, errorFromStatus(transported));
+    }
+}
+
 test "latest main error detail prefix remains append only across graph integration" {
     @setEvalBranchQuota(30000);
     var hash: u64 = 14695981039346656037;
@@ -4369,7 +4390,7 @@ test "published main Detail inventory remains stable after SQL integration" {
     var hash: u64 = 14695981039346656037;
     var count: usize = 0;
     inline for (@typeInfo(Detail).@"enum".field_names, @typeInfo(Detail).@"enum".field_values) |field_name, value| {
-        if (value <= 969) {
+        if (value <= 972) {
             for (field_name) |byte| hash = (hash ^ byte) *% 1099511628211;
             var bytes: [4]u8 = undefined;
             std.mem.writeInt(u32, &bytes, @intCast(value), .little);
@@ -4377,6 +4398,6 @@ test "published main Detail inventory remains stable after SQL integration" {
             count += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, 970), count);
-    try std.testing.expectEqual(@as(u64, 16056847732095885735), hash);
+    try std.testing.expectEqual(@as(usize, 973), count);
+    try std.testing.expectEqual(@as(u64, 10976950832745621870), hash);
 }

@@ -62,6 +62,14 @@ pub const ChunkParentResultShaper = struct {
         alloc: Allocator,
         key: []const u8,
     ) anyerror!?[]u8 = null,
+    /// Resolve derivation identity using the same pinned storage view as the
+    /// member payload. External stores need not expose native DB state keys.
+    artifact_derivation_digest: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        ref: types.ArtifactRef,
+        payload: []const u8,
+    ) anyerror!?[32]u8 = null,
     load_many_stored: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -174,6 +182,14 @@ pub const SearchResultPostprocessor = struct {
         alloc: Allocator,
         key: []const u8,
     ) anyerror!?[]u8,
+    /// Resolve derivation identity using the same pinned storage view as the
+    /// member payload. External stores need not expose native DB state keys.
+    artifact_derivation_digest: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        ref: types.ArtifactRef,
+        payload: []const u8,
+    ) anyerror!?[32]u8 = null,
     load_many_stored: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1031,7 +1047,7 @@ fn hydrateDirectChunkAncestors(
 // Capture content and derivation identity from the same storage view as the
 // member and its parent. These opaque revisions are not traversal cursors.
 fn hydrateArtifactRevisions(alloc: Allocator, result: *types.SearchResult, payloads: []const ?[]u8, shaper: ChunkParentResultShaper) !void {
-    const load = shaper.load_stored orelse return;
+    if (shaper.load_stored == null and shaper.artifact_derivation_digest == null) return;
     // A document may have thousands of members but one producer state.
     // Hash that state once per pinned query view, retaining only its digest.
     var states = std.StringHashMapUnmanaged(?[32]u8).empty;
@@ -1043,33 +1059,40 @@ fn hydrateArtifactRevisions(alloc: Allocator, result: *types.SearchResult, paylo
     for (result.hits, 0..) |*hit, i| {
         const ref = if (hit.artifact_ref) |*ref| ref else continue;
         const payload = payloads[i] orelse hit.stored_data orelse continue;
-        var state_key = std.ArrayListUnmanaged(u8).empty;
-        defer state_key.deinit(alloc);
-        try internal_keys.appendDocumentPrefix(&state_key, alloc, ref.document_id);
-        try state_key.append(alloc, internal_keys.asset_state_kind);
-        // An embedding hit reports its source chunk (see reconcileArtifactRef),
-        // and its payload above is that chunk's: fingerprint the chunk
-        // producer's state too, so both revisions describe the reported member.
-        const producer = if (ref.kind == .chunk and ref.source != null and ref.source.?.kind == .asset)
-            ref.source.?.name
-        else if (ref.kind == .embedding and ref.source != null and ref.source.?.kind == .chunk)
-            ref.source.?.name
-        else
-            ref.name;
-        try internal_keys.appendEncodedComponent(&state_key, alloc, producer);
-        const state_digest: ?[32]u8 = if (states.getEntry(state_key.items)) |cached| cached.value_ptr.* else blk: {
-            const state = try load(shaper.ctx, alloc, state_key.items);
-            defer if (state) |value| alloc.free(value);
-            var digest: ?[32]u8 = null;
-            if (state) |value| {
-                var bytes: [32]u8 = undefined;
-                std.crypto.hash.sha2.Sha256.hash(value, &bytes, .{});
-                digest = bytes;
-            }
-            const key = try alloc.dupe(u8, state_key.items);
-            errdefer alloc.free(key);
-            try states.put(alloc, key, digest);
-            break :blk digest;
+        const state_digest: ?[32]u8 = if (shaper.artifact_derivation_digest) |resolve|
+            // Source units can have different inputs under the same parent and
+            // producer. The storage port owns its derivation/cache identity.
+            try resolve(shaper.ctx, alloc, ref.*, payload)
+        else native_state: {
+            const load = shaper.load_stored orelse break :native_state null;
+            var state_key = std.ArrayListUnmanaged(u8).empty;
+            defer state_key.deinit(alloc);
+            try internal_keys.appendDocumentPrefix(&state_key, alloc, ref.document_id);
+            try state_key.append(alloc, internal_keys.asset_state_kind);
+            // An embedding hit reports its source chunk (see reconcileArtifactRef),
+            // and its payload above is that chunk's: fingerprint the chunk
+            // producer's state too, so both revisions describe the reported member.
+            const producer = if (ref.kind == .chunk and ref.source != null and ref.source.?.kind == .asset)
+                ref.source.?.name
+            else if (ref.kind == .embedding and ref.source != null and ref.source.?.kind == .chunk)
+                ref.source.?.name
+            else
+                ref.name;
+            try internal_keys.appendEncodedComponent(&state_key, alloc, producer);
+            break :native_state if (states.getEntry(state_key.items)) |cached| cached.value_ptr.* else blk: {
+                const state = try load(shaper.ctx, alloc, state_key.items);
+                defer if (state) |value| alloc.free(value);
+                var digest: ?[32]u8 = null;
+                if (state) |value| {
+                    var bytes: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(value, &bytes, .{});
+                    digest = bytes;
+                }
+                const key = try alloc.dupe(u8, state_key.items);
+                errdefer alloc.free(key);
+                try states.put(alloc, key, digest);
+                break :blk digest;
+            };
         };
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly-artifact-member-revision-v1");
@@ -1800,6 +1823,7 @@ pub fn postprocessTextSearchResult(
             .load_parent_stored_many = processor.load_many_parent_stored,
             .load_stored = processor.load_stored,
             .load_many_stored = processor.load_many_stored,
+            .artifact_derivation_digest = processor.artifact_derivation_digest,
             .load_projected_stored = processor.load_projected_stored,
             .load_many_projected_stored = processor.load_many_projected_stored,
         });
@@ -1847,6 +1871,7 @@ pub fn postprocessVectorSearchResult(
             .load_parent_stored_many = processor.load_many_parent_stored,
             .load_stored = processor.load_stored,
             .load_many_stored = processor.load_many_stored,
+            .artifact_derivation_digest = processor.artifact_derivation_digest,
             .load_projected_stored = processor.load_projected_stored,
             .load_many_projected_stored = processor.load_many_projected_stored,
         });
@@ -3838,4 +3863,82 @@ test "artifact identity reports the source of a dense hit's embedding and keeps 
     var other: ?types.ArtifactRef = try chunk(alloc, "doc:b");
     defer if (other) |*ref| ref.deinit(alloc);
     try std.testing.expectError(error.InvalidChunkArtifact, reconcileArtifactRef(alloc, &other, resolved));
+}
+
+test "external lake archive and pending members use pinned derivation port without native state reads" {
+    const a = std.testing.allocator;
+    const Loader = struct {
+        keys: [2][]const u8,
+        derivation_calls: usize = 0,
+        fn load(raw: ?*anyopaque, alloc: Allocator, key: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            for (self.keys, 0..) |candidate, i| if (std.mem.eql(u8, key, candidate)) {
+                return try alloc.dupe(u8, if (i == 0) "{\"text\":\"archive chunk\"}" else "{\"text\":\"pending chunk\"}");
+            };
+            // Lake stores support row/artifact identities, never native DB's
+            // synthesized document-prefix/asset-state key namespace.
+            return error.TestUnexpectedNativeStateLookup;
+        }
+        fn parent(_: ?*anyopaque, alloc: Allocator, _: types.SearchRequest, _: []const u8) !?[]u8 {
+            return try alloc.dupe(u8, "{}");
+        }
+        fn resolve(_: ?*anyopaque, alloc: Allocator, hit: types.SearchHit) ![]u8 {
+            return alloc.dupe(u8, hit.artifact_ref.?.document_id);
+        }
+        fn derivation(raw: ?*anyopaque, _: Allocator, ref: types.ArtifactRef, payload: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.derivation_calls += 1;
+            const pending = std.mem.startsWith(u8, ref.document_id, "wal1:");
+            if (std.mem.indexOf(u8, payload, if (pending) "pending chunk" else "archive chunk") == null) return error.TestWrongPinnedPayload;
+            return @as([32]u8, @splat(if (pending) 2 else 1));
+        }
+    };
+    const archive = try internal_keys.chunkArtifactKeyAlloc(a, "lake1:archive-parent", "body_chunks", 0);
+    defer a.free(archive);
+    const pending = try internal_keys.chunkArtifactKeyAlloc(a, "wal1:pending-parent", "body_chunks", 0);
+    defer a.free(pending);
+    var loader = Loader{ .keys = .{ archive, pending } };
+    var previous: [2]?[]u8 = @splat(null);
+    defer for (previous) |revision| if (revision) |bytes| a.free(bytes);
+    // Text and vector paths must both propagate the port; repeated hydration
+    // produces identical revisions from the same pinned view.
+    for ([_]bool{ false, true }) |vector| {
+        const hits = try a.alloc(types.SearchHit, 2);
+        var initialized: usize = 0;
+        var transferred = false;
+        errdefer if (!transferred) {
+            for (hits[0..initialized]) |*hit| hit.deinit(a);
+            a.free(hits);
+        };
+        for (loader.keys, hits) |key, *hit| {
+            const id = try a.dupe(u8, key);
+            errdefer a.free(id);
+            hit.* = .{ .id = id, .artifact_ref = try artifact_ids.decodeArtifactRefAlloc(a, key) };
+            initialized += 1;
+        }
+        const processor: SearchResultPostprocessor = .{
+            .ctx = &loader,
+            .is_visible = TestPostprocessor.isVisible,
+            .resolve_parent_id = Loader.resolve,
+            .load_parent_stored = Loader.parent,
+            .load_stored = Loader.load,
+            .artifact_derivation_digest = Loader.derivation,
+        };
+        const raw: types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 2 };
+        const req: types.SearchRequest = .{ .return_mode = .member, .include_stored = true };
+        transferred = true;
+        var result = if (vector) try postprocessVectorSearchResult(a, req, raw, true, processor) else try postprocessTextSearchResult(a, req, raw, true, processor);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+        for (result.hits, 0..) |hit, i| {
+            try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, if (i == 0) "archive chunk" else "pending chunk") != null);
+            const ref = hit.artifact_ref.?;
+            try std.testing.expectEqualStrings(if (i == 0) "lake1:archive-parent" else "wal1:pending-parent", ref.document_id);
+            try std.testing.expectEqual(@as(usize, 71), ref.revision.?.len);
+            try std.testing.expectEqual(@as(usize, 71), ref.derivation_revision.?.len);
+            if (previous[i]) |revision| try std.testing.expectEqualStrings(revision, ref.revision.?) else previous[i] = try a.dupe(u8, ref.revision.?);
+        }
+        try std.testing.expect(!std.mem.eql(u8, result.hits[0].artifact_ref.?.derivation_revision.?, result.hits[1].artifact_ref.?.derivation_revision.?));
+    }
+    try std.testing.expectEqual(@as(usize, 4), loader.derivation_calls);
 }

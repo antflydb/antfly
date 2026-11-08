@@ -17,7 +17,7 @@
 //! This leaf has no storage, VM, lock, RPC, or publication capability.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const types = @import("types.zig");
+const types = @import("mutation_values.zig");
 const transform_mod = @import("transform.zig");
 
 pub fn CoalescedKeyValueRequest(comptime T: type) type {

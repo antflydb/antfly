@@ -119,7 +119,7 @@ pub const Api = struct {
         var owned = try batch_api.parseBatchRequest(alloc, body);
         defer owned.deinit(alloc);
 
-        try self.db.batch(owned.req);
+        try self.db.batch(embedded_db.types.fromPublicMutation(owned.req));
         return try batch_api.encodeBatchResponse(alloc, owned.result());
     }
 
@@ -1605,6 +1605,20 @@ test "embedded api Cypher relational counts account for rejected storage candida
         \\{"action":"put","name":"g","definition":{"labels":[{"name":"Keep","table":"docs","where":{"tenant":"keep"}}],"relationships":[]}}
     );
     defer a.free(definition);
+    // Projection decoding may grow the reader arena. Exercise every failure
+    // point before ownership and schema/index pins transfer to the reader.
+    const DbPointer = @TypeOf(api.db.inner);
+    const ProjectionInit = struct {
+        fn run(allocator: Allocator, db: DbPointer) !void {
+            var reader = try db.beginRelationalRows(allocator, .{
+                .fields = &.{"body"},
+                .cypher_presence_fields = &.{"body"},
+                .cypher_projection_json = "[{\"name\":\"body\",\"mode\":\"value\"}]",
+            });
+            defer reader.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, ProjectionInit.run, .{api.db.inner});
     try std.testing.expectError(error.CypherAnchorBudgetExceeded, api.cypherJson(a, "g",
         \\{"query":"MATCH (n:Keep) RETURN count(n.body)","limits":{"memory_bytes":8388608,"scanned_anchors":1}}
     ));

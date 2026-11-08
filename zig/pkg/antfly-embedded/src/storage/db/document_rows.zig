@@ -16,25 +16,28 @@
 //! Retained document SQL read view. Shares docstore snapshot, schema epoch,
 //! owner-prefix traversal, TTL and authorization machinery with native reads.
 const std = @import("std");
-const storage_engine = @import("../engine_selection.zig");
-const store_mod = @import("../docstore.zig");
-const registry = @import("schema_registry.zig");
-const types = @import("types.zig");
-const internal = @import("../internal_keys.zig");
-const time = @import("antfly_platform").time;
-const ttl = @import("../ttl.zig");
-const graph = @import("query/graph_exec.zig");
-const document = @import("../../sql/document_row.zig");
-const catalog = @import("../../sql/catalog.zig");
-const scalar = @import("../../sql/scalar.zig");
-const View = @import("../relational_read_view.zig").View;
+const Types = @import("read_session_types").types;
+const Source = @import("read_session_source_types").types;
+const store_mod = Source.store;
+const registry = Source.schema_registry;
+const types = Types.types;
+const internal = Source.internal;
+const time = Source.platform.time;
+const ttl = Source.ttl;
+const graph = Source.graph;
+const document = Source.document;
+const catalog = Source.catalog;
+const scalar = Source.scalar;
+const View = Types.view;
 
-pub const Session = struct {
-    text: ?*@import("text_rows.zig").Owner = null,
-    preparation_runtime: ?@import("../../schema/relational_expression.zig").PreparationRuntime = null,
-    privacy: ?@import("privacy_read.zig").PolicySnapshot = null,
-    row_policy_lease: ?@import("row_policy_gate.zig").Gate.Lease = null,
-    range_proofs: ?[]const @import("../range_protection.zig").Proof = null,
+pub const Session = Implementation;
+
+pub const Implementation = struct {
+    privacy: ?Source.privacy_read.PolicySnapshot = null,
+    row_policy_lease: ?Source.row_policy_gate.Gate.Lease = null,
+    range_proofs: ?[]const Types.range_protection.Proof = null,
+    text: ?*Source.text_rows.Owner = null,
+    preparation_runtime: ?Source.relational_expression.PreparationRuntime = null,
     alloc: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     store: *store_mod.DocStore,
@@ -68,13 +71,13 @@ pub const Session = struct {
         return openSnapshotImpl(alloc, store, txn, schema, range, from, to, opts, now_ns, null);
     }
     /// Selection transfers only on success; txn transfers on every outcome.
-    pub fn openTextSnapshot(alloc: std.mem.Allocator, store: *store_mod.DocStore, txn: store_mod.DocStore.Txn, schema: ?registry.SchemaView, range: types.ByteRange, from: []const u8, to: []const u8, opts: types.ScanOptions, now_ns: u64, text: *@import("text_rows.zig").Owner) !*Session {
+    pub fn openTextSnapshot(alloc: std.mem.Allocator, store: *store_mod.DocStore, txn: store_mod.DocStore.Txn, schema: ?registry.SchemaView, range: types.ByteRange, from: []const u8, to: []const u8, opts: types.ScanOptions, now_ns: u64, text: *Source.text_rows.Owner) !*Session {
         return openSnapshotImpl(alloc, store, txn, schema, range, from, to, opts, now_ns, text);
     }
-    fn openSnapshotImpl(alloc: std.mem.Allocator, store: *store_mod.DocStore, txn: store_mod.DocStore.Txn, schema: ?registry.SchemaView, range: types.ByteRange, from: []const u8, to: []const u8, opts: types.ScanOptions, now_ns: u64, text: ?*@import("text_rows.zig").Owner) !*Session {
+    fn openSnapshotImpl(alloc: std.mem.Allocator, store: *store_mod.DocStore, txn: store_mod.DocStore.Txn, schema: ?registry.SchemaView, range: types.ByteRange, from: []const u8, to: []const u8, opts: types.ScanOptions, now_ns: u64, text: ?*Source.text_rows.Owner) !*Session {
         var read = txn;
         errdefer read.abort();
-        try @import("../transactions.zig").checkExternalReadAdmission(&read);
+        try Source.transactions.checkExternalReadAdmission(&read);
         if (schema) |view| if (view.storageMode() != .document) return error.UnsupportedSqlExecution;
         if (opts.include_range_proofs) if (schema) |view| if (view.tableSchema().ttl_duration_ns != 0) return error.UnsupportedSqlExecution;
         if (opts.relational_query_json.len > 1024 * 1024 or opts.limit > 4096) return error.InvalidRelationalRowsRequest;
@@ -110,17 +113,17 @@ pub const Session = struct {
             copy.* = condition;
             copy.column = try owned.dupe(u8, condition.column);
             copy.collation = if (condition.collation) |collation| try owned.dupe(u8, collation) else null;
-            copy.value = if (condition.value) |value| try @import("../typed_json.zig").clone(owned, value) else null;
+            copy.value = if (condition.value) |value| try Source.typed_json.clone(owned, value) else null;
         }
         var filter = if (opts.filter_query_json.len != 0) try graph.PreparedPatternFilter.init(alloc, opts.filter_query_json) else null;
         errdefer if (filter) |*compiled| compiled.deinit();
         const lower_raw = if (from.len == 0 or std.mem.order(u8, from, range.start) == .lt) range.start else from;
         const upper_raw = if (to.len == 0 or (range.end.len != 0 and std.mem.order(u8, range.end, to) == .lt)) range.end else to;
-        const session = try alloc.create(Session);
+        const session = try alloc.create(Implementation);
         errdefer alloc.destroy(session);
         session.* = .{
             .text = text,
-            .range_proofs = if (opts.include_range_proofs) try @import("../range_protection.zig").capture(owned, &read, lower_raw, upper_raw) else null,
+            .range_proofs = if (opts.include_range_proofs) try Types.range_protection.capture(owned, &read, lower_raw, upper_raw) else null,
             .alloc = alloc,
             .arena = undefined,
             .store = store,
@@ -153,8 +156,7 @@ pub const Session = struct {
         return session;
     }
 
-    pub fn deinit(self: *Session) void {
-        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionDeinit", .{self}) catch @panic("incompatible storage owner");
+    pub fn deinit(self: *Implementation) void {
         if (self.text) |text| text.deinit();
         if (self.row_policy_lease) |*lease| lease.release();
         self.txn.abort();
@@ -165,13 +167,12 @@ pub const Session = struct {
         self.alloc.destroy(self);
     }
 
-    pub fn rangeProofs(self: *Session, alloc: std.mem.Allocator) ![]@import("../range_protection.zig").Proof {
-        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionRangeProofs", .{ self, alloc });
+    pub fn rangeProofs(self: *Implementation, alloc: std.mem.Allocator) ![]Types.range_protection.Proof {
         try self.checkpoint();
-        return alloc.dupe(@import("../range_protection.zig").Proof, self.range_proofs orelse return error.SqlRangeTrackingRequired);
+        return alloc.dupe(Types.range_protection.Proof, self.range_proofs orelse return error.SqlRangeTrackingRequired);
     }
 
-    fn checkpoint(self: *const Session) !void {
+    fn checkpoint(self: *const Implementation) !void {
         if (self.failed) return error.InvalidSqlBackendResponse;
         if (self.cancellation) |token| try token.check();
         if (self.deadline_ns) |deadline| if (time.monotonicNs() >= deadline) return error.DeadlineExceeded;
@@ -181,8 +182,7 @@ pub const Session = struct {
     /// Uses the same pinned public validator as native schema admission. SQL
     /// does not implement a second defaults/coercion/generated-value engine.
     /// All output belongs to the bounded caller arena.
-    pub fn normalizeRows(self: *Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
-        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionNormalizeRows", .{ self, alloc, writes });
+    pub fn normalizeRows(self: *Implementation, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
         if (self.privacy) |policy| if (policy.prepared.policy.mode != .monitor) return error.UnsupportedSqlExecution;
         if (writes.len > 4096) return error.InvalidArgument;
         const result = try alloc.alloc(types.BatchWrite, writes.len);
@@ -234,8 +234,7 @@ pub const Session = struct {
         return result;
     }
 
-    pub fn next(self: *Session, alloc: std.mem.Allocator, limit: u32) !View.Page {
-        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionNext", .{ self, alloc, limit });
+    pub fn next(self: *Implementation, alloc: std.mem.Allocator, limit: u32) !View.Page {
         if (limit == 0 or limit > 4096) return error.InvalidRelationalRowsBudget;
         try self.checkpoint();
         errdefer self.failed = true;
@@ -251,7 +250,7 @@ pub const Session = struct {
             break :blk prefix;
         } else self.lower;
         const Context = struct {
-            session: *Session,
+            session: *Implementation,
             owned: std.mem.Allocator,
             scratch: *std.heap.ArenaAllocator,
             rows: std.ArrayList(View.Row) = .empty,
@@ -306,7 +305,7 @@ pub const Session = struct {
                     }
                     break :version 0;
                 };
-                const visible = if (session.privacy) |policy| try @import("privacy_read.zig").project(temporary, policy, key, bytes, &session.txn) else bytes;
+                const visible = if (session.privacy) |policy| try Source.privacy_read.project(temporary, policy, key, bytes, &session.txn) else bytes;
                 const root = try std.json.parseFromSliceLeaky(std.json.Value, temporary, visible, .{ .parse_numbers = false });
                 if (session.filter) |*filter| if (!try filter.matchesJson(temporary, key, root)) return .@"continue";
                 if (session.conditions.len != 0) {
@@ -349,7 +348,7 @@ pub const Session = struct {
                     break :blk result;
                 } else null;
                 ctx.bytes += charge;
-                try ctx.rows.append(ctx.owned, .{ .id = projected.id, .version = projected.version, .schema_version = session.table.schema_version, .value = projected.value, .sql_nulls = projected.sql_nulls, .expected_content_digest = digest, .document = if (session.include_document) try @import("../typed_json.zig").clone(ctx.owned, root) else null });
+                try ctx.rows.append(ctx.owned, .{ .id = projected.id, .version = projected.version, .schema_version = session.table.schema_version, .value = projected.value, .sql_nulls = projected.sql_nulls, .expected_content_digest = digest, .document = if (session.include_document) try Source.typed_json.clone(ctx.owned, root) else null });
                 return .@"continue";
             }
         };

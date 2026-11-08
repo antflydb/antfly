@@ -6673,7 +6673,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var prepared = try self.prepareRestoreOwnerControl(alloc, group_id, table_name, descriptor, input, options, request);
         defer prepared.deinit();
         const encoded = prepared.value.batch_json orelse return prepared.value.response;
-        var batch = try @import("antfly_local_sources").api_batch.parseInternalBatchRequest(alloc, encoded);
+        var batch = try @import("antfly_local_sources").api_internal_batch.parseInternalBatchRequest(alloc, encoded);
         defer batch.deinit(alloc);
         const scope = batch.req.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
         if (!std.mem.eql(u8, &scope, &input.scope.digest()) or batch.req.restore_staging == null) return error.RestoreStagingScopeChanged;
@@ -13517,7 +13517,7 @@ fn qualifyDirectoryRetirement(physical: *client.Owner, root_path: []const u8, ro
     var aborted = if (ordered) try physical.replicatedBatchAtRaftEntryJson("rows", abort, 1, 1) else try physical.replicatedBatchJson("rows", abort);
     aborted.deinit();
     const control: ?locks.NativeControl = if (ordered) null else .{ .route = route, .owner = owner, .decision = ref.decision };
-    const native_resolve = try local.api_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = .{ .admission = ref.admission, .native_control = control, .operation = .{ .resolve = ref.decision } }, .sync_level = .write });
+    const native_resolve = try local.api_internal_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = .{ .admission = ref.admission, .native_control = control, .operation = .{ .resolve = ref.decision } }, .sync_level = .write });
     var retired = if (ordered) try physical.replicatedBatchAtRaftEntryJson("rows", native_resolve, 1, 2) else try physical.batchJson("rows", native_resolve);
     retired.deinit();
     const query = try std.json.Stringify.valueAlloc(a, locks.Query{ .admission = ref.admission, .native_control = control }, .{});
@@ -13605,11 +13605,11 @@ fn qualifyDirectoryRetirement(physical: *client.Owner, root_path: []const u8, ro
         },
         .sync_level = .write,
     };
-    const ack = try local.api_batch.encodeOwnerBatchRequest(a, ack_request);
+    const ack = try local.api_internal_batch.encodeOwnerBatchRequest(a, ack_request);
     if (ordered) {
         var wrong_dialect = ack_request;
         wrong_dialect.transaction.?.acknowledge.external_decision_owner = owner;
-        const native_ack = try local.api_batch.encodeOwnerBatchRequest(a, wrong_dialect);
+        const native_ack = try local.api_internal_batch.encodeOwnerBatchRequest(a, wrong_dialect);
         try std.testing.expectError(error.InvalidBatchRequest, physical.replicatedBatchAtRaftEntryJson("rows", native_ack, 1, 3));
     }
     var acknowledged = if (ordered) try physical.replicatedBatchAtRaftEntryJson("rows", ack, 1, 3) else try physical.replicatedBatchJson("rows", ack);
@@ -14506,7 +14506,7 @@ test "SQL relation lifetime published native restore control authenticates curre
     try std.testing.expect((try ProvisionedKernelOwnerSource.publishedRestoreBatchSelection(a, 172, descriptor, finish)) != null);
     const encoded_finish = try table_writes.encodeStorageKernelBatchRequest(a, finish);
     defer a.free(encoded_finish);
-    var decoded_finish = try local.api_batch.parseInternalBatchRequest(a, encoded_finish);
+    var decoded_finish = try local.api_internal_batch.parseInternalBatchRequest(a, encoded_finish);
     defer decoded_finish.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), decoded_finish.req.writes.len);
     try std.testing.expectEqual(@as(usize, 0), decoded_finish.req.deletes.len);
@@ -14515,7 +14515,7 @@ test "SQL relation lifetime published native restore control authenticates curre
     decoded_mixed.deletes = &.{"must-not-delete"};
     const encoded_mixed = try table_writes.encodeStorageKernelBatchRequest(a, decoded_mixed);
     defer a.free(encoded_mixed);
-    var roundtrip_mixed = try local.api_batch.parseInternalBatchRequest(a, encoded_mixed);
+    var roundtrip_mixed = try local.api_internal_batch.parseInternalBatchRequest(a, encoded_mixed);
     defer roundtrip_mixed.deinit(a);
     try std.testing.expectError(error.InvalidBatchRequest, ProvisionedKernelOwnerSource.publishedRestoreBatchSelection(a, 172, descriptor, roundtrip_mixed.req));
     decoded_mixed = decoded_finish.req;

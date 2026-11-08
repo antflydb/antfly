@@ -289,6 +289,8 @@ pub const Call = union(enum) {
     write_validation: []const u8,
     write_validation_revision: void,
     resolver_catalog_read: @import("../metadata/resolver_catalog_read.zig").Request,
+    lake_source_owner_read: u64,
+
     schema_validation_owner_read: @import("../metadata/schema_validation_read.zig").OwnerReadRequest,
     schema_validation_discover: @import("../metadata/schema_validation_read.zig").DiscoveryRequest,
     schema_validation_work: @import("../metadata/schema_validation_work.zig").Query,
@@ -401,6 +403,7 @@ pub const Call = union(enum) {
             .sql_snapshot_cohort => |request| request.owner != null,
             .sql_relation_boot_read, .sql_relation_lifetime_page => true,
             .lake_index_lifecycle_read,
+            .lake_source_owner_read,
             .lake_index_lifecycle_work,
             .setting_snapshot,
             .policy_snapshot,
@@ -723,6 +726,10 @@ test "native lake lifecycle calls bind private read and mutation grants" {
     const read: Call = .{ .lake_index_lifecycle_read = 4 };
     const write: Call = .{ .lake_index_lifecycle_mutate = .{ .table_id = 4, .expected_revision = 7, .mutation = .{ .release = @splat(9) } } };
     try std.testing.expect(read.requiresSettingAuthorityReadGrant());
+    const owner: Call = .{ .lake_source_owner_read = 4 };
+    try std.testing.expect(owner.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!owner.requiresAdministrativeGrant());
+    try std.testing.expect(!owner.isMutation());
     try std.testing.expect(!read.requiresAdministrativeGrant());
     try std.testing.expect(!read.isMutation());
     try std.testing.expect(write.requiresAdministrativeGrant());

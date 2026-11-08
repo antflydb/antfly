@@ -16,30 +16,52 @@
 //! Physical local-query provider. The storage archive owns and closes the DB;
 //! this component borrows that opaque handle for one complete query and returns
 //! one encoded response. Index internals never cross the ABI. The provider is
-//! co-generated with the owning storage kernel in release builds so physical
-//! storage and local query share one optimized compilation graph.
+//! co-located with the storage kernel. Private DB layout checks belong to its
+//! capability issuer; the independently compiled dispatcher sees no DB type.
 
 const std = @import("std");
-const abi = @import("kernel_owner_abi");
+const abi = @import("local_query_abi");
 const error_identity = @import("kernel_error_identity");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const query_api = @import("antfly_local_sources").api_query;
 const local_query = @import("antfly_source_root").antfly_sources.local_query;
-const distributed_graph = @import("../api/distributed_graph.zig");
+const distributed_graph = @import("antfly_local_sources").api_local_graph;
 const aggregation_plan = @import("../api/aggregation_plan.zig");
 const local_query_contract = @import("antfly_local_sources").api_local_query_contract;
 
-pub fn execute(
-    request: *const abi.LocalQueryRequest,
-    out_response: *abi.QueryOwnedResponse,
+/// Issue a synchronous execution capability only after validating the caller's
+/// existing native DB borrow in the physical owner. The donor remains owned
+/// and admitted by its caller; no stack-backed adapter or allocator is retained.
+pub fn issue(
+    borrow: *const abi.CheckedDbBorrow,
+    out_execution: *abi.QueryExecution,
     out_failure: *abi.FailureIdentity,
 ) callconv(.c) abi.Status {
+    out_execution.* = .{};
+    out_failure.* = .{};
+    const db = borrow.resolve(db_mod.DB) catch |err| return fail(err, .validate_request, out_failure);
+    out_execution.* = .{ .context = db, .execute_fn = executeIssued };
+    return .ok;
+}
+
+pub fn issueForDb(db: *db_mod.DB) abi.QueryExecution {
+    return .{ .context = db, .execute_fn = executeIssued };
+}
+
+fn executeIssued(context: ?*anyopaque, request: *const abi.LocalQueryRequest, out_response: *abi.QueryOwnedResponse, out_failure: *abi.FailureIdentity) callconv(.c) abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    const pointer = context orelse return fail(error.InvalidArgument, .validate_request, out_failure);
+    if (@intFromPtr(pointer) % @alignOf(db_mod.DB) != 0) return fail(error.InvalidArgument, .validate_request, out_failure);
+    const db: *db_mod.DB = @ptrCast(@alignCast(pointer));
+    return executeForDb(db, request, out_response, out_failure);
+}
+
+fn executeForDb(live_db: *db_mod.DB, request: *const abi.LocalQueryRequest, out_response: *abi.QueryOwnedResponse, out_failure: *abi.FailureIdentity) abi.Status {
     out_response.* = .{};
     out_failure.* = .{};
     if (request.version != abi.abi_version)
         return fail(error.InvalidAbiVersion, .validate_request, out_failure);
-    const live_db: *db_mod.DB = @ptrCast(@alignCast(request.db orelse
-        return fail(error.InvalidArgument, .validate_request, out_failure)));
     const table_name = request.table_name.slice();
     if (table_name.len == 0 or request.request_json.len == 0)
         return fail(error.InvalidArgument, .validate_request, out_failure);

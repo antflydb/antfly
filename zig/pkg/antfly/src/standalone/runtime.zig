@@ -3135,6 +3135,11 @@ const LocalStandaloneMetadata = struct {
         if ((call == .relational_index_status or call == .relational_index_prepare) and !context.setting_admin) return error.Forbidden;
         if ((call == .store_root_enroll or call == .store_root_enrollment_status) and !context.setting_admin) return error.Forbidden;
         if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, receiving_context);
+        if (call == .lake_source_owner_read) {
+            try lockAtomicForRequest(&self.mutex, receiving_context);
+            defer self.mutex.unlock();
+            return (self.lifecycle_store orelse return error.UnsupportedOperation).getLakeSourceOwner(alloc, group_ids.main_metadata_group_id, call.lake_source_owner_read);
+        }
         if (call == .lake_index_lifecycle_work) {
             try lockAtomicForRequest(&self.mutex, receiving_context);
             defer self.mutex.unlock();
@@ -3222,7 +3227,7 @@ const LocalStandaloneMetadata = struct {
                 if (activation.version < required) return error.TableTopologyProtocolUpgradeRequired;
                 return store.prepareRelationCreateJsonWithContext(alloc, group_ids.main_metadata_group_id, request, .query_population, context);
             },
-            .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate, .relational_index_begin => unreachable,
+            .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate, .relational_index_begin => unreachable,
             .relational_index_status => |request| {
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 return store.relationalIndexStatusJson(alloc, group_ids.main_metadata_group_id, request);

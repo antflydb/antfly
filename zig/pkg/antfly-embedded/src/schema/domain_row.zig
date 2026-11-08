@@ -52,22 +52,7 @@ pub const Admission = struct {
     }
 };
 
-/// A destination fingerprint for a completed logical preparation. This is
-/// not an authorization token: only authenticated internal handoffs and owned
-/// SQL session records may attach it to a write. Canonical owner verification
-/// still runs before the atomic row/index/intent boundary.
-pub const PreparedContract = struct {
-    version: u8 = 1,
-    schema_version: u32,
-    domain_digest: [32]u8,
-
-    pub fn validate(self: PreparedContract) !void {
-        if (self.version != 1 or std.mem.allEqual(u8, &self.domain_digest, 0)) return error.InvalidRelationalExpressionInput;
-    }
-    pub fn eql(self: PreparedContract, other: PreparedContract) bool {
-        return self.version == other.version and self.schema_version == other.schema_version and std.mem.eql(u8, &self.domain_digest, &other.domain_digest);
-    }
-};
+pub const PreparedContract = @import("prepared_row_contract.zig").PreparedContract;
 
 pub const Failure = struct { ordinal: u32, violation: values.Violation };
 pub const Plan = struct {

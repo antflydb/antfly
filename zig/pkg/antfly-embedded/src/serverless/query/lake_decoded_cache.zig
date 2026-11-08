@@ -118,6 +118,7 @@ pub const Cache = struct {
     bytes: usize = 0,
     tick: u64 = 0,
     hits: u64 = 0,
+    eviction_epoch: std.atomic.Value(u64) = .init(0),
     flights: std.AutoHashMapUnmanaged([32]u8, *Flight) = .empty,
     loading_bytes: usize = 0,
     max_loading_bytes: usize = 64 * 1024 * 1024,
@@ -346,6 +347,7 @@ pub const Cache = struct {
         self.lock();
         defer self.mutex.unlock();
         const removed = self.entries.fetchRemove(key) orelse return;
+        _ = self.eviction_epoch.fetchAdd(1, .monotonic);
         self.bytes -= removed.value.footprint();
         removed.value.cached = false;
         if (removed.value.refs == 0) removed.value.destroy(self);
@@ -395,6 +397,7 @@ pub const Cache = struct {
                 }
             }
             const removed = self.entries.fetchRemove(oldest orelse return).?;
+            _ = self.eviction_epoch.fetchAdd(1, .monotonic);
             self.bytes -= removed.value.footprint();
             removed.value.cached = false;
             removed.value.destroy(self);

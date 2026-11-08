@@ -1161,7 +1161,7 @@ test "resolver curation ordered review commits outcomes replay and receipts toge
         try std.testing.expectEqual(command.config_generation, parsed.value.request.resolver_review.?.config_generation);
         try std.testing.expect(try replication.decodeRestoreFinishForReplay(std.testing.allocator, record) == null);
     }
-    const codec = @import("../../api/batch.zig");
+    const codec = @import("../../api/batch_internal.zig");
     const encoded = try codec.encodeBatchRequest(a, .{ .resolver_review = command });
     try std.testing.expectError(error.InvalidBatchRequest, codec.parseBatchRequest(std.testing.allocator, encoded));
     var decoded = try codec.parseInternalBatchRequest(std.testing.allocator, encoded);

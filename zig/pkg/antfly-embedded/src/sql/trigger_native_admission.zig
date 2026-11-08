@@ -36,7 +36,7 @@ pub fn scope(a: A, req: types.BatchRequest) !authority.Scope {
     if (unsigned.transaction) |*command| if (command.* == .prepare) {
         command.prepare.topology_epoch = 0;
     };
-    const body = try @import("../api/batch.zig").encodeOwnerBatchRequest(a, unsigned);
+    const body = try @import("../api/batch_internal.zig").encodeOwnerBatchRequest(a, unsigned);
     defer a.free(body);
     return .{
         .purpose = if (req.transaction != null and req.transaction.? == .prepare) .native_prepare else .native_batch,

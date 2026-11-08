@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const types = @import("types.zig");
+const types = @import("mutation_values.zig");
 
 pub fn resolveDocumentTransform(
     alloc: Allocator,
@@ -48,12 +48,7 @@ pub fn resolveDocumentTransform(
 ///
 /// Keep this independent of document state so an unsupported request cannot
 /// become an acknowledged no-op merely because its target is absent.
-pub fn validateDocumentTransform(alloc: Allocator, transform: types.DocumentTransform) !void {
-    for (transform.operations) |op| {
-        var prepared = try prepareTransformOp(alloc, op, false);
-        prepared.deinit(alloc);
-    }
-}
+pub const validateDocumentTransform = @import("mutation_validation.zig").validateDocumentTransform;
 
 pub fn validateTransformOpType(op: types.TransformOpType) !void {
     switch (op) {

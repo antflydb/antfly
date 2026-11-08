@@ -50,6 +50,7 @@ pub const View = struct {
         }
     };
     pub const Page = struct {
+        owner_release: ?@import("read_session_contract.zig").Release = null,
         arena: std.heap.ArenaAllocator,
         rows: []const Row,
         after: ?[]const u8,
@@ -76,6 +77,9 @@ pub const View = struct {
                     lease.page.deinit();
                     lease.alloc.destroy(lease);
                 }
+            } else if (self.owner_release) |owner| {
+                self.arena.deinit();
+                owner.deinit();
             } else {
                 for (self.retained_pages) |*page| page.deinit();
                 for (self.columnar_blocks) |block| block.deinit();

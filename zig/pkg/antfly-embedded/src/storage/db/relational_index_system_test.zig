@@ -20,7 +20,7 @@ const hot_standby_publisher_adapter = @import("antfly_server_test_sources").loca
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const db_mod = @import("mod.zig");
-const rows = @import("relational_rows.zig");
+const rows = @import("read_session_backend").RelationalRows;
 const records = @import("relational_index_records.zig");
 const internal = @import("../internal_keys.zig");
 const primary_mod = @import("antfly_server_test_sources").local_test_sources.storage_hot_standby_primary;
@@ -3375,7 +3375,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     try std.testing.expectError(error.OnlineSourceScopeChanged, db.nativeIndexOwnerState(identity));
     const Wire = struct {
         fn apply(database: *db_mod.DB, command: @import("relational_index_raft_contract.zig").Command, entry: receipts.OrderedApplyReceipt) !void {
-            const codec = @import("../../api/batch.zig");
+            const codec = @import("../../api/batch_internal.zig");
             const encoded = try codec.encodeBatchRequest(alloc, .{ .relational_index_owner_control = command });
             defer alloc.free(encoded);
             var decoded = try codec.parseInternalBatchRequest(alloc, encoded);
@@ -3383,7 +3383,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
             try server_test_adapter.applyOrderedGroup(database, 11, decoded.req, entry);
         }
         fn roundtrip(backing: std.mem.Allocator, command: raft.Command) !void {
-            const codec = @import("../../api/batch.zig");
+            const codec = @import("../../api/batch_internal.zig");
             const request: db_mod.types.BatchRequest = .{ .relational_index_owner_control = .{ .control = command }, .timestamp_ns = 18446744073709551600 };
             const encoded = try codec.encodeBatchRequest(backing, request);
             defer backing.free(encoded);
@@ -3395,7 +3395,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Wire.roundtrip, .{admission.command});
     {
-        const codec = @import("../../api/batch.zig");
+        const codec = @import("../../api/batch_internal.zig");
         const request: db_mod.types.BatchRequest = .{ .relational_index_owner_control = .{ .control = admission.command } };
         const encoded = try codec.encodeBatchRequest(alloc, request);
         defer alloc.free(encoded);
@@ -9951,7 +9951,7 @@ test "relational index system restore receipts require local coverage through fa
     // Hidden import pages must not request ordinary serving-table visibility.
     // Exercise the compiled-owner JSON boundary as well as the native request.
     try std.testing.expectEqual(.write, page.batch.?.sync_level);
-    const batch_api = @import("../../api/batch.zig");
+    const batch_api = @import("../../api/batch_internal.zig");
     const encoded_page = try batch_api.encodeBatchRequest(alloc, page.batch.?);
     defer alloc.free(encoded_page);
     var decoded_page = try batch_api.parseInternalBatchRequest(alloc, encoded_page);
@@ -12137,7 +12137,7 @@ test "relational index system query lease typed point hydration retains nulls nu
     const one = try reader.lookupSqlBatch(a, &.{ "z", "a" }, output_layout, 1);
     try std.testing.expectEqual(@as(usize, 1), one.consumed);
     const Probe = struct {
-        fn run(backing: std.mem.Allocator, live: *@import("relational_rows.zig").Reader) !void {
+        fn run(backing: std.mem.Allocator, live: *@import("read_session_backend").RelationalRows.Reader) !void {
             var region = std.heap.ArenaAllocator.init(backing);
             defer region.deinit();
             const layout = try @import("../../sql/catalog.zig").Row.TypedLayout.init(region.allocator(), &.{ "payload", "optional", "score" });

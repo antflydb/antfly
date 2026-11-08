@@ -214,7 +214,7 @@ fn submitOnce(server: *Server, a: A, context: operation.RequestContext, table: [
         var route = (try nativeControlRoute(server, a, checked.checked, checked.native_control, checked.retirement_control)) orelse (try routes.resolveGroupRoute(a, server.catalogSource(), server.cfg.session_router orelse fallback.router(), group, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
         defer route.deinit(a);
         if (route != .remote) return error.GroupLeaderUnavailable;
-        const encoded = try local.api_batch.encodeBatchRequest(a, request);
+        const encoded = try local.api_internal_batch.encodeBatchRequest(a, request);
         defer a.free(encoded);
         var client = @import("http_client.zig").ApiHttpClient.init(a, server.cfg.session_executor orelse return error.UnsupportedOperation);
         _ = client.withInternalServiceAuth(server.cfg.internal_service_secret, server.cfg.internal_service_issuer);

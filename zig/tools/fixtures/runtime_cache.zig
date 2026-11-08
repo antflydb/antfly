@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
         const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
         // Shared native owners keep their real imports, options and native
         // objects. The cache fixture replaces expensive bodies for these
-        // providers just as it does for the seven runtime archives below.
+        // providers just as it does for the eight runtime archives below.
         if (std.mem.eql(u8, artifact.name, "antfly-storage-engine") or
             std.mem.eql(u8, artifact.name, "antfly-inference-core"))
             artifact.root_module.root_source_file = sources.add(b.fmt("{s}-cache-body.zig", .{artifact.name}), "comptime {}\n");
@@ -209,13 +209,13 @@ pub fn build(b: *std.Build) void {
                 "observabilityRevision(@import(\"cache_prometheus\")) ^ (observabilityRevision(@import(\"cache_structlog\")) << 8)"
         else if (unit == .distributed)
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @intFromBool(@import(\"cache_lite_capabilities\").capabilitiesForProfile(.native).local_inference_runtime) ^ ownerRevision(@import(\"raft_engine\"))"
-        else if (unit == .storage_kernel)
+        else if (unit == .storage_kernel or unit == .local_query)
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ ownerRevision(@import(\"raft_engine\"))"
         else
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\")";
         const declarations = switch (unit) {
             .api_kernel => "const specs = @import(\"antfly_openapi_specs\");\n" ++ profiles.owner_probe_source,
-            .distributed, .storage_kernel => profiles.owner_probe_source,
+            .distributed, .storage_kernel, .local_query => profiles.owner_probe_source,
             .inference => profiles.observability_probe_source,
             else => "",
         };
@@ -233,11 +233,12 @@ pub fn build(b: *std.Build) void {
         \\extern fn probe_inference() u64;
         \\extern fn probe_api_kernel() u64;
         \\extern fn probe_storage_kernel() u64;
+        \\extern fn probe_local_query() u64;
         \\extern fn probe_enrichment_compute() u64;
         \\pub fn main() void {
-        \\    std.debug.print("CACHE_PROBE {s} {x} {x} {x} {x} {x} {x} {x}\n", .{
+        \\    std.debug.print("CACHE_PROBE {s} {x} {x} {x} {x} {x} {x} {x} {x}\n", .{
         \\        @import("build_info").version(), probe_cli(), probe_distributed(),
-        \\        probe_serverless(), probe_inference(), probe_api_kernel(), probe_storage_kernel(), probe_enrichment_compute(),
+        \\        probe_serverless(), probe_inference(), probe_api_kernel(), probe_storage_kernel(), probe_local_query(), probe_enrichment_compute(),
         \\    });
         \\}
     );
@@ -343,7 +344,7 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
             std.debug.panic("{s} archive depends on simulation test support", .{@tagName(unit)});
         if (std.mem.eql(u8, name, "lmdb_engine"))
             std.debug.panic("{s} archive depends on disabled LMDB", .{@tagName(unit)});
-        if (unit != .distributed and unit != .storage_kernel and std.mem.eql(u8, name, "antfly_lite_options"))
+        if (unit != .distributed and unit != .storage_kernel and unit != .local_query and std.mem.eql(u8, name, "antfly_lite_options"))
             std.debug.panic("{s} archive depends on Lite capability settings", .{@tagName(unit)});
         if (unit != .api_kernel and (std.mem.eql(u8, name, "antfly_mcp") or std.mem.eql(u8, name, "antfly_a2a")))
             std.debug.panic("{s} archive depends on API protocol adapters", .{@tagName(unit)});

@@ -138,3 +138,32 @@ def test_timing_separates_upstream_from_end_to_end_duration():
         "backend_seconds": 2,
         "outside_backend_seconds": 10,
     }
+
+
+def test_probe_includes_a_slow_connection_close(monkeypatch):
+    clock = [0.0]
+
+    class Response:
+        status = 200
+        headers = {"Server-Timing": "antfly_upstream;dur=10.000"}
+
+        def __enter__(self):
+            clock[0] += 0.02
+            return self
+
+        def read(self, _limit):
+            clock[0] += 0.01
+            return b'{"ok":true}'
+
+        def __exit__(self, *_):
+            clock[0] += 20
+
+    monkeypatch.setattr(qualify_gateway, "open_request", lambda *a, **k: Response())
+    monkeypatch.setattr(qualify_gateway.time, "monotonic", lambda: clock[0])
+    result, evidence = qualify_gateway.probe("http://127.0.0.1", "/health", None)
+    assert result == {"ok": True}
+    assert evidence["seconds"] == pytest.approx(20.03)
+    assert evidence["headers_seconds"] == pytest.approx(0.02)
+    assert evidence["body_seconds"] == pytest.approx(0.01)
+    assert evidence["close_seconds"] == pytest.approx(20)
+    assert evidence["outside_backend_seconds"] == pytest.approx(20.02)

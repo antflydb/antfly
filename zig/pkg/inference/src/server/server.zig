@@ -12070,6 +12070,8 @@ pub const Node = struct {
             try self.resolveRequestModelSelection(scratch, io, request.model, "extractors");
         const model_path = model_path_selection.path;
         const model_path_selection_control: ?InferenceExecutionControl = model_path_selection.bind(self.bindExecutionControl(null, control orelse .{}));
+        // Preserve model-selection validity in direct and brokered execution.
+        execution_options.control = model_path_selection_control;
         defer scratch.free(model_path);
         // Only architecture/configuration and capability are needed here.
         // Full tokenizer JSON materialization belongs to the admitted managed
@@ -12338,14 +12340,14 @@ pub const Node = struct {
             break :bytes planned;
         } else null;
         const execution_mutex = loaded.targetInferenceExecutionMutex();
-        const effective = model_path_selection_control orelse InferenceExecutionControl{};
+        const effective = control orelse InferenceExecutionControl{};
         // A waiting GPU boundary request cannot use the session workspace
         // yet. Admit its device ceiling only when it reaches the front of the
         // model queue; otherwise concurrent waiters reserve duplicate device
         // capacity and fail before the already-serialized execution can drain.
         // This is distinct from the execution/provider lock: admission may
         // evict other models and must remain outside those locks.
-        const gliner_turn = if (backend == .cuda or backend == .metal) try loaded.gliner_execution_lane.acquire(model_path_selection_control orelse .{}) else null;
+        const gliner_turn = if (backend == .cuda or backend == .metal) try loaded.gliner_execution_lane.acquire(control orelse .{}) else null;
         defer if (gliner_turn) |turn| turn.release();
         const admission_mutex = if (backend == .cuda or backend == .metal) &loaded.gliner_boundary_admission_lock else null;
         if (admission_mutex) |mutex| try effective.lock(mutex);
@@ -12413,12 +12415,12 @@ pub const Node = struct {
             if (execution_mutex) |mutex| try effective.lock(mutex);
             defer if (execution_mutex) |mutex| mutex.unlock();
             var managed = if (workspace_plan) |plan|
-                session_factory.getManagedGlinerBoundaryComputeBackend(loaded.session, scratch, budget, model_path_selection_control, plan, if (workspace_permit) |*permit| permit else null) catch |err| {
+                session_factory.getManagedGlinerBoundaryComputeBackend(loaded.session, scratch, budget, control, plan, if (workspace_permit) |*permit| permit else null) catch |err| {
                     if (err == error.GlinerBoundaryWorkspacePlanChanged) continue;
                     return err;
                 }
             else
-                try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, model_path_selection_control);
+                try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, control);
             defer managed.deinit();
             const json = if (test_qualification)
                 try boundary_executor.execute(&managed.backend, scratch, &config, loaded.getTokenizer(), request, request_options)

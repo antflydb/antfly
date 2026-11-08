@@ -42,6 +42,47 @@ fn applyCommittedOwnerEntry(owner: *client.Owner, table: []const u8, body: []con
     }
 }
 
+test "borrowed document batches cross compiled owner without payload ownership transfer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var owner = try client.Owner.open(.{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 1 });
+    defer owner.deinit();
+    const document = try alloc.dupe(u8, "{\"id\":9007199254740993,\"text\":\"borrowed\"}");
+    defer alloc.free(document);
+    const writes = [_]abi.BorrowedDocumentWrite{.{ .key = .fromSlice("a"), .document_json = .fromSlice(document) }};
+    var inserted = try owner.batchBorrowedDocuments(.{ .table_name = .fromSlice("docs"), .writes = &writes, .write_count = writes.len });
+    inserted.deinit();
+    @memset(document, 'x');
+    var persisted = try owner.lookupJson("docs", "{\"key\":\"a\"}");
+    defer persisted.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, persisted.bytes(), "9007199254740993") != null);
+
+    const invalid = [_]abi.BorrowedDocumentWrite{
+        .{ .key = .fromSlice("not-committed"), .document_json = .fromSlice("{}") },
+        .{ .key = .fromSlice("bad"), .document_json = .fromSlice("[]") },
+    };
+    try std.testing.expectError(error.InvalidBatchRequest, owner.batchBorrowedDocuments(.{ .table_name = .fromSlice("docs"), .writes = &invalid, .write_count = invalid.len }));
+    try std.testing.expectError(error.NotFound, owner.lookupJson("docs", "{\"key\":\"not-committed\"}"));
+    var output: abi.OwnedBytes = .{};
+    var failure: abi.FailureIdentity = .{};
+    const invalid_status = abi.antfly_storage_owner_batch_borrowed_documents(owner.handle, &.{ .table_name = .fromSlice("docs"), .write_count = 1 }, &output, &failure);
+    try error_identity.validateFailureEnvelope(invalid_status, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("InvalidArgument", failure.errorName());
+    try std.testing.expectEqual(@backingInt(abi.BorrowedBatchOperation.validate), failure.operation);
+    try std.testing.expect(output.ptr == null);
+    const old_status = abi.antfly_storage_owner_batch_borrowed_documents(owner.handle, &.{ .version = abi.abi_version - 1 }, &output, &failure);
+    try error_identity.validateFailureEnvelope(old_status, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("InvalidAbiVersion", failure.errorName());
+
+    const deletes = [_]abi.BorrowedBytes{.fromSlice("a")};
+    var deleted = try owner.batchBorrowedDocuments(.{ .table_name = .fromSlice("docs"), .deletes = &deletes, .delete_count = deletes.len });
+    defer deleted.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, deleted.bytes(), "\"deleted\":1") != null);
+}
+
 test "opaque owner policy receipt controls retain verifier configuration" {
     const a = std.testing.allocator;
     var context: client.Context = .{};
@@ -139,7 +180,7 @@ test "opaque owner retained relational read crosses checked archive boundary" {
 
 test "opaque owner conditional writes retain version and digest fences" {
     const alloc = std.testing.allocator;
-    const batch = @import("antfly_local_sources").api_batch;
+    const batch = @import("antfly_local_sources").api_internal_batch;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
@@ -441,7 +482,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
     const alloc = std.testing.allocator;
     const transfer = @import("antfly_local_sources").storage_db_source_artifact_transfer;
     const contract = @import("antfly_local_sources").api_local_query_contract;
-    const batch = @import("antfly_local_sources").api_batch;
+    const batch = @import("antfly_local_sources").api_internal_batch;
     const source = @import("antfly_local_sources").storage_db_online_source_contract;
     const Call = struct {
         fn transport(ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, request: transfer.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
@@ -678,7 +719,7 @@ test "opaque owner runtime source authority crosses compiled boundary and surviv
 test "opaque owner online source controls and status survive compiled boundary restart" {
     const alloc = std.testing.allocator;
     const contract = @import("antfly_local_sources").api_local_query_contract;
-    const batch = @import("antfly_local_sources").api_batch;
+    const batch = @import("antfly_local_sources").api_internal_batch;
     const source = @import("antfly_local_sources").storage_db_online_source_contract;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1064,7 +1105,7 @@ test "opaque portable and native restore preserve bounded range through captured
     const handoff = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
     const transition = @import("antfly_local_sources").storage_db_relational_transition_contract;
     const seal = @import("antfly_local_sources").storage_db_native_backup_seal_contract;
-    const batch_wire = @import("antfly_local_sources").api_batch;
+    const batch_wire = @import("antfly_local_sources").api_internal_batch;
     const Driver = struct {
         owner: *client.Owner,
         index: u64 = 0,
@@ -2244,6 +2285,14 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         invalid_abi_failure.operation,
     );
     try std.testing.expectEqualStrings("InvalidAbiVersion", invalid_abi_failure.errorName());
+
+    // Reject an incompatible owner-issued capability before invoking it.
+    // A poisoned context must never reach an owner callback.
+    invalid_abi_request = .{ .execution = .{ .version = 0, .context = @ptrFromInt(1) }, .table_name = .fromSlice("docs"), .request_json = .fromSlice("{}") };
+    const incompatible_db_status = abi.antfly_local_query_execute(&invalid_abi_request, &invalid_abi_response, &invalid_abi_failure);
+    try std.testing.expectEqual(abi.Status.invalid_abi, incompatible_db_status);
+    try std.testing.expectEqualStrings("InvalidAbiVersion", invalid_abi_failure.errorName());
+    try std.testing.expectEqual(@as(u64, 0), invalid_abi_response.buffer.len);
 
     // Every operation family crossing the storage-owner boundary carries the
     // same complete envelope even when it remains in the storage unit.
@@ -4878,7 +4927,7 @@ test "opaque owner lookup and typed scans preserve metadata scope digest and row
     ;
     var owner = try client.Owner.open(.{ .path = .fromSlice(path), .table_name = .fromSlice("rows"), .group_id = 7301, .has_identity_namespace = 1, .identity_table_id = 73, .identity_shard_id = 7301, .identity_range_id = 7301, .schema_json = .fromSlice(schema) });
     defer owner.deinit();
-    const seed = try @import("antfly_local_sources").api_batch.encodeOwnerBatchRequest(alloc, .{ .writes = &.{.{ .key = "r", .value = "{\"id\":\"a\",\"count\":9007199254740993,\"payload\":null}", .json_null_fields = &.{"payload"} }}, .sync_level = .write });
+    const seed = try @import("antfly_local_sources").api_internal_batch.encodeOwnerBatchRequest(alloc, .{ .writes = &.{.{ .key = "r", .value = "{\"id\":\"a\",\"count\":9007199254740993,\"payload\":null}", .json_null_fields = &.{"payload"} }}, .sync_level = .write });
     defer alloc.free(seed);
     var applied = try owner.batchJson("rows", seed);
     applied.deinit();
@@ -5518,7 +5567,7 @@ test "opaque native private SQL lock observations require actual frozen particip
     for (commands) |command| {
         // Use the production private-control envelope, including its
         // sql_lock_v1 checkpoint discriminator and native live dispatcher.
-        const raw_command = try local.api_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = command, .sync_level = .write });
+        const raw_command = try local.api_internal_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = command, .sync_level = .write });
         defer a.free(raw_command);
         var applied = try owner.batchJson("rows", raw_command);
         applied.deinit();
@@ -5637,12 +5686,12 @@ fn qualifyNativeAbsentAbort(owner: *client.Owner, owner_live: *bool, open: abi.O
         var missing_envelope = resolve;
         missing_envelope.native_control = null;
         missing_envelope.operation = operation;
-        const raw = try local.api_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = missing_envelope, .sync_level = .write });
+        const raw = try local.api_internal_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = missing_envelope, .sync_level = .write });
         defer a.free(raw);
         try std.testing.expectError(error.ExternalTransactionDecisionChanged, owner.batchJson("rows", raw));
     }
     for (0..2) |_| {
-        const raw = try local.api_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = resolve, .sync_level = .write });
+        const raw = try local.api_internal_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = resolve, .sync_level = .write });
         defer a.free(raw);
         var applied = try owner.batchJson("rows", raw);
         applied.deinit();
@@ -5660,7 +5709,7 @@ fn qualifyNativeAbsentAbort(owner: *client.Owner, owner_live: *bool, open: abi.O
     var wrong_group = resolve;
     wrong_group.admission.binding.namespace.group = 73;
     wrong_group.native_control.?.route.route.group_id = 73;
-    const wrong_raw = try local.api_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = wrong_group, .sync_level = .write });
+    const wrong_raw = try local.api_internal_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = wrong_group, .sync_level = .write });
     defer a.free(wrong_raw);
     try std.testing.expectError(error.IdentityNamespaceMismatch, owner.batchJson("rows", wrong_raw));
     const ack = try std.json.Stringify.valueAlloc(a, .{ ._transaction = .{ .phase = "external_acknowledge_v1", .txn_id = &txn_hex, .participant = participant, .external_decision_owner = control.owner }, .sync_level = "write" }, .{});
@@ -5677,7 +5726,7 @@ fn qualifyNativeAbsentAbort(owner: *client.Owner, owner_live: *bool, open: abi.O
         .{ .admission = execution, .checked = checked, .operation = .{ .acquire = .{ .backend = (try execution.registration()).lease.backend, .sequence = 1, .nonce = @splat(37), .action = .{ .try_acquire = .{ .resource = try execution.binding.table(), .mode = .{ .table = .access_share }, .scope = .{ .transaction = .{ .id = execution.transaction, .subtransaction = 0 } } } } } } },
     };
     for (late) |command| {
-        const raw = try local.api_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = command, .sync_level = .write });
+        const raw = try local.api_internal_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = command, .sync_level = .write });
         defer a.free(raw);
         try std.testing.expectError(error.LockEffectExpired, owner.batchJson("rows", raw));
     }
@@ -5691,7 +5740,7 @@ fn qualifyNativeAbsentAbort(owner: *client.Owner, owner_live: *bool, open: abi.O
     owner_live.* = true;
     const after = try owner.nativeRelationBinding(a, "rows");
     try std.testing.expectEqualDeep(before, after);
-    const late_raw = try local.api_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = late[0], .sync_level = .write });
+    const late_raw = try local.api_internal_batch.encodeOwnerBatchRequest(a, .{ .sql_lock = late[0], .sync_level = .write });
     defer a.free(late_raw);
     try std.testing.expectError(error.LockEffectExpired, owner.batchJson("rows", late_raw));
 }
@@ -5796,7 +5845,7 @@ test "opaque native retirement status requires exact current image and stored fe
     const request: transition.NativeRetirementStatusRequest = .{ .fence = fence, .descriptor = descriptor, .pin = try P.PhysicalPin.fromBinding(binding), .native_instance = instance };
     // Matching wire claims alone do not establish the sealed live fence.
     try std.testing.expectError(error.IntegrityTopologyChanged, owner.nativeRetirementStatusJson(a, "rows", request));
-    const begin = try local.api_batch.encodeBatchRequest(a, .{ .relational_topology = .{ .action = .begin, .fence = fence, .sql_drop_control = true } });
+    const begin = try local.api_internal_batch.encodeBatchRequest(a, .{ .relational_topology = .{ .action = .begin, .fence = fence, .sql_drop_control = true } });
     defer a.free(begin);
     var applied = try owner.nativeFkGenerationControlJson("rows", begin);
     applied.deinit();
@@ -5849,7 +5898,7 @@ test "opaque native retirement status requires exact current image and stored fe
     try std.testing.expect(output.ptr == null and output.len == 0);
     // Real cancellation removes the current fence; a prior positive status
     // can never authorize a new absent-fence observation after that cut.
-    const cancel = try local.api_batch.encodeBatchRequest(a, .{ .relational_topology = .{ .action = .cancel_child_generation_source, .fence = fence, .sql_drop_control = true } });
+    const cancel = try local.api_internal_batch.encodeBatchRequest(a, .{ .relational_topology = .{ .action = .cancel_child_generation_source, .fence = fence, .sql_drop_control = true } });
     defer a.free(cancel);
     var canceled = try owner.nativeFkGenerationControlJson("rows", cancel);
     canceled.deinit();

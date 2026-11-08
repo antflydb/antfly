@@ -2641,7 +2641,7 @@ fn residualDepthwiseConv(
     const bias_name = try fmtAlloc(allocator, "vision_tower.blocks.{d}.{d}.{s}.fn.dw.bias", .{ stage, layer, block_prefix });
     defer allocator.free(bias_name);
 
-    if (cb.kind() == .cuda) {
+    if (build_options.enable_cuda and cb.kind() == .cuda) {
         if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceDepthwiseResidual(cb, input, try cb.getWeight(weight_name), try cb.getWeight(bias_name), batch, height, width, channels)) |result| return result;
     }
     const updates_ct = try cb.tokenGridConv2d(
@@ -2776,7 +2776,7 @@ fn residualMlp(
     const fc2_b_name = try fmtAlloc(allocator, "vision_tower.blocks.{d}.{d}.{s}.fn.net.fc2.bias", .{ stage, layer, block_prefix });
     defer allocator.free(fc2_b_name);
 
-    if (cb.kind() == .cuda) {
+    if (build_options.enable_cuda and cb.kind() == .cuda) {
         if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceMlp(cb, input, .{
             try cb.getWeight(norm_w_name), try cb.getWeight(norm_b_name),
             try cb.getWeight(fc1_w_name),  try cb.getWeight(fc1_b_name),
@@ -3045,7 +3045,10 @@ fn applyEncoderImagePromptEmbeddingsTensor(
     const merged = if (prompt_seq_len > 0) blk: {
         const prompt_embeddings = try cb.embeddingLookup(try promptEmbedWeight(cb), prompt_input_ids, batch * prompt_seq_len, d_model);
         defer cb.free(prompt_embeddings);
-        if (batch > 1) break :blk try @import("../ops/cuda/cuda_compute.zig").CudaCompute.concatFlorenceImagePrompt(cb, image.features, prompt_embeddings, batch, image.seq_len, prompt_seq_len, d_model);
+        if (batch > 1) {
+            if (comptime !build_options.enable_cuda) return error.UnsupportedShape;
+            break :blk try @import("../ops/cuda/cuda_compute.zig").CudaCompute.concatFlorenceImagePrompt(cb, image.features, prompt_embeddings, batch, image.seq_len, prompt_seq_len, d_model);
+        }
         break :blk try cb.concatRows2D(allocator, image.features, prompt_embeddings, image.seq_len, prompt_seq_len, d_model);
     } else try cb.sliceRows2D(allocator, image.features, 0, batch * image.seq_len, d_model);
 
@@ -3675,7 +3678,7 @@ fn compactSelfCacheRows(
     d_model: usize,
 ) !CT {
     if (batch == 1) return cb.sliceRows2D(allocator, slab, 0, active_len, d_model);
-    if (cb.kind() == .cuda and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_PACKED_SELF_KV"))
+    if (build_options.enable_cuda and cb.kind() == .cuda and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_PACKED_SELF_KV"))
         return compactSelfCacheRowsDevice(cb, slab, batch, capacity, active_len, d_model);
 
     var acc: ?CT = null;

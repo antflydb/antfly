@@ -21,7 +21,7 @@ const attachments = @import("../system_catalog/triggers.zig");
 const records = @import("../system_catalog/routines.zig");
 const authority = @import("../common/trigger_preparation_authority.zig");
 const types = @import("../storage/db/types.zig");
-const batch = @import("../api/batch.zig");
+const batch = @import("../api/batch_internal.zig");
 
 const View = struct {
     state: attachments.State,

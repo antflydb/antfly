@@ -91,6 +91,10 @@ const HttpResponseState = struct {
 };
 
 fn fail(err: anyerror) abi.Status {
+    // Error integers are archive-local. Preserve the originating name before
+    // an undeclared error becomes a generic boundary failure; never log inputs.
+    if (!@import("antfly_runtime_abi").error_abi.errorHasStableDetail(err))
+        std.log.warn("API owner returned undeclared error err={s}", .{@errorName(err)});
     return abi.statusFromError(err);
 }
 

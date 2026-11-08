@@ -1,0 +1,21 @@
+# Development compiler only. Sources and all Zig caches stay in the worktree.
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates curl git make pkg-config python3 xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+COPY zig/toolchain.env /opt/zig-toolchain.env
+RUN . /opt/zig-toolchain.env && \
+    case "$(uname -m)" in \
+      x86_64) zig_arch=x86_64; zig_sha256="$ZIG_X86_64_LINUX_SHA256" ;; \
+      aarch64) zig_arch=aarch64; zig_sha256="$ZIG_AARCH64_LINUX_SHA256" ;; \
+      *) exit 1 ;; \
+    esac && \
+    curl --fail --location --retry 3 "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" -o /opt/zig.tar.xz && \
+    echo "$zig_sha256  /opt/zig.tar.xz" | sha256sum --check --strict && \
+    mkdir /opt/zig && tar -xJf /opt/zig.tar.xz -C /opt/zig --strip-components=1 && \
+    rm /opt/zig.tar.xz
+ENV PATH="/opt/zig:${PATH}"
+ENV ZIG_LOCAL_CACHE_DIR=/workspace/zig/.zig-cache/linux/local
+ENV ZIG_GLOBAL_CACHE_DIR=/workspace/zig/.zig-cache/linux/global
+WORKDIR /workspace/zig
+CMD ["make", "watch-plans", "WATCH_STEP=query-paging-test"]

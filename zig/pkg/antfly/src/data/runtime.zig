@@ -2460,7 +2460,7 @@ fn needsDenseRepairWritePreflight(req: antfly.db.types.BatchRequest) bool {
     // Reuse the codec's exhaustive shape guard so mixed or future effects
     // cannot acquire the isolated control's admission behavior.
     if (req.row_policy_publication != null or req.row_policy_install_bundle.len != 0) {
-        @import("antfly_local_sources").api_batch.validateRowPolicyPublicationRequest(req) catch return true;
+        @import("antfly_local_sources").api_internal_batch.validateRowPolicyPublicationRequest(req) catch return true;
         return false;
     }
     // Private index effects already require independent metadata permission.
@@ -15529,7 +15529,7 @@ pub const DataServer = struct {
         if (req.resolver_review != null) return @import("../common/data_raft_protocol.zig").batch_resolver_review_protocol_version;
         if (req.group_source != null) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (antfly.db.types.requiresGraphRelationshipProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
-        if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.writes, req.predicates))
+        if (@import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(req.writes, req.predicates))
             return @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
         if (req.merge_proof_adoption != null) return data_raft_batch.merge_proof_adoption_protocol_version;
         if (req.artifact_publication_transport != null) return @import("../common/data_raft_protocol.zig").batch_artifact_publication_transport_protocol_version;
@@ -16758,7 +16758,7 @@ pub const DataServer = struct {
                                     self.api_server_cfg.internal_service_secret,
                                     self.api_server_cfg.internal_service_issuer,
                                 );
-                                const body = try antfly.public_api.batch.encodeBatchRequest(alloc, proposal_req);
+                                const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, proposal_req);
                                 defer alloc.free(body);
                                 const forwarding = self.nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse {
                                     try self.sleepDataRaftBatchLeaderRetry();
@@ -16981,7 +16981,7 @@ pub const DataServer = struct {
             self.api_server_cfg.internal_service_secret,
             self.api_server_cfg.internal_service_issuer,
         );
-        const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
+        const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
         const forwarding = self.nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse return false;
         const encoded_route_fence = if (route.write_route_fence) |fence|
@@ -52718,7 +52718,7 @@ fn implementationTests() type {
         }
 
         test "pure policy control bypasses only ordinary dense repair writer preflight" {
-            const contract = @import("antfly_local_sources").api_batch;
+            const contract = @import("antfly_local_sources").api_internal_batch;
             const request: antfly.db.types.BatchRequest = .{ .row_policy_publication = .{
                 .table_id = 7,
                 .expected_generation = 2,

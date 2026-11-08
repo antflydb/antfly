@@ -14,59 +14,11 @@
 // limitations under the License.
 
 const std = @import("std");
-pub const work_control = @import("work_control.zig");
+pub const work_control = @import("image_work_control");
 
-pub const Resample = enum(u32) {
-    nearest = 0,
-    lanczos = 1,
-    bilinear = 2,
-    bicubic = 3,
-    /// Pillow's antialiased, quantized two-pass BICUBIC implementation. This
-    /// is distinct from the legacy bicubic sampler used by existing model
-    /// configurations so parity-sensitive callers must opt in explicitly.
-    pillow_bicubic = 4,
-    /// Torchvision uint8 antialiased bicubic, with adaptive int16 coefficients.
-    torchvision_bicubic = 5,
-};
-
-pub const PixelFormat = enum(u8) {
-    rgb8 = 3,
-    rgba8 = 4,
-};
-
-pub const ImageU8 = struct {
-    data: []const u8,
-    width: u32,
-    height: u32,
-    format: PixelFormat,
-    /// Zero selects the tightly packed width*channels layout. A non-zero
-    /// stride permits borrowing renderer-owned rows without repacking them.
-    row_stride_bytes: usize = 0,
-
-    pub fn channels(self: ImageU8) usize {
-        return @backingInt(self.format);
-    }
-
-    pub fn rowStride(self: ImageU8) !usize {
-        const packed_row = std.math.mul(usize, self.width, self.channels()) catch
-            return error.InvalidImageBuffer;
-        const stride = if (self.row_stride_bytes == 0) packed_row else self.row_stride_bytes;
-        if (stride < packed_row) return error.InvalidImageBuffer;
-        return stride;
-    }
-
-    pub fn validate(self: ImageU8) !void {
-        if (self.width == 0 or self.height == 0) return error.InvalidImageBuffer;
-        const stride = try self.rowStride();
-        const last_row_offset = std.math.mul(usize, self.height - 1, stride) catch
-            return error.InvalidImageBuffer;
-        const packed_row = std.math.mul(usize, self.width, self.channels()) catch
-            return error.InvalidImageBuffer;
-        const required = std.math.add(usize, last_row_offset, packed_row) catch
-            return error.InvalidImageBuffer;
-        if (self.data.len < required) return error.InvalidImageBuffer;
-    }
-};
+pub const Resample = @import("image_values").Resample;
+pub const PixelFormat = @import("image_values").PixelFormat;
+pub const ImageU8 = @import("image_values").ImageU8;
 
 /// Convert a decoded RGB/RGBA image into normalized CHW f32 layout.
 pub fn preprocessDecoded(
@@ -235,7 +187,7 @@ pub fn preprocessDecodedRectScaledWithResampleInto(
     }
 
     for (0..th) |y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..tw) |x| {
             for (0..3) |ch| {
                 const val = sampleResized(resolved_img, x, y, ch, scale_x, scale_y, resample);
@@ -323,7 +275,7 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
     }
 
     for (0..th) |y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..cw) |x| {
             for (0..3) |ch| {
                 const val = sampleResized(resolved_img, x, y, ch, scale_x, scale_y, resample);
@@ -357,7 +309,7 @@ fn preprocessDecodedRectKeepAspectPadRightBilinearSimd(
         const plane = result[ch * th * tw .. (ch + 1) * th * tw];
 
         for (0..th) |y| {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             const row_offset = y * tw;
             var x: usize = 0;
             while (x + lanes <= content_width) : (x += lanes) {
@@ -396,7 +348,7 @@ fn preprocessDecodedRectBilinearSimd(
         const plane = result[ch * th * tw .. (ch + 1) * th * tw];
 
         for (0..th) |y| {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             const row_offset = y * tw;
             var x: usize = 0;
             while (x + lanes <= tw) : (x += lanes) {
@@ -440,7 +392,7 @@ fn preprocessDecodedRectBilinearInterleaved(
     };
 
     for (0..th) |y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         const src_y = (@as(f32, @floatFromInt(y)) + 0.5) * scale_y - 0.5;
         const y0 = clampIndex(@intFromFloat(@floor(src_y)), img.height);
         const y1 = clampIndex(@as(i32, @intCast(y0)) + 1, img.height);
@@ -485,7 +437,7 @@ fn solidRgb(img: ImageU8) !?[3]u8 {
 
     const rgb = [3]u8{ img.data[0], img.data[1], img.data[2] };
     for (0..@as(usize, img.height)) |y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..@as(usize, img.width)) |x| {
             if (x == 0 and y == 0) continue;
             const idx = y * stride + x * channels;
@@ -680,7 +632,7 @@ pub fn buildPillowBicubicAxis(
     const filter_scale = @max(scale, 1.0);
     const support = 2.0 * filter_scale;
     for (0..target_size) |target| {
-        if (target & 63 == 0) try @import("work_control.zig").check();
+        if (target & 63 == 0) try @import("image_work_control").check();
         const center = (@as(f64, @floatFromInt(target)) + 0.5) * scale;
         var first: isize = @intFromFloat(center - support + 0.5);
         var last: isize = @intFromFloat(center + support + 0.5);
@@ -755,7 +707,7 @@ fn pillowHorizontal(img: ImageU8, axis: BicubicAxis, horizontal: []u8, target_wi
         }
     };
     for (0..img.height) |source_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..target_width) |target_x| {
             const start = axis.starts[target_x];
             const begin = axis.offsets[target_x];
@@ -821,7 +773,7 @@ fn preprocessDecodedRectPillowBicubic(
     const row_bytes = target_width * 3;
     const Vec = @Vector(8, i32);
     for (0..target_height) |target_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         const start = vertical_axis.starts[target_y];
         const begin = vertical_axis.offsets[target_y];
         const end = vertical_axis.offsets[target_y + 1];

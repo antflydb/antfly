@@ -14,7 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const batch_api = @import("antfly_local_sources").api_batch;
+const batch_api = @import("antfly_local_sources").api_internal_batch;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig");

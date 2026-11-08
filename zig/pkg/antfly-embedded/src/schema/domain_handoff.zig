@@ -16,9 +16,8 @@
 //! Private canonical-row handoffs. The internal route/session boundary grants
 //! origin authority; this descriptor only fences the immutable destination.
 const std = @import("std");
-const rows = @import("domain_row.zig");
 const A = std.mem.Allocator;
-pub const Contract = rows.PreparedContract;
+pub const Contract = @import("prepared_row_contract.zig").PreparedContract;
 pub const Wire = struct { contract: Contract, row_indices: ?[]const u32 = null };
 
 /// One stable contract address shared by every selected row in a batch. Writes
