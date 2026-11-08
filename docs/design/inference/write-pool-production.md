@@ -1,11 +1,9 @@
 # Bounded CUDA write-pool serving qualification
 
-> Historical GPU qualification: the measurements below predate the PR #1517
-> review fixes for cohort capacity fallback, per-caller serialization and
-> extraction observations. They are retained with the original artifact
-> identities, not attributed to the revised code. Run the restored harness
-> against a newly built CUDA binary before qualifying this revision. CPU unit
-> tests do not establish CUDA parity, throughput, or memory compliance.
+> Fresh PR #1574 qualification passed on 2026-11-08 on glowworm/GB10.
+> The current results below identify production code `c845eded3c`; the separately
+> labelled historical results retain their original identities. This qualifies
+> the declared fixture and serving envelope, not arbitrary workloads.
 
 This work targets the four-model profile in
 [`configs/inference-write-pool-40g.json`](../../../configs/inference-write-pool-40g.json):
@@ -149,6 +147,54 @@ also requires numpy, av and pyarrow. A shorter
 `--diagnostic` run is recorded as diagnostic evidence and cannot replace the
 full sustained campaign. Preserve failed and incomplete receipts alongside
 successful reruns.
+
+## Fresh PR #1574 GB10 results
+
+The complete campaign and legacy write regression passed on `glowworm`
+(`spark-beb5`, NVIDIA GB10). The optimized CUDA HTTP server was built from
+`c845eded3c8f6a86552d57bc321ea27c61859203`; its SHA-256 is
+`850cbe958ea8f29d65a5edf017d95d21a9f177d6159b8956cf11a4d8fc0deb22`.
+The subsequent merge of main `3e8975a1da` changes no inference-package Zig source.
+The merged branch also passes the 64 focused tests and production type-check.
+
+The [machine-readable receipt](write-pool-pr1574-qualification.json) records
+configuration, loaded model hashes, environment, physical batch counters,
+context/schema sweeps, memory sampling and independent pressure recovery.
+Raw requests, samples, acquisition receipts and service logs are retained in
+`.benchmark-results/pr1574` on the qualification worktree and in the local
+`fresh-evidence.tar.gz` bundle; the receipt records its SHA-256.
+
+| Model | Concurrent / serialized throughput, five rounds | Mixed p95 |
+|---|---:|---:|
+| EmbeddingGemma 2 | 1.61× | 21.7 ms |
+| GLiNER2.5 | 2.95× | 50.8 ms |
+| Whisper small | 1.39× | 445.8 ms |
+| LightOnOCR3 | 1.91× | 2,458.9 ms |
+
+Every controlled cohort retained output/usage parity and repeated physical
+batching. The mixed soak completed 172 turnovers and 1,376 requests in 300.9 s,
+including exclusive windowed extraction. All context and frozen schema sweeps
+passed, including exact per-caller decoded/returned/token observations.
+
+All 73 pinned speech clips scored 7.57% WER. The 86.345 s and 156.08 s varied
+composites scored 12.00% and 12.47%. The intentionally repetitive checkpoint
+accuracy case still scores 87.5% WER; it is recorded as a known limitation and
+is excluded from passed accuracy claims. The four synthetic OCR layouts passed.
+
+Memory evidence is complete for every phase, with service-PID NVML attribution
+and no sampling errors. Peak sampled managed CUDA allocation was 6,307,409,404 B;
+peak service NVML was 6,833,618,944 B. The cgroup recorded a 3,987,664,896 B peak.
+These overlapping measurements must not be added. Configured limits remain
+38 GiB managed CUDA and 72 GiB process memory; unified-memory auto-sizing may
+resolve admission ceilings below the nominal configuration. Deadlines,
+disconnects, healthy-peer recovery and instance identity checks passed. Recovery
+returned to the warmed scratch reservations with no active requests or KV.
+
+The independent production engine/host pressure test also passed guard rejection,
+failed-free quarantine, unload/reload and confirmed-free cleanup. Its sampler
+collected 50 raw samples, including stable samples for all four required phases,
+under a deliberately bounded 64 MiB managed allocation guard. This test exercises
+failure recovery without filling the GPU.
 
 ## Historical GB10 results
 
