@@ -195,3 +195,21 @@ fn memory_errors_carry_server_code() {
         other => panic!("unexpected error: {other:?}"),
     }
 }
+
+#[test]
+fn remember_explicit_key_retries_send_identical_evidence() {
+    let (url, seen) = serve(200, OPERATION);
+    let client = antfly_sdk::new_client(&url, reqwest::Client::new());
+    for _ in 0..2 {
+        block_on(
+            client
+                .memory_space("agent")
+                .remember("same text", Some("retry")),
+        )
+        .unwrap();
+    }
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests[0].body, requests[1].body);
+    assert_eq!(requests[0].header("idempotency-key"), Some("retry"));
+    assert_eq!(requests[1].header("idempotency-key"), Some("retry"));
+}

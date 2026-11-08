@@ -735,7 +735,20 @@ export class AntflyClient {
       options?: string | MemoryCallOptions
     ) => {
       const { text, id, sourceId, evidence, assertions, ...observation } = input;
-      const evidenceId = id ?? globalThis.crypto.randomUUID();
+      const headers = memoryMutationHeaders(options);
+      const evidenceId =
+        id ??
+        (typeof options === "string" || options?.idempotencyKey !== undefined
+          ? Array.from(
+              new Uint8Array(
+                await globalThis.crypto.subtle.digest(
+                  "SHA-256",
+                  new TextEncoder().encode(`antfly-memory-remember:${headers["Idempotency-Key"]}`)
+                )
+              ),
+              (byte) => byte.toString(16).padStart(2, "0")
+            ).join("")
+          : globalThis.crypto.randomUUID());
       const result = await this.memory.observe(
         space,
         {
@@ -757,7 +770,10 @@ export class AntflyClient {
               }
             : {}),
         },
-        options
+        {
+          ...(typeof options === "string" ? {} : options),
+          idempotencyKey: headers["Idempotency-Key"],
+        }
       );
       return { ...result, evidenceId };
     },
@@ -799,7 +815,7 @@ export class AntflyClient {
         body,
         params: { path: { space }, header: memoryScopeHeaders(options) },
       }),
-    /** Pin a memory so briefs always include it. */
+    /** Prioritize a memory in the brief within its item and byte limits. */
     pin: (space: string, id: string, options?: MemoryCallOptions & { reason?: string }) =>
       this.memoryApi.POST("/memory/v1/spaces/{space}/pins", {
         body: { id, pinned: true, ...(options?.reason ? { reason: options.reason } : {}) },

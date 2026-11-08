@@ -155,7 +155,7 @@ curl -X POST http://127.0.0.1:8080/memory/v1/spaces/agent/outcomes \
 {"action": "outcome", "phase": "succeeded", "revision": 7}
 ```
 
-Outcomes feed back into ranking only where you ask for it. Recall with `"utility_weight": 0.5` (0 to 1) adds that weight times the memory's outcome utility, `(successes - failures) / (successes + failures + 2)`, to its score. The default of 0 leaves ranking unchanged. Utility counts only outcomes the caller is allowed to read.
+Outcomes feed back into ranking only where you ask for it. Recall with `"utility_weight": 0.5` (0 to 1) adds that weight times the memory's outcome utility, `(successes - failures) / (successes + failures + 2)`, to its score. The default of 0 leaves ranking unchanged. Utility counts only retained outcomes the caller is allowed to read, in the selected branch. Forgetting any memory used by an outcome immediately excludes that outcome from every utility score. Historical recall excludes outcomes recorded after `known_at`.
 
 ### 6. Load a Session Brief
 
@@ -180,15 +180,15 @@ curl -s 'http://127.0.0.1:8080/memory/v1/spaces/agent/brief?limit=8&token_budget
 }
 ```
 
-The brief holds current, active claims only. Disputed and provisional claims stay out unless you pass `include_provisional`. Constraints and preferences rank first, then procedures and lessons, then decisions and plain facts. Settled claims and claims with good outcomes rank higher, and restated duplicates collapse to one item. `subjects` lists what else the space knows about, so the agent can recall it on demand. `scope`, `task` and `environment` narrow the brief to one context. The whole rendered response, not just the items, fits within `token_budget` bytes.
+The brief holds current, active claims only. Disputed claims stay out unless pinned. Provisional claims stay out unless pinned or you pass `include_provisional`. Constraints and preferences rank first, then procedures and lessons, then decisions and plain facts. Settled claims and claims with good outcomes rank higher, and restated duplicates collapse to one item. `subjects` lists what else the space knows about, so the agent can recall it on demand. `scope`, `task` and `environment` narrow the brief to one context. The whole rendered response, not just the items, fits within `token_budget` bytes.
 
-Pin a memory to keep it in the brief regardless of rank:
+Pin a memory to prioritize it ahead of unpinned memories, within the brief’s item and byte limits:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/memory/v1/spaces/agent/pins   -H 'Content-Type: application/json'   -H 'Idempotency-Key: pin-terraform'   -d '{"id": "deploy-terraform", "reason": "Every deploy task needs this"}'
 ```
 
-Send `"pinned": false` to unpin. Pins belong to the selected branch and are not inherited by forks. Pinning a team-visible memory changes every principal's brief, so it requires curator access.
+Send `"pinned": false` to unpin, including after the evidence expires. Pins belong to the selected branch and are not inherited by forks. Pinning a team-visible memory changes every principal's brief, so it requires curator access.
 
 ### 7. Review Memory Health
 

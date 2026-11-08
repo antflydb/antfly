@@ -465,7 +465,8 @@ await client.memory.outcome("team", {
 Mutating helpers (`remember`, `observe`, `outcome`, `pin`, `unpin`, `configure`,
 `maintain`, ...) generate an `Idempotency-Key` UUID unless you pass
 `{ idempotencyKey }`; pass a stable key to retry safely. A string in that position
-is still accepted as the key. Every helper takes `{ database, namespace, branch }`
+is still accepted as the key. `remember` derives the evidence id from an explicit
+key when you omit `id`, so retries send the same body. Every helper takes `{ database, namespace, branch }`
 to set `X-Antfly-Database`, `X-Antfly-Namespace`, and `X-Antfly-Memory-Branch`.
 `brief`, `consolidate`, and `recall` are reads and send no key.
 

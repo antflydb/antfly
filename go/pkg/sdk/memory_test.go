@@ -256,3 +256,19 @@ func TestMemorySpaceDecodesErrors(t *testing.T) {
 		t.Fatalf("non-JSON error: %#v", err)
 	}
 }
+
+func TestMemoryRememberExplicitKeyRetryHasIdenticalBody(t *testing.T) {
+	server, requests := newMemoryTestServer(t, http.StatusOK, memoryOperationJSON)
+	space := newMemoryTestClient(t, server.URL).MemorySpace("agent")
+	for range 2 {
+		if _, err := space.Remember(context.Background(), "same text", WithIdempotencyKey("retry")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := requests()
+	first, _ := json.Marshal(got[0].body)
+	retry, _ := json.Marshal(got[1].body)
+	if string(first) != string(retry) || got[0].header.Get("Idempotency-Key") != got[1].header.Get("Idempotency-Key") {
+		t.Fatalf("retry changed the immutable evidence: %s vs %s", first, retry)
+	}
+}

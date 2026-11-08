@@ -20214,12 +20214,18 @@ test "native memory brief, consolidation, pins and the agent MCP profile" {
     const outcome_call =
         \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_outcome","arguments":{"space":"team","body":{"id":"o1","task_id":"deploy","success":true,"used_memory_ids":["ticket"]}}}}
     ;
-    inline for (0..2) |_| {
-        var recorded = try adapters.executeMemoryMcpProfileRequest(&api, .{ .method = .post, .endpoint_path = "/memory/v1/mcp/agent", .session_id = session_id, .body = outcome_call }, @as(?AuthenticatedIdentity, null), .agent);
+    const reordered_call =
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_outcome","arguments":{"body":{"used_memory_ids":["ticket"],"success":true,"task_id":"deploy","id":"o1"},"space":"team"}}}
+    ;
+    var first_recorded: ?[]u8 = null;
+    defer if (first_recorded) |first| a.free(first);
+    for ([_][]const u8{ outcome_call, outcome_call, reordered_call }) |call| {
+        var recorded = try adapters.executeMemoryMcpProfileRequest(&api, .{ .method = .post, .endpoint_path = "/memory/v1/mcp/agent", .session_id = session_id, .body = call }, @as(?AuthenticatedIdentity, null), .agent);
         defer recorded.deinit(a);
         try std.testing.expectEqual(@as(u16, 200), recorded.status);
         try std.testing.expect(std.mem.indexOf(u8, recorded.body, "isError\":true") == null);
         try std.testing.expect(std.mem.indexOf(u8, recorded.body, "succeeded") != null);
+        if (first_recorded) |first| try std.testing.expectEqualStrings(first, recorded.body) else first_recorded = try a.dupe(u8, recorded.body);
     }
     var agent_brief = try adapters.executeMemoryMcpProfileRequest(&api, .{
         .method = .post,
@@ -20258,12 +20264,22 @@ test "native memory agent idempotency keys are content addressed" {
     defer arena.deinit();
     const a = arena.allocator();
     const body = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"id\":\"o1\"}", .{});
+    const ordered = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"id\":\"o1\",\"nested\":{\"a\":1,\"b\":2}}", .{});
+    const reordered = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"nested\":{\"b\":2,\"a\":1},\"id\":\"o1\"}", .{});
+    try std.testing.expectEqualStrings(try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", ordered), try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", reordered));
     const other = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"id\":\"o2\"}", .{});
     const first = try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", body);
     try std.testing.expectEqualStrings(first, try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", body));
     try std.testing.expect(!std.mem.eql(u8, first, try adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", other)));
     try std.testing.expect(!std.mem.eql(u8, first, try adapters.memoryAgentIdempotencyKey(a, "outcome", "other", "", "", body)));
     try std.testing.expect(first.len <= 256 and std.mem.startsWith(u8, first, "agent:"));
+    var nested = body;
+    for (0..66) |_| {
+        var array = try std.array_list.Managed(std.json.Value).initCapacity(a, 1);
+        array.appendAssumeCapacity(nested);
+        nested = .{ .array = array };
+    }
+    try std.testing.expectError(error.InvalidMemoryRequest, adapters.memoryAgentIdempotencyKey(a, "outcome", "team", "", "", nested));
 }
 
 test "native memory catalog ownership denies generic and batched data admission" {

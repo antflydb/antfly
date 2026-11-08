@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{Client, Error, types};
+use sha2::{Digest, Sha256};
 
 type MemoryResult<T> = Result<T, Error<types::Error>>;
 
@@ -167,11 +168,16 @@ impl<'a> MemorySpace<'a> {
         if text.trim().is_empty() {
             return Err(Error::InvalidRequest("remember text is empty".into()));
         }
+        let key = idempotency_key.map_or_else(new_idempotency_key, str::to_owned);
+        let evidence_id = format!(
+            "{:x}",
+            Sha256::digest(format!("antfly-memory-remember:{key}"))
+        );
         let request: types::MemoryObservationRequest = serde_json::from_value(serde_json::json!({
-            "evidence": [{"id": new_idempotency_key(), "text": text}],
+            "evidence": [{"id": evidence_id, "text": text}],
         }))
         .map_err(|error| Error::InvalidRequest(error.to_string()))?;
-        self.observe(&request, idempotency_key).await
+        self.observe(&request, Some(&key)).await
     }
 
     /// Records whether a task that used recalled memories succeeded.
@@ -202,7 +208,7 @@ impl<'a> MemorySpace<'a> {
             .into_inner())
     }
 
-    /// Keeps memory `id` in the brief regardless of rank.
+    /// Prioritizes memory `id` in the brief within its item and byte limits.
     pub async fn pin(
         &self,
         id: &str,

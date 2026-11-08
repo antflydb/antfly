@@ -279,3 +279,18 @@ it("remembers text as one evidence item cited by evidence-less assertions", asyn
   expect(second.headers.get("Idempotency-Key")).toBe("k2");
   expect(JSON.parse(await second.text())).toEqual({ evidence: [{ id: "e2", text: "Second" }] });
 });
+
+it("replays remember with the same evidence when an explicit operation key is reused", async () => {
+  const sent = captureMemoryRequests();
+  const client = new AntflyClient({ baseUrl: "http://memory.test" });
+  const first = await client.memory.remember(
+    "team",
+    { text: "same text" },
+    { idempotencyKey: "retry" }
+  );
+  const retry = await client.memory.remember("team", { text: "same text" }, "retry");
+  expect(first.evidenceId).toBe(retry.evidenceId);
+  expect(await sent[0]?.text()).toBe(await sent[1]?.text());
+  expect(sent[0]?.headers.get("Idempotency-Key")).toBe("retry");
+  expect(sent[1]?.headers.get("Idempotency-Key")).toBe("retry");
+});

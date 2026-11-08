@@ -304,7 +304,7 @@ def test_simple_path_mutations_generate_or_pass_through_keys() -> None:
         "evidence": [
             {"id": "runbook-2", "source_id": "runbook", "text": "Runbook v2", "thread_id": "t1", "visibility": "team"}
         ],
-        "assertions": [{"id": "a"}],
+        "assertions": [{"id": "a", "evidence": [{"id": "runbook-2"}]}],
     }
     assert seen[1].headers["x-antfly-database"] == "projects"
     assert seen[1].headers["x-antfly-namespace"] == "agents"
@@ -337,3 +337,17 @@ def test_generated_client_exposes_brief_consolidation_and_pins() -> None:
         assert callable(module.sync_detailed)
     assert MemoryPin(id="a").to_dict()["id"] == "a"
     assert MemoryBriefRequest(limit=4).to_dict()["limit"] == 4
+
+
+
+def test_remember_explicit_key_retries_send_identical_evidence_and_fill_citations() -> None:
+    client, seen, http = _recording_client()
+    with http:
+        for _ in range(2):
+            client.memory.remember("team", "same text", idempotency_key="retry", assertions=[{"id": "a"}])
+        client.memory.remember("team", "same text", idempotency_key="other")
+    assert seen[0].content == seen[1].content
+    assert seen[0].headers["idempotency-key"] == seen[1].headers["idempotency-key"] == "retry"
+    body = json.loads(seen[0].content)
+    assert body["assertions"][0]["evidence"] == [{"id": body["evidence"][0]["id"]}]
+    assert body["evidence"][0]["id"] != json.loads(seen[2].content)["evidence"][0]["id"]

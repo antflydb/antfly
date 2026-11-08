@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -258,8 +259,14 @@ class MemoryOperations:
         for model extraction derive them). ``evidence_id`` is generated when omitted;
         evidence IDs name immutable source versions.
         """
+        evidence_id = evidence_id or (
+            hashlib.sha256(("antfly-memory-remember:" + idempotency_key).encode()).hexdigest()
+            if idempotency_key
+            else _new_key()
+        )
+        idempotency_key = idempotency_key or _new_key()
         evidence = _compact(
-            id=evidence_id or _new_key(),
+            id=evidence_id,
             source_id=source_id,
             text=text,
             thread_id=thread_id,
@@ -267,7 +274,9 @@ class MemoryOperations:
         )
         body: dict[str, Any] = {"evidence": [evidence]}
         if assertions is not None:
-            body["assertions"] = assertions
+            body["assertions"] = [
+                {**assertion, "evidence": assertion.get("evidence", [{"id": evidence_id}])} for assertion in assertions
+            ]
         return self.execute(
             space,
             "observe",
@@ -339,7 +348,7 @@ class MemoryOperations:
         namespace: str = "public",
         branch: str = "",
     ) -> Any:
-        """Pin memory ``id`` so ``brief`` always includes it."""
+        """Prioritize memory ``id`` in ``brief`` within its item and byte limits."""
         return self._set_pin(space, id, True, reason, idempotency_key, database, namespace, branch)
 
     def unpin(

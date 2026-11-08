@@ -8158,3 +8158,216 @@ test "memory consolidation reports links whose target was retired" {
     defer std.testing.allocator.free(review);
     try std.testing.expect(std.mem.indexOf(u8, review, "\"kind\":\"dangling_link\",\"memory_ids\":[\"why\"],\"entity_id\":null,\"target_id\":\"choice\"") != null);
 }
+
+test "review utility excludes outcomes whose other input was forgotten before maintenance" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", layered_claims, "claims", 3);
+    try discard(&store, .outcome, "", "{\"id\":\"o\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[\"z-ticket\",\"a-language\"]}", "outcome", 4);
+    try discard(&store, .forget, "", "{\"assertion_ids\":[\"a-language\"]}", "forget", 5);
+    const result = try std.json.parseFromSliceLeaky(m.types.Brief, a, try store.service("alice", true, 6).execute(a, .brief, "", "{\"token_budget\":8192}", ""), .{});
+    for (result.items) |item| if (std.mem.eql(u8, item.id, "z-ticket")) {
+        try std.testing.expectEqual(@as(u32, 0), item.utility.successes);
+        return;
+    };
+    return error.TestExpectedEqual;
+}
+
+test "review historical recall excludes future outcomes" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", layered_claims, "claims", 3);
+    try discard(&store, .outcome, "", "{\"id\":\"o\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[\"z-ticket\"]}", "outcome", 10);
+    const result = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try store.service("alice", true, 20).execute(a, .recall, "", "{\"known_at\":5,\"utility_weight\":1,\"token_budget\":8192}", ""), .{});
+    for (result.items) |hit| if (std.mem.eql(u8, hit.memory.assertion.id, "z-ticket")) {
+        try std.testing.expectEqual(@as(f64, 1), hit.score);
+        return;
+    };
+    return error.TestExpectedEqual;
+}
+
+test "review pin reasons obey reject and redact intake policies" {
+    for ([_]bool{ false, true }) |redact| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        const svc = ScreeningFixture.service(&store, 1);
+        _ = try svc.execute(a, .create, "", if (redact) "{\"intake_screening\":{\"mode\":\"redact\"}}" else "{}", "create");
+        _ = try svc.execute(a, .observe, "", source, "source");
+        _ = try svc.execute(a, .assertions, "", layered_claims, "claims");
+        const body = "{\"id\":\"z-ticket\",\"reason\":\"password=synthetic-fixture\"}";
+        if (!redact) {
+            try std.testing.expectError(error.MemorySecretDetected, svc.execute(a, .pin, "", body, "pin"));
+        } else {
+            const receipt = try svc.execute(a, .pin, "", body, "pin");
+            const status = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, receipt, .{});
+            try std.testing.expect(status.intake_screening.redactions > 0);
+            try std.testing.expectEqualStrings(receipt, try svc.execute(a, .pin, "", body, "pin"));
+        }
+        var it = store.values.valueIterator();
+        while (it.next()) |raw| try std.testing.expect(std.mem.indexOf(u8, raw.*, "synthetic-fixture") == null);
+    }
+}
+
+test "review branch utility and pins do not cross forks" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 200);
+    _ = try svc.execute(a, .create, "", "{\"features\":{\"lineage\":true}}", "create");
+    _ = try svc.execute(a, .observe, "", source, "source");
+    _ = try svc.execute(a, .assertions, "", helm, "claims");
+    _ = try svc.execute(a, .pin, "", "{\"id\":\"helm\"}", "pin");
+    _ = try svc.execute(a, .fork_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageFork{ .id = "fork", .expected_revision = try SupersessionFixture.revision(svc, a) }, .{}), "fork");
+    var branch = svc;
+    branch.context.branch = "fork";
+    _ = try branch.execute(a, .outcome, "", "{\"id\":\"o\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[\"helm\"]}", "outcome");
+    const main = try std.json.parseFromSliceLeaky(m.types.Brief, a, try svc.execute(a, .brief, "", "{\"token_budget\":8192}", ""), .{});
+    const fork = try std.json.parseFromSliceLeaky(m.types.Brief, a, try branch.execute(a, .brief, "", "{\"token_budget\":8192}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 1), main.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fork.items.len);
+    try std.testing.expect(main.items[0].pinned and !fork.items[0].pinned);
+    try std.testing.expectEqual(@as(u32, 0), main.items[0].utility.successes);
+    try std.testing.expectEqual(@as(u32, 1), fork.items[0].utility.successes);
+}
+
+test "review expired pins can be unpinned and maintenance reclaims their capacity" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = store.service("alice", true, 1);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"text\":\"Expires\",\"expires_at\":10}]}", "source");
+    _ = try svc.execute(a, .assertions, "", layered_claims, "claims");
+    _ = try svc.execute(a, .pin, "", "{\"id\":\"z-ticket\"}", "pin");
+    _ = try svc.execute(a, .pin, "", "{\"id\":\"a-language\"}", "other-pin");
+    svc.context.now_ms = 20;
+    _ = try svc.execute(a, .pin, "", "{\"id\":\"z-ticket\",\"pinned\":false}", "unpin");
+    for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "maintenance-{d}", .{i}));
+    try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "brief-pin/", null, 256)).rows.len);
+}
+
+test "review utility revalidates administrative access to other principals outcomes" {
+    const Grant = struct {
+        fn require(_: *anyopaque, grant: m.types.RequiredGrant) !void {
+            if (grant == .admin) return error.Forbidden;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const alice = store.service("alice", true, 1);
+    _ = try alice.execute(a, .create, "", "{}", "create");
+    _ = try alice.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"text\":\"Shared\",\"visibility\":\"team\"}],\"assertions\":[{\"id\":\"rule\",\"subject\":\"deploys\",\"predicate\":\"requires\",\"value\":\"review\",\"statement\":\"Requires review\",\"visibility\":\"team\",\"evidence\":[{\"id\":\"e1\"}]}]}", "source");
+    _ = try alice.execute(a, .outcome, "", "{\"id\":\"o\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[\"rule\"]}", "outcome");
+    var revoked = store.service("bob", true, 2);
+    revoked.context.grant_ptr = &store;
+    revoked.context.require_grant_fn = Grant.require;
+    try std.testing.expectError(error.Forbidden, revoked.execute(a, .brief, "", "{}", ""));
+}
+
+test "review consolidation distinguishes unavailable source access from retired links and deduplicates targets" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    const svc = store.service("alice", true, 3);
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"external\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"assertions\":[{\"id\":\"choice\",\"subject\":\"db\",\"predicate\":\"engine\",\"value\":\"lmdb\",\"kind\":\"decision\",\"statement\":\"We chose LMDB\",\"evidence\":[{\"id\":\"external\"}]}]}", "choice");
+    _ = try svc.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"why\",\"subject\":\"db\",\"predicate\":\"reason\",\"value\":\"mmap\",\"kind\":\"rationale\",\"statement\":\"Memory-mapped reads are fast\",\"motivates\":[\"choice\"],\"rejected_in_favor_of\":[\"choice\"],\"evidence\":[{\"id\":\"e1\"}]}]}", "why");
+    store.resource_state = .denied;
+    const denied = try std.json.parseFromSliceLeaky(m.types.Consolidation, a, try svc.execute(a, .consolidate, "", "{}", ""), .{});
+    for (denied.findings) |finding| try std.testing.expect(finding.kind != .dangling_link);
+    store.resource_state = .missing;
+    const missing = try std.json.parseFromSliceLeaky(m.types.Consolidation, a, try svc.execute(a, .consolidate, "", "{}", ""), .{});
+    var dangling: usize = 0;
+    for (missing.findings) |finding| if (finding.kind == .dangling_link) {
+        dangling += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), dangling);
+}
+
+test "review team memory utility counts only the readers own private outcomes" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const alice = store.service("alice", true, 1);
+    _ = try alice.execute(a, .create, "", "{}", "create");
+    _ = try alice.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"text\":\"Shared\",\"visibility\":\"team\"}],\"assertions\":[{\"id\":\"rule\",\"subject\":\"deploys\",\"predicate\":\"requires\",\"value\":\"review\",\"statement\":\"Requires review\",\"visibility\":\"team\",\"evidence\":[{\"id\":\"e1\"}]}]}", "source");
+    const bob = store.service("bob", false, 2);
+    _ = try bob.execute(a, .outcome, "", "{\"id\":\"o\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[\"rule\"]}", "outcome");
+    const owner = try std.json.parseFromSliceLeaky(m.types.Brief, a, try bob.execute(a, .brief, "", "{}", ""), .{});
+    const other = try std.json.parseFromSliceLeaky(m.types.Brief, a, try store.service("alice", false, 3).execute(a, .brief, "", "{}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 1), owner.items.len);
+    try std.testing.expectEqual(@as(usize, 1), other.items.len);
+    try std.testing.expectEqual(@as(u32, 1), owner.items[0].utility.successes);
+    try std.testing.expectEqual(@as(u32, 0), other.items[0].utility.successes);
+}
+
+test "review brief preserves epistemically distinct claims when collapsing restatements" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    const svc = store.service("alice", true, 3);
+    _ = try svc.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"observed\",\"subject\":\"deployment\",\"predicate\":\"needs\",\"value\":\"review\",\"statement\":\"Review is required\",\"role\":\"observed\",\"evidence\":[{\"id\":\"e1\"}]},{\"id\":\"guess\",\"subject\":\"deployment\",\"predicate\":\"needs\",\"value\":\"review\",\"statement\":\"Review may be required\",\"role\":\"hypothesized\",\"evidence\":[{\"id\":\"e1\"}]}]}", "claims");
+    const brief = try std.json.parseFromSliceLeaky(m.types.Brief, a, try svc.execute(a, .brief, "", "{\"token_budget\":8192}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 2), brief.items.len);
+}
+
+test "review failed administrative authorization cannot authorize later private brief records" {
+    const Grant = struct {
+        fn require(_: *anyopaque, grant: m.types.RequiredGrant) !void {
+            if (grant == .admin) return error.Forbidden;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", layered_claims, "claims", 3);
+    var revoked = store.service("bob", true, 4);
+    revoked.context.grant_ptr = &store;
+    revoked.context.require_grant_fn = Grant.require;
+    const brief = try std.json.parseFromSliceLeaky(m.types.Brief, a, try revoked.execute(a, .brief, "", "{}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 0), brief.items.len);
+    try std.testing.expectEqual(@as(usize, 0), brief.subjects.len);
+}
+
+test "review content addressed agent receipts do not expose raw credential fingerprints" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = ScreeningFixture.service(&store, 1);
+    _ = try svc.execute(a, .create, "", "{\"intake_screening\":{\"mode\":\"redact\"}}", "create");
+    const body = "{\"evidence\":[{\"id\":\"e\",\"text\":\"password=synthetic-fixture\"}]}";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    const token = try std.fmt.allocPrint(a, "agent:{s}", .{std.fmt.bytesToHex(digest, .lower)});
+    const result = try svc.execute(a, .observe, "", body, token);
+    const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, result, .{});
+    const public_guess = try std.json.Stringify.valueAlloc(a, .{ "alice", token }, .{});
+    std.crypto.hash.sha2.Sha256.hash(public_guess, &digest, .{});
+    try std.testing.expect(!std.mem.eql(u8, receipt.id, &std.fmt.bytesToHex(digest, .lower)));
+    try std.testing.expectEqualStrings(result, try svc.execute(a, .observe, "", body, token));
+    var it = store.values.valueIterator();
+    while (it.next()) |raw| try std.testing.expect(std.mem.indexOf(u8, raw.*, "synthetic-fixture") == null);
+}
+
+test "review first agent write to a legacy space replays after initializing its digest key" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = ScreeningFixture.service(&store, 1);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    var state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    state.input_digest_key = "";
+    try store.values.put(a, "control", try std.json.Stringify.valueAlloc(a, state, .{}));
+    const result = try svc.execute(a, .observe, "", source, "agent:legacy-first-write");
+    const revision = store.revision;
+    try std.testing.expectEqualStrings(result, try svc.execute(a, .observe, "", source, "agent:legacy-first-write"));
+    try std.testing.expectEqual(revision, store.revision);
+}

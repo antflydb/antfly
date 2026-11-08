@@ -712,7 +712,36 @@ pub const MemoryMcpProfile = enum { full, agent };
 /// Content-addressed idempotency for agent tools that omit a key: an
 /// identical retry replays the first receipt; any change is a new operation.
 pub fn memoryAgentIdempotencyKey(a: std.mem.Allocator, action: []const u8, space: []const u8, branch: []const u8, id: []const u8, body: std.json.Value) ![]const u8 {
-    const encoded = try @import("antfly-json").stringifyValueAlloc(a, body);
+    const canonical = try canonicalMemoryAgentBody(a, body, 0);
+    return memoryAgentKeyEncoded(a, action, space, branch, id, try @import("antfly-json").stringifyValueAlloc(a, canonical));
+}
+
+// JSON object order is not operation identity. Normalize both the automatic
+// key and the body submitted for the service's byte-exact receipt fingerprint.
+fn canonicalMemoryAgentBody(a: std.mem.Allocator, body: std.json.Value, depth: usize) !std.json.Value {
+    if (depth > 64) return error.InvalidMemoryRequest;
+    return switch (body) {
+        .object => |object| blk: {
+            const keys = try a.dupe([]const u8, object.keys());
+            std.mem.sort([]const u8, keys, {}, struct {
+                fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
+                    return std.mem.lessThan(u8, lhs, rhs);
+                }
+            }.less);
+            var out: std.json.ObjectMap = .empty;
+            for (keys) |key| try out.put(a, key, try canonicalMemoryAgentBody(a, object.get(key).?, depth + 1));
+            break :blk .{ .object = out };
+        },
+        .array => |array| blk: {
+            var out = try std.array_list.Managed(std.json.Value).initCapacity(a, array.items.len);
+            for (array.items) |item| out.appendAssumeCapacity(try canonicalMemoryAgentBody(a, item, depth + 1));
+            break :blk .{ .array = out };
+        },
+        else => body,
+    };
+}
+
+fn memoryAgentKeyEncoded(a: std.mem.Allocator, action: []const u8, space: []const u8, branch: []const u8, id: []const u8, encoded: []const u8) ![]const u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     inline for (.{ action, space, branch, id }) |part| {
         var length: [8]u8 = undefined;
@@ -749,8 +778,10 @@ pub fn executeMemoryMcpProfileRequest(server_ptr: anytype, request: McpRequest, 
             };
             const input = std.json.parseFromSliceLeaky(Arguments, a, try @import("antfly-json").stringifyValueAlloc(a, args), .{ .ignore_unknown_fields = false, .parse_numbers = false }) catch return mcpError(a, "invalid memory tool arguments");
             if (memory_api.memory.operations.idRequired(self.action) and input.id.len == 0) return mcpError(a, "missing memory resource id");
-            const idempotency_key = if (self.agent and input.idempotency_key.len == 0 and memory_api.memory.mutates(self.action))
-                try memoryAgentIdempotencyKey(a, @tagName(self.action), input.space, input.branch, input.id, input.body)
+            const derive_key = self.agent and input.idempotency_key.len == 0 and memory_api.memory.mutates(self.action);
+            const admitted_body = if (derive_key) try canonicalMemoryAgentBody(a, input.body, 0) else input.body;
+            const idempotency_key = if (derive_key)
+                try memoryAgentKeyEncoded(a, @tagName(self.action), input.space, input.branch, input.id, try @import("antfly-json").stringifyValueAlloc(a, admitted_body))
             else
                 input.idempotency_key;
             var response = try self.server.executeMemoryService(input.space, .{
@@ -759,7 +790,7 @@ pub fn executeMemoryMcpProfileRequest(server_ptr: anytype, request: McpRequest, 
                 .namespace = input.namespace,
                 .action = self.action,
                 .id = input.id,
-                .body = input.body,
+                .body = admitted_body,
                 .idempotency_key = idempotency_key,
             }, self.identity, self.request);
             defer response.deinit(self.server.alloc);

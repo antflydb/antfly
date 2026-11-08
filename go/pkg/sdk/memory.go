@@ -18,6 +18,7 @@ package sdk
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -142,7 +143,7 @@ func (e *MemoryAPIError) Error() string {
 	return fmt.Sprintf("memory request failed (%d): %s", e.StatusCode, e.Message)
 }
 
-// Create creates or replaces the memory space configuration.
+// Create creates the memory space with its initial configuration.
 func (s *MemorySpace) Create(ctx context.Context, config oapi.MemorySpaceConfig, opts ...MemoryCallOption) (*oapi.MemoryOperation, error) {
 	call, err := newMemoryCall(opts)
 	if err != nil {
@@ -212,9 +213,10 @@ func (s *MemorySpace) Remember(ctx context.Context, text string, opts ...MemoryC
 	}
 	id := call.evidenceID
 	if id == "" {
-		if id, err = NewIdempotencyKey(); err != nil {
-			return nil, err
-		}
+		// Derive identity from the operation key so explicit-key retries send
+		// the same immutable evidence and replay the committed receipt.
+		digest := sha256.Sum256([]byte("antfly-memory-remember:" + call.idempotencyKey))
+		id = hex.EncodeToString(digest[:])
 	}
 	return s.observe(ctx, oapi.MemoryObservationRequest{
 		Evidence: []oapi.MemoryEvidence{{Id: id, SourceId: call.sourceID, Text: text}},
@@ -251,7 +253,7 @@ func (s *MemorySpace) Consolidate(ctx context.Context, req oapi.MemoryConsolidat
 	return memoryResult(resp.HTTPResponse, resp.Body, resp.JSON200)
 }
 
-// Pin keeps memory id in the brief regardless of rank.
+// Pin prioritizes memory id in the brief within its item and byte limits.
 func (s *MemorySpace) Pin(ctx context.Context, id, reason string, opts ...MemoryCallOption) (*oapi.MemoryOperation, error) {
 	return s.pin(ctx, id, true, reason, opts)
 }

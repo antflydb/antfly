@@ -236,13 +236,21 @@ pub const Service = struct {
         try run.prepareLineage(action, id);
         var fingerprint: []const u8 = "";
         var hash_version: u8 = 0;
-        const receipt_identity = if (run.service.context.branch.len == 0) try hash(a, .{ self.context.principal, idempotency_key }) else try hash(a, .{ self.context.principal, run.service.context.branch, idempotency_key });
-        const receipt_key = if (idempotency_key.len > 0) try key(a, "operation", receipt_identity) else "";
+        const legacy_receipt_identity = if (run.service.context.branch.len == 0) try hash(a, .{ self.context.principal, idempotency_key }) else try hash(a, .{ self.context.principal, run.service.context.branch, idempotency_key });
+        // An agent key hashes raw arguments, which may contain credentials
+        // redacted at intake. Do not expose an offline-guessable digest in
+        // the public receipt id; bind content-addressed keys to the space key.
+        const content_addressed = std.mem.startsWith(u8, idempotency_key, "agent:");
+        var receipt_identity = if (content_addressed and run.state.input_digest_key.len == 64) try inputFingerprint(a, legacy_receipt_identity, run.state.input_digest_key, 1) else legacy_receipt_identity;
+        var receipt_key = if (idempotency_key.len > 0) try key(a, "operation", receipt_identity) else "";
         const required_grant = if (mutates(action)) try run.requiredGrant(action, id, body) else if (actionGrant(action) == .curator) t.RequiredGrant.curator else if (actionGrant(action) == .admin) t.RequiredGrant.admin else null;
         if (required_grant) |grant| try self.context.requireGrant(grant);
         if (mutates(action)) {
             if (idempotency_key.len == 0 or idempotency_key.len > 256) return error.MemoryIdempotencyKeyRequired;
-            if (try run.read(t.Operation, receipt_key)) |receipt| {
+            var previous_receipt = try run.read(t.Operation, receipt_key);
+            // Preserve retries of receipts written before keyed agent ids.
+            if (previous_receipt == null and content_addressed and !eql(u8, receipt_identity, legacy_receipt_identity)) previous_receipt = try run.read(t.Operation, try key(a, "operation", legacy_receipt_identity));
+            if (previous_receipt) |receipt| {
                 fingerprint = try inputFingerprint(a, .{ .action = action, .id = id, .body = body, .principal = self.context.principal }, run.state.input_digest_key, receipt.request_hash_version);
                 if (!eql(u8, receipt.request_hash, fingerprint)) return error.MemoryIdempotencyConflict;
                 try self.context.requireGrant(operationGrant(receipt));
@@ -274,6 +282,11 @@ pub const Service = struct {
             }
             if (run.state.input_digest_key.len != 0 and run.state.input_digest_key.len != 64) return error.MemoryCorruptState;
             hash_version = if (run.state.input_digest_key.len == 64) 1 else 0;
+            // A legacy space can acquire its digest key on this first write.
+            if (content_addressed and hash_version == 1) {
+                receipt_identity = try inputFingerprint(a, legacy_receipt_identity, run.state.input_digest_key, 1);
+                receipt_key = try key(a, "operation", receipt_identity);
+            }
             fingerprint = try inputFingerprint(a, .{ .action = action, .id = id, .body = body, .principal = self.context.principal }, run.state.input_digest_key, hash_version);
         }
         var admitted_body = body;
@@ -527,6 +540,7 @@ const Run = struct {
     evidence_rows: std.StringHashMapUnmanaged(t.StoredEvidence) = .empty,
     entity_rows: std.StringHashMapUnmanaged(t.EntityRecord) = .empty,
     projection_rows: std.StringHashMapUnmanaged(t.EntityProjection) = .empty,
+    outcome_rows: std.StringHashMapUnmanaged(StoredOutcome) = .empty,
     identity_members: std.StringHashMapUnmanaged([]const []const u8) = .empty,
     identity_policy: ?EntityPolicy = null,
     identity_native: bool = false,
@@ -571,6 +585,7 @@ const Run = struct {
     views: std.StringHashMapUnmanaged(bool) = .empty,
     backend_rows: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     historical: std.StringHashMapUnmanaged(?t.StoredAssertion) = .empty,
+    utility_outcomes: std.StringHashMapUnmanaged(bool) = .empty,
     lineage_head: ?t.LineageHead = null,
     lineage_index: ?@import("persistent_index.zig").Index = null,
     lineage_raw: bool = false,
@@ -1473,6 +1488,8 @@ const Run = struct {
         _ = self.evidence_rows.remove(path);
         _ = self.entity_rows.remove(path);
         _ = self.projection_rows.remove(path);
+        _ = self.outcome_rows.remove(path);
+        self.utility_outcomes.clearRetainingCapacity();
         if (self.change_positions.get(path)) |position| {
             self.changes.items[position].json = json;
         } else {
@@ -1497,6 +1514,8 @@ const Run = struct {
         self.evidence_rows.clearRetainingCapacity();
         self.entity_rows.clearRetainingCapacity();
         self.projection_rows.clearRetainingCapacity();
+        self.outcome_rows.clearRetainingCapacity();
+        self.utility_outcomes.clearRetainingCapacity();
         self.clearIdentityCaches();
         self.views.clearRetainingCapacity();
         self.historical.clearRetainingCapacity();
@@ -1558,6 +1577,7 @@ const Run = struct {
         if (T == t.StoredEvidence) return &self.evidence_rows;
         if (T == t.EntityRecord) return &self.entity_rows;
         if (T == t.EntityProjection) return &self.projection_rows;
+        if (T == StoredOutcome) return &self.outcome_rows;
         @compileError("unsupported decoded memory record");
     }
     fn trackTime(self: *Run, time: ?i64) void {
@@ -1567,7 +1587,7 @@ const Run = struct {
         };
     }
     fn parseRead(self: *Run, comptime T: type, path: []const u8, json: []const u8) !T {
-        const value = if (comptime T == t.StoredAssertion or T == t.StoredEvidence or T == t.EntityRecord or T == t.EntityProjection) blk: {
+        const value = if (comptime T == t.StoredAssertion or T == t.StoredEvidence or T == t.EntityRecord or T == t.EntityProjection or T == StoredOutcome) blk: {
             const rows = self.decodedRows(T);
             if (rows.get(path)) |cached| break :blk cached;
             const decoded = try parse(T, self.a, json);
@@ -1592,8 +1612,8 @@ const Run = struct {
         if (snapshot.state == .denied or snapshot.state == .changed) self.trackTime(self.service.context.now_ms +| resource_check_interval_ms);
     }
     fn requireAdmin(self: *Run) !void {
-        self.administrative_view = true;
         try self.service.context.requireGrant(.admin);
+        self.administrative_view = true;
     }
     fn requiredGrant(self: *Run, action: Action, id: []const u8, body: []const u8) !t.RequiredGrant {
         if (action == .advance) {
@@ -5501,7 +5521,7 @@ const Run = struct {
         try self.put(path, StoredOutcome{ .outcome = request, .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision });
         // Reverse bindings let reads derive per-memory utility without
         // scanning every outcome. Reads recheck the outcome itself.
-        for (request.used_memory_ids) |id| try self.put(try outcomeUseKey(self.a, id, request.id), OutcomeUse{ .outcome_id = request.id, .memory_id = id });
+        for (request.used_memory_ids) |id| try self.put(try outcomeUseKey(self.a, self.service.context.branch, id, request.id), OutcomeUse{ .outcome_id = request.id, .memory_id = id });
     }
     fn advance(self: *Run, id: []const u8, receipt: *t.Operation) !void {
         if (id.len == 0) return self.maintenance();
@@ -6334,7 +6354,8 @@ const Run = struct {
             if (try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-outcome", binding.outcome_id)) != null or try self.read(StoredOutcome, try key(self.a, "outcome", binding.outcome_id)) == null) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "brief-pin/")) {
             const stored = try parse(t.StoredPin, self.a, row.json);
-            if (try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-assertion", stored.id)) != null) try self.remove(row.key);
+            const record = try self.assertion(stored.id);
+            if (try self.read(bool, "forgotten-all") != null or record == null or !try self.retained(record.?, 0)) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "outcome/")) {
             const stored = try parse(StoredOutcome, self.a, row.json);
             if (!try self.outcomeRetained(stored)) {
@@ -7186,7 +7207,7 @@ const Run = struct {
             score += try cosine(query_vector, embedding);
         };
         if (require_match and request.query.len > 0 and score <= 0) return null;
-        if (request.utility_weight > 0) score += request.utility_weight * (try self.utility(claim.id)).score;
+        if (request.utility_weight > 0) score += request.utility_weight * (try self.utility(claim.id, request.known_at)).score;
         if (claim.stability == .provisional) score *= 0.5;
         const support = try self.visibleSupport(claim, request.known_at, valid);
         record.assertion.evidence = support.evidence;
@@ -7342,14 +7363,14 @@ const Run = struct {
                     break;
                 }
             };
-            if (duplicate) {
+            if (duplicate or selected.items.len >= request.limit) {
                 omitted += 1;
                 continue;
             }
             // UTF-8 bytes are a conservative token upper bound. Include the
             // complete rendered object, including citations and metadata.
-            const size = (try self.encode(hit)).len;
-            if (selected.items.len >= request.limit or bytes + size > request.token_budget) {
+            const size = try encodedSize(hit);
+            if (bytes + size > request.token_budget) {
                 omitted += 1;
                 continue;
             }
@@ -7368,9 +7389,9 @@ const Run = struct {
         while (true) {
             // Bound the complete rendered response, including framing,
             // readiness, citations and the bound's own decimal digits.
-            const rendered = try self.encode(result);
-            if (rendered.len == result.token_upper_bound) {
-                if (rendered.len <= request.token_budget) return rendered;
+            const size = try encodedSize(result);
+            if (size == result.token_upper_bound) {
+                if (size <= request.token_budget) return self.encode(result);
                 if (result.episodes.len > 0) {
                     result.episodes = result.episodes[0 .. result.episodes.len - 1];
                 } else if (result.entities.len > 0) {
@@ -7383,22 +7404,40 @@ const Run = struct {
                 result.complete = false;
                 result.truncated = true;
             }
-            result.token_upper_bound = rendered.len;
+            result.token_upper_bound = size;
         }
     }
 
     /// Outcome-derived utility, counted only from retained outcomes the caller
     /// may read. Bounded by max_utility_outcomes reverse bindings per memory.
-    fn utility(self: *Run, id: []const u8) !t.Utility {
+    fn utility(self: *Run, id: []const u8, known_at: ?i64) !t.Utility {
         var result: t.Utility = .{};
         if (try self.read(bool, "forgotten-all") != null) return result;
-        const prefix = try std.fmt.allocPrint(self.a, "outcome-use/{s}/", .{try hash(self.a, id)});
+        const prefix = try std.fmt.allocPrint(self.a, "outcome-use/{s}/{s}/", .{ try hash(self.a, self.service.context.branch), try hash(self.a, id) });
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, null, t.max_utility_outcomes);
+        var bindings: std.ArrayList(OutcomeUse) = .empty;
+        var paths: std.ArrayList([]const u8) = .empty;
         for (page.rows) |row| {
             const binding = parse(OutcomeUse, self.a, row.json) catch return error.MemoryCorruptState;
-            if (try self.read(bool, try key(self.a, "forgotten-outcome", binding.outcome_id)) != null) continue;
+            if (!eql(u8, binding.memory_id, id)) return error.MemoryCorruptState;
+            try bindings.append(self.a, binding);
+            try paths.append(self.a, try key(self.a, "outcome", binding.outcome_id));
+            try paths.append(self.a, try key(self.a, "forgotten-outcome", binding.outcome_id));
+        }
+        try self.prefetch(paths.items);
+        for (bindings.items) |binding| {
+            try self.service.context.check();
             const stored = (try self.read(StoredOutcome, try key(self.a, "outcome", binding.outcome_id))) orelse continue;
-            if (!eql(u8, stored.owner, self.service.context.principal) and !self.service.context.admin) continue;
+            if (!eql(u8, stored.owner, self.service.context.principal)) {
+                if (!self.service.context.admin) continue;
+                try self.requireAdmin();
+            }
+            if (known_at) |known| if (stored.recorded_at > known) continue;
+            // Outcomes are conjunctive dependencies: forgetting any used
+            // memory makes the whole outcome unavailable immediately.
+            const eligible = try self.utility_outcomes.getOrPut(self.a, stored.outcome.id);
+            if (!eligible.found_existing) eligible.value_ptr.* = try self.outcomeRetained(stored);
+            if (!eligible.value_ptr.*) continue;
             if (stored.outcome.success) result.successes += 1 else result.failures += 1;
         }
         result.complete = page.next == null;
@@ -7408,7 +7447,8 @@ const Run = struct {
         return result;
     }
     fn anyOutcomeUse(self: *Run) !bool {
-        return (try self.service.backend.scan(self.service.backend.ptr, self.a, "outcome-use/", null, 1)).rows.len > 0;
+        const prefix = try std.fmt.allocPrint(self.a, "outcome-use/{s}/", .{try hash(self.a, self.service.context.branch)});
+        return (try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, null, 1)).rows.len > 0;
     }
     fn pinKey(self: *Run, id: []const u8) ![]const u8 {
         try t.validateId(id);
@@ -7432,9 +7472,9 @@ const Run = struct {
         if (request.reason.len > t.max_text_bytes or !std.unicode.utf8ValidateSlice(request.reason)) return error.InvalidMemoryRequest;
         const record = (try self.assertion(request.id)) orelse return error.MemoryNotFound;
         try self.authorize(record.owner, record.assertion.visibility);
-        if (!try self.evidenceVisible(record)) return error.MemoryNotFound;
         const path = try self.pinKey(request.id);
         if (!request.pinned) return self.remove(path);
+        if (!try self.evidenceVisible(record)) return error.MemoryNotFound;
         if (try self.read(t.StoredPin, path) == null) {
             const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "brief-pin/", null, t.max_brief_pins);
             if (page.rows.len >= t.max_brief_pins) return error.MemoryWorkLimit;
@@ -7487,7 +7527,7 @@ const Run = struct {
         const pinned = try self.pinnedIds();
         const scan = try self.currentMemories(.{ .scope = request.scope, .task = request.task, .environment = request.environment, .include_provisional = request.include_provisional }, pinned.keys());
         const outcomes = try self.anyOutcomeUse();
-        const Candidate = struct { item: t.BriefItem, hit: t.RecallHit };
+        const Candidate = struct { item: t.BriefItem, duplicate_key: []const u8 };
         var ranked_candidates: std.ArrayList(Candidate) = .empty;
         var subjects: std.StringArrayHashMapUnmanaged(u32) = .empty;
         for (scan.hits) |hit| {
@@ -7498,7 +7538,7 @@ const Run = struct {
             entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
             // Disputed claims would spread uncertainty into every session.
             if (hit.memory.lifecycle != .active and !is_pinned) continue;
-            const used = if (outcomes) try self.utility(claim.id) else t.Utility{};
+            const used = if (outcomes) try self.utility(claim.id, null) else t.Utility{};
             var score = briefKindWeight(claim.kind) + 2 * used.score;
             if (claim.stability == .settled) score += 1;
             switch (claim.role) {
@@ -7507,7 +7547,9 @@ const Run = struct {
                 else => {},
             }
             if (is_pinned) score += 100;
-            try ranked_candidates.append(self.a, .{ .hit = hit, .item = .{ .id = claim.id, .statement = claim.statement, .kind = claim.kind, .subject = claim.subject, .predicate = claim.predicate, .scope = claim.scope, .stability = claim.stability, .valid_from = claim.valid_from, .pinned = is_pinned, .score = score, .utility = used } });
+            const value = if (self.objectTyped(claim.predicate)) (try self.canonical(claim.value)) orelse claim.value else claim.value;
+            const duplicate_key = try hash(self.a, .{ subject, claim.predicate, claim.scope, claim.environment, claim.task, claim.visibility, if (claim.visibility == .private) hit.memory.owner else "", value, claim.kind, claim.role, claim.modality, claim.stability, hit.memory.lifecycle });
+            try ranked_candidates.append(self.a, .{ .duplicate_key = duplicate_key, .item = .{ .id = claim.id, .statement = claim.statement, .kind = claim.kind, .subject = claim.subject, .predicate = claim.predicate, .scope = claim.scope, .stability = claim.stability, .valid_from = claim.valid_from, .pinned = is_pinned, .score = score, .utility = used } });
         }
         std.mem.sort(Candidate, ranked_candidates.items, {}, struct {
             fn less(_: void, left: Candidate, right: Candidate) bool {
@@ -7515,27 +7557,23 @@ const Run = struct {
             }
         }.less);
         var selected: std.ArrayList(t.BriefItem) = .empty;
-        var kept: std.ArrayList(t.RecallHit) = .empty;
+        var kept: ResourceSet = .empty;
         var omitted: usize = 0;
         var bytes: usize = 0;
         for (ranked_candidates.items) |candidate| {
-            var duplicate = false;
-            for (kept.items) |present| {
-                const left = candidate.hit.memory.assertion;
-                const right = present.memory.assertion;
-                if (try self.sameCanonicalGroup(left, right) and try self.sameCanonicalValue(left, right) and (left.visibility == .team or eql(u8, candidate.hit.memory.owner, present.memory.owner))) {
-                    duplicate = true;
-                    break;
-                }
+            try self.service.context.check();
+            if (kept.contains(candidate.duplicate_key) or selected.items.len >= request.limit) {
+                omitted += 1;
+                continue;
             }
-            const size = (try self.encode(candidate.item)).len;
-            if (duplicate or selected.items.len >= request.limit or bytes + size > request.token_budget) {
+            const size = try encodedSize(candidate.item);
+            if (bytes + size > request.token_budget) {
                 omitted += 1;
                 continue;
             }
             bytes += size;
             try selected.append(self.a, candidate.item);
-            try kept.append(self.a, candidate.hit);
+            try kept.put(self.a, candidate.duplicate_key, {});
         }
         const SubjectEntry = t.SubjectCount;
         var ranked: std.ArrayList(SubjectEntry) = .empty;
@@ -7546,24 +7584,95 @@ const Run = struct {
                 return if (left.memories == right.memories) std.mem.lessThan(u8, left.subject, right.subject) else left.memories > right.memories;
             }
         }.less);
-        var result: t.Brief = .{ .items = selected.items, .subjects = ranked.items[0..@min(ranked.items.len, 8)], .guidance = brief_guidance, .scanned = scan.scanned, .omitted = omitted, .complete = !scan.more and omitted == 0, .token_upper_bound = 0, .revision = self.state.revision, .config_generation = self.state.config.generation };
+        const result: t.Brief = .{ .items = selected.items, .subjects = ranked.items[0..@min(ranked.items.len, 8)], .guidance = brief_guidance, .scanned = scan.scanned, .omitted = omitted, .complete = !scan.more and omitted == 0, .token_upper_bound = 0, .revision = self.state.revision, .config_generation = self.state.config.generation };
+        return self.renderBrief(result, request.token_budget);
+    }
+    fn renderBrief(self: *Run, initial: t.Brief, token_budget: usize) ![]const u8 {
+        var result = initial;
         while (true) {
-            const rendered = try self.encode(result);
-            if (rendered.len == result.token_upper_bound) {
-                if (rendered.len <= request.token_budget) return rendered;
+            try self.service.context.check();
+            const size = try encodedSize(result);
+            if (size == result.token_upper_bound) {
+                if (size <= token_budget) {
+                    const output = try self.a.alloc(u8, size);
+                    var writer: std.Io.Writer = .fixed(output);
+                    try std.json.Stringify.value(result, .{}, &writer);
+                    std.debug.assert(writer.end == size);
+                    return output;
+                }
                 if (result.subjects.len > 0) {
                     result.subjects = result.subjects[0 .. result.subjects.len - 1];
-                } else if (selected.items.len > 0) {
-                    _ = selected.pop();
-                    result.items = selected.items;
+                } else if (result.items.len > 0) {
+                    result.items = result.items[0 .. result.items.len - 1];
                     result.omitted += 1;
                 } else if (result.guidance.len > 0) {
                     result.guidance = "";
                 } else return error.InvalidMemoryRequest;
                 result.complete = false;
             }
-            result.token_upper_bound = rendered.len;
+            result.token_upper_bound = size;
         }
+    }
+    fn findingLess(left: t.Finding, right: t.Finding) bool {
+        if (left.kind != right.kind) return @backingInt(left.kind) < @backingInt(right.kind);
+        const lhs = if (left.memory_ids.len > 0) left.memory_ids[0] else left.entity_id orelse "";
+        const rhs = if (right.memory_ids.len > 0) right.memory_ids[0] else right.entity_id orelse "";
+        if (!eql(u8, lhs, rhs)) return std.mem.lessThan(u8, lhs, rhs);
+        return std.mem.lessThan(u8, left.target_id orelse "", right.target_id orelse "");
+    }
+    /// Keep only the best requested findings in O(log(limit)) work per input.
+    /// Long relationship lists must not allocate an unbounded discarded report.
+    const BoundedFindings = struct {
+        const Slot = struct { finding: t.Finding, ids: std.ArrayList([]const u8) = .empty };
+        slots: std.ArrayList(Slot) = .empty,
+        limit: usize,
+        total: usize = 0,
+        fn append(self: *@This(), a: A, finding: t.Finding) !void {
+            self.total += 1;
+            if (self.slots.items.len == self.limit and !findingLess(finding, self.slots.items[0].finding)) return;
+            const full = self.slots.items.len == self.limit;
+            if (!full) try self.slots.append(a, .{ .finding = finding });
+            var i: usize = if (full) 0 else self.slots.items.len - 1;
+            const slot = &self.slots.items[i];
+            slot.ids.clearRetainingCapacity();
+            try slot.ids.appendSlice(a, finding.memory_ids);
+            slot.finding = finding;
+            slot.finding.memory_ids = slot.ids.items;
+            if (!full) {
+                while (i > 0) {
+                    const parent = (i - 1) / 2;
+                    if (!findingLess(self.slots.items[parent].finding, self.slots.items[i].finding)) break;
+                    std.mem.swap(Slot, &self.slots.items[parent], &self.slots.items[i]);
+                    i = parent;
+                }
+            } else {
+                while (2 * i + 1 < self.slots.items.len) {
+                    var worst = 2 * i + 1;
+                    if (worst + 1 < self.slots.items.len and findingLess(self.slots.items[worst].finding, self.slots.items[worst + 1].finding)) worst += 1;
+                    if (!findingLess(self.slots.items[i].finding, self.slots.items[worst].finding)) break;
+                    std.mem.swap(Slot, &self.slots.items[i], &self.slots.items[worst]);
+                    i = worst;
+                }
+            }
+        }
+        fn sorted(self: @This(), a: A) ![]const t.Finding {
+            const out = try a.alloc(t.Finding, self.slots.items.len);
+            for (self.slots.items, out) |slot, *finding| finding.* = slot.finding;
+            std.mem.sort(t.Finding, out, {}, struct {
+                fn less(_: void, lhs: t.Finding, rhs: t.Finding) bool {
+                    return findingLess(lhs, rhs);
+                }
+            }.less);
+            return out;
+        }
+    };
+    fn linkRetired(self: *Run, id: []const u8) !bool {
+        const record = (try self.assertion(id)) orelse return true;
+        self.authorize(record.owner, record.assertion.visibility) catch return false;
+        const prior = self.retention_maintenance;
+        self.retention_maintenance = true;
+        defer self.retention_maintenance = prior;
+        return !try self.retained(record, 0);
     }
     fn consolidate(self: *Run, request: t.ConsolidationRequest) ![]const u8 {
         if (request.limit == 0 or request.limit > t.max_consolidation_findings) return error.InvalidMemoryRequest;
@@ -7571,9 +7680,10 @@ const Run = struct {
         const pinned = try self.pinnedIds();
         const scan = try self.currentMemories(.{}, &.{});
         const outcomes = try self.anyOutcomeUse();
-        var findings: std.ArrayList(t.Finding) = .empty;
+        var findings: BoundedFindings = .{ .limit = request.limit };
         var visible: ResourceSet = .empty;
         var referenced: ResourceSet = .empty;
+        var retired_links: std.StringHashMapUnmanaged(bool) = .empty;
         var duplicates: std.StringArrayHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
         var by_kind: std.StringArrayHashMapUnmanaged(u32) = .empty;
         var by_lifecycle: std.StringArrayHashMapUnmanaged(u32) = .empty;
@@ -7582,6 +7692,7 @@ const Run = struct {
         var stats: t.SpaceStats = .{};
         for (scan.hits) |hit| try visible.put(self.a, hit.memory.assertion.id, {});
         for (scan.hits) |hit| {
+            try self.service.context.check();
             const record = hit.memory;
             const claim = record.assertion;
             stats.memories += 1;
@@ -7607,24 +7718,29 @@ const Run = struct {
                 try findings.append(self.a, .{ .kind = .dispute, .memory_ids = ids.items, .reason = record.reason orelse "conflicting current claims need a supersession verdict", .suggested_action = .review_supersession });
             }
             const single = self.singlePredicate(claim.predicate);
-            if (single and claim.valid_from == null and record.lifecycle == .active) try findings.append(self.a, .{ .kind = .unordered, .memory_ids = try self.a.dupe([]const u8, &.{claim.id}), .reason = "single-valued predicate without valid_from cannot be ordered against later values", .suggested_action = .add_valid_from });
-            if (record.lifecycle == .active and (claim.stability == .provisional or claim.role == .inferred or claim.role == .hypothesized)) try findings.append(self.a, .{ .kind = .unverified, .memory_ids = try self.a.dupe([]const u8, &.{claim.id}), .reason = "provisional or inferred claim; check it against its evidence and settle or retract it", .suggested_action = .verify });
+            if (single and claim.valid_from == null and record.lifecycle == .active) try findings.append(self.a, .{ .kind = .unordered, .memory_ids = &.{claim.id}, .reason = "single-valued predicate without valid_from cannot be ordered against later values", .suggested_action = .add_valid_from });
+            if (record.lifecycle == .active and (claim.stability == .provisional or claim.role == .inferred or claim.role == .hypothesized)) try findings.append(self.a, .{ .kind = .unverified, .memory_ids = &.{claim.id}, .reason = "provisional or inferred claim; check it against its evidence and settle or retract it", .suggested_action = .verify });
             if (request.stale_after_ms) |window| if ((single or claim.stability == .provisional) and record.recorded_from +| @as(i64, @intCast(@min(window, std.math.maxInt(i64)))) <= now) {
-                try findings.append(self.a, .{ .kind = .stale, .memory_ids = try self.a.dupe([]const u8, &.{claim.id}), .reason = "volatile claim has not changed within stale_after_ms; reconfirm it", .suggested_action = .verify });
+                try findings.append(self.a, .{ .kind = .stale, .memory_ids = &.{claim.id}, .reason = "volatile claim has not changed within stale_after_ms; reconfirm it", .suggested_action = .verify });
             };
-            const used = if (outcomes) try self.utility(claim.id) else t.Utility{};
-            if (used.failures >= 2 and used.failures > used.successes) try findings.append(self.a, .{ .kind = .harmful, .memory_ids = try self.a.dupe([]const u8, &.{claim.id}), .reason = "used mostly in failed tasks; it may be wrong or misapplied", .suggested_action = .correct });
+            const used = if (outcomes) try self.utility(claim.id, null) else t.Utility{};
+            if (used.failures >= 2 and used.failures > used.successes) try findings.append(self.a, .{ .kind = .harmful, .memory_ids = &.{claim.id}, .reason = "used mostly in failed tasks; it may be wrong or misapplied", .suggested_action = .correct });
             // Public views drop links to retired targets; inspect stored links.
             const stored_claim = if (try self.assertion(claim.id)) |raw| raw.assertion else claim;
+            var checked_links: ResourceSet = .empty;
             inline for (.{ stored_claim.depends_on, stored_claim.supersedes, stored_claim.motivates, stored_claim.rejected_in_favor_of }) |targets| for (targets) |target| {
-                const linked = try self.assertion(target);
-                if (linked == null or !try self.retained(linked.?, 0)) try findings.append(self.a, .{ .kind = .dangling_link, .memory_ids = try self.a.dupe([]const u8, &.{claim.id}), .target_id = target, .reason = "links to a memory that does not exist or was retired", .suggested_action = .fix_link });
+                try self.service.context.check();
+                if (checked_links.contains(target)) continue;
+                try checked_links.put(self.a, target, {});
+                const retired = try retired_links.getOrPut(self.a, target);
+                if (!retired.found_existing) retired.value_ptr.* = try self.linkRetired(target);
+                if (retired.value_ptr.*) try findings.append(self.a, .{ .kind = .dangling_link, .memory_ids = &.{claim.id}, .target_id = target, .reason = "links to a memory that does not exist or was retired", .suggested_action = .fix_link });
             };
             const durable_kind = switch (claim.kind) {
                 .constraint, .preference, .procedural, .lesson => true,
                 else => false,
             };
-            if (!pinned.contains(claim.id) and record.lifecycle == .active and claim.stability == .settled and ((durable_kind and used.failures == 0) or (used.successes >= 2 and used.score > 0))) try findings.append(self.a, .{ .kind = .promote, .memory_ids = try self.a.dupe([]const u8, &.{claim.id}), .reason = "settled durable or repeatedly useful memory; consider pinning it to the brief", .suggested_action = .pin });
+            if (!pinned.contains(claim.id) and record.lifecycle == .active and claim.stability == .settled and ((durable_kind and used.failures == 0) or (used.successes >= 2 and used.score > 0))) try findings.append(self.a, .{ .kind = .promote, .memory_ids = &.{claim.id}, .reason = "settled durable or repeatedly useful memory; consider pinning it to the brief", .suggested_action = .pin });
         }
         var buckets = duplicates.iterator();
         while (buckets.next()) |entry| if (entry.value_ptr.items.len > 1) {
@@ -7651,15 +7767,7 @@ const Run = struct {
             after = page.next;
             if (after == null or entities_scanned >= 1024) break;
         }
-        std.mem.sort(t.Finding, findings.items, {}, struct {
-            fn less(_: void, left: t.Finding, right: t.Finding) bool {
-                if (left.kind != right.kind) return @intFromEnum(left.kind) < @intFromEnum(right.kind);
-                const lhs = if (left.memory_ids.len > 0) left.memory_ids[0] else left.entity_id orelse "";
-                const rhs = if (right.memory_ids.len > 0) right.memory_ids[0] else right.entity_id orelse "";
-                if (!eql(u8, lhs, rhs)) return std.mem.lessThan(u8, lhs, rhs);
-                return std.mem.lessThan(u8, left.target_id orelse "", right.target_id orelse "");
-            }
-        }.less);
+        const shown = try findings.sorted(self.a);
         const counts = struct {
             fn sorted(a: A, map: std.StringArrayHashMapUnmanaged(u32)) ![]const t.Count {
                 var out: std.ArrayList(t.Count) = .empty;
@@ -7677,8 +7785,7 @@ const Run = struct {
         stats.by_lifecycle = try counts.sorted(self.a, by_lifecycle);
         stats.by_stability = try counts.sorted(self.a, by_stability);
         stats.by_producer = try counts.sorted(self.a, by_producer);
-        const shown = findings.items[0..@min(findings.items.len, request.limit)];
-        const omitted = findings.items.len - shown.len;
+        const omitted = findings.total - shown.len;
         return self.encode(t.Consolidation{ .findings = shown, .stats = stats, .scanned = scan.scanned, .omitted = omitted, .complete = !scan.more and omitted == 0 and after == null, .revision = self.state.revision, .config_generation = self.state.config.generation });
     }
     fn entityList(self: *Run, request: anytype) ![]const u8 {
@@ -7767,9 +7874,9 @@ fn key(a: A, prefix: []const u8, id: []const u8) ![]const u8 {
 fn dependencyKey(a: A, kind: []const u8, parent: []const u8, child: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "dependency/{s}/{s}/{s}", .{ kind, try hash(a, parent), try hash(a, child) });
 }
-fn outcomeUseKey(a: A, memory_id: []const u8, outcome_id: []const u8) ![]const u8 {
+fn outcomeUseKey(a: A, branch: []const u8, memory_id: []const u8, outcome_id: []const u8) ![]const u8 {
     try t.validateId(memory_id);
-    return std.fmt.allocPrint(a, "outcome-use/{s}/{s}", .{ try hash(a, memory_id), try hash(a, outcome_id) });
+    return std.fmt.allocPrint(a, "outcome-use/{s}/{s}/{s}", .{ try hash(a, branch), try hash(a, memory_id), try hash(a, outcome_id) });
 }
 fn briefKindWeight(kind: t.Kind) f64 {
     return switch (kind) {
@@ -8060,7 +8167,7 @@ fn inputFingerprint(a: A, value: anytype, secret: []const u8, version: u8) ![]co
 }
 fn screenedAction(action: Action) bool {
     return switch (action) {
-        .recall, .start_evaluation, .fork_lineage, .checkpoint_lineage, .revert_lineage, .put_evaluation_dataset, .evaluation_verdict, .propose_supersession, .review_supersession, .observe, .assertions, .correct, .outcome, .curate_entity, .propose_entity, .review_entity, .propose_relationship, .review_relationship => true,
+        .pin, .recall, .start_evaluation, .fork_lineage, .checkpoint_lineage, .revert_lineage, .put_evaluation_dataset, .evaluation_verdict, .propose_supersession, .review_supersession, .observe, .assertions, .correct, .outcome, .curate_entity, .propose_entity, .review_entity, .propose_relationship, .review_relationship => true,
         else => false,
     };
 }
@@ -8295,4 +8402,78 @@ test "memory performance identity rebuild discovers each canonical group once ac
     try std.testing.expectEqual(@as(usize, 4), counts.dependencies);
     try std.testing.expectEqual(@as(usize, 14), counts.groups); // Seven groups × two raw identities.
     std.debug.print("IDENTITY GROUP DISCOVERY dependencies=412 groups=7 raw_group_scans={d} retained_claims={d}\n", .{ counts.groups, affected.count() });
+}
+
+test "memory consolidation findings retain the ordered prefix with bounded reusable storage" {
+    var input_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer input_arena.deinit();
+    const a = input_arena.allocator();
+    var reference: std.ArrayList(t.Finding) = .empty;
+    var storage: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var findings: Run.BoundedFindings = .{ .limit = 16 };
+    for (0..10000) |i| {
+        const id = try std.fmt.allocPrint(a, "id-{d:0>5}", .{10000 - i});
+        const finding: t.Finding = .{ .kind = @fromBackingInt(@intCast(i % @typeInfo(t.FindingKind).@"enum".field_names.len)), .memory_ids = try a.dupe([]const u8, &.{id}), .reason = "review", .suggested_action = .verify };
+        try reference.append(a, finding);
+        try findings.append(fixed.allocator(), finding);
+    }
+    std.mem.sort(t.Finding, reference.items, {}, struct {
+        fn less(_: void, lhs: t.Finding, rhs: t.Finding) bool {
+            return Run.findingLess(lhs, rhs);
+        }
+    }.less);
+    const selected = try findings.sorted(fixed.allocator());
+    try std.testing.expectEqual(@as(usize, 10000), findings.total);
+    try std.testing.expectEqual(@as(usize, 16), selected.len);
+    for (selected, reference.items[0..16]) |actual, expected| {
+        try std.testing.expectEqual(expected.kind, actual.kind);
+        try std.testing.expectEqualStrings(expected.memory_ids[0], actual.memory_ids[0]);
+    }
+    try std.testing.expect(fixed.end_index < storage.len);
+}
+
+test "memory brief byte cap renders one exact buffer without allocating discarded responses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const statement = try a.alloc(u8, 2048);
+    @memset(statement, 'x');
+    @memcpy(statement[0..4], "\"\\\n\t");
+    const items = try a.alloc(t.BriefItem, 64);
+    for (items) |*item| item.* = .{ .id = "id", .statement = statement, .kind = .semantic, .subject = "subject", .predicate = "property", .scope = "", .stability = .settled, .valid_from = null, .pinned = false, .score = 1, .utility = .{} };
+    const brief: t.Brief = .{ .items = items, .subjects = &.{}, .guidance = brief_guidance, .scanned = 64, .omitted = 0, .complete = true, .token_upper_bound = 0, .revision = 1, .config_generation = 1 };
+    var storage: [1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var run = performanceTestRun(fixed.allocator());
+    const rendered = try run.renderBrief(brief, storage.len);
+    try std.testing.expectEqual(rendered.len, fixed.end_index);
+    const parsed = try parse(t.Brief, a, rendered);
+    try std.testing.expectEqual(rendered.len, parsed.token_upper_bound);
+    try std.testing.expectEqual(@as(usize, 64), parsed.omitted);
+    try std.testing.expect(!parsed.complete);
+}
+
+test "memory utility shares decoded outcome arrays across memory bindings and invalidates overlay edits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ids = try a.alloc([]const u8, 256);
+    for (ids, 0..) |*id, i| id.* = try std.fmt.allocPrint(a, "memory-{d}", .{i});
+    const stored: StoredOutcome = .{ .outcome = .{ .id = "outcome", .task_id = "task", .success = true, .used_memory_ids = ids }, .owner = "alice", .recorded_at = 1 };
+    const raw = try std.json.Stringify.valueAlloc(a, stored, .{});
+    var storage: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var run = performanceTestRun(fixed.allocator());
+    const first = try run.parseRead(StoredOutcome, "outcome/key", raw);
+    const allocated = fixed.end_index;
+    for (0..1024) |_| {
+        const next = try run.parseRead(StoredOutcome, "outcome/key", raw);
+        try std.testing.expect(first.outcome.used_memory_ids.ptr == next.outcome.used_memory_ids.ptr);
+    }
+    try std.testing.expectEqual(allocated, fixed.end_index);
+    var replacement = stored;
+    replacement.outcome.success = false;
+    try run.put("outcome/key", replacement);
+    try std.testing.expect(!(try run.read(StoredOutcome, "outcome/key")).?.outcome.success);
 }
