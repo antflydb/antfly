@@ -340,4 +340,55 @@ it("validates host budgets and session identity before issuing requests", async 
     RangeError
   );
   expect(() => createMemorySession({ client, space: "s", runId: "" })).toThrow();
+  expect(() => createMemoryTools({ client, space: "s", explainMaxBytes: 1023 })).toThrow(
+    RangeError
+  );
+  expect(() => createMemoryTools({ client, space: "s", explainMaxBytes: 1024 })).not.toThrow();
+});
+
+it("remembers managed evidence without submitting external assertions and retries exactly", async () => {
+  const { z } = await import("zod");
+  const requests: Request[] = [];
+  vi.stubGlobal("fetch", async (request: Request) => {
+    requests.push(request.clone());
+    return new Response('{"id":"op","phase":"pending"}', {
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+  const client = new AntflyClient({ baseUrl: "http://memory.test" });
+  const options = {
+    client,
+    space: "s",
+    profile: "agent",
+    rememberMode: "managed",
+    runId: "managed-run",
+  } as const;
+  const input = { statement: "A fact worth extracting", sourceUrl: "https://example.com/note" };
+  const tool = createMemoryTools(options).antfly_memory_remember;
+  expect((tool.inputSchema as import("zod").ZodType).parse(input)).toEqual(input);
+  expect(z.toJSONSchema(tool.inputSchema as import("zod").ZodObject).properties).not.toHaveProperty(
+    "rememberMode"
+  );
+  await tool.execute?.(input, toolOptions());
+  await createMemoryTools(options).antfly_memory_remember.execute?.(input, toolOptions());
+  const first = requests[0];
+  const retry = requests[1];
+  if (!first || !retry) throw new Error("Missing requests");
+  expect(first.headers.get("Idempotency-Key")).toBe(retry.headers.get("Idempotency-Key"));
+  const body = await bodyOf(first);
+  expect(body).toEqual(await bodyOf(retry));
+  expect(body.assertions).toBeUndefined();
+  expect(body.evidence[0]).toMatchObject({
+    text: input.statement,
+    source_url: input.sourceUrl,
+    managed: true,
+  });
+  await expect(
+    tool.execute?.(input, {
+      toolCallId: "t1",
+      messages: [],
+      abortSignal: AbortSignal.abort(),
+    } as never)
+  ).rejects.toThrow();
+  expect(requests).toHaveLength(2);
 });

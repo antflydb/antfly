@@ -191,6 +191,14 @@ undo it.
 model arguments can only reduce retrieval budgets. Server configuration still
 applies its own maximum. Defaults are 16 brief items/1024 response bytes and
 20 recall items/2048 response bytes. `utilityWeight` is a host option (0–1).
+`explainMaxBytes` must be at least 1024, matching the native explanation minimum.
+
+`rememberMode` selects the producer at construction time. The default
+`"assertion"` records a structured fact with evidence in external/hybrid spaces.
+Use `rememberMode: "managed"` for managed extraction in managed/hybrid spaces;
+its model arguments contain only `statement` and optional `sourceUrl`. It admits
+managed evidence and returns the native pending receipt without submitting an
+external assertion. Native extraction and producer policy remain authoritative.
 
 ```ts
 import { createMemorySession } from "@antfly/ai-sdk";

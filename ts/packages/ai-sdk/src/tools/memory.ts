@@ -12,6 +12,8 @@ export interface AntflyMemoryToolsOptions {
   branch?: string;
   /** Existing three tools by default; agent opts into the native eight-tool profile. */
   profile?: "basic" | "agent";
+  /** Host-selected producer: structured assertions (default), or native managed extraction. */
+  rememberMode?: "assertion" | "managed";
   /** Globally unique host run/request ID. Reuse on retries across process restarts. */
   runId?: string;
   recallLimit?: number;
@@ -78,7 +80,7 @@ function validate(options: AntflyMemoryToolsOptions) {
     recallTokens: integerOption("recallTokenBudget", options.recallTokenBudget, 2048, 65536),
     briefLimit: integerOption("briefLimit", options.briefLimit, 16, 64),
     briefTokens: integerOption("briefTokenBudget", options.briefTokenBudget, 1024, 65536),
-    explainBytes: integerOption("explainMaxBytes", options.explainMaxBytes, 8192, 65536, 512),
+    explainBytes: integerOption("explainMaxBytes", options.explainMaxBytes, 8192, 65536, 1024),
   };
 }
 function digest(parts: readonly unknown[]): string {
@@ -148,50 +150,82 @@ export function createMemoryTools(options: AntflyMemoryToolsOptions): Record<str
       );
     },
   });
-  const remember = tool({
-    description: `Record a fact with its source evidence in '${options.space}'. Returns a durable operation receipt, admitted evidence IDs and duplicate-review signals.`,
-    inputSchema: z
-      .object({
-        subject: z.string().min(1).max(256),
-        predicate: z.string().min(1).max(200),
-        value: z.string().min(1).max(2000),
-        statement: z.string().min(1).max(20000),
-        sourceUrl: z.string().url().optional(),
-      })
-      .strict(),
-    execute: async (
-      { subject, predicate, value, statement, sourceUrl },
-      { abortSignal, toolCallId }
-    ) => {
-      abortSignal?.throwIfAborted();
-      const key = operationKey(options, "remember", toolCallId);
-      const evidenceId = digest([key, "evidence"]);
-      return checked(
-        await options.client.memoryApi.POST("/memory/v1/spaces/{space}/observations", {
-          signal: abortSignal,
-          params: {
-            path: { space: options.space },
-            header: { ...headers(options), "Idempotency-Key": key },
-          },
-          body: {
-            scoped_evidence_ids: true,
-            evidence: [{ id: evidenceId, text: statement, source_url: sourceUrl }],
-            assertions: [
-              {
-                id: digest([key, "assertion"]),
-                subject,
-                predicate,
-                value,
-                statement,
-                evidence: [{ id: evidenceId }],
-              },
-            ],
-          },
-        }),
-        "observation"
-      );
+  const rememberEvidence = async (
+    input: {
+      statement: string;
+      sourceUrl?: string;
+      subject?: string;
+      predicate?: string;
+      value?: string;
     },
-  });
+    execution: { abortSignal?: AbortSignal; toolCallId: string }
+  ) => {
+    execution.abortSignal?.throwIfAborted();
+    const key = operationKey(options, "remember", execution.toolCallId);
+    const evidenceId = digest([key, "evidence"]);
+    const assertions =
+      input.subject !== undefined && input.predicate !== undefined && input.value !== undefined
+        ? [
+            {
+              id: digest([key, "assertion"]),
+              subject: input.subject,
+              predicate: input.predicate,
+              value: input.value,
+              statement: input.statement,
+              evidence: [{ id: evidenceId }],
+            },
+          ]
+        : undefined;
+    if (options.rememberMode !== "managed" && assertions === undefined)
+      throw new Error("Structured remember requires subject, predicate and value");
+    return checked(
+      await options.client.memoryApi.POST("/memory/v1/spaces/{space}/observations", {
+        signal: execution.abortSignal,
+        params: {
+          path: { space: options.space },
+          header: { ...headers(options), "Idempotency-Key": key },
+        },
+        body: {
+          scoped_evidence_ids: true,
+          evidence: [
+            {
+              id: evidenceId,
+              text: input.statement,
+              source_url: input.sourceUrl,
+              ...(options.rememberMode === "managed" ? { managed: true } : {}),
+            },
+          ],
+          ...(options.rememberMode === "managed" ? {} : { assertions }),
+        },
+      }),
+      "observation"
+    );
+  };
+  const remember =
+    options.rememberMode === "managed"
+      ? tool({
+          description: `Keep source evidence in '${options.space}' for native managed extraction. The returned receipt may remain pending until extraction completes.`,
+          inputSchema: z
+            .object({
+              statement: z.string().min(1).max(20000),
+              sourceUrl: z.string().url().optional(),
+            })
+            .strict(),
+          execute: rememberEvidence,
+        })
+      : tool({
+          description: `Record a fact with its source evidence in '${options.space}'. Returns a durable operation receipt, admitted evidence IDs and duplicate-review signals.`,
+          inputSchema: z
+            .object({
+              subject: z.string().min(1).max(256),
+              predicate: z.string().min(1).max(200),
+              value: z.string().min(1).max(2000),
+              statement: z.string().min(1).max(20000),
+              sourceUrl: z.string().url().optional(),
+            })
+            .strict(),
+          execute: rememberEvidence,
+        });
   const forget = tool({
     description: `Permanently forget specified evidence in '${options.space}'.`,
     needsApproval: true,
