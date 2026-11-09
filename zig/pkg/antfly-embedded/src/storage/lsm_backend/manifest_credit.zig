@@ -69,9 +69,19 @@ pub fn estimate(allocator: std.mem.Allocator, options: anytype, root_len: usize,
         // Greedy packing has at most 1 + 2*sum/capacity outputs. Account for
         // each independent splitting limit; tiny physical caps fall back to
         // the one-row bound. No assumption about input insertion order.
-        var outputs = @min(group.rows, 1 +| (2 *| group.logical) / logical_limit);
-        outputs = @min(group.rows, outputs +| if (physical_limit <= 64 * 1024) group.rows else (2 *| group.physical) / (physical_limit - 64 * 1024));
-        if (options.max_run_file_entries != 0) outputs = @min(group.rows, outputs +| group.rows / options.max_run_file_entries);
+        const fits_one = group.logical <= logical_limit and
+            physical_limit > 64 * 1024 and group.physical <= physical_limit - 64 * 1024 and
+            (options.max_run_file_entries == 0 or group.rows <= options.max_run_file_entries);
+        // If the entire partition fits, greedy packing cannot split it. The
+        // general multi-output bound otherwise charges two descriptors for a
+        // half-full partition, multiplying multi-megabyte key fences enough
+        // to reject a valid commit even after all old debt has been flushed.
+        var outputs: u64 = 1;
+        if (!fits_one) {
+            outputs = @min(group.rows, 1 +| (2 *| group.logical) / logical_limit);
+            outputs = @min(group.rows, outputs +| if (physical_limit <= 64 * 1024) group.rows else (2 *| group.physical) / (physical_limit - 64 * 1024));
+            if (options.max_run_file_entries != 0) outputs = @min(group.rows, outputs +| group.rows / options.max_run_file_entries);
+        }
         bytes +|= outputs *| (192 +| root_len +| 2 *| group.bound_bytes);
     }
     return bytes;

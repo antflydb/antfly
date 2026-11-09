@@ -23108,6 +23108,35 @@ fn implementationTests() type {
             }
         }
 
+        test "lsm manifest credits retain one descriptor when the complete long-key partition fits" {
+            const a = std.testing.allocator;
+            var state: State = .{};
+            defer state.deinit(a);
+            var key: [16 * 1024]u8 = @splat('k');
+            for (0..6) |i| {
+                key[key.len - 1] = @intCast(i);
+                try state.upsert(a, .{}, &key, "value", false);
+            }
+            var storage = storage_io.MemoryStorage.init(a);
+            defer storage.deinit();
+            var backend = try Backend.open(a, "/manifest-credit-long-keys", .{
+                .storage = storage.storage(),
+                .max_run_file_bytes = 1024 * 1024,
+                .max_run_file_physical_bytes = 1024 * 1024,
+            });
+            defer backend.close();
+            const credit = try backend.prepareManifestCredit(&state, &@as(State, .{}));
+            // The conservative physical bound exceeds half the output cap,
+            // but the complete partition still fits one physical/logical run.
+            try std.testing.expectEqual(@as(u64, 128 + 192 + "/manifest-credit-long-keys".len + 2 * key.len), credit);
+            var outputs = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, &backend, &state, 0);
+            defer compaction_mod.discardOutputRuns(Backend, &backend, &outputs);
+            try std.testing.expectEqual(@as(usize, 1), outputs.items.len);
+            const encoded = try repository_mod.encodeManifestAlloc(a, backend.next_run_id, outputs.items, &.{});
+            defer a.free(encoded);
+            try std.testing.expect(encoded.len <= credit);
+        }
+
         test "lsm point leases pin immutable values across flush and overwrite" {
             const alloc = std.testing.allocator;
             var storage = storage_io.MemoryStorage.init(alloc);
