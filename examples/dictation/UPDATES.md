@@ -159,6 +159,36 @@ and the app requires signed feed metadata and verification before extraction.
 The Sparkle release tools are downloaded by exact version and SHA-256 from
 `release/policy.json`; the Swift package is pinned in `Package.resolved`.
 
+### Resuming a long Apple notarization
+
+The signing job submits to Apple without waiting, then saves a
+`dictation-notarization` artifact for ninety days before polling. It contains the
+exact signed ZIP, submission ID, release identity, and archive digest; private
+keys and the temporary signing keychain are excluded. The checkpoint uses the
+same GCS exchange as the other release handoffs (or Actions when disabled).
+
+A thirty-minute CI wait timeout does not cancel Apple's processing. Check the
+submission ID with `notarytool info`; if Apple rejects it, inspect the submission
+log and fix the reported issues. If it remains pending or becomes accepted,
+resume the **original** release run after it has completed:
+
+```sh
+gh workflow run dictation-release.yml --ref main -f resume_run_id=ORIGINAL_RUN_ID
+```
+
+The controller accepts only a completed default-branch release whose protected
+signing job successfully saved its checkpoint. It checks the original controller,
+current tag and policy, archive hash, Developer ID signatures and team, then waits
+on the same Apple submission. It never rebuilds, re-signs, or resubmits the app.
+Signing and publication still require their normal environment approvals. A
+resume can itself time out; retry with the same **original** run ID. An empty
+manual dispatch remains the storage-only probe and cannot publish.
+
+Releases made before checkpoint support cannot be resumed this way. Keep their
+submission IDs for diagnosis; a fresh run is needed if their runner exits before
+saving a signed artifact. Do not move a tag or rebuild once its version has been
+reserved or its immutable release ledger has been published.
+
 A separate publication job uses the existing **release-promotion** environment
 and `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_ENDPOINT_URL` secrets.
 The canonical bucket is **antfly-releases**. Apple credentials remain isolated
@@ -197,11 +227,34 @@ write succeeds, retry completes the other without replacing immutable assets.
 A lost response is resolved by reading the exact existing bytes on retry.
 
 Set repository variable `DICTATION_GITHUB_MIRROR=true` to enable a separate
-GitHub mirror job **after** canonical R2 publication. Mirror failures cannot block
-R2 feeds. Draft lookup includes the paginated releases listing because GitHub's
+GitHub mirror job **after** canonical R2 publication. The publisher exports the
+sealed ledger digest; the mirror restores those exact signed downloads from
+public R2 and verifies their identity, sizes, hashes, and feed before uploading.
+It does not fetch another Actions/GCS copy and needs no storage credentials.
+Mirror failures cannot block R2 feeds. Draft lookup includes the paginated releases listing because GitHub's
 by-tag endpoint excludes drafts. Reconciliation reads assets by numeric release
 ID, preserves verified uploads, and removes only empty matching draft placeholders.
 GitHub does not own the app channel or Antfly's Latest release marker.
+
+With `CI_ARTIFACT_GCS=true`, the unsigned and signed handoffs use the existing
+private GCS exchange and retain only small Actions receipts for ninety days.
+Their GCS objects expire at 120 days, covering the receipt/retry window and
+content reuse. With the switch disabled, the same helpers retain the original
+files in Actions for ninety days; readers also support historical Actions-only
+runs. Request and identity JSON records have explicit ninety-day retention.
+The unsigned build uses helpers pinned to the default-branch controller, separate
+from its source checkout. Signing and publication retain their protected gates.
+
+Before merging these handoffs, apply Colony's reviewed `ci-artifact-provider`
+condition update: only Dictation's exact main controller and storage probe are
+admitted to staging. This grants no container-publishing authority. Then run:
+
+```sh
+gh workflow run dictation-release.yml --repo antflydb/antfly --ref main
+```
+
+Manual dispatch only tests upload/reuse/verified restore; it cannot build, sign,
+or publish an app. A real release still starts through the tag-request workflow.
 
 If signing succeeded but publication failed, use **Re-run failed jobs** to reuse
 the signed artifact. Never re-sign an already reserved version: timestamps can
