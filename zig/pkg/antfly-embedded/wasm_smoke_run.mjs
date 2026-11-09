@@ -160,8 +160,11 @@ for (const [query, count] of [
 const repeatedText = "x".repeat(400000);
 const cachedText = api.cypher("knowledge", {query:"RETURN reduce(a=0,i IN range(1,1000)|a+size(ltrim($s)))", parameters:{s:repeatedText}, limits:{intermediate_states:30000}});
 if (cachedText.rows[0][0].value !== "400000000") throw new Error("WASM cached Unicode analysis changed its result");
+// An invariant predicate can be evaluated once by the reducer certificate.
+const cachedSearch = api.cypher("knowledge", {query:"RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS 'z' THEN 1 ELSE 0 END)",parameters:{s:repeatedText},limits:{intermediate_states:30000}});
+if (cachedSearch.rows[0][0].value !== "0") throw new Error("WASM invariant string search changed its result");
 try {
-    api.cypher("knowledge", {query:"RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS 'z' THEN 1 ELSE 0 END)",parameters:{s:repeatedText},limits:{intermediate_states:30000}});
+    api.cypher("knowledge", {query:"RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS toString(i) THEN 1 ELSE 0 END)",parameters:{s:repeatedText},limits:{intermediate_states:30000}});
     throw new Error("WASM string search bypassed work limits");
 } catch (error) { if (error.diagnostic?.code !== "CypherStateBudgetExceeded") throw error; }
 // Oversized indexes remain correct on wasm32, where usize is narrower than INTEGER.
