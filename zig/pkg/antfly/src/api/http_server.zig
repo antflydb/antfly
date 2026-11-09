@@ -22052,10 +22052,11 @@ pub const ApiHttpServer = struct {
         }
         const join_target_count = targets.items.len;
         const graph_binding = @import("graph_primary_table_binding.zig");
-        const graph_qualifiers = if (parsed_request.value.graph_queries != null)
-            try graph_binding.qualifiersAlloc(a, body)
+        var graph_document: ?std.json.Value = if (parsed_request.value.graph_queries != null)
+            try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{ .parse_numbers = false })
         else
-            &.{};
+            null;
+        const graph_qualifiers = if (graph_document) |*root| try graph_binding.qualifiersValueAlloc(a, root) else &.{};
         for (graph_qualifiers) |name| {
             // Existing internal qualifiers remain explicit native identities.
             if (std.mem.startsWith(u8, name, "table:")) continue;
@@ -22115,7 +22116,7 @@ pub const ApiHttpServer = struct {
             try graph_bindings.append(a, .{ .names = names, .physical = resolved.?.name });
             if (identity.*) |*value| try projectCatalogIdentity(self.alloc, value, key, resolved.?.name);
         }
-        const bound_body = if (parsed_request.value.graph_queries == null) null else try graph_binding.bindMany(a, body, graph_bindings.items);
+        const bound_body = if (graph_document) |*root| try graph_binding.bindParsedAlloc(a, root, graph_bindings.items) else null;
         return .{ .arena = arena, .physical = physical, .label = label, .join = join, .dispatch = .{ .primary_foreign = primary_foreign, .context = context, .incarnation = incarnation }, .revision = result.revision, .bound_body = bound_body };
     }
 

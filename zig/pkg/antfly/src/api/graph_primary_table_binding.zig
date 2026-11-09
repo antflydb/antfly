@@ -27,10 +27,14 @@ pub fn bind(alloc: std.mem.Allocator, body: []const u8, primary_names: []const [
 pub fn bindMany(alloc: std.mem.Allocator, body: []const u8, bindings: []const Binding) !?[]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
+    return bindParsedAlloc(alloc, &parsed.value, bindings);
+}
+
+pub fn bindParsedAlloc(alloc: std.mem.Allocator, root: *std.json.Value, bindings: []const Binding) !?[]u8 {
     var binder = Binder{ .bindings = bindings };
-    try visit(&parsed.value, &binder);
+    try visit(root, &binder);
     if (!binder.changed) return null;
-    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    return try std.json.Stringify.valueAlloc(alloc, root.*, .{});
 }
 
 /// Structural table qualifiers only; never interpret user predicate values as
@@ -38,13 +42,17 @@ pub fn bindMany(alloc: std.mem.Allocator, body: []const u8, bindings: []const Bi
 pub fn qualifiersAlloc(alloc: std.mem.Allocator, body: []const u8) ![][]const u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
+    return qualifiersValueAlloc(alloc, &parsed.value);
+}
+
+pub fn qualifiersValueAlloc(alloc: std.mem.Allocator, root: *std.json.Value) ![][]const u8 {
     var collector = Collector{ .alloc = alloc };
     defer collector.names.deinit(alloc);
     errdefer {
         var keys = collector.names.keyIterator();
         while (keys.next()) |key| alloc.free(key.*);
     }
-    try visit(&parsed.value, &collector);
+    try visit(root, &collector);
     const names = try alloc.alloc([]const u8, collector.names.count());
     var keys = collector.names.keyIterator();
     for (names) |*name| name.* = keys.next().?.*;
