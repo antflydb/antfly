@@ -8586,6 +8586,18 @@ test "lite 4 concurrent foreground writers and 2 ride-along members survive a cr
                 return;
             };
             self.result = write.commit();
+            // `commit()`'s own contract (see `StagedCommit.wait()`'s doc
+            // comment): a failed ticket -- this test's injected one-shot
+            // sync fault, surfacing as `OutcomeUnknown` -- leaves the
+            // transaction exactly as `commitStaged` left it (writer slot
+            // and generation lock already released, but the pending
+            // key/value buffers and `PendingNode`s still intact), precisely
+            // so the caller can still call `abort` to free them. `commit()`
+            // itself does not do this automatically on failure (only on
+            // success, via `StagedCommit.wait()`), so a caller that checks
+            // the result and returns without aborting on failure -- as this
+            // worker used to -- leaks that transaction's pending buffers.
+            if (self.result) |_| {} else |_| write.abort();
         }
     };
 
