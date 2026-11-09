@@ -215,6 +215,26 @@ final class SpeechAudioBuffer: @unchecked Sendable {
   }
 }
 
+/// One synchronous AVAudioConverter input request owns its buffer and consumption
+/// state. The lock also serializes requests if the converter invokes its input
+/// block from another thread; no mutable local or native buffer crosses a closure.
+private final class ConversionInput: @unchecked Sendable {
+  private let lock = NSLock()
+  private var buffer: AVAudioPCMBuffer?
+  init(_ buffer: AVAudioPCMBuffer) { self.buffer = buffer }
+  func take(_ state: UnsafeMutablePointer<AVAudioConverterInputStatus>) -> AVAudioBuffer? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard let buffer else {
+      state.pointee = .noDataNow
+      return nil
+    }
+    self.buffer = nil
+    state.pointee = .haveData
+    return buffer
+  }
+}
+
 // AVAudioEngine serializes this node's tap. The converter is confined to that
 // callback until the engine stops, then flushed on the main actor.
 final class CaptureConverter: @unchecked Sendable {
@@ -244,16 +264,10 @@ final class CaptureConverter: @unchecked Sendable {
       sink.fail("Cannot allocate speech audio buffer.")
       return
     }
-    var supplied = false
+    let request = ConversionInput(input)
     var failure: NSError?
     let status = converter.convert(to: output, error: &failure) { _, state in
-      if supplied {
-        state.pointee = .noDataNow
-        return nil
-      }
-      supplied = true
-      state.pointee = .haveData
-      return input
+      request.take(state)
     }
     if status == .error { sink.fail(failure?.localizedDescription ?? "Audio conversion failed.") }
     if output.frameLength > 0 { sink.append(output) }

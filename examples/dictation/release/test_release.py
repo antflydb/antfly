@@ -32,6 +32,21 @@ SIGNATURE = base64.b64encode(bytes(range(64))).decode()
 
 
 class ReleaseTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin", "requires native Apple lipo")
+    def test_native_architecture_validation_with_spaces_in_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "Antfly Dictation"
+            subprocess.run(
+                ["xcrun", "clang", "-arch", "arm64", "-x", "c", "-", "-o", str(binary)],
+                input="int main(void) { return 0; }",
+                text=True,
+                check=True,
+                capture_output=True,
+            )
+            r.verify_architecture(binary, "arm64")
+            with self.assertRaises(subprocess.CalledProcessError):
+                r.verify_architecture(binary, "x86_64")
+
     def test_version_order_and_apple_bundle_versions(self):
         tags = [
             "dictation/v0.1.0-beta.1",
