@@ -211,9 +211,13 @@ chunked and reused across serial preparation, with no extra image copies or
 resampling passes. Generation returns unused growth after prompt preparation
 while keeping output ownership; serial reranking reuses its capacity. Outputs
 release before their allocation owner; additional
-leases release before the original borrowed permit. Generation also charges
-the same preparation capacity to its invocation budget, including offline
-callers. Admission failures preserve permanent-limit versus transient-contention
+leases release before the original borrowed permit. Generation reserves known
+media work in its invocation budget before choosing a prefill chunk, including
+offline callers. Execution borrows the process and local credits independently
+without charging either twice. CLI resource-pressure retries and alternate-route
+replanning preserve this fixed credit while reducing model workspace. Unknown
+codec growth acquires only the remaining deficit in each ledger; a failed
+reservation-metadata allocation refunds both ledgers before a same-scope retry. Admission failures preserve permanent-limit versus transient-contention
 errors, while actual backing-allocator failures remain distinct.
 Reranker token preflight inspects image headers and uses the execution geometry;
 it no longer decodes/resizes the same image before execution.
@@ -635,7 +639,10 @@ zig build test-bin -Dtest-filter="image decode admission" -Dtest-filter="model p
 
 The fixtures include short, wide 8-bit and 16-bit RGBA PNGs, retained multi-image
 outputs, permanent and contended denials, offline-budget quantum tails, backing
-allocation failure, cancellation and allocation-failure cleanup. A generated
+allocation failure, cancellation and allocation-failure cleanup. Planning tests
+verify that a fitting smaller prefill chunk is selected with media already
+reserved. Transactional tests cover independent process/local credits, immediate
+metadata-failure refunds, same-scope retries and owned backend-tensor publication. A generated
 4,000,000×1 PNG exercises the original default-Qwen-geometry reproduction:
 its initial forecast is about 60 MB, while decoding alone needs over 64 MB.
 Extraction must grow its admission rather than allocate that difference outside

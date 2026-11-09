@@ -6369,6 +6369,8 @@ pub const Node = struct {
             .has_audio = preflight.has_audio,
             .has_video = preflight.video_count > 0,
         });
+        var media_budget_credit = try @import("../pipelines/preprocessing_memory.zig").BudgetCredit.reserve(&run_budget, generation.fallbackImagePreparationBytes(gpt_config, model.manifest.gguf_projector_path, prompt_estimate.media_admission));
+        defer media_budget_credit.deinit();
         const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
             .{
                 .backend = backend_kind,
@@ -6534,7 +6536,7 @@ pub const Node = struct {
             .cb = cb,
             .session = model.session,
             .media_run_budget = &run_budget,
-            .media_prepaid_host_bytes = prompt_estimate.media_admission.host_scratch_bytes,
+            .media_prepaid = .{ .process_bytes = prompt_estimate.media_admission.host_scratch_bytes, .budget_bytes = media_budget_credit.bytes },
             .explicit_scratch_limit = self.config.generation_budget_overrides.scratch_limit_bytes,
             .gpt_config = gpt_config,
             .kv_dtype = kv_dtype,
@@ -15304,7 +15306,7 @@ pub const Node = struct {
         }
         var image_permit = model.session.admitHostPreprocess(image_working_bytes) catch |err| return inferenceFailureResponse(ctx, err);
         defer image_permit.deinit();
-        var image_memory = @import("../pipelines/preprocessing_memory.zig").Scope.init(ctx.allocator, model.session, image_working_bytes, null);
+        var image_memory = @import("../pipelines/preprocessing_memory.zig").Scope.init(ctx.allocator, model.session, .{ .process_bytes = image_working_bytes }, null);
         defer image_memory.deinit();
         const image_allocator = try image_memory.allocator();
 
@@ -17004,6 +17006,11 @@ pub const Node = struct {
             }
         }
 
+        var media_budget_credit = @import("../pipelines/preprocessing_memory.zig").BudgetCredit.reserve(&run_budget, generation.fallbackImagePreparationBytes(gpt_config, model.manifest.gguf_projector_path, prompt_estimate.?.media_admission)) catch |err| {
+            if (err == error.MemoryBudgetExceeded) return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
+            return contextRequestFailure(ctx, err);
+        };
+        defer media_budget_credit.deinit();
         var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
         budget_components[0] = .{
             .backend = backend_kind,
@@ -17478,7 +17485,7 @@ pub const Node = struct {
             .cb = cb,
             .session = model.session,
             .media_run_budget = &run_budget,
-            .media_prepaid_host_bytes = prompt_estimate.?.media_admission.host_scratch_bytes,
+            .media_prepaid = .{ .process_bytes = prompt_estimate.?.media_admission.host_scratch_bytes, .budget_bytes = media_budget_credit.bytes },
             .explicit_scratch_limit = self.config.generation_budget_overrides.scratch_limit_bytes,
             .gpt_config = gpt_config,
             .kv_dtype = kv_dtype,

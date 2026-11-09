@@ -181,6 +181,14 @@ pub const Pipeline = struct {
     }
 };
 
+/// Takes ownership on both success and failure. Keep this guard even when a
+/// caller preallocates list capacity, so future producers cannot lose a tensor
+/// between backend execution and publication into the cleanup inventory.
+fn appendOwnedImageEmbedding(cb: *const ComputeBackend, allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(NativeImageEmbedding), image: NativeImageEmbedding) !void {
+    errdefer cb.free(image.tensor);
+    try list.append(allocator, image);
+}
+
 fn activeTokenLength(mask: []const i32) usize {
     var last_active: usize = 0;
     var found = false;
@@ -269,19 +277,21 @@ pub fn scoreDocument(
         native_image_embeddings.deinit(allocator);
     }
     if (vision_session == null) {
+        try native_image_embeddings.ensureTotalCapacity(allocator, prepared_images.items.len);
         for (prepared_images.items, 0..) |prepared, index| {
             if (execution_control) |control|
                 try control.update(.executing, @intCast(index), @intCast(prepared_images.items.len));
-            try native_image_embeddings.append(allocator, .{
+            try appendOwnedImageEmbedding(cb, allocator, &native_image_embeddings, .{
                 .tensor = try qwen2vl_vision.encodePreparedImageTokensTensor(cb, allocator, gpt_cfg, prep_cfg, prepared),
                 .token_count = prepared.image_token_count,
             });
         }
     } else {
+        try image_embeddings.ensureTotalCapacity(allocator, prepared_images.items.len);
         for (prepared_images.items, 0..) |prepared, index| {
             if (execution_control) |control|
                 try control.update(.executing, @intCast(index), @intCast(prepared_images.items.len));
-            try image_embeddings.append(allocator, try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared, execution_control));
+            image_embeddings.appendAssumeCapacity(try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared, execution_control));
         }
     }
 
@@ -856,5 +866,36 @@ test "encodeDocumentPromptWithImageExpansion truncates image placeholder run to 
     }
     for (prepared.attention_mask) |value| {
         try std.testing.expectEqual(@as(i32, 1), value);
+    }
+}
+
+test "image decode admission native image publication transfers or destroys its tensor exactly once" {
+    const Fake = struct {
+        frees: usize = 0,
+        fn free(raw: *anyopaque, _: CT) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.frees += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |deny| {
+        var fake = Fake{};
+        var table: ComputeBackend.VTable = undefined;
+        table.freeTensor = Fake.free;
+        const cb = ComputeBackend{ .ptr = &fake, .vtable = &table };
+        var marker: u8 = 0;
+        const image = NativeImageEmbedding{ .tensor = @ptrCast(&marker), .token_count = 1 };
+        var list = std.ArrayListUnmanaged(NativeImageEmbedding).empty;
+        const a = if (deny) std.testing.failing_allocator else std.testing.allocator;
+        defer list.deinit(a);
+        if (deny) {
+            try std.testing.expectError(error.OutOfMemory, appendOwnedImageEmbedding(&cb, a, &list, image));
+            try std.testing.expectEqual(@as(usize, 0), list.items.len);
+        } else {
+            try appendOwnedImageEmbedding(&cb, a, &list, image);
+            try std.testing.expectEqual(@as(usize, 0), fake.frees);
+            try std.testing.expectEqual(@as(usize, 1), list.items.len);
+            for (list.items) |owned| cb.free(owned.tensor);
+        }
+        try std.testing.expectEqual(@as(usize, 1), fake.frees);
     }
 }

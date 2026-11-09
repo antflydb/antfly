@@ -13,8 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Allocation ownership for serial media preparation. Initial process-wide
-//! credit is borrowed from a permit that must outlive this scope. Codec scratch,
+//! Allocation ownership for serial media preparation. Independent process and
+//! local-budget credits are borrowed from owners that must outlive this scope.
+//! Codec scratch,
 //! tensors, and allocation bookkeeping beyond that forecast acquire their own
 //! leases before allocating. Do not move the scope after obtaining its allocator.
 const std = @import("std");
@@ -22,26 +23,55 @@ const sessions = @import("../backends/session.zig");
 const memory = @import("../runtime/tier/memory.zig");
 const AdmittedAllocator = @import("../backends/admitted_allocator.zig").AdmittedAllocator;
 
+/// Both credits are borrowed. Their respective owners must outlive Scope.
+/// They can differ: offline planning can reserve local budget before acquiring
+/// process capacity, whereas serving normally prepays both ledgers together.
+pub const Credit = struct {
+    process_bytes: usize = 0,
+    budget_bytes: usize = 0,
+};
+
+/// Reserve known media work before model prefill planning chooses its chunk.
+pub const BudgetCredit = struct {
+    budget: *memory.RunBudget,
+    bytes: usize,
+
+    pub fn reserve(budget: *memory.RunBudget, bytes: usize) !@This() {
+        try reserveBudget(budget, bytes);
+        return .{ .budget = budget, .bytes = bytes };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.budget.release(.{ .kind = .scratch, .tier = .host, .bytes = self.bytes });
+        self.bytes = 0;
+    }
+};
+
+fn reserveBudget(budget: *memory.RunBudget, bytes: usize) !void {
+    try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_tier = .host, .scratch_bytes = bytes });
+}
+
 pub const Scope = struct {
     owner: AdmittedAllocator,
     session: ?sessions.Session,
     budget: ?*memory.RunBudget,
+    borrowed_budget_bytes: usize,
     budget_bytes: usize = 0,
     local_controller: memory.AdmissionController = .{},
     started: bool = false,
 
-    pub fn init(backing: std.mem.Allocator, session: ?sessions.Session, prepaid_host_bytes: usize, budget: ?*memory.RunBudget) @This() {
-        return .{ .owner = .{ .backing = backing, .prepaid_host_bytes = prepaid_host_bytes }, .session = session, .budget = budget };
+    pub fn init(backing: std.mem.Allocator, session: ?sessions.Session, credit: Credit, budget: ?*memory.RunBudget) @This() {
+        return .{ .owner = .{ .backing = backing, .prepaid_host_bytes = credit.process_bytes }, .session = session, .budget = budget, .borrowed_budget_bytes = credit.budget_bytes };
     }
 
     pub fn allocator(self: *@This()) !std.mem.Allocator {
         if (!self.started) {
-            // Process credit is already held by the caller; the per-run ledger
-            // separately accounts media preparation alongside model execution.
-            if (self.budget) |budget| try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_tier = .host, .scratch_bytes = self.owner.prepaid_host_bytes });
-            self.budget_bytes = self.owner.prepaid_host_bytes;
+            const own_budget = self.owner.prepaid_host_bytes -| self.borrowed_budget_bytes;
+            if (self.budget) |budget| try reserveBudget(budget, own_budget);
+            self.budget_bytes = own_budget;
             self.owner.admission_context = self;
             self.owner.admit = acquire;
+            self.owner.rollback_admission = rollback;
             self.started = true;
         }
         return self.owner.allocator();
@@ -55,26 +85,35 @@ pub const Scope = struct {
             // not make an intrinsically oversized request look like contention.
             try admission.validateOwnedHostScratch(try std.math.add(usize, owned, amount));
         };
-        if (self.budget) |budget| try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_tier = .host, .scratch_bytes = amount });
-        errdefer if (self.budget) |budget| budget.release(.{ .kind = .scratch, .tier = .host, .bytes = amount });
+        const required_budget = (try std.math.add(usize, owned, amount)) -| self.borrowed_budget_bytes;
+        const budget_growth = required_budget -| self.budget_bytes;
+        if (self.budget) |budget| try reserveBudget(budget, budget_growth);
+        errdefer if (self.budget) |budget| budget.release(.{ .kind = .scratch, .tier = .host, .bytes = budget_growth });
         const lease = if (self.session) |session| (try session.admitHostPreprocess(amount)).lease else null;
         // Offline callers may have only a local run budget and no session.
         // A local lease gives those reservations the same owned cleanup path.
         const result = lease orelse try self.local_controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = amount }, false);
-        self.budget_bytes += amount;
+        self.budget_bytes += budget_growth;
         return result;
     }
 
     /// Return unused growth at a phase boundary while preserving output leases.
     /// Serial image cohorts otherwise reuse capacity to avoid per-buffer IPC.
     pub fn trim(self: *@This()) !void {
-        const before = self.owner.reserved_bytes;
-        defer {
-            const released = before - self.owner.reserved_bytes;
-            if (self.budget) |budget| budget.release(.{ .kind = .scratch, .tier = .host, .bytes = released });
-            self.budget_bytes -= released;
-        }
+        defer self.refundBudget();
         try self.owner.trim();
+    }
+
+    fn rollback(raw: *anyopaque, _: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.refundBudget();
+    }
+
+    fn refundBudget(self: *@This()) void {
+        const needed = (self.owner.prepaid_host_bytes + self.owner.reserved_bytes) -| self.borrowed_budget_bytes;
+        const released = self.budget_bytes -| needed;
+        if (self.budget) |budget| budget.release(.{ .kind = .scratch, .tier = .host, .bytes = released });
+        self.budget_bytes -= released;
     }
 
     pub fn failure(self: *const @This(), err: anyerror) anyerror {
@@ -110,7 +149,7 @@ test "image decode admission charges PNG8 and PNG16 scanlines beyond prepaid geo
         defer permit.deinit();
         {
             var budget = memory.RunBudget.init(.{ .host_limit_bytes = 256 * 1024, .scratch_limit_bytes = 256 * 1024 });
-            var scope = Scope.init(a, session, initial, &budget);
+            var scope = Scope.init(a, session, .{ .process_bytes = initial }, &budget);
             defer scope.deinit();
             const alloc = try scope.allocator();
             var prepared = Test.qwen.prepareImage(alloc, bytes, Test.config) catch |err| return scope.failure(err);
@@ -139,7 +178,7 @@ test "image decode admission retains earlier image tensors while another PNG dec
     var permit = try session.admitHostPreprocess(initial);
     defer permit.deinit();
     {
-        var scope = Scope.init(std.testing.allocator, session, initial, null);
+        var scope = Scope.init(std.testing.allocator, session, .{ .process_bytes = initial }, null);
         defer scope.deinit();
         const a = try scope.allocator();
         var first = try Test.qwen.prepareImage(a, Test.png8, Test.config);
@@ -165,7 +204,7 @@ test "image decode admission distinguishes intrinsic limits and peer contention"
         defer peer.deinit();
         const before = controller.snapshot().host_scratch_bytes;
         {
-            var scope = Scope.init(std.testing.allocator, session, initial, null);
+            var scope = Scope.init(std.testing.allocator, session, .{ .process_bytes = initial }, null);
             defer scope.deinit();
             const result = Test.qwen.prepareImage(try scope.allocator(), Test.png16, Test.config);
             if (result) |value| {
@@ -184,7 +223,7 @@ test "image decode admission distinguishes intrinsic limits and peer contention"
 test "image decode admission honors offline budgets and does not reject fitting quantum tails" {
     var budget = memory.RunBudget.init(.{ .host_limit_bytes = 2048 });
     {
-        var scope = Scope.init(std.testing.allocator, null, 0, &budget);
+        var scope = Scope.init(std.testing.allocator, null, .{}, &budget);
         defer scope.deinit();
         const a = try scope.allocator();
         const small = try a.alloc(u8, 1024);
@@ -201,7 +240,7 @@ test "image decode admission preserves true backing allocator failure" {
     const session = Test.session(&controller, 8192);
     var permit = try session.admitHostPreprocess(4096);
     defer permit.deinit();
-    var scope = Scope.init(std.testing.failing_allocator, session, 4096, null);
+    var scope = Scope.init(std.testing.failing_allocator, session, .{ .process_bytes = 4096 }, null);
     defer scope.deinit();
     const a = try scope.allocator();
     try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 128));
@@ -216,8 +255,12 @@ test "image decode admission unwinds every decoder allocation failure without lo
             const initial = try Test.qwen.imageWorkingBytes(&.{Test.png16}, Test.config);
             var permit = try session.admitHostPreprocess(initial);
             defer permit.deinit();
+            var budget = memory.RunBudget.init(.{ .host_limit_bytes = 256 * 1024 });
+            var credit = try BudgetCredit.reserve(&budget, initial);
+            defer credit.deinit();
+            defer std.debug.assert(budget.host_scratch_bytes == initial);
             defer std.debug.assert(controller.snapshot().host_scratch_bytes == initial);
-            var scope = Scope.init(a, session, initial, null);
+            var scope = Scope.init(a, session, .{ .process_bytes = initial, .budget_bytes = credit.bytes }, &budget);
             defer scope.deinit();
             var prepared = Test.qwen.prepareImage(try scope.allocator(), Test.png16, Test.config) catch |err| return scope.failure(err);
             defer prepared.deinit();
@@ -252,7 +295,7 @@ test "image decode admission cancellation releases decoder scratch and preserves
     var permit = try session.admitHostPreprocess(initial);
     defer permit.deinit();
     {
-        var scope = Scope.init(std.testing.allocator, session, initial, null);
+        var scope = Scope.init(std.testing.allocator, session, .{ .process_bytes = initial }, null);
         defer scope.deinit();
         var probe = Probe{};
         const control = @import("antfly_image").work_control.Scope.enter(.{ .context = &probe, .check_fn = Probe.check });
@@ -288,7 +331,7 @@ test "image decode admission default Qwen limits charge the original short wide 
     var permit = try session.admitHostPreprocess(initial);
     defer permit.deinit();
     {
-        var scope = Scope.init(a, session, initial, null);
+        var scope = Scope.init(a, session, .{ .process_bytes = initial }, null);
         defer scope.deinit();
         var prepared = Test.qwen.prepareImage(try scope.allocator(), png, config) catch |err| return scope.failure(err);
         defer prepared.deinit();
@@ -297,4 +340,96 @@ test "image decode admission default Qwen limits charge the original short wide 
         try std.testing.expectEqual(geometry.resized_width, prepared.resized_width);
     }
     try std.testing.expectEqual(initial, controller.snapshot().host_scratch_bytes);
+}
+
+test "image decode admission media credit participates in prefill planning and is borrowed once" {
+    const cfg = @import("../models/gpt.zig").Config{ .hidden_size = 8, .num_hidden_layers = 1, .num_attention_heads = 1, .attention_head_dim = 8, .vocab_size = 1 };
+    const components = [_]memory.GptGenerationBudgetComponent{.{ .backend = .cuda, .kv_dtype = .f16, .config = cfg }};
+    const full = try components[0].estimate(512, 1, 512);
+    const small = try components[0].estimate(512, 1, 32);
+    const media_bytes = (full.scratch_bytes - small.scratch_bytes) / 2;
+    var budget = memory.RunBudget.init(.{ .scratch_limit_bytes = full.scratch_bytes });
+    var credit = try BudgetCredit.reserve(&budget, media_bytes);
+    defer credit.deinit();
+    const chunk = try memory.reserveGptGenerationAtLargestChunk(&budget, &components, 512, 1, 512);
+    try std.testing.expectEqual(@as(usize, 256), chunk);
+    var controller: memory.AdmissionController = .{};
+    const session = Test.session(&controller, full.scratch_bytes);
+    var permit = try session.admitHostPreprocess(media_bytes);
+    defer permit.deinit();
+    const before = budget.scratchTotalBytes();
+    {
+        var scope = Scope.init(std.testing.allocator, session, .{ .process_bytes = media_bytes, .budget_bytes = credit.bytes }, &budget);
+        defer scope.deinit();
+        const a = try scope.allocator();
+        const output = try a.alloc(u8, 128);
+        defer a.free(output);
+        try std.testing.expectEqual(before, budget.scratchTotalBytes());
+        try std.testing.expectEqual(media_bytes, controller.snapshot().host_scratch_bytes);
+    }
+    try std.testing.expectEqual(before, budget.scratchTotalBytes());
+}
+
+test "image decode admission budget-only credit does not fabricate prepaid process capacity" {
+    var budget = memory.RunBudget.init(.{ .host_limit_bytes = 4096 });
+    var credit = try BudgetCredit.reserve(&budget, 4096);
+    defer credit.deinit();
+    var scope = Scope.init(std.testing.allocator, null, .{ .budget_bytes = credit.bytes }, &budget);
+    defer scope.deinit();
+    const a = try scope.allocator();
+    const output = try a.alloc(u8, 128);
+    a.free(output);
+    try std.testing.expect(scope.local_controller.snapshot().host_scratch_bytes > 0);
+    try std.testing.expectEqual(credit.bytes, budget.host_scratch_bytes);
+    try scope.trim();
+    try std.testing.expectEqual(@as(usize, 0), scope.local_controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(credit.bytes, budget.host_scratch_bytes);
+}
+
+test "image decode admission failed reservation metadata refunds both ledgers before retry" {
+    for ([_]usize{ 0, 4096 }) |prepaid| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        var budget = memory.RunBudget.init(.{ .host_limit_bytes = 128 * 1024 });
+        var credit = try BudgetCredit.reserve(&budget, prepaid);
+        defer credit.deinit();
+        var scope = Scope.init(failing.allocator(), null, .{ .budget_bytes = credit.bytes }, &budget);
+        defer scope.deinit();
+        const a = try scope.allocator();
+        try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 1024));
+        try std.testing.expectEqual(@as(usize, 0), scope.local_controller.snapshot().host_scratch_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scope.owner.reserved_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scope.budget_bytes);
+        try std.testing.expectEqual(prepaid, budget.host_scratch_bytes);
+        failing.fail_index = std.math.maxInt(usize);
+        const retry = try a.alloc(u8, 80 * 1024);
+        a.free(retry);
+        try scope.trim();
+        try std.testing.expectEqual(prepaid, budget.host_scratch_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scope.local_controller.snapshot().host_scratch_bytes);
+    }
+}
+
+test "image decode admission shared denial refunds local budget and permits same-scope retry" {
+    var controller: memory.AdmissionController = .{};
+    const session = Test.session(&controller, 128 * 1024);
+    var permit = try session.admitHostPreprocess(4096);
+    defer permit.deinit();
+    var budget = memory.RunBudget.init(.{ .host_limit_bytes = 256 * 1024 });
+    var credit = try BudgetCredit.reserve(&budget, 4096);
+    defer credit.deinit();
+    var peer = try session.admitHostPreprocess(120 * 1024);
+    defer peer.deinit();
+    var scope = Scope.init(std.testing.allocator, session, .{ .process_bytes = 4096, .budget_bytes = credit.bytes }, &budget);
+    defer scope.deinit();
+    const a = try scope.allocator();
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 16 * 1024));
+    try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, scope.failure(error.OutOfMemory));
+    try std.testing.expectEqual(credit.bytes, budget.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 124 * 1024), controller.snapshot().host_scratch_bytes);
+    peer.deinit();
+    const retry = try a.alloc(u8, 16 * 1024);
+    a.free(retry);
+    try scope.trim();
+    try std.testing.expectEqual(credit.bytes, budget.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 4096), controller.snapshot().host_scratch_bytes);
 }
