@@ -817,43 +817,76 @@ pub fn Adapter(comptime native: type) type {
                 db_slice[idx].core.lockApplyExclusive();
                 locked_count += 1;
             }
-            // Only on an error return: undo every follower write already
-            // staged, in reverse order, while every lock above is still
-            // held (this errdefer runs before the unlock defer above,
-            // since defers run in reverse declaration order).
-            errdefer {
-                var i = follower_count;
-                while (i != 0) {
-                    i -= 1;
-                    revertFollower(db_slice[followers[i]], follower_reverts[i]) catch {};
+            // Preparing and staging follower writes (block-scoped so this
+            // errdefer never fires for the leader call below): only on an
+            // error return FROM THIS LOOP, undo every follower write
+            // already staged, in reverse order, while every lock above is
+            // still held.
+            {
+                var prepared_through: usize = 0;
+                errdefer {
+                    var i = prepared_through;
+                    while (i != 0) {
+                        i -= 1;
+                        revertFollower(db_slice[followers[i]], follower_reverts[i]) catch {};
+                    }
                 }
-            }
-            for (followers, 0..) |idx, pos| {
-                const table = tables[idx];
-                if (table.integrity_commands.len == 0) continue;
-                const schema_version = table.relational_schema_version orelse table.schema_version;
-                const intents = db_slice[idx].prepareLocalIntegrityDecision(alloc, schema_version, table.relational_integrity_generation_set, table.integrity_commands) catch |err| {
-                    if (err == error.VersionConflict) return error.SqlWriteConflict;
-                    return outcomes.notApplied(err);
-                };
-                if (intents.len == 0) continue;
-                const reverts = try alloc.alloc(FollowerRevertEntry, intents.len);
-                var batch = try db_slice[idx].core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
-                errdefer batch.abort();
-                for (intents, reverts) |intent, *revert| {
-                    const prior = batch.get(intent.key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
+                for (followers, 0..) |idx, pos| {
+                    const table = tables[idx];
+                    if (table.integrity_commands.len == 0) {
+                        prepared_through = pos + 1;
+                        continue;
+                    }
+                    const schema_version = table.relational_schema_version orelse table.schema_version;
+                    const intents = db_slice[idx].prepareLocalIntegrityDecision(alloc, schema_version, table.relational_integrity_generation_set, table.integrity_commands) catch |err| {
+                        if (err == error.VersionConflict) return error.SqlWriteConflict;
+                        return outcomes.notApplied(err);
                     };
-                    revert.* = .{ .key = intent.key, .prior_value = if (prior) |p| try alloc.dupe(u8, p) else null };
-                    if (intent.value) |value| try batch.put(intent.key, value) else try batch.delete(intent.key);
+                    if (intents.len == 0) {
+                        prepared_through = pos + 1;
+                        continue;
+                    }
+                    const reverts = try alloc.alloc(FollowerRevertEntry, intents.len);
+                    var batch = try db_slice[idx].core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
+                    errdefer batch.abort();
+                    for (intents, reverts) |intent, *revert| {
+                        const prior = batch.get(intent.key) catch |err| switch (err) {
+                            error.NotFound => null,
+                            else => return err,
+                        };
+                        revert.* = .{ .key = intent.key, .prior_value = if (prior) |p| try alloc.dupe(u8, p) else null };
+                        if (intent.value) |value| try batch.put(intent.key, value) else try batch.delete(intent.key);
+                    }
+                    try batch.commit();
+                    follower_reverts[pos] = reverts;
+                    prepared_through = pos + 1;
                 }
-                try batch.commit();
-                follower_reverts[pos] = reverts;
             }
             var leader_adapter = try self.selected(tables[leader_index].table_name);
             defer self.outcome_transaction_id = leader_adapter.outcome_transaction_id;
-            return leader_adapter.commitCoordinatedLocal(alloc, tables[leader_index]);
+            return leader_adapter.commitCoordinatedLocal(alloc, tables[leader_index]) catch |err| {
+                // An ambiguous ("outcome unknown") failure here means the
+                // leader's own write MAY actually have become durable --
+                // reverting the follower in that case could durably erase
+                // a Reference whose child row is in fact live, trading a
+                // merely uncertain outcome for a definite, worse
+                // inconsistency (see the crash-sweep regression this
+                // fixes: `crash sweep: relational foreign-key child
+                // insert, child row and attach record are all-or-nothing`).
+                // Leave every follower write exactly as staged and
+                // propagate the same uncertainty outward instead; resolving
+                // it is this call's existing ambiguous-outcome contract,
+                // the same one `commitCoordinatedLocal` itself already has
+                // for its own single-table callers.
+                if (!outcomes.isUnknownOutcome(err)) {
+                    var i = follower_count;
+                    while (i != 0) {
+                        i -= 1;
+                        revertFollower(db_slice[followers[i]], follower_reverts[i]) catch {};
+                    }
+                }
+                return err;
+            };
         }
 
         /// Best-effort synchronous undo of `commitCoordinatedFusedMultiTable`'s
