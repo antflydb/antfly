@@ -874,17 +874,32 @@ pub const HandleGuard = struct {
     pub fn suspendQuery(self: *HandleGuard) void {
         const connection = self.connection orelse return;
         std.debug.assert(self.connection_gate_held and self.entry_error == null);
-        // A lane-managed guard (see `lane_managed`) never holds `path_lease`
-        // or `connection.gate.mutex` itself -- the code below unlocks the
-        // gate mutex unconditionally, which would be unlocking something
-        // this guard never locked. Mutation-intent guards are the only ones
-        // that can be lane-managed, and nothing on that path suspends a
-        // query today; this guards against a future caller doing so by
-        // mistake rather than silently corrupting the gate's ticket state.
-        std.debug.assert(!self.lane_managed);
         const root = connection.current.?;
         root.query_borrows += 1;
         self.suspended_query_root = root;
+        // A lane-managed guard (see `lane_managed`) never holds `path_lease`
+        // or `connection.gate.mutex` itself -- `WriterLane.checkout` already
+        // released the gate right after establishing/refreshing the lease,
+        // keeping it parked on the lane instead, so unconditionally
+        // unlocking the gate mutex below would release a mutex this guard
+        // never locked. Give the lease up via `checkinForSuspend`, not
+        // plain `checkin`: this suspend's duration is unbounded (an inline
+        // provider call, issue1015/issue1431), unlike the bounded
+        // durability wait `checkin`'s own fairness-quantum grace period is
+        // sized for, so a foreign waiter must never be stuck behind a
+        // lease this process is not even using while suspended. Resuming
+        // (`resumeQuery`/`resumeAccess`) re-enters fresh, which correctly
+        // re-contends for the lease like a cold start. Nothing to notify
+        // here either: a lane-managed suspend always happens before this
+        // call's own commit, so there is no newly-durable write to
+        // publish yet.
+        if (self.lane_managed) {
+            const store = root.owned_lite_backend.?.native_docstore.?;
+            connection.owner.writer_lane.checkinForSuspend(connection, store);
+            self.connection_gate_held = false;
+            connection.mutex.unlock(handleLockIo());
+            return;
+        }
         // Owned memory plans can release after catalog provisioning. Publish
         // those already-committed primary changes before dropping the lease.
         if (self.path_lease != null and root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence != self.entry_sequence) connection.notifyMutation();

@@ -640,6 +640,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .dependOn(&capiTestRun(b, capi_tests, &.{"storage owner remote content source"}, true).step);
     b.step("lite-write-amplification", "Run the Lite write-amplification counting harness and print its JSON report")
         .dependOn(&capiTestRun(b, capi_tests, &.{"lite write amplification"}, true).step);
+    b.step("lite-write-amplification-cpu", "Run the Lite write-amplification CPU-cost harness (allocations/syscalls/CPU time per write) and print its JSON report")
+        .dependOn(&capiTestRun(b, capi_tests, &.{"lite write amplification cpu"}, true).step);
     const run_capi_models = capiTestRun(b, capi_tests, &capi_model_filters, true);
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")

@@ -1069,15 +1069,22 @@ const recovery_agenda = @import("recovery_agenda.zig");
 // v8: both formats moved their two recovery slots out of the header page
 // into dedicated pages and gained a per-commit manifest (see
 // `slotPhysicalPage`, `CheckpointSlot`, `recoverActiveCheckpoint`).
-// Antfly is unreleased, so the old embedded-slot layout (format_version 3 /
-// indexed_format_version 7) is not preserved: a v7 or v3 file is refused by
-// `decodeHeader`'s version check (surfaced as
-// `error.UnsupportedNativeFormatVersion`), not migrated.
-pub const magic = "AFLITE\x04P";
-const unpacked_v4_magic = "AFLITE\x04N";
-const indexed_magic = "AFLITE\x08P";
-pub const format_version: u32 = 4;
-pub const indexed_format_version: u32 = 8;
+// v9 (lite-single-commit-write-path.md §3.2a "Manifest coverage"): the
+// manifest payload encodes one or more appended page-id runs instead of
+// exactly one (see `encodeManifestPayloadAlloc`/`verifyManifest`), so a
+// commit whose appended pages span more than one contiguous range (several
+// `commit_participant`s each triggering their own intermediate
+// `flushTransactionWrites`/`persistAllocator` cycle, in particular) still
+// gets the one-sync manifest path instead of always falling back to the
+// two-sync presynced one.
+// Antfly is unreleased, so no old layout is preserved: a v3/v7 (pre-v8) or
+// v4/v8 (single-run manifest) file is refused by `decodeHeader`'s version
+// check (surfaced as `error.UnsupportedNativeFormatVersion`), not migrated.
+pub const magic = "AFLITE\x05P";
+const unpacked_v4_magic = "AFLITE\x05N";
+const indexed_magic = "AFLITE\x09P";
+pub const format_version: u32 = 5;
+pub const indexed_format_version: u32 = 9;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -2085,9 +2092,29 @@ const DocumentIndexNode = struct {
     keys: [][]u8,
     pointers: []u64,
     key_pages: ?[]u64 = null,
+    /// Backing storage for every *inline* key in `keys`, one allocation
+    /// instead of one `dupe` per key (a document-index leaf/internal node
+    /// commonly has dozens of keys; `decodeDocumentIndexNode` used to call
+    /// `allocator.dupe` once per key, measured as the single largest
+    /// allocation-site contributor in the write-amplification CPU
+    /// attribution -- ~472 allocations/write out of ~887 total, since a
+    /// commit can decode several such nodes along the root-to-leaf path).
+    /// `keys[i]` is a slice into this buffer when `key_pages[i] == 0`
+    /// (inline). *External* keys (`key_pages[i] != 0`) are deliberately
+    /// excluded: they stay their own individual (if zero-size) allocation
+    /// exactly as before, because `resolveIndexKey` later frees and
+    /// replaces exactly one such key in place once it resolves the real
+    /// content from disk -- that `allocator.free` call requires the key to
+    /// be its own allocation, not a sub-slice of this shared buffer. `null`
+    /// only when no inline key needed any storage (every key external, or
+    /// zero keys), matching `allocator.free` on a `null` being a no-op.
+    key_storage: ?[]u8 = null,
 
     pub fn deinit(self: *DocumentIndexNode, allocator: Allocator) void {
-        for (self.keys) |key| allocator.free(key);
+        if (self.key_pages) |pages| {
+            for (self.keys, pages) |key, page| if (page != 0) allocator.free(key);
+        }
+        if (self.key_storage) |storage| allocator.free(storage);
         allocator.free(self.keys);
         allocator.free(self.pointers);
         if (self.key_pages) |pages| allocator.free(pages);
@@ -3231,13 +3258,48 @@ const IndexEditor = struct {
     fn load(self: *IndexEditor, link: *Link) !*Node {
         if (link.node) |node| return node;
         try self.prepareRead(link.page);
-        const payload = try self.file.readPagePayloadByKindAllocForCheckpoint(self.file.allocator, link.page, .document_index, self.checkpoint);
-        defer self.file.allocator.free(payload);
         const node = try self.newNode(.leaf);
         const alloc = self.nodeAllocator(node);
         // Decoded buffers belong to the editor arena; transfer key slices
         // directly instead of allocating another copy of every inline key.
-        const decoded = try decodeDocumentIndexNode(alloc, payload);
+        const decoded = blk: {
+            // Fast path: this page's bytes are already resident (this writer
+            // read or wrote them in an earlier commit on this same
+            // `NativeFile` and nothing since has reused/rewritten/rolled
+            // back that page -- `page_cache`'s existing eviction already
+            // guarantees that: `PageAllocator.allocate`'s reuse path and
+            // `evictCacheForPagesReusedSince`'s rollback path both call
+            // `page_cache.remove`/`removeLinks` the moment a page's content
+            // actually changes, so a surviving cache entry here is
+            // guaranteed current). `acquirePayload` validates the CRC once
+            // on promotion into a `RawView` and skips it on every
+            // subsequent acquire of the same still-resident view -- the
+            // same cache-hit-skips-CRC property "lite warm value ranges
+            // borrow pages without copies or allocations" already proves
+            // for the value/record path; this reuses that exact mechanism
+            // instead of inventing a parallel one. A `null` return (cold
+            // cache, a concurrent `IndexView` promoted on the same page, or
+            // this writer's own page size mismatch, none of which should
+            // happen in practice for a document-index page) falls back to
+            // the always-correct disk-read-and-decode path below, which
+            // re-seeds the cache for next time via `readPhysicalPageAlloc`.
+            if (self.file.page_cache_enabled.load(.monotonic) and self.file.page_cache_bypass.load(.monotonic) == 0) {
+                const physical = physicalPage(link.page);
+                if (physical != 0 and physical < self.checkpoint.page_count) {
+                    if (try self.file.page_cache.acquirePayload(self.file.allocator, physical, @intCast(self.file.header.page_size))) |view| {
+                        defer self.file.page_cache.releaseRaw(self.file.allocator, view);
+                        if (view.validation.?.kind != .document_index) return error.UnexpectedNativePageKind;
+                        const payload = view.bytes[page_header_size..][0..view.validation.?.payload_len];
+                        if (builtin.is_test) _ = PageDecodeMetrics.index_editor_cache_hits.fetchAdd(1, .monotonic);
+                        break :blk try decodeDocumentIndexNode(alloc, payload);
+                    }
+                }
+            }
+            if (builtin.is_test) _ = PageDecodeMetrics.index_editor_cache_misses.fetchAdd(1, .monotonic);
+            const payload = try self.file.readPagePayloadByKindAllocForCheckpoint(self.file.allocator, link.page, .document_index, self.checkpoint);
+            defer self.file.allocator.free(payload);
+            break :blk try decodeDocumentIndexNode(alloc, payload);
+        };
         node.kind = decoded.kind;
         node.page = link.page;
         node.original_page = link.page;
@@ -4333,6 +4395,56 @@ const PageDecodeMetrics = struct {
     var crc_calls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
     var crc_bytes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
     var extent_decodes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
+    // Diagnostic-only counters for IndexEditor.load's cache-hit fast path
+    // (debugging the item-2 write-amplification fix), not load-bearing.
+    var index_editor_cache_hits: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
+    var index_editor_cache_misses: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
+};
+
+/// Diagnostic-only pwrite attribution by `PageKind` (perf/lwa-cpu's
+/// pwrite-breakdown attribution task), not load-bearing. Bucketed by kind
+/// rather than call site: `PageWriteBatch.flushCount`'s own coalesced
+/// writes can mix several pages (and thus several commits' worth of calls)
+/// under one `write_amplification_trace` scope by the time the actual
+/// syscall happens (ledger pages staged in `persistAllocator` are not
+/// flushed until a later, shared `PageAllocator.flush()` call -- scoping
+/// around `persistAllocator` alone would not reliably cover its own
+/// pwrite), while every page's `PageKind` byte is known exactly at the
+/// point of the write regardless of when it was staged. A contiguous run
+/// written in one syscall (`flushCount`) is bucketed by its first page's
+/// kind; `commit_manifest` and `checkpoint_slot` are always exactly one
+/// page per write by construction, so their buckets are already precise.
+pub const PageWriteMetrics = struct {
+    pub const Bucket = struct {
+        calls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+        bytes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    };
+    var buckets: if (builtin.is_test) [14]Bucket else void = if (builtin.is_test) @splat(.{}) else {};
+
+    fn record(kind: PageKind, bytes: u64) void {
+        if (!builtin.is_test) return;
+        const bucket = &buckets[@backingInt(kind)];
+        _ = bucket.calls.fetchAdd(1, .monotonic);
+        _ = bucket.bytes.fetchAdd(bytes, .monotonic);
+    }
+
+    /// Snapshot a bucket's (calls, bytes) pair for `kind`. Public so an
+    /// external harness (perf/lwa-cpu's CPU bench) can read the pwrite
+    /// attribution by page kind without reaching into this module's
+    /// internals.
+    pub fn get(kind: PageKind) struct { calls: u64, bytes: u64 } {
+        if (!builtin.is_test) return .{ .calls = 0, .bytes = 0 };
+        const bucket = &buckets[@backingInt(kind)];
+        return .{ .calls = bucket.calls.load(.monotonic), .bytes = bucket.bytes.load(.monotonic) };
+    }
+
+    pub fn reset() void {
+        if (!builtin.is_test) return;
+        for (&buckets) |*bucket| {
+            bucket.calls.store(0, .monotonic);
+            bucket.bytes.store(0, .monotonic);
+        }
+    }
 };
 
 /// In-memory cache of encoded pages, keyed by page id.
@@ -4961,6 +5073,9 @@ const PageWriteBatch = struct {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
+            if (builtin.is_test) if (std.enums.fromInt(PageKind, self.buffer[start * size ..][4])) |kind| {
+                PageWriteMetrics.record(kind, (end - start) * size);
+            };
             // This loop is the choke point every PageWriteBatch-staged data
             // page passes through on its way to disk (appendPage/appendValue
             // only stage bytes into `buffer`; this is where they are
@@ -13186,15 +13301,11 @@ pub const NativeFile = struct {
             entries[i] = .{ .page_id = kv.key_ptr.*, .crc = kv.value_ptr.* };
             i += 1;
         }
-        const payload = encodeManifestPayloadAlloc(self.allocator, entries, &builder.reused_pages, manifest_page_id) catch |err| switch (err) {
-            // Not actually one contiguous appended run: fall back exactly
-            // like "too big to fit one page", never a hard error.
-            error.InvalidNativeManifestRange => {
-                if (debugManifestFallbackTraceEnabled()) std.debug.print("manifest fallback: non-contiguous range (count={d})\n", .{count});
-                return false;
-            },
-            else => return err,
-        };
+        // v9: the multi-run encoding (see `encodeManifestPayloadAlloc`) has
+        // no discontiguity failure mode left to catch here -- a window
+        // with scattered appended pages just costs more runs, caught below
+        // by the ordinary "too big to fit one page" check, same as always.
+        const payload = try encodeManifestPayloadAlloc(self.allocator, entries, &builder.reused_pages, manifest_page_id);
         defer self.allocator.free(payload);
         if (payload.len > self.maxPagePayloadBytes()) {
             if (debugManifestFallbackTraceEnabled()) std.debug.print("manifest fallback: payload too big ({d} > {d})\n", .{ payload.len, self.maxPagePayloadBytes() });
@@ -13204,6 +13315,7 @@ pub const NativeFile = struct {
         const page = page_buf[0..self.header.page_size];
         encodePage(page, .commit_manifest, payload);
         try self.file.writePositionalAll(self.runtimeIo(), page, manifest_page_id * @as(u64, self.header.page_size));
+        if (builtin.is_test) PageWriteMetrics.record(.commit_manifest, page.len);
         next.manifest_page = manifest_page_id;
         next.manifest_crc = std.mem.readInt(u32, page[page_crc_offset..][0..4], .little);
         next.manifest_page_count = @intCast(count);
@@ -13300,6 +13412,7 @@ pub const NativeFile = struct {
                 break :blk err;
             };
             self.file.writePositionalAll(io, slot_page, slotPhysicalPage(next_slot) * @as(u64, self.header.page_size)) catch |err| break :blk err;
+            if (builtin.is_test) PageWriteMetrics.record(.checkpoint_slot, slot_page.len);
             self.syncIfRequired(hooks) catch |err| break :blk err;
             break :blk {};
         }) catch {
@@ -13499,6 +13612,7 @@ fn appendPageToFile(
     // must never allocate.
     if (manifest) |builder| builder.reserveCapacity(allocator, 1);
     try file.writePositionalAll(io, page, page_id * @as(u64, @intCast(page_size)));
+    if (builtin.is_test) PageWriteMetrics.record(kind, page.len);
     if (manifest) |builder| builder.note(page_id, std.mem.readInt(u32, page[page_crc_offset..][0..4], .little));
     next_page_id.* += 1;
     return page_id;
@@ -14337,69 +14451,112 @@ const ManifestBuilder = struct {
     }
 };
 
-/// Fixed header before the appended CRC array and the reused (page_id, crc)
-/// pairs: range_start (u64), appended_count (u32), reused_count (u32).
-const manifest_header_size: usize = 16;
+/// Fixed header before the run table and the reused (page_id, crc) pairs:
+/// run_count (u32), reused_count (u32). v9 (design doc §3.2a "Manifest
+/// coverage"): a single since-last-durable-checkpoint window commonly spans
+/// more than one contiguous appended range -- several `commit_participant`s
+/// each triggering their own intermediate `flushTransactionWrites`/
+/// `persistAllocator` cycle (each with its own free-map/ledger pages), or
+/// several ride-along transactions sharing the window -- so the payload
+/// names zero or more runs instead of exactly one.
+const manifest_header_size: usize = 8;
+
+/// Fixed header per run, immediately followed by that run's own flat CRC
+/// array: range_start (u64), count (u32).
+const manifest_run_header_size: usize = 12;
 
 /// A fresh page id the allocator hands out only ever increases
 /// (`PageAllocator.allocate`'s non-reuse branch), so every entry this
 /// window noted that is not a reuse (see `ManifestBuilder.reused_pages`)
-/// is expected to form one contiguous run -- except for exactly one gap at
-/// `manifest_page_id` itself, reserved from that very same sequence before
-/// `flushTransactionWrites` calls `persistAllocator` (whose own ledger/
-/// metadata pages continue the sequence past it), but never an entry since
-/// nothing writes to it until this function runs. `manifest_page_id` is
-/// never re-stored in the payload: it is already `slot.manifest_page` on
-/// the decode side, so `verifyManifest` reconstructs the same gap from
-/// that alone. Naming the run with a start id, a count, and a flat CRC
-/// array costs 4 bytes per page instead of 12, which is what lets
-/// `max_single_sync_pages` be in the thousands instead of the low
-/// hundreds. Reused pages (explicit, from the free list, never contiguous
-/// with anything in particular) still cost a full (page_id, crc) pair
-/// each. `error.InvalidNativeManifestRange` means the appended set was not
-/// actually one contiguous run plus that one known gap -- a sign some
-/// page escaped the allocator's own next_page_id sequencing -- and the
-/// caller must treat that exactly like "too big to fit": fall back to the
-/// presynced two-sync path, never propagate it as a hard error.
+/// forms one or more contiguous runs, with exactly one gap total (not one
+/// per run) at `manifest_page_id` -- reserved from that very same sequence
+/// before `flushTransactionWrites` calls `persistAllocator` (whose own
+/// ledger/metadata pages continue the sequence past it), but never an
+/// entry since nothing writes to it until this function runs. Falling
+/// inside a run bridges it exactly like the v8 single-run encoding did;
+/// falling between two runs (or before the first/after the last) needs no
+/// special handling at all. `manifest_page_id` is never re-stored in the
+/// payload: it is already `slot.manifest_page` on the decode side, so
+/// `verifyManifest` reconstructs the same gap from that alone. Naming a run
+/// with a start id, a count, and a flat CRC array costs 4 bytes per page
+/// instead of 12 (what a reused page -- explicit, from the free list,
+/// never assumed contiguous with anything -- still costs, as a full
+/// (page_id, crc) pair), so a window with few, long runs stays cheap; the
+/// degenerate case (every appended page its own one-entry run) costs the
+/// same 16 bytes/page as encoding every page as if it were reused, still
+/// bounded by `max_single_sync_pages` and caught by the caller's own
+/// payload-too-big-for-one-page check, so this never needs to fail for
+/// discontiguity the way the v8 encoder did.
 fn encodeManifestPayloadAlloc(allocator: Allocator, entries: []const ManifestEntry, reused_pages: *const std.AutoHashMapUnmanaged(u64, void), manifest_page_id: u64) ![]u8 {
-    var appended_min: ?u64 = null;
-    var appended_max: ?u64 = null;
+    var appended = try std.ArrayListUnmanaged(ManifestEntry).initCapacity(allocator, entries.len);
+    defer appended.deinit(allocator);
     var reused_count: usize = 0;
     for (entries) |entry| {
         if (reused_pages.contains(entry.page_id)) {
             reused_count += 1;
         } else {
-            if (appended_min == null or entry.page_id < appended_min.?) appended_min = entry.page_id;
-            if (appended_max == null or entry.page_id > appended_max.?) appended_max = entry.page_id;
+            appended.appendAssumeCapacity(entry);
         }
     }
-    const appended_count = entries.len - reused_count;
-    const range_start = appended_min orelse 0;
-    const gap_in_span = appended_count > 0 and manifest_page_id >= range_start and manifest_page_id <= appended_max.?;
-    if (appended_count > 0) {
-        const span = appended_max.? - range_start + 1;
-        const expected = appended_count + @as(usize, if (gap_in_span) 1 else 0);
-        if (span != expected) return error.InvalidNativeManifestRange;
+    std.mem.sort(ManifestEntry, appended.items, {}, manifestEntryLessThan);
+
+    // Greedily merge adjacent (or gap-bridged) appended ids into the fewest
+    // runs: this both minimizes payload size and is the only pass needed,
+    // since every page id is visited exactly once in sorted order.
+    var runs = std.ArrayListUnmanaged(struct { range_start: u64, crcs: std.ArrayListUnmanaged(u32) }).empty;
+    defer {
+        for (runs.items) |*run| run.crcs.deinit(allocator);
+        runs.deinit(allocator);
     }
-    const out = try allocator.alloc(u8, manifest_header_size + appended_count * 4 + reused_count * manifest_entry_size);
+    var i: usize = 0;
+    while (i < appended.items.len) {
+        var crcs = std.ArrayListUnmanaged(u32).empty;
+        try crcs.append(allocator, appended.items[i].crc);
+        const range_start = appended.items[i].page_id;
+        var last_id = range_start;
+        var j = i + 1;
+        while (j < appended.items.len) {
+            const next_id = appended.items[j].page_id;
+            const bridges_gap = next_id == last_id + 2 and last_id + 1 == manifest_page_id;
+            if (next_id != last_id + 1 and !bridges_gap) break;
+            try crcs.append(allocator, appended.items[j].crc);
+            last_id = next_id;
+            j += 1;
+        }
+        try runs.append(allocator, .{ .range_start = range_start, .crcs = crcs });
+        i = j;
+    }
+
+    var payload_len: usize = manifest_header_size;
+    for (runs.items) |run| payload_len += manifest_run_header_size + run.crcs.items.len * 4;
+    payload_len += reused_count * manifest_entry_size;
+
+    const out = try allocator.alloc(u8, payload_len);
     errdefer allocator.free(out);
-    std.mem.writeInt(u64, out[0..8], range_start, .little);
-    std.mem.writeInt(u32, out[8..12], @intCast(appended_count), .little);
-    std.mem.writeInt(u32, out[12..16], @intCast(reused_count), .little);
-    const appended_crcs = out[manifest_header_size..][0 .. appended_count * 4];
-    var reused_offset: usize = manifest_header_size + appended_count * 4;
-    for (entries) |entry| {
-        if (reused_pages.contains(entry.page_id)) {
-            std.mem.writeInt(u64, out[reused_offset..][0..8], entry.page_id, .little);
-            std.mem.writeInt(u32, out[reused_offset + 8 ..][0..4], entry.crc, .little);
-            reused_offset += manifest_entry_size;
-        } else {
-            var idx = entry.page_id - range_start;
-            if (gap_in_span and entry.page_id > manifest_page_id) idx -= 1;
-            std.mem.writeInt(u32, appended_crcs[idx * 4 ..][0..4], entry.crc, .little);
+    std.mem.writeInt(u32, out[0..4], @intCast(runs.items.len), .little);
+    std.mem.writeInt(u32, out[4..8], @intCast(reused_count), .little);
+    var offset: usize = manifest_header_size;
+    for (runs.items) |run| {
+        std.mem.writeInt(u64, out[offset..][0..8], run.range_start, .little);
+        std.mem.writeInt(u32, out[offset + 8 ..][0..4], @intCast(run.crcs.items.len), .little);
+        offset += manifest_run_header_size;
+        for (run.crcs.items) |crc| {
+            std.mem.writeInt(u32, out[offset..][0..4], crc, .little);
+            offset += 4;
         }
     }
+    for (entries) |entry| {
+        if (!reused_pages.contains(entry.page_id)) continue;
+        std.mem.writeInt(u64, out[offset..][0..8], entry.page_id, .little);
+        std.mem.writeInt(u32, out[offset + 8 ..][0..4], entry.crc, .little);
+        offset += manifest_entry_size;
+    }
+    std.debug.assert(offset == out.len);
     return out;
+}
+
+fn manifestEntryLessThan(_: void, lhs: ManifestEntry, rhs: ManifestEntry) bool {
+    return lhs.page_id < rhs.page_id;
 }
 
 /// `out` must be exactly one physical page (`header.page_size` bytes): the
@@ -14533,32 +14690,41 @@ fn verifyManifest(file: std.Io.File, io: std.Io, slot: CheckpointSlot, page_size
     const payload = decodePagePayload(buf[0..page_size], .commit_manifest) catch return false;
     if (computePageCrc(.commit_manifest, payload) != slot.manifest_crc) return false;
     if (payload.len < manifest_header_size) return false;
-    const range_start = std.mem.readInt(u64, payload[0..8], .little);
-    const appended_count = std.mem.readInt(u32, payload[8..12], .little);
-    const reused_count = std.mem.readInt(u32, payload[12..16], .little);
-    const total = @as(u64, appended_count) + reused_count;
-    if (total != slot.manifest_page_count) return false;
-    if (payload.len != manifest_header_size + @as(usize, appended_count) * 4 + @as(usize, reused_count) * manifest_entry_size) return false;
-    // Walks the same implicit gap encodeManifestPayloadAlloc skipped: a
-    // candidate id equal to this slot's own manifest page is never an
-    // entry (nothing writes to it until the manifest page itself is
-    // built), so it is passed over without consuming one of the
-    // appended_count CRC array slots -- reconstructed purely from
-    // slot.manifest_page, never stored in the payload itself.
-    var i: u32 = 0;
-    var page_id = range_start;
-    while (i < appended_count) : (i += 1) {
-        if (page_id == slot.manifest_page) page_id += 1;
-        const expected_crc = std.mem.readInt(u32, payload[manifest_header_size + @as(usize, i) * 4 ..][0..4], .little);
-        if (page_id < reserved_header_pages or page_id >= slot.page_count) return false;
-        var crc_buf: [4]u8 = undefined;
-        const got = file.readPositionalAll(io, &crc_buf, page_id * @as(u64, page_size) + page_crc_offset) catch return false;
-        if (got != 4) return false;
-        if (std.mem.readInt(u32, &crc_buf, .little) != expected_crc) return false;
-        page_id += 1;
+    const run_count = std.mem.readInt(u32, payload[0..4], .little);
+    const reused_count = std.mem.readInt(u32, payload[4..8], .little);
+    var offset: usize = manifest_header_size;
+    var total_appended: u64 = 0;
+    for (0..run_count) |_| {
+        if (offset + manifest_run_header_size > payload.len) return false;
+        const range_start = std.mem.readInt(u64, payload[offset..][0..8], .little);
+        const count = std.mem.readInt(u32, payload[offset + 8 ..][0..4], .little);
+        offset += manifest_run_header_size;
+        if (offset + @as(usize, count) * 4 > payload.len) return false;
+        // Walks the same implicit gap encodeManifestPayloadAlloc skipped: a
+        // candidate id equal to this slot's own manifest page is never an
+        // entry (nothing writes to it until the manifest page itself is
+        // built), so it is passed over without consuming one of this run's
+        // own CRC array slots -- reconstructed purely from
+        // slot.manifest_page, never stored in the payload itself. At most
+        // one run ever actually bridges the gap; every other run's walk
+        // below never matches it, so this check is a no-op there.
+        var i: u32 = 0;
+        var page_id = range_start;
+        while (i < count) : (i += 1) {
+            if (page_id == slot.manifest_page) page_id += 1;
+            const expected_crc = std.mem.readInt(u32, payload[offset..][0..4], .little);
+            offset += 4;
+            if (page_id < reserved_header_pages or page_id >= slot.page_count) return false;
+            var crc_buf: [4]u8 = undefined;
+            const got = file.readPositionalAll(io, &crc_buf, page_id * @as(u64, page_size) + page_crc_offset) catch return false;
+            if (got != 4) return false;
+            if (std.mem.readInt(u32, &crc_buf, .little) != expected_crc) return false;
+            page_id += 1;
+        }
+        total_appended += count;
     }
-    var offset: usize = manifest_header_size + @as(usize, appended_count) * 4;
     for (0..reused_count) |_| {
+        if (offset + manifest_entry_size > payload.len) return false;
         const reused_page_id = std.mem.readInt(u64, payload[offset..][0..8], .little);
         const expected_crc = std.mem.readInt(u32, payload[offset + 8 ..][0..4], .little);
         offset += manifest_entry_size;
@@ -14568,6 +14734,9 @@ fn verifyManifest(file: std.Io.File, io: std.Io, slot: CheckpointSlot, page_size
         if (got != 4) return false;
         if (std.mem.readInt(u32, &crc_buf, .little) != expected_crc) return false;
     }
+    if (offset != payload.len) return false;
+    const total = total_appended + reused_count;
+    if (total != slot.manifest_page_count) return false;
     return true;
 }
 
@@ -15000,6 +15169,33 @@ fn probeDocumentIndexNode(raw: []const u8, key: []const u8) !IndexProbe {
     return .{ .leaf = leaf, .page = selected };
 }
 
+/// First pass for `decodeDocumentIndexNode`: walks the same entry layout
+/// (2-byte key_len, 8-byte pointer, then either an 8-byte key_page or
+/// `key_len` inline bytes) purely to sum the inline-key bytes, so the real
+/// decode pass below can allocate exactly one backing buffer for all of
+/// this node's inline keys instead of one `dupe` per key. Bounds-checks the
+/// same way the decode pass does (a corrupt length here must not read out
+/// of `raw`), but does not validate key ordering or any other invariant --
+/// the decode pass still does that on its own, identical, walk.
+fn sumInlineDocumentIndexKeyBytes(raw: []const u8, start_pos: usize, count: usize) !usize {
+    var pos = start_pos;
+    var total: usize = 0;
+    for (0..count) |_| {
+        if (pos + 10 > raw.len) return error.InvalidDocumentIndex;
+        const key_len: usize = std.mem.readInt(u16, raw[pos..][0..2], .little);
+        pos += 10; // 2-byte length + 8-byte pointer, common to every entry
+        if (key_len == index_external_key_marker) {
+            if (pos + 8 > raw.len) return error.InvalidDocumentIndex;
+            pos += 8;
+        } else {
+            if (key_len > index_inline_key_limit or pos + key_len > raw.len) return error.InvalidDocumentIndex;
+            total += key_len;
+            pos += key_len;
+        }
+    }
+    return total;
+}
+
 fn decodeDocumentIndexNode(allocator: Allocator, raw: []const u8) !DocumentIndexNode {
     if (raw.len < document_index_header_size or !std.mem.eql(u8, raw[0..8], document_index_magic))
         return error.InvalidDocumentIndex;
@@ -15013,12 +15209,17 @@ fn decodeDocumentIndexNode(allocator: Allocator, raw: []const u8) !DocumentIndex
     if (kind == .leaf and count == 0) return error.InvalidDocumentIndex;
     const keys = try allocator.alloc([]u8, count);
     var keys_initialized: usize = 0;
-    errdefer {
-        for (keys[0..keys_initialized]) |key| allocator.free(key);
-        allocator.free(keys);
-    }
     const key_pages = try allocator.alloc(u64, count);
-    errdefer allocator.free(key_pages);
+    // External keys (`key_pages[i] != 0`) are each their own real
+    // allocation (see the comment at their assignment below); inline keys
+    // live in `key_storage`, freed once, separately. On an error partway
+    // through the loop, only the external keys actually initialized so
+    // far need freeing here.
+    errdefer {
+        for (keys[0..keys_initialized], key_pages[0..keys_initialized]) |key, page| if (page != 0) allocator.free(key);
+        allocator.free(keys);
+        allocator.free(key_pages);
+    }
     @memset(key_pages, 0);
     const pointer_extra: usize = if (kind == .internal) 1 else 0;
     const pointers = try allocator.alloc(u64, count + pointer_extra);
@@ -15029,6 +15230,14 @@ fn decodeDocumentIndexNode(allocator: Allocator, raw: []const u8) !DocumentIndex
         pointers[0] = std.mem.readInt(u64, raw[pos..][0..8], .little);
         pos += 8;
     }
+    // One allocation for every inline key's bytes in this node, instead of
+    // one `dupe` per key -- see `DocumentIndexNode.key_storage`'s doc
+    // comment for why (measured as the single largest allocation-site
+    // contributor in the write-amplification CPU attribution).
+    const inline_bytes_total = try sumInlineDocumentIndexKeyBytes(raw, pos, count);
+    const key_storage = if (inline_bytes_total != 0) try allocator.alloc(u8, inline_bytes_total) else null;
+    errdefer if (key_storage) |storage| allocator.free(storage);
+    var storage_used: usize = 0;
     for (keys, 0..) |*key, i| {
         if (pos + 10 > raw.len) return error.InvalidDocumentIndex;
         const key_len: usize = std.mem.readInt(u16, raw[pos..][0..2], .little);
@@ -15040,18 +15249,29 @@ fn decodeDocumentIndexNode(allocator: Allocator, raw: []const u8) !DocumentIndex
             if (pos + 8 > raw.len) return error.InvalidDocumentIndex;
             key_pages[i] = std.mem.readInt(u64, raw[pos..][0..8], .little);
             if (key_pages[i] == 0) return error.InvalidDocumentIndex;
+            // A real (if zero-size) individual allocation, not a slice
+            // into `key_storage`: `resolveIndexKey` later frees and
+            // replaces exactly this key in place once it resolves the
+            // external content, so it must be its own allocation the
+            // allocator can `free` on its own, not a sub-slice of a
+            // larger buffer freed as a whole elsewhere.
             key.* = try allocator.alloc(u8, 0);
             pos += 8;
         } else {
             if (key_len > index_inline_key_limit or pos + key_len > raw.len) return error.InvalidDocumentIndex;
-            key.* = try allocator.dupe(u8, raw[pos .. pos + key_len]);
+            // `sumInlineDocumentIndexKeyBytes` already proved `key_storage`
+            // has room for every inline key's bytes in this same walk.
+            const storage = key_storage.?;
+            @memcpy(storage[storage_used..][0..key_len], raw[pos .. pos + key_len]);
+            key.* = storage[storage_used..][0..key_len];
+            storage_used += key_len;
             pos += key_len;
         }
         keys_initialized += 1;
         if (i > 0 and key_pages[i - 1] == 0 and key_pages[i] == 0 and std.mem.order(u8, keys[i - 1], key.*) != .lt) return error.InvalidDocumentIndex;
     }
     if (pos != raw.len) return error.InvalidDocumentIndex;
-    return .{ .kind = kind, .keys = keys, .pointers = pointers, .key_pages = key_pages };
+    return .{ .kind = kind, .keys = keys, .pointers = pointers, .key_pages = key_pages, .key_storage = key_storage };
 }
 
 fn decodeValuePage(raw: []const u8) !ValuePage {
@@ -15528,6 +15748,198 @@ test "lite native recovery falls back and truncates when a manifest-listed page 
     const recovered = (try reopened.getDocumentAlloc(allocator, "doc")).?;
     defer allocator.free(recovered);
     try std.testing.expectEqualStrings("stable", recovered);
+}
+
+// v9 required test (design doc §3.2a "Manifest coverage" / 37a00f96fd): a
+// torn page in a SECOND (or later) run of a multi-run manifest must still
+// be caught, falling recovery back exactly as a single-run v8 manifest
+// would. Fabricates a higher-sequence slot, in the file's own spare slot
+// page, whose manifest genuinely spans two runs with a real gap between
+// them (not the single `manifest_page_id` gap the one-run encoder already
+// bridged) -- the shape a window with more than one
+// `flushTransactionWrites`/`persistAllocator` cycle commonly produces.
+test "lite native manifest with a torn page in a later run falls back and truncates" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "manifest-second-run-torn.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    try file.putDocument("doc", "stable");
+    const stable_sequence = file.activeCheckpoint().commit_sequence;
+    const base_page_count = file.activeCheckpoint().page_count;
+    const other_slot_index: u8 = 1 - file.header.active_checkpoint;
+    file.close();
+
+    // Never the real active slot -- this must not disturb the already-
+    // durable "stable" document this test later confirms survives intact.
+    const run1_start = base_page_count;
+    const run2_start = base_page_count + 10;
+    const manifest_page_id = base_page_count + 20;
+    const total_pages = base_page_count + 30;
+
+    var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    try raw.setLength(std.testing.io, total_pages * @as(u64, default_page_size));
+
+    var entries: [6]ManifestEntry = undefined;
+    var page_buf: [default_page_size]u8 = undefined;
+    for (0..3) |i| {
+        const page_id = run1_start + i;
+        encodePage(&page_buf, .data, "run1-page");
+        try raw.writePositionalAll(std.testing.io, &page_buf, page_id * @as(u64, default_page_size));
+        entries[i] = .{ .page_id = page_id, .crc = std.mem.readInt(u32, page_buf[page_crc_offset..][0..4], .little) };
+    }
+    for (0..3) |i| {
+        const page_id = run2_start + i;
+        encodePage(&page_buf, .data, "run2-page");
+        try raw.writePositionalAll(std.testing.io, &page_buf, page_id * @as(u64, default_page_size));
+        entries[3 + i] = .{ .page_id = page_id, .crc = std.mem.readInt(u32, page_buf[page_crc_offset..][0..4], .little) };
+    }
+
+    const empty_reused: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    const manifest_payload = try encodeManifestPayloadAlloc(allocator, &entries, &empty_reused, manifest_page_id);
+    defer allocator.free(manifest_payload);
+    // Two genuinely separate runs: a real hole between them, not the single
+    // reserved manifest-page id this window also skips over.
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, manifest_payload[0..4], .little));
+
+    var manifest_buf: [default_page_size]u8 = undefined;
+    encodePage(&manifest_buf, .commit_manifest, manifest_payload);
+    try raw.writePositionalAll(std.testing.io, &manifest_buf, manifest_page_id * @as(u64, default_page_size));
+
+    const fabricated_sequence = stable_sequence + 1;
+    const fabricated_slot = CheckpointSlot{
+        .commit_sequence = fabricated_sequence,
+        .page_count = total_pages,
+        .presynced = false,
+        .manifest_page = manifest_page_id,
+        .manifest_crc = std.mem.readInt(u32, manifest_buf[page_crc_offset..][0..4], .little),
+        .manifest_page_count = entries.len,
+    };
+    var slot_buf: [default_page_size]u8 = undefined;
+    encodeCheckpointSlotPage(&slot_buf, fabricated_slot);
+    try raw.writePositionalAll(std.testing.io, &slot_buf, slotPhysicalPage(other_slot_index) * @as(u64, default_page_size));
+    raw.close(std.testing.io);
+
+    // Sanity: the fabricated two-run manifest verifies and wins on its own
+    // -- confirms the construction above (and encodeManifestPayloadAlloc's
+    // multi-run output) is genuinely valid before the corruption below is
+    // what makes it fail.
+    {
+        const report = try inspect(allocator, std.testing.io, path);
+        try std.testing.expect(report.valid);
+        try std.testing.expectEqual(fabricated_sequence, report.commit_sequence);
+    }
+
+    // Tear one page in the SECOND run only -- the first run (and its own
+    // header/CRC-array bounds) verifies cleanly; only the later run's own
+    // entry must be what catches this.
+    {
+        var writable = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer writable.close(std.testing.io);
+        const damaged = (run2_start + 1) * @as(u64, default_page_size) + page_crc_offset;
+        try writable.writePositionalAll(std.testing.io, "X", damaged);
+    }
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(stable_sequence, report.commit_sequence);
+    try std.testing.expectEqual(base_page_count, report.page_count);
+
+    var reopened = try NativeFile.openWithIo(allocator, std.testing.io, path, .{ .no_sync = true });
+    defer reopened.close();
+    try std.testing.expectEqual(stable_sequence, reopened.activeCheckpoint().commit_sequence);
+    const recovered = (try reopened.getDocumentAlloc(allocator, "doc")).?;
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings("stable", recovered);
+}
+
+// v9 required test: a corrupted run table (not just a corrupted data page)
+// must fail verification safely -- a declared run `count` or `run_count`
+// that overruns the manifest page's own payload must return `false`
+// (an ordinary "fall back" outcome), never read out of bounds or panic.
+// Both payloads below are hand-corrupted: never something
+// `encodeManifestPayloadAlloc` itself would produce.
+test "lite native manifest run table rejects out-of-bounds run entries instead of crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const total_pages = reserved_header_pages + 4;
+    const page_id = reserved_header_pages;
+    var page_buf: [default_page_size]u8 = undefined;
+    encodePage(&page_buf, .data, "ok");
+    const real_crc = std.mem.readInt(u32, page_buf[page_crc_offset..][0..4], .little);
+
+    // Case 1: a run's declared `count` claims far more CRCs than the page
+    // has room for.
+    {
+        const path = try testPath(allocator, tmp, "manifest-run-count-overrun.aflite");
+        defer allocator.free(path);
+        var raw = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+        try raw.setLength(std.testing.io, total_pages * @as(u64, default_page_size));
+        try raw.writePositionalAll(std.testing.io, &page_buf, page_id * @as(u64, default_page_size));
+
+        var payload: [manifest_header_size + manifest_run_header_size]u8 = undefined;
+        std.mem.writeInt(u32, payload[0..4], 1, .little); // run_count
+        std.mem.writeInt(u32, payload[4..8], 0, .little); // reused_count
+        std.mem.writeInt(u64, payload[8..16], page_id, .little); // range_start
+        std.mem.writeInt(u32, payload[16..20], 1000, .little); // count: bogus, no room on the page
+        var manifest_buf: [default_page_size]u8 = undefined;
+        encodePage(&manifest_buf, .commit_manifest, &payload);
+        const manifest_page_id = reserved_header_pages + 1;
+        try raw.writePositionalAll(std.testing.io, &manifest_buf, manifest_page_id * @as(u64, default_page_size));
+        raw.close(std.testing.io);
+
+        const slot = CheckpointSlot{
+            .commit_sequence = 1,
+            .page_count = total_pages,
+            .presynced = false,
+            .manifest_page = manifest_page_id,
+            .manifest_crc = std.mem.readInt(u32, manifest_buf[page_crc_offset..][0..4], .little),
+            .manifest_page_count = 1,
+        };
+        var reader = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+        defer reader.close(std.testing.io);
+        try std.testing.expect(!verifyManifest(reader, std.testing.io, slot, default_page_size));
+    }
+
+    // Case 2: the run table itself claims more runs than fit -- the second
+    // run's own 12-byte header has no room left in the page payload at all,
+    // even though the first run's single entry is genuinely valid.
+    {
+        const path = try testPath(allocator, tmp, "manifest-run-table-overrun.aflite");
+        defer allocator.free(path);
+        var raw = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+        try raw.setLength(std.testing.io, total_pages * @as(u64, default_page_size));
+        try raw.writePositionalAll(std.testing.io, &page_buf, page_id * @as(u64, default_page_size));
+
+        var payload: [manifest_header_size + manifest_run_header_size + 4]u8 = undefined;
+        std.mem.writeInt(u32, payload[0..4], 3, .little); // claims 3 runs
+        std.mem.writeInt(u32, payload[4..8], 0, .little);
+        std.mem.writeInt(u64, payload[8..16], page_id, .little);
+        std.mem.writeInt(u32, payload[16..20], 1, .little); // run 1: one real, valid entry
+        std.mem.writeInt(u32, payload[20..24], real_crc, .little);
+        // No bytes left at all for runs 2 and 3's own headers.
+        var manifest_buf: [default_page_size]u8 = undefined;
+        encodePage(&manifest_buf, .commit_manifest, &payload);
+        const manifest_page_id = reserved_header_pages + 1;
+        try raw.writePositionalAll(std.testing.io, &manifest_buf, manifest_page_id * @as(u64, default_page_size));
+        raw.close(std.testing.io);
+
+        const slot = CheckpointSlot{
+            .commit_sequence = 1,
+            .page_count = total_pages,
+            .presynced = false,
+            .manifest_page = manifest_page_id,
+            .manifest_crc = std.mem.readInt(u32, manifest_buf[page_crc_offset..][0..4], .little),
+            .manifest_page_count = 3,
+        };
+        var reader = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+        defer reader.close(std.testing.io);
+        try std.testing.expect(!verifyManifest(reader, std.testing.io, slot, default_page_size));
+    }
 }
 
 // WS1(b) required test: "a v8 build refuses a v7 file" (design doc §3.1).
@@ -22448,6 +22860,54 @@ test "lite warm value ranges borrow pages without copies or allocations" {
     const bytes = file.test_value_cache_borrowed_bytes.load(.monotonic) - borrowed;
     try std.testing.expect(bytes > 100 * 16);
     std.debug.print("LITE_VALUE_LEASE ranges=100 returned_bytes=1600 borrowed_page_bytes={d} all_cache_copied_bytes=0 crc_calls=0 crc_bytes=0 extent_decodes=0 release_locks=0 backing_reads=0 allocations=0\n", .{bytes});
+}
+
+// Regression gate for `IndexEditor.load`'s cache-hit fast path: a steady
+// write workload that keeps revisiting the same small set of document-index
+// pages (the write-amplification harness's own shape -- few distinct keys,
+// many updates) must not pay a fresh CRC verification on every single
+// commit's `IndexEditor.load` of those same pages. Asserts directly on the
+// fast path's own hit/miss counters rather than on the aggregate
+// `PageDecodeMetrics.crc_calls` delta: a write commit also CRC-verifies the
+// free-map/allocator/manifest pages every time regardless of this fix (out
+// of scope here -- see items 3/4), so that aggregate is not this fix's
+// signal and asserting on it either passes for the wrong reason or (as
+// first written) fails for the wrong reason.
+test "lite index editor reuses verified document-index pages across commits" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "index-editor-cache-reuse.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    // Seed enough distinct keys that the document index has more than one
+    // leaf, so the updates below actually revisit shared pages rather than
+    // always landing on a lone root leaf.
+    for (0..64) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+        try file.putDocument(key, "seed");
+    }
+    const hits_before = PageDecodeMetrics.index_editor_cache_hits.load(.monotonic);
+    const misses_before = PageDecodeMetrics.index_editor_cache_misses.load(.monotonic);
+    const rounds = 64;
+    const keys_per_round = 8;
+    for (0..rounds) |_| {
+        for (0..keys_per_round) |i| {
+            var key_buf: [16]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+            try file.putDocument(key, "updated");
+        }
+    }
+    const hits = PageDecodeMetrics.index_editor_cache_hits.load(.monotonic) - hits_before;
+    const misses = PageDecodeMetrics.index_editor_cache_misses.load(.monotonic) - misses_before;
+    std.debug.print("LITE_INDEX_EDITOR_CACHE fast_path_hits={d} fast_path_misses={d} rounds={d} keys_per_round={d}\n", .{ hits, misses, rounds, keys_per_round });
+    // Every one of these updates revisits a document-index page this same
+    // writer wrote in the immediately preceding commit; the fast path must
+    // take every one of them (zero misses) once the cache is warm.
+    try std.testing.expectEqual(@as(u64, 0), misses);
+    try std.testing.expect(hits > 0);
 }
 
 test "lite value cursor initialization errors release borrowed pages" {

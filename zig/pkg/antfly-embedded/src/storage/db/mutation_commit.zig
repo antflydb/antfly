@@ -159,6 +159,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const prepareInlineSparsePublication = S.prepareInlineSparsePublication;
         const InlineDensePublication = S.InlineDensePublication;
         const prepareInlineDensePublication = S.prepareInlineDensePublication;
+        const InlineAlgebraicPublication = S.InlineAlgebraicPublication;
+        const prepareInlineAlgebraicPublication = S.prepareInlineAlgebraicPublication;
         const attachPreparedUpsertDocumentProjections = S.attachPreparedUpsertDocumentProjections;
         const augmentExtractedWriteWithGraphFieldEdges = S.augmentExtractedWriteWithGraphFieldEdges;
         const augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed = S.augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed;
@@ -559,7 +561,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // generation are revalidated below under the apply fence.
             const scoped_restore_replication_apply = opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope != null and opts.restore_staging == null;
             const live_replication_apply = opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope == null and opts.restore_staging == null;
-            if (opts.transaction_resolution == null and !scoped_restore_replication_apply and !live_replication_apply) {
+            // lite-single-commit-write-path.md §3.3c: a single-table write
+            // deciding its own UNIQUE claims for the first time, in this
+            // same call (`capi/sql.zig`'s `commitCoordinated`). Unlike
+            // `live_replication_apply`/`scoped_restore_replication_apply`
+            // (replaying a decision some OTHER writer already made), this
+            // caller is the first and only decider, so it still runs full
+            // validation below -- see `prepareLocalIntegrityDecision`.
+            const local_decision_apply = opts.integrity_authority == .local_decision;
+            if (opts.transaction_resolution == null and !scoped_restore_replication_apply and !live_replication_apply and !local_decision_apply) {
                 for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
                 for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
                 if (!req.graph_endpoint_cleanup_planned and hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
@@ -570,8 +580,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (view.storageMode() != .relational) return error.InvalidRelationalRowsRequest;
                 if (view.version() != version) return error.PreparedGenerationChanged;
             }
-            // Integrity effects may only enter through durable transaction prepare.
-            if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null) return error.InvalidIntegrityOperation;
+            // Integrity effects may only enter through durable transaction
+            // prepare, or (new) a `.local_decision` call's own
+            // `integrity_commands` -- validated and applied below, in this
+            // same apply-locked section, never read back from storage.
+            if (req.integrity.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null) return error.InvalidIntegrityOperation;
+            if (req.integrity_commands.len != 0 and !local_decision_apply) return error.InvalidIntegrityOperation;
             var relational_index_snapshot = S.ownerField(self, "core").*.relational_indexes.acquire();
             defer if (relational_index_snapshot) |*index_snapshot| index_snapshot.deinit();
             const index_ready = try preparation_alloc.alloc(bool, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan.boundIndexes().len else 0);
@@ -1401,6 +1415,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .use_preprepared_rows = use_preprepared_rows,
             };
             defer write_buffers.deinit();
+            if (local_decision_apply) {
+                // `preparation.effects_arena` outlives this call through
+                // the rest of the native commit below (see its own use for
+                // other inline-publication effects, e.g. line ~701), so
+                // the claim writes returned here stay valid without
+                // tracking individual frees against `preparation_alloc`.
+                const local_integrity_writes = try prepareLocalIntegrityDecision(
+                    self,
+                    preparation.effects_arena.allocator(),
+                    req.relational_schema_version orelse req.schema_version,
+                    req.relational_integrity_generation_set,
+                    req.integrity_commands,
+                );
+                for (local_integrity_writes) |intent| {
+                    if (intent.value) |value| {
+                        try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = intent.key, .value = value });
+                    } else {
+                        try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, intent.key);
+                    }
+                }
+            }
             if (S.ownerField(self, "local_execution").*.row_policy_table_name) |table_name| {
                 try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = internal_keys.graph_owning_table_key, .value = table_name });
             }
@@ -3699,6 +3734,60 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     inline_dense_publication = null;
                 }
             }
+            // Algebraic workstream: single-commit write path for algebraic
+            // indexes. Unlike full_text, algebraic facts already live in the
+            // primary DocStore (no separate storage backend to migrate), so
+            // the gate here only needs to match the sync level that actually
+            // forces synchronous algebraic visibility: `syncLevelRequiresDerivedVisibility`
+            // below is false for `.enrichments`, so only `.full_index` ever
+            // reaches the untargeted `applyDerivedBatchProfiled` fallback
+            // this is short-circuiting (see that call site further down).
+            // Prepared only up to whatever room is left in `commit_participants`
+            // after `authored_acceptance`/text above -- a publication that
+            // cannot get a slot is aborted immediately (not left prepared)
+            // and simply falls back to the existing non-inline path for that
+            // one index; it must never turn a write that would otherwise
+            // succeed into a failure.
+            //
+            // Attempted regardless of `executor.hasWorkers()` -- mirroring
+            // text's own "Phase 2 round 2" fix above (the default Lite
+            // configuration runs with background index workers, so gating
+            // on no-workers would mean this fast path almost never engages).
+            // `InlineAlgebraicPublication.stage` reaches `Index.
+            // applyBatchWithOptionsView`, which takes the SAME `self.
+            // lockWrites()` mutex a worker's own `applyAlgebraicBatchByName
+            // WithOptions` -> `applyBatchWritesLocked` call takes, so the two
+            // are already mutually exclusive without needing `!hasWorkers()`
+            // as a proxy for "no concurrent worker apply".
+            var inline_algebraic_publications: [2]?*InlineAlgebraicPublication = @splat(null);
+            var inline_algebraic_handled_names: [2][]const u8 = undefined;
+            var inline_algebraic_publication_count: usize = 0;
+            defer for (inline_algebraic_publications[0..inline_algebraic_publication_count]) |maybe_prepared| {
+                if (maybe_prepared) |prepared| prepared.abort();
+            };
+            if (append_derived_replay and effective_req.sync_level == .full_index and
+                materialized_derived_batch != null)
+            {
+                for (sync_targets.all_indexes) |target_name| {
+                    if (inline_algebraic_publication_count >= inline_algebraic_publications.len) break;
+                    if (commit_participants.len >= @import("../commit_participant.zig").List.max_participants) break;
+                    const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = target_name, .kind = .algebraic };
+                    const prepared = prepareInlineAlgebraicPublication(
+                        S.ownerField(self, "alloc").*,
+                        S.ownerField(self, "core").*.store,
+                        S.ownerField(self, "core").*.index_manager,
+                        materialized_derived_batch.?,
+                        index_ref,
+                    ) catch continue;
+                    commit_participants.append(prepared.participant()) catch {
+                        prepared.abort();
+                        break;
+                    };
+                    inline_algebraic_publications[inline_algebraic_publication_count] = prepared;
+                    inline_algebraic_handled_names[inline_algebraic_publication_count] = target_name;
+                    inline_algebraic_publication_count += 1;
+                }
+            }
             const combined_commit_participant: ?@import("../commit_participant.zig").Participant =
                 if (commit_participants.len != 0) commit_participants.participant() else null;
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -3961,6 +4050,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_dense_handled_name, sequence);
                 }
             }
+            // Same durability boundary as the inline text publications just
+            // above, for the algebraic ones. Mirror each now-durable
+            // publication's sequence into the background worker's own
+            // bookkeeping the same way text does above (see
+            // `Executor.advanceAppliedSequenceIfContiguous`'s doc comment):
+            // without this, a registered algebraic worker's `applied_
+            // sequence` never advances past what catch-up itself sets, so
+            // every write's `waitForAll`/notify cycle finds this worker
+            // still behind target and runs a redundant catch-up turn --
+            // which, finding nothing left to replay, still persists its
+            // own applied-sequence advancement as a second durable commit.
+            for (inline_algebraic_publications[0..inline_algebraic_publication_count], 0..) |maybe_prepared, i| {
+                if (maybe_prepared) |prepared| {
+                    prepared.install();
+                    inline_algebraic_publications[i] = null;
+                    if (S.ownerField(self, "executor").*.hasWorkers()) {
+                        _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_algebraic_handled_names[i], sequence);
+                    }
+                }
+            }
             snapshot_mutation.release();
             if (split_shadow_ticket) |ticket| {
                 const apply_shadow_start_ns = monotonicTimeNs();
@@ -4089,8 +4198,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         if (sync_targets.all_indexes.len != 0) {
                             try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.all_indexes, profile);
                         }
-                    } else {
+                    } else if (inline_algebraic_publication_count == 0) {
                         try applyDerivedBatchProfiled(self, materialized_derived_batch.?, profile);
+                    } else {
+                        // Algebraic workstream: every index already published
+                        // inline above (same native transaction as the primary
+                        // commit, already installed above) must not also run
+                        // through this post-commit path -- that would re-apply
+                        // it a second time, same as the full_text case above.
+                        var remaining_targets = std.ArrayListUnmanaged([]const u8).empty;
+                        defer remaining_targets.deinit(S.ownerField(self, "alloc").*);
+                        remaining: for (sync_targets.all_indexes) |target_name| {
+                            for (inline_algebraic_handled_names[0..inline_algebraic_publication_count]) |handled_name| {
+                                if (std.mem.eql(u8, handled_name, target_name)) continue :remaining;
+                            }
+                            try remaining_targets.append(S.ownerField(self, "alloc").*, target_name);
+                        }
+                        if (remaining_targets.items.len != 0) {
+                            try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, remaining_targets.items, profile);
+                        }
                     }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.derived_apply_ns, derived_apply_start_ns);
                 }
@@ -4540,6 +4666,110 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.mem.startsWith(u8, key, protection.writer_prefix) or
                 std.mem.startsWith(u8, key, protection.index_counter_prefix) or
                 std.mem.startsWith(u8, key, protection.index_writer_prefix);
+        }
+
+        /// lite-single-commit-write-path.md §3.3c: validates and
+        /// materializes UNIQUE-constraint integrity effects for a single
+        /// table write deciding them for the first time in this one call
+        /// (`BatchExecutionOptions.integrity_authority == .local_decision`,
+        /// set only by `capi/sql.zig`'s `commitCoordinated` fast path) --
+        /// no durable intent record, no begin record. Runs the same
+        /// `relational_integrity.prepare`/`validatePreparedEffects`/
+        /// `checkVersionPredicates` sequence `storage/db/db.zig`'s
+        /// `writeTransactionInternalOnce` runs for `req.integrity_commands`,
+        /// just without the durable round trip through "intents": the
+        /// caller must already be holding the SAME apply-exclusive lock
+        /// this commit is about to write under (this never acquires or
+        /// releases it), so the check and the write land in one native
+        /// batch with no gap a concurrent writer could land in between. A
+        /// `.foreign` generation command is refused: cross-table FK
+        /// bookkeeping (the parent's own `.attach`/`.detach` record) still
+        /// needs a multi-table coordinator, never this single-table path.
+        /// Returned intents are allocated from `alloc` and remain valid
+        /// for the caller's own commit lifetime (the same `preparation_alloc`
+        /// arena every other per-call buffer in this function uses).
+        fn prepareLocalIntegrityDecision(
+            self: anytype,
+            alloc: Allocator,
+            schema_version: ?u32,
+            generation_set: ?[32]u8,
+            commands: []const @import("relational_integrity_contract.zig").Command,
+        ) ![]const transactions_mod.WriteIntent {
+            if (commands.len == 0) return &.{};
+            const integrity_mod = @import("relational_integrity.zig");
+            const catalog_mod = @import("relational_integrity_catalog.zig");
+            const retirement_mod = @import("relational_integrity_retirement.zig");
+            const shadow_mod = @import("online_integrity_shadow.zig");
+            const store = S.ownerField(self, "core").*.store;
+            const byte_range = S.ownerField(self, "core").*.byteRange();
+
+            // Nothing was ever begun or written as an "intent" under any
+            // txn id for this call, so a fresh random id only needs to
+            // avoid colliding with a REAL pending transaction's id -- it
+            // exists purely so the read guard below can tell this call's
+            // (nonexistent) own pending writes apart from someone else's.
+            var scratch_txn_id: transactions_mod.TxnId = undefined;
+            const scratch_io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
+            try scratch_io.randomSecure(&scratch_txn_id);
+            var integrity_read = try integrity_mod.CurrentView.initForTransaction(store, alloc, scratch_txn_id);
+            defer integrity_read.deinit();
+
+            for (commands) |command| try shadow_mod.requireServing(&integrity_read, byte_range, &command.address.routing);
+
+            const raw_catalog = integrity_read.get(catalog_mod.key) catch |err| switch (err) {
+                error.NotFound => return error.IntegrityCatalogChanged,
+                else => return err,
+            };
+            var catalog = try catalog_mod.decode(alloc, raw_catalog);
+            defer catalog.deinit();
+            if (generation_set) |expected| {
+                const actual = @import("relational_integrity_activation.zig").generationSet(catalog);
+                if (!std.mem.eql(u8, &expected, &actual)) return error.IntegrityCatalogChanged;
+            }
+            const version = schema_version orelse return error.PreparedGenerationChanged;
+            if (catalog.schema_version != version) return error.PreparedGenerationChanged;
+            const incarnation = try catalog_mod.incarnationFromTableId(S.ownerField(self, "core").*.identity_namespace.table_id);
+            if (!std.mem.eql(u8, &incarnation, &catalog.incarnation)) return error.IntegrityCatalogIncarnationMismatch;
+            for (commands) |command| {
+                const generation = catalog.findGeneration(command.address.generation) orelse return error.IntegrityCatalogChanged;
+                if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
+                if (generation.retired and (command.operation == .establish or command.operation == .attach)) return error.IntegrityCatalogChanged;
+            }
+
+            try retirement_mod.requireMutable(&integrity_read);
+            try retirement_mod.admitCommands(&integrity_read, commands);
+
+            var effects = try integrity_mod.prepare(alloc, &integrity_read, commands);
+            defer effects.deinit();
+            try integrity_mod.validatePreparedEffects(alloc, &integrity_read, effects.operations);
+
+            var predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
+            defer predicates.deinit(alloc);
+            var intents = std.ArrayListUnmanaged(transactions_mod.WriteIntent).empty;
+            errdefer intents.deinit(alloc);
+            for (effects.operations) |operation| {
+                try shadow_mod.requireServing(&integrity_read, byte_range, operation.routing_key);
+                const parsed = try integrity_mod.parseKey(operation.key);
+                const generation = catalog.findGeneration(parsed.address.generation) orelse return error.IntegrityCatalogChanged;
+                if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
+                if (generation.retired and operation.kind != .delete) return error.IntegrityCatalogChanged;
+                try predicates.append(alloc, integrity_mod.predicate(operation));
+                if (operation.kind != .guard) {
+                    // Copy out of `effects.arena` (freed by the `defer`
+                    // above when this function returns) into `alloc`,
+                    // which the caller keeps alive for the whole commit.
+                    const key_copy = try alloc.dupe(u8, operation.key);
+                    const value_copy = if (operation.value) |value| try alloc.dupe(u8, value) else null;
+                    try intents.append(alloc, .{ .key = key_copy, .value = value_copy });
+                }
+            }
+
+            var manager = try S.ownerField(self, "core").*.initTxnManager();
+            defer manager.deinit();
+            try manager.checkVersionPredicates(predicates.items, null);
+            try manager.checkIntentConflicts(intents.items, null);
+
+            return try intents.toOwnedSlice(alloc);
         }
 
         pub fn tryLockApplyForPortableRuntime(self: anytype) !void {

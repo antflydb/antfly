@@ -67,6 +67,25 @@ pub const Mutation = struct {
     is_delete: bool = false,
 };
 
+/// An outstanding, not-yet-waited-on commit of a `.ride_along` `Sink.submit`
+/// (see `Sink.submitDeferred`). Opaque: `Backend` never needs to know what
+/// concrete thing `ptr` is (a `lite/docstore.zig` `Store.Ticket`'s container,
+/// for `native_catalog_sink.zig`'s implementation), only that `wait()` must
+/// run exactly once, eventually, to free it and observe its error (if any).
+/// This is what lets several ride-along `NamespaceTxn.commit()`s -- e.g. one
+/// per background pass of a multi-pass maintenance sweep -- each return
+/// immediately (this backend's own in-memory mirror is already updated by
+/// the time `commit()` returns, independent of this) instead of each
+/// blocking on its own durability barrier; see `Backend.pending_ride_along`.
+pub const Pending = struct {
+    ptr: *anyopaque,
+    waitFn: *const fn (ptr: *anyopaque) anyerror!void,
+
+    pub fn wait(self: Pending) anyerror!void {
+        return self.waitFn(self.ptr);
+    }
+};
+
 /// Durable storage underlying this backend's in-memory mirror. Implemented
 /// concretely by `lite/native_catalog_sink.zig` against a Lite `.aflite`
 /// file's native index-catalog records. A single `Sink` value may be shared
@@ -88,6 +107,20 @@ pub const Sink = struct {
     /// allocated with the given allocator and freed by the caller
     /// immediately after use.
     loadAllAlloc: *const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry,
+    /// Optional (`null` for a `Sink` with no deferred path, e.g. the test
+    /// fakes below): like `submit`, but for `durable = false` only, and
+    /// never blocks waiting for the underlying group commit to apply --
+    /// `mutations` is deep-copied before this returns, so the caller's own
+    /// buffers (`NamespaceTxn.pending`'s arena) may be freed immediately
+    /// after. Returns a `Pending` the caller must eventually `wait()` on
+    /// (directly, or via `Backend.pending_ride_along`'s batching) to avoid
+    /// leaking the underlying group-commit request and to observe a late
+    /// failure. See the design doc's §3.2a "group membership, not
+    /// standalone commits": this is what lets `NamespaceTxn.commit()` join
+    /// the next group-commit queue instead of leading (and closing) its own
+    /// one-member group every time, without adding a wait the caller doesn't
+    /// need yet.
+    submitDeferred: ?*const fn (ptr: *anyopaque, scope: []const u8, mutations: []const Mutation) anyerror!Pending = null,
 };
 
 const State = struct {
@@ -155,6 +188,18 @@ pub const Backend = struct {
     open_options: backend_types.OpenOptions,
     state: *RcState,
     mutex: std.atomic.Mutex = .unlocked,
+    /// Ride-along commits (`NamespaceTxn.commit()` with `durable = false`)
+    /// staged via `sink.submitDeferred` but not yet waited on (design doc
+    /// §3.2a: background work rides along and is crash-recomputable, but a
+    /// `Pending` still owns a heap-allocated group-commit request that
+    /// must eventually be freed, and a late failure must eventually
+    /// surface). Drained opportunistically -- never on a count or byte
+    /// threshold of its own, which would just reintroduce the per-pass
+    /// durability-barrier wait this exists to avoid; see
+    /// `enqueuePendingRideAlong`. Writers to this backend are already
+    /// serialized by the caller's own per-index lock
+    /// (`capabilities().single_writer`), so this needs no lock of its own.
+    pending_ride_along: std.ArrayListUnmanaged(Pending) = .empty,
 
     pub fn init(allocator: Allocator, options: Options) !Backend {
         const scope = try allocator.dupe(u8, options.scope);
@@ -197,11 +242,56 @@ pub const Backend = struct {
     }
 
     pub fn close(self: *Backend) void {
+        // Close is one of §3.2a's durability barriers: never leave a
+        // ride-along `Pending` un-waited (and so its group-commit request
+        // heap-leaked) just because nothing else happened to drain it.
+        // Any error from a ride-along commit is unrecoverable at this point
+        // (the work is designed to be safe to lose) -- it was already
+        // logged/surfaced, if at all, inside `wait()`'s own implementation.
+        self.drainPendingRideAlong() catch {};
+        self.pending_ride_along.deinit(self.allocator);
         lockBackend(self);
         releaseState(self.allocator, self.state);
         self.mutex.unlock();
         self.allocator.free(self.scope);
         self.* = undefined;
+    }
+
+    /// Stash a ride-along commit's `Pending` for later, batched `wait()`ing
+    /// (design doc §3.2a). Deliberately never drains itself on a count (or
+    /// any other) threshold: with no concurrent foreground group and the
+    /// idle-flush timer not yet due, nothing but that timer (or a future
+    /// durable commit) ever resolves a ride-along ticket, so a `wait()`
+    /// here would block for however long that takes -- re-imposing, just
+    /// at a coarser granularity, the exact per-pass durability-barrier
+    /// wait this exists to avoid (caught by
+    /// "lite graph metric-build background passes ride along" wanting
+    /// zero extra syncs: an earlier version of this function drained every
+    /// 8 entries and forced the idle timer to fire mid-sequence). Draining
+    /// instead happens only where `wait()` is either free (a just-returned
+    /// durable commit on this same backend already covers every earlier
+    /// ride-along ticket still in this list -- see `NamespaceTxn.commit`)
+    /// or already required (`close`).
+    fn enqueuePendingRideAlong(self: *Backend, pending: Pending) !void {
+        try self.pending_ride_along.append(self.allocator, pending);
+    }
+
+    /// Waits on every accumulated ride-along `Pending`, in enqueue (so
+    /// also apply/queue) order, then clears the list regardless of outcome
+    /// -- a `Pending` whose `wait()` already ran must never be waited on
+    /// again. Returns the first error encountered (after still waiting on
+    /// the rest, so nothing downstream of it leaks), matching
+    /// `driveMutationCoordinator`'s own "every member equally uncertain on
+    /// a shared-commit failure" semantics.
+    pub fn drainPendingRideAlong(self: *Backend) !void {
+        defer self.pending_ride_along.clearRetainingCapacity();
+        var first_err: ?anyerror = null;
+        for (self.pending_ride_along.items) |pending| {
+            pending.wait() catch |err| {
+                if (first_err == null) first_err = err;
+            };
+        }
+        if (first_err) |err| return err;
     }
 
     pub fn capabilities(_: *Backend) backend_types.Capabilities {
@@ -520,7 +610,36 @@ pub const Backend = struct {
                 // tag" regression test.
                 const trace_scope = wal_trace.scopeDefault(.main_txn_commit);
                 defer trace_scope.end();
-                try self.backend.sink.submit(self.backend.sink.ptr, self.backend.scope, self.pending.items, self.durable);
+                // Ride-along (`!self.durable`): stage without blocking, when
+                // the sink supports it. `submitDeferred` deep-copies
+                // `self.pending.items` before returning, so `pending_arena`
+                // (below) stays safe to free right away even though the
+                // real native commit this joins may not apply until some
+                // later foreground group or idle-flush barrier drains the
+                // queue -- see `Backend.pending_ride_along`'s doc comment
+                // for why this call must not itself wait. Falls back to the
+                // old always-blocking `submit` for a `Sink` with no deferred
+                // path (every current fake/test `Sink`), which keeps this
+                // exactly as correct -- just not as fast -- as before.
+                if (!self.durable and self.backend.sink.submitDeferred != null) {
+                    const pending = try self.backend.sink.submitDeferred.?(self.backend.sink.ptr, self.backend.scope, self.pending.items);
+                    try self.backend.enqueuePendingRideAlong(pending);
+                } else {
+                    try self.backend.sink.submit(self.backend.sink.ptr, self.backend.scope, self.pending.items, self.durable);
+                    // Opportunistic, free drain: this durable commit just
+                    // led (or joined) a group-commit that -- being a
+                    // foreground/durable group -- already swept up every
+                    // ride-along member already staged on the same Store,
+                    // this backend's own earlier ride-along commits
+                    // included. Their `Pending.wait()` is therefore already
+                    // resolved by the time `submit` above returns, so this
+                    // never blocks. A failure here is a PAST ride-along
+                    // commit's, not this (already-succeeded, already-
+                    // durable) one's -- swallowed the same way `close()`
+                    // does, consistent with ride-along work being safe to
+                    // lose per the design doc's crash invariant.
+                    if (self.durable) self.backend.drainPendingRideAlong() catch {};
+                }
                 wal_trace.recordCommit();
             }
 
