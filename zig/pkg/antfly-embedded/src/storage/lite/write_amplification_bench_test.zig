@@ -57,6 +57,18 @@ const algebraic_index_name = "algebraic_wamp_v0";
 const algebraic_config_json =
     \\{"version":1,"table":"docs","group_fields":[{"name":"region","path":"region","type":"string"},{"name":"customer","path":"customer","type":"string"}],"hll_cardinalities":[{"name":"customers_by_region","group_by":["region"],"value_field":"customer"}]}
 ;
+// `measureSingleWriterAlgebraicOverwrite`'s key cycle: small enough (vs.
+// `measureSingleWriterAlgebraic`'s 128-key cycle, which at `default_updates
+// = 128` never repeats a key and so never overwrites one) that most writes
+// in a `default_updates`-sized run land on a key already written earlier in
+// the same run with a *different* seed -- and so a different `customer`
+// value -- retracting the old fact and marking the HLL cardinality sketch
+// dirty (`Index.hllCardinalityDirtyTxn`). `runHllMaintenance`'s own doc
+// comment: "Rebuilds any HLL cardinality materialization marked dirty by a
+// delete or overwrite" -- only an overwrite (or delete) workload exercises
+// its ride-along commit at all; the plain insert-only `algebraic` mode above
+// never dirties it.
+const algebraic_overwrite_key_cycle: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Instrumented std.Io: the harness's own leaf IO counting layer. Delegates
@@ -858,6 +870,29 @@ fn measureConcurrentAlgebraic(alloc: std.mem.Allocator, comptime name: []const u
     return .{ .updates = writers * updates_per_writer, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
 }
 
+/// Single-writer algebraic *overwrite* mode: same fixture and sync level as
+/// `measureSingleWriterAlgebraic`, but a small key cycle
+/// (`algebraic_overwrite_key_cycle`) so most writes overwrite an existing
+/// doc's group-by/customer value instead of inserting a fresh one -- the
+/// only way to dirty and so exercise the HLL cardinality sketch's ride-along
+/// maintenance path (`runHllMaintenance`/`flushPendingHllObservations`),
+/// which the insert-only `algebraic` mode above never triggers.
+fn measureSingleWriterAlgebraicOverwrite(alloc: std.mem.Allocator, comptime name: []const u8, updates: usize) !ModeReport {
+    var fixture = try Fixture.open(alloc, name, .algebraic);
+    defer fixture.close();
+
+    var key_buffer: [32]u8 = undefined;
+    wal_trace.reset();
+    wal_trace.registerCallingThread();
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    for (0..updates) |i| {
+        const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i % algebraic_overwrite_key_cycle});
+        try insertOneAlgebraic(alloc, fixture.handle, key, i, "full_index");
+    }
+    const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    return .{ .updates = updates, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
+}
+
 // ---------------------------------------------------------------------------
 // Relational write-surface modes (lite-single-commit-write-path.md §3.3c):
 // secondary indexes, unique constraints, foreign keys, and SQL INSERT/UPDATE
@@ -1443,6 +1478,12 @@ const ReportJson = struct {
     /// native commit.
     algebraic: ModeJson,
     algebraic_8_writers: ModeJson,
+    /// Same algebraic config, but overwriting a small cycle of keys instead
+    /// of inserting fresh ones every time -- the only workload shape that
+    /// dirties the HLL cardinality sketch and so exercises its ride-along
+    /// maintenance commit (`algebraic_hll_maintenance`'s background syncs),
+    /// which the insert-only `algebraic` mode above always reads as zero.
+    algebraic_overwrite: ModeJson,
 };
 
 test "lite write amplification report" {
@@ -1461,6 +1502,7 @@ test "lite write amplification report" {
     const sparse_concurrent = try measureConcurrentVector(alloc, "lite-write-amp-sparse-concurrent", true, default_writers, updates / default_writers);
     const algebraic = try measureSingleWriterAlgebraic(alloc, "lite-write-amp-algebraic", updates);
     const algebraic_concurrent = try measureConcurrentAlgebraic(alloc, "lite-write-amp-algebraic-concurrent", default_writers, updates / default_writers);
+    const algebraic_overwrite = try measureSingleWriterAlgebraicOverwrite(alloc, "lite-write-amp-algebraic-overwrite", updates);
 
     std.debug.print("lite write amplification report (updates={d}, text_bytes={d}, dense_dims={d}, sparse_terms={d}):\n", .{ updates, text_bytes, dense_dims, sparse_terms });
     printStageTable("primary-only", primary);
@@ -1475,6 +1517,16 @@ test "lite write amplification report" {
     printStageTable("sparse-vector-visible, 8 writers", sparse_concurrent);
     printStageTable("algebraic-visible", algebraic);
     printStageTable("algebraic-visible, 8 writers", algebraic_concurrent);
+    printStageTable("algebraic-visible, overwrite", algebraic_overwrite);
+
+    // Journal suppression + ride-along HLL maintenance target (lite-single-
+    // commit-write-path.md §3.2a/§3.3b): even a workload that dirties and
+    // rebuilds the HLL sketch on most writes still reaches 1.0 durable
+    // commits/write with 0 background syncs/update -- the dirty rebuild
+    // rides along in the SAME native transaction as the write that dirtied
+    // it (or a later one), never forcing a sync of its own.
+    try expectAtMost(algebraic_overwrite.durableCommitsPerWrite(), 1.0, "algebraic overwrite durable commits/write");
+    try expectAtMost(algebraic_overwrite.perUpdate(.background), 0.0, "algebraic overwrite background syncs/update");
 
     const report: ReportJson = .{
         .text_bytes = text_bytes,
@@ -1492,6 +1544,7 @@ test "lite write amplification report" {
         .sparse_vector_8_writers = modeJson(sparse_concurrent),
         .algebraic = modeJson(algebraic),
         .algebraic_8_writers = modeJson(algebraic_concurrent),
+        .algebraic_overwrite = modeJson(algebraic_overwrite),
     };
     const json_text = try std.json.Stringify.valueAlloc(alloc, report, .{ .whitespace = .indent_2 });
     defer alloc.free(json_text);
