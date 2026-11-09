@@ -391,3 +391,126 @@ Throughput gates compare against SQLite in the same run of `scripts/bench/lite_s
 10. An injected fsync error sends `OutcomeUnknown` to every member and triggers reconciliation.
 11. Non-owner processes never retire, merge or reconcile.
 12. A v8 build refuses a v7 file.
+
+## 7. Status: commit-efficiency verification (`perf/lwa-commit-eff2`, Debug harness)
+
+Lands `b60ca652ab` (ride-along commits join the next group instead of
+leading their own, via `Store.stageRideAlong`) and `37a00f96fd` (native
+commit manifest format v9: a run table of zero or more `(range_start,
+count, crc[])` entries instead of one assumed-contiguous run, so a window
+spanning several `flushTransactionWrites`/`persistAllocator` cycles no
+longer falls back to the two-sync presynced path). Base `3d3c1f7e56`,
+merged onto `da5239f5cd` with no conflicts.
+
+**Debug harness (`zig build lite-write-amplification`, 128 updates,
+1 writer unless noted), before (HEAD `da5239f5cd`) vs. after:**
+
+| Mode | syncs/update before → after | durable commits/write | writes/s before → after |
+|---|---|---|---|
+| Primary only | 2.0 → **1.0** | 1.0 | 8.1 → 8.1 |
+| Full-text visible (indexed) | 2.03 → **1.02** | 1.03 | 4.7 → 4.8 |
+| Graph visible | 2.0 → **1.0** | 1.0 | 6.3 → 5.4 |
+| Dense vector visible | 2.0 → **1.0** | 1.0 | 4.5 → 4.4 |
+| Sparse vector visible | 2.0 → **1.0** | 1.0 | 0.7 → 0.6 (unchanged; §7.3) |
+| Relational foreign-key child insert | 29.9 → **15.1** | 16.3 | 1.0 → 1.0 |
+
+The second sync (the v8 manifest-contiguity fallback) is gone in every
+mode: calling-thread syncs/update is ~1.0 everywhere (full-text/graph's
+1.02-1.03 is real multi-commit overhead from unrelated bookkeeping, not a
+second sync). Sparse vector throughput is unchanged -- its cost is a
+separate, still-open problem (§7.3), not a sync-count problem.
+
+### 7.1 A latent, now-fixed ride-along hang
+
+`Store.ensureRideAlongFlushStarted` used to `tryLockStoreExclusive` to
+start the one-time idle-flush background task, skipping silently on
+contention (including the entire window a concurrent commit holds that
+lock for, `commit_in_sync != 0`) on the stated assumption that "the next
+`stageRideAlong` call gets another chance." Before `b60ca652ab`, nothing
+depended on that assumption: ride-along commits led (and closed) their
+own group immediately, so the idle timer was never the only thing that
+could resolve a pending ride-along ticket. After `b60ca652ab` (and this
+change's own `native_catalog_backend.zig` fix below), a ride-along ticket
+with no concurrent foreground write and no later `stageRideAlong` call
+depends entirely on that timer; losing the race to arm it left the ticket
+-- and `Store.close()`'s eventual `forceDrainDurable()` wait on it --
+blocked for however long until *something* drove the queue, which could
+be never. Reproduced as a genuine hang (zero CPU progress, not just slow)
+in `crash sweep: sustained full_index writes survive a crash during
+ride-along merge and retirement`, sampled to a `tryLock` loop stuck
+waiting on a `commit_in_sync`-held `store.mutex`. Fixed by guarding the
+one-time task spawn with a dedicated, essentially-never-contended lock
+(`ride_along_flush_start_mutex`) instead of the broad store-exclusive one,
+so arming can no longer be skipped by ordinary commit traffic. The same
+crash-sweep test passed twice in a row after the fix (previously hung for
+40+ minutes under load without producing a result).
+
+### 7.2 WS4 for background index maintenance
+
+`native_catalog_sink.Sink` gained `submitDeferred`/`Pending`
+(`storage/native_catalog_backend.zig`, `storage/lite/native_catalog_sink.zig`):
+`NamespaceTxn.commit()` with `durable = false` now stages via
+`Store.stageRideAlong` and returns immediately -- the backend's in-memory
+mirror is updated synchronously regardless, per the existing
+`applyExternallyCommittedMutations` contract -- instead of calling
+`Store.submitIndexMutation`, which always led (and closed) its own
+one-member group even when non-durable. `Backend.pending_ride_along`
+collects the resulting `Pending`s and drains them opportunistically: free,
+because a durable commit on the same backend already swept them into its
+own group by the time its `submit` returns; never on a count/byte
+threshold of its own, which regressed the `graph metric-build` test below
+by reintroducing a bounded form of the same per-pass idle wait this
+exists to remove. Verified via
+`storage.lite.docstore.test.lite graph metric-build background passes
+ride along: N passes plus one foreground write is one sync`: 11
+worker/coordinator passes, 0 syncs for those passes, confirmed via a
+direct harness run (`metric-build passes=11, syncs for those
+passes=0`) -- previously 11 standalone non-durable commits.
+
+**Still open:** three of the `WS4-for-graph`/`WS4-for-dense`
+`commits_for_this_write <= 6` regression tests failed under this session's
+extreme host contention (load average repeatedly 20-70 on 14 cores) with
+counts above 6, where they passed before this change. The working
+hypothesis is that the 50 ms idle-flush timer did not get scheduled before
+the tests' own setup-to-measurement window elapsed in wall time, so
+ride-along backlog from index setup that would normally have settled
+beforehand landed inside the measured write's own commit count instead.
+Not reproduced as a hang (all three completed and reported a concrete,
+too-high count), and not attempted to fix blind under the same contention
+that may be causing it; needs a clean re-run on a quiet host before
+deciding whether the bound needs tightening, loosening, or a structural
+fix (e.g. making index-open/seed settling wait on `Backend.
+pending_ride_along`, not just on application-level idle). The `<= 6`
+bounds are left unchanged rather than tightened, since the only values
+observed in this session were either unchanged (full-text, which passed)
+or anomalously high (graph/dense, under contention) -- neither supports a
+lower number yet.
+
+### 7.3 Sparse vector per-write cost: not yet fixed
+
+`SparseIndex.installInlineSparsePublication` → `native_catalog_backend.
+Backend.applyExternallyCommittedMutations` → persistent-treap `put` per
+mutation is architecturally proportional to the write's own size: with
+`sparse_terms = 32` (the harness's dimension count) and every term
+brand-new (the harness's deterministic token ids never repeat across the
+128 documents it writes), each write durably touches roughly 2 (forward/
+reverse) + 5 per term (chunk, chunk-range-meta, term-meta, term-catalog
+entry, term-range-meta) + 2 (counters) ≈ 164 keys, each a `mem_ordered.
+Tree.put` -- an O(log n) persistent-treap path copy, each node copy its
+own `allocator.create` plus three `allocator.dupe`s. Dense goes through
+the same backend at a handful of keys per write; the ~6x throughput gap
+(0.6-0.8 vs. 4.4-4.5 writes/s) is explained by that ratio of key count
+times Debug `GeneralPurposeAllocator`'s per-call stack-capture cost, not
+by an algorithmic defect in the business logic -- `addToPostings`'s
+"append to an existing chunk" path, the one case that really would rewrite
+an unnecessarily large existing posting list, is never exercised by this
+harness's non-colliding term ids. No fix attempted this session: the
+only concrete lever found (merging the chunk and chunk-range-meta writes
+into one key, cutting one `put` of five per term) is a durable key-format
+change with broad blast radius (every other `readChunkRangeMeta` caller)
+that was not safe to land and verify under this session's build/test
+turnaround and host contention. Left for a follow-up with a quiet host
+and real profiling (the file's own `WriteProfile` counters are already
+wired for the bulk-append path but not the incremental one `stageIncremental
+Mutations` uses; extending them there first would turn this from an
+estimate into a measurement before cutting anything).

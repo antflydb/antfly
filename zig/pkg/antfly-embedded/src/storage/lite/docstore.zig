@@ -1702,6 +1702,22 @@ pub const Store = struct {
     ride_along_idle_ns: u64 = 50 * std.time.ns_per_ms,
     ride_along_byte_threshold: usize = 1024 * 1024,
     ride_along_flush_started: std.atomic.Value(bool) = .init(false),
+    /// Guards only the one-time `ride_along_flush_future` spawn below --
+    /// deliberately not `self.mutex`/`lockStoreExclusive`'s broader
+    /// store-exclusive lock, which `ensureRideAlongFlushStarted` used to
+    /// `tryLock`. That lock is also what a commit mid-`syncIfRequired`
+    /// (`commit_in_sync != 0`) holds contended for the whole sync window,
+    /// so a `stageRideAlong` call landing during exactly that window used
+    /// to skip starting the flush loop with nothing guaranteed to retry:
+    /// if that was the only `stageRideAlong` call this Store ever saw (no
+    /// later call, no foreground write), the idle-flush timer -- the one
+    /// thing a lone ride-along ticket needs to ever resolve without a
+    /// foreground write riding behind it -- would never start at all, and
+    /// `Ticket.wait()` would block until `close()`'s own
+    /// `forceDrainDurable()` (not gated on this lock). A dedicated,
+    /// essentially-never-contended lock removes that gap: this init can
+    /// no longer be skipped by unrelated store activity.
+    ride_along_flush_start_mutex: std.atomic.Mutex = .unlocked,
     ride_along_flush_cancel: maintenance.CancelToken = .{},
     ride_along_flush_future: ?std.Io.Future(void) = null,
     ride_along_wake: std.Io.Event = .unset,
@@ -3307,14 +3323,23 @@ pub const Store = struct {
     fn ensureRideAlongFlushStarted(self: *Store) void {
         if (self.ride_along_flush_started.load(.acquire)) return;
         if (self.read_only) return;
-        // Non-blocking, like the maintenance kicks elsewhere (WS2): a
-        // ride-along caller must never pay for someone else's in-flight
-        // commit just to start this one-time background task. If
-        // self.mutex is contended right now, skip starting it this call --
-        // the next stageRideAlong (or this same byte threshold, checked
-        // without needing self.mutex at all) gets another chance.
-        if (!tryLockStoreExclusive(self)) return;
-        defer self.mutex.unlock();
+        // Guarded by `ride_along_flush_start_mutex`, not the store-exclusive
+        // lock (`lockStoreExclusive`/`tryLockStoreExclusive`): that lock is
+        // also held for an entire in-flight group's `commit_in_sync` sync
+        // window, so a `tryLock` here used to be able to lose to ordinary
+        // commit traffic. If this call is the ONLY `stageRideAlong` this
+        // Store ever sees -- no later call, no foreground write -- nothing
+        // else would ever retry, so a lost race here used to mean the
+        // idle-flush timer (the one thing a lone ride-along ticket needs to
+        // resolve without a foreground write riding behind it) never starts
+        // at all; `Ticket.wait()` then blocks until `close()`'s own
+        // `forceDrainDurable()`, not this barrier. `ride_along_flush_start_
+        // mutex` is contended only by this tiny critical section (never by
+        // an in-flight commit's sync window), so blocking on it here is
+        // cheap and bounded -- unlike the store-exclusive lock, it can't be
+        // held by someone else for a whole fsync.
+        platform_sync.lockYielding(&self.ride_along_flush_start_mutex);
+        defer self.ride_along_flush_start_mutex.unlock();
         if (self.ride_along_flush_started.load(.acquire)) return;
         self.ride_along_flush_future = self.file.runtime().concurrent(rideAlongFlushLoop, .{self}) catch return;
         self.ride_along_flush_started.store(true, .release);
@@ -4259,9 +4284,10 @@ pub const Txn = struct {
         self.* = undefined;
     }
 
-    /// `durable = false` commits through Store.commitRideAlong instead of a
-    /// group-commit ticket, so this transaction never forces its own fsync:
-    /// it becomes durable when a later durable commit's checkpoint covers it
+    /// `durable = false` commits through `Store.stageRideAlong` instead of
+    /// a leading/closing group-commit ticket, so this transaction never
+    /// forces its own fsync: it joins whichever group's native transaction
+    /// next forms and becomes durable when that group's checkpoint commits
     /// (design doc §3.2a). Only owner-turn background work (retirement,
     /// reclamation, catch-up, status) may pass false; foreground and
     /// acknowledgement callers keep `commit()`'s durable default, or an
@@ -4298,13 +4324,21 @@ pub const Txn = struct {
     /// `mutations`/`context` must stay alive until the group's apply runs,
     /// which is only guaranteed once the ticket resolves -- not merely once
     /// it is staged, since staging may just enqueue behind an in-flight
-    /// group. `wait` is therefore also where the transaction's pending
-    /// buffers (which `mutations`' key/value slices borrow from) are freed:
-    /// freeing them any earlier would race the group leader's apply.
+    /// group (a ride-along member in particular may sit queued until a
+    /// foreground group forms, or `forceDrainDurable`'s idle-flush/byte-
+    /// threshold barrier leads on its behalf -- see `Store.stageRideAlong`).
+    /// `wait` is therefore also where the transaction's pending buffers
+    /// (which `mutations`' key/value slices borrow from) are freed: freeing
+    /// them any earlier would race the group leader's apply.
     pub const StagedCommit = struct {
         allocator: Allocator = undefined,
         txn: ?*Txn = null,
         staged: ?Store.Staged = null,
+        /// Set instead of `staged` for a ride-along commit (§3.2a): a
+        /// `Store.Ticket` straight from `Store.stageRideAlong`, which --
+        /// unlike `Store.Staged` -- never leads/drives its own group, so
+        /// there is no `drive()` step here, only the wait.
+        ride_along_ticket: ?Store.Ticket = null,
         context: ?*PrimaryCommitContext = null,
 
         pub fn wait(self: StagedCommit) !void {
@@ -4318,6 +4352,8 @@ pub const Txn = struct {
             if (self.staged) |staged| {
                 staged.drive();
                 try staged.ticket().wait();
+            } else if (self.ride_along_ticket) |ticket| {
+                try ticket.wait();
             }
             // Only on success: a failed ticket (OutcomeUnknown, a rejected
             // apply) leaves the transaction exactly as `commitStaged` left
@@ -4395,10 +4431,20 @@ pub const Txn = struct {
         // fsync. Driving here would make a leader run its whole group
         // (fsync included) while the caller still holds the DB apply lock
         // and the capi writer lane, so no other writer could join the group.
-        // Ride-along work commits synchronously without a ticket; it has no
-        // durability wait of its own.
+        // Ride-along work joins the next group's native transaction via
+        // `Store.stageRideAlong` (§3.2a's "group membership, not standalone
+        // commits") instead of leading a standalone `commitRideAlong` of its
+        // own: one copy-on-write publication, allocator-ledger write and
+        // slot write then covers both this ride-along member and whichever
+        // foreground write (or `forceDrainDurable` barrier) next drains the
+        // queue, rather than paying those bytes again on every ride-along
+        // commit. `stageRideAlong` never leads/closes a group itself, so
+        // its ticket is stashed on `ride_along_ticket` instead of `staged`
+        // (no `drive()` step applies); `StagedCommit.wait()` waits on
+        // whichever of the two is set.
+        var ride_along_ticket: ?Store.Ticket = null;
         const staged: ?Store.Staged = if (self.ride_along) staged: {
-            try store.commitRideAlong(context, PrimaryCommitContext.apply);
+            ride_along_ticket = try store.stageRideAlong(.{ .context = context, .apply = PrimaryCommitContext.apply, .estimated_bytes = estimated_bytes });
             break :staged null;
         } else try store.enqueue(.{ .context = context, .apply = PrimaryCommitContext.apply, .estimated_bytes = estimated_bytes });
         self.releaseGenerationReadLock();
@@ -4407,7 +4453,7 @@ pub const Txn = struct {
             self.writer_reserved = false;
         }
 
-        return .{ .allocator = allocator, .txn = self, .staged = staged, .context = context };
+        return .{ .allocator = allocator, .txn = self, .staged = staged, .ride_along_ticket = ride_along_ticket, .context = context };
     }
 
     pub fn commit(self: *Txn) !void {
