@@ -532,6 +532,7 @@ pub fn checkCheckpointsViaDb(
     var required = try finalAcknowledgedState(allocator, split.durable_acknowledged);
     defer required.deinit(allocator);
 
+    if (native.recovery_debug_log) std.debug.print("[native-recovery] >>> checkCheckpointsViaDb verification open path={s} crashed={}\n", .{ path, outcome != null });
     var handle = openDbWithIo(allocator, path, std.testing.io, false) catch |err| {
         if (required.count() != 0) return err;
         return;
@@ -2849,8 +2850,10 @@ const ride_along_steps: [ride_along_key_count * ride_along_round_count]RideAlong
 };
 
 fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    if (native.recovery_debug_log) std.debug.print("[native-recovery] === subrun start path={s} ===\n", .{path});
     var handle = try openDbWithIo(allocator, path, io, true);
     defer handle.close();
+    defer if (native.recovery_debug_log) std.debug.print("[native-recovery] === subrun end path={s} ===\n", .{path});
 
     // Reaches the same merge/retirement machinery the production repro
     // needed ~7,500 writes for in a handful of writes instead -- see the
@@ -2869,6 +2872,14 @@ fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const 
             .expectations = &.{.{ .key = step.key, .before = step.before, .after = step.after, .searchable_after = step.after }},
         });
         try handle.db.batch(.{ .writes = &.{.{ .key = step.key, .value = json }}, .sync_level = .full_index });
+        if (native.recovery_debug_log) if (handle.backend.native_docstore) |store| {
+            std.debug.print("[native-recovery] acked key={s} value={s} commit_sequence={d} durable_header_set={}\n", .{
+                step.key,
+                step.after,
+                store.file.activeCheckpoint().commit_sequence,
+                store.file.durable_header != null,
+            });
+        };
 
         // Mirrors production: a WS5 retirement turn driven explicitly here
         // (this harness bypasses the Owner/pool layer that normally drives
@@ -2880,6 +2891,16 @@ fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const 
 }
 
 test "crash sweep: sustained full_index writes survive a crash during ride-along merge and retirement" {
+    // Regression B investigation (AcknowledgedWriteLost under ride-along
+    // merge/retirement): scope native.zig's recovery instrumentation to
+    // just this scenario, so a failing run's checkpoint-candidate/verify
+    // trace and every ride-along-vs-durable commit's resulting sequence
+    // are directly in the test log instead of needing a separate
+    // instrumented rebuild.
+    const prior_recovery_log = native.recovery_debug_log;
+    native.recovery_debug_log = true;
+    defer native.recovery_debug_log = prior_recovery_log;
+
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "sustained-full-index-ride-along",
         .run = runSustainedFullIndexRideAlongUnderCrash,

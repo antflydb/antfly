@@ -5043,6 +5043,19 @@ pub const VacuumImage = struct {
 
 pub const ReaderCoordinator = @import("reader_coordinator.zig").Coordinator;
 
+/// Off by default. Crash/durability investigations (regression B: an
+/// acknowledged full_index write surviving to a stale checkpoint after a
+/// ride-along merge/retirement) flip this on for the duration of their own
+/// run to log every recovery candidate's slot index/commit_sequence/verify
+/// result, and every ride-along (non-durable) commit's resulting
+/// commit_sequence and whether durable_header moved.
+pub var recovery_debug_log: bool = false;
+
+fn recoveryDebugLog(comptime fmt: []const u8, args: anytype) void {
+    if (!recovery_debug_log) return;
+    std.debug.print("[native-recovery] " ++ fmt ++ "\n", args);
+}
+
 var test_header_fingerprint_hashes: std.atomic.Value(u64) = .init(0);
 
 test "lite header fingerprints cache unchanged state and fence every header field" {
@@ -13048,12 +13061,19 @@ pub const NativeFile = struct {
             // durability barrier. Readers on this handle see the new roots;
             // reopening after a crash sees the previous complete checkpoint.
             if (changed) {
+                const was_durable_header_null = self.durable_header == null;
                 if (self.durable_header == null) self.durable_header = previous;
                 self.header.checkpoints[self.header.active_checkpoint] = next;
+                recoveryDebugLog("ride-along commit (non-durable) commit_sequence={d} captured_durable_header={} durable_header_commit_sequence={d}", .{
+                    next.commit_sequence,
+                    was_durable_header_null,
+                    self.durable_header.?.checkpoints[self.durable_header.?.active_checkpoint].commit_sequence,
+                });
             }
             return;
         }
         if (changed) {
+            recoveryDebugLog("durable commit commit_sequence={d} durable_header_was_set={}", .{ next.commit_sequence, self.durable_header != null });
             const manifest_prepared = if (manifest_commits_enabled) try self.tryBuildCommitManifest(&next) else false;
             if (!manifest_prepared) try self.syncIfRequired(hooks);
             try self.publishCheckpoint(next, manifest_prepared, hooks);
@@ -14593,12 +14613,25 @@ fn recoverActiveCheckpoint(
         candidates += 1;
     }
     if (candidates == 0) return error.InvalidNativeCheckpoint;
+    if (recovery_debug_log) for (order[0..candidates], 0..) |index, rank| {
+        const slot = header.checkpoints[index];
+        recoveryDebugLog("candidate rank={d} slot_index={d} commit_sequence={d} presynced={} manifest_page={d} manifest_page_count={d}", .{ rank, index, slot.commit_sequence, slot.presynced, slot.manifest_page, slot.manifest_page_count });
+    };
     for (order[0..candidates], 0..) |index, rank| {
         const slot = header.checkpoints[index];
-        if (!verifyManifest(file, io, slot, header.page_size)) continue;
-        if (rank == 0) return .{ .index = index };
-        if (!allow_truncate) return .{ .index = index };
+        const verified = verifyManifest(file, io, slot, header.page_size);
+        recoveryDebugLog("verify slot_index={d} commit_sequence={d} verified={}", .{ index, slot.commit_sequence, verified });
+        if (!verified) continue;
+        if (rank == 0) {
+            recoveryDebugLog("chosen slot_index={d} commit_sequence={d} (top candidate, no fallback)", .{ index, slot.commit_sequence });
+            return .{ .index = index };
+        }
+        if (!allow_truncate) {
+            recoveryDebugLog("chosen slot_index={d} commit_sequence={d} (fallback rank={d}, read-only, no truncate)", .{ index, slot.commit_sequence, rank });
+            return .{ .index = index };
+        }
         const truncated_size = try checkpointPrefixSize(slot, header.page_size);
+        recoveryDebugLog("chosen slot_index={d} commit_sequence={d} (fallback rank={d}, truncating to {d} bytes)", .{ index, slot.commit_sequence, rank, truncated_size });
         try file.setLength(io, truncated_size);
         return .{ .index = index, .truncated_to = truncated_size };
     }
