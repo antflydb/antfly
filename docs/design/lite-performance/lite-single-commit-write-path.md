@@ -596,42 +596,132 @@ bug: `docstore.zig`'s `rideAlongFlushLoop` (the idle-flush timer that bounds
 how long a ride-along write can sit undurable when no foreground commit
 comes along to carry it) still fires periodically, now tagged
 `.ride_along_flush` in `write_amplification_trace.zig` instead of falling
-into the unattributed `.other` bucket. `relational foreign-key` is
-unaffected (still ~15.5-15.7, unchanged) -- it still spans two physical
-tables through the full cross-database two-phase protocol; folding its
-`.attach` bookkeeping into the child's own fused commit is the multi-table
-coordinator described as follow-up work below, not done in this pass.
+into the unattributed `.other` bucket. `relational foreign-key` was
+unaffected by this pass (still ~15.5-15.7) -- it still spanned two
+physical tables through the full cross-database two-phase protocol;
+folding its `.attach` bookkeeping into the child's own fused commit is
+the multi-table coordinator §7.6 below implements.
 
-**Follow-up: the FK multi-table coordinator.** `capi/sql.zig`'s
-`eligibleForLocalDecision` excludes any multi-table request, and
-`mutation_commit.zig`'s `prepareLocalIntegrityDecision` refuses a `.foreign`
-generation command as defense-in-depth
-(`if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;`)
-even if something upstream routed one in. Each SQL table opens its own `*DB`
-(own `core.apply_mutex`) via `capi/tables.zig`'s `get(handle, name)`, all
-against the same `.aflite` file; `relational_integrity_contract.zig`'s
-claim/reference keys (`Address.key`) are addressed by `routing = hash(
-generation, tuple_digest)`, not by table id, so they live in a namespace
-shared by every table participating in one FK's `generation` -- the parent's
-`.attach`/`.detach` record can fold into the child's own native batch via
-`BatchExecutionOptions.extra_store_writes` exactly like a UNIQUE claim does
-today, with no separate commit against the parent's own store. What is
-missing is the lock discipline: a fused child insert/update needs the
-parent's row to stay stable while it claims/releases a reference, and a
-parent delete needs no concurrent child claim while it checks for zero
-remaining references, so both operations must hold *both* tables'
-`apply_mutex` for the duration of touching that shared state -- in one
-fixed global order (ascending `core.identity_namespace.table_id`) to rule
-out a deadlock between a child-insert-then-parent-check order on one thread
-and a parent-delete-then-child-check order on another. That requires a new
-entry point upstream of `commitCoordinatedLocal` that resolves every
-participant table via `tables.zig`'s `get`, sorts them by table id, and
-acquires their `apply_mutex`es in that order before the normal single-table
-batch logic runs -- not a change to `prepareLocalIntegrityDecision` in
-place, since by the time that runs today the caller already holds only its
-own table's lock. Not implemented this pass: a cross-table lock-ordering
-primitive is exactly the kind of thing worth its own dedicated, heavily
-stress-tested session rather than folding in under time pressure --
-the concurrency test matrix it needs (parent-delete racing child-insert
-across N threads with no orphan/lost-reject/deadlock, plus a two-table
-mutual-FK lock-order test) is substantial in its own right.
+### 7.6 FK multi-table coordinator: implemented
+
+Builds on §7.5's follow-up. `capi/sql.zig`'s `eligibleForLocalDecision`
+excluded any multi-table request, and `mutation_commit.zig`'s
+`prepareLocalIntegrityDecision` refused a `.foreign_key` generation
+command as defense-in-depth even if something upstream routed one in.
+Each SQL table opens its own `*DB` (own `core.apply_mutex`) via
+`capi/tables.zig`'s `get(handle, name)`, all against the same `.aflite`
+file.
+
+**Physical layout, corrected from §7.5's own assumption.**
+`relational_integrity_contract.zig`'s claim/reference keys are addressed
+by `hash(generation, tuple_digest)` with no table id in the *address*,
+but every key -- including these -- still passes through
+`docstore.zig`'s `Txn.prefixedKey`, which unconditionally prepends the
+owning table's own `"\x02db/" ++ namespace ++ "\x00"` key prefix
+(`storage/lite/backend.zig`'s `configureDbOpenOptionsForNamespace`).
+`api/relational_integrity_commit.zig`'s `Plan.expand` always attributes
+the `.attach`/`.detach` command to the **parent's own**
+`TableCommitRequest`, so in the working two-phase path it is validated
+and written through the parent's own `*DB`/`core.store`, landing under
+the parent's physical prefix -- never the child's. So §7.5's "fold the
+`.attach` into the child's own native batch via `extra_store_writes`"
+idea does not work: that would write the Reference under the *child's*
+prefix, where the parent's own later reference scans (at DELETE time)
+would never find it. The achievable design keeps the write split across
+two physical stores and instead shares one fsync between them.
+
+**Lock discipline.** `capi/sql.zig`'s `commitCoordinatedFusedMultiTable`
+is a new entry point upstream of `commitCoordinatedLocal`. For a
+prepared plan with exactly one table carrying real row writes/deletes
+(the *leader*, e.g. a child's own INSERT) and every other participant
+carrying only `integrity_commands` (a *follower*, e.g. the parent's
+`.attach`), it resolves every participant's `*DB` via `tables.zig`'s
+`get`, and -- only when every follower's `table_id` is smaller than the
+leader's -- locks each follower's `core.apply_mutex` directly, in
+ascending `table_id` order, before anything else runs. The leader's own
+lock is never touched directly: `commitCoordinatedLocal` acquires and
+releases it internally, unmodified, strictly after (and so strictly
+above, in table-id terms) every follower lock this call already holds.
+That keeps the full lock-acquisition sequence for this call -- every
+follower ascending, then the leader internally, last and largest -- in
+the same global ascending order a concurrent parent-side DELETE's own
+single-table `commitCoordinatedLocal` call follows (RESTRICT's
+"zero remaining references" check only ever touches the parent's own
+prefix, so it needs no cross-table lock at all, just its own
+`apply_mutex` -- already the correct serialization point against a
+concurrent attach, since both operations' writes land under that same
+prefix). A direction whose leader's `table_id` is *not* the largest
+(the other side of a mutual-FK pair, where each table is a parent to
+the other's child) falls back to the existing cross-database two-phase
+`sql_commit.zig` coordinator, which already serializes through
+`handle.sql_commit_mutex` -- never attempted through this lock-ordering
+scheme, so it can never invert it.
+
+**Commit sharing.** Each follower's validated effects are written via
+a ride-along commit (`BatchOptions.durability = .ride_along`) against
+that follower's own `core.store` -- all tables of one Lite single-file
+backend share one underlying `docstore.Store`, so the entry is swept
+into the very next foreground commit on *any* table of that store,
+normally the leader's own commit immediately following (lite-single-
+commit-write-path.md §3.2a/§7.2's existing pattern, not a new commit
+primitive).
+
+**The ambiguous-outcome bug this needed fixing.** The first version
+reverted every already-staged follower write (a synchronous,
+foreground compensating commit restoring prior bytes, or deleting a
+key that did not exist before) whenever the leader's call returned
+*any* error. Crash-sweep testing (`crash sweep: relational foreign-key
+child insert`, new in `crash_consistency_capi_test.zig`) caught this:
+`commitCoordinatedLocal` can fail with `error.SqlMutationOutcomeUnknown`
+-- an injected crash during checkpoint publication is the textbook
+case -- meaning the leader's row write *may already be durable*.
+Reverting on that ambiguous outcome durably erased the parent's
+Reference via the revert's own synchronous commit while the child row
+turned out to be genuinely durable: a parent DELETE then incorrectly
+succeeded despite a surviving child reference -- exactly the orphan
+this coordinator exists to prevent. Fixed by checking
+`dependencies.sql_errors.isUnknownOutcome(err)`: only a *definite*
+leader failure triggers the revert; an ambiguous one leaves every
+follower write exactly as staged and propagates the same uncertainty
+outward, matching `commitCoordinatedLocal`'s own existing
+ambiguous-outcome contract. (A narrower residual gap remains
+undefended: a crash during the revert's *own* commit, after a
+definite leader failure, could still leave a follower's stale
+Reference pointing at a child row that never came to exist -- a
+dangling reference, not an orphan. Not exercised by the current
+crash-sweep scenario and not closed in this pass.)
+
+**Measured** (`zig build lite-write-amplification`'s relational write
+surface report, 128 updates): `relational foreign-key child
+insert/update` dropped from ~15.5-16 to ~1.9 durable commits/write with
+1 writer, ~2.3 with 8. The residual above 1.0 is the same
+`ride_along_flush` idle-timer dynamic §3.3b documents for the
+algebraic overwrite case: the follower's ride-along write usually, but
+not always, gets swept into the exact same fsync as the leader's own
+foreground commit; when it loses that race it becomes durable on the
+next foreground commit (on any table of the store) or the 50ms
+idle-flush timer instead, costing close to a second commit. Gates
+tightened accordingly in `write_amplification_bench_test.zig`:
+`foreign_key.durableCommitsPerWrite()` from 20.0 to 3.0, plus a new
+`foreign_key_concurrent` gate at 3.5 (no gate existed for the
+concurrent mode before). Closing the remaining gap to ~1.0 needs the
+same cross-cutting ride-along-timing work §3.3b/§7.5 already flagged
+as follow-up, not a change specific to FK.
+
+**Tests.** `write_amplification_bench_test.zig` gained two concurrency
+regressions alongside the existing UNIQUE-race/missing-parent-race
+pair: a parent DELETE racing a child INSERT against the same parent
+(asserts the no-orphan invariant against final durable state, not
+per-worker outcome codes -- a DELETE matching zero rows still reports
+`.ok` under standard SQL semantics, so more than one racing DELETE can
+legitimately "win"), and a two-table mutual-FK pair with concurrent
+writers inserting in both directions (only one direction's leader
+qualifies for the fused path; the other takes the two-phase fallback;
+both must complete without deadlock). `crash_consistency_capi_test.zig`
+gained the FK child-insert crash-sim scenario described above. All
+pre-existing suites stayed green throughout:
+`capi-contract-test -Dtest-filter="relational"` (414 tests),
+`-Dtest-filter="capi SQL outcome"` (26 tests),
+`-Dtest-filter="crash sweep exhaustive"` (7 tests), and
+`antfly-storage-test -Dtest-filter="crash sweep"` (23 tests) -- all
+0 failed, 0 leaked.
