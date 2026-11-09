@@ -27,3 +27,9 @@ test {
     _ = @import("antfly_local_sources").storage_db_artifact_publication;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_input;
 }
+
+// Keep wire validation visible to the focused control filter as well as the
+// normal storage shards that own the implementation tests.
+test "distributed txn private control wire contracts" {
+    _ = @import("antfly_local_sources").api_internal_batch;
+}

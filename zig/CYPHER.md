@@ -6016,3 +6016,13 @@ Compiled readiness projections validate their nested control header against the
 shared query ABI, independently of the enclosing storage projection ABI. A real
 owner regression exercises both readiness operations with valid query controls
 and rejects substituted storage-version controls before executing owner reads.
+
+Legacy wire decoding preserves its document-version scheme on private controls.
+All exclusive control validators treat that scheme as transport metadata, so
+range tracking, graph cleanup, publications, catalog/proof controls, grouped
+sources and resolver review survive wire round trips without admitting mixed
+user mutations. The focused control-wire gate covers admission, legacy and
+revision-v1 envelopes, public rejection and mixed-effect rejection.
+Sole-control root counts exclude only the revision envelope's explicit scheme
+and mandatory zero timestamp; controls that disallow authored timestamps still
+reject nonzero timestamps.

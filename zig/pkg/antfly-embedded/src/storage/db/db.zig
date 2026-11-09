@@ -7734,6 +7734,7 @@ pub const DB = struct {
         // This boundary accepts a control only, never a mixed user mutation.
         const defaults: types.BatchRequest = .{};
         inline for (@typeInfo(types.BatchRequest).@"struct".field_names, @typeInfo(types.BatchRequest).@"struct".field_types) |reflected_name, field_type| {
+            if (comptime std.mem.eql(u8, reflected_name, "document_version_scheme")) continue;
             if (comptime !std.mem.eql(u8, reflected_name, "relational_topology") and !std.mem.eql(u8, reflected_name, "sync_level")) {
                 const value = @field(req, reflected_name);
                 if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
