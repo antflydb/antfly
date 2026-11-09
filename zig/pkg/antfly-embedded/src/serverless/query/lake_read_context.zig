@@ -71,24 +71,41 @@ pub const IoTrace = struct {
         peak_inflight: u64 = 0,
         opening_nanoseconds: u64 = 0,
         read_ahead_bytes: u64 = 0,
+        map_lookup_nanoseconds: u64 = 0,
+        map_provider_reads: u64 = 0,
+        map_provider_nanoseconds: u64 = 0,
+        map_locator_hits: u64 = 0,
+        prefetch_submitted: u64 = 0,
+        prefetch_declined: u64 = 0,
+        prefetch_queue_nanoseconds: u64 = 0,
+        navigation_provider_reads: u64 = 0,
+        navigation_provider_nanoseconds: u64 = 0,
+        payload_provider_reads: u64 = 0,
+        payload_provider_nanoseconds: u64 = 0,
+        cache_wait_nanoseconds: u64 = 0,
+        decoded_cache_hits: u64 = 0,
+        source_peak_inflight: u64 = 0,
+        hydration_lane_submitted: u64 = 0,
+        hydration_lane_declined: u64 = 0,
         source_provider_reads: u64 = 0,
         source_provider_bytes: u64 = 0,
         source_provider_nanoseconds: u64 = 0,
         source_provider_errors: u64 = 0,
         pub fn add(self: *Snapshot, other: Snapshot) void {
             inline for (@typeInfo(Snapshot).@"struct".field_names) |field| {
-                if (comptime std.mem.eql(u8, field, "peak_inflight")) @field(self, field) = @max(@field(self, field), @field(other, field)) else @field(self, field) +|= @field(other, field);
+                if (comptime std.mem.endsWith(u8, field, "peak_inflight")) @field(self, field) = @max(@field(self, field), @field(other, field)) else @field(self, field) +|= @field(other, field);
             }
         }
         pub fn since(self: Snapshot, before: Snapshot) Snapshot {
             var result: Snapshot = .{};
-            inline for (@typeInfo(Snapshot).@"struct".field_names) |field| @field(result, field) = if (comptime std.mem.eql(u8, field, "peak_inflight")) @field(self, field) else @field(self, field) -| @field(before, field);
+            inline for (@typeInfo(Snapshot).@"struct".field_names) |field| @field(result, field) = if (comptime std.mem.endsWith(u8, field, "peak_inflight")) @field(self, field) else @field(self, field) -| @field(before, field);
             return result;
         }
     };
     const fields = @typeInfo(Snapshot).@"struct".field_names.len;
     values: [fields]std.atomic.Value(u64) = @splat(.init(0)),
     active: std.atomic.Value(u64) = .init(0),
+    source_active: std.atomic.Value(u64) = .init(0),
     read_ahead_budget: ReadAheadBudget = .{},
     /// Composed leaves/refills share their outer request's one allowance.
     read_ahead_shared: ?*ReadAheadBudget = null,
@@ -116,6 +133,15 @@ pub const IoTrace = struct {
         inline for (@typeInfo(Snapshot).@"struct".field_names, 0..) |field, i| @field(result, field) = self.values[i].load(.monotonic);
         return result;
     }
+    pub fn beginSource(self: *IoTrace) void {
+        const active = self.source_active.fetchAdd(1, .monotonic) + 1;
+        inline for (@typeInfo(Snapshot).@"struct".field_names, 0..) |field, i| if (comptime std.mem.eql(u8, field, "source_peak_inflight")) {
+            _ = self.values[i].fetchMax(active, .monotonic);
+        };
+    }
+    pub fn endSource(self: *IoTrace) void {
+        _ = self.source_active.fetchSub(1, .monotonic);
+    }
     pub fn begin(self: *IoTrace) u64 {
         const active = self.active.fetchAdd(1, .monotonic) + 1;
         inline for (@typeInfo(Snapshot).@"struct".field_names, 0..) |field, i| if (comptime std.mem.eql(u8, field, "peak_inflight")) {
@@ -124,6 +150,21 @@ pub const IoTrace = struct {
         return @import("antfly_platform").time.monotonicNs();
     }
     pub fn end(self: *IoTrace, start: u64, requests: u64, bytes: u64, failed: bool) void {
+        self.endClass(start, requests, bytes, failed, .artifact);
+    }
+    pub fn endClass(self: *IoTrace, start: u64, requests: u64, bytes: u64, failed: bool, class: IoClass) void {
+        const elapsed = @import("antfly_platform").time.monotonicNs() -| start;
+        switch (class) {
+            .artifact => {},
+            .navigation => {
+                self.add("navigation_provider_reads", requests);
+                self.add("navigation_provider_nanoseconds", elapsed);
+            },
+            .payload => {
+                self.add("payload_provider_reads", requests);
+                self.add("payload_provider_nanoseconds", elapsed);
+            },
+        }
         _ = self.active.fetchSub(1, .monotonic);
         self.add("provider_reads", requests);
         self.add("provider_bytes", bytes);
@@ -132,7 +173,9 @@ pub const IoTrace = struct {
     }
 };
 
+pub const IoClass = enum { artifact, navigation, payload };
 pub const Context = struct {
+    io_class: IoClass = .artifact,
     io: ?std.Io = null,
     /// The owner has synchronized the construction allocator of every client
     /// used in this scope. Providers must separately advertise concurrency.

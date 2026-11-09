@@ -742,7 +742,10 @@ const Owner = struct {
             // its row groups; unordered scans may freeze a few files below.
             if (self.stream.iterator_parent.?.fileCount() != 1 or !try self.stream.freezeSmallEnumeration(maximum)) return self.splitEnumerated(a, maximum);
         }
-        if (self.stream.selection != null) return null;
+        if (self.stream.selection != null) {
+            if (self.stream.files.len < 2) return null;
+            return try self.splitChildren(a, @min(maximum, self.stream.files.len), true);
+        }
         if (self.started or self.dynamic != null or self.stream.partition_count != 1 or maximum < 2 or self.stream.source.scanner.shared_reader == null) return null;
         // Multiple files form lazy contiguous ranges. Opening a later footer
         // must not move its error ahead of an earlier successfully read prefix.
@@ -1079,7 +1082,7 @@ const Owner = struct {
             errdefer a.destroy(reader);
             reader.* = .{ .cache = parent_reader.cache, .base = parent_reader.base, .scope = parent_reader.scope, .context = parent_reader.context };
             source.scanner.shared_reader = reader;
-            cursor.* = try openPinned(a, self.table, .{ .fields = self.stream.columns, .conditions = self.conditions, .after = self.after, .before = self.before, .primary_key = self.primary_key, .limit = 1024 }, self.context, source);
+            cursor.* = try openPinned(a, self.table, .{ .fields = self.stream.columns, .conditions = self.conditions, .after = self.after, .before = self.before, .primary_key = self.primary_key, .physical_selection = self.stream.selection, .limit = 1024 }, self.context, source);
             const child: *Owner = @ptrCast(@alignCast(cursor.ptr));
             child.stream.examined = self.stream.examined;
             child.stream.limits = self.stream.limits;
@@ -2992,4 +2995,53 @@ test "lake SQL compact encodings accept all-null delta headers in full and selec
         try std.testing.expectEqual(@as(usize, if (selective) 1 else 4), result.rows.len);
         for (result.rows) |row| for ([_][]const u8{ "v", "lengths", "prefixes" }) |field| try std.testing.expect(row.value.object.get(field).? == .null);
     };
+}
+
+test "lake SQL bounded window profiles selected file lanes preserve exact rows and canonical order" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populateData(a, 3, @embedFile("../serverless/query/testdata/pyarrow_plain_nullable_snappy.parquet"));
+    defer lake.deinit(a);
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{});
+    var refs: [3]@import("../storage/rowsource/types.zig").RowRef = undefined;
+    for (&refs, [_]usize{ 2, 0, 2 }) |*ref, index| ref.* = .{ .external = .{ .source_id = lake.inventory.source_id, .snapshot_id = lake.inventory.snapshot_id, .file_id = lake.inventory.files[index].file_id, .row_group_ordinal = 0, .row_ordinal = 0 } };
+    const request: catalog.Scan = .{ .fields = &.{"amount"}, .row_refs = &refs, .limit = 1024 };
+    var expected: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (expected.items) |id| a.free(id);
+        expected.deinit(a);
+    }
+    {
+        const serial = try openPinned(a, lake.table, request, .{}, &lake.source);
+        defer serial.close(serial.ptr);
+        while (true) {
+            const page = try serial.next(serial.ptr, a, 128);
+            defer page.deinit();
+            for (page.rows) |row| try expected.append(a, try a.dupe(u8, row.id));
+            if (page.after == null) break;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), expected.items.len);
+    const parallel = try openPinned(a, lake.table, request, .{}, &lake.source);
+    defer parallel.close(parallel.ptr);
+    const lanes = (try parallel.split_ordered.?(parallel.ptr, a, 4)).?;
+    defer {
+        for (lanes) |lane| lane.close(lane.ptr);
+        a.free(lanes);
+    }
+    try std.testing.expectEqual(@as(usize, 2), lanes.len);
+    var seen: usize = 0;
+    for (lanes) |lane| while (true) {
+        const page = try lane.next(lane.ptr, a, 128);
+        defer page.deinit();
+        for (page.rows) |row| {
+            try std.testing.expect(seen < expected.items.len);
+            try std.testing.expectEqualStrings(expected.items[seen], row.id);
+            seen += 1;
+        }
+        if (page.after == null) break;
+    };
+    try std.testing.expectEqual(expected.items.len, seen);
 }

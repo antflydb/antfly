@@ -71,6 +71,7 @@ pub const Binding = struct {
                 until = certificate.until_ms;
             }
         };
+        try result.reader.bindPublicationLocators(publication.opening_bundles);
         object.cloud_certified_roots = result.roots;
         object.cloud_certificate_until_ms = until;
         return result;
@@ -479,6 +480,17 @@ test "external lake opening global frontier wrapped publication builds real Parq
     reopened.cloud_retention_qualified = true;
     var binding = (try Binding.init(a, &reopened, selected, .none)).?;
     defer binding.deinit();
+    try std.testing.expect(selected.opening_bundles[0].provider_locators.len != 0);
+    var altered = selected;
+    var altered_bundles: [4]catalog.OpeningBundle = undefined;
+    @memcpy(altered_bundles[0..selected.opening_bundles.len], selected.opening_bundles);
+    var altered_locators: [128]catalog.ProviderLocator = undefined;
+    const locators = selected.opening_bundles[0].provider_locators;
+    @memcpy(altered_locators[0..locators.len], locators);
+    altered_locators[0].generation = "wrong-provider-version";
+    altered_bundles[0].provider_locators = altered_locators[0..locators.len];
+    altered.opening_bundles = altered_bundles[0..selected.opening_bundles.len];
+    try std.testing.expectError(error.InvalidCloudRetentionCertificate, Binding.init(a, &reopened, altered, .none));
     var artifacts = reopened.artifactStore();
     for (selected.opening_bundles) |bundle| {
         const bytes = try artifacts.getVerifiedAllocWithCancellation(bundle.artifact.artifact_id, bundle.artifact.byte_len, bundle.artifact.checksum, .none);

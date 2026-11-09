@@ -26,7 +26,7 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 98;
+pub const native_reader_protocol: u16 = 99;
 pub const minimum_reader_protocol: u16 = 97;
 
 // Readers retain the prior contract while new writers publish opening bundles.
@@ -107,13 +107,21 @@ pub const CloudGenerations = struct {
     vacuum: CloudVacuumProgress = .{},
     certificate: ?CloudRetentionCertificate = null,
 };
+pub const ProviderLocator = struct {
+    id: []const u8,
+    bytes: u64,
+    generation: []const u8,
+    retention_until_ms: u64 = 0,
+};
 pub const OpeningBundle = struct {
     artifact: artifacts.ArtifactRef,
     decoded_bytes: u32,
     /// Optional publication-authenticated bootstrap selector. It avoids a
     /// dependent map-page read for this seed only, never other artifacts.
     provider_generation: ?[]const u8 = null,
+    provider_locators: []const ProviderLocator = &.{},
     pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+        if (self.provider_locators.len != 0) return stream.write(.{ .artifact = self.artifact, .decoded_bytes = self.decoded_bytes, .provider_generation = self.provider_generation, .provider_locators = self.provider_locators });
         if (self.provider_generation) |generation| return stream.write(.{ .artifact = self.artifact, .decoded_bytes = self.decoded_bytes, .provider_generation = generation });
         return stream.write(.{ .artifact = self.artifact, .decoded_bytes = self.decoded_bytes });
     }
@@ -171,7 +179,14 @@ pub const Publication = struct {
     pub fn validate(self: Publication) !void {
         try validateReaderProtocol(self.reader_protocol);
         if (self.opening_bundles.len > 4 or (self.opening_bundles.len != 0 and self.reader_protocol < 98)) return error.InvalidLakeIndexCatalog;
+        var locator_count: usize = 0;
         for (self.opening_bundles) |bundle| {
+            if (bundle.provider_locators.len != 0 and (self.reader_protocol < 99 or self.cloud_generations == null)) return error.InvalidLakeIndexCatalog;
+            locator_count += bundle.provider_locators.len;
+            if (locator_count > 128) return error.InvalidLakeIndexCatalog;
+            for (bundle.provider_locators) |locator| {
+                if (locator.id.len == 0 or locator.id.len > 512 or locator.bytes == 0 or locator.bytes > 32 * 1024 * 1024 or locator.generation.len == 0 or locator.generation.len > 4096 or std.mem.eql(u8, locator.generation, "null")) return error.InvalidLakeIndexCatalog;
+            }
             if (bundle.provider_generation) |generation| if (generation.len == 0 or generation.len > 4096 or std.mem.eql(u8, generation, "null")) return error.InvalidLakeIndexCatalog;
             if (bundle.artifact.kind != .doc_values or bundle.artifact.metadata_version != 1 or bundle.artifact.byte_len > 5 * 1024 * 1024 or bundle.decoded_bytes < 5 or bundle.decoded_bytes > 4 * 1024 * 1024) return error.InvalidLakeIndexCatalog;
             try artifactValid(bundle.artifact);
@@ -521,6 +536,24 @@ test "metadata.lake opening publication preserves ready roots and fences changed
     defer hinted.deinit();
     try hinted.value.validate();
     try std.testing.expectEqualStrings("provider-version", hinted.value.opening_bundles[0].provider_generation.?);
+    var located = accelerated;
+    var map_id: [175]u8 = @splat('0');
+    @memcpy(map_id[0..7], "sha256:");
+    @memcpy(map_id[7..71], inventory.checksum);
+    @memcpy(map_id[71..78], ":graph:");
+    map_id[142] = ':';
+    located.cloud_generations = .{ .root = .{ .artifact_id = &map_id, .checksum = inventory.checksum, .byte_len = 42, .generation = "map-version" } };
+    var located_bundle = hinted_bundle;
+    located_bundle.provider_locators = &.{.{ .id = &map_id, .bytes = 42, .generation = "payload-version" }};
+    located.opening_bundles = &.{located_bundle};
+    const located_bytes = try std.json.Stringify.valueAlloc(a, located, .{});
+    defer a.free(located_bytes);
+    const located_roundtrip = try std.json.parseFromSlice(Publication, a, located_bytes, .{});
+    defer located_roundtrip.deinit();
+    try located_roundtrip.value.validate();
+    try std.testing.expectEqualStrings("payload-version", located_roundtrip.value.opening_bundles[0].provider_locators[0].generation);
+    located.reader_protocol = 98;
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, located.validate());
     hinted_bundle.provider_generation = "";
     accelerated.opening_bundles = &.{hinted_bundle};
     try std.testing.expectError(error.InvalidLakeIndexCatalog, accelerated.validate());

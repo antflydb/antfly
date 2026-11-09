@@ -4220,18 +4220,53 @@ const Execution = struct {
                     }
                     break :hydrate;
                 }
+                // The winning page already identifies its files. Discover
+                // independent footers together before the first file cursor
+                // blocks, using private owned provider clients and the shared
+                // parsed-footer cache. Payload selection stays in each cursor.
+                if (self.source.scanner.shared_reader) |reader| if (reader.context.parallel_object_io) {
+                    if (self.source.fileMap()) |map| {
+                        const range_io = local.serverless_query_lake_range_io;
+                        var planned: [8]range_io.RangeRead = undefined;
+                        var planned_count: usize = 0;
+                        for (refs) |row_ref| {
+                            const external = switch (row_ref) {
+                                .external => |value| value,
+                                else => continue,
+                            };
+                            const index = map.get(external.file_id) orelse continue;
+                            const file = self.source.fileAt(index);
+                            const object = range_io.objectRefForExternalFileUri(file) catch continue;
+                            var duplicate = false;
+                            for (planned[0..planned_count]) |prior| if (range_io.sameObjectVersion(prior.object, object)) {
+                                duplicate = true;
+                                break;
+                            };
+                            if (duplicate) continue;
+                            planned[planned_count] = range_io.planParquetFooterRead(object, 64 * 1024) catch continue;
+                            planned_count += 1;
+                            if (planned_count == planned.len) break;
+                        }
+                        reader.prefetch(planned[0..planned_count]) catch {
+                            try self.context.ensureActive();
+                        };
+                    }
+                };
                 const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields, .row_refs = refs, .limit = @intCast(count) }, request, self.source);
                 defer cursor.close(cursor.ptr);
-                if (T == std.json.Value or T == types.ColumnSource) if (cursor.next_columns) |next_columns| {
-                    while (true) {
+                if (T == std.json.Value or T == types.ColumnSource) if (cursor.next_columns != null) {
+                    const parallel = if (self.source.scanner.shared_reader) |reader| reader.context.parallel_object_io else false;
+                    const pages = try @import("lake_hydration_pages.zig").Pages.init(a, cursor, self.context, parallel);
+                    defer pages.deinit();
+                    while (try pages.next()) |page| {
                         var page_arena = std.heap.ArenaAllocator.init(a);
                         defer page_arena.deinit();
                         const pa = page_arena.allocator();
-                        const page = try next_columns(cursor.ptr, pa, 4096);
                         try page.validate();
                         if (T == types.ColumnSource and page.native != null) return error.UnsupportedSqlExecution;
                         const retained = if (T == types.ColumnSource) try types.ColumnSourcePage.retainOrCopy(a, page.batch, page.selection, page.retain_columns) else {};
                         defer if (T == types.ColumnSource) retained.release();
+                        if (T == types.ColumnSource) try pages.retainAllocator(retained);
                         for (0..page.selection.len) |row_index| {
                             const identity = try page.cell(pa, row_index, "_id");
                             if (identity.value != .string) return error.InvalidSqlBackendResponse;
@@ -4255,7 +4290,6 @@ const Execution = struct {
                                 result[position] = value;
                             }
                         }
-                        if (page.after == null) break;
                     }
                     break :hydrate;
                 };

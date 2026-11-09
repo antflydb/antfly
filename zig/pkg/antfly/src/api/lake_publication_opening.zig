@@ -48,13 +48,34 @@ const Producer = struct {
     segments: usize = 0,
     small: [16]artifacts.ChunkRef = undefined,
     small_count: usize = 0,
+    locators: std.ArrayList(catalog.ProviderLocator) = .empty,
+    locator_attempts: usize = 0,
     remaining: u64 = read_budget,
     token: Token,
 
+    fn recordLocator(raw: *anyopaque, ref: artifacts.ChunkRef) !void {
+        const self: *Producer = @ptrCast(@alignCast(raw));
+        if (self.locators.items.len == 128 or self.locator_attempts == 256) return;
+        for (self.locators.items) |value| if (std.mem.eql(u8, value.id, ref.artifact_id)) return;
+        const object = self.store.providerStore() orelse return;
+        const writer = object.cloud_writer orelse return;
+        self.locator_attempts += 1;
+        const found = writer.lookup(self.a, ref.artifact_id, self.token) catch |err| switch (err) {
+            error.CloudGenerationMissing => return,
+            else => return err,
+        };
+        var record = found orelse return;
+        defer record.deinit(self.a);
+        if (record.bytes != ref.byte_len) return error.InvalidCloudGenerationMap;
+        try self.locators.append(self.a, .{ .id = try self.a.dupe(u8, record.id), .bytes = record.bytes, .generation = try self.a.dupe(u8, record.generation), .retention_until_ms = record.retention_until_ms });
+    }
     fn capture(raw: *anyopaque, identity: []const u8, digest: [32]u8, bytes: []const u8) !void {
         const self: *Producer = @ptrCast(@alignCast(raw));
         if (bytes.len > self.remaining) return error.OpeningBundleBudgetExceeded;
         self.remaining -= bytes.len;
+        // Physical object captures also cover child navigation pages reached
+        // through the page store. Synthetic range identities have no map entry.
+        if (identity.len == 175) if ((stores.uploadScopeFromArtifactId(identity) catch null) != null) try recordLocator(self, .{ .artifact_id = identity, .checksum = "", .byte_len = bytes.len });
         try self.collector.addIdentity(identity, digest, bytes);
     }
     fn add(self: *Producer, domain: [32]u8, ref: ?tree.Ref, text: bool, depth: u8, small: bool) void {
@@ -70,6 +91,7 @@ const Producer = struct {
     }
     fn read(self: *Producer, a: A, ref: artifacts.ChunkRef) !void {
         if (ref.byte_len > packs.max_decoded_bytes or self.collector.full()) return;
+        try recordLocator(self, ref);
         const bytes = try artifacts.readArtifact(a, self.store.*, ref, self.token, self.cached);
         a.free(bytes);
     }
@@ -125,7 +147,7 @@ const Producer = struct {
             if (self.collector.full()) break;
             var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.a));
             defer scratch.deinit();
-            _ = try @import("lake_index_seekable_text.zig").warmSmall(scratch.allocator(), .{ .store = self.store.*, .cache = self.cached, .context = self.cached.context, .cancellation = self.token }, ref, 512 * 1024);
+            _ = try @import("lake_index_seekable_text.zig").warmSmall(scratch.allocator(), .{ .store = self.store.*, .cache = self.cached, .context = self.cached.context, .cancellation = self.token, .locator = .{ .ptr = self, .record = Producer.recordLocator } }, ref, 512 * 1024);
         }
     }
     const Visitor = struct {
@@ -142,7 +164,7 @@ const Producer = struct {
             if (!self.navigation.text or self.producer.segments == 16 or self.producer.collector.full()) return;
             self.producer.segments += 1;
             const route = try std.json.parseFromSliceLeaky(struct { route: @import("lake_index_native_text.zig").SegmentRouting }, self.a, value, .{ .ignore_unknown_fields = true });
-            _ = try @import("lake_index_seekable_text.zig").warmOpening(self.a, .{ .store = self.producer.store.*, .cache = self.producer.cached, .context = self.producer.cached.context, .cancellation = self.producer.token }, route.route.ref, 1024 * 1024);
+            _ = try @import("lake_index_seekable_text.zig").warmOpening(self.a, .{ .store = self.producer.store.*, .cache = self.producer.cached, .context = self.producer.cached.context, .cancellation = self.producer.token, .locator = .{ .ptr = self.producer, .record = Producer.recordLocator } }, route.route.ref, 1024 * 1024);
             if (self.navigation.small and route.route.bytes <= 256 * 1024 and self.producer.small_count < self.producer.small.len) {
                 for (self.producer.small[0..self.producer.small_count]) |prior| if (std.mem.eql(u8, prior.artifact_id, route.route.ref.artifact_id)) return;
                 const alloc = self.producer.a;
@@ -178,6 +200,24 @@ pub fn publish(a: A, store: *stores.ArtifactStore, publication: catalog.Publicat
             if (record.bytes != pack.artifact.byte_len) return error.InvalidCloudGenerationMap;
             out.provider_generation = try a.dupe(u8, record.generation);
         };
+    }
+    if (publication.reader_protocol >= 99 and result.len != 0 and producer.locators.items.len != 0) {
+        const locators = try a.alloc(catalog.ProviderLocator, producer.locators.items.len);
+        var copied: usize = 0;
+        errdefer {
+            for (locators[0..copied]) |value| {
+                a.free(value.id);
+                a.free(value.generation);
+            }
+            a.free(locators);
+        }
+        for (producer.locators.items, locators) |value, *out| {
+            const id = try a.dupe(u8, value.id);
+            errdefer a.free(id);
+            out.* = .{ .id = id, .bytes = value.bytes, .generation = try a.dupe(u8, value.generation), .retention_until_ms = value.retention_until_ms };
+            copied += 1;
+        }
+        result[0].provider_locators = locators;
     }
     return result;
 }

@@ -652,6 +652,8 @@ pub const Cache = struct {
                 const waiting = claim.?;
                 claim = null;
                 {
+                    const wait_start = @import("antfly_platform").time.monotonicNs();
+                    defer if (context.trace) |trace| trace.add("cache_wait_nanoseconds", @import("antfly_platform").time.monotonicNs() -| wait_start);
                     defer self.finish(waiting, io);
                     while (!waiting.flight.event.isSet()) {
                         try context.ensureActive();
@@ -685,12 +687,12 @@ pub const Cache = struct {
         }
         const io_started = if (context.trace) |trace| trace.begin() else 0;
         const bytes = loader.load(loader.ptr, a) catch |err| {
-            if (context.trace) |trace| trace.end(io_started, 1, 0, true);
+            if (context.trace) |trace| trace.endClass(io_started, 1, 0, true, context.io_class);
             return err;
         };
         if (context.trace) |trace| {
             const traffic = if (loader.provider_read) |read| read(loader.ptr) else ProviderRead{ .requests = 1, .bytes = bytes.len };
-            trace.end(io_started, traffic.requests, traffic.bytes, false);
+            trace.endClass(io_started, traffic.requests, traffic.bytes, false, context.io_class);
         }
         errdefer a.free(bytes);
         try context.ensureActive();
@@ -1121,7 +1123,9 @@ pub const Reader = struct {
     fn readSource(self: *Reader, alloc: Allocator, read: ranges.RangeRead) ![]u8 {
         const started = @import("antfly_platform").time.monotonicNs();
         var failed = true;
+        if (self.context.trace) |trace| trace.beginSource();
         defer if (self.context.trace) |trace| {
+            trace.endSource();
             trace.add("source_provider_reads", 1);
             trace.add("source_provider_bytes", if (failed) 0 else read.range.len);
             trace.add("source_provider_errors", @intFromBool(failed));
@@ -1294,6 +1298,8 @@ pub const Reader = struct {
                 const waiting = claim.?;
                 claim = null;
                 {
+                    const wait_start = @import("antfly_platform").time.monotonicNs();
+                    defer if (self.context.trace) |trace| trace.add("cache_wait_nanoseconds", @import("antfly_platform").time.monotonicNs() -| wait_start);
                     defer self.cache.finish(waiting, io);
                     while (!waiting.flight.event.isSet()) {
                         try self.context.ensureActive();

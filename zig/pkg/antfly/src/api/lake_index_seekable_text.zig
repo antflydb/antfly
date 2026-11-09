@@ -83,6 +83,7 @@ pub const Directory = struct {
 pub const Descriptor = struct { manifest: local.serverless_manifest_artifact_ref.ArtifactRef, ordinal: usize };
 pub const Descriptors = std.StringHashMapUnmanaged(Descriptor);
 pub const Read = struct {
+    locator: ?struct { ptr: *anyopaque, record: *const fn (*anyopaque, Ref) anyerror!void } = null,
     /// Generation-owned descriptor routing. Shared physical sources never
     /// decide which generation's file manifest a reader must retain.
     descriptors: ?*const Descriptors = null,
@@ -126,6 +127,11 @@ fn warmMode(a: A, read: Read, ref: Ref, maximum_bytes: usize, opening_only: bool
     if (ref.byte_len > maximum_bytes or ref.byte_len > 512 * 1024) return 0;
     try read.check();
     const directory = try loadDirectory(a, read, ref);
+    if (read.locator) |hook| {
+        for (directory.metadata) |piece| try hook.record(hook.ptr, piece.retainedArtifact());
+        for (directory.blocks[0..@min(directory.blocks.len, 128)]) |piece| try hook.record(hook.ptr, piece.retainedArtifact());
+        if (directory.metadata_bundle) |bundle| try hook.record(hook.ptr, bundle);
+    }
     var spent: usize = @intCast(ref.byte_len);
     var bundled = false;
     if (directory.metadata_bundle) |bundle| if (bundle.byte_len <= maximum_bytes -| spent) {
@@ -201,6 +207,9 @@ fn upload(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: C
     return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
 }
 fn initialMetadata(a: A, source: local.index.SegmentSource) ![]const Range {
+    return initialMetadataMode(a, source, true);
+}
+fn initialMetadataMode(a: A, source: local.index.SegmentSource, delivery: bool) ![]const Range {
     const length = std.math.cast(usize, source.len()) orelse return error.NativeLakeTextCorpusTooLarge;
     var footer: [24]u8 = undefined;
     // Opaque/legacy fixtures keep their existing all-block representation.
@@ -216,6 +225,30 @@ fn initialMetadata(a: A, source: local.index.SegmentSource) ![]const Range {
         .offset = @intCast(reader.stored_offset + 21 + @as(u64, reader.doc_count) * 24),
         .len = @as(usize, reader.num_blocks) * 8,
     });
+    if (delivery) {
+        // Navigation needed to locate winning identities belongs in opening
+        // metadata when compact. Payload IDs and stored bodies remain selective.
+        const identity_table = 21 + @as(u64, reader.doc_count) * 24 + @as(u64, reader.num_blocks) * 12;
+        if (reader.num_blocks != 0 and identity_table <= 384 * 1024) try ranges.append(a, .{ .offset = @intCast(reader.stored_offset), .len = @intCast(identity_table) });
+        var column_navigation: usize = 0;
+        var column_sections: usize = 0;
+        for (reader.fields) |field| for (field.sections) |section| {
+            if (section.section_type != .columnar_stored or section.length == 0 or column_navigation >= 128 * 1024 or column_sections == 8) continue;
+            column_sections += 1;
+            const view = (try reader.sectionView(field.name, .columnar_stored)).?;
+            var column = try local.section_source_column.Reader.init(a, view);
+            defer column.deinit();
+            const directory = column.directory.range orelse continue;
+            const directory_bytes: usize = @as(usize, column.directory.num_chunks) * @as(usize, if (column.directory.indexed) 16 else 8);
+            if (directory_bytes > 64 * 1024 or directory_bytes + 28 > 128 * 1024 - column_navigation) continue;
+            column_navigation += directory_bytes + 28;
+            try ranges.append(a, .{ .offset = @intCast(view.offset), .len = @intCast(@min(8, view.length)) });
+            if (view.length >= 8) try ranges.append(a, .{ .offset = @intCast(view.offset + view.length - 8), .len = 8 });
+            try ranges.append(a, .{ .offset = @intCast(directory.offset), .len = 4 });
+            if (directory_bytes != 0) try ranges.append(a, .{ .offset = @intCast(directory.offset + (if (column.directory.data_start == 4) 4 + column.directory.payload_length else 4)), .len = directory_bytes });
+            if (column.directory.data_start == 4 and directory.length >= 8) try ranges.append(a, .{ .offset = @intCast(directory.offset + directory.length - 8), .len = 8 });
+        };
+    }
     const tail = if (reader.paged_source) |paged| paged.directory.offset else std.mem.readInt(u64, footer[0..8], .big);
     try ranges.append(a, .{ .offset = @intCast(tail), .len = length - @as(usize, @intCast(tail)) });
     for (reader.fields) |field| for (field.sections) |section| {
@@ -251,7 +284,9 @@ fn initialMetadata(a: A, source: local.index.SegmentSource) ![]const Range {
     var metadata_length: usize = 0;
     for (merged.items) |range| metadata_length = try std.math.add(usize, metadata_length, range.len);
     // Oversized optional navigation stays in authenticated native blocks.
-    return if (metadata_length <= pack_bytes and metadata_length < length / 2) merged.items else &.{};
+    if (metadata_length <= pack_bytes and metadata_length < length / 2) return merged.items;
+    if (delivery) return initialMetadataMode(a, source, false);
+    return &.{};
 }
 fn packedPiece(a: A, pack: Ref, offset: usize, pack_offset: usize, bytes: []const u8) !Piece {
     var digest: [32]u8 = undefined;
@@ -710,6 +745,8 @@ fn requiredRange(a: A, store: stores.ArtifactStore, id: []const u8, offset: u64,
     return bytes;
 }
 const CoalescedRead = struct {
+    /// Explicit selected spans must not grow to unrelated whole-pack reads.
+    planned: bool = false,
     publication: bool = false,
     store: stores.ArtifactStore,
     pack: Ref,
@@ -995,7 +1032,7 @@ fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, canc
             const result: *PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
             if (try result.get(piece)) |value| return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, try PhysicalPin.retain(lease, value));
         };
-        if (!publication) if (try readAheadPiece(a, store, piece, cancellation, cache)) |verified| return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, verified);
+        if (!publication and !(if (coalesced) |group| group.planned else false)) if (try readAheadPiece(a, store, piece, cancellation, cache)) |verified| return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, verified);
         const verified = if (coalesced) |group| try group.verifiedLease(a, piece, cache) else direct: {
             const bytes = try artifacts.readPhysicalRange(a, store, piece.pack.?.artifact_id, piece.pack_offset, length, cancellation, cache);
             errdefer a.free(bytes);
@@ -1132,17 +1169,21 @@ const Owner = struct {
                 std.heap.page_allocator.destroy(self);
             }
         };
-        fn warm(self: *@This(), pieces: []const Piece, pin: ?*WorkerPin) anyerror!void {
+        fn warm(self: *@This(), pieces: []const Piece, pin: ?*WorkerPin, submitted_ns: u64, class: local.serverless_query_lake_read_context.IoClass) anyerror!void {
+            if (self.capability.context.trace) |trace| trace.add("prefetch_queue_nanoseconds", @import("antfly_platform").time.monotonicNs() -| submitted_ns);
             // Navigation belongs to the worker, so completion releases the pin
             // even when this segment is never visited by the query again.
             defer if (pin) |lease| lease.release();
             try self.capability.check();
             const token: Cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
             var cached = self.capability.cache;
-            if (cached) |*cache| cache.context.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+            if (cached) |*cache| {
+                cache.context.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+                cache.context.io_class = class;
+            }
             const first = pieces[0];
             const last = pieces[pieces.len - 1];
-            var group: ?CoalescedRead = if (first.pack != null) .{ .store = self.capability.store, .pack = first.pack.?, .start = first.pack_offset, .length = last.offset + @as(usize, @intCast(last.ref.byte_len)) - first.offset, .logical_end = last.offset + @as(usize, @intCast(last.ref.byte_len)), .cancellation = token, .a = std.heap.page_allocator, .pieces = pieces } else null;
+            var group: ?CoalescedRead = if (first.pack != null) .{ .store = self.capability.store, .pack = first.pack.?, .start = first.pack_offset, .length = last.offset + @as(usize, @intCast(last.ref.byte_len)) - first.offset, .logical_end = last.offset + @as(usize, @intCast(last.ref.byte_len)), .cancellation = token, .a = std.heap.page_allocator, .pieces = pieces, .planned = true } else null;
             defer if (group) |*value| value.deinit();
             for (pieces) |piece| {
                 try self.capability.check();
@@ -1241,16 +1282,25 @@ const Owner = struct {
                 while (slot < self.pending.len and self.pending[slot] != null) : (slot += 1) {}
                 // A full speculative queue yields instead of stalling WAND
                 // on an unvisited range. Required reads recycle consumed slots.
-                if (slot == self.pending.len) return;
+                if (slot == self.pending.len) {
+                    if (cached.context.trace) |trace| trace.add("prefetch_declined", 1);
+                    return;
+                }
+                if (cached.context.trace) |trace| if (!trace.reserveReadAhead(offset - piece.offset)) {
+                    trace.add("prefetch_declined", 1);
+                    return;
+                };
                 const worker_pin: ?*WorkerPin = if (pin) |owned| blk: {
                     const worker = std.heap.page_allocator.create(WorkerPin) catch return;
                     worker.* = .{ .lease = owned.lease.retain() };
                     break :blk worker;
                 } else null;
-                self.pending[slot] = local.sql_parallel_scheduler.global().submitIoTransient(io, @as(usize, @intCast(offset - piece.offset)) * 2, warm, .{ self, pieces, worker_pin }) orelse {
+                self.pending[slot] = local.sql_parallel_scheduler.global().submitIoTransient(io, @as(usize, @intCast(offset - piece.offset)) * 2, warm, .{ self, pieces, worker_pin, @import("antfly_platform").time.monotonicNs(), if (metadata != null) local.serverless_query_lake_read_context.IoClass.navigation else local.serverless_query_lake_read_context.IoClass.payload }) orelse {
                     if (worker_pin) |owned| owned.destroy();
+                    if (cached.context.trace) |trace| trace.add("prefetch_declined", 1);
                     return;
                 };
+                if (cached.context.trace) |trace| trace.add("prefetch_submitted", 1);
                 self.directory_pins[slot] = worker_pin;
                 self.offsets[slot] = piece.offset;
                 self.lengths[slot] = offset - piece.offset;
@@ -1289,6 +1339,7 @@ const Owner = struct {
                 .text_page => &cached.cache.text_pages,
             };
             const held = lane.lookup(key) orelse return null;
+            if (cached.context.trace) |trace| trace.add("decoded_cache_hits", 1);
             errdefer held.release();
             try checkContext(self);
             try cached.context.ensureActive();
@@ -1558,7 +1609,9 @@ const Owner = struct {
                     group = .{ .publication = publication, .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = transport, .pieces = directory.blocks[index..next] };
                 };
             }
-            var lease = try readPieceLeaseCoalesced(transport, capability.store, piece, capability.cancellation, capability.cache, if (group) |*value| value else null, publication);
+            var piece_cache = capability.cache;
+            if (piece_cache) |*cache| cache.context.io_class = if (metadata != null) .navigation else .payload;
+            var lease = try readPieceLeaseCoalesced(transport, capability.store, piece, capability.cancellation, piece_cache, if (group) |*value| value else null, publication);
             defer lease.deinit();
             const data = lease.bytes();
             try capability.check();

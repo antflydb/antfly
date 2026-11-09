@@ -216,6 +216,9 @@ pub const Reader = struct {
     /// Borrowed from the admitted publication, for an optional opening seed
     /// only. Both the record and this exact map binding must outlive the reader.
     opening_hint: ?struct { root: Ref, record: Record } = null,
+    publication_locators: []const local.metadata_lake_index_catalog.OpeningBundle = &.{},
+    locator_root: ?Ref = null,
+    trace: ?*local.serverless_query_lake_read_context.IoTrace = null,
     alternatives: []const *Reader = &.{},
     cache_limit: usize = 8 * 1024 * 1024,
     cache_allocator: A = std.heap.page_allocator,
@@ -352,6 +355,11 @@ pub const Reader = struct {
         defer a.free(path);
         var client = self.client;
         client.allocator = a;
+        const provider_started = @import("antfly_platform").time.monotonicNs();
+        defer if (self.trace) |trace| {
+            trace.add("map_provider_reads", 1);
+            trace.add("map_provider_nanoseconds", @import("antfly_platform").time.monotonicNs() -| provider_started);
+        };
         var result = client.getObject(self.bucket, path, .{ .version_id = ref.generation, .skip_metadata_probe = true, .max_response_bytes = @intCast(ref.byte_len), .cancellation = remote(token) }) catch |err| switch (err) {
             error.FileNotFound, error.NotFound => return error.CloudGenerationMapUnavailable,
             else => return err,
@@ -464,8 +472,38 @@ pub const Reader = struct {
         if (!std.mem.eql(u8, &map_scope.domain, &payload_scope.domain)) return error.InvalidCloudGenerationMap;
         self.opening_hint = .{ .root = root, .record = record };
     }
+    /// The admitted publication authenticates these optional direct locators.
+    /// Keep the exact root binding and namespace; hints grant no authority to
+    /// unrelated IDs or a later incarnation/generation.
+    pub fn bindPublicationLocators(self: *Reader, bundles: []const local.metadata_lake_index_catalog.OpeningBundle) !void {
+        const root = self.root orelse return;
+        const domain = (try api.uploadScopeFromArtifactId(root.artifact_id)) orelse return error.InvalidCloudGenerationMap;
+        var total: usize = 0;
+        var seen: [128][]const u8 = undefined;
+        for (bundles) |bundle| for (bundle.provider_locators) |value| {
+            total += 1;
+            if (total > 128) return error.InvalidCloudGenerationMap;
+            for (seen[0 .. total - 1]) |prior| if (std.mem.eql(u8, prior, value.id)) return error.InvalidCloudGenerationMap;
+            seen[total - 1] = value.id;
+            try (Record{ .id = value.id, .bytes = value.bytes, .generation = value.generation, .retention_until_ms = value.retention_until_ms }).validate();
+            const scoped = (try api.uploadScopeFromArtifactId(value.id)) orelse return error.InvalidCloudGenerationMap;
+            if (!std.mem.eql(u8, &domain.domain, &scoped.domain)) return error.InvalidCloudGenerationMap;
+        };
+        self.publication_locators = bundles;
+        self.locator_root = root;
+    }
     pub fn lookup(self: *Reader, a: A, id: []const u8, token: Token) !?Record {
         try token.check();
+        const started = @import("antfly_platform").time.monotonicNs();
+        defer if (self.trace) |trace| trace.add("map_lookup_nanoseconds", @import("antfly_platform").time.monotonicNs() -| started);
+        if (self.locator_root) |bound| if (self.root) |root| {
+            if (bound.byte_len == root.byte_len and bound.retention_until_ms == root.retention_until_ms and std.mem.eql(u8, bound.artifact_id, root.artifact_id) and std.mem.eql(u8, bound.checksum, root.checksum) and std.mem.eql(u8, bound.generation, root.generation)) {
+                for (self.publication_locators) |bundle| for (bundle.provider_locators) |value| if (std.mem.eql(u8, value.id, id)) {
+                    if (self.trace) |trace| trace.add("map_locator_hits", 1);
+                    return try (Record{ .id = value.id, .bytes = value.bytes, .generation = value.generation, .retention_until_ms = value.retention_until_ms }).clone(a);
+                };
+            }
+        };
         if (self.opening_hint) |hint| if (self.root) |root| {
             if (root.byte_len == hint.root.byte_len and root.retention_until_ms == hint.root.retention_until_ms and
                 std.mem.eql(u8, root.artifact_id, hint.root.artifact_id) and std.mem.eql(u8, root.checksum, hint.root.checksum) and
@@ -1493,4 +1531,27 @@ test "external lake read ahead opening hints skip map I/O and fence map identity
     const foreign_id = try foreign_scope.artifactId(checksum);
     try std.testing.expectError(error.InvalidCloudGenerationMap, reader.bindOpeningHint(.{ .id = &foreign_id, .bytes = 42, .generation = "foreign-v1" }));
     try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    reader.opening_hint = null;
+    const bundle: local.metadata_lake_index_catalog.OpeningBundle = .{
+        .artifact = .{ .kind = .doc_values, .metadata_version = 1, .artifact_id = &root_id, .checksum = checksum, .byte_len = 1 },
+        .decoded_bytes = 5,
+        .provider_locators = &.{.{ .id = id, .bytes = 42, .generation = "published-v8" }},
+    };
+    try reader.bindPublicationLocators(&.{bundle});
+    var trace: local.serverless_query_lake_read_context.IoTrace = .{};
+    reader.trace = &trace;
+    var direct = (try reader.lookup(a, id, .none)).?;
+    defer direct.deinit(a);
+    try std.testing.expectEqualStrings("published-v8", direct.generation);
+    try std.testing.expectEqual(@as(u64, 1), trace.snapshot().map_locator_hits);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expectError(error.Canceled, reader.lookup(a, id, .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled }));
+    try std.testing.expectError(error.TestMapRead, reader.lookup(a, &unrelated, .none));
+    reader.root.?.generation = "changed-root";
+    try std.testing.expectError(error.TestMapRead, reader.lookup(a, id, .none));
+    reader.root = root;
+    var foreign = bundle;
+    foreign.provider_locators = &.{.{ .id = &foreign_id, .bytes = 42, .generation = "foreign" }};
+    try std.testing.expectError(error.InvalidCloudGenerationMap, reader.bindPublicationLocators(&.{foreign}));
+    try std.testing.expectError(error.InvalidCloudGenerationMap, reader.bindPublicationLocators(&.{ bundle, bundle }));
 }

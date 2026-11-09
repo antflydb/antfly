@@ -208,8 +208,43 @@ The admitted native cut remains the authority for committed generation and WAL
 watermark. Restart cache recovery does not relax freshness, reader expiry,
 incarnation, credential rotation, or external-catalog checks. Protocol 97 cuts
 remain readable without bundles; a new publication/rebuild is needed to gain
-publication-level opening bundles. Metadata capability 85 fences older readers
+publication-level opening bundles. Metadata capability 86 fences older readers
 from new lake catalog writes.
+
+Protocol 99 additionally admits up to 128 provider-qualified demand locators
+inside the authenticated opening descriptors. The producer spends at most 256
+lookup attempts collecting navigation and native-pack locators. Their identity,
+length, generation and retention fields participate in the publication's existing
+certificate binding. A reader borrows them only under the exact admitted map
+root, including its generation, checksum, length and retention identity; namespace
+mismatches and duplicate IDs fail closed. Unknown IDs retain ordinary map lookup.
+Locators introduce no new payload reachability roots. Protocol-97/98 cuts remain
+readable, and protocol-98 publication paths omit the new fields.
+
+Compact identity tables and stored-column navigation join the native opening
+metadata, bounded to 384 KiB and 128 KiB respectively before native page alignment.
+Stored-column discovery visits at most eight sections per segment.
+The existing one-MiB metadata ceiling still applies; if delivery metadata would
+displace useful core opening pages, publication falls back to the core set.
+Payload identities, bodies and selected column chunks remain demand reads.
+
+Ranking resolves up to 64 query terms per field before waiting for their posting
+headers, overlapping independent norms and postings through the existing bounded
+source queue. Native hydration sorts identity validation into physical order,
+plans 64-winner tiles and at most four column cursors per tile, then scatters
+values to ranked output positions. Selected Parquet hydration warms up to eight
+file footers and can split selected files into four disjoint cursor lanes. The
+page gatherer submits all admitted lanes before inline fallback, joins each wave
+before result assembly, and cancels/joins outstanding work on failure. Returned
+column leases retain a stable synchronized allocator owner through final release.
+Single-file selections retain their column pipeline and serial cursor fallback.
+
+Explicitly planned native spans avoid unrelated whole-pack expansion. Their
+speculative jobs share the request's eight-MiB conservative reservation allowance;
+rejected jobs leave required reads available. Request profiles additionally expose
+navigation/payload provider loads, generation-map loads and direct-locator hits,
+prefetch submissions/declines/queue time, shared-cache wait time and decoded-cache
+hits. Timers can overlap and are not an HTTP-attempt or billing count.
 
 Opening bundle descriptors can also carry the exact provider generation captured
 by the publication writer. That descriptor is authenticated with the publication

@@ -4316,7 +4316,16 @@ const StreamingBoolBuilder = struct {
     }
     fn lookupTerm(self: *@This(), field: []const u8, term: []const u8) !?inverted.LookupResult {
         const field_entry = try self.lookups.getOrPut(self.a, field);
-        if (!field_entry.found_existing) field_entry.value_ptr.* = .empty;
+        if (!field_entry.found_existing) {
+            field_entry.value_ptr.* = .empty;
+            if (try self.fieldReader(field)) |reader| if (self.stats.fields.getPtr(field)) |stats| {
+                var names: [64][]const u8 = undefined;
+                var count_: usize = 0;
+                var keys = stats.frequencies.keyIterator();
+                while (count_ < names.len) : (count_ += 1) names[count_] = (keys.next() orelse break).*;
+                try reader.prefetchTerms(names[0..count_]);
+            };
+        }
         const entry = try field_entry.value_ptr.getOrPut(self.a, term);
         if (!entry.found_existing) {
             entry.value_ptr.* = null;
