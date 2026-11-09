@@ -414,3 +414,22 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
         TestBoundary.call("value", &callbacks.rejectingDispatch, &callbacks.value, .{ &base, 2 }),
     );
 }
+
+test "time series callback transport canonicalizes aggregation query failures" {
+    const VTable = struct { query: *const fn (*const anyerror) anyerror!u64 };
+    const TestBoundary = Boundary(VTable);
+    const Callbacks = struct {
+        fn query(failure: *const anyerror) anyerror!u64 {
+            return failure.*;
+        }
+    };
+    const cases = [_]struct { original: anyerror, expected: anyerror }{
+        .{ .original = error.InvalidAggregation, .expected = error.InvalidQueryRequest },
+        .{ .original = error.UnsupportedAggregation, .expected = error.UnsupportedQueryRequest },
+        .{ .original = error.OutOfMemory, .expected = error.OutOfMemory },
+        .{ .original = error.Timeout, .expected = error.Timeout },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case.expected, TestBoundary.callRemote("query", TestBoundary.local_dispatch, &Callbacks.query, .{&case.original}));
+    }
+}

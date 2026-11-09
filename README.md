@@ -107,7 +107,7 @@ See [LICENSING.md](LICENSING.md) for third-party notices and source ownership.
 
 [antfly.io/docs](https://antfly.io/docs), or the source under [`docs/`](docs). Good starting points:
 
-- [Quickstart](docs/guides/quickstart.mdx), [Document Engine](docs/guides/document-engine.mdx), and [Hybrid Search](docs/guides/hybrid-search.mdx)
+- [Quickstart](docs/guides/quickstart.mdx), [Document Engine](docs/guides/document-engine.mdx), [Hybrid Search](docs/guides/hybrid-search.mdx), and [Time series](docs/guides/time-series.mdx)
 - [Multimodal](docs/guides/multimodal.mdx), [Artifact Indexes](docs/guides/artifact-indexes.mdx), and [Inference](docs/guides/inference.mdx) with the [supported models](docs/guides/supported-models.mdx)
 - [Documentation index](docs/README.md)
 - [Antfly Lite](docs/guides/lite.mdx), [Architecture](docs/architecture.mdx), and [Object storage](docs/reference/s3-storage.md)

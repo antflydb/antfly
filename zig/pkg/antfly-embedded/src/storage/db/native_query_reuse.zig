@@ -56,6 +56,17 @@ pub const State = struct {
     pub fn asRequest(self: *const State) Request {
         return .{ .id = &self.id, .table_id = self.table_id, .expires_ms = self.expires_ms, .create = true, .indexes = self.indexes };
     }
+    pub fn matchesIndexes(self: State, indexes: ?[]const []const u8) bool {
+        var request = self.asRequest();
+        request.indexes = indexes;
+        return self.matchesSelection(request);
+    }
+    pub fn asRequestWithIndexes(self: *const State, indexes: ?[]const []const u8) Request {
+        std.debug.assert(self.matchesIndexes(indexes));
+        var request = self.asRequest();
+        request.indexes = indexes;
+        return request;
+    }
     pub fn matches(self: State, digest: [32]u8, now_ms: u64) bool {
         return self.expires_ms > now_ms and std.mem.eql(u8, &self.digest, &digest);
     }
@@ -86,4 +97,16 @@ test "external lake native reuse owns and preserves index selection" {
     try std.testing.expect(!state.matchesSelection(expected));
     expected.indexes = &.{"other"};
     try std.testing.expect(!state.matchesSelection(expected));
+}
+
+test "time series native reuse binds exact index selection" {
+    const id: [64]u8 = @splat('a');
+    var state = try State.init(std.testing.allocator, .{ .id = &id, .table_id = 7, .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 300000, .indexes = &.{ "a", "bc" } }, .{ .sequence = 1, .digest = @splat(1), .manifest_checksum = @splat(2) });
+    defer state.deinit();
+    try std.testing.expect(state.matchesIndexes(&.{ "a", "bc" }));
+    try std.testing.expect(!state.matchesIndexes(null));
+    try std.testing.expect(!state.matchesIndexes(&.{}));
+    try std.testing.expect(!state.matchesIndexes(&.{ "ab", "c" }));
+    try std.testing.expect(!state.matchesIndexes(&.{ "bc", "a" }));
+    try std.testing.expect(state.asRequestWithIndexes(&.{ "a", "bc" }).indexesEqual(.{ .id = &id, .table_id = 7, .expires_ms = state.expires_ms, .indexes = &.{ "a", "bc" } }));
 }

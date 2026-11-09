@@ -512,29 +512,29 @@ pub const Repository = struct {
         return digest;
     }
     fn readManifest(self: *Repository, a: A, request: cut.Request, namespace: Namespace, cancellation: Cancellation) ![]u8 {
+        return (try self.readManifestIfPresent(a, request, namespace, cancellation)) orelse error.CatalogGenerationChanged;
+    }
+    fn readManifestIfPresent(self: *Repository, a: A, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?[]u8 {
         try cancellation.check();
         const bridge: TokenBridge = .{ .token = cancellation };
-        var result = self.store.opened.client.getObject(self.store.opened.bucket, try self.key(a, request, namespace), .{ .skip_metadata_probe = true, .max_response_bytes = max_manifest_bytes, .cancellation = bridge.object() }) catch |err| {
+        const object_key = try self.key(a, request, namespace);
+        defer a.free(object_key);
+        var result = self.store.opened.client.getObject(self.store.opened.bucket, object_key, .{ .skip_metadata_probe = true, .max_response_bytes = max_manifest_bytes, .cancellation = bridge.object() }) catch |err| {
             try cancellation.check();
             return switch (err) {
-                error.NotFound, error.ObjectNotFound, error.FileNotFound => error.CatalogGenerationChanged,
+                error.NotFound, error.ObjectNotFound, error.FileNotFound => null,
                 else => err,
             };
         };
         defer result.deinit(self.store.opened.client.allocator);
         try cancellation.check();
-        return a.dupe(u8, result.body);
+        return try a.dupe(u8, result.body);
     }
     fn checkedManifest(a: A, bytes: []const u8, request: cut.Request, namespace: Namespace) !Manifest {
         try request.validate(cut.nowMs());
         const manifest = std.json.parseFromSliceLeaky(Manifest, a, bytes, .{ .allocate = .alloc_always }) catch return error.CatalogGenerationChanged;
         if (manifest.version != 1 or !manifest.namespace.eql(namespace) or manifest.request.table_id != request.table_id or manifest.request.expires_ms != request.expires_ms or !std.mem.eql(u8, manifest.request.id, request.id) or manifest.files.len > local.storage_db_native_backup_seal.max_files) return error.CatalogGenerationChanged;
-        if ((manifest.request.indexes == null) != (request.indexes == null)) return error.CatalogGenerationChanged;
-        if (request.indexes) |expected| {
-            const actual = manifest.request.indexes.?;
-            if (expected.len != actual.len) return error.CatalogGenerationChanged;
-            for (expected, actual) |left, right| if (!std.mem.eql(u8, left, right)) return error.CatalogGenerationChanged;
-        }
+        if (!manifest.request.indexesEqual(request)) return error.CatalogGenerationChanged;
         var total: u64 = 0;
         for (manifest.files, 0..) |file, i| {
             if (!safePath(file.path) or (std.mem.eql(u8, file.path, "query-cut.json") or std.mem.eql(u8, file.path, "query-remote.json"))) return error.CatalogGenerationChanged;
@@ -1014,8 +1014,8 @@ pub const Repository = struct {
         };
         return true;
     }
-    /// A complete remote-native checkpoint already owns its immutable extents.
-    /// Publish only a new authenticated manifest; never read/download/re-upload
+    /// Honor existing bindings first. A complete remote-native checkpoint can
+    /// publish a new authenticated manifest without reading/downloading/re-uploading
     /// those extents or derive a checkpoint from a partial storage view.
     fn reference(raw: *anyopaque, executor: port.Executor, request: cut.Request, namespace: Namespace, source: port.Storage, cancellation: Cancellation) !bool {
         return referenceImpl(raw, executor, request, namespace, source, cancellation) catch |err| return repositoryFailure("reference", err, cancellation);
@@ -1023,17 +1023,37 @@ pub const Repository = struct {
     fn referenceImpl(raw: *anyopaque, executor: port.Executor, request: cut.Request, namespace: Namespace, source: port.Storage, cancellation: Cancellation) !bool {
         var receiver = try executor.receive();
         const io = receiver.io();
-        _ = io;
         const self = from(raw);
         try request.validate(cut.nowMs());
         if (!request.create or !(try request.namespace(namespace)).eql(namespace)) return error.CatalogGenerationChanged;
         try cancellation.check();
-        const bytes = (try source.nativeCheckpointReferenceAlloc(self.a)) orelse return false;
-        defer self.a.free(bytes);
-        if (bytes.len > max_manifest_bytes) return error.QueryCandidateBudgetExceeded;
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
+        // Creation is idempotent: a committed generation is authoritative,
+        // even when its local cache/hint disappeared or live rows changed.
+        if (self.store.opened.fs_client != null) {
+            const path = try std.fs.path.join(a, &.{ try self.linkedRoot(a, request, namespace), "query-cut.json" });
+            const existing = local.storage_db_native_backup.readFileAlloc(a, io, path, max_manifest_bytes) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            if (existing) |value| {
+                const committed = std.json.parseFromSliceLeaky(cut.Manifest, a, value, .{ .allocate = .alloc_always }) catch |err| return if (err == error.OutOfMemory) err else error.CatalogGenerationChanged;
+                try cut.validateManifestBinding(committed, request, namespace);
+                return true;
+            }
+        }
+        if (try self.readManifestIfPresent(a, request, namespace, cancellation)) |value| {
+            const committed = try checkedManifest(a, value, request, namespace);
+            _ = try self.validateManifestAuthority(a, committed, request, namespace);
+            return true;
+        }
+        // Existing bindings above attest their selection. An unbound remote
+        // checkpoint only attests files, so use normal capture for a subset.
+        if (request.indexes != null) return false;
+        const bytes = (try source.nativeCheckpointReferenceAlloc(a)) orelse return false;
+        if (bytes.len > max_manifest_bytes) return error.QueryCandidateBudgetExceeded;
         const checkpoint = try std.json.parseFromSliceLeaky(port.CheckpointReference, a, bytes, .{ .allocate = .alloc_always });
         const authority = try self.domain(a, namespace);
         if (checkpoint.version != 1 or !checkpoint.namespace.eql(namespace) or !std.mem.eql(u8, &authority, &checkpoint.authority)) return error.CatalogGenerationChanged;
@@ -1115,6 +1135,7 @@ pub const Repository = struct {
     }
     fn reuseImpl(raw: *anyopaque, executor: port.Executor, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
         const self = from(raw);
+        if (!previous.indexesEqual(request)) return null;
         try cancellation.check();
         try request.validate(cut.nowMs());
         if (!request.create or !(try request.namespace(namespace)).eql(namespace)) return error.CatalogGenerationChanged;
@@ -2588,4 +2609,106 @@ test "external lake native reuse falls back when its basis expires behind collec
     try std.testing.expect(worker.failure == null);
     try std.testing.expect(worker.proof == null);
     try worker.request.validate(cut.nowMs());
+}
+
+test "external lake native time series capture remains immutable after preflight and hint loss" {
+    // This regression inspects physical DB hints. Control-only test owners
+    // exercise the protocol contracts; the API runtime owner runs this case.
+    if (comptime !@hasDecl(local, "storage_db_db")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ true, false }) |linked| {
+        var directory = try local.common_test_directory.TestDirectory.init("native-capture-idempotent");
+        defer directory.cleanup();
+        var repository = try Repository.init(a, null, null, .standalone, directory.path());
+        defer repository.deinit();
+        var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .filesystem_io = io });
+        defer runtime.deinit();
+        runtime.ptr().query_cut_repository = if (linked) repository.capability() else repository.chunkedCapability();
+        const root = try std.fs.path.join(a, &.{ directory.path(), "db" });
+        defer a.free(root);
+        const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+        const options: local.storage_db_db.OpenOptions = .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .start_optional_runtimes = false };
+        var db = try local.storage_db_db.DB.open(a, root, options);
+        defer db.close();
+        var stage: []const u8 = "seed capture";
+        errdefer std.debug.print("\nnative capture linked={} stage={s}\n", .{ linked, stage });
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":1}" }} });
+        const seed: cut.Request = .{ .id = &@as([64]u8, @splat('a')), .table_id = 7, .expires_ms = cut.nowMs() + 240000, .create = true };
+        try db.captureQueryCut(seed, .none);
+        var request = seed;
+        request.id = &@as([64]u8, @splat('b'));
+        stage = "initial reuse";
+        request.timeout_ms = 60000;
+        try db.captureQueryCut(request, .none);
+        const cache = try cut.pathAlloc(a, root, request.id);
+        defer a.free(cache);
+        // The preflight generation reused retained extents without a local pin.
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, cache, .{}));
+        stage = "repeated capture";
+        var different_indexes = request;
+        different_indexes.indexes = &.{"other_index"};
+        try std.testing.expectError(error.CatalogGenerationChanged, db.captureQueryCut(different_indexes, .none));
+        request.timeout_ms = 55000;
+        try db.captureQueryCut(request, .none);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, cache, .{}));
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":2}" }} });
+        stage = "capture after write";
+        request.timeout_ms = 50000;
+        try db.captureQueryCut(request, .none);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, cache, .{}));
+        // Reopening discards process-local hints. Committed authority still wins
+        // over the newer live data and the caller's shorter transport deadline.
+        db.close();
+        db = try local.storage_db_db.DB.open(a, root, options);
+        stage = "capture after reopen";
+        request.timeout_ms = 40000;
+        try db.captureQueryCut(request, .none);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, cache, .{}));
+        stage = "open retained read";
+        var read_request = request;
+        read_request.create = false;
+        {
+            var reader = try db.openQueryCut(read_request, .none);
+            defer reader.close();
+            const value = (try reader.get(a, "doc")).?;
+            defer a.free(value);
+            try std.testing.expectEqualStrings("{\"amount\":1}", value);
+        }
+        const live = (try db.get(a, "doc")).?;
+        defer a.free(live);
+        try std.testing.expectEqualStrings("{\"amount\":2}", live);
+        // An invalid committed binding is an error, never permission to replace
+        // its immutable generation with another snapshot of the live database.
+        stage = "reject corrupt binding";
+        db.local_execution.native_query_reuse = null;
+        if (linked) {
+            const retained_root = try repository.linkedRoot(a, request, namespace);
+            defer a.free(retained_root);
+            const path = try std.fs.path.join(a, &.{ retained_root, "query-cut.json" });
+            defer a.free(path);
+            const bytes = try local.storage_db_native_backup.readFileAlloc(a, io, path, max_manifest_bytes);
+            defer a.free(bytes);
+            var manifest = try std.json.parseFromSlice(cut.Manifest, a, bytes, .{});
+            defer manifest.deinit();
+            manifest.value.namespace.range_id += 1;
+            const corrupt = try std.json.Stringify.valueAlloc(a, manifest.value, .{});
+            defer a.free(corrupt);
+            _ = try local.storage_db_native_backup.writeFileDurable(io, path, corrupt);
+        } else {
+            const bytes = try repository.readManifest(a, request, namespace, .none);
+            defer a.free(bytes);
+            var manifest = try std.json.parseFromSlice(Manifest, a, bytes, .{});
+            defer manifest.deinit();
+            manifest.value.namespace.range_id += 1;
+            const corrupt = try std.json.Stringify.valueAlloc(a, manifest.value, .{});
+            defer a.free(corrupt);
+            const key = try repository.key(a, request, namespace);
+            defer a.free(key);
+            var object = try repository.store.opened.client.putObject(repository.store.opened.bucket, key, corrupt, .{});
+            defer object.deinit(repository.store.opened.client.allocator);
+        }
+        try std.testing.expectError(error.CatalogGenerationChanged, db.captureQueryCut(request, .none));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, cache, .{}));
+    }
 }

@@ -6871,6 +6871,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
     fn requireAlgebraicPartialsLocal(self: *HostedProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !query_api.QueryResponse {
         if (self.local_read_source) |local| return (try local.algebraicPartialsGroupLocal(alloc, group_id, table_name, body)) orelse error.TableNotFound;
+        if (comptime control_only_storage_sources) return error.UnsupportedQueryRequest;
         return (try collectProvisionedHostedLocalAlgebraicPartials(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false)) orelse error.TableNotFound;
     }
 
@@ -13383,13 +13384,20 @@ fn applyAggregationResults(
     meta: *query_api.QueryResponseMeta,
 ) !void {
     if (req.aggregations_json.len == 0) return;
+    var aggregation_ctx = ctx;
+    aggregation_ctx.control = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
     if (comptime control_only_storage_sources) {
-        meta.aggregation_results = try computeAggregationResultsThroughKernel(alloc, req, result, ctx);
+        if (meta.aggregation_execution == null) meta.aggregation_execution = "scan";
+        meta.aggregation_results = try computeAggregationResultsThroughKernel(alloc, req, result, aggregation_ctx);
         return;
     }
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    var aggregation_ctx = ctx;
+    if (aggregation_contract.containsDateHistogram(requests)) {
+        if (meta.aggregation_execution == null) meta.aggregation_execution = "scan";
+        aggregation_ctx.algebraic_available = false;
+        aggregation_ctx.algebraic_scope = .disabled;
+    }
     const constraints = if (canConsiderAlgebraicAggregations(req))
         try algebraicConstraintsForRequestAlloc(alloc, req)
     else
@@ -13432,6 +13440,15 @@ fn computeAggregationResultsThroughKernel(
         .context_json = .fromSlice(context_json),
         .hits = if (hits.len == 0) null else hits.ptr,
         .hit_count = @intCast(hits.len),
+        .execution_deadline_ns = ctx.control.deadline_ns orelse 0,
+        .has_execution_deadline = @intFromBool(ctx.control.deadline_ns != null),
+        .cancellation_ctx = if (ctx.control.cancellation != null) @ptrCast(@constCast(&ctx.control.cancellation.?)) else null,
+        .cancellation_fn = if (ctx.control.cancellation != null) struct {
+            fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                return @intFromBool(token.isCancelled());
+            }
+        }.cancelled else null,
     });
     defer response.deinit();
     return parseAggregationResultsFromKernel(alloc, response.bytes());
@@ -13520,7 +13537,7 @@ fn aggregationOnlyCollectionRequest(req: db_mod.types.SearchRequest) ?db_mod.typ
     // Native owners can answer eligible queries from algebraic materializations
     // without collecting rows. Control-only coordinators already use the
     // stored-row fallback (see tryApplyProvisionedAlgebraicDistributedAggregations).
-    if (!control_only_storage_sources and canConsiderAlgebraicAggregations(req)) return null;
+    if (canConsiderAlgebraicAggregations(req) and (!control_only_storage_sources or std.mem.indexOf(u8, req.aggregations_json, "date_histogram") != null)) return null;
     return aggregationCollectionRequest(req, aggregationFullResultBudget(), req.identity_read_generation);
 }
 
@@ -13541,6 +13558,7 @@ fn applyBoundQueryAggregations(
 ) !void {
     if (req.aggregations_json.len == 0) return;
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
+    if (lease != null and try tryApplyCapturedTemporalAggregations(alloc, aggregation_req, self.db, meta)) return;
     if (aggregationCanUseCurrentResult(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForCapturedResultDb(alloc, aggregation_req, self.db), meta);
     }
@@ -13590,6 +13608,7 @@ fn applyCapturedDbQueryAggregations(
     consistency: raft_mod.ReadConsistency,
 ) !void {
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
+    if (lease != null and try tryApplyCapturedTemporalAggregations(alloc, aggregation_req, db, meta)) return;
     if (aggregationCanUseCurrentResult(req, result.*)) {
         return try applyAggregationResults(
             alloc,
@@ -13757,6 +13776,7 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
     meta: *query_api.QueryResponseMeta,
     required_identity_generations: ?[]const ?u64,
 ) !bool {
+    if (try tryApplyTemporalOwnerAggregations(self, alloc, group_ids, table_name, req, meta, .stale, required_identity_generations)) return true;
     // The existing accelerated planner borrows the first physical algebraic
     // index. A control-only consumer cannot do that; use the exact distributed
     // text/full-result path until the planner itself has a coarse owner ABI.
@@ -13765,9 +13785,11 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
     if (!canConsiderAlgebraicAggregations(req)) return false;
     const constraints = (try algebraicConstraintsForRequestAlloc(alloc, req)) orelse return false;
     defer freeAlgebraicConstraints(alloc, constraints);
+    for (constraints) |constraint| if (constraint.time_range != null) return false;
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
     if (requests.len == 0) return false;
+    if (aggregation_contract.containsDateHistogram(requests) or aggregation_contract.containsNullExclusion(requests)) return false;
 
     // The query coordinator still owns table read admission here. Lease the
     // writer/apply DB instead of opening a second full query catalog while an
@@ -13812,6 +13834,7 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
     defer if (pipeline_requests.len > 0) alloc.free(pipeline_requests);
     var pipeline_filled: usize = 0;
 
+    var histogram_output_budget = db_mod.aggregations.contract.HistogramOutputBudget{};
     for (requests) |request| {
         if (db_mod.aggregations.isPipelineAggregation(request.type)) {
             pipeline_requests[pipeline_filled] = request;
@@ -13822,7 +13845,7 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
         defer request_plan.deinit(alloc);
         var merged = (try collectProvisionedAlgebraicDistributedPartials(self, alloc, group_ids, table_name, req, first_entry.index.name, request_plan.access_paths, request_plan.asProgram(), first_db, required_identity_generations)) orelse return false;
         defer merged.deinit(alloc);
-        var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, first_entry.index, request, constraints, merged)) orelse return false;
+        var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, first_entry.index, request, constraints, merged, &histogram_output_budget)) orelse return false;
         var result_owned = true;
         errdefer if (result_owned) result.deinit(alloc);
         try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, &result);
@@ -14003,6 +14026,7 @@ fn tryApplyHostedAlgebraicDistributedAggregations(
     consistency: raft_mod.ReadConsistency,
     required_identity_generations: ?[]const ?u64,
 ) !bool {
+    if (try tryApplyTemporalOwnerAggregations(self, alloc, group_ids, table_name, req, meta, consistency, required_identity_generations)) return true;
     // Algebraic planning currently borrows a physical index to construct the
     // distributed tensor program. Control-only callers retain exact
     // full-result aggregation until planning is exposed as a coarse owner
@@ -14028,9 +14052,11 @@ fn tryApplyHostedAlgebraicDistributedAggregations(
 
     const constraints = (try algebraicConstraintsForRequestAlloc(alloc, req)) orelse return false;
     defer freeAlgebraicConstraints(alloc, constraints);
+    for (constraints) |constraint| if (constraint.time_range != null) return false;
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
     if (requests.len == 0) return false;
+    if (aggregation_contract.containsDateHistogram(requests) or aggregation_contract.containsNullExclusion(requests)) return false;
 
     if (representative_group_id) |group_id| {
         const first_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -14112,6 +14138,7 @@ fn applyHostedAlgebraicDistributedAggregationsWithPlanner(
     defer if (pipeline_requests.len > 0) alloc.free(pipeline_requests);
     var pipeline_filled: usize = 0;
 
+    var histogram_output_budget = db_mod.aggregations.contract.HistogramOutputBudget{};
     for (requests) |request| {
         if (db_mod.aggregations.isPipelineAggregation(request.type)) {
             pipeline_requests[pipeline_filled] = request;
@@ -14122,7 +14149,7 @@ fn applyHostedAlgebraicDistributedAggregationsWithPlanner(
         defer request_plan.deinit(alloc);
         var merged = (try collectHostedAlgebraicDistributedPartials(self, alloc, group_ids, table_name, req, planner_index_name, request_plan.access_paths, request_plan.asProgram(), consistency, required_identity_generations)) orelse return false;
         defer merged.deinit(alloc);
-        var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, planner_index, request, constraints, merged)) orelse return false;
+        var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, planner_index, request, constraints, merged, &histogram_output_budget)) orelse return false;
         var result_owned = true;
         errdefer if (result_owned) result.deinit(alloc);
         try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, &result);
@@ -14852,7 +14879,7 @@ fn algebraicIrConstraintsFromFixedAlloc(
     const out = try alloc.alloc(algebraic_ir.Constraint, constraints.len);
     errdefer if (out.len > 0) alloc.free(out);
     for (constraints, 0..) |constraint, i| {
-        out[i] = .{ .field = constraint.field, .value = constraint.value };
+        out[i] = .{ .field = constraint.field, .value = constraint.value, .time_range = constraint.time_range };
     }
     return out;
 }
@@ -14875,6 +14902,7 @@ fn algebraicAggregationFromDistributedPartialsAlloc(
     request: db_mod.aggregations.SearchAggregationRequest,
     constraints: []const db_mod.aggregations.FixedConstraint,
     merged: db_mod.algebraic.distributed.MergeSet,
+    histogram_output_budget: *db_mod.aggregations.contract.HistogramOutputBudget,
 ) !?db_mod.aggregations.SearchAggregationResult {
     if (std.mem.eql(u8, request.type, "stats")) {
         return try db_mod.aggregations.algebraicStatsAggregationFromDistributedPartialsAlloc(alloc, index, request, constraints, merged);
@@ -14886,7 +14914,7 @@ fn algebraicAggregationFromDistributedPartialsAlloc(
         return try db_mod.aggregations.algebraicCardinalityAggregationFromDistributedPartialsAlloc(alloc, request, merged);
     }
     if (std.mem.eql(u8, request.type, "date_histogram")) {
-        return try db_mod.aggregations.algebraicDateHistogramAggregationFromDistributedPartialsAlloc(alloc, index, request, constraints, merged);
+        return try db_mod.aggregations.algebraicDateHistogramAggregationFromDistributedPartialsWithContextAlloc(alloc, index, request, constraints, merged, .{ .histogram_output_budget = histogram_output_budget });
     }
     if (std.mem.eql(u8, request.type, "histogram")) {
         return try db_mod.aggregations.algebraicHistogramAggregationFromDistributedPartialsAlloc(alloc, index, request, constraints, merged);
@@ -15859,8 +15887,6 @@ fn collectProvisionedHostedLocalAlgebraicPartials(
     body: []const u8,
     read_activity_held: bool,
 ) !?query_api.QueryResponse {
-    var parsed = try parseAlgebraicPartialsRequest(alloc, body);
-    defer parsed.deinit(alloc);
     var owner = try provisionedLocalQueryDbOwner(resident_db, cache, replica_root_dir, catalog, alloc, group_id, lsm_root_generation, backend_runtime, table_name, read_activity_held);
     defer owner.deinit();
     if (catalog.vtable.privacy_policy_binding != null or catalog.vtable.linearizable_table_routing_snapshot != null) {
@@ -15870,9 +15896,7 @@ fn collectProvisionedHostedLocalAlgebraicPartials(
             summary.deinit(alloc);
         }
     }
-    const partials = try collectAlgebraicPartialsFromDbForRequest(alloc, owner.db(), parsed);
-    defer db_mod.algebraic.distributed.freePartials(alloc, partials);
-    return .{ .json = try encodeAlgebraicPartialsResponse(alloc, partials) };
+    return .{ .json = try executeStorageKernelAlgebraicPartials(alloc, owner.db(), body) };
 }
 
 fn collectProvisionedSearchRequestTextStats(
@@ -35853,4 +35877,255 @@ fn capturePrivacyPolicyVersion(a: std.mem.Allocator, catalog: table_catalog.Cata
         if (std.mem.eql(u8, entry.name, table_name)) break entry;
     } else return @splat(0);
     return @import("antfly_local_sources").privacy_catalog.policyBinding(a, table.indexes_json);
+}
+
+/// Coarse distributed temporal path. Complete maintained states cross the wire;
+/// only a storage owner plans and folds them. Any decline uses the exact scan.
+fn temporalOwnerCall(self: anytype, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, body: []const u8, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+    try local_query_contract.checkQueryDeadline(req);
+    if (comptime @TypeOf(self) == *HostedProvisionedTableReadSource) {
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_id, routePolicyForConsistency(consistency))) orelse return null;
+        defer route.deinit(alloc);
+        return switch (route) {
+            .local => blk: {
+                if (comptime control_only_storage_sources) if (self.local_read_source == null) break :blk null;
+                break :blk try self.requireAlgebraicPartialsLocal(alloc, group_id, table_name, body);
+            },
+            .remote => |remote| try algebraicPartialsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, req),
+        };
+    } else {
+        return try self.groupLocalSource().algebraicPartialsGroupLocal(alloc, group_id, table_name, body);
+    }
+}
+
+fn temporalOwnerBody(alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest, group_id: u64, shards_json: ?[]const u8) ![]u8 {
+    const timeout_ms = try queryRemainingTimeoutMs(req);
+    var group_req = req;
+    if (group_req.native_query_cut) |cut| group_req.native_query_cut = try cut.forGroup(group_id);
+    const query_json = try local_query_contract.encodeQueryRequestWithGraphWireMode(alloc, group_req, false, true, true);
+    defer alloc.free(query_json);
+    return try withNativeCutEnvelope(alloc, group_req, try std.json.Stringify.valueAlloc(alloc, local_query_contract.TemporalWire{
+        .temporal_query = query_json,
+        .table_name = table_name,
+        .shards_json = shards_json,
+        .timeout_ms = timeout_ms,
+    }, .{}));
+}
+
+const TemporalOwnerSlot = struct {
+    arena: std.heap.ArenaAllocator,
+    response: ?query_api.QueryResponse = null,
+    err: ?anyerror = null,
+};
+
+fn temporalAttemptDeclined(meta: *query_api.QueryResponseMeta) bool {
+    meta.aggregation_execution = @tagName(local_query_contract.TemporalDecline.scan_temporal_budget);
+    return false;
+}
+
+fn temporalOwnerFallbackError(err: anyerror) bool {
+    return switch (err) {
+        error.UnsupportedQueryRequest, error.InvalidQueryRequest, error.UnexpectedHttpStatus, error.QueryCandidateBudgetExceeded, error.AlgebraicResultBucketLimit => true,
+        else => false,
+    };
+}
+
+fn temporalOwnerErrorDeclined(meta: *query_api.QueryResponseMeta, err: anyerror) bool {
+    if (err == error.QueryCandidateBudgetExceeded or err == error.AlgebraicResultBucketLimit) return temporalAttemptDeclined(meta);
+    meta.aggregation_execution = @tagName(local_query_contract.TemporalDecline.scan_temporal_owner_unavailable);
+    return false;
+}
+
+fn runTemporalOwnerWindow(self: anytype, slots: []TemporalOwnerSlot, group_ids: []const u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency, generations: ?[]const ?u64, io: ?std.Io) void {
+    const Source = @TypeOf(self);
+    const Fiber = struct {
+        fn run(source: Source, slot: *TemporalOwnerSlot, group_id: u64, name: []const u8, request: db_mod.types.SearchRequest, read_consistency: raft_mod.ReadConsistency) void {
+            const arena_alloc = slot.arena.allocator();
+            const body = temporalOwnerBody(arena_alloc, name, request, group_id, null) catch |err| {
+                slot.err = err;
+                return;
+            };
+            slot.response = temporalOwnerCall(source, arena_alloc, group_id, name, request, body, read_consistency) catch |err| {
+                slot.err = err;
+                return;
+            };
+        }
+    };
+    var group: std.Io.Group = .init;
+    for (slots, 0..) |*slot, i| {
+        var group_req = req;
+        if (generations) |items| group_req.identity_read_generation = items[i].?;
+        if (io) |backend| group.async(backend, Fiber.run, .{ self, slot, group_ids[i], table_name, group_req, consistency }) else Fiber.run(self, slot, group_ids[i], table_name, group_req, consistency);
+    }
+    if (io) |backend| group.await(backend) catch {};
+}
+
+fn tryApplyTemporalOwnerAggregations(self: anytype, alloc: std.mem.Allocator, group_ids: []const u64, table_name: []const u8, req: db_mod.types.SearchRequest, meta: *query_api.QueryResponseMeta, consistency: raft_mod.ReadConsistency, generations: ?[]const ?u64) !bool {
+    if (group_ids.len == 0 or req.aggregations_json.len == 0 or std.mem.indexOf(u8, req.aggregations_json, "date_histogram") == null) return false;
+    const shapes = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
+    defer query_api.freeAggregationRequests(alloc, shapes);
+    if (!aggregation_contract.containsDateHistogram(shapes)) return false;
+    meta.aggregation_execution = @tagName(local_query_contract.TemporalDecline.scan_unsupported_temporal_shape);
+    if (!canConsiderAlgebraicAggregations(req)) return false;
+    meta.aggregation_execution = @tagName(local_query_contract.TemporalDecline.scan_unproven_temporal_predicate);
+    const constraints = (try algebraicConstraintsForRequestAlloc(alloc, req)) orelse return false;
+    defer freeAlgebraicConstraints(alloc, constraints);
+    var temporal = false;
+    for (constraints) |constraint| if (constraint.time_range != null) {
+        temporal = true;
+        break;
+    };
+    if (!temporal) return false;
+    try validateRequiredIdentityGenerations(group_ids.len, generations);
+    try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    meta.aggregation_execution = @tagName(local_query_contract.TemporalDecline.scan_temporal_owner_unavailable);
+    const shards = try a.alloc(local_query_contract.TemporalShard, group_ids.len);
+    var transfer = local_query_contract.TemporalTransferBudget{};
+    const io_impl: ?FanoutIo = if (@hasField(@typeInfo(@TypeOf(self)).pointer.child, "io_impl")) self.io_impl else null;
+    const fanout = planFanout(.query, io_impl, group_ids.len);
+    // Keep at most one bounded fanout window of transport buffers alive. Parsed
+    // states are admitted against one request-wide budget before retention.
+    var start: usize = 0;
+    while (start < group_ids.len) : (start += fanout.width) {
+        try local_query_contract.checkQueryDeadline(req);
+        const end = @min(start + fanout.width, group_ids.len);
+        const slots = try alloc.alloc(TemporalOwnerSlot, end - start);
+        defer alloc.free(slots);
+        for (slots) |*slot| slot.* = .{ .arena = .init(alloc) };
+        defer for (slots) |*slot| slot.arena.deinit();
+        runTemporalOwnerWindow(self, slots, group_ids[start..end], table_name, req, consistency, if (generations) |items| items[start..end] else null, if (fanout.parallel) io_impl.?.io() else null);
+        // Prefer cancellation/deadline errors over optimization declines.
+        try local_query_contract.checkQueryDeadline(req);
+        for (slots) |slot| if (slot.err) |err| {
+            if (!temporalOwnerFallbackError(err)) return err;
+        };
+        for (slots, start..end) |*slot, i| {
+            if (slot.err) |err| return temporalOwnerErrorDeclined(meta, err);
+            const response = slot.response orelse return false;
+            if (try temporalOwnerDeclined(a, response.json, meta)) return false;
+            if (!transfer.acceptBytes(response.json.len)) return temporalAttemptDeclined(meta);
+            // Parse in the window arena first: rejected states are never copied
+            // into the retained request arena.
+            const parsed = try std.json.parseFromSliceLeaky(local_query_contract.TemporalShard, slot.arena.allocator(), response.json, .{});
+            var count: usize = 0;
+            for (parsed.partials) |partials| count += partials.len;
+            if (!transfer.acceptCells(count)) return temporalAttemptDeclined(meta);
+            if (i > 0 and !std.mem.eql(u8, shards[0].signature, parsed.signature)) {
+                meta.aggregation_execution = @tagName(local_query_contract.TemporalDecline.scan_temporal_schema_changed);
+                return false;
+            }
+            shards[i] = try std.json.parseFromSliceLeaky(local_query_contract.TemporalShard, a, response.json, .{ .allocate = .alloc_always });
+        }
+    }
+    const merged_json = try std.json.Stringify.valueAlloc(a, shards, .{});
+    var fold_req = req;
+    if (generations) |items| fold_req.identity_read_generation = items[0].?;
+    const body = try temporalOwnerBody(a, table_name, fold_req, group_ids[0], merged_json);
+    if (body.len > local_query_contract.temporal_max_bytes) return temporalAttemptDeclined(meta);
+    var response = (temporalOwnerCall(self, a, group_ids[0], table_name, fold_req, body, consistency) catch |err| switch (err) {
+        else => if (temporalOwnerFallbackError(err)) return temporalOwnerErrorDeclined(meta, err) else return err,
+    }) orelse return false;
+    defer response.deinit(a);
+    if (try temporalOwnerDeclined(a, response.json, meta)) return false;
+    try local_query_contract.checkQueryDeadline(req);
+    meta.aggregation_results = try parseAggregationResultsFromKernel(alloc, response.json);
+    meta.aggregation_execution = "materialized_temporal";
+    return true;
+}
+
+fn temporalOwnerDeclined(a: std.mem.Allocator, json: []const u8, meta: *query_api.QueryResponseMeta) !bool {
+    if (json.len == 0 or json[0] != '"') return false;
+    const reason = try std.json.parseFromSliceLeaky(local_query_contract.TemporalDecline, a, json, .{});
+    meta.aggregation_execution = @tagName(reason);
+    return true;
+}
+
+/// Physical retained-cover and bound owners already hold a query read lease.
+/// Complete temporal requests must be attempted before source-row hydration.
+fn tryApplyCapturedTemporalAggregations(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, db: *db_mod.DB, meta: *query_api.QueryResponseMeta) !bool {
+    if (comptime control_only_storage_sources) return false;
+    if (!canConsiderAlgebraicAggregations(req)) return false;
+    const constraints = (try algebraicConstraintsForRequestAlloc(alloc, req)) orelse return false;
+    defer freeAlgebraicConstraints(alloc, constraints);
+    const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
+    defer query_api.freeAggregationRequests(alloc, requests);
+    if (!aggregation_contract.containsDateHistogram(requests)) return false;
+    var ctx = try aggregationContextForCapturedResultDb(alloc, req, db);
+    const manager = ctx.index_manager orelse return false;
+    const entry = db_mod.aggregations.resolveTemporalAlgebraicIndex(manager, req.index_name) orelse return false;
+    ctx.algebraic_index_name = entry.config.name;
+    ctx.algebraic_available = try physical_local_query.algebraicIndexFreshEnoughForName(alloc, entry.config.name, db);
+    if (!ctx.algebraic_available) return false;
+    ctx.control = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+    ctx.algebraic_scope = .root;
+    ctx.algebraic_constraints = constraints;
+    var schema = db.core.acquireSchemaView();
+    defer if (schema) |*view| view.release();
+    const time = @import("antfly_platform").time;
+    ctx.temporal_materializations_exact = if (schema) |view|
+        local_query_contract.temporalRangeVisibleThroughDeadline(req, constraints, view.tableSchema().ttl_field, view.visibilityTtlDurationNs(), time.realtimeNs(), time.monotonicNs())
+    else
+        true;
+    const results = (try db_mod.aggregations.tryTemporalMaterializedAggregations(alloc, requests, ctx)) orelse return false;
+    errdefer db_mod.aggregations.deinitResults(alloc, results);
+    for (results) |*result| try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, result);
+    meta.aggregation_results = results;
+    meta.aggregation_execution = "materialized_temporal";
+    return true;
+}
+
+test "time series temporal owner fanout bounds waves and joins failures" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const Fixture = struct {
+        io: std.Io,
+        active: std.atomic.Value(u32) = .init(0),
+        peak: std.atomic.Value(u32) = .init(0),
+        calls: std.atomic.Value(u32) = .init(0),
+        fn groupLocalSource(self: *@This()) *@This() {
+            return self;
+        }
+        fn algebraicPartialsGroupLocal(self: *@This(), alloc: std.mem.Allocator, owner: u64, _: []const u8, _: []const u8) !?query_api.QueryResponse {
+            const live = self.active.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(live, .monotonic);
+            _ = self.calls.fetchAdd(1, .monotonic);
+            try self.io.sleep(.fromMilliseconds(20), .awake);
+            if (owner == 3) return error.Timeout;
+            return .{ .json = try std.fmt.allocPrint(alloc, "{d}", .{owner}) };
+        }
+    };
+    var fixture = Fixture{ .io = threaded.io() };
+    var slots: [4]TemporalOwnerSlot = undefined;
+    for (&slots) |*slot| slot.* = .{ .arena = .init(a) };
+    defer for (&slots) |*slot| slot.arena.deinit();
+    runTemporalOwnerWindow(&fixture, &slots, &.{ 1, 2, 3, 4 }, "readings", .{}, .stale, null, threaded.io());
+    try std.testing.expect(fixture.peak.load(.monotonic) > 1);
+    try std.testing.expect(fixture.peak.load(.monotonic) <= 4);
+    try std.testing.expectEqual(@as(u32, 0), fixture.active.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 4), fixture.calls.load(.monotonic));
+    try std.testing.expectEqual(error.Timeout, slots[2].err.?);
+    try std.testing.expect(!temporalOwnerFallbackError(error.Timeout));
+    try std.testing.expect(temporalOwnerFallbackError(error.QueryCandidateBudgetExceeded));
+    var meta = query_api.QueryResponseMeta{};
+    try std.testing.expect(!temporalAttemptDeclined(&meta));
+    try std.testing.expectEqualStrings("scan_temporal_budget", meta.aggregation_execution.?);
+    try std.testing.expectEqual(@as(usize, 0), meta.aggregation_results.len);
+    try std.testing.expect(!temporalOwnerErrorDeclined(&meta, error.UnsupportedQueryRequest));
+    try std.testing.expectEqualStrings("scan_temporal_owner_unavailable", meta.aggregation_execution.?);
+}
+
+test "time series owner envelopes retain budgets without native cuts" {
+    const a = std.testing.allocator;
+    const body = try temporalOwnerBody(a, "readings", .{ .execution_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s }, 7, null);
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(local_query_contract.TemporalWire, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.timeout_ms != null);
+    try std.testing.expect(parsed.value.timeout_ms.? > 0 and parsed.value.timeout_ms.? <= 5000);
+    try std.testing.expectError(error.Timeout, temporalOwnerBody(a, "readings", .{ .execution_deadline_ns = 0 }, 7, null));
 }

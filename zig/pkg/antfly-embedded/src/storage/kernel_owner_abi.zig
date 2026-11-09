@@ -19,15 +19,17 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-// Version 87 combines checked query DB borrows with privacy policy fences.
+// Version 89 combines aggregation budgets with checked DB borrows and policy fences.
 // Older owners must reject their operation identifiers before dispatch.
-pub const abi_version: u32 = 87;
+pub const abi_version: u32 = 89;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
 pub const failure_error_name_capacity = failure_abi.failure_error_name_capacity;
 
 const query_abi = @import("local_query_abi");
+/// Shared query headers and failures evolve independently of storage layouts.
+pub const query_abi_version: u32 = query_abi.abi_version;
 pub const BorrowedBytes = query_abi.BorrowedBytes;
 pub const OwnedBytes = query_abi.OwnedBytes;
 
@@ -1163,6 +1165,10 @@ pub const AggregationRequest = extern struct {
     context_json: BorrowedBytes = .{},
     hits: ?[*]const AggregationHit = null,
     hit_count: u64 = 0,
+    execution_deadline_ns: u64 = 0,
+    has_execution_deadline: u8 = 0,
+    cancellation_ctx: ?*anyopaque = null,
+    cancellation_fn: ?CancellationCheckFn = null,
 };
 
 /// Synchronous coarse dispatch of one generated document-artifact child range.

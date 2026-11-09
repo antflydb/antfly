@@ -463,27 +463,4 @@ pub fn mergeAggregationDomainResults(
     };
 }
 
-pub fn canConsiderAlgebraicAggregations(req: types.SearchRequest) bool {
-    return req.full_text == null and
-        req.filter_text == null and
-        req.exclusion_text == null and
-        req.exclusion_query_json.len == 0 and
-        req.full_text_queries.len == 0 and
-        req.dense == null and
-        req.sparse == null and
-        req.dense_queries.len == 0 and
-        req.sparse_queries.len == 0 and
-        req.graph_queries.len == 0 and
-        req.merge_config == null and
-        req.reranker == null and
-        req.pruner == null and
-        req.filter_prefix.len == 0 and
-        req.filter_ids.len == 0 and
-        req.exclude_ids.len == 0 and
-        req.filter_doc_ids.len == 0 and
-        !req.filter_doc_ids_positive and
-        req.exclude_doc_ids.len == 0 and
-        !searchRequestHasResolvedDocFilter(req) and
-        req.distance_over == null and
-        req.distance_under == null;
-}
+pub const canConsiderAlgebraicAggregations = local_query_contract.canConsiderAlgebraicAggregations;

@@ -106,6 +106,7 @@ fn admissionReservations(txn: anytype, current: Namespace) !Reservations {
 pub const State = struct {
     direct_vectors: bool = false,
     chunked_frames: bool = false,
+    ttl_sources: bool = false,
     graph_artifacts: bool = false,
     namespace: Namespace = @splat(0),
     latest: u64 = 0,
@@ -183,12 +184,22 @@ fn encodeGraph(state: State) [graph_state_size]u8 {
     @memcpy(bytes[graph_state_size - 32 ..], &checksum(bytes[0 .. graph_state_size - 32]));
     return bytes;
 }
+fn encodeSources(state: State) [graph_state_size + 1]u8 {
+    var bytes: [graph_state_size + 1]u8 = undefined;
+    const previous = encodeGraph(state);
+    @memcpy(bytes[0 .. graph_state_size - 32], previous[0 .. graph_state_size - 32]);
+    @memcpy(bytes[0..4], "RER6");
+    bytes[graph_state_size - 32] = 1;
+    @memcpy(bytes[bytes.len - 32 ..], &checksum(bytes[0 .. bytes.len - 32]));
+    return bytes;
+}
 pub fn decode(bytes: []const u8) !State {
+    const sources = bytes.len == graph_state_size + 1;
     const legacy = bytes.len == legacy_state_size;
     const chunked = bytes.len == chunked_state_size;
-    const graph = bytes.len == graph_state_size;
+    const graph = bytes.len == graph_state_size or sources;
     if ((!legacy and bytes.len != state_size and !chunked and !graph) or
-        !std.mem.eql(u8, bytes[0..4], if (legacy) "RER2" else if (graph) "RER5" else if (chunked) "RER4" else "RER3") or
+        !std.mem.eql(u8, bytes[0..4], if (sources) "RER6" else if (legacy) "RER2" else if (graph) "RER5" else if (chunked) "RER4" else "RER3") or
         !std.mem.eql(u8, bytes[bytes.len - 32 ..], &checksum(bytes[0 .. bytes.len - 32])))
         return error.RetainedEffectsCorrupt;
     var state: State = .{ .namespace = bytes[4..28].* };
@@ -225,7 +236,12 @@ pub fn decode(bytes: []const u8) !State {
     if (graph) {
         if (bytes[pos] > 1) return error.RetainedEffectsCorrupt;
         state.graph_artifacts = bytes[pos] == 1;
+        pos += 1;
         if (state.graph_artifacts and (!state.chunked_frames or !state.direct_vectors)) return error.RetainedEffectsCorrupt;
+    }
+    if (sources) {
+        if (bytes[pos] != 1) return error.RetainedEffectsCorrupt;
+        state.ttl_sources = true;
     }
     return state;
 }
@@ -239,7 +255,9 @@ pub fn load(txn: anytype) !?State {
     return try decode(raw);
 }
 fn save(txn: anytype, state: State) !void {
-    if (state.graph_artifacts) {
+    if (state.ttl_sources) {
+        try txn.put(state_key, &encodeSources(state));
+    } else if (state.graph_artifacts) {
         try txn.put(state_key, &encodeGraph(state));
     } else if (state.chunked_frames) {
         try txn.put(state_key, &encodeChunked(state));
@@ -287,6 +305,9 @@ pub fn admitWithCapabilities(txn: anytype, expected_namespace: Namespace, epoch:
 /// Graph afterimages use a separately negotiated effect language. No public
 /// source admission calls this until graph transfer is certified end to end.
 pub fn admitWithArtifactCapabilities(txn: anytype, expected_namespace: Namespace, epoch: u64, pin: [32]u8, limit: u64, direct_vectors: bool, chunked_frames: bool, graph_artifacts: bool) !u64 {
+    return admitWithSourceCapabilities(txn, expected_namespace, epoch, pin, limit, direct_vectors, chunked_frames, graph_artifacts, false);
+}
+pub fn admitWithSourceCapabilities(txn: anytype, expected_namespace: Namespace, epoch: u64, pin: [32]u8, limit: u64, direct_vectors: bool, chunked_frames: bool, graph_artifacts: bool, ttl_sources: bool) !u64 {
     if (epoch == 0 or std.mem.eql(u8, &pin, &@as([32]u8, @splat(0))) or limit < max_frame_bytes)
         return error.InvalidRetainedEffectsAdmission;
     if (graph_artifacts and (!chunked_frames or !direct_vectors)) return error.InvalidRetainedEffectsAdmission;
@@ -314,6 +335,11 @@ pub fn admitWithArtifactCapabilities(txn: anytype, expected_namespace: Namespace
     if (state.graph_artifacts != graph_artifacts) {
         if (state.active()) return error.InvalidRetainedEffectsAdmission;
         state.graph_artifacts = graph_artifacts;
+    }
+    if (state.ttl_sources != ttl_sources) {
+        if (state.active()) return error.InvalidRetainedEffectsAdmission;
+        if (!try noExistingIntents(txn)) return error.RetainedEffectsFull;
+        state.ttl_sources = ttl_sources;
     }
     for (state.consumers) |value| if (value.epoch == epoch) {
         if (!std.mem.eql(u8, &value.pin, &pin)) return error.RetainedEffectsFenceMismatch;
@@ -421,6 +447,7 @@ pub const Reader = struct {
     pos: usize = 16,
     remaining: u32,
     pub const Effect = struct {
+        ttl_source: ?[16]u8 = null,
         key: []const u8,
         value: ?[]const u8,
         timestamp: u64,
@@ -432,7 +459,7 @@ pub const Reader = struct {
         }
     };
     pub fn init(bytes: []const u8, sequence: u64) !Reader {
-        if (bytes.len < 48 or bytes.len > max_frame_bytes or (!std.mem.eql(u8, bytes[0..4], "REF3") and !std.mem.eql(u8, bytes[0..4], "REF4")) or
+        if (bytes.len < 48 or bytes.len > max_frame_bytes or (!std.mem.eql(u8, bytes[0..4], "REF3") and !std.mem.eql(u8, bytes[0..4], "REF4") and !std.mem.eql(u8, bytes[0..4], "RF63") and !std.mem.eql(u8, bytes[0..4], "RF64")) or
             std.mem.readInt(u64, bytes[4..12], .little) != sequence)
             return error.RetainedEffectsCorrupt;
         // Share the payload hash pass between checksum validation and complete
@@ -453,9 +480,10 @@ pub const Reader = struct {
                 if (effect.timestamp != 0) return error.RetainedEffectsCorrupt;
                 if (effect.value) |value| _ = integrity.validateTransferRecord(effect.key, value) catch return error.RetainedEffectsCorrupt;
             } else if (effect.isVector()) {
-                if (!std.mem.eql(u8, bytes[0..4], "REF4") or effect.timestamp != 0) return error.RetainedEffectsCorrupt;
+                if ((!std.mem.eql(u8, bytes[0..4], "REF4") and !std.mem.eql(u8, bytes[0..4], "RF64")) or effect.timestamp != 0) return error.RetainedEffectsCorrupt;
                 @import("db/online_vector_artifacts.zig").validate(effect.key, effect.value) catch return error.RetainedEffectsCorrupt;
             } else if (!internal_keys.isStoredDocumentRowKey(effect.key)) return error.RetainedEffectsCorrupt;
+            if (effect.ttl_source != null and (!internal_keys.isPrimaryDocumentKey(effect.key) or effect.value == null)) return error.RetainedEffectsCorrupt;
             if (last) |previous| if (std.mem.order(u8, previous, effect.key) != .lt) return error.RetainedEffectsCorrupt;
             last = effect.key;
         }
@@ -468,9 +496,17 @@ pub const Reader = struct {
         }
         if (self.pos > self.bytes.len or self.bytes.len - self.pos < 16) return error.RetainedEffectsCorrupt;
         const key_len = std.mem.readInt(u32, self.bytes[self.pos..][0..4], .little);
-        const value_len = std.mem.readInt(u32, self.bytes[self.pos + 4 ..][0..4], .little);
+        const raw_value_len = std.mem.readInt(u32, self.bytes[self.pos + 4 ..][0..4], .little);
+        const source_present = retained_frame.hasSources(self.bytes[0..4]) and raw_value_len != std.math.maxInt(u32) and raw_value_len & retained_frame.source_flag != 0;
+        const value_len = if (retained_frame.hasSources(self.bytes[0..4]) and raw_value_len != std.math.maxInt(u32)) raw_value_len & ~retained_frame.source_flag else raw_value_len;
         const timestamp = std.mem.readInt(u64, self.bytes[self.pos + 8 ..][0..8], .little);
         self.pos += 16;
+        var ttl_source: ?[16]u8 = null;
+        if (source_present) {
+            if (self.bytes.len - self.pos < 16) return error.RetainedEffectsCorrupt;
+            ttl_source = self.bytes[self.pos..][0..16].*;
+            self.pos += 16;
+        }
         if (key_len == 0 or key_len > self.bytes.len - self.pos) return error.RetainedEffectsCorrupt;
         const key = self.bytes[self.pos..][0..key_len];
         self.pos += key_len;
@@ -480,9 +516,9 @@ pub const Reader = struct {
             value = self.bytes[self.pos..][0..value_len];
             self.pos += value_len;
         }
-        if (value == null and timestamp != 0) return error.RetainedEffectsCorrupt;
+        if (value == null and timestamp != 0 and (!retained_frame.hasSources(self.bytes[0..4]) or !internal_keys.isPrimaryDocumentKey(key))) return error.RetainedEffectsCorrupt;
         self.remaining -= 1;
-        return .{ .key = key, .value = value, .timestamp = timestamp };
+        return .{ .key = key, .value = value, .timestamp = timestamp, .ttl_source = ttl_source };
     }
 };
 
@@ -872,13 +908,32 @@ pub const Capture = struct {
         defer alloc.free(values);
         const timestamps = try alloc.alloc(u64, keys.len);
         defer alloc.free(timestamps);
+        const ttl_sources = try alloc.alloc(?[16]u8, keys.len);
+        defer alloc.free(ttl_sources);
+        @memset(ttl_sources, null);
         var size: usize = 48;
-        for (keys, values, timestamps) |key, *value, *timestamp| {
+        var deletion_version_floor: ?u64 = null;
+        for (keys, values, timestamps, ttl_sources) |key, *value, *timestamp, *ttl_source| {
             value.* = txn.get(key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
             timestamp.* = 0;
+            // Source-aware document tombstones reuse the authenticated version
+            // word for the final allocator floor. Legacy frames retain zero.
+            if (state.ttl_sources and value.* == null and internal_keys.isPrimaryDocumentKey(key)) {
+                if (deletion_version_floor == null) {
+                    const floor = txn.get(@import("ttl.zig").document_version_watermark_key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    deletion_version_floor = if (floor) |raw| blk: {
+                        if (raw.len != 8) return error.InvalidTimestamp;
+                        break :blk std.mem.readInt(u64, raw[0..8], .little);
+                    } else 0;
+                }
+                timestamp.* = deletion_version_floor.?;
+            }
             if (integrity.isKey(key)) {
                 _ = integrity.parseKey(key) catch return error.RetainedEffectsCorrupt;
                 if (value.*) |raw| _ = integrity.validateTransferRecord(key, raw) catch return error.RetainedEffectsCorrupt;
@@ -907,8 +962,12 @@ pub const Capture = struct {
                     else => return err,
                 };
                 if (raw_timestamp) |raw| {
-                    if (raw.len != 8) return error.RetainedEffectsCorrupt;
-                    timestamp.* = std.mem.readInt(u64, raw[0..8], .little);
+                    timestamp.* = @import("ttl.zig").writeVersion(raw) orelse return error.RetainedEffectsCorrupt;
+                    if (state.ttl_sources and !internal_keys.isRelationalRowKey(key)) {
+                        var encoded: [16]u8 = undefined;
+                        std.mem.writeInt(i128, &encoded, @import("ttl.zig").sourceTimestamp(raw).?, .little);
+                        ttl_source.* = encoded;
+                    } else if (raw.len == 24) return error.RetainedEffectsFenceMismatch;
                 }
                 // Typed query/TTL readers use the packed row metadata. Refuse
                 // a sidecar-only typed update before commit rather than retain
@@ -920,6 +979,7 @@ pub const Capture = struct {
             }
             const value_len = if (value.*) |raw| raw.len else 0;
             size = std.math.add(usize, size, 16) catch return error.RetainedEffectsFull;
+            if (ttl_source.* != null) size = std.math.add(usize, size, 16) catch return error.RetainedEffectsFull;
             size = std.math.add(usize, size, key.len) catch return error.RetainedEffectsFull;
             size = std.math.add(usize, size, value_len) catch return error.RetainedEffectsFull;
             if (size > retained_frame.max_logical_bytes) return error.RetainedEffectsFull;
@@ -941,22 +1001,23 @@ pub const Capture = struct {
             const offsets = try alloc.alloc(u32, keys.len);
             defer alloc.free(offsets);
             var header: [16]u8 = undefined;
-            @memcpy(header[0..4], if (state.graph_artifacts) "REFG" else if (state.direct_vectors) "REF4" else "REF3");
+            @memcpy(header[0..4], retained_frame.frameMagic(state.direct_vectors, state.graph_artifacts, state.ttl_sources));
             std.mem.writeInt(u64, header[4..12], sequence, .little);
             std.mem.writeInt(u32, header[12..16], @intCast(keys.len), .little);
             var payload_hash = std.crypto.hash.sha2.Sha256.init(.{});
             payload_hash.update(&header);
             var frame_offset: usize = header.len;
-            for (keys, values, timestamps, 0..) |key, value, timestamp, index| {
+            for (keys, values, timestamps, ttl_sources, 0..) |key, value, timestamp, source, index| {
                 offsets[index] = @intCast(frame_offset);
                 var entry: [16]u8 = undefined;
                 std.mem.writeInt(u32, entry[0..4], @intCast(key.len), .little);
-                std.mem.writeInt(u32, entry[4..8], if (value) |raw| @intCast(raw.len) else std.math.maxInt(u32), .little);
+                std.mem.writeInt(u32, entry[4..8], if (value) |raw| @as(u32, @intCast(raw.len)) | (if (source != null) retained_frame.source_flag else 0) else std.math.maxInt(u32), .little);
                 std.mem.writeInt(u64, entry[8..16], timestamp, .little);
                 payload_hash.update(&entry);
+                if (source) |bytes| payload_hash.update(&bytes);
                 payload_hash.update(key);
                 if (value) |raw| payload_hash.update(raw);
-                frame_offset += 16 + key.len + if (value) |raw| raw.len else 0;
+                frame_offset += 16 + @as(usize, if (source != null) 16 else 0) + key.len + (if (value) |raw| raw.len else 0);
             }
             if (frame_offset + 32 != size) return error.RetainedEffectsCorrupt;
             const payload_checksum = payload_hash.finalResult();
@@ -964,12 +1025,13 @@ pub const Capture = struct {
             defer alloc.free(chunk_buffer);
             var emitter: ChunkEmitter = .{ .sequence = sequence, .buffer = chunk_buffer, .hashes = hashes };
             try emitter.append(txn, &header);
-            for (keys, values, timestamps) |key, value, timestamp| {
+            for (keys, values, timestamps, ttl_sources) |key, value, timestamp, source| {
                 var entry: [16]u8 = undefined;
                 std.mem.writeInt(u32, entry[0..4], @intCast(key.len), .little);
-                std.mem.writeInt(u32, entry[4..8], if (value) |raw| @intCast(raw.len) else std.math.maxInt(u32), .little);
+                std.mem.writeInt(u32, entry[4..8], if (value) |raw| @as(u32, @intCast(raw.len)) | (if (source != null) retained_frame.source_flag else 0) else std.math.maxInt(u32), .little);
                 std.mem.writeInt(u64, entry[8..16], timestamp, .little);
                 try emitter.append(txn, &entry);
+                if (source) |bytes| try emitter.append(txn, &bytes);
                 try emitter.append(txn, key);
                 if (value) |raw| try emitter.append(txn, raw);
             }
@@ -980,6 +1042,7 @@ pub const Capture = struct {
                 .total = @intCast(size),
                 .direct_vectors = state.direct_vectors,
                 .graph_artifacts = state.graph_artifacts,
+                .ttl_sources = state.ttl_sources,
                 .logical_digest = logical_digest,
                 .payload_checksum = payload_checksum,
                 .chunk_hashes = hashes,
@@ -991,15 +1054,19 @@ pub const Capture = struct {
         } else {
             const bytes = try alloc.alloc(u8, size);
             defer alloc.free(bytes);
-            @memcpy(bytes[0..4], if (state.direct_vectors) "REF4" else "REF3");
+            @memcpy(bytes[0..4], retained_frame.frameMagic(state.direct_vectors, false, state.ttl_sources));
             std.mem.writeInt(u64, bytes[4..12], sequence, .little);
             std.mem.writeInt(u32, bytes[12..16], @intCast(keys.len), .little);
             var pos: usize = 16;
-            for (keys, values, timestamps) |key, value, timestamp| {
+            for (keys, values, timestamps, ttl_sources) |key, value, timestamp, source| {
                 std.mem.writeInt(u32, bytes[pos..][0..4], @intCast(key.len), .little);
-                std.mem.writeInt(u32, bytes[pos + 4 ..][0..4], if (value) |raw| @intCast(raw.len) else std.math.maxInt(u32), .little);
+                std.mem.writeInt(u32, bytes[pos + 4 ..][0..4], if (value) |raw| @as(u32, @intCast(raw.len)) | (if (source != null) retained_frame.source_flag else 0) else std.math.maxInt(u32), .little);
                 std.mem.writeInt(u64, bytes[pos + 8 ..][0..8], timestamp, .little);
                 pos += 16;
+                if (source) |source_bytes| {
+                    @memcpy(bytes[pos..][0..16], &source_bytes);
+                    pos += 16;
+                }
                 @memcpy(bytes[pos..][0..key.len], key);
                 pos += key.len;
                 if (value) |raw| {
