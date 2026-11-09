@@ -1436,6 +1436,15 @@ pub const OpenOptions = struct {
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     io: ?std.Io = null,
+    /// Overrides `Store.ride_along_idle_ns`'s default (50ms) when set. See
+    /// that field's own doc comment: this is a durability-latency
+    /// tradeoff for ride-along work with no concurrent foreground writer,
+    /// not a knob for making any one caller's write cadence look better --
+    /// widening it delays durability for background/ride-along work
+    /// across every consumer that stages through this store (graph,
+    /// relational jobs, resolution, enrichment, algebraic HLL
+    /// maintenance), not just whichever one a caller has in mind.
+    ride_along_idle_ns: ?u64 = null,
 };
 
 pub const CreateOptions = struct {
@@ -1446,6 +1455,8 @@ pub const CreateOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     writer_lock_marker: []const u8 = "",
     io: ?std.Io = null,
+    /// See `OpenOptions.ride_along_idle_ns`.
+    ride_along_idle_ns: ?u64 = null,
 };
 
 const MutationRequest = struct {
@@ -1699,6 +1710,14 @@ pub const Store = struct {
     ride_along_pending_count: usize = 0,
     ride_along_pending_bytes: usize = 0,
     ride_along_last_enqueue_ns: i96 = 0,
+    /// Durability bound for ride-along work when no foreground writer
+    /// arrives to drain it for free (barrier (a), `rideAlongFlushLoop`
+    /// below). Overridable at open time via `OpenOptions.ride_along_idle_ns`/
+    /// `CreateOptions.ride_along_idle_ns`; the default (50ms) is deliberate
+    /// and shared by every ride-along user of this store (graph,
+    /// relational jobs, resolution, enrichment, algebraic HLL maintenance),
+    /// so callers override it only to test this barrier itself, never to
+    /// tune write-amplification numbers for one caller's own benefit.
     ride_along_idle_ns: u64 = 50 * std.time.ns_per_ms,
     ride_along_byte_threshold: usize = 1024 * 1024,
     ride_along_flush_started: std.atomic.Value(bool) = .init(false),
@@ -1792,6 +1811,7 @@ pub const Store = struct {
             .maintenance_policy = policy,
             .maintenance_start_suppressed = true,
         };
+        if (opts.ride_along_idle_ns) |idle_ns| result.ride_along_idle_ns = idle_ns;
         errdefer result.close();
         // A standalone owner may live for only one CLI invocation, so reopen
         // services its debt. External owners schedule this work themselves:
@@ -1841,7 +1861,7 @@ pub const Store = struct {
         file.reserve_retirement_capacity = true;
         if (opts.reclamation.max_storage_bytes != 0) file.max_file_bytes = opts.reclamation.max_storage_bytes;
         file.vacuum_target_indexed = opts.reclamation.page_reuse;
-        return .{
+        var result: Store = .{
             .score_cache_owner = next_score_cache_owner.fetchAdd(1, .monotonic),
             .allocator = allocator,
             .file = file,
@@ -1850,6 +1870,8 @@ pub const Store = struct {
             .maintenance_policy = policy,
             .maintenance_start_suppressed = opts.externally_locked,
         };
+        if (opts.ride_along_idle_ns) |idle_ns| result.ride_along_idle_ns = idle_ns;
+        return result;
     }
 
     fn stopMaintenance(self: *Store) void {
