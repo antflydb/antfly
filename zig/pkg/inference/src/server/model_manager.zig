@@ -4942,6 +4942,19 @@ pub const ModelHandle = struct {
     }
 };
 
+/// A lifetime pin for metadata probes that must not count as inference use.
+pub const ModelObservationHandle = struct {
+    handle: ModelHandle,
+
+    pub fn get(self: *const ModelObservationHandle) *LoadedModel {
+        return self.handle.get();
+    }
+
+    pub fn release(self: *ModelObservationHandle) void {
+        self.handle.releaseWithUsage(false);
+    }
+};
+
 pub const LoadedModelSnapshot = struct {
     allocator: std.mem.Allocator,
     /// Borrowed observation pins; release them only through this owner.
@@ -7843,6 +7856,17 @@ pub const ModelManager = struct {
         if (std.meta.eql(handle.get().managed_publication, expected)) return;
         handle.retire();
         return error.ModelArtifactsChanging;
+    }
+
+    /// Observe the same warm publication as request loading without renewing
+    /// idle residency. The pin still protects against eviction and retirement.
+    pub fn acquireCachedObservationFromDir(self: *ModelManager, model_dir: []const u8) !?ModelObservationHandle {
+        return self.acquireCachedObservationFromDirWithControl(model_dir, .{});
+    }
+
+    pub fn acquireCachedObservationFromDirWithControl(self: *ModelManager, model_dir: []const u8, control: InferenceExecutionControl) !?ModelObservationHandle {
+        const handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
+        return .{ .handle = handle };
     }
 
     /// Return owned warm-request metadata without holding a second runtime
@@ -10842,6 +10866,87 @@ test "model cache eviction skips active and pinned models and removes aliases" {
     manager.unlockLoadedModels();
     try std.testing.expect(after_eviction == null);
     allocator.free(evicted.?.key);
+}
+
+test "cached model observation preserves TTL and eviction order across repeated probes" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.metal} });
+    defer {
+        var it = manager.loaded.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        manager.loaded.deinit(allocator);
+        manager.loaded_aliases.deinit(allocator);
+        manager.in_flight_loads.deinit(allocator);
+    }
+    manager.configureModelCache(1, 2);
+    var oldest = admissionEvictionTestModel(1);
+    var recent = admissionEvictionTestModel(2);
+    recent.pinned = true;
+    // Match startup preloads, which need not publish a path-only alias.
+    try manager.loaded.put(allocator, try backendVariantCacheKey(allocator, "model", .metal, null), &oldest);
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "recent"), &recent);
+    const selected = ResolvedModel{ .path = "model", .publication = null };
+    const stale = ResolvedModel{ .path = "model", .publication = @as([32]u8, @splat(1)) };
+    try std.testing.expectError(error.ModelArtifactsChanging, manager.acquireCachedObservationFromDirWithControl("model", .{
+        .io = std.testing.io,
+        .model_selection = stale.binding(),
+    }));
+    try std.testing.expectEqual(@as(usize, 0), oldest.active_handles);
+    try std.testing.expectEqual(@as(u64, 1), oldest.last_used_ns);
+    const expired_at = 11 + std.time.ns_per_ms;
+    for (0..3) |_| {
+        var observation = (try manager.acquireCachedObservationFromDirWithControl("model", selected.bind(InferenceExecutionControl{ .io = std.testing.io }))).?;
+        defer observation.release();
+        try std.testing.expect(observation.get() == &oldest);
+        try std.testing.expectEqual(@as(usize, 1), oldest.active_handles);
+        manager.lockLoadedModels();
+        const held = manager.takeLruModelLocked(expired_at, true, null);
+        manager.unlockLoadedModels();
+        defer if (held) |removed| allocator.free(removed.key);
+        try std.testing.expect(held == null);
+        observation.release();
+        try std.testing.expectEqual(@as(usize, 0), oldest.active_handles);
+        try std.testing.expectEqual(@as(u64, 1), oldest.last_used_ns);
+    }
+    try std.testing.expect((try manager.acquireCachedObservationFromDir("cold model")) == null);
+    try std.testing.expectEqual(@as(usize, 0), manager.in_flight_loads.count());
+    recent.pinned = false;
+    manager.lockLoadedModels();
+    const expired = manager.takeLruModelLocked(expired_at, true, null);
+    manager.unlockLoadedModels();
+    defer if (expired) |removed| allocator.free(removed.key);
+    try std.testing.expect(expired != null and expired.?.model == &oldest);
+}
+
+test "cached model observation preserves inference usage and final retired cleanup" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.metal} });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 64 });
+    try manager.ensureResourceOwnerReady();
+    var probe = TeardownTestProbe{};
+    const model = try teardownTestModel(&manager, &probe);
+    var inference = try manager.publishLoadedModel(model, true, null, null, 0);
+    defer inference.release();
+    var observation = (try manager.acquireCachedObservationFromDir(model.model_dir)).?;
+    defer observation.release();
+    try std.testing.expectEqual(@as(usize, 2), model.active_handles);
+    const before_release = platform.time.monotonicNs();
+    inference.release();
+    const used_at = model.last_used_ns;
+    try std.testing.expect(used_at >= before_release);
+    var owner = (try manager.acquireCachedFromDir(model.model_dir)).?;
+    defer owner.release();
+    owner.retire();
+    try std.testing.expect(model.retired and !probe.closed);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded_aliases.count());
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    try std.testing.expectEqual(used_at, model.last_used_ns);
+    try std.testing.expectEqual(@as(usize, 64), manager.admissionController().snapshot().host_weight_bytes);
+    observation.release();
+    try std.testing.expect(probe.closed);
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
 }
 
 test "loaded model snapshot preserves TTL while ordinary inference release records use" {

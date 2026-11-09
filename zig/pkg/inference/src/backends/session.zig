@@ -692,6 +692,8 @@ pub const ExecutionCapabilities = struct {
     boundary_batch_padded_tokens: usize = 0,
     boundary_batch_collection_wait_us: u64 = 0,
     cooperative_steps: bool = false,
+    /// F16 shared prefix storage is protected by the model execution scope and KV lock.
+    cooperative_prompt_cache: bool = false,
     max_active_requests: usize = 1,
     max_batch_rows: usize = 1,
     /// Mixed prefill/decode padding is excluded unless explicitly qualified.

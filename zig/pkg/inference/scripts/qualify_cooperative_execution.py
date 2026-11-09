@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compare serialized and cooperative one-row serving on the same owned pool.
+"""Compare serialized/cooperative serving and decode rows on one owned pool.
 
 Run each mode against the same binary and model inventory, then --compare both
 output directories. Gates are fixed here before measurement. GPU sharing remains
@@ -351,6 +351,13 @@ def run(args):
     )
     short = prompt(args.short_records, args.short_output, "tulip-harbor-9462", "garden")
     long["temperature"] = short["temperature"] = args.temperature
+    prefix_cache = getattr(args, "prefix_cache", False)
+    if prefix_cache:
+        for body in (long, short):
+            body.update(
+                prompt_cache=True,
+                prompt_cache_key="cooperative-cache-equivalence",
+            )
     workload = {
         "long": long,
         "short": short,
@@ -380,6 +387,11 @@ def run(args):
             status, raw, _ = q.http(args.url, "/metrics", text=True, timeout=5)
             assert status == 200
             row["scheduler_at_completion"] = q.metrics(raw)
+        if prefix_cache:
+            assert row["response"]["usage"]["cached_prompt_tokens"] > 0, (
+                label,
+                "cached campaign did not reuse a prefix",
+            )
         return row
 
     try:
@@ -454,11 +466,18 @@ def run(args):
         else:
             c.set_phase("independent-references")
             for label, body in (("long", long), ("short", short)):
-                choices = c.request("generate", body)["response"]["choices"]
+                choices = c.request("generate", {**body, "prompt_cache": False})[
+                    "response"
+                ]["choices"]
                 if label in references:
                     assert choices == references[label], "independent reference differs"
                 else:
                     references[label] = choices
+        if prefix_cache:
+            c.set_phase("prefix-cache-prime")
+            for label, body in (("long", long), ("short", short)):
+                primed = c.request("generate", body)
+                assert primed["response"]["choices"] == references[label], label
         (args.output / "references.json").write_text(
             json.dumps(references, indent=2) + "\n"
         )
@@ -533,6 +552,10 @@ def run(args):
             pairs[label]["short_prompt_tokens"] = y["response"]["usage"][
                 "prompt_tokens"
             ]
+            pairs[label]["short_uncached_prompt_tokens"] = (
+                pairs[label]["short_prompt_tokens"]
+                - y["response"]["usage"].get("cached_prompt_tokens", 0)
+            )
             if args.mode == "cooperative":
                 assert y["completed_at"] < x["completed_at"], (
                     "short request did not complete before long request"
@@ -562,10 +585,27 @@ def run(args):
                         decode_progress
                     )
                     pairs[label]["both_decode_observed"] = both_decode
+                elif prefix_cache:
+                    # Reused-prefix suffix prefill executes directly under its
+                    # scope rather than contributing scheduler query tokens.
+                    # Count decode rows to prove the long owner progressed.
+                    decode_progress = (
+                        y["scheduler_at_completion"][
+                            "antfly_inference_native_scheduler_step_decode_items_total"
+                        ]
+                        - before[
+                            "antfly_inference_native_scheduler_step_decode_items_total"
+                        ]
+                    )
+                    assert decode_progress > args.short_output, (
+                        "no long-request decoding while cached short request ran"
+                    )
+                    pairs[label]["scheduled_decode_items_during_short"] = decode_progress
                 else:
                     assert (
                         progress
-                        > y["response"]["usage"]["prompt_tokens"] + args.short_output
+                        > pairs[label]["short_uncached_prompt_tokens"]
+                        + args.short_output
                     ), "no long-request GPU progress while short request ran"
                 if args.rows == 1:
                     assert (
@@ -605,6 +645,12 @@ def run(args):
                     8, 8, "cooperative-ownership-turnover"
                 ),
             }
+            # F16 prefix-cache requests now share cooperative execution.
+            # An unqualified cache dtype retains the exclusive ownership fence.
+            bodies["turnover_exclusive"] = q.Campaign.generate(
+                8, 8, "cooperative-ownership-exclusive"
+            )
+            bodies["turnover_exclusive"]["cache_dtype"] = "f32"
             for key, body in bodies.items():
                 choices = c.request("generate", body)["response"]["choices"]
                 if key in references:
@@ -648,13 +694,14 @@ def run(args):
                         pool.submit(turnover_request, "turnover_small")
                         for _ in range(4)
                     ]
-                    exclusive = pool.submit(turnover_request, "turnover_cache")
-                    for future in active + queued + [exclusive]:
+                    cached = pool.submit(turnover_request, "turnover_cache")
+                    exclusive = pool.submit(turnover_request, "turnover_exclusive")
+                    for future in active + queued + [cached, exclusive]:
                         future.result()
                 print(
                     "ownership-turnover",
                     round_index,
-                    "7 completed requests including exclusive cache route",
+                    "8 completed requests including cooperative cache and exclusive KV dtype routes",
                     flush=True,
                 )
             (args.output / "references.json").write_text(
@@ -743,6 +790,11 @@ def main():
     p.add_argument("--short-output", type=int, default=32)
     p.add_argument("--generation-timeout", type=int, default=600)
     p.add_argument("--probe-interval", type=float, default=0.25)
+    p.add_argument(
+        "--prefix-cache",
+        action="store_true",
+        help="Prime prefixes from independent uncached references, then require reuse",
+    )
     p.add_argument("--turnover-rounds", type=int, default=2)
     p.add_argument(
         "--compare-batching", type=Path, nargs=2, metavar=("SINGLE_ROW", "TWO_ROWS")

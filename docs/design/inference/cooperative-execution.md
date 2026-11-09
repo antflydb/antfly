@@ -36,8 +36,12 @@ The read-pool deployment selects batching for ready requests without a batch-fil
 wait; this deployment choice does not turn a failed performance gate into a pass.
 The decoder's backend declaration currently fences sharing to eagerly uploaded
 dense Gemma 4 E4B CUDA geometry. Other backends default to exclusive execution.
-Graph, prompt-cache, speculative, selected-KV and multimodal requests retain
-exclusive ownership. Backend declarations carry both the sharing limits and the
+F16 prefix-cache requests in CUDA's supported `simple` and `block_hash` modes,
+including streaming responses, can participate when the backend declares
+`cooperative_prompt_cache`. CUDA radix caching remains disabled until device
+pages have the required independent lifetime. Other KV dtypes, graph,
+speculative, selected-KV and multimodal requests retain exclusive ownership.
+Backend declarations carry both the sharing limits and the
 measured immutable-weight inventory; the generic scheduler does not infer either
 from architecture dimensions.
 The inventory uses actual eagerly uploaded CUDA weight bytes. A BERT-specific
@@ -85,10 +89,32 @@ between backend support, interleaving configuration and row batching.
    setting is 10 ms. Completion arms this deadline once. CPU progress and other
    owners do not extend it. Expiry, cancellation, and the burst limit let ready
    peers proceed. A lone request does not wait for an absent peer.
+7. Prefix lookup/attachment, publication, GPU access and sequence retirement
+   acquire the model execution scope before cache KV metadata. Cached prefixes
+   retain reference-counted blocks; eviction releases only cache ownership,
+   leaving attached requests valid. A placement probe takes only the metadata
+   lock and reads tokens without attachment, allocation, TTL/LRU refresh,
+   hit accounting or eviction. Admission checks reuse again: the probe conveys
+   a scheduling estimate and never pins cache entries or authorizes memory.
+   Advancing host KV tables uses a metadata execution scope: it retains the
+   lane, model mutex and request budget and confirms stream completion, while
+   preserving backend owner state. It cannot launch a decoder batch. Backends
+   without an explicit drain contract retain normal request transitions. A
+   failed drain requires worker restart before borrowed storage can retire.
+   The fast path also requires an attached prefix cache.
+   `ANTFLY_INFERENCE_CUDA_KV_METADATA_SCOPE=0` restores the former transitions
+   for controlled comparisons.
 
-Every owner in the cooperative envelope has its own KV, transient admission,
-request budget and cancellation lifetime. Its one-row step cannot borrow a
-peer's budget. Widening active counts, physical rows, or the backend declaration
+The existing `qualify_cooperative_execution.py --prefix-cache` campaign creates
+independent uncached references with different request markers, primes each
+prefix, then requires actual reuse and exact outputs in concurrent streaming
+and buffered requests. Queue turnover includes supported cached sharing and an
+exclusive F32 request; the disconnect campaign verifies healthy-peer recovery.
+
+Every owner in the cooperative envelope has its own KV sequence, mutable tail,
+transient admission, request budget and cancellation lifetime. Shared prefix
+pages remain reference counted. A one-row step cannot borrow a peer's budget.
+Widening active counts, physical rows, or the backend declaration
 requires new fairness, output-equivalence and resource-accounting evidence.
 
 ## Physical device budget and recovery

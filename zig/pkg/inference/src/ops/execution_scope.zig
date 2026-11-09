@@ -19,7 +19,7 @@ const ops = @import("ops.zig");
 const control_mod = @import("../execution_control.zig");
 const Control = control_mod.InferenceExecutionControl;
 
-pub const Phase = enum { setup, step, release, cleanup };
+pub const Phase = enum { setup, step, metadata, release, cleanup };
 pub const OwnerSnapshot = struct { transitions: u64 = 0, reuses: u64 = 0, cleanups: u64 = 0, releases: u64 = 0, resets: u64 = 0 };
 
 /// Access last_owner only under the model execution mutex. Counters are atomic
@@ -116,7 +116,14 @@ pub const Scope = struct {
         std.debug.assert(self.active and self.backend == null);
         backend.bindExecutionBudget();
         errdefer backend.clearExecutionBudget();
-        if (self.phase == .cleanup) {
+        if (self.phase == .metadata) {
+            // Host KV table changes must not race a pending upload/readback.
+            // They do not execute a model or alter its request-local backend
+            // state, so preserve the remembered owner and deferred-free policy.
+            const drain = backend.execution_batch_drain orelse return error.ExecutionMetadataUnsupported;
+            drain(backend.ptr) catch |err|
+                std.debug.panic("execution metadata stream cannot drain; worker restart required: {s}", .{@errorName(err)});
+        } else if (self.phase == .cleanup) {
             if (backend.execution_cleanup) |cleanup| cleanup(backend.ptr, backend.execution_owner);
         } else if (self.phase == .release) {
             if (backend.execution_release) |release| release(backend.ptr, backend.execution_owner);
@@ -127,6 +134,7 @@ pub const Scope = struct {
     /// The scope owns this borrowed aggregate until GPU work and publication
     /// drain. The request-local backend wrapper remains unchanged.
     pub fn bindDecodeBatch(self: *Scope, budget: *@import("../runtime/tier/memory.zig").RunBudget, rows: usize) void {
+        std.debug.assert(self.phase != .metadata);
         var backend = self.backend orelse unreachable;
         backend.execution_budget = budget;
         backend.bindExecutionBudget();
@@ -163,6 +171,51 @@ pub const Scope = struct {
         self.active = false;
     }
 };
+
+test "execution scope metadata drains and binds budget without an owner transition" {
+    const Memory = @import("../runtime/tier/memory.zig");
+    const Probe = struct {
+        budget: ?*Memory.RunBudget = null,
+        drains: usize = 0,
+        fn bind(raw: *anyopaque, budget: ?*Memory.RunBudget) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.budget = budget;
+        }
+        fn enter(_: *anyopaque, _: u64) !void {
+            return error.UnexpectedOwnerTransition;
+        }
+        fn drain(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.drains += 1;
+            try std.testing.expect(self.budget != null);
+        }
+    };
+    var mutex = std.atomic.Mutex.unlocked;
+    var lane = control_mod.ExecutionLane{};
+    var probe = Probe{};
+    var budget = Memory.RunBudget.init(.{});
+    var backend = ops.ComputeBackend{ .ptr = &probe, .vtable = undefined, .execution_budget = &budget, .execution_budget_bind = Probe.bind, .execution_enter = Probe.enter, .execution_batch_drain = Probe.drain, .execution_owner = 17 };
+    {
+        var scope = try Scope.acquire(.{}, .{ .mutex = &mutex, .lane = &lane, .phase = .metadata });
+        defer scope.deinit();
+        try scope.bind(backend);
+        try std.testing.expect(probe.budget == &budget);
+    }
+    try std.testing.expect(probe.budget == null);
+    try std.testing.expectEqual(@as(usize, 1), probe.drains);
+    backend.execution_batch_drain = null;
+    {
+        var scope = try Scope.acquire(.{}, .{ .mutex = &mutex, .lane = &lane, .phase = .metadata });
+        defer scope.deinit();
+        try std.testing.expectError(error.ExecutionMetadataUnsupported, scope.bind(backend));
+        try std.testing.expect(probe.budget == null);
+    }
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+    var next = try Scope.acquire(.{}, .{ .mutex = &mutex, .lane = &lane });
+    defer next.deinit();
+    try std.testing.expectError(error.UnexpectedOwnerTransition, next.bind(backend));
+}
 
 test "execution owner transitions reset once and preserve same-request steps" {
     const Probe = struct {

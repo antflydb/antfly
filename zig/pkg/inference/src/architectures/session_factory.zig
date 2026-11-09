@@ -8677,6 +8677,7 @@ fn archExecutionCapabilities(raw: *anyopaque) @import("../backends/session.zig")
         cfg.effectiveKVHeads() == 2 and cfg.headDim() == 256 and cfg.global_head_dim == 512;
     return .{
         .cooperative_steps = cooperative,
+        .cooperative_prompt_cache = cooperative,
         .max_active_requests = if (cooperative) 2 else 1,
         .max_batch_rows = if (cooperative) compute.cooperativeDecodeBatchRows(cfg.weight_tying) else 1,
         .decode_only_batching = true,
@@ -13007,6 +13008,7 @@ test "cooperative backend declaration uses eager weight inventory independently 
     const session = Session{ .ptr = &arch, .vtable = &arch_vtable };
     var caps = session.executionCapabilities();
     try std.testing.expect(caps.cooperative_steps);
+    try std.testing.expect(caps.cooperative_prompt_cache);
     try std.testing.expectEqual(@as(?usize, 4096), caps.measured_resident_weights);
     try std.testing.expectEqual(@as(usize, 2), caps.max_active_requests);
     try std.testing.expectEqual(@as(usize, 1), caps.max_batch_rows);

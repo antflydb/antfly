@@ -1367,7 +1367,7 @@ pub const CooperativeExecutionConfig = struct {
 
     pub fn enabledForRequest(self: @This(), capabilities: @import("../backends/session.zig").ExecutionCapabilities, graph: bool, draft: bool, cache: bool, media: bool) bool {
         return self.mode == .on and capabilities.cooperative_steps and capabilities.max_active_requests >= self.max_active_requests and
-            !graph and !draft and !cache and !media and
+            !graph and !draft and (!cache or capabilities.cooperative_prompt_cache) and !media and
             !platform.env.getenvBool("ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING") and
             !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET") and
             !cudaDecodeGraphReplayRequested(platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"));
@@ -16320,7 +16320,7 @@ pub const Node = struct {
             .cache_dtype = body.cache_dtype orelse (if (native_transfer != null) "f16" else null),
             .cache_compaction_ratio = body.cache_compaction_ratio,
             .kv_cache_mode = if (selected_kv) .select_v1 else .exact_hybrid,
-            .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
+            .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null,
             .prompt_cache_key = prompt_cache_key,
         };
         const backend_selection = parseGenerateBackendSelection(body.backend, body.mode, body.compiled_target) catch |err| {
@@ -16669,25 +16669,32 @@ pub const Node = struct {
             gpt_config,
             self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
         );
-        const cooperative_cuda = native_transfer == null and !selected_kv and self.config.cooperative_execution.enabledForRequest(
-            model.session.executionCapabilities(),
-            backend_selection.graph_mode_requested or graphModeEnabled() or effective_compiled_partition_backend != null,
-            effective_draft_model_name != null or auto_draft_sibling != null or config.speculation_requested,
-            config.prompt_cache_enabled,
-            generateMessagesHaveMedia(effective_messages),
-        );
+        const cooperative_cuda = native_transfer == null and !selected_kv and
+            (!config.prompt_cache_enabled or (kv_dtype == .f16 and config.cache_compaction_ratio == null)) and
+            self.config.cooperative_execution.enabledForRequest(
+                model.session.executionCapabilities(),
+                backend_selection.graph_mode_requested or graphModeEnabled() or effective_compiled_partition_backend != null,
+                effective_draft_model_name != null or auto_draft_sibling != null or config.speculation_requested,
+                config.prompt_cache_enabled,
+                generateMessagesHaveMedia(effective_messages),
+            );
         if (cooperative_cuda and self.config.generation_batching.mode == .on and self.config.generation_batching.max_step_items > model.session.executionCapabilities().max_batch_rows)
             return ctx.status(400).json(.{ .@"error" = "UNQUALIFIED_COOPERATIVE_BATCH", .message = "Requested row count exceeds the backend cooperative decode-batching capability" });
         const native_isolated = native_transfer == null and canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, effective_draft_model_name != null or auto_draft_sibling != null, config.prompt_cache_enabled, want_stream);
         // Queued callers own neither scheduler work nor device KV/scratch.
         // Exclusive requests fence the shared backend's cache/graph lifetime.
-        const generation_slot = model.generation_admission.acquire(
+        const queued_cached_tokens = if (config.prompt_cache_enabled and prompt_estimate != null and config.prompt_cache_key != null and !generateMessagesHaveMedia(effective_messages) and prompt_tokens <= prompt_estimate.?.encoded.ids.len)
+            model.prompt_prefix_cache.peekLongestPrefixForPool(config.prompt_cache_key.?, prompt_estimate.?.encoded.ids[0..prompt_tokens], prompt_tokens -| 16, generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced()))
+        else
+            0;
+        const generation_slot = model.generation_admission.acquireWithWork(
             execution_control,
             !cooperative_cuda and !native_isolated,
             runtime.scheduler.generation_admission.Limits.forRequests(
                 self.config.max_concurrent_requests,
                 if (cooperative_cuda) self.config.cooperative_execution.max_active_requests else null,
             ),
+            .{ .prefill_tokens = prompt_tokens - queued_cached_tokens, .decode_tokens = @intCast(configured_max_tokens) },
         ) catch |err| {
             if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
             return inferenceFailureResponse(ctx, err);
@@ -17397,6 +17404,10 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
         var decode_state = generation.NativeDecodeState.initPaged(execution_allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        // Prefix-cache metadata and every attached sequence share one KV lock.
+        // GPU writes, cache lookup/publication and cleanup additionally own the
+        // model execution scope: lock order is model execution, then cache KV.
+        if (prompt_cache) |cache| decode_state.kv_lock = &cache.mutex;
         if (cooperative_cuda) {
             decode_state.execution_backend = cb;
             decode_state.execution_control = execution_control;
@@ -25782,6 +25793,68 @@ pub const Node = struct {
         return try instances.toOwnedSlice(allocator);
     }
 
+    /// Internal worker scheduling protocol, versioned independently of public
+    /// inference schemas. It pins only an already loaded generation, tokenizes
+    /// on the CPU and reads cache metadata; it never loads weights or creates KV.
+    pub fn estimateGeneratePlacement(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const control = httpInferenceExecutionControl(self, ctx);
+        try control.check();
+        const bytes = (try ctx.body()) orelse return ctx.status(400).json(.{ .@"error" = "missing_body" });
+        if (bytes.len > 2 * 1024 * 1024) return ctx.status(413).json(.{ .@"error" = "PLACEMENT_REQUEST_TOO_LARGE" });
+        var parsed = std.json.parseFromSlice(api.GenerateRequest, ctx.allocator, bytes, .{ .ignore_unknown_fields = true }) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST" });
+        defer parsed.deinit();
+        const body = parsed.value;
+        if (body.backend) |backend| if (backend != .cuda)
+            return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
+        // Keep unsupported transformations on ordinary routing. A partial
+        // estimate must never claim to describe the eventual rendered prompt.
+        if (body.messages.len == 0 or generateRequestHasNonTextContentParts(body) or body.tools != null or body.tool_choice != null or body.context_management != null or body.response_format != null or body.grammar != null or body.draft_model != null or body.kv_cache != null)
+            return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
+        if (try self.acquireSlotUnits(ctx, 1)) |response| return response;
+        defer self.releaseSlotUnits(1);
+        const selected = self.resolveRequestModelSelection(ctx.allocator, ctx.io, if (body.model.len > 0) body.model else null, "generators") catch |err| return requestModelResolutionError(ctx, err);
+        const path = selected.path;
+        defer ctx.allocator.free(path);
+        if (try rejectDisallowedModel(self, ctx, path)) |response| return response;
+        var handle = (self.model_manager.acquireCachedObservationFromDirWithControl(path, self.bindModelSelection(selected, control)) catch |err|
+            return modelLoadFailureResponse(ctx, err)) orelse return ctx.status(409).json(.{ .@"error" = "MODEL_NOT_LOADED" });
+        defer handle.release();
+        const model = handle.get();
+        if (!model.session.executionCapabilities().cooperative_steps) return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
+        const cfg = session_factory.getGptConfig(model.session) orelse return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
+        const numeric = parseGenerateNumericOptions(body.max_tokens, null) catch |err| return contextRequestFailure(ctx, err);
+        var owned = self.parseGenerateMessages(ctx.allocator, body) catch |err| return contextRequestFailure(ctx, err);
+        defer owned.deinit();
+        var estimate: ?NativePromptEstimate = null;
+        defer if (estimate) |*value| value.deinit();
+        const tokens = try self.estimateNativePromptTokens(ctx.allocator, path, model, cfg, owned.messages, numeric.max_tokens, 0, if (body.chat_template_kwargs) |kwargs| kwargs.enable_thinking else null, false, &estimate);
+        try control.check();
+        const dtype = if (body.cache_dtype) |name| runtime.kv.pool.parseKvDType(name) orelse return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" }) else session_factory.recommendedKvDTypeForSession(model.session, .cuda);
+        const cached = if (self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and body.prompt_cache_key != null and body.prompt_cache_key.?.len > 0)
+            model.prompt_prefix_cache.peekLongestPrefixForPool(body.prompt_cache_key.?, estimate.?.encoded.ids[0..tokens], tokens -| 16, generation.kvPoolConfig(.cuda, dtype, cfg, generationKvSlidingTrimForced()))
+        else
+            0;
+        const admission = model.generation_admission.snapshot();
+        const scheduled = if (model.native_generate_coordinator) |coordinator| coordinator.snapshot() else runtime.scheduler.native_generate.Snapshot{ .waiting_requests = 0, .prefill_requests = 0, .decode_requests = 0, .active_units = 0 };
+        return ctx.json(.{
+            .version = @as(u32, 1),
+            .model = body.model,
+            .instance_id = try std.fmt.allocPrint(ctx.allocator, "{x:0>32}", .{model.runtime_id}),
+            .requested_decode_tokens = numeric.max_tokens,
+            .prompt_tokens = tokens,
+            .cached_tokens = cached,
+            .uncached_prompt_tokens = tokens - cached,
+            .active_requests = admission.active,
+            .queued_requests = admission.waiting,
+            .queued_prefill_tokens = admission.queued_work.prefill_tokens,
+            .queued_decode_tokens = admission.queued_work.decode_tokens,
+            .active_decode_tokens = admission.active_work.decode_tokens,
+            .pending_prefill_tokens = scheduled.prefill_tokens,
+            .decode_context_tokens = scheduled.decode_context_tokens,
+        });
+    }
+
     pub fn listModelInstances(self: *Node, ctx: *httpx.Context) !httpx.Response {
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
@@ -25887,6 +25960,7 @@ pub const Node = struct {
     }
 
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("X-Antfly-Generation-Placement-Version", "1");
         const catalog_publication = @import("../registry/catalog_publication.zig");
         const catalog_generation = catalog_publication.read(ctx.allocator, ctx.io, self.config.models_dir) catch |err| return requestModelResolutionError(ctx, err);
         const json_body = self.listModelsJsonAlloc(ctx.allocator, ctx.io) catch |err| {
@@ -26548,6 +26622,8 @@ pub const Node = struct {
         // The AI prefix retains the host's inference authentication and permissions.
         try prefixed.get("/_antfarm/readers", httpx.Handler.bind(self, antfarmReaders));
         try prefixed.post("/_antfarm/readers/apple", httpx.Handler.bind(self, antfarmAppleOcr));
+        // Private worker scheduling metadata, under inference authentication.
+        try prefixed.post("/_placement/generate", httpx.Handler.bind(self, estimateGeneratePlacement));
         // Keep the retired endpoint deterministic when inference routes share
         // the standalone public server. Without an explicit tombstone, httpx
         // reports 405 because nearby generated routes match the path shape,
@@ -31556,6 +31632,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/generate/batch") or
             std.mem.eql(u8, path, "/models/instances") or
             std.mem.eql(u8, path, "/_antfarm/readers/apple") or
+            std.mem.eql(u8, path, "/_placement/generate") or
             std.mem.eql(u8, path, "/predict") or
             std.mem.eql(u8, path, "/read") or
             std.mem.eql(u8, path, "/read/execute") or
@@ -36929,6 +37006,10 @@ test "generation cooperative execution is independent of row batching and fences
     try std.testing.expect(!enabled.enabledForRequest(safe, true, false, false, false));
     try std.testing.expect(!enabled.enabledForRequest(safe, false, true, false, false));
     try std.testing.expect(!enabled.enabledForRequest(safe, false, false, true, false));
+    var cached = safe;
+    cached.cooperative_prompt_cache = true;
+    try std.testing.expect(enabled.enabledForRequest(cached, false, false, true, false));
+    try std.testing.expect(!enabled.enabledForRequest(cached, true, false, true, false));
     try std.testing.expect(!enabled.enabledForRequest(safe, false, false, false, true));
     try std.testing.expectError(error.InvalidCooperativeExecutionConfig, (CooperativeExecutionConfig{ .max_active_requests = 3 }).validate());
 }
@@ -50949,6 +51030,84 @@ test "standalone embedding HTTP revision parser and acknowledgements" {
         var invalid = try std.json.parseFromSlice(std.json.Value, a, invalid_body, .{});
         defer invalid.deinit();
         try std.testing.expectError(error.InvalidEmbeddingRevision, parseEmbedRequest(invalid.value));
+    }
+}
+
+test "generation placement empty request cannot activate model or reserve KV" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/_placement/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.estimateGeneratePlacement(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expectEqual(InferenceHttpRouteAdmission.inference, inferenceHttpRouteAdmission("POST", "/_placement/generate"));
+}
+
+test "generation placement empty model resolves the default generator without loading" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/generators/default");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/generators/default/config.json",
+        .data = "{\"model_type\":\"llama\"}",
+    });
+    const tensor_header = "{\"probe\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    const tensor_header_size = comptime std.mem.alignForward(usize, tensor_header.len, 8);
+    var weights: [8 + tensor_header_size + 4]u8 = @splat(0);
+    std.mem.writeInt(u64, weights[0..8], tensor_header_size, .little);
+    @memset(weights[8..][0..tensor_header_size], ' ');
+    @memcpy(weights[8..][0..tensor_header.len], tensor_header);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/generators/default/model.safetensors",
+        .data = &weights,
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true });
+    defer node.deinit();
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/_placement/generate");
+    defer request.deinit();
+    request.body =
+        \\{"model":"","messages":[{"role":"user","content":"hello"}]}
+    ;
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.estimateGeneratePlacement(&ctx);
+    defer response.deinit();
+    if (response.status.code != 409) std.debug.print("unexpected placement response: {s}\n", .{response.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 409), response.status.code);
+    try std.testing.expectEqualStrings("{\"error\":\"MODEL_NOT_LOADED\"}", response.body.?);
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.in_flight_loads.count());
+}
+
+test "generation placement rejects grammar before model resolution" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    for ([_][]const u8{
+        \\{"model":"missing","messages":[{"role":"user","content":"hello"}],"grammar":"json"}
+        ,
+        \\{"model":"missing","messages":[{"role":"user","content":"hello"}],"grammar":"root ::= \"ok\""}
+        ,
+        \\{"model":"missing","messages":[{"role":"user","content":"hello"}],"grammar":""}
+        ,
+    }) |body| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/_placement/generate");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.estimateGeneratePlacement(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 422), response.status.code);
+        try std.testing.expectEqualStrings("{\"error\":\"PLACEMENT_UNAVAILABLE\"}", response.body.?);
+        try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+        try std.testing.expectEqual(@as(usize, 0), node.model_manager.in_flight_loads.count());
     }
 }
 

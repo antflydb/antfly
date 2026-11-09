@@ -4118,6 +4118,7 @@ pub const CudaCompute = struct {
     florence_fused_attention_inputs_enabled: bool = false,
     lighton_recurrent: @import("lighton_recurrent.zig").Module = .{},
     lighton_attention: @import("lighton_attention.zig").Module = .{},
+    gemma_decode_head: @import("gemma_decode_head.zig").Module = .{},
     lighton_attention_enabled: bool = false,
     lighton_attention_chunk128: ?bool = null,
     lighton_batched_kv_write_enabled: bool = false,
@@ -5424,6 +5425,7 @@ pub const CudaCompute = struct {
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_attention_chunk128_calls={d}\n", .{self.lighton_attention.chunk128_calls});
         self.lighton_attention.deinit(&self.ctx);
+        self.gemma_decode_head.deinit(&self.ctx);
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
             std.debug.print("LIGHTONOCR3 cuda_bucketed_linear_calls={d}\n", .{self.stats.bf16_bucketed_linear_calls});
             if (self.cublaslt) |*blas| std.debug.print("LIGHTONOCR3 cuda_canonical_gdn_calls={d} plans={d}\n", .{ blas.canonical_gdn_calls, blas.canonical_gdn_plans });
@@ -20143,6 +20145,15 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
                             error.CudaKernelUnavailable, error.InvalidCudaState => break :q6_q8_blk,
                             else => return err,
                         };
+                        // A two-row head reuses each dequantized weight tile
+                        // while preserving the singleton row's arithmetic.
+                        if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_PAIRED_HEAD", true) and
+                            try self.gemma_decode_head.run(&self.ctx, device, q8_input, weight_tensor.buffer, rows, in_dim, out_dim))
+                        {
+                            self.dispatch_stats.note(self.allocator, .linear_no_bias, .q6_k, .q6_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
+                            self.stats.launch_linear += 1;
+                            return createTensor(self, device, shape, out_count);
+                        }
                         // The sampled path needs every logit. Reuse the exact
                         // singleton Q8_1 head for each row; only the projection
                         // tail is split, while the decoder backbone stays fused.
