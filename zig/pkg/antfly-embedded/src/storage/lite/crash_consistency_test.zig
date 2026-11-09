@@ -2765,6 +2765,124 @@ test "TTL/outbox ride-along bookkeeping needs an explicit durability barrier bef
     }
 }
 
+// Same durability-barrier shape again, for the two ride-along conversions in
+// `lite-single-commit-write-path.md`'s "adaptive/enrichment/recovery-agenda"
+// workstream: `enrichment_runtime.zig`'s `mutateMediaPassOnce` (the media-
+// pass cursor checkpoint, now `beginBatchWithOptions(.{ .durability =
+// .ride_along })` instead of its own commit+explicit `sync`) and
+// `capi/sql_ddl.zig`'s `acknowledgeAgenda` (the recovery-agenda marker clear,
+// now `submitIndexMutation(..., durable = false)`). Both are safe to lose:
+// a stale cursor just means a restart re-derives a bounded amount of
+// recompute from the last durable checkpoint (`media_pass.zig`'s own doc
+// comment -- "restart never infers coverage from a partial artifact set"),
+// and an un-acknowledged recovery marker just means the next recovery turn
+// re-scans and re-acknowledges it.
+test "enrichment checkpoint and recovery-agenda ride-along bookkeeping need an explicit durability barrier before close, or the advance/acknowledgement is lost" {
+    const allocator = std.testing.allocator;
+    const media_pass_mod = @import("../db/enrichment/media_pass.zig");
+    const recovery_agenda_mod = @import("recovery_agenda.zig");
+
+    const cursor_prefix = try media_pass_mod.scope(allocator, "doc:a", "chunker", "body");
+    defer allocator.free(cursor_prefix);
+    const cursor_key = try media_pass_mod.key(allocator, cursor_prefix, null);
+    defer allocator.free(cursor_key);
+    const cursor_value_old = try media_pass_mod.encode(allocator, media_pass_mod.Cursor{
+        .input_digest = @splat(9),
+        .page_count = 1,
+        .covered_through_ordinal = 64,
+    });
+    defer allocator.free(cursor_value_old);
+    const cursor_value_new = try media_pass_mod.encode(allocator, media_pass_mod.Cursor{
+        .input_digest = @splat(9),
+        .page_count = 2,
+        .covered_through_ordinal = 128,
+    });
+    defer allocator.free(cursor_value_new);
+
+    // A plain (non-table-scoped) tracked key's own marker: `prefix ++ ""`.
+    // `recovery_agenda.namespace("\x00\x00__metadata__:schema")` returns
+    // `""`, matching this scope exactly.
+    const recovery_marker_key = recovery_agenda_mod.prefix;
+
+    // Scenario A: advance the checkpoint to its new value and clear the
+    // recovery marker, both via a ride-along (non-durable) commit, then
+    // close with NO later durability barrier. Structurally acknowledged
+    // (the calls returned success) but, per §3.2a, not yet durable.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/enrichment-recovery-no-barrier.aflite", .{tmp.sub_path});
+        defer allocator.free(path);
+
+        var file = try native.NativeFile.createWithIo(allocator, std.testing.io, path, .{});
+        try file.putDocument("seed", "seed-value");
+        try file.putDocument(cursor_key, cursor_value_old);
+        try file.putDocument(recovery_marker_key, "");
+
+        try file.beginTransaction();
+        try file.putDocument(cursor_key, cursor_value_new);
+        try file.deleteDocument(recovery_marker_key);
+        try file.commitTransactionWithDurability(false, null);
+        try std.testing.expect(file.durable_header != null);
+        file.close();
+
+        var reopened = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+        defer reopened.close();
+        const seed = try reopened.getDocumentAlloc(allocator, "seed");
+        defer if (seed) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualStrings("seed-value", seed orelse return error.TestExpectedEqual);
+
+        // Recovery resumes from the last durable checkpoint, not the lost
+        // advance -- the restart's own re-derivation redoes the bounded
+        // amount of work between the two covered_through_ordinal values.
+        const cursor_row = try reopened.getDocumentAlloc(allocator, cursor_key);
+        defer if (cursor_row) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualSlices(u8, cursor_value_old, cursor_row orelse return error.TestExpectedEqual);
+
+        const marker_row = try reopened.getDocumentAlloc(allocator, recovery_marker_key);
+        defer if (marker_row) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualStrings("", marker_row orelse return error.TestExpectedEqual);
+    }
+
+    // Scenario B: the identical ride-along writes, but with an explicit
+    // `file.sync()` barrier before close -- the checkpoint advance and the
+    // marker clear are both durable.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/enrichment-recovery-with-barrier.aflite", .{tmp.sub_path});
+        defer allocator.free(path);
+
+        var file = try native.NativeFile.createWithIo(allocator, std.testing.io, path, .{});
+        try file.putDocument("seed", "seed-value");
+        try file.putDocument(cursor_key, cursor_value_old);
+        try file.putDocument(recovery_marker_key, "");
+
+        try file.beginTransaction();
+        try file.putDocument(cursor_key, cursor_value_new);
+        try file.deleteDocument(recovery_marker_key);
+        try file.commitTransactionWithDurability(false, null);
+        try std.testing.expect(file.durable_header != null);
+        try file.sync();
+        try std.testing.expect(file.durable_header == null);
+        file.close();
+
+        var reopened = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+        defer reopened.close();
+        const seed = try reopened.getDocumentAlloc(allocator, "seed");
+        defer if (seed) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualStrings("seed-value", seed orelse return error.TestExpectedEqual);
+
+        const cursor_row = try reopened.getDocumentAlloc(allocator, cursor_key);
+        defer if (cursor_row) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualSlices(u8, cursor_value_new, cursor_row orelse return error.TestExpectedEqual);
+
+        const marker_row = try reopened.getDocumentAlloc(allocator, recovery_marker_key);
+        defer if (marker_row) |bytes| allocator.free(bytes);
+        try std.testing.expect(marker_row == null);
+    }
+}
+
 // ---------------------------------------------------------------------
 // Crash-during-ride-along regression (prefix-ordered durability)
 //
