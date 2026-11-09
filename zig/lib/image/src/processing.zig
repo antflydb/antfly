@@ -290,7 +290,9 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
         try @import("image_work_control").check();
         for (0..cw) |x| {
             for (0..3) |ch| {
-                const val = sampleResized(resolved_img, x, y, ch, scale_x, scale_y, resample, tw, th);
+                // Sampling covers the resized content; tw is only the padded
+                // destination stride and must not change source coordinates.
+                const val = sampleResized(resolved_img, x, y, ch, scale_x, scale_y, resample, cw, th);
                 result[ch * th * tw + y * tw + x] = normalizeSample(val, mean[ch], std_dev[ch], rescale_factor);
             }
         }
@@ -1095,6 +1097,37 @@ test "preprocess decoded keep aspect pads remaining width" {
 
     try std.testing.expectEqual(@as(usize, 3 * 6 * 2), out.len);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[5], 1e-6);
+}
+
+test "nearest aspect-fit sampling preserves the full crop independently of padding" {
+    const a = std.testing.allocator;
+    const means = [3]f32{ 0.1, 0.2, 0.3 };
+    const stds = [3]f32{ 0.5, 0.25, 0.75 };
+    const pad = [3]f32{ 250, 240, 230 };
+    const cases = [_]struct { width: u32, height: u32, source_x: []const usize, source_y: []const usize }{
+        .{ .width = 6, .height = 2, .source_x = &.{ 0, 1, 2, 3 }, .source_y = &.{ 0, 1 } },
+        .{ .width = 10, .height = 4, .source_x = &.{ 0, 0, 1, 1, 2, 2, 3, 3 }, .source_y = &.{ 0, 0, 1, 1 } },
+        .{ .width = 5, .height = 1, .source_x = &.{ 1, 3 }, .source_y = &.{1} },
+        .{ .width = 3, .height = 2, .source_x = &.{ 0, 2, 3 }, .source_y = &.{ 0, 1 } },
+    };
+    for ([_]PixelFormat{ .rgb8, .rgba8 }) |format| {
+        const channels: usize = @backingInt(format);
+        const stride = 4 * channels + 5;
+        var pixels: [42]u8 = @splat(255);
+        for (0..2) |y| for (0..4) |x| for (0..3) |ch| {
+            pixels[y * stride + x * channels + ch] = @intCast(10 + y * 80 + x * 15 + ch * 3);
+        };
+        const img = ImageU8{ .data = pixels[0 .. stride + 4 * channels], .width = 4, .height = 2, .format = format, .row_stride_bytes = stride };
+        for (cases) |case| {
+            const out = try preprocessDecodedRectKeepAspectPadRightScaledWithResample(a, img, case.width, case.height, means, stds, 0.01, .nearest, pad);
+            defer a.free(out);
+            for (0..3) |ch| for (case.source_y, 0..) |source_y, y| for (0..case.width) |x| {
+                const sample: f32 = if (x < case.source_x.len) @floatFromInt(pixels[source_y * stride + case.source_x[x] * channels + ch]) else pad[ch];
+                const expected = (sample * 0.01 - means[ch]) / stds[ch];
+                try std.testing.expectApproxEqAbs(expected, out[ch * case.width * case.height + y * case.width + x], 1e-6);
+            };
+        }
+    }
 }
 
 test "preprocess decoded rect scaled applies explicit rescale factor" {
