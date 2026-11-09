@@ -152,6 +152,18 @@ pub const Request = struct {
         if (deadline_ns) |deadline| request.timeout_ms = (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms;
         return request;
     }
+    /// Index selection is part of a generation's identity; transport deadlines
+    /// are not. Keep null (all indexes) distinct from an empty selection.
+    pub fn indexesEqual(self: Request, other: Request) bool {
+        if ((self.indexes == null) != (other.indexes == null)) return false;
+        if (self.indexes) |expected| {
+            const actual = other.indexes.?;
+            if (expected.len != actual.len) return false;
+            for (expected, actual) |lhs, rhs| if (!std.mem.eql(u8, lhs, rhs)) return false;
+        }
+        return true;
+    }
+
     pub fn validate(self: Request, now: u64) !void {
         if (self.id.len != 64 or self.table_id == 0) return error.InvalidQueryRequest;
         if (self.cover.len != 0) {

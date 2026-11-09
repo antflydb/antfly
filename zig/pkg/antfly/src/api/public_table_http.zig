@@ -875,6 +875,26 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
     };
 }
 
+/// Preserve malformed versus unsupported aggregation failures at every public
+/// query boundary, including errors discovered while reading source values.
+pub fn normalizePublicAggregationError(err: anyerror) anyerror {
+    return switch (err) {
+        error.InvalidQueryRequest, error.InvalidAggregation => error.InvalidQueryRequest,
+        error.UnsupportedQueryRequest, error.UnsupportedAggregation => error.UnsupportedQueryRequest,
+        else => err,
+    };
+}
+
+test "time series public aggregation failures retain client and operational classes" {
+    try std.testing.expectEqual(error.InvalidQueryRequest, normalizePublicAggregationError(error.InvalidAggregation));
+    try std.testing.expectEqual(error.InvalidQueryRequest, normalizePublicAggregationError(error.InvalidQueryRequest));
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, normalizePublicAggregationError(error.UnsupportedAggregation));
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, normalizePublicAggregationError(error.UnsupportedQueryRequest));
+    for ([_]anyerror{ error.OutOfMemory, error.Timeout, error.Canceled, error.QueryCandidateBudgetExceeded }) |failure| {
+        try std.testing.expectEqual(failure, normalizePublicAggregationError(failure));
+    }
+}
+
 /// Preserve operation outcomes across query adapters before dependency-error
 /// classification can mistake cancellation for an upstream provider failure.
 pub fn queryCancellationError(err: anyerror) ?error{ Timeout, DeadlineExceeded, Canceled } {

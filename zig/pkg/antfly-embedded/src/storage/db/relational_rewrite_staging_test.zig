@@ -40,15 +40,23 @@ fn apply(target: *db_mod.DB, value: *const staging.PreparedPage, index: u64) !vo
 }
 
 test "relational index system rewrite shared staging preserves post-cut updates deletes partial frames and replay across reopen" {
-    try runRewrite(false);
+    try runRewrite(false, false);
 }
 
 test "relational index system rewrite unchanged document cohort preserves snapshot tail timestamps and recovery" {
-    try runRewrite(true);
+    try runRewrite(true, false);
 }
 
-fn runRewrite(preserve_document: bool) !void {
-    const document_schema = "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}},\"required\":[\"x\"],\"additionalProperties\":false}}}}";
+test "time series rewrite staging preserves signed snapshot and retained tail sources across restart" {
+    try runRewrite(true, true);
+}
+
+fn runRewrite(preserve_document: bool, time_series: bool) !void {
+    const ordinary_document_schema = "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}},\"required\":[\"x\"],\"additionalProperties\":false}}}}";
+    const document_schema = if (time_series)
+        \\{"version":1,"ttl_field":"at","ttl_duration_ns":9223372036854775807,"storage_mode":"document","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"x":{"type":"integer"},"at":{"type":"string","format":"date-time"}},"required":["x"],"additionalProperties":false}}}}
+    else
+        ordinary_document_schema;
     const from_schema = if (preserve_document) document_schema else source_schema;
     const to_schema = if (preserve_document) document_schema else target_schema;
     var directory = std.testing.tmpDir(.{});
@@ -68,7 +76,7 @@ fn runRewrite(preserve_document: bool) !void {
     var source_open = true;
     defer if (source_open) source.close();
     try source.setSchemaJson(alloc, from_schema);
-    try server_test_adapter.applyOrdered(&source, .{ .timestamp_ns = 101, .writes = &.{ .{ .key = "a", .value = "{\"x\":2}" }, .{ .key = "b", .value = "{\"x\":4}" } } }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&source, .{ .document_version_scheme = if (time_series) .revision_v1 else .legacy, .timestamp_ns = 101, .writes = &.{ .{ .key = "a", .value = if (time_series) "{\"x\":2,\"at\":\"1969-12-31T23:59:59Z\"}" else "{\"x\":2}" }, .{ .key = "b", .value = "{\"x\":4}" } } }, .{ .term = 1, .index = 1 });
     const owner = try source.relationalTopologyIdentity();
     const source_scope: @import("online_source_contract.zig").Scope = .{
         .fence = .{ .role = .rewrite_source, .transition_id = 1, .attempt = 1, .admission_epoch = owner.next_epoch, .owner_group_id = 12, .peer_group_id = 22, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest },
@@ -83,7 +91,7 @@ fn runRewrite(preserve_document: bool) !void {
     merge_alias.receiver_namespace.table_id = source_scope.fence.namespace.table_id;
     try std.testing.expectError(error.InvalidOnlineSourceCommand, merge_alias.validate());
     try std.testing.expectError(error.InvalidOnlineSourceCommand, (@import("online_merge_io_contract.zig").Request{ .scope = source_scope, .operation = .{ .status = .receiver } }).validate());
-    try server_test_adapter.applyOrdered(&source, .{ .online_source = .{ .admit = .{ .scope = source_scope, .limit = retained.default_limit } } }, .{ .term = 1, .index = 2 });
+    try server_test_adapter.applyOrdered(&source, .{ .online_source = .{ .admit = .{ .scope = source_scope, .limit = retained.default_limit, .ttl_sources = time_series } } }, .{ .term = 1, .index = 2 });
     const start = (try source.onlineSourceStatus(source_scope)).start;
     const certificate = try source.prepareOnlineSourcePublication(source_scope, .none);
     try server_test_adapter.applyOrdered(&source, .{ .online_source = .{ .publish_certificate = .{ .scope = source_scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
@@ -124,11 +132,12 @@ fn runRewrite(preserve_document: bool) !void {
     var first = try target.prepareRewriteStagingPage(alloc, scope, &decoder, 1, .none, &programs);
     defer first.deinit();
     try apply(&target, &first, 2);
+    if (time_series) try std.testing.expectEqual(@as(?i128, -std.time.ns_per_s), try @import("../ttl.zig").readSourceTimestamp(target.core.store, alloc, "a"));
     var last = try target.prepareRewriteStagingPage(alloc, scope, &decoder, 128, .none, &programs);
     defer last.deinit();
     // An acknowledged source transaction occurs after the immutable snapshot
     // page was prepared, but before the receiver has applied that last page.
-    try server_test_adapter.applyOrdered(&source, .{ .timestamp_ns = 202, .writes = &.{ .{ .key = "a", .value = "{\"x\":9}" }, .{ .key = "c", .value = "{\"x\":5}" } }, .deletes = &.{"b"} }, .{ .term = 1, .index = 4 });
+    try server_test_adapter.applyOrdered(&source, .{ .document_version_scheme = if (time_series) .revision_v1 else .legacy, .timestamp_ns = 202, .writes = &.{ .{ .key = "a", .value = if (time_series) "{\"x\":9,\"at\":\"1969-12-31T23:59:58Z\"}" else "{\"x\":9}" }, .{ .key = "c", .value = if (time_series) "{\"x\":5,\"at\":\"1970-01-01T00:00:00Z\"}" else "{\"x\":5}" } }, .deletes = &.{"b"} }, .{ .term = 1, .index = 4 });
     try apply(&target, &last, 3);
     try apply(&target, &last, 3); // Lost response, identical committed command.
     try std.testing.expectError(error.RestoreStagingProgressChanged, apply(&target, &first, 4));
@@ -235,14 +244,18 @@ fn runRewrite(preserve_document: bool) !void {
     const parsed_c = try std.json.parseFromSlice(std.json.Value, alloc, c_json, .{});
     defer parsed_c.deinit();
     if (preserve_document) {
-        try std.testing.expectEqualStrings("{\"x\":9}", a_json);
-        try std.testing.expectEqualStrings("{\"x\":5}", c_json);
+        try std.testing.expectEqualStrings(if (time_series) "{\"x\":9,\"at\":\"1969-12-31T23:59:58Z\"}" else "{\"x\":9}", a_json);
+        try std.testing.expectEqualStrings(if (time_series) "{\"x\":5,\"at\":\"1970-01-01T00:00:00Z\"}" else "{\"x\":5}", c_json);
     } else {
         try std.testing.expectEqual(@as(i64, 27), parsed_a.value.object.get("g").?.integer);
         try std.testing.expectEqual(@as(i64, 15), parsed_c.value.object.get("g").?.integer);
     }
     try std.testing.expectEqual(@as(?[]u8, null), try target.get(alloc, "b"));
     try std.testing.expectEqual(@as(u64, 202), try target.getTimestamp(alloc, "a"));
+    if (time_series) {
+        try std.testing.expectEqual(@as(?i128, -2 * std.time.ns_per_s), try @import("../ttl.zig").readSourceTimestamp(target.core.store, alloc, "a"));
+        try std.testing.expectEqual(@as(?i128, 0), try @import("../ttl.zig").readSourceTimestamp(target.core.store, alloc, "c"));
+    }
     target.close();
     target_open = false;
     target = try db_mod.DB.open(alloc, target_path, target_options);

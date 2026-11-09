@@ -33,6 +33,9 @@ const encoded_size = checksum_offset + 32;
 pub const Phase = enum(u8) { retaining = 1, fenced = 2, released = 3 };
 pub const SnapshotPhase = enum(u8) { prepared = 1, pinned = 2, published = 3 };
 pub const Progress = struct {
+    /// Derived from the durable retained-language admission, never a new
+    /// interpretation of the legacy progress record's fixed-size encoding.
+    ttl_sources: bool = false,
     namespace: [24]u8,
     consumer_epoch: u64,
     pin: [32]u8,
@@ -271,11 +274,12 @@ fn find(txn: anytype, scope: Scope) !?Located {
     return null;
 }
 pub fn status(txn: anytype, scope: Scope) !Progress {
-    const progress = (try find(txn, scope) orelse return error.OnlineSourceScopeChanged).progress;
+    var progress = (try find(txn, scope) orelse return error.OnlineSourceScopeChanged).progress;
     if (progress.phase == .released) return progress;
     const journal = try retained.load(txn) orelse return error.OnlineSourceCorrupt;
     if (!std.mem.eql(u8, &journal.namespace, &progress.namespace) or
         (progress.phase == .fenced and journal.latest != progress.through_sequence)) return error.OnlineSourceCorrupt;
+    progress.ttl_sources = journal.ttl_sources;
     for (journal.consumers) |consumer| if (consumer.epoch == progress.consumer_epoch) {
         if (!std.mem.eql(u8, &consumer.pin, &progress.pin) or consumer.start != progress.start or
             consumer.acknowledged != progress.acknowledged) return error.OnlineSourceCorrupt;
@@ -333,13 +337,14 @@ pub fn stagePinned(txn: anytype, scope: Scope, seal_digest: [32]u8) !void {
 /// The caller owns the native apply fence and commits this with its Raft/standby
 /// marker and outbox. For final_fence it must additionally check transaction
 /// drainage under that same apply fence before calling stage.
-fn admitRetention(txn: anytype, scope: Scope, limit: u64, binding: ?@import("artifact_inventory.zig").Binding) !u64 {
+fn admitRetention(txn: anytype, scope: Scope, limit: u64, binding: ?@import("artifact_inventory.zig").Binding, ttl_sources: bool) !u64 {
     if (binding) |expected| if (expected.effect_protocol >= 16) {
         var ordered = (try @import("artifact_inventory.zig").load(std.heap.page_allocator, txn)) orelse return error.ArtifactCatalogDrift;
         defer ordered.deinit();
         if (!std.meta.eql(ordered.value.command.binding, expected)) return error.ArtifactCatalogDrift;
-        return retained.admitWithArtifactCapabilities(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), limit, true, true, true);
+        return retained.admitWithSourceCapabilities(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), limit, true, true, true, ttl_sources);
     };
+    if (ttl_sources) return retained.admitWithSourceCapabilities(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), limit, try directVectorMode(txn, binding), true, false, true);
     return retained.admitWithDirectVectors(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), limit, try directVectorMode(txn, binding));
 }
 fn directVectorMode(txn: anytype, binding: ?@import("artifact_inventory.zig").Binding) !bool {
@@ -370,7 +375,7 @@ pub fn stage(txn: anytype, command: Command, applied_index: u64) !void {
         if (existing) |found| {
             if (found.progress.phase == .released) return error.OnlineSourceScopeChanged;
             if (!std.meta.eql(found.progress.artifact_catalog, command.admit.artifact_catalog)) return error.ArtifactCatalogDrift;
-            _ = try admitRetention(txn, scope, command.admit.limit, command.admit.artifact_catalog);
+            _ = try admitRetention(txn, scope, command.admit.limit, command.admit.artifact_catalog, command.admit.ttl_sources);
             return;
         }
         try @import("../source_pin_state.zig").requireNoPrepared(txn, scope.namespace());
@@ -386,7 +391,7 @@ pub fn stage(txn: anytype, command: Command, applied_index: u64) !void {
                 cleanup_pending = cleanup_pending or old.phase == .released;
                 continue;
             };
-            const start = try admitRetention(txn, scope, command.admit.limit, command.admit.artifact_catalog);
+            const start = try admitRetention(txn, scope, command.admit.limit, command.admit.artifact_catalog, command.admit.ttl_sources);
             try txn.put(&key(slot), &encode(.{ .namespace = scope.namespace(), .consumer_epoch = scope.consumer_epoch, .pin = scope.pin(), .start = start, .acknowledged = start, .admitted_applied_index = applied_index, .artifact_catalog = command.admit.artifact_catalog }));
             try txn.put(@import("../source_pin_state.zig").key, &(@import("../source_pin_state.zig").Prepared{ .namespace = scope.namespace(), .pin = scope.pin(), .applied_index = applied_index, .retained_start = start, .scope_bytes = try scope.encode() }).encode());
             return;
