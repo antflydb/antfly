@@ -6298,6 +6298,26 @@ pub const DB = struct {
         self.async_context.promotion_runtime = null;
         self.resolution_owner.deinitContext(self.runtime_alloc);
         self.resolution_append_context = null;
+        // Close must never be able to hang on a ride-along ticket some
+        // worker is blocked waiting on (design doc §3.2a/perf/lwa-commit-eff2):
+        // a worker's own `stageRideAlong`/`submitIndexMutation(durable=false)`
+        // call can leave its ticket queued, not yet resolved, if nothing else
+        // happens to drive the group-commit queue before this point (the
+        // leader-loop fix that stops a foreground write's own leadership turn
+        // once its own ticket is covered means that is no longer guaranteed
+        // to have already happened). Force every currently-queued commit --
+        // ride-along or not -- through to resolution now, while every worker
+        // this function is about to ask to shut down is still running and so
+        // can still notice its own ticket is done, and strictly before that
+        // shutdown request below. A worker that is instead blocked on
+        // something this cannot resolve (not a ride-along ticket) is a
+        // different bug; this exists so a ride-along ticket is never that
+        // something. Best-effort: close must still proceed if this fails --
+        // see `lite close: final durability sync failed` below for the same
+        // tolerance later in this function.
+        if (executor_ready) self.core.syncStore(true) catch |err| {
+            std.log.warn("close-time store sync before executor shutdown failed err={s}", .{@errorName(err)});
+        };
         // Derived full-text publishers may be asleep in merge backpressure
         // admission. Close that admission before joining their executor: the
         // merge runtime is the owner of the wakeup predicate, so joining the

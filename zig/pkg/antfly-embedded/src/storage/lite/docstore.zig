@@ -1699,6 +1699,24 @@ pub const Store = struct {
     ride_along_pending_count: usize = 0,
     ride_along_pending_bytes: usize = 0,
     ride_along_last_enqueue_ns: i96 = 0,
+    /// Count of currently-queued, not-yet-drained members with
+    /// `ride_along = false` -- i.e. every member with no backstop of its
+    /// own. A ride-along member left queued when a leader stops early
+    /// (`driveMutationCoordinator`'s `own_request`) is still guaranteed a
+    /// drain: the idle-flush timer above, the byte threshold, or the next
+    /// foreground write. A non-ride-along member (an ordinary foreground
+    /// write, or a derived/index worker's own synchronous
+    /// `submitMutation`/`submitIndexMutation` call) has none of those --
+    /// it is parked in `Ticket.wait()` relying entirely on *some* leader
+    /// draining it. `driveMutationCoordinator` must never stop early while
+    /// this is nonzero, or such a member can be stranded forever (observed
+    /// live: a derived worker blocked in `Ticket.wait()` while the thread
+    /// that would otherwise lead the queue had already stopped, since its
+    /// own ticket was covered -- see perf/lwa-commit-eff2's leader-loop
+    /// change). Guarded by `commit_mutex`, maintained alongside
+    /// `ride_along_pending_count` in `enqueueRequest`/
+    /// `drainMutationBatchLocked`.
+    non_ride_along_pending_count: usize = 0,
     ride_along_idle_ns: u64 = 50 * std.time.ns_per_ms,
     ride_along_byte_threshold: usize = 1024 * 1024,
     ride_along_flush_started: std.atomic.Value(bool) = .init(false),
@@ -3214,8 +3232,14 @@ pub const Store = struct {
             // ever being applied at a time, and whatever stages while that
             // group's `commitTransactionWithDurability` runs (including its
             // fsync) forms the next group, bounding flight to the applying
-            // group plus the one accumulating behind it.
-            if (self.become_leader) self.store.driveMutationCoordinator(false);
+            // group plus the one accumulating behind it. Passing
+            // `self.request` as `own_request` stops this leader's turn as
+            // soon as its own ticket is covered, rather than continuing to
+            // drain whatever else the queue has accumulated: a foreground
+            // write must not pay latency or commit count for unrelated
+            // backlog. Any leftover goes to the idle flush or whichever
+            // request leads the queue next (see `driveMutationCoordinator`).
+            if (self.become_leader) self.store.driveMutationCoordinator(false, self.request);
         }
 
         pub fn ticket(self: Staged) Ticket {
@@ -3262,6 +3286,8 @@ pub const Store = struct {
             self.ride_along_pending_count +|= 1;
             self.ride_along_pending_bytes +|= plan.estimated_bytes;
             self.ride_along_last_enqueue_ns = std.Io.Clock.awake.now(io).nanoseconds;
+        } else {
+            self.non_ride_along_pending_count +|= 1;
         }
         self.commit_mutex.unlock(io);
 
@@ -3301,7 +3327,11 @@ pub const Store = struct {
         const become_leader = self.commit_head != null and !self.commit_draining;
         if (become_leader) self.commit_draining = true;
         self.commit_mutex.unlock(io);
-        if (become_leader) self.driveMutationCoordinator(true);
+        // A barrier, not a foreground write: drain to empty (`own_request =
+        // null`), not just until some one ticket is covered. Nothing must
+        // be left behind for close/sync/the reuse frontier to have called
+        // this for in the first place.
+        if (become_leader) self.driveMutationCoordinator(true, null);
     }
 
     /// WS1 hook: call before relying on `durableSequence()` to bound which
@@ -3423,22 +3453,33 @@ pub const Store = struct {
             if (request.ride_along) {
                 self.ride_along_pending_count -|= 1;
                 self.ride_along_pending_bytes -|= request.estimated_bytes;
+            } else {
+                self.non_ride_along_pending_count -|= 1;
             }
         }
         return batch;
     }
 
-    /// Run until the pending queue is empty, applying one bounded group at a
-    /// time. Only the thread that staged the first request of a newly-formed
-    /// queue (`become_leader` in `enqueue`/`forceDrainDurable`) ever runs
-    /// this; every other staging thread only enqueues and waits on its own
-    /// ticket. `force_durable` makes every batch this call drains durable
-    /// regardless of any member's own `durable` flag (`forceDrainDurable`'s
-    /// callers: the ride-along idle-flush timer and byte threshold,
-    /// `Store.close`, `Store.sync`, and WS1's reuse-frontier hook) --
-    /// otherwise a batch of ride-along-only members, all `durable = false`,
-    /// would take the deferred-publication path and never actually fsync.
-    fn driveMutationCoordinator(self: *Store, force_durable: bool) void {
+    /// Applies one bounded group per call to a foreground leader (one that
+    /// supplies `own_request`), stopping as soon as that request's own
+    /// ticket is covered; drains until the queue is fully empty for a
+    /// barrier (`own_request = null`: `forceDrainDurable`'s callers --
+    /// close, sync, the idle-flush timer, the byte threshold, and WS1's
+    /// reuse-frontier hook). Only the thread that staged the first request
+    /// of a newly-formed queue (`become_leader` in `enqueue`/
+    /// `forceDrainDurable`) ever runs this; every other staging thread only
+    /// enqueues and waits on its own ticket. A foreground write's own
+    /// leadership turn must not pay latency or commit count for unrelated
+    /// backlog -- whatever is left queued when `own_request` is covered
+    /// (backlog already ahead of it, or ride-along work that arrived while
+    /// its group's native commit was applying) is left for the idle flush
+    /// or whichever request leads the queue next, by resetting
+    /// `commit_draining` to false before returning rather than looping to
+    /// drain it here. `force_durable` makes every batch this call drains
+    /// durable regardless of any member's own `durable` flag -- otherwise a
+    /// batch of ride-along-only members, all `durable = false`, would take
+    /// the deferred-publication path and never actually fsync.
+    fn driveMutationCoordinator(self: *Store, force_durable: bool, own_request: ?*MutationRequest) void {
         const io = self.file.runtime();
         while (true) {
             self.commit_mutex.lockUncancelable(io);
@@ -3478,12 +3519,34 @@ pub const Store = struct {
                 item.done = true;
                 current = item.next;
             }
+            // `own_request` is a member of some batch this same call
+            // already drained (this one, or an earlier iteration's), since
+            // it was queued before this call was ever entered -- so by the
+            // time its `.done` is observed true here, it is actually done,
+            // never a stale read racing its own completion. `null` (a
+            // barrier) never stops early: it keeps looping, as before,
+            // until the top-of-loop empty check above ends it.
+            //
+            // Stopping early is only safe while `non_ride_along_pending_
+            // count` is zero: a ride-along member left queued still has a
+            // backstop (the idle-flush timer, the byte threshold, or the
+            // next foreground write), but a non-ride-along one -- an
+            // ordinary write, or a derived/index worker's own synchronous
+            // `submitMutation`/`submitIndexMutation` call -- has none and
+            // is parked in `Ticket.wait()` relying entirely on some leader
+            // draining it. Walking away while one is still queued strands
+            // it forever (observed live: a derived worker deadlocked
+            // against the main thread waiting on it, both parked, nothing
+            // left to ever lead the queue again).
+            const stop_here = if (own_request) |req| req.done and self.non_ride_along_pending_count == 0 else false;
+            if (stop_here) self.commit_draining = false;
             self.commit_ready.broadcast(io);
             self.commit_mutex.unlock(io);
 
             if (result) |_| {} else |err| {
                 if (err == error.LiteStorageBudgetExceeded) self.recordMaintenanceError(err);
             }
+            if (stop_here) break;
         }
         // Start after publication, and only once -- after this leader's
         // entire queue (including anything staged while it was draining
@@ -7379,7 +7442,7 @@ test "lite a group fsync failure sends OutcomeUnknown to every member" {
     store.commit_head = &first;
     store.commit_tail = &second;
     store.commit_draining = true;
-    store.driveMutationCoordinator(false);
+    store.driveMutationCoordinator(false, null);
     try std.testing.expectError(error.OutcomeUnknown, first.result);
     try std.testing.expectError(error.OutcomeUnknown, second.result);
 }
