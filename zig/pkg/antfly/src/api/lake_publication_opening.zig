@@ -165,7 +165,9 @@ const Worker = struct {
     cached: artifacts.CachedRead,
     token: Token,
     fn run(self: *Worker) anyerror!void {
-        try self.cached.context.ensureActive();
+        const guard: artifacts.ReadCancellation = .{ .parent = self.token, .context = self.cached.context };
+        const token = guard.token();
+        try guard.check();
         var arena = std.heap.ArenaAllocator.init(self.backing);
         defer arena.deinit();
         const a = arena.allocator();
@@ -174,8 +176,8 @@ const Worker = struct {
         var store = try self.store.reopenReadOnly(a);
         defer store.deinit();
         store.implementation.cloud_io = self.cached.context.io;
-        try store.bindPublication(self.publication, self.token);
-        packs.warmPublication(a, store.artifactStore(), .{ .artifact = .{ .artifact_id = self.bundle.artifact.artifact_id, .checksum = self.bundle.artifact.checksum, .byte_len = self.bundle.artifact.byte_len }, .decoded_bytes = self.bundle.decoded_bytes }, self.domain, self.cached, self.token) catch |err| switch (err) {
+        try store.bindPublication(self.publication, token);
+        packs.warmPublication(a, store.artifactStore(), .{ .artifact = .{ .artifact_id = self.bundle.artifact.artifact_id, .checksum = self.bundle.artifact.checksum, .byte_len = self.bundle.artifact.byte_len }, .decoded_bytes = self.bundle.decoded_bytes }, self.domain, self.cached, token) catch |err| switch (err) {
             // Immutable optional cache material cannot be repaired in place.
             // Remember its absence for this publication; demand remains strict.
             error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeTextOpeningPack => return,

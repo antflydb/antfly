@@ -186,7 +186,10 @@ size or index count from turning a publication hint into a corpus download.
 The cold reader coalesces concurrent preparation of the same publication and
 credential scope. Independently owned provider clients fetch bundles in waves
 with at most four workers, a conservative 32 MiB wave reservation, and the shared
-I/O scheduler's admission. Cancellation joins workers before releasing clients
+I/O scheduler's admission. Provider cancellation polling includes the request
+deadline and explicit cancellation, while fallible artifact checkpoints preserve
+reader protection and precise deadline errors. Transport polling never invokes
+possibly task-bound checkpoint I/O. Cancellation joins workers before releasing clients
 or scratch memory. Denied optional scheduling falls back to demand reads.
 Cloud generation maps, retention certificates, and collection mark the new
 bundle objects alongside the original closure.

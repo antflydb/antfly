@@ -35,18 +35,51 @@ pub const CachedRead = struct {
     context: local.serverless_query_lake_read_context.Context,
 };
 
+/// Borrowed for one synchronous read or joined worker. Transport polling
+/// observes deadlines; fallible checkpoints also retain reader protection.
+pub const ReadCancellation = struct {
+    parent: Cancellation,
+    context: ?local.serverless_query_lake_read_context.Context = null,
+    pub fn check(self: *const ReadCancellation) !void {
+        if (self.context) |context| try context.ensureActive();
+        try self.parent.check();
+    }
+    fn checkpoint(raw: *const anyopaque) !void {
+        try @as(*const ReadCancellation, @ptrCast(@alignCast(raw))).check();
+    }
+    fn canceled(raw: *const anyopaque) bool {
+        const self: *const ReadCancellation = @ptrCast(@alignCast(raw));
+        // Transport polling can run from another canceled task. It must not
+        // execute arbitrary fallible checkpoints or task-local/renewal I/O.
+        if (self.context) |context| {
+            if (context.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return true;
+            if (context.cancellation) |signal| if (signal.isCancelled()) return true;
+        }
+        if (self.parent.ptr) |ptr| if (self.parent.is_cancelled_fn) |callback| return callback(ptr);
+        return false;
+    }
+    pub fn token(self: *const ReadCancellation) Cancellation {
+        return .{ .ptr = self, .check_fn = checkpoint, .is_cancelled_fn = canceled };
+    }
+};
+
 pub fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation, cached: ?CachedRead) ![]u8 {
+    const guard: ReadCancellation = .{ .parent = cancellation, .context = if (cached) |cache| cache.context else null };
+    const active = guard.token();
     var loader = struct {
         store: stores.ArtifactStore,
         ref: ChunkRef,
         cancellation: Cancellation,
         fn load(raw: *anyopaque, alloc: A) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return self.store.getVerifiedAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation);
+            return self.store.getVerifiedAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation) catch |err| {
+                try self.cancellation.check();
+                return err;
+            };
         }
-    }{ .store = store, .ref = ref, .cancellation = cancellation };
+    }{ .store = store, .ref = ref, .cancellation = active };
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
-    try cancellation.check();
+    try active.check();
     if (cached) |cache| {
         const digest = try stores.sha256DigestFromChecksum(ref.checksum);
         const bytes = try cache.cache.readImmutableAlloc(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, digest, cache.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
@@ -68,6 +101,8 @@ pub fn readColumnRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset:
     return readBoundedRange(a, store, ref, offset, length, digest, cancellation, cached, max_block_bytes);
 }
 fn readBoundedRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, cached: ?CachedRead, maximum: usize) ![]u8 {
+    const guard: ReadCancellation = .{ .parent = cancellation, .context = if (cached) |cache| cache.context else null };
+    const active = guard.token();
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
     if (offset > ref.byte_len or length > ref.byte_len - offset or length > maximum) return error.InvalidGraphPage;
     if (offset == 0 and length == ref.byte_len) {
@@ -84,15 +119,18 @@ fn readBoundedRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u6
         token: Cancellation,
         fn load(raw: *anyopaque, alloc: A) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            const bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.offset, self.length, self.token);
+            const bytes = self.store.getRangeAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.offset, self.length, self.token) catch |err| {
+                try self.token.check();
+                return err;
+            };
             errdefer alloc.free(bytes);
             if (bytes.len != self.length) return error.ArtifactIntegrityMismatch;
             try stores.validatePayloadSha256WithCancellation(bytes, &std.fmt.bytesToHex(&self.digest, .lower), self.token);
             return bytes;
         }
     };
-    var loader: Loader = .{ .store = store, .ref = ref, .offset = offset, .length = length, .digest = digest, .token = cancellation };
-    try cancellation.check();
+    var loader: Loader = .{ .store = store, .ref = ref, .offset = offset, .length = length, .digest = digest, .token = active };
+    try active.check();
     if (cached) |cache| {
         var identity: [256]u8 = undefined;
         const key = try std.fmt.bufPrint(&identity, "{s}:page:{x}:{x}", .{ ref.artifact_id, offset, length });
@@ -119,18 +157,23 @@ pub fn readPublicationArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef,
 /// Borrow a verified bounded block until the caller has copied/decoded its
 /// requested range. Current authority is checked even when payloads are warm.
 pub fn readArtifactLease(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation, cached: ?CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
+    const guard: ReadCancellation = .{ .parent = cancellation, .context = if (cached) |cache| cache.context else null };
+    const active = guard.token();
     const Loader = struct {
         store: stores.ArtifactStore,
         ref: ChunkRef,
         cancellation: Cancellation,
         fn load(raw: *anyopaque, alloc: A) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return self.store.getVerifiedAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation);
+            return self.store.getVerifiedAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation) catch |err| {
+                try self.cancellation.check();
+                return err;
+            };
         }
     };
-    var loader: Loader = .{ .store = store, .ref = ref, .cancellation = cancellation };
+    var loader: Loader = .{ .store = store, .ref = ref, .cancellation = active };
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
-    try cancellation.check();
+    try active.check();
     if (cached) |cache| {
         const digest = try stores.sha256DigestFromChecksum(ref.checksum);
         var lease = try cache.cache.readImmutableBlockLease(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, digest, cache.context, .{ .ptr = &loader, .load = Loader.load });
@@ -142,17 +185,23 @@ pub fn readArtifactLease(a: A, store: stores.ArtifactStore, ref: ChunkRef, cance
 }
 
 /// Physical coalesced/unit reads bypass byte-cache loaders. Attribute their
-/// actual I/O here so request diagnostics count one wire operation per miss.
+/// payload I/O here. Provider-internal metadata/authentication operations are
+/// covered separately by process-wide object-store metrics.
 pub fn readPhysicalRange(a: A, store: stores.ArtifactStore, id: []const u8, offset: u64, length: usize, token: Cancellation, cached: ?CachedRead) ![]u8 {
+    const guard: ReadCancellation = .{ .parent = token, .context = if (cached) |cache| cache.context else null };
+    try guard.check();
     const trace = if (cached) |cache| cache.context.trace else null;
     if (cached) |cache| try cache.context.ensureActive();
     const started = if (trace) |value| value.begin() else 0;
     var provider = store;
-    const bytes = provider.getRangeAllocWithCancellationUsingAllocator(a, id, offset, length, token) catch |err| {
+    const bytes = provider.getRangeAllocWithCancellationUsingAllocator(a, id, offset, length, guard.token()) catch |err| {
         if (trace) |value| value.end(started, 1, 0, true);
+        try guard.check();
         return err;
     };
     if (trace) |value| value.end(started, 1, bytes.len, false);
+    errdefer a.free(bytes);
+    try guard.check();
     if (cached) |cache| cache.cache.recordPhysicalRead(bytes.len);
     return bytes;
 }
@@ -3063,4 +3112,81 @@ test "external lake aggregate tree frames lend wide unselected states until next
     try std.testing.expect(budget.peak < 256 * 1024);
     try std.testing.expect(reader.tree_prefetches > 0);
     std.debug.print("borrowed aggregate frames: groups={} output_peak={}\n", .{ delivered, budget.peak });
+}
+
+test "external lake opening provider cancellation binds deadlines and preserves fallible checkpoints" {
+    var guard: ReadCancellation = .{ .parent = .none, .context = .{} };
+    const token = guard.token();
+    try token.check();
+    try std.testing.expect(!token.isCancelled());
+    // Simulate a deadline arriving after provider I/O has started. The same
+    // callback handed to its transport must observe it, without returning to
+    // a cache checkpoint or refreshing the request's budget.
+    guard.context.?.deadline_ns = 0;
+    try std.testing.expect(token.isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, token.check());
+    guard.context.?.deadline_ns = null;
+    const ExpiredReader = struct {
+        fn expired(_: *anyopaque) !void {
+            return error.LakeIndexReaderLeaseExpired;
+        }
+    };
+    var dummy: u8 = 0;
+    guard.context.?.checkpoint = .{ .ptr = &dummy, .check = ExpiredReader.expired };
+    // A reader checkpoint remains fallible at normal artifact boundaries;
+    // transport polling must not run its potentially task-bound callback.
+    try std.testing.expect(!token.isCancelled());
+    try std.testing.expectError(error.LakeIndexReaderLeaseExpired, token.check());
+}
+
+test "external lake opening artifact transports preserve scoped deadline errors after cancellation" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        expired: bool = false,
+        polls: usize = 0,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.expired) return error.DeadlineExceeded;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).expired;
+        }
+        fn read(raw: *anyopaque, _: A, _: []const u8, _: usize, token: Cancellation) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // The provider has entered I/O, then a scoped expiration arrives.
+            self.expired = true;
+            self.polls += 1;
+            try std.testing.expect(token.isCancelled());
+            // Actual transports report the boolean probe as Canceled.
+            return error.Canceled;
+        }
+        fn range(raw: *anyopaque, alloc: A, id: []const u8, _: u64, length: usize, token: Cancellation) ![]u8 {
+            return read(raw, alloc, id, length, token);
+        }
+    };
+    var directory = try local.common_test_directory.TestDirectory.init("opening-scoped-provider-cancel");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    var vtable = store.vtable.*;
+    vtable.get_bounded_alloc_with_cancellation = Probe.read;
+    vtable.get_range_alloc_with_cancellation = Probe.range;
+    var probe: Probe = .{};
+    store.ptr = &probe;
+    store.vtable = &vtable;
+    const scope = try stores.UploadScope.forPublication(@splat(55), 1, std.testing.io);
+    const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const id = try scope.artifactId(checksum);
+    const ref: ChunkRef = .{ .artifact_id = &id, .checksum = checksum, .byte_len = 1 };
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: CachedRead = .{ .cache = &cache, .scope = @splat(6), .context = .{ .io = std.testing.io, .checkpoint = .{ .ptr = &probe, .check = Probe.checkpoint } } };
+    const parent: Cancellation = .{ .ptr = &probe, .is_cancelled_fn = Probe.canceled };
+    try std.testing.expectError(error.DeadlineExceeded, readArtifact(a, store, ref, parent, cached));
+    probe.expired = false;
+    try std.testing.expectError(error.DeadlineExceeded, readArtifactLease(a, store, ref, parent, cached));
+    probe.expired = false;
+    try std.testing.expectError(error.DeadlineExceeded, readPhysicalRange(a, store, &id, 0, 1, parent, cached));
+    try std.testing.expectEqual(@as(usize, 3), probe.polls);
 }
