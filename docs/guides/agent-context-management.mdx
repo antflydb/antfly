@@ -1,0 +1,131 @@
+---
+title: "Bound Agent Context with a Separate Summarizer"
+description: "Prepare retrieval and research conversations using the existing generator providers"
+order: 7
+---
+
+Retrieval and research requests accept optional `context_management`. The main
+agent and summarizer can use different models, providers, credentials and
+endpoints. Omit the option to retain existing agent behavior. The retrieval
+`pruner` continues to filter hits by score; context management prepares the
+assembled conversation after retrieval, reranking and pruning.
+
+```json
+{
+  "context_management": {
+    "mode": "compact",
+    "context_window_tokens": 32768,
+    "target_input_tokens": 12000,
+    "reserved_output_tokens": 4000,
+    "keep_recent_turns": 2,
+    "summarizer_context_window_tokens": 16384,
+    "summary_output_tokens": 1024,
+    "max_summary_batches": 8,
+    "summarizer": {
+      "provider": "openai",
+      "model": "your-summary-model",
+      "api_key": "${secret:summary-provider-key}"
+    }
+  }
+}
+```
+
+The summarizer is an ordinary `GeneratorConfig`, resolved through the same
+provider dispatch and secret store as `/db` generation. Omitting `summarizer`
+inherits the effective generator for that model call (the first generator when
+using a chain). Summary calls use a single provider without fallback or automatic
+repair retries. Providers with structured-output adapters receive the memory
+schema; other adapters receive JSON instructions and the same strict validation.
+Selecting a remote summarizer sends selected conversation and evidence to that
+configured provider. Both generators can be remote; no native inference model or
+loopback HTTP server is required.
+
+Use the same object with the native CLI:
+
+```bash
+antfly agents retrieval --table docs --full-text-search 'deadline' --generate \
+  --generator '{"provider":"antfly","model":"your-agent-model"}' \
+  --context-management '{"context_window_tokens":32768,"target_input_tokens":12000}'
+```
+
+`antfly agents research` also accepts `--context-management`. Research passes the
+policy to its retrieval researchers. Summary work consumes their allocated model
+calls and the overall research budget; increase those budgets when needed.
+Pipeline retries lent only one model call cannot spend that call on compaction
+and then make an unbudgeted generation. Model-directed retrieval reserves a
+destination call during preparation; if the remaining budget cannot fund
+compaction, it returns an incomplete result with the retrieved evidence.
+
+Context is inspected before every relevant model call and again after tool output
+grows. `compact` generates memory only when the input exceeds the threshold.
+`inspect` reports sizes without changing context, `reject` refuses oversized
+input, and `window` discards eligible completed exchanges without a summary.
+Instructions, current questions and constraints, recent turns, the most recent
+exchange and open tool transactions remain protected. Within a long agent turn,
+older completed tool exchanges can be reduced together with their results.
+Validated reduction also releases their accumulated tool-context allowance;
+authoritative results remain available in the history and hit registry.
+Research verification retains the exact report it is checking.
+
+Each summary batch includes previous memory and one complete exchange; an
+exchange is never split to fit. Every completed tool call must retain its original
+ID and name. Small tool results are copied verbatim. Pipeline retrieval and
+research evidence is represented as a completed `assembled_evidence` exchange;
+source identities are carried separately from document text. Summary contract v2
+requires each tool evidence entry to return its exact `source_ids` array. Missing,
+invented, duplicate, or cross-tool identities reject the candidate before dispatch;
+mentioning an ID in prose does not satisfy the contract. IDs remain opaque strings,
+including punctuation, URLs, Unicode, and JSON escapes. Existing v1 checkpoints
+without this optional field remain readable; new checkpoints preserve its presence. Memory is framed as
+untrusted data in user context and cannot authorize tools or change instructions.
+These checks protect structure and attribution; they cannot prove factual quality.
+Evaluate retention of task-specific facts and downstream answer quality when
+choosing a summarizer.
+
+Set both models' actual supported context windows. The destination output
+reservation must cover every generator in its chain. Public imported history must be text-only; opaque provider metadata in imported
+history is rejected explicitly. Provider replay blocks collected within the
+current agent loop remain attached to retained exchanges.
+
+Input accounting charges
+serialized UTF-8 bytes, tool schemas, response formats, opaque provider replay
+blocks, 32 tokens per message and 512 tokens for template framing. This is a
+conservative estimate for models without an exposed exact tokenizer, and may
+compact earlier than their native token count would require. Native generation
+also performs its usual exact tokenizer/template admission. Arbitrary remote
+provider templates cannot be proven by this estimate; leave headroom and respect
+provider errors. Apple destinations receive a text rendering of internal tool
+evidence, and that same rendering is used for budget accounting. ChatGPT does
+not expose a per-call output cap: summary replies are checked against the output
+reservation using provider token usage, or conservative byte accounting when
+usage is unavailable. The summary window is checked independently after
+reserving its output. Insufficient capacity, reduction or batches returns a typed error; there
+is no implicit provider change or window fallback.
+
+Summary memory and selection masks are derived, request-local state. Full
+conversation history and signed `research_state` remain authoritative.
+Continuations resupply them and prepare a new prompt; they do not trust a
+client-supplied derived-memory mask. Repeated preparation within a retrieval run
+checks the source-history digest and recounts against the current destination
+configuration, including tool schemas. Changing summarizers does not invalidate
+portable text memory. Existing inference checkpoint model, tokenizer, template,
+history and memory compatibility checks remain in force for that separate API.
+Cancellation, deadlines, malformed/truncated summaries, missing evidence and final
+budget failure do not replace authoritative history. Context errors retain the
+same `code`, `error`, `message`, and `retryable` fields in JSON responses and SSE
+`error` events, including failures after retrieval has started streaming. Research
+deadlines during preparation or generation return an incomplete result with signed,
+resumable `research_state`; SSE delivers that result in `done`, without an `error`
+event. Reset the deadline and resubmit the state to continue the interrupted phase.
+
+Responses include `context_management` events, also available over SSE. They
+report original/final effective sizes, retained/compacted messages, counting
+method, memory-contract version, provider/model, latency, batches, retries and
+summary token usage. Summary usage is separate from destination generation;
+provider-reported usage is zero when that adapter does not supply it. TypeScript
+streaming clients can receive these with `onContextManagement`.
+
+Text compaction is independent of numerical KV cache compaction. KV state still
+requires compatible native models, revisions, layouts and positions. Reducing KV
+memory does not extend a model's logical context window or make checkpoints
+portable across providers.
