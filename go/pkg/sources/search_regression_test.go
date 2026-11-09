@@ -101,22 +101,58 @@ func TestParentFullTextRejectsArtifactSources(t *testing.T) {
 	}
 }
 
-func TestSemanticMediaPureTemplateLineage(t *testing.T) {
-	for _, template := range []string{"{{content.resource.uri}}", "{{{content.resource.uri}}}", "{{{ content.resource.uri }}}"} {
+func TestSemanticMediaTypedTemplateLineage(t *testing.T) {
+	for _, template := range []string{"{{remoteMedia url=content.resource.uri}}", "{{media url=content.resource.uri}}", "{{ remoteMedia  url=content.resource.uri }}"} {
 		t.Run(template, func(t *testing.T) {
 			stream := testMediaStream()
-			raw := strings.ReplaceAll(string(testNativeIndex(stream, true)), "{{content.resource.uri}}", template)
-			index, err := decodeSearchIndex([]byte(raw))
+			index, err := decodeSearchIndex(testNativeIndex(stream, true))
 			require.NoError(t, err)
+			nativeEnrichments(index.Config)["image_dense"]["template"] = template
 			require.NoError(t, checkNativeStream(stream, index, true))
 		})
 	}
-	for _, template := range []string{"", "{{{", "{{content.resource.uri}}}", "{{{content.resource.uri}}", "{{other.uri}}", "{{helper content.resource.uri}}", "{{#if content}}{{content.resource.uri}}{{/if}}", "{{content.resource.uri}}{{other}}"} {
+	for _, template := range []string{"{{content.resource.uri}}", "{{{content.resource.uri}}}", "{{remoteMedia url=content.resource.uri mode=\"extract\"}}", "{{media url=other.uri}}", "{{remoteMedia url=\"content.resource.uri\"}}", "{{media url=content.resource.uri}}{{other}}", "", "{{{", "{{content.resource.uri}}}", "{{{content.resource.uri}}", "{{other.uri}}", "{{helper content.resource.uri}}", "{{#if content}}{{content.resource.uri}}{{/if}}", "{{content.resource.uri}}{{other}}"} {
 		stream := testMediaStream()
-		raw := strings.ReplaceAll(string(testNativeIndex(stream, true)), "{{content.resource.uri}}", template)
-		index, err := decodeSearchIndex([]byte(raw))
+		index, err := decodeSearchIndex(testNativeIndex(stream, true))
 		require.NoError(t, err)
+		nativeEnrichments(index.Config)["image_dense"]["template"] = template
 		require.Error(t, checkNativeStream(stream, index, true), template)
+	}
+}
+
+func TestSemanticMediaInputModesAndModalities(t *testing.T) {
+	for _, tc := range []struct {
+		name, field, template, input, modality, upstream string
+		valid                                            bool
+	}{
+		{name: "raw_uri_is_text", field: "content.resource.uri", modality: "image"},
+		{name: "plain_template_is_text", template: "{{content.resource.uri}}", modality: "audio"},
+		{name: "typed_image", template: "{{media url=content.resource.uri}}", modality: "image", valid: true},
+		{name: "typed_audio", template: "{{remoteMedia url=content.resource.uri}}", modality: "audio", valid: true},
+		{name: "typed_multimodal", template: "{{media url=content.resource.uri}}", modality: "multimodal", valid: true},
+		{name: "media_cannot_claim_text", template: "{{media url=content.resource.uri}}", modality: "text"},
+		{name: "pdf_pages", field: "content.resource.uri", input: "pdf_page_images", modality: "image", valid: true},
+		{name: "pdf_uri_template", template: "{{{content.resource.uri}}}", input: "pdf_page_images", modality: "image", valid: true},
+		{name: "pdf_wrong_modality", field: "content.resource.uri", input: "pdf_page_images", modality: "audio"},
+		{name: "pdf_wrong_field", field: "other.uri", input: "pdf_page_images", modality: "image"},
+		{name: "pdf_typed_template_is_not_uri", template: "{{media url=content.resource.uri}}", input: "pdf_page_images", modality: "image"},
+		{name: "unknown_input", template: "{{media url=content.resource.uri}}", input: "future_mode", modality: "image"},
+		{name: "media_cannot_claim_artifact_ancestor", template: "{{media url=content.resource.uri}}", upstream: "chunks", modality: "image"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := testMediaStream()
+			stream.Retrieval.Semantic.VectorSpace.DocumentModality = management.VectorSpaceDocumentModality(tc.modality)
+			index, err := decodeSearchIndex(testNativeIndex(stream, true))
+			require.NoError(t, err)
+			e := nativeEnrichments(index.Config)["image_dense"]
+			e["field"], e["template"], e["embedding_input"], e["source_artifact_name"] = tc.field, tc.template, tc.input, tc.upstream
+			err = checkNativeStream(stream, index, true)
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
 	}
 }
 

@@ -126,7 +126,7 @@ func (c *testSearchIndexClient) CreateSearchIndex(_ context.Context, _, _ string
 }
 func testNativeIndex(stream SearchStream, complete bool) []byte {
 	space := stream.Retrieval.Semantic.VectorSpace
-	raw, _ := json.Marshal(map[string]any{"config": map[string]any{"type": "embeddings", "dimension": 3, "distance_metric": "cosine", "embedder": map[string]any{"provider": "antfly", "model": space.Model, "model_identity": space.Revision}, "sources": []any{map[string]any{"artifact": "image_dense"}}, "enrichments": []any{map[string]any{"name": "image_dense", "kind": "embedding", "template": "{{content.resource.uri}}", "vector_space": VectorSpaceIdentity(space)}}}, "status": map[string]any{"readiness": map[string]any{"queryable": true, "complete": complete}}})
+	raw, _ := json.Marshal(map[string]any{"config": map[string]any{"type": "embeddings", "dimension": 3, "distance_metric": "cosine", "embedder": map[string]any{"provider": "antfly", "model": space.Model, "model_identity": space.Revision}, "sources": []any{map[string]any{"artifact": "image_dense"}}, "enrichments": []any{map[string]any{"name": "image_dense", "kind": "embedding", "template": "{{remoteMedia url=content.resource.uri}}", "vector_space": VectorSpaceIdentity(space)}}}, "status": map[string]any{"readiness": map[string]any{"queryable": true, "complete": complete}}})
 	return raw
 }
 func TestSearchReadinessVerifiesNativeRecipeAndCachesIndexes(t *testing.T) {

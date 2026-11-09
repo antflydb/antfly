@@ -72,6 +72,17 @@ semantic retrieval. Query input support is explicit: indexing media does not
 advertise an image-query HTTP route. This contract supports server-embedded text
 and supplied dense vectors. Direct image queries can use compatible client vectors.
 
+Managed original-media bindings require a direct typed native input such as
+`template: "{{remoteMedia url=content.resource.uri}}"` or
+`template: "{{media url=content.resource.uri}}"`, matching a non-text document
+modality. A URI field or plain `{{content.resource.uri}}` interpolation embeds
+text and cannot certify media readiness. Native `embedding_input: pdf_page_images`
+may instead consume the resource URI as a field or pure interpolation, with
+`document_modality: image`. Unknown input modes, text-producing helper options,
+composed prompts and unproven artifact/media transitions report an unsupported
+binding; they never become ready based only on a matching URI dependency.
+
+
 A generic artifact need not contain text or have an index. Generic artifact
 inspection uses native document artifact APIs. The source status reports
 `unsupported/per_artifact_coverage_not_observed` when no safe aggregate observation
@@ -119,7 +130,10 @@ legacy import-job creation. Binding-only edits keep the existing table-write
 requirement. Source detail's **Search and processing** panel shows observed
 representation states and applies declarations without queuing a provider sync.
 Hosted GET/list responses include opaque processing declarations only for table
-administrators. Other table readers retain streams, artifacts and observed
+administrators. Full processing/stream validation runs at configuration admission
+and reconciliation. Cloud authorization reads project only permissions and TTL
+from PostgreSQL, then validate policy and current publication fences; unrelated
+private prompts and inference plans are neither transferred nor hashed there. Other table readers retain streams, artifacts and observed
 readiness. On either runtime, omitted/null `processing` in an update preserves
 the stored declaration atomically. An explicit empty plan clears desired
 processing and requires table administration in Colony; physical shared indexes

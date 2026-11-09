@@ -41625,6 +41625,28 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/place/north_carolina", .edge_type = "located_in", .weight = 0.5 },
     }, .sync_level = .full_index });
 
+    // Without an admitted owner, a thin edge write must not emit work.
+    try db.batch(.{ .graph_writes = &.{
+        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/anni_albers", .edge_type = "taught", .weight = 0.6 },
+    } });
+    {
+        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), 0);
+        defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
+        try std.testing.expectEqual(@as(usize, 0), groups.len);
+    }
+
+    // Settle the thin graph write before observing context. Background replay
+    // is allowed to advance independently of this fixture's manual producer.
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    // Manual execution uses the admitted catalog and its publication fences.
+    try db.addEnrichment(.{
+        .name = "conceptualize_v1",
+        .kind = .asset,
+        .field = "name",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .neighbor_context = .{ .graph_index = "taxonomy" },
+    });
     var backend = mem_backend.Backend.init(alloc, .{});
     defer backend.close();
     var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
@@ -41663,16 +41685,14 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         .{ .key = doc_store_key, .value = "{\"name\":\"Black Mountain College\"}" },
     }, &.{});
 
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{
-        .kind = .asset,
-        .index_name = "conceptualize_v1",
-        .artifact_name = "conceptualize_v1",
-        .doc_key = doc_key,
-        .source_field = "name",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-        .neighbor_context_json = "{\"graph_index\":\"taxonomy\",\"direction\":\"out\",\"limit\":8}",
-        .sequence = 3,
-    };
+    // Use canonical catalog-planned requests, including serialized context
+    // defaults, so the recipe fence certifies the definition actually invoked.
+    var manual_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
+    defer freeRequestPlanCache(alloc, &manual_plan_cache);
+    const manual_requests = try getOrCreatePlannedRequests(&runtime, doc_key, &manual_plan_cache);
+    try std.testing.expectEqual(@as(usize, 1), manual_requests.len);
+    var request = manual_requests[0];
+    request.sequence = 3;
     var prepared_sources = PreparedDocumentSourceCache.init(&runtime);
     defer prepared_sources.deinit();
 
@@ -41694,7 +41714,8 @@ test "asset producer neighbor context samples local graph adjacency into the inp
     try std.testing.expectEqualStrings(
         "Black Mountain College\n{\"neighbors\":[" ++
             "{\"edge_type\":\"located_in\",\"direction\":\"out\",\"target\":\"entities/place/north_carolina\",\"weight\":0.5}," ++
-            "{\"edge_type\":\"started_by\",\"direction\":\"out\",\"target\":\"entities/person/john_andrew_rice\",\"weight\":0.98}]}",
+            "{\"edge_type\":\"started_by\",\"direction\":\"out\",\"target\":\"entities/person/john_andrew_rice\",\"weight\":0.98}," ++
+            "{\"edge_type\":\"taught\",\"direction\":\"out\",\"target\":\"entities/person/anni_albers\",\"weight\":0.6}]}",
         harness.last_input.items,
     );
 
@@ -41714,52 +41735,40 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         "Black Mountain College\n{\"neighbors\":[" ++
             "{\"edge_type\":\"influenced\",\"direction\":\"out\",\"target\":\"entities/person/josef_albers\",\"weight\":0.75}," ++
             "{\"edge_type\":\"located_in\",\"direction\":\"out\",\"target\":\"entities/place/north_carolina\",\"weight\":0.5}," ++
-            "{\"edge_type\":\"started_by\",\"direction\":\"out\",\"target\":\"entities/person/john_andrew_rice\",\"weight\":0.98}]}",
+            "{\"edge_type\":\"started_by\",\"direction\":\"out\",\"target\":\"entities/person/john_andrew_rice\",\"weight\":0.98}," ++
+            "{\"edge_type\":\"taught\",\"direction\":\"out\",\"target\":\"entities/person/anni_albers\",\"weight\":0.6}]}",
         harness.last_input.items,
     );
 
     // A request without neighbor context keeps its input untouched even when
     // graph indexes exist for the table.
-    var plain = request;
-    plain.artifact_name = "plain_v1";
-    plain.index_name = "plain_v1";
-    plain.neighbor_context_json = "";
+    try db.addEnrichment(.{
+        .name = "plain_v1",
+        .kind = .asset,
+        .field = "name",
+        .producer_json = request.producer_json,
+    });
+    var plain_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
+    defer freeRequestPlanCache(alloc, &plain_plan_cache);
+    const plain_requests = try getOrCreatePlannedRequests(&runtime, doc_key, &plain_plan_cache);
+    const plain = blk: {
+        for (plain_requests) |planned| {
+            if (std.mem.eql(u8, planned.artifact_name, "plain_v1")) break :blk planned;
+        }
+        return error.TestUnexpectedResult;
+    };
     try runOnce(&runtime, plain, &prepared_sources, &window);
     try std.testing.expectEqual(@as(usize, 3), harness.calls);
     try std.testing.expectEqualStrings("Black Mountain College", harness.last_input.items);
 
-    // --- Scheduling. The manual invocations above prove the skip-state
-    // behavior; the rest drives the re-run through the scheduling path the
-    // worker uses (edge batch -> replay hint emission -> worker selection ->
-    // catalog-planned request). Before any asset enrichment references the
-    // graph index, an edge-only batch on the default thin-replay sync level
-    // emits no enrichment hint, so worker selection yields nothing.
-    try db.batch(.{ .graph_writes = &.{
-        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/anni_albers", .edge_type = "taught", .weight = 0.6 },
-    } });
-    {
-        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), 0);
-        defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
-        try std.testing.expectEqual(@as(usize, 0), groups.len);
-    }
-
-    // Admit the neighbor-context enrichment and apply another edge-only
-    // batch through the same thin path. The journal record now carries the
-    // enrichment hint for the owning source document and, because the
-    // context samples reverse edges (direction `both`), for the same-table
-    // target document.
-    try db.addEnrichment(.{
-        .name = "conceptualize_v1",
-        .kind = .asset,
-        .field = "name",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-        .neighbor_context = .{ .graph_index = "taxonomy" },
-    });
+    // The manual invocations handled earlier changes. Observe only subsequent
+    // hints when driving admitted producers through the scheduling path.
+    const scheduling_after = db.core.nextDerivedSequence();
     try db.batch(.{ .graph_writes = &.{
         .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/ruth_asawa", .edge_type = "exhibited", .weight = 0.25 },
     } });
     const write_hint_sequence = blk: {
-        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), 0);
+        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), scheduling_after);
         defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
         try std.testing.expectEqual(@as(usize, 2), groups.len);
         try std.testing.expectEqualStrings(doc_key, groups[0].doc_key);
@@ -41798,7 +41807,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
     }.run;
     try db.runDerivedUntil(write_hint_sequence);
     {
-        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), 0);
+        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), scheduling_after);
         defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
         try runScheduled(&runtime, groups, &request_plan_cache, &prepared_sources, &window);
     }
@@ -42604,6 +42613,45 @@ test "enrichment extractSourceText empty fields and templates share no output wh
         defer alloc.free(whitespace);
         try std.testing.expectEqualStrings(" \t\n", whitespace);
     }
+}
+
+test "source semantic media input preserves typed bytes instead of embedding URI text" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        fn text(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedTextEmbedding;
+        }
+        fn parts(ptr: *anyopaque, alloc: Allocator, _: []const u8, input: []const template.ContentPart, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), input.len);
+            try std.testing.expect(input[0] == .binary);
+            try std.testing.expectEqualStrings("image/png", input[0].binary.mime_type);
+            try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, input[0].binary.data);
+            self.calls += 1;
+            return alloc.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    var probe = Probe{};
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &probe, .dense_embed_fn = Probe.text, .dense_embed_parts_fn = Probe.parts };
+    const raw = "{\"content\":{\"resource\":{\"uri\":\"data:image/png;base64,AQID\"}}}";
+    var request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "images", .doc_key = "doc", .source_field = "", .source_template = "{{media url=content.resource.uri}}" };
+    var media = try prepareDenseSourceInput(a, .{}, provider, raw, request);
+    defer media.deinit(a);
+    try std.testing.expect(media == .parts);
+    const vector = try provider.embedDenseParts(a, "images", media.parts, 2);
+    defer a.free(vector);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+
+    // This formerly passed Sources media readiness, but native rendering has
+    // always produced a text part containing the URI, not the media bytes.
+    request.source_template = "{{content.resource.uri}}";
+    var text = try prepareDenseSourceInput(a, .{}, provider, raw, request);
+    defer text.deinit(a);
+    try std.testing.expect(text == .parts);
+    try std.testing.expectEqual(@as(usize, 1), text.parts.len);
+    try std.testing.expect(text.parts[0] == .text);
+    try std.testing.expectEqualStrings("data:image/png;base64,AQID", text.parts[0].text);
 }
 
 test "extractSourceText with template skips _embeddings field" {

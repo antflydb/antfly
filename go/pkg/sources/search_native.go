@@ -113,6 +113,12 @@ func nativeEnrichments(config map[string]any) map[string]map[string]any {
 // Validate each projection transition, including the fixed text output of a
 // chunk producer. An ancestor name alone does not prove which field was read.
 func nativeLineage(enrichments map[string]map[string]any, member string, stream SearchStream) bool {
+	if stream.ResourceField != "" {
+		return nativeMediaLineage(enrichments[member], stream)
+	}
+	if stream.Retrieval.Semantic.VectorSpace.DocumentModality != "text" {
+		return false
+	}
 	seen := map[string]bool{}
 	projected := stream.Retrieval.Semantic.MemberField
 	for hops := 0; hops <= 64; hops++ {
@@ -132,6 +138,10 @@ func nativeLineage(enrichments map[string]map[string]any, member string, stream 
 		seen[member] = true
 		e, ok := enrichments[member]
 		if !ok {
+			return false
+		}
+		input, _ := e["embedding_input"].(string)
+		if input != "" && input != "text" {
 			return false
 		}
 		field, _ := e["field"].(string)
@@ -161,15 +171,54 @@ func nativeLineage(enrichments map[string]map[string]any, member string, stream 
 		upstream, _ := e["source_artifact_name"].(string)
 		if upstream == "" {
 			expected := stream.Field
-			if stream.ResourceField != "" {
-				expected = stream.ResourceField + ".uri"
-			}
 			return stream.Artifact == "" && expected != "" && field == expected
 		}
 		projected = field
 		member = upstream
 	}
 	return false
+}
+
+// Original media must enter the embedding producer as media, without a text or
+// chunk ancestor. A matching URI dependency alone does not prove modality.
+func nativeMediaLineage(e map[string]any, stream SearchStream) bool {
+	binding := stream.Retrieval.Semantic
+	upstream, _ := e["source_artifact_name"].(string)
+	if stream.Artifact != "" || binding.MemberField != "" || e["kind"] != "embedding" || upstream != "" {
+		return false
+	}
+	if binding.VectorSpace.DocumentModality == "text" {
+		return false
+	}
+	field, _ := e["field"].(string)
+	template, _ := e["template"].(string)
+	input, _ := e["embedding_input"].(string)
+	if input == "pdf_page_images" {
+		// This native mode consumes a URI and rasterizes PDF pages.
+		if binding.VectorSpace.DocumentModality != "image" {
+			return false
+		}
+		if template != "" {
+			if field != "" {
+				return false
+			}
+			var valid bool
+			field, valid = pureFieldTemplate(template)
+			if !valid {
+				return false
+			}
+		}
+	} else {
+		if (input != "" && input != "text") || field != "" {
+			return false
+		}
+		var valid bool
+		field, valid = mediaFieldTemplate(template)
+		if !valid {
+			return false
+		}
+	}
+	return field == stream.ResourceField+".uri"
 }
 
 func checkNativeStream(stream SearchStream, index nativeSearchIndex, semantic bool) error {
@@ -599,6 +648,20 @@ func pureFieldTemplate(template string) (string, bool) {
 		}
 	}
 	return field, true
+}
+
+// Admit only a single typed media input from the declared resource. Ordinary
+// interpolation renders URL text. Options, literal URLs, blocks and composed
+// prompts require a richer lineage protocol and fail closed here.
+func mediaFieldTemplate(source string) (string, bool) {
+	if !strings.HasPrefix(source, "{{") || strings.HasPrefix(source, "{{{") || !strings.HasSuffix(source, "}}") {
+		return "", false
+	}
+	parts := strings.Fields(source[2 : len(source)-2])
+	if len(parts) != 2 || (parts[0] != "remoteMedia" && parts[0] != "media") || !strings.HasPrefix(parts[1], "url=") {
+		return "", false
+	}
+	return pureFieldTemplate("{{" + strings.TrimPrefix(parts[1], "url=") + "}}")
 }
 
 var errSearchMetadataBudget = errors.New("native metadata budget exceeded")
