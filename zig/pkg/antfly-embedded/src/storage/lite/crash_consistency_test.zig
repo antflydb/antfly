@@ -148,6 +148,17 @@ pub const Scenario = struct {
     /// normal document/search checks, additionally verify the replay
     /// journal itself is still structurally readable.
     retirement: bool = false,
+    /// Overrides `via_db`/`checkCheckpointsViaNative` with caller-supplied
+    /// lookup semantics, for a scenario whose rows cannot be read back by
+    /// either of this file's two checkers -- e.g. a SQL relational table
+    /// opened through the full capi `Handle` (`antfly_db_sql_json`), whose
+    /// rows live under an encoded, table-scoped physical key rather than at
+    /// the raw document key `checkCheckpointsViaDb`'s `handle.db.lookup`
+    /// expects. `path`/`outcome`/`checkpoints` are exactly what
+    /// `checkCheckpointsViaNative`/`checkCheckpointsViaDb` receive; `null`
+    /// `outcome` means an uncrashed run. See
+    /// `storage/lite/crash_consistency_capi_test.zig`.
+    custom_check: ?*const fn (allocator: Allocator, path: []const u8, outcome: ?CrashOutcome, checkpoints: []const Checkpoint) anyerror!void = null,
 };
 
 pub const SweepOptions = struct {
@@ -306,7 +317,11 @@ fn checkInvariants(
     const power_loss: PowerLoss = if (outcome) |o| o.power_loss else .none;
     const crash_note = if (outcome == null) " [uncrashed run]" else "";
 
-    if (scenario.via_db) {
+    if (scenario.custom_check) |check_fn| {
+        check_fn(allocator, path, outcome, checkpoints) catch |err| {
+            try report.fail(placeholder, when, power_loss, "custom invariant check failed: {s}{s}", .{ @errorName(err), crash_note });
+        };
+    } else if (scenario.via_db) {
         checkCheckpointsViaDb(allocator, path, outcome, checkpoints, scenario.search_index, scenario.search_field, scenario.retirement) catch |err| {
             try report.fail(placeholder, when, power_loss, "db invariant check failed: {s}{s}", .{ @errorName(err), crash_note });
         };
@@ -2452,7 +2467,7 @@ test "crash sweep: commit failing after staging under a persistent io fault does
     handle_open = false;
 }
 
-fn reportFailures(report: *const SweepReport) !void {
+pub fn reportFailures(report: *const SweepReport) !void {
     if (report.ok()) return;
     for (report.failures.items) |f| {
         std.debug.print(
