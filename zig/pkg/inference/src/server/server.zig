@@ -15288,10 +15288,26 @@ pub const Node = struct {
         const prep_cfg = multimodal_qwen_adapter.loadPreprocessorConfig(ctx.allocator, model_path) catch
             return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "model preprocessor configuration is unsupported" });
 
+        // Admit geometry-dependent decoder, tensor, coefficient and row-window
+        // ownership before any image preprocessing. Documents execute serially.
+        var image_working_bytes: usize = 0;
+        for (parsed_docs.items) |doc| {
+            model_path_selection_control.check() catch |err| return inferenceFailureResponse(ctx, err);
+            image_working_bytes = @max(image_working_bytes, multimodal_qwen_adapter.imageWorkingBytes(doc.images, prep_cfg) catch |err|
+                return inferenceFailureResponse(ctx, err));
+        }
+        const image_units = admissionUnitsFor(std.math.add(usize, media_admission.resident_byte_cap, image_working_bytes) catch return inferenceFailureResponse(ctx, error.ResourceLimitExceeded), read_admission_bytes_per_unit);
+        if (image_units > reserved_units) {
+            if (try self.growSlotUnits(ctx, reserved_units, image_units)) |response| return response;
+            reserved_units = image_units;
+        }
+        var image_permit = model.session.admitHostPreprocess(image_working_bytes) catch |err| return inferenceFailureResponse(ctx, err);
+        defer image_permit.deinit();
+
         // The compute backend and resident slots below share the loaded
         // model's stateful GPU runtime. Hold the target-model lane for their
-        // complete lifetime; request parsing and image preparation remain
-        // outside it.
+        // complete lifetime. Request media parsing and geometry admission
+        // above do not touch that stateful runtime.
         const execution_mutex = model.targetInferenceExecutionMutex();
         if (execution_mutex) |mutex| model_path_selection_control.lock(mutex) catch |err|
             return inferenceFailureResponse(ctx, err);

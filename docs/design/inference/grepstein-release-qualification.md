@@ -98,6 +98,164 @@ Retry affected source versions after the policy change and require complete
 artifact coverage before semantic or graph enrichment. Avoid automatic image
 tiling without a tested ordering/deduplication policy.
 
+## Diagnose repeated output before raising token limits
+
+Use the native PDF raster in the reader comparison, alongside a reference
+renderer. A photo page can induce invented or repeated tables when small
+lettering is aliased; an `OUTPUT_TRUNCATED` response does not by itself mean
+the legitimate transcription needs more tokens. Keep incomplete OCR unresolved.
+
+Configure PDF sampling independently of model preprocessing:
+
+```json
+{"ocr":{"render":{"sampling":"auto","dpi":150,"resolution":"requested_dpi"},"reader":{"provider":"antfly","model":"lightonai/LightOnOCR-3-4B","max_tokens":2048}}}
+```
+
+- `auto` (default) smooths continuous-tone images and preserves one-bit ink
+  coverage during minification.
+- `pdf` honors source PDF interpolation declarations for reproducibility.
+- `smooth` explicitly uses bilinear sampling even for one-bit image color;
+  stencil masks keep their source rules. It can blur thin strokes.
+
+DPI, resolution, pixel/dimension caps and memory admission remain independent.
+Sampling does not raise those limits. Shared windows, embedding source identities
+and extraction fingerprints include the policy and its algorithm version.
+Units and chunks carry `ocr_render_policy` alongside requested/effective DPI and
+actual geometry. `resolved_profile` is null when a platform compatibility
+renderer supplies the pixels instead of the native sampler.
+
+The default OCR rendering profile smooths continuous-tone images independently of the
+PDF's `/Interpolate` setting. Exact rendering retains PDF sampling semantics,
+and one-bit scans retain coverage-preserving minification. Smoothing operates
+on the existing decoded image; it adds no full-page buffer or output pixels.
+It increases sampling work and can increase PNG size, so include rendering and
+transport in throughput measurements.
+
+For a bounded A100 reproduction on rc.13, the native 150-DPI raster of
+`EFTA00001227.pdf` (PDF SHA-256
+`d00cd4de31cea68991ae53508df4b78f5f0fd7c424c571388a747aa3746b41fa`)
+exhausted 2048 tokens with both pinned reader sizes while continuing invented
+table rows. With OCR-profile smoothing, 4B stopped at 528 tokens and 0.8B at
+10 tokens under the same ceiling and image-only greedy generation request.
+These are renderer-to-reader diagnostics using the deployed CUDA runtime,
+not proof of full-corpus accuracy or of a deployed server containing the
+rendering change. Inspect actual visible text, not only completion status.
+The corpus artifact definition and pool limits need not change for this fix;
+retry native extraction only after deploying a runtime with the rendering fix.
+
+## Model preprocessing and provider guidance
+
+PDF painting and model resizing are different operations. Resize filters,
+normalization, patch geometry and pixel/token limits belong to the pinned
+model's processor contract. `ocr.render.sampling` does not override them.
+Qwen2-VL honors supported nearest, bilinear or bicubic declarations. The native
+Qwen3.5/LightOn path implements Pillow-compatible antialiased bicubic and
+rejects conflicting declarations. Unknown/malformed filters fail closed.
+The shared image library owns an execution recipe. Model resolution revisions
+include it for declared image/video inputs and for undeclared modalities (whose
+embedding pipelines may accept images until loading resolves their executor).
+Explicit text-only and audio-only models retain their artifact-only revision.
+Qwen2/ColQwen additionally version their model-specific processor contract. This
+fences SigLIP/default-profile vectors as well as Qwen vectors without requiring
+model-name exceptions for every future image encoder.
+
+Current derived-unit writers emit `duf6`, and completed-state reuse still requires
+version 6. Readers can authenticate persisted `duf5` units using the original
+hashed field set, so child work does not have to wait for a parent re-extraction.
+Version-5 payloads cannot claim rendering-policy metadata, even as a null mirror;
+unknown versions and modified content are rejected. Their rendering policy stays
+unknown. When the parent later publishes version 6, the existing generation and
+acceptance fences invalidate the old children and replace them with children
+bound to the new fingerprint. No source-table recreation is required. Plan parent
+regeneration with the same bounded job/admission limits.
+
+LightOn's [4B model card](https://huggingface.co/lightonai/LightOnOCR-3-4B#rendering-and-preprocessing-tips)
+recommends rendering at 400 DPI, then resizing to a 2048-pixel longest edge with
+aspect ratio preserved. Its [processor](https://huggingface.co/lightonai/LightOnOCR-3-4B/blob/main/processor_config.json)
+declares bicubic sampling. Pin the revision when reproducing this pipeline.
+Direct low-resolution painting is not equivalent to high-resolution rendering
+followed by antialiased reduction. This change retains the explicit 150-DPI
+default and existing caps; it does not silently allocate 400-DPI pages or claim
+exact reproduction of LightOn's reference pipeline.
+
+Hosted providers publish different input quality guidance:
+[Document AI](https://docs.cloud.google.com/document-ai/docs/file-types)
+recommends at least 200 DPI, generally 300 or higher;
+[Textract](https://docs.aws.amazon.com/textract/latest/dg/textract-best-practices.html)
+recommends at least 150 DPI and avoiding conversion/downsampling of supported
+originals. Neither recommendation establishes their internal sampling filter.
+[Tesseract](https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html) performs
+its own preprocessing and generally prefers at least 300 DPI.
+
+## Sampling regression and CPU measurements
+
+The processor contract is checked against checked-in Pillow 12.1.0 RGB fixtures
+for all supported filters (nearest, antialiased bilinear and antialiased bicubic),
+including magnification, reduction, single-pixel axes and non-default channel
+normalization. Regenerate with
+`uv run --with pillow==12.1.0 zig/lib/image/testdata/generate_resampling_references.py`,
+then format the generated Zig file. These pixel checks do not invoke a model.
+
+The separable resizer retains an 8-bit horizontal row window, rather than a
+full-height intermediate. This preserves the reference quantization boundary.
+Coefficient storage is allocated exactly; Pillow only retains one row of f64
+coefficients, while Torchvision retains the axis needed for its global precision
+selection. Geometry-based admission includes source decoding, normalized images
+retained earlier in the batch, filter tables and the row window. Both the native
+ColQwen reranker and the Qwen3.5 fallback generation route reserve this work.
+Reranker token preflight inspects image headers and uses the execution geometry;
+it no longer decodes/resizes the same image before execution.
+
+A local safe-build CPU comparison with the previous implementation preserved
+all output floats for three nonuniform RGB workloads. Each result is a mean of
+three timed iterations after warm-up; shared-machine timing is diagnostic,
+not a performance threshold or hosted-GPU measurement.
+
+| Source → model dimensions | Previous bicubic | Row-window bicubic |
+| --- | ---: | ---: |
+| 1801×1278 → 1024×728 | 22.5 ms | 19.8 ms |
+| 2400×3200 → 840×1120 | 70.0 ms | 68.9 ms |
+| 1×100000 → 28×3584 | 28.4 ms | 18.8 ms |
+
+The million-row regression (1×1000000 → 28×35840) fits a preprocessing
+allocation budget below 32 MiB. Previously the horizontal buffer alone required
+84 MB, excluding tensors and coefficients. Source decoding is admitted separately.
+
+To compare actual native PDF painting and PNG transport sizes, build
+`zig build lib-pdf-bench -Doptimize=safe -j2` from `zig/`, then run from the
+repository root:
+
+```sh
+zig/zig-out/bin/lib-pdf-bench sampling-report path/to/sample.pdf 150 3 output-prefix
+```
+
+The command emits one JSON record per sampling policy, including PDF/PNG SHA-256,
+actual geometry, renderer quality, PNG byte count and mean render-plus-encode
+time. It rejects nondeterministic output and optionally writes each PNG for
+comparison through the same pinned `/read` model. Parsing/cold-start, HTTP
+transport, reader latency and accuracy are separate measurements.
+
+Local 150-DPI measurements on the native-text fixture and the two-line scan
+produced identical PNG hashes across policies (the scan explicitly requests
+interpolation); rendering plus encoding took about 20–23 ms and 35–39 ms,
+respectively. The text fixture reports `degraded` native glyph rendering, not
+fully native fidelity. For the Grepstein photo canary, `auto` took 180 ms and
+produced 2,463,230 bytes; `pdf` took 99 ms and produced 612,874 bytes.
+The `auto` PNG hash remains
+`622c903d2c249c0924403cae961a7f2ca53f6f975887060f7c3db370b263aa72`.
+That material CPU/transport tradeoff must remain visible in rollout measurements.
+
+The state-gate test separately verifies that old markers cannot satisfy current
+completed-state reuse. The ordered apply integration test uses a complete unit
+captured from the previous version-5 encoder: it computes/publishes child chunks,
+then replaces them after a version-6 parent publication and retires them after
+parent removal. Run `zig build document-unit-upgrade-test -Doptimize=safe -j2`
+from `zig/` for that production callback/receiver path. Codec tests verify the
+captured fingerprint, tamper rejection, missing-policy semantics and allocation
+failure cleanup. Both metadata-based and downloaded-byte source fingerprints
+bind the resolved render recipe. Full scan/photo/text reader accuracy and deployed end-to-end throughput
+remain required before broad backfill; these local tests do not claim them.
+
 ## Large-page vLLM comparison
 
 The reader throughput target is parity with vLLM, preferably faster, while

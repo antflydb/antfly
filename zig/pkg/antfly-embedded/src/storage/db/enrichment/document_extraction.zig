@@ -248,7 +248,9 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
 
         pub const RenderQuality = @import("antfly_pdf").RenderQuality;
         pub const nativeRasterBboxToPagePoints = @import("antfly_pdf").nativeRasterBboxToPagePoints;
-        pub const RenderProfile = enum { exact, ocr };
+        pub const RenderProfile = @import("antfly_pdf").RenderProfile;
+        pub const ImageSamplingPolicy = @import("antfly_pdf").ImageSamplingPolicy;
+        pub const RenderPolicy = @import("antfly_pdf").RenderPolicy;
         // Keep the erased executor ABI identical in unit/minimal builds even
         // though the rendering functions themselves are stubbed.
         pub const PageRenderExecutor = @import("antfly_pdf").PageRenderExecutor;
@@ -256,6 +258,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
         pub const RenderScratchGrowth = @import("antfly_pdf").RenderScratchGrowth;
         pub const PageRenderRequest = struct {
             page_number: usize,
+            sampling: @import("antfly_pdf").ImageSamplingPolicy = .auto,
             requested_dpi: u16 = 150,
             resolution_policy: RenderResolutionPolicy = .requested_dpi,
             max_pixels: u64 = 40_000_000,
@@ -767,7 +770,11 @@ pub const PdfRenderSession = struct {
     }
 
     pub fn renderPagePngAdaptiveAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64, max_dimension: u32) !RenderedPdfPage {
-        return try pdf.renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &self.parsed, page_number, dpi, max_pixels, max_dimension, .ocr);
+        return self.renderPagePngAdaptiveWithSamplingAlloc(alloc, page_number, dpi, max_pixels, max_dimension, .auto);
+    }
+
+    pub fn renderPagePngAdaptiveWithSamplingAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64, max_dimension: u32, sampling: pdf.ImageSamplingPolicy) !RenderedPdfPage {
+        return try pdf.renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &self.parsed, page_number, dpi, max_pixels, max_dimension, sampling.profile());
     }
 
     pub fn renderPagesBatchAlloc(self: *PdfRenderSession, alloc: Allocator, requests: []const PdfPageRenderRequest, options: PdfPageRenderBatchOptions) !RenderedPdfPageBatch {
@@ -1154,6 +1161,8 @@ fn isBlankRange(text: []const u8, from: u32, to: u32) bool {
     }
     return true;
 }
+pub const RenderPolicy = pdf.RenderPolicy;
+pub const ImageSamplingPolicy = pdf.ImageSamplingPolicy;
 pub const Unit = struct {
     unit_id: []u8,
     unit_type: []u8,
@@ -1168,6 +1177,7 @@ pub const Unit = struct {
     ocr_used: bool = false,
     ocr_attempted: bool = false,
     ocr_render_dpi: ?u16 = null,
+    ocr_render_policy: ?pdf.RenderPolicy = null,
     ocr_effective_render_dpi: ?u16 = null,
     ocr_rendered_width: ?u32 = null,
     ocr_rendered_height: ?u32 = null,
@@ -1367,6 +1377,7 @@ pub const Config = struct {
     ocr_config_json: []const u8 = "",
     ocr_render_dpi: u16 = 150,
     ocr_render_resolution: pdf.RenderResolutionPolicy = .requested_dpi,
+    ocr_render_sampling: pdf.ImageSamplingPolicy = .auto,
     ocr_max_rendered_pixels: u64 = 40_000_000,
     ocr_max_rendered_dimension: u32 = 4096,
     ocr_prompt: []const u8 = "",
@@ -2319,7 +2330,11 @@ fn parseQualityOptions(quality: std.json.ObjectMap, config: *TextQualityConfig) 
 }
 
 fn parseOcrRenderOptions(render: std.json.ObjectMap, config: *Config) !void {
-    try rejectUnknownFields(render, &.{ "dpi", "resolution", "max_pixels", "max_dimension" });
+    try rejectUnknownFields(render, &.{ "dpi", "resolution", "sampling", "max_pixels", "max_dimension" });
+    if (render.get("sampling")) |sampling| {
+        if (sampling != .string) return error.InvalidDocumentExtractionConfig;
+        config.ocr_render_sampling = std.meta.stringToEnum(pdf.ImageSamplingPolicy, sampling.string) orelse return error.InvalidDocumentExtractionConfig;
+    }
     if (render.get("resolution")) |resolution| {
         if (resolution != .string) return error.InvalidDocumentExtractionConfig;
         config.ocr_render_resolution = std.meta.stringToEnum(pdf.RenderResolutionPolicy, resolution.string) orelse return error.InvalidDocumentExtractionConfig;
@@ -2658,6 +2673,7 @@ fn metadataFingerprintResolvedAlloc(alloc: Allocator, source_url: []const u8, co
             var hasher = std.crypto.hash.sha2.Sha256.init(.{});
             hashField(&hasher, "kind", "document_extraction_metadata_fingerprint_v5");
             hashNativeTextConfig(&hasher, config.native_text);
+            hashRenderPolicy(&hasher, config);
             hashField(&hasher, "config_json", config_json);
             hashField(&hasher, "filename", config.filename);
             hashField(&hasher, "content_type", config.content_type);
@@ -2715,6 +2731,7 @@ pub fn metadataFingerprintLegacyAlloc(
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hashField(&hasher, "kind", "document_extraction_metadata_fingerprint_v3");
     hashNativeTextConfig(&hasher, config.native_text);
+    hashRenderPolicy(&hasher, config);
     hashField(&hasher, "source_url", source_url);
     hashField(&hasher, "config_json", config_json);
     hashField(&hasher, "filename", config.filename);
@@ -2754,6 +2771,22 @@ pub fn verifyChecksumDigestHex(config: Config, digest_hex: []const u8) !void {
             if (!std.ascii.eqlIgnoreCase(config.checksum, digest_hex)) return error.DocumentChecksumMismatch;
         },
     }
+}
+
+pub fn renderPolicy(config: Config) pdf.RenderPolicy {
+    return .{ .sampling = config.ocr_render_sampling, .resolved_profile = config.ocr_render_sampling.profile(), .resolution = config.ocr_render_resolution };
+}
+
+pub fn hashRenderPolicy(hasher: *std.crypto.hash.sha2.Sha256, config: Config) void {
+    if (!config.ocr_enabled) return;
+    var version: [2]u8 = undefined;
+    std.mem.writeInt(u16, &version, (RenderPolicy{}).version, .big);
+    hashField(hasher, "ocr_render_policy_version", &version);
+    hashField(hasher, "ocr_render_sampling", @tagName(config.ocr_render_sampling));
+    hashField(hasher, "ocr_render_resolution", @tagName(config.ocr_render_resolution));
+    hashU64Field(hasher, "ocr_render_dpi", config.ocr_render_dpi);
+    hashU64Field(hasher, "ocr_max_rendered_pixels", config.ocr_max_rendered_pixels);
+    hashU64Field(hasher, "ocr_max_rendered_dimension", config.ocr_max_rendered_dimension);
 }
 
 fn hashNativeTextConfig(hasher: *std.crypto.hash.sha2.Sha256, native_text: NativeTextConfig) void {
@@ -7115,4 +7148,38 @@ test "document extraction fingerprint binds custom extension routing" {
     defer a.free(other);
     try std.testing.expectEqualStrings(custom, moved);
     try std.testing.expect(!std.mem.eql(u8, custom, other));
+}
+
+test "OCR sampling configuration is strict and defaults to automatic" {
+    const a = std.testing.allocator;
+    var default = try parseConfig(a, "{}");
+    defer default.deinit(a);
+    try std.testing.expectEqual(ImageSamplingPolicy.auto, default.ocr_render_sampling);
+    for ([_][]const u8{ "auto", "pdf", "smooth" }) |name| {
+        const json = try std.json.Stringify.valueAlloc(a, .{ .ocr = .{ .reader = .{ .provider = "antfly", .model = "fixture" }, .render = .{ .sampling = name } } }, .{});
+        defer a.free(json);
+        var config = try parseConfig(a, json);
+        defer config.deinit(a);
+        try std.testing.expectEqualStrings(name, @tagName(config.ocr_render_sampling));
+        const policy = renderPolicy(config);
+        try std.testing.expectEqual(config.ocr_render_sampling.profile(), policy.resolved_profile);
+        try std.testing.expectEqual(@as(u16, 1), policy.version);
+    }
+    for ([_][]const u8{ "123", "null", "\"nearest\"", "\"bicubic\"" }) |invalid| {
+        const json = try std.mem.concat(a, u8, &.{ "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"fixture\"},\"render\":{\"sampling\":", invalid, "}}}" });
+        defer a.free(json);
+        try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(a, json));
+    }
+}
+
+test "OCR sampling recipe identity changes even when config JSON is unchanged" {
+    const a = std.testing.allocator;
+    const base = Config{ .version = "v1", .ocr_enabled = true };
+    const first = (try metadataFingerprintLegacyAlloc(a, "https://example.test/page.pdf", "{}", base)).?;
+    defer a.free(first);
+    var changed = base;
+    changed.ocr_render_sampling = .pdf;
+    const second = (try metadataFingerprintLegacyAlloc(a, "https://example.test/page.pdf", "{}", changed)).?;
+    defer a.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
 }
