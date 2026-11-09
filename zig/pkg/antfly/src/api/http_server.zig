@@ -16108,7 +16108,10 @@ pub const ApiHttpServer = struct {
             .context = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none },
             .resolver = resolver,
         };
-        if (self.source.vtable.system_catalog != null and query_req.req.graph_queries.len > 0 and distributed_graph.supportsCrossRange(query_req.req)) {
+        // Catalog binding is required independently of execution capability.
+        // Unsupported coordinator modes must be rejected with their precise
+        // diagnostic, never fall back to physical execution of logical names.
+        if (self.source.vtable.system_catalog != null and query_req.req.graph_queries.len > 0) {
             query_req.req.graph_table_read_authorizer = .{ .ctx = &graph_binding, .authorize_table = CatalogGraphReadContext.authorize };
         } else if (authenticated_identity) |*identity| {
             attachGraphTableReadAuthorizer(&query_req.req, identity);
@@ -16150,11 +16153,30 @@ pub const ApiHttpServer = struct {
 
         fn authorize(ctx: ?*const anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!db_mod.types.GraphTableReadAuthorization {
             const self: *@This() = @ptrCast(@alignCast(@constCast(ctx orelse return .{ .allowed = false })));
-            const target = try system_catalog.Target.literal(name);
-            const key = try target.resourceNameAlloc(self.resolver.arena);
+            // Graph endpoint tags retain physical identities across catalog
+            // renames. Resolve their current logical grant through the indexed
+            // reverse lookup, under the same revision as forward bindings.
+            // Unlike public table targets, graph qualifiers also accept these
+            // canonical storage identities (including returned path nodes).
+            const a = self.resolver.arena;
+            if (!self.resolver.logical_names.contains(name)) {
+                const bytes = try self.server.source.systemCatalog(a, self.context, .{ .resolve_many = .{
+                    .storage_names = &.{name},
+                    .expected_revision = self.resolver.revision,
+                } });
+                const reverse = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
+                if (reverse.tables.len != 0 or reverse.logical_names.len != 1) return error.InvalidCatalogRecord;
+                if (self.resolver.revision) |revision| if (reverse.revision != revision) return error.CatalogGenerationChanged;
+                self.resolver.revision = reverse.revision;
+                try self.resolver.logical_names.put(a, try a.dupe(u8, name), reverse.logical_names[0]);
+            }
+            const logical = self.resolver.logical_names.get(name).?;
+            const target = try system_catalog.Target.parse(logical orelse name);
+            const key = try target.resourceNameAlloc(a);
             if (!try tablePermissionCurrentlyAllowed(self.identity, key, .read)) return .{ .allowed = false };
             const resolved = try self.server.resolveQueryCatalog(self.resolver, self.context, &.{target}, false);
             const table = resolved.tables[0] orelse return .{ .allowed = false };
+            if (logical != null and !std.mem.eql(u8, table.name, name)) return error.CatalogGenerationChanged;
             const physical = try alloc.dupe(u8, table.name);
             errdefer alloc.free(physical);
             return .{
@@ -21944,6 +21966,7 @@ pub const ApiHttpServer = struct {
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery = null,
         revision: ?u64 = null,
         tables: std.StringHashMapUnmanaged(?system_catalog.ResolvedTable) = .empty,
+        logical_names: std.StringHashMapUnmanaged(?[]const u8) = .empty,
         definitions: std.StringHashMapUnmanaged(system_catalog.QueryDefinition) = .empty,
     };
 
@@ -59370,6 +59393,12 @@ test "system catalog plain retries and joined graph reads reuse request identity
         fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(input == .resolve_many);
+            if (input.resolve_many.storage_names.len != 0) {
+                const name = input.resolve_many.storage_names[0];
+                const logical = if (std.mem.eql(u8, name, "table:original")) try (system_catalog.Target{ .table = "entities" }).resourceNameAlloc(a) else null;
+                defer if (logical) |key| a.free(key);
+                return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 1, .tables = &.{}, .logical_names = &.{logical} }, .{});
+            }
             self.bindings += 1;
             const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = self.bindings, .name = if (self.bindings == 1) "table:original" else "table:replacement" }};
             return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = self.bindings, .tables = &tables }, .{});
@@ -59386,14 +59415,22 @@ test "system catalog plain retries and joined graph reads reuse request identity
         fn query(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.queries += 1;
-            var binding = try req.graph_table_read_authorizer.?.authorize(a, "entities");
-            defer binding.deinit(a);
-            try std.testing.expectEqualStrings("table:original", binding.physical_table_name.?);
+            for ([_][]const u8{ "entities", "table:original" }) |name| {
+                var binding = try req.graph_table_read_authorizer.?.authorize(a, name);
+                defer binding.deinit(a);
+                try std.testing.expectEqualStrings("table:original", binding.physical_table_name.?);
+            }
             if (self.retry_first and self.queries == 1) return error.StorageReadTemporarilyUnavailable;
             return .{ .json = try a.dupe(u8, "{\"responses\":[{\"hits\":{\"hits\":[]}}]}") };
         }
     };
-    for ([_]bool{ false, true }) |joined| {
+    for ([_]struct { joined: bool, deduplicate: bool }{
+        .{ .joined = false, .deduplicate = true },
+        .{ .joined = true, .deduplicate = true },
+        .{ .joined = false, .deduplicate = false },
+        .{ .joined = true, .deduplicate = false },
+    }) |mode| {
+        const joined = mode.joined;
         var fake = Fake{ .retry_first = !joined };
         const reads: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
         const writes: table_writes.TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch } };
@@ -59406,8 +59443,10 @@ test "system catalog plain retries and joined graph reads reuse request identity
         const base =
             \\{"query":{"match_all":{}},"graph_queries":{"mentions":{"index":"relations_graph","traverse":{"start":{"keys":["doc"]},"edge_types":["mentions"],"max_depth":1,"limit":10,"include_documents":true}}},"limit":10
         ;
+        const query_base = if (mode.deduplicate) try alloc.dupe(u8, base) else try std.mem.replaceOwned(u8, alloc, base, "\"include_documents\":true", "\"include_documents\":true,\"deduplicate_nodes\":false");
+        defer alloc.free(query_base);
         const body = try std.mem.concat(alloc, u8, &.{
-            base,
+            query_base,
             if (joined)
                 \\,"join":{"right_table":"other","on":{"left_field":"customer_id","right_field":"_id"}}
             else
@@ -62740,4 +62779,74 @@ test "external lake query cleanup scheduler continues productive checkpoint reti
         try std.testing.expectEqual(@as(usize, 0), final.stores.len);
         try std.testing.expectEqual(@as(u64, 30000), server.lakeArtifactCollectionIntervalMs(30000));
     }
+}
+
+test "system catalog graph physical endpoints recheck logical grants and binding epochs" {
+    const a = std.testing.allocator;
+    const target: system_catalog.Target = .{ .database = "analytics", .table = "entities" };
+    const key = try target.resourceNameAlloc(a);
+    defer a.free(key);
+    const Fake = struct {
+        logical: []const u8,
+        revision: u64 = 7,
+        reverse_reads: usize = 0,
+        forward_reads: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, _: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const input = call.resolve_many;
+            if (input.expected_revision) |expected| if (expected != self.revision) return error.CatalogGenerationChanged;
+            if (input.storage_names.len != 0) {
+                self.reverse_reads += 1;
+                const logical = if (std.mem.eql(u8, input.storage_names[0], "table:entities")) self.logical else null;
+                return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = self.revision, .tables = &.{}, .logical_names = &.{logical} }, .{});
+            }
+            self.forward_reads += 1;
+            try std.testing.expectEqualStrings("analytics", input.targets[0].database);
+            try std.testing.expectEqualStrings("entities", input.targets[0].table);
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = self.revision, .tables = &.{.{ .table_id = 42, .name = "table:entities" }} }, .{});
+        }
+    };
+    var fake: Fake = .{ .logical = key };
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog } }, null, null);
+    defer server.deinit();
+    var auth = try initTestAuthManager(a);
+    try bindTestAuthManager(a, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var grant = try usermgr.Permission.initOwned(a, .table, key, .read);
+    defer grant.deinit(a);
+    var user = try auth.manager.createUser("graph-reader", "secret", &.{grant});
+    defer user.deinit(a);
+    var permissions = [_]usermgr.Permission{grant};
+    var identity = (try cloneCatalogIdentity(a, .{
+        .username = @constCast("graph-reader"),
+        .credential_principal = @constCast("basic:graph-reader"),
+        .live_user_manager = &auth.manager,
+        .permissions = &permissions,
+    })).?;
+    defer identity.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var resolver: ApiHttpServer.CatalogQueryResolver = .{ .arena = arena.allocator() };
+    var context: ApiHttpServer.CatalogGraphReadContext = .{ .server = &server, .identity = identity, .context = .{}, .resolver = &resolver };
+    var allowed = try ApiHttpServer.CatalogGraphReadContext.authorize(&context, a, "table:entities");
+    defer allowed.deinit(a);
+    try std.testing.expect(allowed.allowed);
+    try std.testing.expectEqualStrings("table:entities", allowed.physical_table_name.?);
+    // A scoped table's basename never inherits its grant in default.public.
+    var basename = try ApiHttpServer.CatalogGraphReadContext.authorize(&context, a, "entities");
+    defer basename.deinit(a);
+    try std.testing.expect(!basename.allowed);
+    try auth.manager.removePermissionFromUser("graph-reader", key, .table);
+    var revoked = try ApiHttpServer.CatalogGraphReadContext.authorize(&context, a, "table:entities");
+    defer revoked.deinit(a);
+    try std.testing.expect(!revoked.allowed);
+    try std.testing.expectEqual(@as(usize, 2), fake.reverse_reads);
+    try std.testing.expectEqual(@as(usize, 1), fake.forward_reads);
+    fake.revision += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, ApiHttpServer.CatalogGraphReadContext.authorize(&context, a, "table:another"));
 }

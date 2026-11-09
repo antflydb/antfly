@@ -4083,6 +4083,11 @@ fn canonicalGraphStepInMemory(
     const scratch_alloc = memory.tracked.allocator();
     var table_scratch = graph_traversal_mod.MetadataScratch.init(scratch_alloc, null);
     errdefer table_scratch.deinit();
+    // Selectors carry public logical names; durable edge metadata carries
+    // physical identities. Compare only after the same authorization/cache
+    // used to route and hydrate these nodes has bound both table names.
+    const current_table_name = (try reader.admission.ensureTable(current_table)).table_name;
+    const expansion_table_name = (try reader.admission.ensureTable(expansion_table)).table_name;
     var edge_bytes: usize = 0;
     for (edges, 0..) |edge, edge_index| {
         edge_bytes = std.math.add(usize, edge_bytes, graphEdgeOwnedBytes(edge)) catch
@@ -4092,7 +4097,7 @@ fn canonicalGraphStepInMemory(
         const evaluated = try reader.admission.evaluateEdge(params.edge_filter, edge, &table_scratch);
         if (!evaluated.matched) continue;
         if (!std.math.isFinite(edge.weight)) return error.InvalidGraphEdgeValue;
-        const endpoint = @import("antfly_local_sources").graph_metadata_tables.adjacentInTables(edge, key, current_table, evaluated.source_table orelse expansion_table, evaluated.target_table orelse expansion_table, params.direction);
+        const endpoint = @import("antfly_local_sources").graph_metadata_tables.adjacentInTables(edge, key, current_table_name, evaluated.source_table orelse expansion_table_name, evaluated.target_table orelse expansion_table_name, params.direction);
         if (!endpoint.connected) continue;
         if (memory.descriptors.items.len == limit) {
             if (work_budget.remaining_nodes <= work_budget.remaining_edges)
