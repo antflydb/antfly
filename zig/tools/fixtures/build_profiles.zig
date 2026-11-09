@@ -380,7 +380,17 @@ fn sourcePath(b: *std.Build, path: std.Build.LazyPath) []const u8 {
 /// targets on every mutation probe dominates their configuration time.
 /// Retained steps still traverse their real production dependencies.
 pub fn retainCacheTargets(b: *std.Build, default_name: []const u8) void {
+    const requested = b.option([]const u8, "cache-steps", "Serialize only these comma-separated fixture execution roots after auditing");
     b.default_step = &b.top_level_steps.get(default_name).?.step;
+    if (requested) |names| {
+        var selected = std.mem.splitScalar(u8, names, ',');
+        while (selected.next()) |name| {
+            if (b.top_level_steps.get(name)) |step| {
+                b.default_step = &step.step;
+                break;
+            }
+        }
+    }
     var index = b.top_level_steps.count();
     while (index > 0) {
         index -= 1;
@@ -390,6 +400,13 @@ pub fn retainCacheTargets(b: *std.Build, default_name: []const u8) void {
         // in test_runtime_cache.py; retain the actual steps, not copies.
         for ([_][]const u8{ "lib-hash-test", "sql-grammar-generated-check", "regen-sql-grammar", "check-snowball", "regen-snowball" }) |contract| {
             if (std.mem.eql(u8, name, contract)) retain = true;
+        }
+        if (requested) |names| {
+            retain = &b.top_level_steps.values()[index].step == b.default_step;
+            var selected = std.mem.splitScalar(u8, names, ',');
+            while (selected.next()) |wanted| {
+                if (std.mem.eql(u8, name, wanted)) retain = true;
+            }
         }
         if (!retain) b.top_level_steps.swapRemoveAt(index);
     }

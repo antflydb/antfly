@@ -119,11 +119,26 @@ class RuntimeCacheTest(unittest.TestCase):
                 "-Dsystem-blas=false",
             ]
         )
+        # Only the production runtime fixture owns this archive-probe
+        # namespace. Alternate tiny fixtures keep their own normal build API.
+        # Audits still visit every production target before roots are pruned.
+        execution_roots = targets[: targets.index("--")] if "--" in targets else targets
+        select_roots = (
+            any(
+                target == "cache-probe" or target.startswith("runtime-unit-")
+                for target in execution_roots
+            )
+            and "--help" not in execution_roots
+        )
+        fixture_flags = (
+            ["-Dcache-steps=" + ",".join(execution_roots)] if select_roots else []
+        )
         result = subprocess.run(
             [
                 "zig",
                 "build",
                 *targets,
+                *fixture_flags,
                 *native_flags,
                 f"-Dantfly-version={version}",
                 *settings,
