@@ -25,6 +25,20 @@ final class FixtureProtocol: URLProtocol, @unchecked Sendable {
 }
 
 @Suite(.serialized) struct ClientTests {
+  @Test func managedPasswordUsesBasicAuthWithoutForwardingExternalBearer() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [FixtureProtocol.self]
+    FixtureProtocol.reply = { request in
+      #expect(
+        request.value(forHTTPHeaderField: "Authorization") == "Basic "
+          + Data("admin:local-private-password".utf8).base64EncodedString())
+      return (200, "application/json", "{\"data\":[]}")
+    }
+    let connection = try AntflyClient(
+      server: "http://127.0.0.1:47831", token: "external-token",
+      basicPassword: "local-private-password", session: URLSession(configuration: configuration))
+    _ = try await connection.models()
+  }
   func client() throws -> AntflyClient {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [FixtureProtocol.self]
