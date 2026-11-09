@@ -45,6 +45,43 @@ class Store:
 
 
 class ArtifactExchangeTests(unittest.TestCase):
+    def test_composites_take_the_transport_switch_as_an_explicit_input(self):
+        root = Path(__file__).resolve().parents[2]
+        for action in ("upload-ci-artifact", "probe-ci-artifact"):
+            manifest = (root / ".github/actions" / action / "action.yml").read_text()
+            self.assertNotRegex(manifest, r"\bvars\s*\.")
+            self.assertIn("  gcs-enabled:\n", manifest)
+            self.assertIn("    default: 'false'\n", manifest)
+            self.assertIn("inputs.gcs-enabled", manifest)
+        probe = (root / ".github/actions/probe-ci-artifact/action.yml").read_text()
+        for step in re.split(r"\n    - ", probe):
+            if "uses: ./.github/actions/upload-ci-artifact" in step:
+                self.assertIn("gcs-enabled: ${{ inputs.gcs-enabled }}", step)
+            elif "uses: ./.github/actions/download-ci-artifact" in step:
+                self.assertNotIn("gcs-enabled:", step)
+
+    def test_each_workflow_resolves_the_transport_switch_before_calling_actions(self):
+        root = Path(__file__).resolve().parents[2]
+        calls = 0
+        for path in (root / ".github/workflows").glob("*.yml"):
+            text = path.read_text()
+            for match in re.finditer(
+                r"(?m)^( *)(- )?uses: \S+/(?:upload-ci-artifact|probe-ci-artifact)\s*$",
+                text,
+            ):
+                uses_indent = len(match[1]) + (2 if match[2] else 0)
+                next_step = re.search(
+                    r"(?m)^ {" + str(uses_indent - 2) + r"}- ", text[match.end() :]
+                )
+                step = text[match.end() :][: next_step.start() if next_step else None]
+                self.assertIn(
+                    "gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}",
+                    step,
+                    str(path),
+                )
+                calls += 1
+        self.assertGreater(calls, 0)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

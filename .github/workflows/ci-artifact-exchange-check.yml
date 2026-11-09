@@ -17,4 +17,5 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/probe-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           namespace: release

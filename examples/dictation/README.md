@@ -15,7 +15,12 @@ Antfly's existing native provider; the app does not ship a second speech engine.
 ## Install the macOS app
 
 Official releases are Apple Silicon ZIPs containing a signed, notarized app and
-its pinned Antfly runtime. After downloading a published release:
+its pinned Antfly runtime.
+
+[Download v0.1.0-beta.1 for Apple Silicon](https://releases.antfly.io/antfly-dictation/releases/0.1.0-beta.1/Antfly-Dictation-0.1.0-beta.1-arm64.zip).
+The download becomes available when the signed beta release completes.
+
+After downloading:
 
 1. Quit any development copy and unzip the download.
 2. Move **Antfly Dictation.app** into `/Applications` or `~/Applications`, then open it.

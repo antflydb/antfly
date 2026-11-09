@@ -138,5 +138,6 @@ jobs:
       - name: Upload immutable CLI snapshot
         uses: ./release-controller/.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           name: antfly-cli-snapshot
           path: dist/cli-snapshot/

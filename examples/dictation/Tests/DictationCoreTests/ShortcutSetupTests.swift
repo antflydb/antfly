@@ -7,6 +7,10 @@ import Testing
 @testable import DictationApp
 @testable import DictationCore
 
+@MainActor private final class KeyboardTrust {
+  var value = false
+}
+
 private func setupDirectory(_ config: Configuration) throws -> URL {
   let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
   try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -18,11 +22,11 @@ private func setupDirectory(_ config: Configuration) throws -> URL {
   saved.effectiveShortcut = .controlOptionSpace
   let directory = try setupDirectory(saved)
   defer { try? FileManager.default.removeItem(at: directory) }
-  var trusted = false
+  let trusted = KeyboardTrust()
   var prompts = 0
   var panes: [String] = []
   let store = Store(
-    directory: directory, registerHotkey: false, keyboardAccess: { trusted },
+    directory: directory, registerHotkey: false, keyboardAccess: { trusted.value },
     keyboardAccessRequest: { prompts += 1 }, settingsOpener: { panes.append($0) })
   store.config.effectiveShortcut = .fn
   store.setUpShortcut()
@@ -31,7 +35,7 @@ private func setupDirectory(_ config: Configuration) throws -> URL {
   #expect(panes == ["com.apple.preference.security?Privacy_Accessibility"])
   let file = directory.appendingPathComponent("settings.json")
   #expect(try Configuration.decode(Data(contentsOf: file)).effectiveShortcut == .controlOptionSpace)
-  trusted = true
+  trusted.value = true
   store.refreshShortcutAccess()
   #expect(!store.shortcutSetupPending && store.config.effectiveShortcut == .fn)
   #expect(try Configuration.decode(Data(contentsOf: file)).effectiveShortcut == .fn)
@@ -67,13 +71,13 @@ private func setupDirectory(_ config: Configuration) throws -> URL {
   saved.effectiveShortcut = .controlOptionSpace
   let directory = try setupDirectory(saved)
   defer { try? FileManager.default.removeItem(at: directory) }
-  var trusted = false
+  let trusted = KeyboardTrust()
   let store = Store(
-    directory: directory, registerHotkey: false, keyboardAccess: { trusted },
+    directory: directory, registerHotkey: false, keyboardAccess: { trusted.value },
     keyboardAccessRequest: {}, settingsOpener: { _ in })
   store.setUpShortcut()
   store.cancelShortcutSetup()
-  trusted = true
+  trusted.value = true
   store.refreshShortcutAccess()
   #expect(!store.shortcutSetupPending && store.config.effectiveShortcut == .controlOptionSpace)
   #expect(

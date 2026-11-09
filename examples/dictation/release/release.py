@@ -162,6 +162,11 @@ def resolve(request, event, controller, default_branch):
     return identity
 
 
+def verify_architecture(binary, architecture):
+    # lipo consumes every argument after -verify_arch as an architecture.
+    run("lipo", str(binary), "-verify_arch", architecture)
+
+
 def verify_bundle(bundle, identity, key):
     derived = version(identity["tag"])
     info = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
@@ -192,7 +197,7 @@ def verify_bundle(bundle, identity, key):
         raise ValueError("Embedded Sparkle differs from the trusted release policy")
     binary = bundle / "Contents/MacOS/AntflyDictation"
     for arch in ("arm64",):
-        run("lipo", "-verify_arch", arch, str(binary))
+        verify_architecture(binary, arch)
     load_commands = run("xcrun", "vtool", "-show-build", str(binary))
     minimums = re.findall(r"\bminos\s+(\d+(?:\.\d+)+)", load_commands)
 
@@ -216,7 +221,7 @@ def verify_bundle(bundle, identity, key):
     runtime = bundle / "Contents/Resources/Runtime"
     runtime_policy.verify_staged(runtime)
     executable = runtime / "antfly"
-    run("lipo", "-verify_arch", "arm64", str(executable))
+    verify_architecture(executable, "arm64")
     if run("lipo", "-archs", str(binary)).strip() != "arm64":
         raise ValueError("The app must contain only Apple Silicon code")
     if run("lipo", "-archs", str(executable)).strip() != "arm64":
