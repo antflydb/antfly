@@ -743,8 +743,7 @@ pub fn capturePrimarySource(alloc: std.mem.Allocator, txn: anytype, namespace: N
         error.NotFound => return error.EnrichmentSourceChanged,
         else => return err,
     };
-    if (ttl.len != 8) return error.EnrichmentSourceChanged;
-    const timestamp = std.mem.readInt(u64, ttl[0..8], .little);
+    const timestamp = @import("../ttl.zig").writeVersion(ttl) orelse return error.EnrichmentSourceChanged;
     if (timestamp == 0) return error.EnrichmentSourceChanged;
     const position = try inputRevision(txn, namespace, document);
     return .{ .document_key = try alloc.dupe(u8, document), .content_digest = digest_value, .timestamp = timestamp, .input_position = position };
@@ -960,7 +959,7 @@ pub fn validateSources(alloc: std.mem.Allocator, txn: anytype, namespace: Namesp
             error.NotFound => return error.EnrichmentSourceChanged,
             else => return err,
         };
-        if (timestamp.len != 8 or std.mem.readInt(u64, timestamp[0..8], .little) != source.timestamp) return error.EnrichmentSourceChanged;
+        if ((@import("../ttl.zig").writeVersion(timestamp) orelse return error.EnrichmentSourceChanged) != source.timestamp) return error.EnrichmentSourceChanged;
     }
 }
 

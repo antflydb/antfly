@@ -6908,6 +6908,8 @@ pub const MetadataAdminVoprSource = struct {
             // VOPR's public catalog façade does not own the private
             // publication/coordination protocols. Keep these explicit so a
             // newly added Call remains visible to exhaustive compilation.
+            .resolver_authority_mutate,
+            .native_memory_create,
             .lake_source_owner_read,
             .lake_index_lifecycle_read,
             .lake_index_lifecycle_work,
@@ -6976,6 +6978,7 @@ pub const MetadataAdminVoprSource = struct {
                 break :blk try std.json.Stringify.valueAlloc(alloc, value.value, .{});
             },
             .export_snapshot => try store.exportSystemCatalog(alloc, group_id),
+            .graph_authority => |request| try std.json.Stringify.valueAlloc(alloc, try store.graphAuthority(alloc, group_id, request), .{}),
             .read => |request| try store.systemCatalogRead(alloc, group_id, request),
             .list_tables => |request| try store.listSystemCatalogTables(alloc, group_id, request),
             .table_status => |request| try store.listSystemCatalogTables(alloc, group_id, request.listing()),

@@ -1226,6 +1226,8 @@ mod tests {
 #[cfg(feature = "sources")]
 pub mod sources;
 
+pub mod time_series;
+
 /// Simple-path helpers for the native agent memory API.
 pub mod memory;
 pub use memory::{MemorySpace, new_idempotency_key};

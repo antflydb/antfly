@@ -38,6 +38,8 @@ export {
   AntflyClient,
   DEFAULT_WRITE_MAX_REQUEST_BYTES,
   DEFAULT_WRITE_MAX_RESPONSE_BYTES,
+  type GraphDiagnostic,
+  GraphExecutionError,
   HierarchyCursorStaleError,
   INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES,
   type IndexMutationTemporarilyUnavailableCode,
@@ -52,8 +54,6 @@ export {
   type RestoreOptions,
   type SchemaMutationOptions,
   SQLExecutionError,
-  GraphExecutionError,
-  type GraphDiagnostic,
   StorageReadTemporarilyUnavailableError,
   StorageResourceExhaustedError,
 } from "./client.js";
@@ -469,6 +469,9 @@ export type {
   RetrievalAgentRequest,
   RetrievalAgentResult,
   RetrievalAgentSteps,
+  AgentContextManagement,
+  AgentContextEvent,
+  AgentContextDiagnostics,
   RetrievalAgentStreamCallbacks,
   RetrievalNavigationConfig,
   RouteType,
@@ -542,6 +545,8 @@ export type {
 } from "./client.js";
 export { ChatGPTConnectionError } from "./client.js";
 export { AntflyHTTPError, AntflyResponseError } from "./errors.js";
+export type { GraphData, GraphDecoded, GraphIdentity, GraphValue } from "./graph-wire.js";
+export { decodeGraphValue, encodeGraphParameter } from "./graph-wire.js";
 export type { AudioReadMetadata, AudioReadOptions, AudioReadSegment } from "./inference-types.js";
 export type {
   MemoryCallOptions,
@@ -558,6 +563,24 @@ export type {
 export { parseMemoryJSON, stringifyMemoryJSON } from "./memory.js";
 export * from "./models.js";
 export type {
+  SeriesBucket,
+  SeriesPoint,
+  SeriesQueryOptions,
+  SeriesRange,
+  TimeSeries,
+} from "./time-series.js";
+export {
+  fixedDurationNanoseconds,
+  SeriesImportError,
+  seriesBatch,
+  seriesQuery,
+  seriesRead,
+  seriesResults,
+  seriesSQL,
+  seriesTimestampNanoseconds,
+  timeSeriesTable,
+} from "./time-series.js";
+export type {
   CatalogTablespaceBindingRequest,
   ChatGPTAccount,
   ChatGPTBegin,
@@ -565,14 +588,14 @@ export type {
   CreateTablespaceRequest,
   DatabaseCatalogRecord,
   GraphCatalogEntry,
-  GraphQueryRequest,
-  GraphQueryResult,
-  GraphWriteReceipt,
-  GraphWriteStatus,
-  GraphQueryStats,
   GraphDefinition,
   GraphLabelMapping,
+  GraphQueryRequest,
+  GraphQueryResult,
+  GraphQueryStats,
   GraphRelationshipMapping,
+  GraphWriteReceipt,
+  GraphWriteStatus,
   NamespaceCatalogRecord,
   PrivacyCategory,
   PrivacyFinding,
@@ -587,6 +610,3 @@ export type {
   RenameCatalogResourceRequest,
   TablespaceCatalogRecord,
 } from "./types.js";
-
-export { encodeGraphParameter, decodeGraphValue } from "./graph-wire.js";
-export type { GraphValue, GraphIdentity, GraphData, GraphDecoded } from "./graph-wire.js";

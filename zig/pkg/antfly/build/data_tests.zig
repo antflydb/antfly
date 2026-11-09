@@ -201,6 +201,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft batch protocol cache reuses only short lived negative evidence",
         "raft batch protocol activation is reusable only in its accepted leader term",
         "raft batch protocol activation cleanup preserves in flight references",
+        "time series document revision protocol dominates older envelope features",
+        "time series optional revision upgrade preserves a mixed group's mandatory protocol floor",
         "data raft forwarding admission waits within the borrowed deadline and cancellation",
         "data raft apply completion notifications fence reuse deadlines and bounded ownership",
         "data raft retry clock and sleep borrow VoprIo",
