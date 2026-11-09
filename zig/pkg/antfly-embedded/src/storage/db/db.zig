@@ -149759,3 +149759,59 @@ test "source semantic media input repair distinguishes supported producer kinds"
     for ([_][]const u8{ "chunks", "turns" }) |name|
         try std.testing.expectError(error.NotFound, db.reprocessDocumentArtifactRange(a, name, .{ .limit = 1 }));
 }
+
+test "source semantic media input rejects PDF ancestry on nonempty sources and preserves text pipelines" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-pdf-ancestry");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"https://example.org/source.pdf\"}" }}, .sync_level = .write });
+    try db.addEnrichment(.{ .name = "links", .kind = .chunk, .field = "body", .chunk_size = 512 });
+    try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .field = "text" } });
+    var config = types.EnrichmentConfig{ .name = "pages", .kind = .embedding, .field = "text", .source_artifact_name = "links", .embedding_input = .pdf_page_images, .expected_dims = 3 };
+    for ([_][]const u8{ "links", "turns", "missing" }) |upstream| {
+        config.source_artifact_name = upstream;
+        try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(config));
+        try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(config));
+        try std.testing.expect((try db.getEnrichment(a, .embedding, "pages")) == null);
+    }
+    config.source_artifact_name = "links";
+    config.embedding_input = .text;
+    try db.addEnrichment(config);
+    try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"_unused\",\"dims\":3,\"embedding_name\":\"pages\",\"metric\":\"l2_squared\"}" });
+    config.embedding_input = .pdf_page_images;
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(config));
+    var retained = (try db.getEnrichment(a, .embedding, "pages")).?;
+    defer retained.deinit(a);
+    try std.testing.expectEqual(@TypeOf(retained.embedding_input).text, retained.embedding_input);
+    const requests = try db.core.index_manager.planGeneratedEnrichments(a, "doc", "{\"body\":\"https://example.org/source.pdf\"}", &.{}, &.{});
+    defer @import("enrichment/enrichment_types.zig").deinitGeneratedRequests(a, requests);
+    var dense_requests: usize = 0;
+    for (requests) |request| if (request.kind == .dense_embedding) {
+        dense_requests += 1;
+        try std.testing.expectEqual(@TypeOf(request.embedding_input).text, request.embedding_input);
+        try std.testing.expectEqual(@TypeOf(request.input_kind).materialized_chunks, request.input_kind);
+    };
+    try std.testing.expectEqual(@as(usize, 1), dense_requests);
+}
+
+test "source semantic media input PDF producers cannot be bound to sparse consumers" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-pdf-sparse");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    var config = types.EnrichmentConfig{ .name = "pages", .kind = .embedding, .field = "uri", .embedding_input = .pdf_page_images };
+    try db.addEnrichment(config);
+    try std.testing.expectError(error.InvalidIndexConfig, db.addIndex(.{ .name = "sparse_single", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse_embedding\",\"embedding_name\":\"pages\"}" }));
+    try std.testing.expectError(error.InvalidIndexConfig, db.addIndex(.{ .name = "sparse_sources", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse_embedding\",\"sources\":[{\"artifact\":\"pages\"}]}" }));
+    config.embedding_input = .text;
+    _ = try db.upsertEnrichment(config);
+    try db.addIndex(.{ .name = "sparse_text", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse_embedding\",\"embedding_name\":\"pages\"}" });
+    config.embedding_input = .pdf_page_images;
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(config));
+    var retained = (try db.getEnrichment(a, .embedding, "pages")).?;
+    defer retained.deinit(a);
+    try std.testing.expectEqual(@TypeOf(retained.embedding_input).text, retained.embedding_input);
+}

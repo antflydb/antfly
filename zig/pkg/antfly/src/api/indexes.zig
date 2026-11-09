@@ -670,7 +670,7 @@ fn validateEmbeddingArtifactShape(
     dims: u32,
 ) !void {
     if (sparse) {
-        if (cfg.expected_dims != 0) return error.InvalidEnrichmentConfig;
+        if (cfg.expected_dims != 0 or cfg.embedding_input != .text) return error.InvalidEnrichmentConfig;
     } else if (dims > 0 and cfg.expected_dims > 0 and cfg.expected_dims != dims) {
         return error.InvalidEnrichmentConfig;
     }
