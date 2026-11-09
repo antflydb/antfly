@@ -2971,7 +2971,15 @@ pub const DocStore = struct {
 
         const key = internal_keys.replayLatestSequenceKey(kind_ordinal);
         const raw = txn.get(key[0..]) catch |err| switch (err) {
-            error.NotFound => return fallback_last,
+            // Journal sharing: a per-hint latest-sequence marker is no
+            // longer written on every commit (see lite/docstore.zig's
+            // `writeReplayEntries`). Its absence just means this lane's
+            // progress now lives entirely in the single producer head
+            // sequence -- an upper bound on "how far could this hint
+            // possibly be behind," not an exact per-hint watermark. A
+            // backend that still maintains the per-hint marker (anything
+            // other than Lite, today) keeps its exact answer unchanged.
+            error.NotFound => return @max(self.lastReplaySequence(fallback_last), fallback_last),
             else => return err,
         };
         const latest = decodeReplaySequence(raw) orelse return error.CorruptReplayMetadata;

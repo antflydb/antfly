@@ -5805,15 +5805,14 @@ fn encodeReplayPayloadForHint(
     return try change_journal_mod.encodeRecord(alloc, filtered);
 }
 
-fn writeOriginalReplayHintEntries(txn: anytype, sequence: u64, mask: u8, payload: []const u8) !void {
-    const latest_raw = encodeReplaySequence(sequence);
+/// Journal sharing: the reverse of `replayHintOrdinal`, used by
+/// `forEachReplayLane` to recover which hint a lane-scan caller asked for
+/// so it can filter/project the single shared "all" lane entry for it.
+fn hintFromOrdinal(ordinal: u8) ?change_journal_mod.TargetHint {
     for (replay_hints) |hint| {
-        if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
-        const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
-        try txn.put(key[0..], payload);
-        const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
-        try txn.put(latest_key[0..], latest_raw[0..]);
+        if (replayHintOrdinal(hint) == ordinal) return hint;
     }
+    return null;
 }
 
 /// WS5: journal credit ledger helpers shared by the append path
@@ -5846,6 +5845,7 @@ fn requireCurrentReplayJournalFormat(txn: anytype) !void {
 }
 
 fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
+    _ = alloc;
     // WS5: refuse a pre-ledger journal on the very first real append it
     // sees, and stamp a fresh journal with the current version so every
     // later append (and the retirement transactions that eventually charge
@@ -5863,25 +5863,24 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
         try txn.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
     }
 
-    // WS5: this append is charged against the journal credit ledger in the
-    // same transaction that grows the journal, using the entry's real
-    // key+payload bytes (already in hand here, no extra read needed).
-    // Admission is checked against an upper bound (every lane gets the full
-    // unfiltered payload) before any key is written, so a refused append
-    // leaves no partial state behind. Retirement recovers the same real
-    // bytes cheaply too -- via `documentValueLen`, a page read that never
-    // touches external value pages -- so the ledger can equal a scan of
-    // real bytes without ever materializing a large document's value just
-    // to account for its deletion.
-    const consumer_mask = if (txn.store) |store| store.active_consumer_hint_mask.load(.acquire) else replay_reference.all_hints_mask;
-    const mask_all = change_journal_mod.encodedRecordHintMask(payload) catch 0;
-    const mask = mask_all & consumer_mask;
-    const lane_count: u64 = 1 + @popCount(mask);
-    const upper_bound_charge: u64 = lane_count * (internal_keys.replay_key_len + payload.len);
+    // Journal sharing: one physical entry per commit, under the "all" lane,
+    // shared by every consumer -- no more per-hint filtered copy and no more
+    // per-hint latest-sequence marker (see `forEachReplayLane`'s read-time
+    // filtering, and `latestReplaySequenceForOrdinal`'s fallback to the
+    // single producer head sequence in storage/docstore.zig). This append is
+    // charged against the journal credit ledger in the same transaction that
+    // grows the journal, using the entry's real key+payload bytes (already
+    // in hand here, no extra read needed) -- an exact charge now that there
+    // is only ever one lane, not an upper bound. Retirement recovers the
+    // same real bytes cheaply too -- via `documentValueLen`, a page read
+    // that never touches external value pages -- so the ledger can equal a
+    // scan of real bytes without ever materializing a large document's
+    // value just to account for its deletion.
+    const charge: u64 = internal_keys.replay_key_len + payload.len;
     if (txn.store) |store| {
         const ledger = try loadJournalCreditLedger(txn);
         const admissible = store.journal_credit_capacity_bytes -| store.journal_credit_progress_reserve_bytes;
-        if (ledger.bytes + upper_bound_charge > admissible) return error.JournalCreditCapacityExceeded;
+        if (ledger.bytes + charge > admissible) return error.JournalCreditCapacityExceeded;
     }
 
     // The init marker's value never changes once set; rewriting the same
@@ -5890,50 +5889,20 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     if (!already_initialized) try txn.put(internal_keys.replay_meta_init_key[0..], "");
     const next_raw = encodeReplaySequence(sequence + 1);
     try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
-    const latest_raw = encodeReplaySequence(sequence);
 
     const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
     try txn.put(all_key[0..], payload);
-    const all_latest_key = internal_keys.replayLatestSequenceKey(internal_keys.replay_all_kind);
-    try txn.put(all_latest_key[0..], latest_raw[0..]);
-
-    var charged_bytes: u64 = internal_keys.replay_key_len + payload.len;
-    var charged_records: u64 = 1;
-
-    write_hints: {
-        if (mask == 0) break :write_hints;
-
-        var decoded = change_journal_mod.decodeRecord(alloc, payload) catch {
-            try writeOriginalReplayHintEntries(txn, sequence, mask, payload);
-            charged_bytes += @as(u64, @popCount(mask)) * (internal_keys.replay_key_len + payload.len);
-            charged_records += @popCount(mask);
-            break :write_hints;
-        };
-        defer decoded.deinit();
-
-        for (replay_hints) |hint| {
-            if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
-            const lane_payload = try encodeReplayPayloadForHint(alloc, decoded.record, hint);
-            defer alloc.free(lane_payload);
-            const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
-            try txn.put(key[0..], lane_payload);
-            const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
-            try txn.put(latest_key[0..], latest_raw[0..]);
-            charged_bytes += internal_keys.replay_key_len + lane_payload.len;
-            charged_records += 1;
-        }
-    }
 
     if (txn.store != null) {
         var ledger = try loadJournalCreditLedger(txn);
-        ledger = ledger.charged(charged_bytes, charged_records);
+        ledger = ledger.charged(charge, 1);
         try storeJournalCreditLedger(txn, ledger);
     }
 }
 
 // Both runtime adapters share traversal and ownership rules. Only NotFound
 // means exhaustion; failed reads and malformed keys must reach replay workers.
-fn forEachReplayLane(
+fn forEachReplayLaneRaw(
     store: *Store,
     prefix: []const u8,
     kind: u8,
@@ -5970,6 +5939,71 @@ fn forEachReplayLane(
             else => return err,
         };
     }
+}
+
+const ReplayLaneFilterStop = error{ReplayLaneFilterStop};
+
+/// Journal sharing: a hint lane no longer carries its own physical copy of
+/// the journal (see `writeReplayEntries`). Every consumer reads the single
+/// "all" lane entry by sequence and, for a hint-specific lane, filters and
+/// re-projects it for its own hint at read time instead -- the exact same
+/// per-hint shape `encodeReplayPayloadForHint` used to produce at write
+/// time, just computed lazily on the entries a catch-up scan actually
+/// visits rather than on every commit regardless of whether anything ever
+/// reads that lane.
+fn forEachReplayLane(
+    store: *Store,
+    prefix: []const u8,
+    kind: u8,
+    from_sequence: u64,
+    max_entries: usize,
+    context: *anyopaque,
+    callback: backend_erased.Store.ReplayCallback,
+) !backend_types.ReplayLaneIterationStats {
+    if (kind == internal_keys.replay_all_kind) {
+        return try forEachReplayLaneRaw(store, prefix, kind, from_sequence, max_entries, context, callback);
+    }
+    const hint = hintFromOrdinal(kind) orelse return error.InvalidReplayEntryKey;
+
+    const Filter = struct {
+        store: *Store,
+        hint: change_journal_mod.TargetHint,
+        inner_ctx: *anyopaque,
+        inner_callback: backend_erased.Store.ReplayCallback,
+        max_matched: usize,
+        stats: backend_types.ReplayLaneIterationStats = .{ .scan_batches = 1, .fallback_used = true },
+
+        fn handle(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.stats.scanned_entries += 1;
+            self.stats.last_sequence = sequence;
+            const mask = change_journal_mod.encodedRecordHintMask(payload) catch 0;
+            if ((mask & change_journal_mod.singleHintMask(self.hint)) == 0) return;
+
+            var decoded = try change_journal_mod.decodeRecord(self.store.allocator, payload);
+            defer decoded.deinit();
+            const filtered = try encodeReplayPayloadForHint(self.store.allocator, decoded.record, self.hint);
+            defer self.store.allocator.free(filtered);
+            try self.inner_callback(self.inner_ctx, sequence, filtered);
+
+            self.stats.matched_entries += 1;
+            if (self.max_matched != 0 and self.stats.matched_entries >= self.max_matched) {
+                return ReplayLaneFilterStop.ReplayLaneFilterStop;
+            }
+        }
+    };
+    var filter = Filter{
+        .store = store,
+        .hint = hint,
+        .inner_ctx = context,
+        .inner_callback = callback,
+        .max_matched = max_entries,
+    };
+    _ = forEachReplayLaneRaw(store, prefix, internal_keys.replay_all_kind, from_sequence, 0, &filter, Filter.handle) catch |err| switch (err) {
+        ReplayLaneFilterStop.ReplayLaneFilterStop => {},
+        else => return err,
+    };
+    return filter.stats;
 }
 
 fn collectReplayEntries(store: *Store, prefix: []const u8, alloc: Allocator, from_sequence: u64) ![]backend_types.ReplayEntry {
@@ -9275,9 +9309,12 @@ pub fn expectLedgerMatchesScanForTest(store: *Store) !void {
         }
     };
     var collector = Collector{};
-    _ = try forEachReplayLane(store, "", internal_keys.replay_all_kind, 0, 0, &collector, Collector.collect);
-    for (replay_hints) |hint|
-        _ = try forEachReplayLane(store, "", replayHintOrdinal(hint), 0, 0, &collector, Collector.collect);
+    // Journal sharing: the "all" lane is the only lane with a physical,
+    // charged entry now -- a hint-specific `forEachReplayLane` call filters
+    // that same entry at read time instead of scanning a stored copy of
+    // its own, so iterating it here would double-count bytes the ledger
+    // was never charged for.
+    _ = try forEachReplayLaneRaw(store, "", internal_keys.replay_all_kind, 0, 0, &collector, Collector.collect);
 
     var read = try Txn.openReadWithPrefix(store, "");
     defer read.abort();
@@ -9395,12 +9432,26 @@ test "WS5 serviceRetirement clamps to durably-applied consumer progress, never t
     const retired_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
     try std.testing.expectError(error.NotFound, read.get(&retired_key));
     // Entries 2 and 3 -- not yet applied by "body_text" -- must survive.
+    // Journal sharing: there is no longer a separate physical full_text-lane
+    // key to check; the shared "all" lane entry is the only stored copy, and
+    // a full_text-specific scan reads (and filters) it from there.
     inline for (.{ 2, 3 }) |sequence| {
         const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
-        const full_text_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), sequence);
         _ = try read.get(&all_key);
-        _ = try read.get(&full_text_key);
     }
+
+    const FoundContext = struct {
+        found: [2]bool = .{ false, false },
+        fn handle(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (sequence == 2) self.found[0] = true;
+            if (sequence == 3) self.found[1] = true;
+        }
+    };
+    var found_ctx = FoundContext{};
+    _ = try store.forEachReplayLaneFrom(replayHintOrdinal(.full_text), 1, 0, &found_ctx, FoundContext.handle);
+    try std.testing.expect(found_ctx.found[0]);
+    try std.testing.expect(found_ctx.found[1]);
 }
 
 // WS5 (a) consumer-generic coverage: the fresh progress-v2 scan above only
