@@ -7,7 +7,9 @@ servers and downloaded models have independent lifecycles.
 
 ## Installation and everyday updates
 
-Download the official Apple Silicon ZIP from `releases.antfly.io/antfly-dictation` (or the optional GitHub mirror), quit
+After the first signed app release is published, download its Apple Silicon ZIP
+from `https://releases.antfly.io/antfly-dictation/releases/<version>/Antfly-Dictation-<version>-arm64.zip`
+(or the optional GitHub mirror), quit
 any development copy, and move **Antfly Dictation.app** into `/Applications`
 (or your user account's `~/Applications`). Launch that installed copy. The first
 migration from an ad hoc development build to Developer ID signing may require
@@ -274,7 +276,9 @@ available; the signing job only inspects the unsigned artifact as data.
 
 Updating the pin requires a reviewed policy change and compatibility smoke tests.
 The pinned release includes the native Apple provider bridge. Local mode offers
-Whisper and native Apple speech and cleanup. Apple transcription and generation
+Whisper and native Apple speech and cleanup. Automatic local presets choose
+Apple speech only when the server reports it ready, otherwise Whisper. Choosing
+a transcriber explicitly preserves that choice across subsequent discovery. Apple transcription and generation
 require macOS 26 or newer and appropriate speech assets or Apple Intelligence
 readiness; macOS 15 users can use Whisper. The bridge comes from the verified
 release archive, never from a separately source-built sidecar.

@@ -1,6 +1,6 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
-import DictationCore
+@testable import DictationCore
 import Foundation
 import Testing
 
@@ -81,4 +81,87 @@ import Testing
   #expect(store.working)
   #expect(store.config.presets == original)
   #expect(!store.runtime.ready)
+}
+
+@Test func managedValidationUsesLocalOriginAndPreservesTheInactiveExternalAddress() throws {
+  for address in ["", "localhost", "not a server", "https://previous.example"] {
+    var config = Configuration()
+    config.server = address
+    let validated = try config.validated()
+    #expect(validated.server == address)
+    #expect(validated.effectiveServer == Configuration.managedServerOrigin)
+    #expect(
+      try Configuration.decode(JSONEncoder().encode(config)).effectiveServer
+        == Configuration.managedServerOrigin)
+    if address != "https://previous.example" {
+      config.connectionMode = .external
+      #expect(throws: DictationError.self) { try config.validated() }
+    }
+  }
+}
+
+private func localCatalog(error: String? = nil) throws -> ModelCatalog {
+  var capabilities: [String: Any] = ["live_preview": false, "recognition_hints": false]
+  if let error { capabilities["readiness_error"] = error }
+  return try JSONDecoder().decode(
+    ModelCatalog.self,
+    from: JSONSerialization.data(withJSONObject: [
+      "data": [
+        ["id": "transcribers/apple-speech", "task": "transcribe", "dictation": capabilities]
+      ]
+    ]))
+}
+
+@Test func automaticLocalSpeechPrefersReadyAppleAndFallsBackWithoutDownloading() throws {
+  var config = Configuration()
+  config.presets[0].cleanupModel = "generators/custom-cleanup"
+  #expect(config.selectAvailableManagedTranscriber(from: try localCatalog(), supportsApple: true))
+  #expect(config.presets.allSatisfy { $0.model == "transcribers/apple-speech" })
+  #expect(config.presets[0].cleanupModel == "generators/custom-cleanup")
+  #expect(
+    config.selectAvailableManagedTranscriber(
+      from: try localCatalog(error: "assets missing"), supportsApple: true))
+  #expect(config.presets.allSatisfy { $0.model == "transcribers/whisper" })
+  #expect(!config.selectAvailableManagedTranscriber(from: try localCatalog(), supportsApple: false))
+}
+
+@Test func automaticLocalSpeechPreservesExplicitCustomAndExternalSelections() throws {
+  var config = Configuration()
+  config.presets[0].automaticallySelectLocalTranscriber = false
+  config.presets[1].model = "transcribers/custom"
+  config.selectAvailableManagedTranscriber(from: try localCatalog(), supportsApple: true)
+  #expect(config.presets[0].model == "transcribers/whisper")
+  #expect(config.presets[1].model == "transcribers/custom")
+  #expect(config.presets[2].model == "transcribers/apple-speech")
+  config.connectionMode = .external
+  let previous = config.presets
+  #expect(!config.selectAvailableManagedTranscriber(from: try localCatalog(), supportsApple: false))
+  #expect(config.presets == previous)
+}
+
+@MainActor @Test func savingManagedSettingsDoesNotReadOrOverwriteExternalCredentials() throws {
+  let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let store = Store(
+    directory: root, registerHotkey: false,
+    credentialReader: { _ in
+      Issue.record("Read inactive external credentials")
+      return ""
+    },
+    credentialWriter: { _, _ in Issue.record("Overwrote inactive external credentials") })
+  store.config.connectionMode = .managed
+  store.config.server = "not a server"
+  store.save()
+  let saved = try Configuration.decode(
+    Data(contentsOf: root.appendingPathComponent("settings.json")))
+  #expect(saved.usesManagedRuntime && saved.server == "not a server")
+}
+
+@Test func managedClientRoutesToLoopbackWithoutAValidExternalServer() async throws {
+  var config = Configuration()
+  config.server = "not a server"
+  let client = try AntflyClient(configuration: config)
+  #expect(await client.origin.absoluteString == Configuration.managedServerOrigin)
+  let explicit = try AntflyClient(server: "https://external.example")
+  #expect(await explicit.origin.absoluteString == "https://external.example")
 }

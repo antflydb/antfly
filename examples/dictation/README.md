@@ -12,6 +12,25 @@ The app uses SwiftUI, AVAudioEngine, Carbon global hotkeys, Accessibility, and
 Keychain. Sparkle is its pinned third-party update dependency. Apple Speech runs through
 Antfly's existing native provider; the app does not ship a second speech engine.
 
+## Install the macOS app
+
+Official releases are Apple Silicon ZIPs containing a signed, notarized app and
+its pinned Antfly runtime. After downloading a published release:
+
+1. Quit any development copy and unzip the download.
+2. Move **Antfly Dictation.app** into `/Applications` or `~/Applications`, then open it.
+3. Allow microphone access and enable the app in Accessibility for Fn/Globe and paste.
+4. Keep **On this Mac** selected. Automatic presets use ready Apple speech on
+   macOS 26+, otherwise select **Download Whisper Tiny…**. No server address or
+   bearer token is required for bundled mode.
+5. Optional: select a cleanup generator, customize presets and vocabulary, and save settings.
+
+Installed official apps provide **Check for Updates…** and optional automatic
+updates. App updates include the bundled engine and preserve settings, models,
+history, and Keychain credentials. The public Dictation download channels require
+the first signed app release; publishing an Antfly engine release alone does not
+publish the app. See [release activation and installation](UPDATES.md).
+
 ## Build and run
 
 Requires an Apple Silicon Mac with macOS 15+ and a Swift 6 toolchain. Apple transcription additionally
@@ -21,7 +40,7 @@ a Linux server cannot use the Mac's Speech engine through that server.
 
 ```bash
 cd examples/dictation
-./build-app.sh
+BUNDLE_RUNTIME=1 ./build-app.sh
 open 'dist/Antfly Dictation.app'
 ```
 
@@ -33,10 +52,12 @@ Accessibility access. Run the bundle, rather than a bare `swift run` executable,
 so macOS can associate permissions with its stable bundle identifier.
 
 1. In Settings, allow the microphone. Enable Accessibility to use automatic paste.
-2. Set the server origin (default `http://localhost:8080`). Audio and optional
-   cleanup text are processed on that server and its configured providers.
-3. Enter a bearer token if required and save it. Tokens are stored in Keychain,
-   scoped to the server origin; they are never in settings files or snapshots.
+2. Use **On this Mac** for the bundled engine. Automatic local presets prefer ready
+   Apple speech; use **Download Whisper Tiny…** when Apple speech is unavailable.
+   For another server, select **External Antfly server** and enter its HTTP(S) origin.
+3. For an external server only, enter a bearer token if required and save it.
+   Tokens are stored in Keychain, scoped to the server origin; they are never in
+   settings files or snapshots. Bundled mode manages its own credentials.
 4. Discover models. Named transcribers include provider facts, live-preview
    support, and native Apple availability/installed locales in the catalog.
 5. Import `presets/apple.json` or `presets/whisper.json`, or edit the presets.
@@ -86,7 +107,9 @@ hints and decoding options on the recognition stage.
 
 Official downloads are Apple Silicon only and include a pinned, released Antfly runtime. New installations use **On this Mac** by default. In Settings, explicitly
 download Whisper Tiny, or use native Apple speech and cleanup on macOS 26+
-when the required assets and Apple Intelligence are ready. The bundled rc.13
+when the required assets and Apple Intelligence are ready. Automatic local presets
+prefer ready Apple speech and otherwise use Whisper; explicit transcriber choices
+are preserved. The bundled rc.13
 runtime includes the Apple bridge. The app handles startup,
 authentication, model discovery, and shutdown. No separate server install is needed.
 Existing configurations keep their chosen external server. See [updates and

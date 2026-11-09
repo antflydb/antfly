@@ -160,7 +160,8 @@ struct SettingsView: View {
           ) {
             Text("On this Mac (bundled Antfly)").tag(ConnectionMode.managed)
             Text("External Antfly server").tag(ConnectionMode.external)
-          }.onChange(of: store.config.connectionMode) { _, _ in store.runtimeModeChanged() }
+          }.disabled(store.state != .idle || store.working || store.historyWorking)
+            .onChange(of: store.config.connectionMode) { _, _ in store.runtimeModeChanged() }
           if store.config.usesManagedRuntime {
             RuntimeControls(store: store, runtime: store.runtime)
           } else {
@@ -275,7 +276,7 @@ struct SettingsView: View {
                 ForEach(ProcessingStrategy.allCases, id: \.self) { Text($0.label).tag($0) }
               }
               Text(
-                "Automatic uses only advertised capabilities. Incremental requires final recognition segments; Rewrite needs the complete utterance. The selected engine never changes automatically."
+                "Automatic processing uses advertised capabilities. Incremental requires final recognition segments; Rewrite needs the complete utterance. Explicit transcriber selections are preserved."
               ).font(.caption)
               TextField(
                 "Transcriber model or alias",
@@ -283,9 +284,17 @@ struct SettingsView: View {
                   get: { preset.model },
                   set: {
                     preset.model = $0
+                    preset.automaticallySelectLocalTranscriber = false
                     preset.transcriberRoute = nil
                   }))
               Menu("Choose discovered transcriber") {
+                if store.config.usesManagedRuntime {
+                  Button("Automatic (Apple when ready, otherwise Whisper)") {
+                    preset.automaticallySelectLocalTranscriber = true
+                    preset.model = "transcribers/whisper"
+                    store.refreshModels()
+                  }
+                }
                 ForEach(store.models.filter { $0.task == "transcribe" }) { model in
                   Button("\(model.id) · \(model.executorName)") {
                     preset.selectTranscriber(model)
@@ -424,7 +433,7 @@ private struct RuntimeControls: View {
       Button("Open engine log") { NSWorkspace.shared.open(runtime.logURL) }
     }
     Text(
-      "Whisper requires a model download. This released runtime does not include native Apple providers; an external server can provide them. No cleanup model is selected automatically."
+      "Apple speech is selected automatically when available. Otherwise, download Whisper Tiny. Apple speech requires macOS 26+ and installed language assets. No cleanup model is selected automatically."
     ).font(.caption)
   }
 }

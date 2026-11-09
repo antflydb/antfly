@@ -14,6 +14,7 @@ public actor AntflyClient {
     maxConcurrentRequests: Int = 1
   ) throws {
     var config = Configuration()
+    config.connectionMode = .external
     config.server = server
     config.concurrentRequests = maxConcurrentRequests
     try self.init(
@@ -25,7 +26,7 @@ public actor AntflyClient {
   ) throws {
     let config = try configuration.validated()
     inferenceGate = InferenceGate(capacity: config.concurrentRequests ?? 1)
-    origin = URL(string: config.server)!
+    origin = URL(string: config.effectiveServer)!
     self.token = token
     self.basicPassword = basicPassword
     let settings = URLSessionConfiguration.ephemeral

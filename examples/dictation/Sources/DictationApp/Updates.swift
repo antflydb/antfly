@@ -162,7 +162,7 @@ struct UpdateSettings: View {
         .disabled(!updates.enabled)
       Toggle("Include beta releases", isOn: $updates.includeBeta).disabled(!updates.enabled)
       Text(updates.status).font(.caption).foregroundStyle(.secondary)
-      Text("The Antfly server and models are managed separately. App updates do not replace them.")
+      Text("App updates include the bundled Antfly engine. Downloaded models, local server data, and external servers are preserved.")
         .font(.caption).foregroundStyle(.secondary)
     }
   }

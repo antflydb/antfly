@@ -18,9 +18,10 @@ import Security
       let data = try? Data(contentsOf: root.appendingPathComponent("Runtime/release.json")),
       let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     else { return false }
-    return metadata["apple_providers"] as? Bool == true
+    if #available(macOS 26, *) { return metadata["apple_providers"] as? Bool == true }
+    return false
   }
-  nonisolated static let origin = "http://127.0.0.1:47831"
+  nonisolated static let origin = Configuration.managedServerOrigin
   @Published private(set) var status = "Local engine stopped."
   @Published private(set) var ready = false
   @Published private(set) var busy = false
@@ -159,7 +160,7 @@ import Security
             (response as? HTTPURLResponse)?.statusCode == 200, child.isRunning
           {
             ready = true
-            status = "Local engine ready. Download Whisper to start, or discover installed models."
+            status = "Local engine ready. Discover models to check recognition and cleanup readiness."
             changed?()
             return
           }

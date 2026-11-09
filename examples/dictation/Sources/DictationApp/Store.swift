@@ -252,7 +252,7 @@ import SwiftUI
         await self.restoreHistoryDestinations(legacyDestination: legacyDestination, epoch: epoch)
       }
     }
-    if registerHotkey { loadCredential(for: config.server) }
+    if registerHotkey, !config.usesManagedRuntime { loadCredential(for: config.server) }
     hotkey?.changed = { [weak self] down in self?.shortcut(down: down) }
     hotkey?.interrupted = { [weak self] in if self?.state != .idle { self?.cancel() } }
     if registerHotkey {
@@ -392,10 +392,14 @@ import SwiftUI
       historyRevision += 1
     }
     // Unloaded credentials are different from a token explicitly cleared by the user.
-    if credentialOrigin != config.server && !credentialEdited { loadCredential(for: config.server) }
-    try credentialWriter(token, config.server)
-    credentialOrigin = config.server
-    credentialEdited = false
+    if !config.usesManagedRuntime {
+      if credentialOrigin != config.server && !credentialEdited {
+        loadCredential(for: config.server)
+      }
+      try credentialWriter(token, config.server)
+      credentialOrigin = config.server
+      credentialEdited = false
+    }
     try write(JSONEncoder().encode(config), to: settingsFile)
     var shortcutIssue: String?
     do { try registerShortcut() } catch {
@@ -859,7 +863,9 @@ import SwiftUI
         try Task.checkCancellation()
         guard let self, discoveryGeneration == revision else { return }
         _ = try snapshot.validated()
-        if loadCredentials && credentialOrigin != snapshot.server && !credentialEdited {
+        if loadCredentials && !snapshot.usesManagedRuntime
+          && credentialOrigin != snapshot.server && !credentialEdited
+        {
           loadCredential(for: snapshot.server)
         }
         let data = try await client(snapshot, token: token).models()
@@ -867,6 +873,10 @@ import SwiftUI
         let catalog = try JSONDecoder().decode(ModelCatalog.self, from: Data(data.utf8))
         guard discoveryGeneration == revision else { return }
         models = catalog.data
+        if state == .idle, !working {
+          config.selectAvailableManagedTranscriber(
+            from: catalog, supportsApple: runtime.supportsAppleSpeech)
+        }
       } catch { /* Explicit Discover models surfaces connection/readiness errors. */  }
     }
   }
@@ -916,6 +926,7 @@ import SwiftUI
       try await self.runtime.installWhisper()
       try Task.checkCancellation()
       for index in self.config.presets.indices {
+        self.config.presets[index].automaticallySelectLocalTranscriber = false
         self.config.presets[index].model = "transcribers/whisper"
         self.config.presets[index].transcriberRoute = .gateway
         self.config.presets[index].cleanupModel = ""
@@ -933,6 +944,7 @@ import SwiftUI
       try await self.runtime.enableAppleAssets()
       try Task.checkCancellation()
       for index in self.config.presets.indices {
+        self.config.presets[index].automaticallySelectLocalTranscriber = false
         self.config.presets[index].model = "transcribers/apple-speech"
         self.config.presets[index].transcriberRoute = .gateway
         self.config.presets[index].cleanupModel = ""
@@ -1077,8 +1089,10 @@ import SwiftUI
     discoveryGeneration = UUID()
     run {
       self.discovery = try await self.client(token: self.token).models()
-      self.models = try JSONDecoder().decode(ModelCatalog.self, from: Data(self.discovery.utf8))
-        .data
+      let catalog = try JSONDecoder().decode(ModelCatalog.self, from: Data(self.discovery.utf8))
+      self.models = catalog.data
+      self.config.selectAvailableManagedTranscriber(
+        from: catalog, supportsApple: self.runtime.supportsAppleSpeech)
       self.message =
         "Models discovered. Apple native status and installed locales are included below; transcription checks the requested locale."
     }
@@ -1107,7 +1121,7 @@ import SwiftUI
       incoming.table = current.table
       incoming.profile = current.profile
       self.config = incoming
-      self.loadCredential(for: incoming.server)
+      if !incoming.usesManagedRuntime { self.loadCredential(for: incoming.server) }
       _ = try self.persistSettings()
       self.message = "Settings replaced from Antfly."
     }
@@ -1142,7 +1156,8 @@ import SwiftUI
     else { return nil }
     var entry = original
     entry.destination =
-      entry.destination ?? HistoryDestination(server: snapshot.server, table: snapshot.table)
+      entry.destination
+      ?? HistoryDestination(server: snapshot.effectiveServer, table: snapshot.table)
     let bounded = HistoryArchive.bounded([entry] + history)
     guard bounded.contains(where: { $0.id == entry.id }) else {
       historyPersistenceWarning =
@@ -1231,7 +1246,7 @@ import SwiftUI
           try await outbox.enqueue(
             entry,
             destination: entry.destination
-              ?? HistoryDestination(server: snapshot.server, table: snapshot.table))
+              ?? HistoryDestination(server: snapshot.effectiveServer, table: snapshot.table))
         }
         guard self.historyEpoch == epoch, self.config.retainHistory else { return }
         self.historyPersistenceWarning = nil
@@ -1284,7 +1299,8 @@ import SwiftUI
           var destinations = held.destinations[entry.id] ?? []
           if let original = entry.destination { destinations.insert(original) }
           if destinations.isEmpty {
-            destinations.insert(HistoryDestination(server: snapshot.server, table: snapshot.table))
+            destinations.insert(
+              HistoryDestination(server: snapshot.effectiveServer, table: snapshot.table))
           }
           for destination in destinations { groups[destination, default: []].insert(entry.id) }
         }
@@ -1467,7 +1483,7 @@ import SwiftUI
       perform {
         let imported = try Configuration.decode(Data(contentsOf: url))
         self.config = imported
-        self.loadCredential(for: imported.server)
+        if !imported.usesManagedRuntime { self.loadCredential(for: imported.server) }
         _ = try self.persistSettings()
         self.message = "Settings imported."
       }
