@@ -43,6 +43,12 @@ func TestKnowledgeAdmissionAndIdentity(t *testing.T) {
 	require.NoError(t, ValidateKnowledgeProcessing(&k, &plan, "research"))
 	require.Error(t, ValidateKnowledgeProcessing(nil, &plan, "research"))
 	entity := k.Entities[0]
+	collision := entity
+	collision.Name = "overlapping"
+	collision.Namespace += "nested/"
+	k.Entities = append(k.Entities, collision)
+	require.Error(t, ValidateKnowledge(&k, "research"))
+	k.Entities = k.Entities[:1]
 	key := entity.Namespace + "person/alice"
 	join, err := EntityJoinKey("instance-one", entity, key)
 	require.NoError(t, err)
@@ -71,7 +77,14 @@ func TestKnowledgeAdmissionAndIdentity(t *testing.T) {
 	require.Error(t, ValidateKnowledgeProcessing(&k, &plan, "research"))
 	delete(resolver, "aliases")
 	source := plan.Indexes[0].Config["sources"].([]any)[0].(map[string]any)
-	delete(source["edge"].(map[string]any)["metadata"].(map[string]any), "source_id")
+	edge := source["edge"].(map[string]any)
+	for _, id := range []any{nil, "", "{{ _item_index }}", "{{ @index }}"} {
+		edge["edge_id"] = id
+		require.Error(t, ValidateKnowledgeProcessing(&k, &plan, "research"))
+	}
+	edge["edge_id"] = "{{ _item.id }}"
+	require.NoError(t, ValidateKnowledgeProcessing(&k, &plan, "research"))
+	delete(edge["metadata"].(map[string]any), "source_id")
 	require.Error(t, ValidateKnowledgeProcessing(&k, &plan, "research"))
 }
 func TestKnowledgeQueryScopeTimeAndBudgets(t *testing.T) {

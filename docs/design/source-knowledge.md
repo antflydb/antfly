@@ -78,7 +78,7 @@ Graph bindings must name exactly their installed artifact source set. Every sour
 
 For resolver-backed relations, use native endpoint resolution without `_item.source`/`_item.target` string templates: those templates can stringify a local mention object instead of selecting its canonical identity. Explicit endpoint templates are for already identified document/external endpoints.
 
-Native `owner_document`, artifact/member identity and stable per-item `edge_id` distinguish independently supported claims, even between identical endpoints. A native graph source using an explicit logical source endpoint must provide a stable edge ID. The builder preserves supplied edge mappings and adds parent provenance; it does not derive IDs from incidental array order. Native deletion/empty-output retirement retracts the producing document's contribution without erasing other owners' claims. Artifact evidence can be inspected through existing native document/artifact APIs under current access.
+Native `owner_document`, artifact/member identity and stable per-item `edge_id` distinguish independently supported claims, even between identical endpoints. Every portable graph source must map a stable member edge ID; the builder defaults to `{{ _item.id }}` and inputs must provide that stable ID. The builder preserves supplied edge mappings and adds parent provenance; it does not derive IDs from incidental array order. Native deletion/empty-output retirement retracts the producing document's contribution without erasing other owners' claims. Artifact evidence can be inspected through existing native document/artifact APIs under current access.
 
 `native_intervals_v1` names the existing four relationship metadata fields:
 

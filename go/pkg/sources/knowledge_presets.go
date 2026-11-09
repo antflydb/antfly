@@ -97,6 +97,9 @@ func BuildKnowledgeProcessing(p KnowledgePreset) (ProcessingDeclaration, Knowled
 		edge = map[string]any{}
 		source["edge"] = edge
 	}
+	if _, ok := edge["edge_id"]; !ok {
+		edge["edge_id"] = "{{ _item.id }}"
+	}
 	metadata, _ := edge["metadata"].(map[string]any)
 	if metadata == nil {
 		metadata = map[string]any{}

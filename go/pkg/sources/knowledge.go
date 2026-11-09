@@ -66,8 +66,14 @@ func ValidateKnowledge(k *KnowledgeDeclaration, audience string) error {
 		if entities[e.Name] || namespaces[e.Table+"\x00"+e.Namespace] || !strings.HasSuffix(e.Namespace, "/") || strings.ContainsAny(e.Namespace, "{}") {
 			return fmt.Errorf("entity names and namespaces must be distinct stable prefixes")
 		}
+		identityPrefix := e.Table + "\x00" + e.Namespace
+		for existing := range namespaces {
+			if strings.HasPrefix(existing, identityPrefix) || strings.HasPrefix(identityPrefix, existing) {
+				return fmt.Errorf("entity namespaces must not overlap within a table")
+			}
+		}
 		entities[e.Name] = true
-		namespaces[e.Table+"\x00"+e.Namespace] = true
+		namespaces[identityPrefix] = true
 	}
 	graphs := map[string]bool{}
 	for _, g := range k.Graphs {
@@ -169,8 +175,9 @@ func checkGraphBinding(g GraphBinding, cfg map[string]any) error {
 		}
 		seen[a] = true
 		edge, _ := s["edge"].(map[string]any)
-		if id, ok := edge["edge_id"].(string); ok && (strings.Contains(id, "_item_index") || strings.Contains(id, "@index")) {
-			return fmt.Errorf("relationship identity cannot depend on array order")
+		id, ok := edge["edge_id"].(string)
+		if !ok || strings.TrimSpace(id) == "" || strings.Contains(id, "_item_index") || strings.Contains(id, "@index") {
+			return fmt.Errorf("relationship requires stable member identity independent of array order")
 		}
 		metadata, _ := edge["metadata"].(map[string]any)
 		if metadata["source_id"] != "{{ _doc.value.source.id }}" || metadata["parent_revision"] != "{{ _doc.value.source.revision }}" {

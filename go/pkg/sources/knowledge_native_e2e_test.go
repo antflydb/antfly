@@ -154,4 +154,19 @@ func TestNativeSourceKnowledge(t *testing.T) {
 		raw, err = p.QueryKnowledge(ctx, resolvedBinding, resolvedRequest, "research")
 		return err == nil && strings.Contains(string(raw), "employment") && strings.Contains(string(raw), "resolved-claim") && strings.Contains(string(raw), resolvedKnowledge.Entities[0].Namespace+"organization/acme")
 	}, 60*time.Second, 100*time.Millisecond)
+	resolvedResources, err := EntityResources(resolvedBinding, "resolved")
+	require.NoError(t, err)
+	canonical := resolvedRequest.Start[0]
+	_, err = p.call(ctx, "POST", resolvedResources["suppressions"], map[string]any{"keys": []string{canonical}, "actor": "source-knowledge-fixture", "reason": "withdraw resolved evidence"})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		raw, err = p.QueryKnowledge(ctx, resolvedBinding, resolvedRequest, "research")
+		return err == nil && !strings.Contains(string(raw), "employment")
+	}, 30*time.Second, 100*time.Millisecond)
+	_, err = p.call(ctx, "DELETE", resolvedResources["suppressions"]+"/"+url.PathEscape(canonical), map[string]any{"actor": "source-knowledge-fixture", "reason": "restore admitted evidence"})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		raw, err = p.QueryKnowledge(ctx, resolvedBinding, resolvedRequest, "research")
+		return err == nil && strings.Contains(string(raw), "employment")
+	}, 30*time.Second, 100*time.Millisecond)
 }
