@@ -38,7 +38,6 @@ const Allocator = std.mem.Allocator;
 const leann = @import("antfly_vectorindex").leann;
 const search_results = @import("antfly_vectorindex").search_results;
 const search_types = @import("antfly_vectorindex").search_types;
-const platform_time = @import("antfly_platform").time;
 const lsm_backend = @import("lsm_backend/mod.zig");
 const vec = @import("antfly_vector").vector;
 const replicated_mod = @import("leann_replicated.zig");
@@ -92,6 +91,7 @@ pub const VectorLoader = struct {
     /// Optional batch form: fills `out[i * dims ..]` and `found[i]` for each
     /// id. Entries with empty metadata are skipped (left not found).
     load_batch: ?*const fn (ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool) anyerror!void = null,
+    load_batch_timed: ?*const fn (ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool, reembed_ns: *u64) anyerror!void = null,
 };
 
 const Node = struct {
@@ -307,7 +307,7 @@ pub const LeannStore = struct {
 
     pub fn setLoader(self: *LeannStore, loader: VectorLoader) void {
         self.loader = loader;
-        if (self.replicated) |state| state.loader = .{ .ctx = loader.ctx, .load = loader.load, .load_batch = loader.load_batch };
+        if (self.replicated) |state| state.loader = .{ .ctx = loader.ctx, .load = loader.load, .load_batch = loader.load_batch, .load_batch_timed = loader.load_batch_timed };
     }
 
     pub fn isReplicated(self: *const LeannStore) bool {
@@ -659,9 +659,9 @@ pub const LeannStore = struct {
         // can only be checked afterwards, so they over-fetch, widening until
         // k results pass or the whole graph has been considered.
         var want: usize = if (filter.distanceActive()) @max(req.k * 4, req.k + 64) else req.k;
-        var ctx = SourceCtx{ .store = self, .far_from = req.query };
+        var gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
+        var ctx = SourceCtx{ .store = self, .far_from = req.query, .reembed_ns = &gate.reembed_ns };
         const node_filter = NodeFilter{ .store = self, .filter = &filter };
-        const gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
         while (true) {
             want = @min(want, live);
             var resp = try index.search(alloc, ctx.source(), req.query, .{
@@ -735,6 +735,7 @@ pub const LeannStore = struct {
     const SourceCtx = struct {
         store: *LeannStore,
         far_from: []const f32,
+        reembed_ns: ?*u64 = null,
 
         fn source(self: *SourceCtx) leann.EmbeddingSource {
             return .{ .ctx = self, .recompute_fn = recompute };
@@ -745,7 +746,7 @@ pub const LeannStore = struct {
             const store = self.store;
             const d: usize = store.opts.dims;
             const loader = store.loader orelse return error.MissingVectorLoader;
-            if (loader.load_batch) |load_batch| {
+            if (loader.load_batch != null or loader.load_batch_timed != null) {
                 const vector_ids = try store.alloc.alloc(u64, ids.len);
                 defer store.alloc.free(vector_ids);
                 const metas = try store.alloc.alloc([]const u8, ids.len);
@@ -758,7 +759,10 @@ pub const LeannStore = struct {
                     m.* = if (store.index.?.isDeleted(id)) "" else node.metadata;
                 }
                 @memset(found, false);
-                try load_batch(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found);
+                var ignored_ns: u64 = 0;
+                if (loader.load_batch_timed) |timed| {
+                    try timed(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found, self.reembed_ns orelse &ignored_ns);
+                } else try loader.load_batch.?(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found);
                 for (found, 0..) |ok, i| if (!ok) for (out[i * d ..][0..d], self.far_from) |*o, x| {
                     o.* = -1000 * x;
                 };
@@ -1087,29 +1091,35 @@ pub const ReembedCache = struct {
 /// the remaining candidates by estimate.
 pub const SearchGate = struct {
     cancellation: ?search_types.CancellationToken,
-    deadline_ns: ?u64,
+    budget_ns: u64,
+    reembed_ns: u64 = 0,
 
     pub fn init(req: search_types.SearchRequest, budget_ms: u32) SearchGate {
         return .{
             .cancellation = req.cancellation,
-            .deadline_ns = if (budget_ms > 0) platform_time.monotonicNs() + @as(u64, budget_ms) * std.time.ns_per_ms else null,
+            .budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms,
         };
     }
 
     pub fn recomputeGate(self: *const SearchGate) ?leann.RecomputeGate {
-        if (self.cancellation == null and self.deadline_ns == null) return null;
-        return .{ .ctx = self, .check_fn = check };
+        if (self.cancellation == null and self.budget_ns == 0) return null;
+        return .{ .ctx = self, .check_fn = check, .cancel_fn = checkCancellation };
+    }
+
+    fn checkCancellation(raw: *const anyopaque) anyerror!void {
+        const self: *const SearchGate = @ptrCast(@alignCast(raw));
+        if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
     }
 
     fn check(raw: *const anyopaque) anyerror!bool {
         const self: *const SearchGate = @ptrCast(@alignCast(raw));
-        if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
-        if (self.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return false;
+        try checkCancellation(raw);
+        if (self.budget_ns != 0 and self.reembed_ns >= self.budget_ns) return false;
         return true;
     }
 };
 
-const Filter = struct {
+pub const Filter = struct {
     allowed: std.AutoHashMapUnmanaged(u64, void) = .empty,
     excluded: std.AutoHashMapUnmanaged(u64, void) = .empty,
     has_allowed: bool,
@@ -1118,7 +1128,7 @@ const Filter = struct {
     over: ?f32,
     under: ?f32,
 
-    fn init(alloc: Allocator, req: search_types.SearchRequest) !Filter {
+    pub fn init(alloc: Allocator, req: search_types.SearchRequest) !Filter {
         var self = Filter{
             .has_allowed = req.filter_ids.len > 0,
             .key_predicate = req.key_predicate,
@@ -1132,22 +1142,22 @@ const Filter = struct {
         return self;
     }
 
-    fn deinit(self: *Filter, alloc: Allocator) void {
+    pub fn deinit(self: *Filter, alloc: Allocator) void {
         self.allowed.deinit(alloc);
         self.excluded.deinit(alloc);
     }
 
     /// Filters on the node itself (id, key, prefix), applied in the walk.
-    fn nodeActive(self: *const Filter) bool {
+    pub fn nodeActive(self: *const Filter) bool {
         return self.has_allowed or self.excluded.count() > 0 or self.key_predicate != null or
             self.prefix.len > 0;
     }
 
-    fn distanceActive(self: *const Filter) bool {
+    pub fn distanceActive(self: *const Filter) bool {
         return self.over != null or self.under != null;
     }
 
-    fn allows(self: *const Filter, vector_id: u64, metadata: []const u8) !bool {
+    pub fn allows(self: *const Filter, vector_id: u64, metadata: []const u8) !bool {
         if (self.has_allowed and !self.allowed.contains(vector_id)) return false;
         if (self.excluded.contains(vector_id)) return false;
         if (self.prefix.len > 0 and !std.mem.startsWith(u8, metadata, self.prefix)) return false;
@@ -1155,7 +1165,7 @@ const Filter = struct {
         return true;
     }
 
-    fn distanceAllowed(self: *const Filter, dist: f32) bool {
+    pub fn distanceAllowed(self: *const Filter, dist: f32) bool {
         if (self.over) |t| if (!(dist > t)) return false;
         if (self.under) |t| if (!(dist < t)) return false;
         return true;
@@ -1246,6 +1256,54 @@ fn addAll(alloc: Allocator, store: *LeannStore, data: []const f32, dims: usize, 
         });
     }
     try store.apply(items.items, &.{});
+}
+
+test "leann search budget counts reembedding time only" {
+    var gate = SearchGate.init(.{ .query = &.{}, .k = 1 }, 10);
+    try testing.expect(try leann.RecomputeGate.open(gate.recomputeGate()));
+    gate.reembed_ns = 9 * std.time.ns_per_ms;
+    try testing.expect(try leann.RecomputeGate.open(gate.recomputeGate()));
+    gate.reembed_ns = 10 * std.time.ns_per_ms;
+    try testing.expect(!try leann.RecomputeGate.open(gate.recomputeGate()));
+}
+
+test "leann search forwards reembedding time from batch loader" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir);
+    const dims = 16;
+    const data = try testData(alloc, 300, dims);
+    defer alloc.free(data);
+    const Timed = struct {
+        vectors: TestVectors,
+        calls: usize = 0,
+        fn load(ctx: *anyopaque, a: Allocator, id: u64, meta: []const u8) anyerror![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return TestVectors.load(&self.vectors, a, id, meta);
+        }
+        fn batch(ctx: *anyopaque, _: Allocator, ids: []const u64, _: []const []const u8, out: []f32, found: []bool, elapsed: *u64) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            elapsed.* += 10 * std.time.ns_per_ms;
+            for (ids, 0..) |id, i| {
+                const start = @as(usize, @intCast(id)) * dims;
+                @memcpy(out[i * dims ..][0..dims], self.vectors.data[start..][0..dims]);
+                found[i] = true;
+            }
+        }
+    };
+    var source = Timed{ .vectors = .{ .data = data, .dims = dims } };
+    var store = try LeannStore.open(alloc, testing.io, dir, .{ .dims = dims, .metric = .l2_squared, .transient = true, .reembed_budget_ms = 10, .batch_size = 1 });
+    defer store.deinit();
+    store.setLoader(.{ .ctx = &source, .load = Timed.load, .load_batch_timed = Timed.batch });
+    try addAll(alloc, store, data, dims, 0, 300);
+    source.calls = 0;
+    var result = try store.search(alloc, .{ .query = data[0..dims], .k = 50 });
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), source.calls);
+    try testing.expectEqual(@as(usize, 50), result.items.items.len);
 }
 
 test "leann reembed cache: hits by digest, misses on a new digest, evicts least recent" {

@@ -205,6 +205,11 @@ pub const Filter = struct {
 pub const RecomputeGate = struct {
     ctx: *const anyopaque,
     check_fn: *const fn (ctx: *const anyopaque) anyerror!bool,
+    cancel_fn: ?*const fn (ctx: *const anyopaque) anyerror!void = null,
+
+    pub fn checkCancellation(gate: ?RecomputeGate) !void {
+        if (gate) |g| if (g.cancel_fn) |f| try f(g.ctx);
+    }
 
     pub fn open(gate: ?RecomputeGate) !bool {
         const g = gate orelse return true;
@@ -743,7 +748,10 @@ pub const Index = struct {
         defer found.deinit(alloc);
         switch (rerank) {
             .bounds => try self.boundedSearch(alloc, source, q, &approx, start, eff, &found, &stats),
-            else => try self.twoLevelSearch(alloc, source, q, &approx, start, eff, &found, &stats),
+            else => if (eff.filter != null)
+                try self.boundedSearch(alloc, source, q, &approx, start, eff, &found, &stats)
+            else
+                try self.twoLevelSearch(alloc, source, q, &approx, start, eff, &found, &stats),
         }
 
         var out = std.ArrayListUnmanaged(Result).empty;
@@ -767,6 +775,7 @@ pub const Index = struct {
         scale: f32,
         pool: anytype,
         stats: *SearchStats,
+        gate: ?RecomputeGate,
     ) !void {
         var chunk = std.ArrayListUnmanaged(u32).empty;
         defer chunk.deinit(alloc);
@@ -774,13 +783,14 @@ pub const Index = struct {
         while (next < self.node_count) {
             chunk.clearRetainingCapacity();
             while (next < self.node_count and chunk.items.len < 1024) : (next += 1) {
+                if (next % 256 == 0) try RecomputeGate.checkCancellation(gate);
                 if (visited.isSet(next) or self.isDeleted(next)) continue;
                 visited.set(next);
                 if (try filter.allows(next)) try chunk.append(alloc, next);
             }
             const ests = try approx.score(chunk.items);
             stats.approx_evaluated += @intCast(chunk.items.len);
-            for (chunk.items, ests) |id, e| try pool.append(alloc, .{ .id = id, .lower = e.dist - scale * e.bound, .est = e.dist });
+            for (chunk.items, ests) |id, e| try pool.append(alloc, .{ .id = id, .lower = if (self.rabitq == null and !self.upper_vectors.contains(id)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
         }
     }
 
@@ -794,6 +804,7 @@ pub const Index = struct {
         visited: *std.DynamicBitSetUnmanaged,
         queue: anytype,
         stats: *SearchStats,
+        gate: ?RecomputeGate,
     ) !void {
         var chunk = std.ArrayListUnmanaged(u32).empty;
         defer chunk.deinit(alloc);
@@ -801,6 +812,7 @@ pub const Index = struct {
         while (next < self.node_count) {
             chunk.clearRetainingCapacity();
             while (next < self.node_count and chunk.items.len < 1024) : (next += 1) {
+                if (next % 256 == 0) try RecomputeGate.checkCancellation(gate);
                 if (visited.isSet(next) or self.isDeleted(next)) continue;
                 visited.set(next);
                 if (try filter.allows(next)) try chunk.append(alloc, next);
@@ -1408,7 +1420,7 @@ pub const Index = struct {
         const first = try approx.scoreOne(start);
         visited.set(start);
         if (try allowedNode(opts.filter, start)) {
-            try pool.append(alloc, .{ .id = start, .lower = first.dist - scale * first.bound, .est = first.dist });
+            try pool.append(alloc, .{ .id = start, .lower = if (self.rabitq == null and !self.upper_vectors.contains(start)) -std.math.inf(f32) else first.dist - scale * first.bound, .est = first.dist });
             try beam.push(alloc, .{ .dist = first.dist, .id = start });
         }
         try candidates.push(alloc, .{ .dist = first.dist, .id = start });
@@ -1419,6 +1431,7 @@ pub const Index = struct {
         // scores what is still unvisited (codes only, no embeddings).
         var reseeded = false;
         walk: while (true) {
+            if (stats.expanded % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
             if (candidates.len() == 0) {
                 if (opts.filter == null or beam.len() >= ef) break :walk;
                 if (!reseeded) {
@@ -1428,14 +1441,14 @@ pub const Index = struct {
                         const e = try approx.scoreOne(self.entry);
                         stats.approx_evaluated += 1;
                         if (try allowedNode(opts.filter, self.entry)) {
-                            try pool.append(alloc, .{ .id = self.entry, .lower = e.dist - scale * e.bound, .est = e.dist });
+                            try pool.append(alloc, .{ .id = self.entry, .lower = if (self.rabitq == null and !self.upper_vectors.contains(self.entry)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
                             if (beam.len() < ef) try beam.push(alloc, .{ .dist = e.dist, .id = self.entry });
                         }
                         try candidates.push(alloc, .{ .dist = e.dist, .id = self.entry });
                         continue :walk;
                     }
                 }
-                try self.scoreUnvisitedAllowed(alloc, approx, opts.filter.?, &visited, scale, &pool, stats);
+                try self.scoreUnvisitedAllowed(alloc, approx, opts.filter.?, &visited, scale, &pool, stats, opts.gate);
                 break :walk;
             }
             const c = candidates.pop();
@@ -1453,7 +1466,7 @@ pub const Index = struct {
                 const nc = Cand{ .dist = e.dist, .id = nb };
                 const allowed = try allowedNode(opts.filter, nb);
                 // Every allowed estimate joins the pool, as without a filter.
-                if (allowed) try pool.append(alloc, .{ .id = nb, .lower = e.dist - scale * e.bound, .est = e.dist });
+                if (allowed) try pool.append(alloc, .{ .id = nb, .lower = if (self.rabitq == null and !self.upper_vectors.contains(nb)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
                 if (beam.len() >= ef and nc.dist >= beam.top().dist) continue;
                 if (allowed) {
                     if (beam.len() < ef) {
@@ -1462,6 +1475,18 @@ pub const Index = struct {
                 }
                 try candidates.push(alloc, nc);
             }
+        }
+
+        // PQ has no admissible bounds. Rerank the best estimated beam rather
+        // than every allowed node encountered during a selective walk.
+        if (self.rabitq == null and pool.items.len > ef) {
+            const ByEstimate = struct {
+                fn lessThan(_: void, a: Pooled, b: Pooled) bool {
+                    return a.est < b.est or (a.est == b.est and a.id < b.id);
+                }
+            };
+            std.mem.sortUnstable(Pooled, pool.items, {}, ByEstimate.lessThan);
+            pool.items.len = ef;
         }
 
         const ByLower = struct {
@@ -1624,6 +1649,7 @@ pub const Index = struct {
         try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter, opts.gate, &stopped);
 
         while (!stopped) {
+            if (stats.expanded % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
             if (exact_queue.len() == 0) {
                 if (pending.items.len > 0) {
                     try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats, opts.filter, opts.gate, &stopped);
@@ -1648,7 +1674,7 @@ pub const Index = struct {
                     }
                     if (queued_unvisited) break;
                     queued_unvisited = true;
-                    try self.queueUnvisitedAllowed(alloc, approx, filter, &visited, &approx_queue, stats);
+                    try self.queueUnvisitedAllowed(alloc, approx, filter, &visited, &approx_queue, stats, opts.gate);
                     if (approx_queue.len() == 0) break;
                 }
                 try promote(alloc, &approx_queue, &pending, ratio);
@@ -3535,6 +3561,57 @@ test "leann: filtered search walks past rejected nodes to fill k allowed results
             return err;
         };
     }
+}
+
+test "leann: cancellation interrupts an empty filtered walk" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2000, 1, 16, 16, 49);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 16 };
+    var index = try Index.build(alloc, .{ .dims = 16, .quantizer = .rabitq, .max_degree = 16 }, fx.data);
+    defer index.deinit();
+    const State = struct {
+        count: usize = 0,
+        fn allows(raw: *const anyopaque, _: u32) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.count += 1;
+            return false;
+        }
+        fn open(_: *const anyopaque) anyerror!bool {
+            return true;
+        }
+        fn cancel(raw: *const anyopaque) anyerror!void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.count >= 256) return error.Cancelled;
+        }
+    };
+    var state = State{};
+    try testing.expectError(error.Cancelled, index.search(alloc, src.source(), fx.query(0), .{
+        .k = 1,
+        .filter = .{ .ctx = &state, .allows_fn = State.allows },
+        .gate = .{ .ctx = &state, .check_fn = State.open, .cancel_fn = State.cancel },
+    }));
+    try testing.expectEqual(@as(u64, 0), src.recomputed);
+}
+
+test "leann: pq filtered search reads only allowed vectors" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2000, 1, 16, 16, 50);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 16 };
+    var index = try Index.build(alloc, .{ .dims = 16, .quantizer = .pq, .max_degree = 16 }, fx.data);
+    defer index.deinit();
+    const One = struct {
+        fn allows(_: *const anyopaque, id: u32) anyerror!bool {
+            return id == 123;
+        }
+    };
+    const dummy: u8 = 0;
+    var result = try index.search(alloc, src.source(), fx.query(0), .{ .k = 1, .filter = .{ .ctx = &dummy, .allows_fn = One.allows } });
+    defer result.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), result.results.len);
+    try testing.expectEqual(@as(u32, 123), result.results[0].id);
+    try testing.expect(src.recomputed <= 1);
 }
 
 test "leann: sparse filter exhausts the graph without extra recomputes" {

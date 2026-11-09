@@ -38,6 +38,7 @@ const search_results = @import("antfly_vectorindex").search_results;
 const search_types = @import("antfly_vectorindex").search_types;
 const replica_mod = @import("leann_replica.zig");
 const SearchGate = @import("leann_store.zig").SearchGate;
+const RequestFilter = @import("leann_store.zig").Filter;
 
 pub const file_name = "leann.replica";
 const magic = "LEANNRST";
@@ -57,6 +58,7 @@ pub const VectorLoader = struct {
     load: *const fn (ctx: *anyopaque, alloc: Allocator, vector_id: u64, metadata: []const u8) anyerror![]f32,
     /// Optional batch form (see `leann_replica.VectorLoader.load_batch`).
     load_batch: ?*const fn (ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool) anyerror!void = null,
+    load_batch_timed: ?*const fn (ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool, reembed_ns: *u64) anyerror!void = null,
 };
 
 pub const Options = struct {
@@ -347,8 +349,9 @@ pub const ReplicatedState = struct {
                 if (set.contains(key)) return;
                 const owned = try state.alloc.dupe(u8, key);
                 errdefer state.alloc.free(owned);
-                try list.append(state.alloc, owned);
                 try set.put(state.alloc, owned, {});
+                errdefer _ = set.remove(owned);
+                try list.append(state.alloc, owned);
             }
         };
         var bound = self.bindings.keyIterator();
@@ -562,9 +565,10 @@ pub const ReplicatedState = struct {
     const KeyLoader = struct {
         state: *ReplicatedState,
         loader: VectorLoader,
+        reembed_ns: ?*u64 = null,
 
         fn keyLoader(self: *KeyLoader) replica_mod.VectorLoader {
-            return .{ .ctx = self, .load = load, .load_batch = if (self.loader.load_batch != null) loadBatch else null };
+            return .{ .ctx = self, .load = load, .load_batch = if (self.loader.load_batch != null or self.loader.load_batch_timed != null) loadBatch else null };
         }
 
         fn loadBatch(raw: *anyopaque, alloc: Allocator, keys: []const []const u8, out: []f32, found: []bool) anyerror!void {
@@ -580,7 +584,10 @@ pub const ReplicatedState = struct {
                 id.* = bound orelse 0;
                 m.* = if (bound == null) "" else k;
             }
-            try self.loader.load_batch.?(self.loader.ctx, alloc, ids, metas, out, found);
+            var ignored_ns: u64 = 0;
+            if (self.loader.load_batch_timed) |timed| {
+                try timed(self.loader.ctx, alloc, ids, metas, out, found, self.reembed_ns orelse &ignored_ns);
+            } else try self.loader.load_batch.?(self.loader.ctx, alloc, ids, metas, out, found);
         }
 
         fn load(raw: *anyopaque, alloc: Allocator, key: []const u8) anyerror![]f32 {
@@ -697,17 +704,18 @@ pub const ReplicatedState = struct {
         if (req.k == 0) return out;
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         const loader = self.loader orelse return error.MissingVectorLoader;
-        var ctx = KeyLoader{ .state = @constCast(self), .loader = loader };
-        const gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
+        var gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
+        var ctx = KeyLoader{ .state = @constCast(self), .loader = loader, .reembed_ns = &gate.reembed_ns };
         var want: u32 = @intCast(@max(req.k, 1));
         // Id, key and prefix filters go into the graph walk; only distance
         // bounds are applied afterwards, over an enlarged result set.
-        const key_filtered = req.filter_ids.len > 0 or req.exclude_ids.len > 0 or req.key_predicate != null or
-            req.filter_prefix.len > 0;
-        const filtered = req.distance_over != null or req.distance_under != null;
+        var filter = try RequestFilter.init(alloc, req);
+        defer filter.deinit(alloc);
+        const key_filtered = filter.nodeActive();
+        const filtered = filter.distanceActive();
         if (filtered) want = @intCast(@max(req.k * 4, req.k + 64));
         const live: u32 = @intCast(@max(self.replica.liveCount(), 1));
-        var key_filter = KeyRequestFilter{ .state = self, .req = &req };
+        var key_filter = KeyRequestFilter{ .state = self, .filter = &filter };
         while (true) {
             want = @min(want, live);
             const hits = try self.replica.search(alloc, req.query, want, .{
@@ -721,13 +729,13 @@ pub const ReplicatedState = struct {
             var passed: usize = 0;
             for (hits) |h| {
                 const vector_id = self.bindings.get(h.key) orelse continue;
-                if (!try allows(req, vector_id, h.key, h.distance, true)) continue;
+                if (!try filter.allows(vector_id, h.key) or !filter.distanceAllowed(h.distance)) continue;
                 passed += 1;
             }
             if (passed >= req.k or want >= live or !filtered) {
                 for (hits) |h| {
                     const vector_id = self.bindings.get(h.key) orelse continue;
-                    if (!try allows(req, vector_id, h.key, h.distance, true)) continue;
+                    if (!try filter.allows(vector_id, h.key) or !filter.distanceAllowed(h.distance)) continue;
                     out.addResultWithOwnedMetadata(vector_id, h.distance, 0, if (req.load_metadata) try alloc.dupe(u8, h.key) else null);
                 }
                 return out;
@@ -738,25 +746,14 @@ pub const ReplicatedState = struct {
 
     const KeyRequestFilter = struct {
         state: *const ReplicatedState,
-        req: *const search_types.SearchRequest,
+        filter: *const RequestFilter,
 
         fn allows(raw: *const anyopaque, key: []const u8) anyerror!bool {
             const self: *const KeyRequestFilter = @ptrCast(@alignCast(raw));
             const vector_id = self.state.bindings.get(key) orelse return false;
-            return ReplicatedState.allows(self.req.*, vector_id, key, 0, false);
+            return self.filter.allows(vector_id, key);
         }
     };
-
-    fn allows(req: search_types.SearchRequest, vector_id: u64, key: []const u8, dist: f32, check_distance: bool) !bool {
-        if (req.filter_ids.len > 0 and std.mem.indexOfScalar(u64, req.filter_ids, vector_id) == null) return false;
-        if (std.mem.indexOfScalar(u64, req.exclude_ids, vector_id) != null) return false;
-        if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, key, req.filter_prefix)) return false;
-        if (req.key_predicate) |p| if (!try p.allows(p.ptr, key)) return false;
-        if (!check_distance) return true;
-        if (req.distance_over) |t| if (!(dist > t)) return false;
-        if (req.distance_under) |t| if (!(dist < t)) return false;
-        return true;
-    }
 
     pub fn getMetadata(self: *const ReplicatedState, alloc: Allocator, vector_id: u64) !?[]u8 {
         const key = self.key_of.get(vector_id) orelse return null;
@@ -1105,6 +1102,23 @@ test "leann replicated state: a new replica catches up from the latest generatio
     try testing.expectEqualSlices(u8, a, b);
     // Everything indexed matches what the new replica saw: nothing pending.
     try testing.expectEqual(@as(u64, 0), fresh.stats().dirty);
+}
+
+test "leann replicated range drop releases keys on allocation failure" {
+    const Case = struct {
+        fn keep(_: *const u8, _: []const u8) bool {
+            return false;
+        }
+        fn run(alloc: Allocator) !void {
+            var state = try ReplicatedState.init(alloc, .{ .replica = .{ .config = .{ .dims = 8, .max_degree = 8 } } });
+            defer state.deinit();
+            try state.noteElided("doc:one", 1, 100);
+            try state.noteElided("doc:two", 2, 200);
+            const dummy: u8 = 0;
+            _ = try state.dropKeysWhere(&dummy, keep);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Case.run, .{});
 }
 
 test "leann replicated state: a new replica bootstraps from the first build's record" {

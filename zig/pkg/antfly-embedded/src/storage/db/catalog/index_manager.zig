@@ -24065,7 +24065,7 @@ pub const IndexManager = struct {
                     };
                     if (leann_store.loader) |base| {
                         var batched = base;
-                        batched.load_batch = loadDenseVectorsForLeann;
+                        batched.load_batch_timed = loadDenseVectorsForLeann;
                         leann_store.setLoader(batched);
                     }
                     // A replica that crashed between persisting records and
@@ -33433,7 +33433,7 @@ pub const IndexManager = struct {
 
     /// LEANN batch loader: reads stored vectors, then re-embeds every
     /// document whose vector was elided in one embedder call.
-    fn loadDenseVectorsForLeann(ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool) anyerror!void {
+    fn loadDenseVectorsForLeann(ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool, reembed_ns: *u64) anyerror!void {
         const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
         const manager = loader.manager;
         const store = manager.primary_store orelse return;
@@ -33496,7 +33496,11 @@ pub const IndexManager = struct {
         const ok = try alloc.alloc(bool, elided_keys.items.len);
         defer alloc.free(ok);
         @memset(ok, false);
-        try manager.reembedDenseDocuments(alloc, entry, elided_keys.items, vectors, ok);
+        {
+            const started = platform_time.monotonicNs();
+            defer reembed_ns.* +|= platform_time.monotonicNs() -| started;
+            try manager.reembedDenseDocuments(alloc, entry, elided_keys.items, vectors, ok);
+        }
         for (elided_slots.items, 0..) |slot, j| {
             if (!ok[j]) continue;
             const vector = vectors[j * d ..][0..d];

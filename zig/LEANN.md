@@ -131,13 +131,17 @@ suggests rebuilding once `deletedFraction()` passes about 5%.
 
 **Filtered search.** `SearchOptions.filter` restricts results to nodes it
 allows. Both walks still pass through rejected nodes to reach allowed ones,
-but only allowed nodes enter the beam, the results and (in `bounds` mode)
-the recompute pool, so a selective filter keeps walking until it holds `ef`
+but only allowed nodes enter the beam, the results and the recompute pool,
+so a selective filter keeps walking until it holds `ef`
 allowed candidates. Layer-0 edges are directed and reachability is only
 guaranteed from the entry point, so a walk that runs dry restarts there,
 then falls back to scoring the remaining unvisited allowed nodes from their
 codes (no embeddings). `LeannStore` and the replicated state pass id, key
-and prefix filters this way; only distance bounds still over-fetch.
+and prefix filters this way; only distance bounds still over-fetch. PQ filtered
+search walks using code estimates and scores allowed candidates exactly.
+Cancellation is checked during traversal and the fallback scan. The
+re-embedding budget counts time spent regenerating vectors, including
+re-chunking and source preparation, rather than graph or stored-vector reads.
 When fewer than `ef` live nodes pass a filter, this fallback can inspect all
 `node_count` nodes, so its worst-case CPU time is linear in the index size even
 when the result contains only one node. It does not re-embed rejected nodes.
