@@ -1384,11 +1384,15 @@ fn isRequestError(err: anyerror) bool {
 
 /// The run's deadline or the client's cancellation stopped the work; the
 /// same work can succeed when resumed.
-fn interruption(err: anyerror) bool {
+fn deadlineFailure(err: anyerror) bool {
     return switch (err) {
-        error.DeadlineExceeded, error.Timeout, error.Canceled, error.Cancelled, error.ResearchDeadlineExceeded, error.RequestDeadlineExceeded => true,
+        error.DeadlineExceeded, error.Timeout, error.ResearchDeadlineExceeded, error.RequestDeadlineExceeded => true,
         else => false,
     };
+}
+
+fn interruption(err: anyerror) bool {
+    return deadlineFailure(err) or err == error.Canceled or err == error.Cancelled;
 }
 
 /// Failures of the model call itself, as opposed to the request or data.
@@ -1728,16 +1732,18 @@ pub fn run(
             .verify => run_state.runVerify(),
             .done => unreachable,
         };
-        phase_result catch |err| switch (err) {
-            error.ResearchLlmBudgetExhausted => {
-                run_state.incomplete = .{ .reason = "max_llm_calls", .message = "the model-call budget was exhausted" };
-                break;
-            },
-            error.ResearchDeadlineExceeded, error.Timeout, error.DeadlineExceeded => {
+        phase_result catch |err| {
+            if (deadlineFailure(err)) {
                 run_state.incomplete = .{ .reason = "deadline", .message = "the wall-clock budget elapsed; resume with research_state" };
                 break;
-            },
-            else => return err,
+            }
+            switch (err) {
+                error.ResearchLlmBudgetExhausted => {
+                    run_state.incomplete = .{ .reason = "max_llm_calls", .message = "the model-call budget was exhausted" };
+                    break;
+                },
+                else => return err,
+            }
         };
         phases += 1;
         if (run_state.questions != null) {
@@ -1797,7 +1803,9 @@ pub fn execute(
     const result = run(arena, query_runner, generator, parsed, effective_sink, options) catch |err| {
         if (!stream) return err;
         if (effective_sink) |active| {
-            try active.emitValue(arena, "error", .{ .@"error" = @errorName(err) });
+            if (agent_context.failure(err)) |detail| {
+                try active.emitValue(arena, "error", detail.payload(err));
+            } else try active.emitValue(arena, "error", .{ .@"error" = @errorName(err) });
         }
         return .{ .content_type = "text/event-stream", .body = if (sink != null) try alloc.dupe(u8, "") else try alloc.dupe(u8, buffered.body.items) };
     };
@@ -2495,4 +2503,79 @@ test "research agent context compacts resumed evidence with independent summariz
     const event = result.value.context_management.?[0];
     try std.testing.expectEqualStrings("gemini", event.summary_provider.?);
     try std.testing.expect(event.diagnostics.effective_input_tokens.? <= 6000);
+}
+
+test "research deadline aliases during preparation and generation return signed resumable state" {
+    var original = TestFake{};
+    const key: [32]u8 = @splat(0x37);
+    const initial = try runJson(&original, null, test_request, .{ .state_key = key });
+    defer initial.deinit();
+    for ([_]anyerror{ error.RequestDeadlineExceeded, error.ResearchDeadlineExceeded, error.Timeout, error.DeadlineExceeded }) |deadline_error| for ([_]bool{ false, true }) |during_summary| for ([_]bool{ false, true }) |stream| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var raw = try std.json.parseFromSliceLeaky(std.json.Value, a, test_request, .{});
+        try raw.object.put(a, "stream", .{ .bool = stream });
+        var state = initial.value.research_state;
+        state.phase = .write;
+        state.signature = try signState(a, key, state);
+        try raw.object.put(a, "research_state", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, state, .{}), .{}));
+        if (during_summary) {
+            const knowledge = try a.alloc(u8, 8000);
+            @memset(knowledge, 'x');
+            try raw.object.put(a, "agent_knowledge", .{ .string = knowledge });
+            try raw.object.put(a, "context_management", try std.json.parseFromSliceLeaky(std.json.Value, a,
+                \\{"context_window_tokens":16000,"target_input_tokens":6000,"reserved_output_tokens":4000,"summarizer_context_window_tokens":32768,"summarizer":{"provider":"gemini","model":"summary"}}
+            , .{}));
+        }
+        const Interrupt = struct {
+            main: TestFake = .{},
+            err: anyerror,
+            armed: bool = false,
+            summaries: usize = 0,
+            fn check(ptr: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.armed) return self.err;
+            }
+            fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.armed = true;
+                if (std.mem.eql(u8, chain[0].generator.model, "summary")) {
+                    self.summaries += 1;
+                    return .{ .allocator = alloc, .content = try alloc.dupe(u8, "{}") };
+                }
+                return TestFake.generate(&self.main, alloc, chain, messages);
+            }
+        };
+        var interrupt = Interrupt{ .err = deadline_error };
+        const body = try std.json.Stringify.valueAlloc(a, raw, .{});
+        const encoded = try execute(std.testing.allocator, original.runners(null)[0], .{ .ptr = &interrupt, .vtable = &.{ .execute_chain = Interrupt.generate, .check = Interrupt.check } }, body, null, .{ .state_key = key });
+        defer std.testing.allocator.free(encoded.body);
+        const result_json = if (stream) blk: {
+            try std.testing.expect(std.mem.indexOf(u8, encoded.body, "event: error\n") == null);
+            const marker = "event: done\ndata: ";
+            const start = (std.mem.indexOf(u8, encoded.body, marker) orelse return error.TestExpectedEqual) + marker.len;
+            const end = std.mem.indexOfPos(u8, encoded.body, start, "\n\n") orelse return error.TestExpectedEqual;
+            break :blk encoded.body[start..end];
+        } else encoded.body;
+        const stopped = try std.json.parseFromSlice(Result, a, result_json, .{});
+        try std.testing.expectEqual(AgentStatus.incomplete, stopped.value.status);
+        try std.testing.expectEqualStrings("deadline", stopped.value.incomplete_details.?.reason);
+        try std.testing.expectEqual(Phase.write, stopped.value.research_state.phase);
+        try std.testing.expectEqual(@as(usize, if (during_summary) 1 else 0), interrupt.summaries);
+        try std.testing.expectEqualDeep(state.evidence, stopped.value.research_state.evidence);
+        try verifyState(a, key, stopped.value.research_state);
+        try std.testing.expectEqual(state.usage.?.llm_calls.? + 1, stopped.value.usage.?.llm_calls.?);
+        try std.testing.expect(stopped.value.context_management == null);
+        // Resume through the public signed-state path after the deadline is reset.
+        try raw.object.put(a, "research_state", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, stopped.value.research_state, .{}), .{}));
+        _ = raw.object.swapRemove("context_management");
+        _ = raw.object.swapRemove("agent_knowledge");
+        try raw.object.put(a, "stream", .{ .bool = false });
+        var resumed = TestFake{};
+        const completed = try runJson(&resumed, null, try std.json.Stringify.valueAlloc(a, raw, .{}), .{ .state_key = key });
+        defer completed.deinit();
+        try std.testing.expectEqual(AgentStatus.completed, completed.value.status);
+        try std.testing.expectEqual(@as(usize, 0), resumed.queries.load(.monotonic));
+    };
 }

@@ -82,7 +82,20 @@ pub fn completedEvidence(a: std.mem.Allocator, system: g.ChatMessage, evidence: 
     });
 }
 
-pub const Failure = struct { status: u16, message: []const u8 };
+pub const ErrorPayload = struct {
+    @"error": []const u8,
+    code: []const u8,
+    message: []const u8,
+    retryable: bool = false,
+};
+pub const Failure = struct {
+    status: u16,
+    message: []const u8,
+    /// One public error contract for JSON, buffered SSE and live transports.
+    pub fn payload(self: @This(), err: anyerror) ErrorPayload {
+        return .{ .@"error" = @errorName(err), .code = @errorName(err), .message = self.message };
+    }
+};
 pub fn failure(err: anyerror) ?Failure {
     return switch (err) {
         error.InvalidContextRequest => .{ .status = 400, .message = "context_management requires positive, bounded input/output budgets within the destination and summarizer context windows" },

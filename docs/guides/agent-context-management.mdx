@@ -111,7 +111,12 @@ configuration, including tool schemas. Changing summarizers does not invalidate
 portable text memory. Existing inference checkpoint model, tokenizer, template,
 history and memory compatibility checks remain in force for that separate API.
 Cancellation, deadlines, malformed/truncated summaries, missing evidence and final
-budget failure do not replace authoritative history.
+budget failure do not replace authoritative history. Context errors retain the
+same `code`, `error`, `message`, and `retryable` fields in JSON responses and SSE
+`error` events, including failures after retrieval has started streaming. Research
+deadlines during preparation or generation return an incomplete result with signed,
+resumable `research_state`; SSE delivers that result in `done`, without an `error`
+event. Reset the deadline and resubmit the state to continue the interrupted phase.
 
 Responses include `context_management` events, also available over SSE. They
 report original/final effective sizes, retained/compacted messages, counting

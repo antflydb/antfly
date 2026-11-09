@@ -675,27 +675,19 @@ fn failAgentResult(
 ) !EncodedResponse {
     try live.finishPipeline(true);
     if (format == .json) return err;
-    if (if (kind == .retrieval) retryableReadFailure(err) else null) |payload| {
-        try live.emitValue("error", payload);
-        return .{
-            .content_type = "text/event-stream",
-            .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, payload),
-        };
-    }
-    if (err == error.GenerationCapacityUnavailable) {
-        const payload = connections_api.generationCapacityFailure();
-        try live.emitValue("error", payload);
-        return .{
-            .content_type = "text/event-stream",
-            .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, payload),
-        };
-    }
-    // Generation callbacks may originate in a separately compiled runtime.
+    if (agent_context.failure(err)) |detail| return sseFailureResult(alloc, live, detail.payload(err));
+    if (if (kind == .retrieval) retryableReadFailure(err) else null) |payload| return sseFailureResult(alloc, live, payload);
+    if (err == error.GenerationCapacityUnavailable) return sseFailureResult(alloc, live, connections_api.generationCapacityFailure());
+    // Only explicitly classified public errors cross the generation boundary.
     const name = if (kind == .generation) "GenerationFailed" else @errorName(err);
-    try live.emitValue("error", .{ .@"error" = name });
+    return sseFailureResult(alloc, live, .{ .@"error" = name });
+}
+
+fn sseFailureResult(alloc: std.mem.Allocator, live: *LiveEmitter, payload: anytype) !EncodedResponse {
+    try live.emitValue("error", payload);
     return .{
         .content_type = "text/event-stream",
-        .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, .{ .@"error" = name }),
+        .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, payload),
     };
 }
 
@@ -1633,7 +1625,12 @@ fn executeInternal(
             const summary_limit = config.max_summary_batches orelse 8;
             if (summary_limit < 1 or summary_limit > 32) return error.InvalidContextRequest;
             var budget = AgentGenerationBudget{ .runner = exec, .used = 1, .limit = exec_options.budget.max_model_calls orelse (summary_limit + 1) };
-            const prepared = try agent_context.prepareWithSources(arena, &budget, config, cfg.chain, source, .{}, exec.control(), &.{.{ .tool_call_id = "antfly_context_evidence", .source_ids = selected_source_ids }});
+            const prepared = agent_context.prepareWithSources(arena, &budget, config, cfg.chain, source, .{}, exec.control(), &.{.{ .tool_call_id = "antfly_context_evidence", .source_ids = selected_source_ids }}) catch |err| {
+                // Preserve transport cancellation and provider-specific HTTP
+                // handling; only classified context errors become SSE payloads.
+                if (agent_context.failure(err) == null) return err;
+                return failAgentResult(alloc, format, &live, err, .generation);
+            };
             messages = prepared.messages;
             generation_calls = budget.used;
             try context_events.append(arena, prepared.event);
@@ -13095,15 +13092,36 @@ test "retrieval compaction validates exact structured source identities before d
     const body =
         \\{"query":"deadline","queries":[{"table":"docs","full_text_search":{"match":"deadline"}}],"stream":false,"generator":{"provider":"antfly","model":"main","max_tokens":100},"steps":{"generation":{}},"context_management":{"context_window_tokens":4000,"target_input_tokens":2500,"reserved_output_tokens":1000,"summarizer_context_window_tokens":32000,"summarizer":{"provider":"openai","model":"summary"}}}
     ;
-    for (cases) |case| {
+    for (cases) |case| for ([_]enum { json, buffered_sse, live_sse }{ .json, .buffered_sse, .live_sse }) |transport| {
         var fake = Fake{ .ids = case.ids };
-        const result = executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
-        if (case.err) |err| {
-            try std.testing.expectError(err, result);
-            try std.testing.expectEqual(@as(usize, 0), fake.generations);
+        var transcript = SseTranscript{};
+        defer transcript.bytes.deinit(std.testing.allocator);
+        const request_body = try std.mem.replaceOwned(u8, std.testing.allocator, body, "\"stream\":false", if (transport == .json) "\"stream\":false" else "\"stream\":true");
+        defer std.testing.allocator.free(request_body);
+        const result = executeWithOptions(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, request_body, if (transport == .live_sse) .{ .ptr = &transcript, .emit_json_fn = SseTranscript.emit } else null, .{});
+        if (case.err != null and transport == .json) {
+            try std.testing.expectError(case.err.?, result);
         } else {
-            std.testing.allocator.free(try result);
-            try std.testing.expectEqual(@as(usize, 1), fake.generations);
+            const encoded = try result;
+            defer std.testing.allocator.free(encoded.body);
+            if (transport != .json) {
+                const events = try parseSseEventsAlloc(std.testing.allocator, if (transport == .live_sse) transcript.bytes.items else encoded.body);
+                defer std.testing.allocator.free(events);
+                if (case.err) |err| {
+                    try std.testing.expectEqual(@as(usize, 1), countSseEvents(events, "error"));
+                    try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "done"));
+                    const payload = try std.json.parseFromSlice(agent_context.ErrorPayload, std.testing.allocator, firstSseEventData(events, "error").?, .{});
+                    defer payload.deinit();
+                    try std.testing.expectEqualStrings(@errorName(err), payload.value.code);
+                    try std.testing.expectEqualStrings(@errorName(err), payload.value.@"error");
+                    try std.testing.expectEqualStrings(agent_context.failure(err).?.message, payload.value.message);
+                    try std.testing.expect(!payload.value.retryable);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "error"));
+                    try std.testing.expectEqual(@as(usize, 1), countSseEvents(events, "done"));
+                }
+            }
         }
-    }
+        try std.testing.expectEqual(@as(usize, if (case.err != null) 0 else 1), fake.generations);
+    };
 }
