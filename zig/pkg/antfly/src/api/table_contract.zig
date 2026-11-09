@@ -1047,6 +1047,11 @@ fn validatePublicArtifactEnrichmentObject(object: anytype) !void {
             try validatePublicArtifactEnrichmentField(entry.key_ptr.*, entry.value_ptr.*);
         }
     }
+    const mode = if (@hasField(Object, "map")) object.map.get("embedding_input") else object.get("embedding_input");
+    if (mode) |input| if (input == .string and std.mem.eql(u8, input.string, "pdf_page_images")) {
+        const kind = (if (@hasField(Object, "map")) object.map.get("kind") else object.get("kind")) orelse return error.InvalidArtifactEnrichmentRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "embedding")) return error.InvalidArtifactEnrichmentRequest;
+    };
 }
 
 fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Value) !void {
@@ -2622,4 +2627,23 @@ test "resolver adjudication public policy omits disabled guards before metadata 
         try appendCanonicalPublicValue(a, &output, wire, "producer_json");
         try std.testing.expect(std.mem.indexOf(u8, output.items, "require_agreement") == null);
     }
+}
+
+test "PDF embedding input public contract round trips and validates modes" {
+    const a = std.testing.allocator;
+    const config = "{\"type\":\"embeddings\",\"dimension\":3,\"embedder\":{\"provider\":\"ollama\",\"model\":\"fixture\"},\"sources\":[{\"artifact\":\"pages\"}],\"enrichments\":[{\"name\":\"pages\",\"kind\":\"embedding\",\"template\":\"{{{content.resource.uri}}}\",\"embedding_input\":\"pdf_page_images\",\"expected_dims\":3}]}";
+    const normalized = try parseCreateIndexRequest(a, "pdf_vectors", config);
+    defer a.free(normalized);
+    const created = try indexes_api.encodeCreatedIndexConfig(a, "pdf_vectors", normalized);
+    defer a.free(created);
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"embedding_input\":\"pdf_page_images\"") != null);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), config, .{});
+    const enrichment = &value.object.getPtr("enrichments").?.array.items[0];
+    try enrichment.object.put(arena.allocator(), "embedding_input", .{ .string = "typo" });
+    try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(a, value.object, "pdf_vectors", .{ .include_name = true, .default_type = true }));
+    try enrichment.object.put(arena.allocator(), "embedding_input", .{ .string = "pdf_page_images" });
+    try enrichment.object.put(arena.allocator(), "kind", .{ .string = "asset" });
+    try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(a, value.object, "pdf_vectors", .{ .include_name = true, .default_type = true }));
 }
