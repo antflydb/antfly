@@ -64,7 +64,7 @@ def refusal_summary(error):
     accepted = headers.get("X-Accepted-GitHub-Permissions", "")
     required = [
         permission
-        for permission in ("actions=read", "contents=read", "contents=write")
+        for permission in ("actions=read", "checks=read", "contents=read", "contents=write")
         if permission
         in [value.strip() for value in accepted.replace(";", ",").split(",")]
     ]
@@ -98,7 +98,12 @@ class GitHub:
             with self.opener.open(request, timeout=30) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
-            area = "Actions read" if "/actions/" in path else "repository contents"
+            if "/actions/" in path:
+                area = "Actions read"
+            elif "/check-runs" in path:
+                area = "Checks read"
+            else:
+                area = "repository contents"
             raise PublicationError(
                 f"GitHub {method} {area} failed with HTTP {exc.code}; {refusal_summary(exc)}; no token/body logged"
             ) from None
@@ -180,12 +185,20 @@ def check_manifest(api, run, request):
         return None  # Older Colony validators publish the bounded ZIP instead.
     require(len(selected) == 1, "Ambiguous validation reports")
     check = selected[0]
+    # GitHub may replace the supplied workflow URL with this check's own URL.
+    # Accept only these exact identities; external_id still binds the request,
+    # workflow run and attempt, alongside the app and commit checks below.
     require(
         check.get("name") == MANIFEST_CHECK
         and check.get("app", {}).get("slug") == "github-actions"
         and check.get("head_sha") == run["head_sha"]
+        and type(check.get("id")) is int
+        and check["id"] > 0
         and check.get("details_url")
-        == f"https://github.com/{COLONY}/actions/runs/{run['id']}"
+        in (
+            f"https://github.com/{COLONY}/actions/runs/{run['id']}",
+            f"https://github.com/{COLONY}/runs/{check['id']}",
+        )
         and check.get("status") == "completed"
         and check.get("conclusion") == "success",
         "Untrusted validation report",

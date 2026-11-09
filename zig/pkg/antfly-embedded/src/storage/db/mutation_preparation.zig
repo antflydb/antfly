@@ -1518,7 +1518,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             schema: schema_mod.TableSchema,
             fallback_timestamp_ns: u64,
             value: std.json.Value,
-        ) !u64 {
+        ) !i128 {
             if (schema.ttl_duration_ns == 0) return fallback_timestamp_ns;
             const root = switch (value) {
                 .object => |object| object,
@@ -1529,15 +1529,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try ttlTimestampNsFromJsonValue(ttl_value);
         }
 
-        pub fn resolveWriteTimestampFromValue(self: anytype, fallback_timestamp_ns: u64, value: std.json.Value) !u64 {
+        pub fn resolveWriteTimestampFromValue(self: anytype, fallback_timestamp_ns: u64, value: std.json.Value) !i128 {
             const schema = S.ownerField(self, "core").*.schema orelse return fallback_timestamp_ns;
             return try resolveWriteTimestampForSchemaValue(schema, fallback_timestamp_ns, value);
         }
 
-        pub fn resolveWriteTimestampNs(self: anytype, fallback_timestamp_ns: u64, value_json: []const u8) !u64 {
+        pub fn resolveWriteTimestampNs(self: anytype, fallback_timestamp_ns: u64, value_json: []const u8) !i128 {
             const schema = S.ownerField(self, "core").*.schema orelse return fallback_timestamp_ns;
             if (schema.ttl_duration_ns == 0) return fallback_timestamp_ns;
-            return (try ttlTimestampNsFromDocumentValue(S.ownerField(self, "alloc").*, schema, value_json)) orelse fallback_timestamp_ns;
+            return (try ttlTimestampNsFromDocumentValue(S.ownerField(self, "alloc").*, schema, value_json)) orelse @as(i128, fallback_timestamp_ns);
         }
 
         pub fn retainPreparedTextRoots(sync_level: types.SyncLevel, has_text_consumers: bool, split_shadow: bool) bool {
@@ -1597,8 +1597,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             alloc: Allocator,
             schema: schema_mod.TableSchema,
             value_json: []const u8,
-        ) !?u64 {
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+        ) !?i128 {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
             defer parsed.deinit();
             const root = switch (parsed.value) {
                 .object => |object| object,
@@ -1609,24 +1609,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try ttlTimestampNsFromJsonValue(ttl_value);
         }
 
-        pub fn ttlTimestampNsFromJsonValue(value: std.json.Value) !u64 {
-            return switch (value) {
-                .integer => |integer| blk: {
-                    if (integer < 0) return error.InvalidArgument;
-                    break :blk std.math.cast(u64, integer) orelse return error.InvalidArgument;
-                },
-                .number_string => |text| std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch return error.InvalidArgument,
-                .string => |text| ttlTimestampNsFromString(text),
-                else => error.InvalidArgument,
-            };
+        pub fn ttlTimestampNsFromJsonValue(value: std.json.Value) !i128 {
+            return @import("../ttl.zig").parseSourceTimestamp(value) catch return error.InvalidArgument;
         }
 
-        pub fn ttlTimestampNsFromString(text: []const u8) !u64 {
-            const trimmed = std.mem.trim(u8, text, " \t\r\n");
-            if (trimmed.len == 0) return error.InvalidArgument;
-            if (std.fmt.parseInt(u64, trimmed, 10)) |ts| return ts else |_| {}
-            if (try parsePatternRfc3339ToNs(trimmed)) |ts| return ts;
-            return error.InvalidArgument;
+        pub fn ttlTimestampNsFromString(text: []const u8) !i128 {
+            return ttlTimestampNsFromJsonValue(.{ .string = text });
+        }
+
+        pub fn encodeDocumentTimestampValue(alloc: Allocator, fallback_version: u64, source: i128, restored_version: ?u64) ![]u8 {
+            // Event time is immutable across corrections; it cannot fence a
+            // mutation. Only replay restores a version from the source owner.
+            const version = restored_version orelse fallback_version;
+            return @import("../ttl.zig").encodeTimestampAlloc(alloc, version, source);
         }
 
         pub fn prepareRelationalRows(
@@ -1816,8 +1811,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             };
                         }
                         if (ctx.write_plan) |pinned_write_plan| {
-                            // Validate while the transient parsed root exists. The
-                            // commit phase fences this exact immutable plan generation.
                             pinned_write_plan.validateExternalVectorSpacesParsed(scratch_arena.allocator(), prepared.extracted.dense_embeddings, prepared.parsedValue()) catch |err| {
                                 prepared.deinit(owner_alloc);
                                 ctx.fail(err);
@@ -1847,7 +1840,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     ctx.fail(err);
                                     return;
                                 });
-                                prepared.finalizeMetadata(write_timestamp_ns) catch |err| {
+                                const write_version = std.math.cast(u64, write_timestamp_ns) orelse {
+                                    prepared.deinit(owner_alloc);
+                                    ctx.fail(error.InvalidArgument);
+                                    return;
+                                };
+                                prepared.finalizeMetadata(write_version) catch |err| {
                                     prepared.deinit(owner_alloc);
                                     ctx.fail(err);
                                     return;

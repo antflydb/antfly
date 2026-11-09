@@ -9000,6 +9000,9 @@ pub const DB = struct {
                         (!page.artifact_page and !page.projection_page and !page.source_generation_proof_page and page.artifacts.len != 0)) return error.InvalidRestoreStagingCommand;
                     var timestamps: std.StringHashMapUnmanaged(u64) = .empty;
                     defer timestamps.deinit(self.alloc);
+                    var ttl_sources: std.StringHashMapUnmanaged(i128) = .empty;
+                    defer ttl_sources.deinit(self.alloc);
+                    if (page.document_timestamps != null and (relationalColumns(self) != null or page.artifact_page or page.projection_page or page.source_generation_proof_page)) return error.InvalidRestoreStagingCommand;
                     var input_bytes: usize = 0;
                     var previous_artifact: ?[]const u8 = null;
                     for (page.artifacts) |artifact| {
@@ -9025,7 +9028,12 @@ pub const DB = struct {
                         if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
                     }
                     for (page.timestamps, req.writes) |timestamp, row| {
-                        if (timestamp.timestamp == 0 or !std.mem.eql(u8, timestamp.key, row.key)) return error.InvalidRestoreStagingCommand;
+                        if (!std.mem.eql(u8, timestamp.key, row.key)) return error.InvalidRestoreStagingCommand;
+                        if (page.document_timestamps != null) {
+                            if (timestamp.ttl_source_ns) |source| {
+                                try ttl_sources.put(self.alloc, timestamp.key, source);
+                            } else if (timestamp.timestamp != 0) return error.InvalidRestoreStagingCommand;
+                        } else if (timestamp.timestamp == 0 or timestamp.ttl_source_ns != null) return error.InvalidRestoreStagingCommand;
                         input_bytes = std.math.add(usize, input_bytes, row.key.len +| row.value.len) catch return error.TransactionTooLarge;
                         if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
                         const entry = try timestamps.getOrPut(self.alloc, timestamp.key);
@@ -9046,6 +9054,8 @@ pub const DB = struct {
                     apply_opts.wait_for_sync_level = !page.artifact_page and !page.source_generation_proof_page;
                     apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects, .artifact_page = page.artifact_page, .projection_page = page.projection_page, .source_generation_proof_page = page.source_generation_proof_page };
                     apply_opts.restore_timestamps = &timestamps;
+                    apply_opts.restore_ttl_sources = if (page.document_timestamps != null) &ttl_sources else null;
+                    apply_opts.restore_document_version_floor = if (page.document_timestamps) |metadata| metadata.version_floor else 0;
                     apply_opts.restore_replication_request = req;
                     apply_opts.restore_artifacts = page.artifacts;
                     const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1 + @intFromBool(page.artifacts.len != 0 and !page.source_generation_proof_page));
@@ -9075,6 +9085,8 @@ pub const DB = struct {
         defer proof_witness_arena.deinit();
         var page_timestamps: std.StringHashMapUnmanaged(u64) = .empty;
         defer page_timestamps.deinit(self.alloc);
+        var page_ttl_sources: std.StringHashMapUnmanaged(i128) = .empty;
+        defer page_ttl_sources.deinit(self.alloc);
         var apply_opts = opts;
         var apply_req = req;
         var chunk_prepared: ?@import("merge_page_chunks.zig").Prepared = null;
@@ -9119,9 +9131,15 @@ pub const DB = struct {
         };
         if (apply_req.merge_page) |page| if (page.phase == .rows or page.phase == .tail) {
             if (page.chunk) |chunk| {
-                if (apply_req.writes.len != 0) try page_timestamps.put(self.alloc, chunk.row_key, chunk.timestamp);
+                if (apply_req.writes.len != 0) {
+                    try page_timestamps.put(self.alloc, chunk.row_key, chunk.timestamp);
+                    if (chunk.ttl_source) |source| try page_ttl_sources.put(self.alloc, chunk.row_key, std.mem.readInt(i128, &source, .little));
+                }
             } else for (apply_req.writes, page.timestamps) |row, timestamp| try page_timestamps.put(self.alloc, row.key, timestamp);
+            for (page.ttl_sources, 0..) |source, i| if (source) |value| try page_ttl_sources.put(self.alloc, apply_req.writes[i].key, std.mem.readInt(i128, &value, .little));
+            if (relationalColumns(self) != null and page_ttl_sources.count() != 0) return error.InvalidMergePage;
             apply_opts.restore_timestamps = &page_timestamps;
+            apply_opts.restore_ttl_sources = &page_ttl_sources;
             apply_opts.preserve_logical_values = true;
         };
         apply_opts.row_policy_principal = policy_opts.row_policy_principal;
@@ -10027,11 +10045,11 @@ pub const DB = struct {
         if (!internal_keys.isInternalUserKey(key)) {
             const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
             if (ttl_duration_ns != 0) {
-                const timestamp_ns = if (internal_keys.isRelationalRowKey(store_key))
+                const timestamp_ns: ?i128 = if (internal_keys.isRelationalRowKey(store_key))
                     try relational_store.rowWriteTimestampNs(raw)
                 else
-                    try self.getTimestamp(alloc, key);
-                if (timestamp_ns != 0 and ttl_mod.isExpired(timestamp_ns, ttl_duration_ns, currentTimeNs())) {
+                    try ttl_mod.readSourceTimestamp(self.core.store, alloc, key);
+                if (timestamp_ns != null and ttl_mod.isExpired(timestamp_ns.?, ttl_duration_ns, currentTimeNs())) {
                     try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
                     return null;
                 }
@@ -19922,11 +19940,11 @@ pub const DB = struct {
         if (!internal_keys.isInternalUserKey(key)) {
             const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
             if (ttl_duration_ns != 0) {
-                const timestamp_ns = if (ordinal_row) |row|
+                const timestamp_ns: ?i128 = if (ordinal_row) |row|
                     row.writeTimestampNs()
                 else
-                    primary_timestamp orelse try lookupSnapshotTimestamp(alloc, key, probe);
-                if (timestamp_ns != 0 and ttl_mod.isExpired(timestamp_ns, ttl_duration_ns, currentTimeNs())) return null;
+                    try lookupSnapshotTtlTimestamp(alloc, key, probe);
+                if (timestamp_ns != null and ttl_mod.isExpired(timestamp_ns.?, ttl_duration_ns, currentTimeNs())) return null;
             }
         }
         try checkLookupOptionsActive(opts);
@@ -19981,6 +19999,16 @@ pub const DB = struct {
         return .{ .json = stored, .version = version, .expected_content_digest = digest };
     }
 
+    fn lookupSnapshotTtlTimestamp(alloc: Allocator, key: []const u8, probe: *docstore_mod.DocStore.Txn) !?i128 {
+        const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, key);
+        defer alloc.free(timestamp_key);
+        const bytes = probe.get(timestamp_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return ttl_mod.sourceTimestamp(bytes) orelse error.InvalidTimestamp;
+    }
+
     fn lookupSnapshotTimestamp(alloc: Allocator, key: []const u8, probe: *docstore_mod.DocStore.Txn) !u64 {
         const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, key);
         defer alloc.free(timestamp_key);
@@ -19989,8 +20017,7 @@ pub const DB = struct {
             else => return err,
         };
         const bytes = timestamp orelse return 0;
-        if (bytes.len != 8) return error.InvalidTimestamp;
-        return std.mem.readInt(u64, bytes[0..8], .little);
+        return ttl_mod.writeVersion(bytes) orelse error.InvalidTimestamp;
     }
 
     fn lookupRelationalRetirement(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
@@ -21197,12 +21224,16 @@ pub const DB = struct {
     /// release mutation fences before repository I/O, then rebind exact extents.
     fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !bool {
         const repository = self.backend_runtime.query_cut_repository orelse return false;
-        if (repository.vtable.reuse == null) return false;
         const basis = self.local_execution.native_query_reuse orelse return false;
-        if (std.mem.eql(u8, &basis.id, request.id)) return false;
+        if (!basis.matchesIndexes(request.indexes)) return false;
+        // Preflight and execution may bind the same generation with different
+        // transport deadlines. Its first publication wins even after writes.
+        if (std.mem.eql(u8, &basis.id, request.id))
+            return basis.table_id == request.table_id and basis.expires_ms == request.expires_ms;
+        if (repository.vtable.reuse == null) return false;
         const digest = (try self.nativeQueryReuseDigest(cancellation)) orelse return false;
         if (!basis.matches(digest, @import("native_query_cut.zig").nowMs())) return false;
-        const proof = (try repository.reuse(io, basis.asRequest(), request, self.core.identity_namespace, basis.proof(), cancellation)) orelse return false;
+        const proof = (try repository.reuse(io, basis.asRequestWithIndexes(request.indexes), request, self.core.identity_namespace, basis.proof(), cancellation)) orelse return false;
         // Rotate the logical authority, so expiry of the original manifest does
         // not force capture while the authenticated extents still cover readers.
         self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
@@ -21219,15 +21250,22 @@ pub const DB = struct {
         const control: @import("native_query_cut.zig").Control = .{ .parent = cancellation, .deadline_ns = deadline };
         const token = control.token();
         try token.check();
-        if (publish) if (self.backend_runtime.query_cut_repository) |repository| if (self.primary_lsm_storage) |storage| {
-            if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
-        };
         var profile = QueryCaptureProfile.init(benchQueryProfileEnabled(), "query_pin_lock");
         defer profile.finish();
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
         profile.next("reuse_and_admission");
         if (publish and try self.tryReuseNativeQueryCut(io, request, token)) return;
+        // A process-local hint is optional. Recover an already committed
+        // binding before considering a fresh capture of mutable live state.
+        if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
+            // Default filesystem owners have no custom Storage override.
+            // They still need committed-binding discovery after hint loss;
+            // the native view simply has no remote checkpoint reference.
+            var native = lsm_backend_mod.storage_io.IoStorage.init(io);
+            const storage = self.primary_lsm_storage orelse native.storage();
+            if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
+        };
         try self.admitQueryCut(io, request.id, token);
         const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
         defer self.alloc.free(root);
@@ -25793,10 +25831,11 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources },
+                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
                 .index_span_digests = index_spans,
@@ -40254,6 +40293,18 @@ pub const DB = struct {
         };
         var writes: std.ArrayList(types.BatchWrite) = .empty;
         var timestamps: std.ArrayList(staging.Timestamp) = .empty;
+        const document_timestamps = relationalColumns(source) == null;
+        var version_floor: u64 = 0;
+        if (document_timestamps) {
+            const watermark = source.core.store.get(owned, ttl_mod.document_version_watermark_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (watermark) |bytes| {
+                if (bytes.len != 8) return error.InvalidTimestamp;
+                version_floor = std.mem.readInt(u64, bytes[0..8], .little);
+            }
+        }
         var historical: ?schema_registry_mod.SchemaView = null;
         defer if (historical) |*view| view.release();
         var bytes: usize = 0;
@@ -40285,6 +40336,7 @@ pub const DB = struct {
             };
             if (!self.core.byteRange().contains(document_key)) return error.RestoreStagingScopeChanged;
             var timestamp: u64 = 0;
+            var ttl_source_ns: ?i128 = null;
             var json_null_fields: []const []const u8 = &.{};
             const json = if (internal_keys.isRelationalRowKey(row.key)) logical: {
                 if (program) |rewrite| {
@@ -40304,7 +40356,17 @@ pub const DB = struct {
                 json_null_fields = try typed.jsonNullFieldsAlloc(owned);
                 break :logical try typed.reconstructValueAlloc(owned);
             } else logical: {
-                timestamp = try source.getTimestamp(owned, document_key);
+                const timestamp_key = try internal_keys.ttlKeyAlloc(owned, document_key);
+                const timestamp_raw = source.core.store.get(owned, timestamp_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (timestamp_raw) |timestamp_bytes| {
+                    const metadata = ttl_mod.decodeTimestamp(timestamp_bytes) orelse return error.InvalidTimestamp;
+                    timestamp = metadata.version;
+                    ttl_source_ns = metadata.source;
+                    version_floor = @max(version_floor, timestamp);
+                }
                 if (program) |rewrite| break :logical try rewrite.preserveDocument(owned, row.value);
                 break :logical try owned.dupe(u8, row.value);
             };
@@ -40317,7 +40379,7 @@ pub const DB = struct {
             // not treated as new API input that fills today's defaults or
             // recomputes (and thereby repairs) stored generated results.
             try writes.append(owned, .{ .key = document_key, .value = json, .json_null_fields = json_null_fields });
-            try timestamps.append(owned, .{ .key = document_key, .timestamp = timestamp });
+            try timestamps.append(owned, .{ .key = document_key, .timestamp = timestamp, .ttl_source_ns = ttl_source_ns });
             var hash = std.crypto.hash.Blake3.init(.{});
             hash.update(&next.logical_digest);
             var length: [8]u8 = undefined;
@@ -40341,7 +40403,7 @@ pub const DB = struct {
         }
         next.cursor = try owned.dupe(u8, next.cursor);
         const encoded = try next.encode(owned);
-        const page: staging.ImportPage = .{ .expected = staging.digest(raw), .next = encoded, .scope = scope.digest(), .timestamps = timestamps.items };
+        const page: staging.ImportPage = .{ .expected = staging.digest(raw), .next = encoded, .scope = scope.digest(), .timestamps = timestamps.items, .document_timestamps = if (document_timestamps) .{ .version_floor = version_floor } else null };
         return .{
             .arena = arena,
             .phase = next.phase,
@@ -42740,7 +42802,7 @@ pub const DB = struct {
                 else
                     null;
                 if (state.ttl_duration_ns != 0) {
-                    const timestamp = if (relational)
+                    const timestamp: ?i128 = if (relational)
                         ordinal_row.?.writeTimestampNs()
                     else blk: {
                         state.ttl_key_scratch.clearRetainingCapacity();
@@ -42751,11 +42813,11 @@ pub const DB = struct {
                             else => return err,
                         };
                         break :blk if (timestamp_bytes) |value|
-                            if (value.len >= @sizeOf(u64)) std.mem.readInt(u64, value[0..8], .little) else 0
+                            ttl_mod.sourceTimestamp(value)
                         else
-                            0;
+                            null;
                     };
-                    if (timestamp != 0 and ttl_mod.isExpired(timestamp, state.ttl_duration_ns, state.now_ns))
+                    if (timestamp != null and ttl_mod.isExpired(timestamp.?, state.ttl_duration_ns, state.now_ns))
                         return .@"continue";
                 }
 
@@ -45665,7 +45727,7 @@ pub const DB = struct {
         var kept = std.ArrayListUnmanaged([]const u8).empty;
         defer kept.deinit(alloc);
         for (doc_ids, timestamps) |doc_id, ts| {
-            if (ts != 0 and ttl_mod.isExpired(ts, duration_ns, expiry_now)) continue;
+            if (ts != null and ttl_mod.isExpired(ts.?, duration_ns, expiry_now)) continue;
             try kept.append(alloc, doc_id);
         }
         return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, kept.items, generation);
@@ -52116,6 +52178,7 @@ const ttlTimestampNsFromJsonValue = local_mutation.ttlTimestampNsFromJsonValue;
 const ttlTimestampNsFromString = local_mutation.ttlTimestampNsFromString;
 
 const encodeTimestampValue = local_mutation.encodeTimestampValue;
+const encodeDocumentTimestampValue = local_mutation.encodeDocumentTimestampValue;
 
 fn ttlDurationNs(self: *DB) u64 {
     var schema_view = self.core.acquireSchemaView();
@@ -52126,15 +52189,14 @@ fn ttlDurationNs(self: *DB) u64 {
 fn isExpiredDocumentKey(self: *DB, alloc: Allocator, key: []const u8) !bool {
     const duration_ns = ttlDurationNs(self);
     if (duration_ns == 0) return false;
-    const ts = try self.getTimestamp(alloc, key);
-    if (ts == 0) return false;
+    const ts = (try ttl_mod.readSourceTimestamp(self.core.store, alloc, key)) orelse return false;
     return ttl_mod.isExpired(ts, duration_ns, currentTimeNs());
 }
 
-fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]u64 {
-    const timestamps = try alloc.alloc(u64, keys.len);
+fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]?i128 {
+    const timestamps = try alloc.alloc(?i128, keys.len);
     errdefer alloc.free(timestamps);
-    @memset(timestamps, 0);
+    @memset(timestamps, null);
     if (keys.len == 0) return timestamps;
 
     const PendingTimestampLoad = struct {
@@ -52177,8 +52239,7 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
 
     for (pending.items, 0..) |item, i| {
         const raw = read_values[i] orelse continue;
-        if (raw.len != 8) continue;
-        timestamps[item.original_index] = std.mem.readInt(u64, raw[0..8], .little);
+        timestamps[item.original_index] = ttl_mod.sourceTimestamp(raw) orelse continue;
     }
     return timestamps;
 }
@@ -52312,8 +52373,7 @@ fn filterVisibleSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
     const timestamps = try loadDocumentTimestampsMany(self, alloc, parent_ids);
     defer alloc.free(timestamps);
     for (timestamps, 0..) |ts, i| {
-        if (ts == 0) continue;
-        keep[i] = !ttl_mod.isExpired(ts, duration_ns, expiry_now);
+        if (ts) |source| keep[i] = !ttl_mod.isExpired(source, duration_ns, expiry_now);
     }
     return keep;
 }
@@ -53219,7 +53279,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
             }
         }
         for (guard.candidates) |candidate| {
-            const current = (try ttl_mod.readTimestamp(ctx.store, ctx.alloc, candidate.key)) orelse continue;
+            const current = (try ttl_mod.readSourceTimestamp(ctx.store, ctx.alloc, candidate.key)) orelse continue;
             if (current != candidate.timestamp_ns or
                 !ttl_mod.isExpiredWithGrace(current, guard.duration_ns, guard.grace_period_ns, guard.now_ns)) continue;
             try eligible.append(ctx.alloc, candidate.key);
@@ -127115,7 +127175,7 @@ test "db coordinated ttl retains visible rows and emits snapshot bound observati
     try std.testing.expectError(error.ForeignKeyCoordinationRequired, executeDeleteBatchContext(&context.batch, &.{"parent"}, .full_index, null));
 }
 
-test "db primary digest guards projected rows with unchanged custom ttl timestamps" {
+test "db primary digest guards projected rows with unchanged custom ttl timestamps including time series" {
     const alloc = std.testing.allocator;
     for ([_][]const u8{ "document", "relational" }) |mode| {
         var path = try TestDirectory.init("ttl-primary-observation");
@@ -127127,15 +127187,15 @@ test "db primary digest guards projected rows with unchanged custom ttl timestam
         , .{mode});
         defer alloc.free(schema);
         try db.setSchemaJson(alloc, schema);
-        // Keep expiry well in the future, while deliberately preserving the
-        // timestamp across two distinct row images.
+        // Keep expiry well in the future. Explicitly reuse a mutation timestamp
+        // to verify the stronger digest fence independently of event time.
         const old_json = "{\"id\":1,\"expires\":\"2090-01-01T00:00:00Z\",\"value\":1}";
         const new_json = "{\"id\":1,\"expires\":\"2090-01-01T00:00:00Z\",\"value\":2}";
-        try db.batch(.{ .writes = &.{.{ .key = "row", .value = old_json }} });
+        try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "row", .value = old_json }} });
         var before = (try db.lookup(alloc, "row", .{ .fields = &.{"id"}, .include_all_fields = false, .include_primary_digest = true })).?;
         defer before.deinit(alloc);
         try std.testing.expect(before.expected_content_digest != null and before.version != null);
-        try db.batch(.{ .writes = &.{.{ .key = "row", .value = new_json }} });
+        try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "row", .value = new_json }} });
         var after = (try db.lookup(alloc, "row", .{ .include_primary_digest = true })).?;
         defer after.deinit(alloc);
         try std.testing.expectEqual(before.version, after.version);
@@ -149602,6 +149662,493 @@ test "privacy protected hit hydration bounds row scratch and retains only select
     }
 }
 
+test "time series corrections fence mutations independently of event time" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("series-correction-versions");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "observed_at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+    for ([_][]const u8{ "2026-11-06T12:00:00Z", "1970-01-01T00:00:00Z", "1969-12-31T23:59:59Z" }) |observed| {
+        const source = @import("../../datetime.zig").parseRfc3339ToSignedNs(observed).?;
+        const first = try std.fmt.allocPrint(a, "{{\"observed_at\":\"{s}\",\"v\":1}}", .{observed});
+        defer a.free(first);
+        const corrected = try std.fmt.allocPrint(a, "{{\"observed_at\":\"{s}\",\"v\":2}}", .{observed});
+        defer a.free(corrected);
+        try db.batch(.{ .timestamp_ns = 111, .writes = &.{.{ .key = observed, .value = first }} });
+        const initial_version = try db.getTimestamp(a, observed);
+        try std.testing.expect(initial_version != 0);
+        try db.batch(.{ .timestamp_ns = 222, .writes = &.{.{ .key = observed, .value = corrected }}, .predicates = &.{.{ .key = observed, .expected_version = initial_version }} });
+        try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(.{ .timestamp_ns = 333, .writes = &.{.{ .key = observed, .value = first }}, .predicates = &.{.{ .key = observed, .expected_version = initial_version }} }));
+        const corrected_version = try db.getTimestamp(a, observed);
+        try std.testing.expect(corrected_version > initial_version);
+        try std.testing.expectEqual(@as(?i128, source), try ttl_mod.readSourceTimestamp(db.core.store, a, observed));
+        const actual = (try db.get(a, observed)).?;
+        defer a.free(actual);
+        try std.testing.expectEqualStrings(corrected, actual);
+        // Replay restores identity instead of minting a receiver-side version.
+        var restored: std.StringHashMapUnmanaged(u64) = .empty;
+        defer restored.deinit(a);
+        try restored.put(a, "restored", corrected_version);
+        try db.batchInternal(.{ .timestamp_ns = 999, .writes = &.{.{ .key = "restored", .value = corrected }} }, null, .{ .restore_timestamps = &restored, .preserve_logical_values = true });
+        try std.testing.expectEqual(corrected_version, try db.getTimestamp(a, "restored"));
+        try std.testing.expectEqual(@as(?i128, source), try ttl_mod.readSourceTimestamp(db.core.store, a, "restored"));
+    }
+    // An existing eight-byte record upgrades on its first correction.
+    const legacy_source: u64 = 1_793_966_400_000_000_000;
+    const legacy = "{\"observed_at\":\"2026-11-06T12:00:00Z\",\"v\":1}";
+    try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = legacy_source, .writes = &.{.{ .key = "legacy", .value = legacy }} });
+    try db.batch(.{ .timestamp_ns = 444, .writes = &.{.{ .key = "legacy", .value = legacy }}, .predicates = &.{.{ .key = "legacy", .expected_version = legacy_source }} });
+    db.close();
+    db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    try std.testing.expectEqual(legacy_source + 1, try db.getTimestamp(a, "legacy"));
+    try std.testing.expectEqual(@as(?i128, legacy_source), try ttl_mod.readSourceTimestamp(db.core.store, a, "legacy"));
+}
+
+test "time series historical TTL sources preserve write versions and signed visibility" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("historical-ttl");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "observed_at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+    try db.batch(.{
+        .timestamp_ns = 12345,
+        .writes = &.{.{ .key = "historical", .value = "{\"observed_at\":\"1969-12-31T23:59:59Z\",\"v\":1}" }},
+    });
+    try std.testing.expectEqual(@as(u64, 12345), try db.getTimestamp(a, "historical"));
+    try std.testing.expectEqual(@as(?i128, -1_000_000_000), try ttl_mod.readSourceTimestamp(db.core.store, a, "historical"));
+    const value = (try db.get(a, "historical")) orelse return error.TestUnexpectedResult;
+    a.free(value);
+    var reading = (try db.lookup(a, "historical", .{ .include_primary_digest = true })) orelse return error.TestUnexpectedResult;
+    defer reading.deinit(a);
+    try std.testing.expectEqual(@as(?u64, 12345), reading.version);
+    var restored_versions: std.StringHashMapUnmanaged(u64) = .empty;
+    defer restored_versions.deinit(a);
+    try restored_versions.put(a, "historical_restored", 12345);
+    try restored_versions.put(a, "fallback_restored", 12347);
+    try db.batchInternal(.{
+        .timestamp_ns = 99999,
+        .writes = &.{
+            .{ .key = "historical_restored", .value = "{\"observed_at\":\"1969-12-31T23:59:59Z\",\"v\":1}" },
+            .{ .key = "fallback_restored", .value = "{}" },
+        },
+    }, null, .{ .restore_timestamps = &restored_versions, .preserve_logical_values = true });
+    try std.testing.expectEqual(@as(u64, 12345), try db.getTimestamp(a, "historical_restored"));
+    try std.testing.expectEqual(@as(?i128, -1_000_000_000), try ttl_mod.readSourceTimestamp(db.core.store, a, "historical_restored"));
+    try std.testing.expectEqual(@as(?i128, 12347), try ttl_mod.readSourceTimestamp(db.core.store, a, "fallback_restored"));
+    // Receiver schema changes must not replace the snapshot's source instant.
+    try db.setSchema(.{ .version = 2 });
+    var sources: std.StringHashMapUnmanaged(i128) = .empty;
+    defer sources.deinit(a);
+    try sources.put(a, "historical_restored", -2_000_000_000);
+    try db.batchInternal(.{ .writes = &.{.{ .key = "historical_restored", .value = "{}" }} }, null, .{ .restore_timestamps = &restored_versions, .restore_ttl_sources = &sources, .preserve_logical_values = true });
+    try std.testing.expectEqual(@as(u64, 12345), try db.getTimestamp(a, "historical_restored"));
+    try std.testing.expectEqual(@as(?i128, -2_000_000_000), try ttl_mod.readSourceTimestamp(db.core.store, a, "historical_restored"));
+    try db.setSchema(.{ .version = 3, .ttl_field = "observed_at", .ttl_duration_ns = std.time.ns_per_day });
+    try db.batch(.{
+        .timestamp_ns = 12346,
+        .writes = &.{.{ .key = "epoch", .value = "{\"observed_at\":\"1970-01-01T00:00:00Z\",\"v\":2}" }},
+    });
+    try std.testing.expect(try db.getTimestamp(a, "epoch") > 12345);
+    try std.testing.expectEqual(@as(?i128, 0), try ttl_mod.readSourceTimestamp(db.core.store, a, "epoch"));
+    try std.testing.expect((try db.get(a, "historical")) == null);
+    try std.testing.expect((try db.lookup(a, "historical", .{})) == null);
+    try std.testing.expect((try db.get(a, "epoch")) == null);
+    var result = try db.search(a, .{ .query = .{ .match_all = {} }, .limit = 10 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+    try initStoppedTtlRuntimeForTest(&db, .{ .enabled = true, .batch_size = 8, .grace_period_ns = 0 });
+    try db.ttl_runtime.?.runOnce();
+    try db.runUntilIdle();
+    try std.testing.expect((try ttl_mod.readSourceTimestamp(db.core.store, a, "historical")) == null);
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(a, "epoch"));
+    try std.testing.expect((try ttl_mod.readSourceTimestamp(db.core.store, a, "epoch")) == null);
+}
+
+test "time series durable revisions survive frozen rollback zero clocks and deletion ABA" {
+    const a = std.testing.allocator;
+    var dir = try TestDirectory.init("series-durable-revisions");
+    defer dir.cleanup();
+    var db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+    var previous: u64 = 0;
+    for ([_]u64{ 100, 100, 10, 0, 0 }) |wall| {
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = wall, .writes = &.{.{ .key = "reading", .value = "{\"at\":\"1970-01-01T00:00:00Z\",\"v\":1}" }} });
+        const next = try db.getTimestamp(a, "reading");
+        try std.testing.expect(next > previous);
+        try std.testing.expectEqual(@as(?i128, 0), try ttl_mod.readSourceTimestamp(db.core.store, a, "reading"));
+        previous = next;
+    }
+    try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "reading", .value = "{}" }}, .predicates = &.{.{ .key = "reading", .expected_version = 1 }} }));
+    try std.testing.expectEqual(previous, try db.getTimestamp(a, "reading"));
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .deletes = &.{"reading"} });
+    db.close();
+    db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "reading", .value = "{}" }} });
+    try std.testing.expectEqual(previous + 2, try db.getTimestamp(a, "reading"));
+    // Historical admission rejects negative sources without committing a row
+    // or leaking a partially prepared timestamp key.
+    try std.testing.expectError(error.InvalidArgument, db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "rejected", .value = "{\"at\":\"1969-12-31T23:59:59Z\"}" }} }));
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(a, "rejected"));
+    // Untagged historical commands replay their original event-time version.
+    try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "old", .value = "{\"at\":\"1970-01-01T00:00:01Z\"}" }} });
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s), try db.getTimestamp(a, "old"));
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "old", .value = "{}" }} });
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s + 1), try db.getTimestamp(a, "old"));
+}
+
+test "time series retained afterimages preserve signed sources across restart and receiver policy" {
+    const a = std.testing.allocator;
+    const retained = @import("../retained_effects.zig");
+    const frame = @import("../retained_frame.zig");
+    for ([_]bool{ false, true }) |large| {
+        var dir = try TestDirectory.init("series-source-retention");
+        defer dir.cleanup();
+        var db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+        try db.batch(.{ .timestamp_ns = 1, .writes = &.{.{ .key = "bootstrap", .value = "{}" }} });
+        var ns: retained.Namespace = undefined;
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            ns = (try txn.get(&internal_keys.identity_namespace_key))[0..24].*;
+            _ = try retained.admitWithSourceCapabilities(&txn, ns, 1, @splat(9), retained.default_limit, large, true, large, true);
+            try txn.commit();
+        }
+        const padding = try a.alloc(u8, if (large) 2 * 1024 * 1024 else 0);
+        defer a.free(padding);
+        @memset(padding, 'x');
+        const json = try std.fmt.allocPrint(a, "{{\"at\":\"1969-12-31T23:59:59Z\",\"padding\":\"{s}\"}}", .{padding});
+        defer a.free(json);
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "reading", .value = json }} });
+        db.close();
+        db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const cache = try a.create(frame.View.ChunkCache);
+        defer a.destroy(cache);
+        const cache_bytes = try a.alloc(u8, frame.chunk_bytes);
+        defer a.free(cache_bytes);
+        cache.* = .{ .bytes = cache_bytes };
+        var captured = (try retained.readFrame(&read, ns, 1, @splat(9), 0, cache)).?;
+        try std.testing.expectEqual(large, captured == .chunked);
+        const source: [16]u8 = switch (captured) {
+            .contiguous => |*reader| (try reader.next()).?.ttl_source.?,
+            .chunked => |view| (try view.effectAt(0, cache)).ttl_source.?,
+        };
+        try std.testing.expectEqual(@as(i128, -std.time.ns_per_s), std.mem.readInt(i128, &source, .little));
+        var target_dir = try TestDirectory.init("series-retention-target");
+        defer target_dir.cleanup();
+        var target = try DB.open(a, target_dir.path(), .{ .start_optional_runtimes = false });
+        defer target.close();
+        var versions: std.StringHashMapUnmanaged(u64) = .empty;
+        defer versions.deinit(a);
+        var sources: std.StringHashMapUnmanaged(i128) = .empty;
+        defer sources.deinit(a);
+        try versions.put(a, "reading", 100);
+        try sources.put(a, "reading", std.mem.readInt(i128, &source, .little));
+        try target.batchInternal(.{ .writes = &.{.{ .key = "reading", .value = json }} }, null, .{ .restore_timestamps = &versions, .restore_ttl_sources = &sources, .preserve_logical_values = true });
+        try std.testing.expectEqual(@as(u64, 100), try target.getTimestamp(a, "reading"));
+        try std.testing.expectEqual(@as(?i128, -std.time.ns_per_s), try ttl_mod.readSourceTimestamp(target.core.store, a, "reading"));
+        // The final transaction's allocator floor survives removal of the
+        // live sidecar, in both inline and descriptor-backed retained frames.
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .deletes = &.{"reading"} });
+        var deleted_read = try db.core.store.beginReadTxn();
+        defer deleted_read.abort();
+        var deleted = (try retained.readFrame(&deleted_read, ns, 1, @splat(9), 1, cache)).?;
+        try std.testing.expectEqual(large, deleted == .chunked);
+        const deletion_version = switch (deleted) {
+            .contiguous => |*reader| (try reader.next()).?.timestamp,
+            .chunked => |view| (try view.effectAt(0, cache)).timestamp,
+        };
+        try std.testing.expectEqual(@as(u64, 101), deletion_version);
+        // Restored live versions seed the allocator before any later source
+        // floor arrives, including a delete followed by clock rollback.
+        try target.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .deletes = &.{"reading"} });
+        try target.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "reading", .value = "{}" }} });
+        try std.testing.expect((try target.getTimestamp(a, "reading")) > 100);
+    }
+}
+
+test "time series portable document codec preserves signed TTL and write versions" {
+    const a = std.testing.allocator;
+    const entries = [_]backup_codec.DocumentEntry{
+        .{ .key = "historical", .value_flags = 0, .value = "{}", .timestamp_ns = 123, .ttl_source_ns = -1_000_000_000 },
+        .{ .key = "legacy", .value_flags = 0, .value = "{}", .timestamp_ns = 456 },
+    };
+    const encoded = try backup_codec.encodeDocumentBatch(a, &entries);
+    defer a.free(encoded);
+    try std.testing.expectEqual(@as(u32, 2), try backup_codec.documentBatchEntryCount(encoded));
+    const borrowed = try backup_codec.decodeDocumentBatchBorrowed(a, encoded);
+    defer a.free(borrowed);
+    const owned = try backup_codec.decodeDocumentBatch(a, encoded);
+    defer {
+        for (owned) |entry| {
+            a.free(entry.key);
+            a.free(entry.value);
+        }
+        a.free(owned);
+    }
+    for ([_][]backup_codec.DocumentEntry{ borrowed, owned }) |decoded| {
+        try std.testing.expectEqual(@as(u64, 123), decoded[0].timestamp_ns);
+        try std.testing.expectEqual(@as(?i128, -1_000_000_000), decoded[0].ttl_source_ns);
+        try std.testing.expectEqual(@as(?i128, null), decoded[1].ttl_source_ns);
+    }
+    for (0..encoded.len) |length| {
+        try std.testing.expectError(if (length < 4) error.BatchTooShort else error.Truncated, backup_codec.documentBatchEntryCount(encoded[0..length]));
+    }
+}
+
+test "time series pinned Cypher uses signed source for visibility and revision for version" {
+    const a = std.testing.allocator;
+    var dir = try TestDirectory.init("series-cypher-timestamps");
+    defer dir.cleanup();
+    var db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 5 * std.time.ns_per_s });
+    try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 100, .writes = &.{.{ .key = "legacy", .value = "{}" }} });
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 200, .writes = &.{
+        .{ .key = "negative", .value = "{\"at\":\"1969-12-31T23:59:59Z\"}" },
+        .{ .key = "epoch", .value = "{\"at\":\"1970-01-01T00:00:00Z\"}" },
+        .{ .key = "future", .value = "{\"at\":\"1970-01-01T00:00:10Z\"}" },
+    } });
+    for ([_]u64{ 3 * std.time.ns_per_s, 6 * std.time.ns_per_s }) |now| {
+        var fence = (try db.tryStatementReadFence()) orelse return error.CypherSnapshotNotReady;
+        defer fence.release();
+        var cut = try db.captureCypherSelectedSnapshot(a, &fence, &.{}, now, .{});
+        defer cut.deinit();
+        fence.release();
+        const rows = try db.getCypherPinnedDocuments(a, &cut, &.{ "legacy", "negative", "epoch", "future" }, .{});
+        defer {
+            for (rows) |row| if (row) |value| {
+                var owned = value;
+                owned.deinit(a);
+            };
+            a.free(rows);
+        }
+        for (rows, 0..) |row, i| {
+            const visible = now == 3 * std.time.ns_per_s or i == 3;
+            try std.testing.expectEqual(visible, row != null);
+            if (row) |value| try std.testing.expectEqual(@as(u64, if (i == 0) 100 else 200), value.version);
+        }
+    }
+}
+
+test "time series graph TTL reconstructs admitted lifetimes and validates before mutation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("series-graph-ttl-source");
+    defer directory.cleanup();
+    const options: OpenOptions = .{ .start_index_workers = false, .start_optional_runtimes = false };
+    var db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+    const admitted = currentTimeNs();
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = admitted, .writes = &.{.{ .key = "a", .value = "{\"at\":\"1969-12-31T23:59:59Z\",\"ref\":[\"b\",\"c\"]}" }} });
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"},\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}]}" });
+    const writes = [_]types.GraphEdgeWrite{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "link", .ttl_created_ns = admitted }};
+    try db.core.index_manager.applyGraphWrites(&writes);
+    db.close();
+    db = try DB.open(a, directory.path(), options);
+    try db.core.index_manager.applyGraphWrites(&writes);
+    const graph = db.core.index_manager.graphIndex("g").?;
+    const limits: graph_mod.EdgePageLimits = .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 };
+    {
+        var edges = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + 1);
+        defer edges.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), edges.edges.len);
+        try std.testing.expect(edges.edges[0].field_derived);
+    }
+    const timestamp_key = try internal_keys.ttlKeyAlloc(a, "a");
+    defer a.free(timestamp_key);
+    const original = try db.core.store.get(a, timestamp_key);
+    defer a.free(original);
+    try db.core.store.put(timestamp_key, "invalid");
+    graph.neighbor_source_sequence = 123;
+    try std.testing.expectError(error.GraphEdgeTtlMigrationRequired, db.core.index_manager.applyGraphWrites(&.{.{ .index_name = "g", .source = "a", .target = "c", .edge_type = "link", .ttl_created_ns = admitted }}));
+    try std.testing.expectEqual(@as(u64, 0), graph.neighbor_source_sequence);
+    {
+        var edges = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + 1);
+        defer edges.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), edges.edges.len);
+        try std.testing.expectEqualStrings("b", edges.edges[0].target);
+    }
+    try db.core.store.put(timestamp_key, original);
+    try db.core.index_manager.applyGraphWrites(&.{.{ .index_name = "g", .source = "a", .target = "c", .edge_type = "link", .ttl_created_ns = admitted }});
+    var live = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + std.time.ns_per_hour - 1);
+    defer live.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), live.edges.len);
+    var expired = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + std.time.ns_per_hour);
+    defer expired.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), expired.edges.len);
+}
+
+test "time series staged restore preserves timestamp presence sources and deleted revision floor" {
+    const a = std.testing.allocator;
+    const staging = @import("restore_staging.zig");
+    const wire = @import("../../api/batch_internal.zig");
+    const adapter = @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter;
+    var source_dir = try TestDirectory.init("series-staging-source");
+    defer source_dir.cleanup();
+    var target_dir = try TestDirectory.init("series-staging-target");
+    defer target_dir.cleanup();
+    const source_options: OpenOptions = .{ .identity_namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 }, .start_index_workers = false, .start_optional_runtimes = false };
+    const target_options: OpenOptions = .{ .identity_namespace = .{ .table_id = 20, .shard_id = 21, .range_id = 21 }, .start_index_workers = false, .start_optional_runtimes = false };
+    var source = try DB.open(a, source_dir.path(), source_options);
+    defer source.close();
+    var target = try DB.open(a, target_dir.path(), target_options);
+    defer target.close();
+    const schema: schema_mod.TableSchema = .{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day };
+    try source.setSchema(schema);
+    try target.setSchema(schema);
+    for (0..2) |_| try source.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "fallback", .value = "{}" }} });
+    try source.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{
+        .{ .key = "historical", .value = "{\"at\":\"1969-12-31T23:59:59Z\"}" },
+        .{ .key = "epoch", .value = "{\"at\":\"1970-01-01T00:00:00Z\"}" },
+        .{ .key = "wide", .value = "{\"at\":\"9999-12-31T23:59:59.999999999Z\"}" },
+        .{ .key = "missing", .value = "{}" },
+        .{ .key = "legacy_epoch", .value = "{}" },
+    } });
+    try source.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 400, .writes = &.{.{ .key = "legacy", .value = "{}" }} });
+    try source.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 10_000, .writes = &.{.{ .key = "deleted", .value = "{}" }} });
+    try source.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 10_000, .deletes = &.{"deleted"} });
+    for ([_][]const u8{ "missing", "legacy_epoch" }) |key| {
+        const timestamp_key = try internal_keys.ttlKeyAlloc(a, key);
+        defer a.free(timestamp_key);
+        if (std.mem.eql(u8, key, "missing")) try source.core.store.delete(timestamp_key) else try source.core.store.put(timestamp_key, &@as([8]u8, @splat(0)));
+    }
+    const cases = [_]struct { key: []const u8, version: u64, source: ?i128 }{
+        .{ .key = "fallback", .version = 101, .source = 100 },
+        .{ .key = "historical", .version = 102, .source = -std.time.ns_per_s },
+        .{ .key = "epoch", .version = 102, .source = 0 },
+        .{ .key = "wide", .version = 102, .source = 253402300799999999999 },
+        .{ .key = "legacy", .version = 400, .source = 400 },
+        .{ .key = "legacy_epoch", .version = 0, .source = 0 },
+        .{ .key = "missing", .version = 0, .source = null },
+    };
+    source.close();
+    var readonly = source_options;
+    readonly.open_mode = .query_readonly;
+    source = try DB.open(a, source_dir.path(), readonly);
+    const serialized = try schema_mod.serializeSchema(a, target.core.schema orelse .{});
+    defer a.free(serialized);
+    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = source_options.identity_namespace.?, .target_namespace = target_options.identity_namespace.?, .target_schema_digest = staging.digest(serialized) };
+    try target.reserveRestoreStaging(a, scope.plan_id, scope.plan_digest, scope.target_namespace);
+    try target.beginRestoreStaging(a, scope);
+    var index: u64 = 0;
+    for (0..20) |_| {
+        var page = try target.prepareRestoreStagingPage(a, scope, &source, 1, .none);
+        defer page.deinit();
+        if (page.batch) |request| {
+            const encoded = try wire.encodeBatchRequest(a, request);
+            defer a.free(encoded);
+            var decoded = try wire.parseInternalBatchRequest(a, encoded);
+            defer decoded.deinit(a);
+            try std.testing.expect(wire.requiresDocumentVersionsEnvelope(decoded.req));
+            // Missing source with a nonzero version is malformed, not a request
+            // to silently recompute retention under the receiver's schema.
+            if (request.writes.len != 0 and request.restore_staging.?.import_page.timestamps[0].timestamp != 0) {
+                var invalid = decoded.req;
+                var timestamp = invalid.restore_staging.?.import_page.timestamps[0];
+                timestamp.ttl_source_ns = null;
+                invalid.restore_staging.?.import_page.timestamps = &.{timestamp};
+                try std.testing.expectError(error.InvalidRestoreStagingCommand, target.batch(invalid));
+            }
+            index += 1;
+            try adapter.applyOrdered(&target, decoded.req, .{ .term = 1, .index = index });
+            try adapter.applyOrdered(&target, decoded.req, .{ .term = 1, .index = index });
+        }
+        target.close();
+        target = try DB.open(a, target_dir.path(), target_options);
+        if (page.phase == .imported) break;
+    } else return error.TestUnexpectedResult;
+    for (cases) |case| {
+        try std.testing.expectEqual(case.version, try target.getTimestamp(a, case.key));
+        try std.testing.expectEqual(case.source, try ttl_mod.readSourceTimestamp(target.core.store, a, case.key));
+    }
+    const floor = try target.core.store.get(a, ttl_mod.document_version_watermark_key);
+    defer a.free(floor);
+    try std.testing.expectEqual(@as(u64, 10_001), std.mem.readInt(u64, floor[0..8], .little));
+    try target.batch(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } });
+    try target.batch(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } } });
+    try target.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "deleted", .value = "{}" }} });
+    try std.testing.expectEqual(@as(u64, 10_002), try target.getTimestamp(a, "deleted"));
+}
+
+test "time series graph repair requires authoritative lifetimes across clock rollback" {
+    const a = std.testing.allocator;
+    const documents = [_][]const u8{ "{\"ref\":\"b\"}", "{\"ref\":\"b\",\"at\":\"1969-12-31T23:59:59Z\"}", "{\"ref\":\"b\",\"at\":\"1970-01-01T00:00:00Z\"}" };
+    for (0..6) |profile| {
+        const json = documents[profile % documents.len];
+        const mixed = profile >= documents.len;
+        var directory = try TestDirectory.init("series-graph-lifetime-authority");
+        defer directory.cleanup();
+        const options: OpenOptions = .{ .start_index_workers = false, .start_optional_runtimes = false };
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        if (profile % documents.len != 0) try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+        const admitted = currentTimeNs();
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = admitted + 10 * std.time.ns_per_hour, .writes = &.{.{ .key = "b", .value = "{}" }} });
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = admitted, .writes = &.{.{ .key = "a", .value = json }} });
+        try std.testing.expect(try db.getTimestamp(a, "a") > admitted + 10 * std.time.ns_per_hour);
+        if (mixed) try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = if (mixed)
+            "{\"ttl\":{\"duration\":\"1h\"},\"sources\":[{\"artifact\":\"relations_v1\"}],\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}]}"
+        else
+            "{\"ttl\":{\"duration\":\"1h\"},\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}]}" });
+        // Neither a logical revision nor an event timestamp is an admission
+        // clock. Repair cannot invent the missing historical edge lifetime.
+        try std.testing.expectError(error.GraphEdgeTtlMigrationRequired, projectGraphFieldContributionsForRepair(db.async_context, "g", "a"));
+        // Re-admitting the field document through the normal mutation path
+        // creates a durable, replicated edge artifact and lifetime record.
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = admitted, .writes = &.{.{ .key = "a", .value = json }} });
+        try db.runUntilIdle();
+        const graph = db.core.index_manager.graphIndex("g").?;
+        const artifact_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(a, "a", "g", "link", "b", "a");
+        defer a.free(artifact_key);
+        const state_key = try internal_keys.graphDirectStateKeyAlloc(a, "a", "g");
+        defer a.free(state_key);
+        const lifetime_key = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(a, artifact_key, "g", graph.config.coverage_generation, state_key);
+        defer a.free(lifetime_key);
+        const artifact = try db.core.store.get(a, artifact_key);
+        defer a.free(artifact);
+        var edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(a, artifact);
+        defer edge.deinit(a);
+        try std.testing.expectEqual(admitted, edge.ttl_created_ns);
+        if (mixed) {
+            const lifetime = try db.core.store.get(a, lifetime_key);
+            defer a.free(lifetime);
+            try std.testing.expectEqual(admitted, std.mem.readInt(u64, lifetime[0..8], .big));
+        }
+        db.close();
+        db = try DB.open(a, directory.path(), options);
+        _ = try projectGraphFieldContributionsForRepair(db.async_context, "g", "a");
+        const reopened_graph = db.core.index_manager.graphIndex("g").?;
+        var live = try reopened_graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, admitted + std.time.ns_per_hour - 1);
+        defer live.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), live.edges.len);
+        var expired = try reopened_graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, admitted + 2 * std.time.ns_per_hour);
+        defer expired.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), expired.edges.len);
+        // A missing artifact can be reconstructed only when a contributor
+        // lifetime survives. Direct-only edges require explicit re-admission.
+        try db.core.store.delete(artifact_key);
+        if (!mixed) {
+            try std.testing.expectError(error.GraphEdgeTtlMigrationRequired, projectGraphFieldContributionsForRepair(db.async_context, "g", "a"));
+            continue;
+        }
+        _ = try projectGraphFieldContributionsForRepair(db.async_context, "g", "a");
+        var recovered = try reopened_graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, admitted + 2 * std.time.ns_per_hour);
+        defer recovered.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), recovered.edges.len);
+        // Corrupt lifetime authority is rejected before applying field edges.
+        try db.core.store.put(lifetime_key, "invalid");
+        try std.testing.expectError(error.InvalidGraphEdgeTtlLifetime, projectGraphFieldContributionsForRepair(db.async_context, "g", "a"));
+    }
+}
+
 test "external vector compatibility declaration rejects missing and mismatched writer identity" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -149635,6 +150182,50 @@ test "external vector compatibility declaration rejects missing and mismatched w
     // Withdrawing the receipt permits an acquisition update to retain hidden
     // vector bytes; source search independently requires the exact receipt.
     try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
+}
+
+test "time series prepared rows validate external vector receipts" {
+    for ([_][]const u8{ "document", "relational" }) |mode| {
+        const alloc = std.testing.allocator;
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+        defer alloc.free(path);
+        var db = try DB.open(alloc, path, .{});
+        defer db.close();
+        if (std.mem.eql(u8, mode, "relational")) {
+            const columns = [_]schema_mod.RelationalColumn{
+                .{ .name = "metadata", .path = "metadata", .column_type = .json, .is_json = true, .json_kind = .any, .allows_null = true },
+                .{ .name = "revision", .path = "revision", .column_type = .string, .allows_null = true },
+            };
+            try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        }
+        try db.addIndex(.{
+            .name = "external_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"external_vector_space\":\"recipe-v1\"}",
+        });
+        try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+            .writes = &.{.{ .key = "missing", .value = "{\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        }));
+        try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+            .writes = &.{.{ .key = "wrong", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"other\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        }));
+        try db.batch(.{
+            .writes = &.{.{ .key = "matched", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        });
+        try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+            .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}}}" }},
+            .sync_level = .full_index,
+        }));
+        // Withdrawing the receipt permits an acquisition update to retain hidden
+        // vector bytes; source search independently requires the exact receipt.
+        try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
+    }
 }
 
 test "scalar text asset chunks track parent updates and retirement" {

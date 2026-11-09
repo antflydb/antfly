@@ -357,3 +357,7 @@ __all__ += ["resource_reference", "trace_event"]
 from .exceptions import AntflyHTTPError, AntflyNotFoundError, AntflyResponseError
 
 __all__ += ["AntflyHTTPError", "AntflyNotFoundError", "AntflyResponseError"]
+
+from .time_series import fixed_duration_nanoseconds, series_query
+
+__all__ += ["fixed_duration_nanoseconds", "series_query"]
