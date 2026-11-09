@@ -144,6 +144,30 @@
       "commit": "ea0138e2d2b239fb08a8fc7cdb3c468fac221b82",
       "validation": "pending after merge"
     },
-    "wrapper_correction": "Local profiling wrapper now propagates the importer exit code; earlier successful wrapper exit codes did not establish importer success."
+    "wrapper_correction": "Local profiling wrapper now propagates the importer exit code; earlier successful wrapper exit codes did not establish importer success.",
+    "scoped_index_read_regression": {
+      "passed": 1,
+      "failed": 0,
+      "leaks": 0,
+      "build_steps": 86
+    },
+    "main_memory_fixture_correction": {
+      "prior_aggregate_embedded_capi": {
+        "passed": 399,
+        "skipped": 3,
+        "failed": 2,
+        "leaks": 0
+      },
+      "cause": "The new main memory test helper encoded empty anonymous tuple request bodies as JSON arrays. Inspect requires an object for its page options.",
+      "correction": "Encode empty request bodies as explicit objects; API validation remains unchanged.",
+      "focused_memory_suite": {
+        "passed": 24,
+        "skipped": 1,
+        "failed": 0,
+        "leaks": 0,
+        "build_steps": 75
+      },
+      "aggregate_rerun": "pending"
+    }
   }
 }

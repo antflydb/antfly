@@ -12097,10 +12097,13 @@ test "capi native memory decision explanation provenance survives reopen and scr
 }
 
 fn nativeMemoryTestCall(handle: ?*anyopaque, alloc: Allocator, principal: []const u8, action: @import("../memory/service.zig").Action, body: anytype, token: []const u8, name: []const u8) ![]const u8 {
-    const request = try std.json.Stringify.valueAlloc(alloc, .{ .action = action, .principal = principal, .id = name, .body = body, .idempotency_key = token }, .{});
+    // An untyped .{} is an empty tuple and JSON encodes it as []. Empty
+    // memory request bodies are objects, including inspect's page options.
+    const request_body = if (comptime @TypeOf(body) == @TypeOf(.{})) @as(struct {}, .{}) else body;
+    const request = try std.json.Stringify.valueAlloc(alloc, .{ .action = action, .principal = principal, .id = name, .body = request_body, .idempotency_key = token }, .{});
     var output: capi.Buffer = .{};
     const code = antfly_db_memory_json(handle, .fromSlice("personal"), .fromSlice(request), &output);
-    if (code != .ok) std.debug.print("memory C ABI: {s}\n", .{std.mem.span(capi.lastErrorDetail())});
+    if (code != .ok) std.debug.print("memory C ABI action={s}: {s}\n", .{ @tagName(action), std.mem.span(capi.lastErrorDetail()) });
     try std.testing.expectEqual(capi.ErrorCode.ok, code);
     defer std.heap.c_allocator.free(output.ptr.?[0..output.len]);
     return alloc.dupe(u8, output.ptr.?[0..output.len]);
