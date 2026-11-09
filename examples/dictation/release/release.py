@@ -27,6 +27,7 @@ import plistlib
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -39,10 +40,20 @@ HERE = Path(__file__).resolve().parent
 POLICY = json.loads((HERE / "policy.json").read_text())
 SHARED_RELEASE_DIR = HERE.parents[2] / "scripts/release"
 sys.path.append(str(SHARED_RELEASE_DIR))
-from verify_release_ledger import verify_payload  # noqa: E402 — anchored repository imports
-from download_objectstorage import PublicReader, restore_payload  # noqa: E402 — anchored repository imports
-from objectstore_channel import ConditionalWriteConflict  # noqa: E402 — anchored repository imports
-from create_github_release import get_release_by_tag, with_complete_assets  # noqa: E402 — anchored repository imports
+from verify_release_ledger import (
+    verify_payload,
+)  # noqa: E402 — anchored repository imports
+from download_objectstorage import (
+    PublicReader,
+    restore_payload,
+)  # noqa: E402 — anchored repository imports
+from objectstore_channel import (
+    ConditionalWriteConflict,
+)  # noqa: E402 — anchored repository imports
+from create_github_release import (
+    get_release_by_tag,
+    with_complete_assets,
+)  # noqa: E402 — anchored repository imports
 
 SPARKLE = "http://www.andymatuschak.org/xml-namespaces/sparkle"
 ET.register_namespace("sparkle", SPARKLE)
@@ -50,6 +61,7 @@ TAG = re.compile(
     r"dictation/v(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)(?:-(beta|rc)\.([1-9][0-9]{0,2}))?\Z"
 )
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def run(*args, **kwargs):
@@ -361,6 +373,9 @@ def verify_source(identity):
         "scripts/release/release_channels.py",
         "scripts/release/release_lines.py",
         "scripts/release/requirements.lock",
+        ".github/actions/upload-ci-artifact/action.yml",
+        ".github/actions/download-ci-artifact/action.yml",
+        "scripts/ci/artifact_exchange.py",
     ):
         encoded = urllib.parse.quote(path, safe="/")
         current = gh_api(
@@ -521,6 +536,37 @@ def write_manifest(identity, directory, key):
     )
 
 
+def validate_manifest(identity, document):
+    validate_identity(identity)
+    if not isinstance(document, dict):
+        raise ValueError("Invalid Dictation release ledger")
+    entries = document.get("artifacts")
+    expected_names = {
+        "Antfly-Dictation-" + identity["version"] + "-arm64.zip",
+        "appcast.xml",
+        "SHA256SUMS",
+    }
+    if (
+        document.get("schema_version") != 2
+        or document.get("product") != "antfly-dictation"
+        or document.get("identity") != identity
+        or not isinstance(entries, list)
+        or len(entries) != len(expected_names)
+        or any(
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("name"), str)
+            or type(entry.get("size")) is not int
+            or entry["size"] < 0
+            or not isinstance(entry.get("sha256"), str)
+            or not SHA256.fullmatch(entry["sha256"])
+            for entry in entries
+        )
+        or {entry.get("name") for entry in entries} != expected_names
+    ):
+        raise ValueError("Dictation release ledger identity or member set differs")
+    public_key(document["signing_public_key"])
+
+
 def validate_payload(identity, directory, ledger_sha256=None):
     validate_identity(identity)
     ledger_path = directory / "artifacts.json"
@@ -533,21 +579,44 @@ def validate_payload(identity, directory, ledger_sha256=None):
         expected_digest,
     )
     document = json.loads(ledger_path.read_bytes())
-    expected_names = {
-        "Antfly-Dictation-" + identity["version"] + "-arm64.zip",
-        "appcast.xml",
-        "SHA256SUMS",
-    }
-    if (
-        document.get("schema_version") != 2
-        or document.get("product") != "antfly-dictation"
-        or document.get("identity") != identity
-        or {entry["name"] for entry in document["artifacts"]} != expected_names
-    ):
-        raise ValueError("Dictation release ledger identity or member set differs")
-    public_key(document["signing_public_key"])
+    validate_manifest(identity, document)
     verify_feed(identity, directory)
     return document
+
+
+def restore_published(identity, ledger_sha256, out_dir, reader_factory=None):
+    """Restore the publisher-pinned signed payload without storage credentials."""
+    validate_identity(identity)
+    if not SHA256.fullmatch(ledger_sha256):
+        raise ValueError("Invalid published ledger digest")
+    if out_dir.exists():
+        raise ValueError("Published payload output must not already exist")
+    reader_factory = reader_factory or PublicReader
+    base = POLICY["public_base_url"] + "/releases/" + identity["version"]
+    ledger_bytes = reader_factory(base).read_optional("artifacts.json")
+    if (
+        ledger_bytes is None
+        or hashlib.sha256(ledger_bytes).hexdigest() != ledger_sha256
+    ):
+        raise ValueError("Published ledger is missing or its digest differs")
+    document = json.loads(ledger_bytes)
+    validate_manifest(identity, document)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=out_dir.parent, prefix="dictation-mirror-"
+    ) as temporary:
+        stage = Path(temporary) / "payload"
+        stage.mkdir()
+        (stage / "artifacts.json").write_bytes(ledger_bytes)
+        for entry in document["artifacts"]:
+            data = reader_factory(base, max_bytes=entry["size"]).read_optional(
+                entry["name"]
+            )
+            if data is None:
+                raise ValueError("Published artifact is missing: " + entry["name"])
+            (stage / entry["name"]).write_bytes(data)
+        validate_payload(identity, stage, ledger_sha256)
+        stage.rename(out_dir)
 
 
 def promote_feed(storage, channel, identity, feed):
@@ -878,6 +947,10 @@ def main():
     p = sub.add_parser("mirror")
     p.add_argument("identity", type=Path)
     p.add_argument("directory", type=Path)
+    p = sub.add_parser("restore-published")
+    p.add_argument("identity", type=Path)
+    p.add_argument("--ledger-sha256", required=True)
+    p.add_argument("--out-dir", type=Path, required=True)
     for command in ("publish", "recover"):
         p = sub.add_parser(command)
         if command == "publish":
@@ -925,6 +998,10 @@ def main():
         verify_unsigned_zip(args.archive)
     elif args.command == "mirror":
         publish_github_mirror(json.loads(args.identity.read_text()), args.directory)
+    elif args.command == "restore-published":
+        restore_published(
+            json.loads(args.identity.read_text()), args.ledger_sha256, args.out_dir
+        )
     elif args.command in {"publish", "recover"}:
         from storage import ObjectStorage
 
@@ -938,9 +1015,11 @@ def main():
                 json.loads(args.identity.read_text()),
                 args.directory,
                 storage,
-                source_verifier=(lambda identity: None)
-                if args.provider == "local"
-                else verify_source,
+                source_verifier=(
+                    (lambda identity: None)
+                    if args.provider == "local"
+                    else verify_source
+                ),
             )
         else:
             identity = recover(
