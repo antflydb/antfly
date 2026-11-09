@@ -3279,12 +3279,32 @@ pub const Store = struct {
     /// ignored (always treated as non-durable); `plan.context` must stay
     /// valid until the returned ticket resolves.
     pub fn stageRideAlong(self: *Store, plan: MutationPlan) !Ticket {
+        if (test_ride_along_hook) |hook| hook(plan.estimated_bytes, self.ride_along_pending_bytes);
         const staged = try self.enqueueRequest(plan, true);
         staged.drive(); // always a no-op: ride-along requests never lead.
         self.ensureRideAlongFlushStarted();
         if (self.ride_along_pending_bytes >= self.ride_along_byte_threshold) self.forceDrainDurable();
         return staged.ticket();
     }
+
+    // Diagnostic-only: lets `write_amplification_bench_test.zig` attribute
+    // every `stageRideAlong` call's own `estimated_bytes` (and the pending
+    // backlog it joins) during a measured run, since the stage tag active
+    // when a self-forced drain's fsync actually happens belongs to whatever
+    // OTHER write is running at that moment -- never necessarily the
+    // ride-along member whose bytes tipped the threshold -- so the
+    // sync/commit counters' own stage attribution cannot answer "what is
+    // actually staged" on its own. Never set outside a test.
+    pub var test_ride_along_hook: ?*const fn (estimated_bytes: usize, pending_before: usize) void = null;
+
+    // Diagnostic-only: lets `write_amplification_bench_test.zig` classify
+    // every KV mutation in a `Txn`'s pending set (primary rows, index-
+    // catalog mutations) by key as that transaction commits, to attribute
+    // bytes/write by record kind instead of only by which code stage ran.
+    // `Txn.commitStaged` below is the one place that already walks every
+    // pending mutation to compute `estimated_bytes`; this rides that same
+    // walk instead of adding a second one. Never set outside a test.
+    pub var test_commit_key_hook: ?*const fn (key: []const u8, bytes: usize) void = null;
 
     /// Lead the queue right now, forcing whatever is pending (ride-along
     /// or not) into one durable group commit, regardless of any member's
@@ -4394,9 +4414,13 @@ pub const Txn = struct {
             const pending = self.pending.items[pendingNode(current).ordinal];
             mutations[i] = .{ .key = pending.key, .value = pending.value orelse "", .is_delete = pending.value == null };
             estimated_bytes += pending.key.len + mutations[i].value.len;
+            if (Store.test_commit_key_hook) |hook| hook(mutations[i].key, mutations[i].key.len + mutations[i].value.len);
             node = current.next();
         }
-        for (self.index_catalog_pending.items) |m| estimated_bytes += m.key.len + m.value.len;
+        for (self.index_catalog_pending.items) |m| {
+            estimated_bytes += m.key.len + m.value.len;
+            if (Store.test_commit_key_hook) |hook| hook(m.key, m.key.len + m.value.len);
+        }
 
         const context = try allocator.create(PrimaryCommitContext);
         errdefer allocator.destroy(context);
