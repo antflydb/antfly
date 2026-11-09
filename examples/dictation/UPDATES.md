@@ -159,6 +159,36 @@ and the app requires signed feed metadata and verification before extraction.
 The Sparkle release tools are downloaded by exact version and SHA-256 from
 `release/policy.json`; the Swift package is pinned in `Package.resolved`.
 
+### Resuming a long Apple notarization
+
+The signing job submits to Apple without waiting, then saves a
+`dictation-notarization` artifact for ninety days before polling. It contains the
+exact signed ZIP, submission ID, release identity, and archive digest; private
+keys and the temporary signing keychain are excluded. The checkpoint uses the
+same GCS exchange as the other release handoffs (or Actions when disabled).
+
+A thirty-minute CI wait timeout does not cancel Apple's processing. Check the
+submission ID with `notarytool info`; if Apple rejects it, inspect the submission
+log and fix the reported issues. If it remains pending or becomes accepted,
+resume the **original** release run after it has completed:
+
+```sh
+gh workflow run dictation-release.yml --ref main -f resume_run_id=ORIGINAL_RUN_ID
+```
+
+The controller accepts only a completed default-branch release whose protected
+signing job successfully saved its checkpoint. It checks the original controller,
+current tag and policy, archive hash, Developer ID signatures and team, then waits
+on the same Apple submission. It never rebuilds, re-signs, or resubmits the app.
+Signing and publication still require their normal environment approvals. A
+resume can itself time out; retry with the same **original** run ID. An empty
+manual dispatch remains the storage-only probe and cannot publish.
+
+Releases made before checkpoint support cannot be resumed this way. Keep their
+submission IDs for diagnosis; a fresh run is needed if their runner exits before
+saving a signed artifact. Do not move a tag or rebuild once its version has been
+reserved or its immutable release ledger has been published.
+
 A separate publication job uses the existing **release-promotion** environment
 and `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_ENDPOINT_URL` secrets.
 The canonical bucket is **antfly-releases**. Apple credentials remain isolated
