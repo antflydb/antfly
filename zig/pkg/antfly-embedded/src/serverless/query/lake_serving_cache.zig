@@ -1175,6 +1175,11 @@ pub const Reader = struct {
             };
         }
     };
+    fn windowFailed(self: *Reader, trace: *@import("lake_read_context.zig").IoTrace, key: [32]u8, err: anyerror) !void {
+        try self.context.ensureActive();
+        if (err == error.Canceled or err == error.DeadlineExceeded) return err;
+        trace.failReadAhead(key);
+    }
     fn readAheadLease(self: *Reader, alloc: Allocator, read: ranges.RangeRead) !?ranges.RangeLease {
         const trace = self.context.trace orelse return null;
         const window = 1024 * 1024;
@@ -1193,6 +1198,7 @@ pub const Reader = struct {
         var held: [3]?ranges.RangeLease = @splat(null);
         defer for (held) |lease| if (lease) |value| value.release();
         var work: [3]WindowRead = undefined;
+        var failure_keys: [3][32]u8 = undefined;
         var tasks: [3]?Scheduling.Task(anyerror!ranges.RangeLease) = @splat(null);
         defer if (self.context.io) |io| {
             for (&work, &tasks) |*item, *task| if (task.*) |*active| {
@@ -1208,17 +1214,18 @@ pub const Reader = struct {
             widened.range = .{ .offset = offset, .len = @min(window, end - offset) };
             const key = try self.rangeKey(alloc, widened);
             defer alloc.free(key);
+            std.crypto.hash.Blake3.hash(key, &failure_keys[count], .{});
             if (try self.lookupRangeLease(alloc, widened, key)) |lease| {
                 held[count] = lease;
             } else {
-                if (!trace.reserveReadAhead(widened.range.len)) return null;
+                if (trace.readAheadFailed(failure_keys[count]) or !trace.reserveReadAhead(widened.range.len)) return null;
                 work[count] = .{ .reader = self, .read = widened };
                 if (self.context.parallel_object_io) if (self.context.io) |io| {
                     tasks[count] = self.scheduler.submitIoTransient(io, 2 * window, WindowRead.run, .{&work[count]});
                 };
-                if (tasks[count] == null) held[count] = readExactLease(self, alloc, widened) catch |err| switch (err) {
-                    error.OutOfMemory => return null,
-                    else => return err,
+                if (tasks[count] == null) held[count] = readExactLease(self, alloc, widened) catch |err| {
+                    try self.windowFailed(trace, failure_keys[count], err);
+                    return null;
                 };
             }
             offset += widened.range.len;
@@ -1227,8 +1234,8 @@ pub const Reader = struct {
             const outcome = active.await(self.context.io.?);
             task.* = null;
             held[i] = outcome catch |err| {
-                try self.context.ensureActive();
-                return err;
+                try self.windowFailed(trace, failure_keys[i], err);
+                return null;
             };
         };
         try self.context.ensureActive();
@@ -2571,4 +2578,57 @@ test "external lake source read ahead tiny files share one verified transfer acr
     try std.testing.expectEqual(@as(u64, 1), trace.snapshot().source_provider_reads);
     try std.testing.expectEqual(@as(u64, bytes.len), trace.snapshot().source_provider_bytes);
     try std.testing.expectEqual(@as(u64, bytes.len), trace.snapshot().read_ahead_bytes);
+}
+
+test "external lake source read ahead provider failures fall back once per request to authoritative exact reads" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    const bytes = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / 1024);
+    var put = try client.putObject("bucket", "data", bytes, .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        wide: std.atomic.Value(usize) = .init(0),
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (options.range.?.length.? > 64 * 1024) {
+                _ = self.wide.fetchAdd(1, .monotonic);
+                return error.TestOptionalUnavailable;
+            }
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+    provider.vtable.get_object = Provider.get;
+    const base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+    for ([_]bool{ false, true }) |parallel| {
+        provider.wide.store(0, .release);
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        var trace: @import("lake_read_context.zig").IoTrace = .{};
+        var scheduler: Reader.Scheduling.Scheduler = .{};
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(9), .context = .{ .io = io, .trace = &trace, .parallel_object_io = parallel }, .scheduler = &scheduler };
+        var read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "data", .byte_len = bytes.len, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 0, .len = 64 * 1024 }, .purpose = .parquet_column_chunk };
+        for ([_]u64{ 0, 128 * 1024 }) |offset| {
+            read.range.offset = offset;
+            const lease = try reader.reader().readPlannedLease(a, read);
+            defer lease.release();
+            try std.testing.expectEqualSlices(u8, bytes[@intCast(offset)..][0 .. 64 * 1024], lease.bytes);
+        }
+        try std.testing.expectEqual(@as(usize, 1), provider.wide.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 1), trace.snapshot().source_provider_errors);
+        try std.testing.expectEqual(@as(u64, 2 * 64 * 1024), trace.snapshot().source_provider_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    }
 }

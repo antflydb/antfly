@@ -925,13 +925,22 @@ fn readAheadPiece(a: A, store: stores.ArtifactStore, piece: Piece, cancellation:
     defer if (admission) |lease| lease.release();
     var held = (try cached.cache.lookupImmutableBlockLease(a, cached.scope, pack.artifact_id, @intCast(pack.byte_len), digest, cached.context)) orelse cold: {
         const trace = cached.context.trace orelse return null;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update(&cached.scope);
+        hash.update(pack.artifact_id);
+        hash.update(&digest);
+        const failure_key = hash.finalResult();
+        if (trace.readAheadFailed(failure_key)) return null;
         admission = local.sql_parallel_scheduler.global().reserveIo(@intCast(pack.byte_len * 2)) orelse return null;
         if (!trace.reserveReadAhead(pack.byte_len)) return null;
-        break :cold artifacts.readArtifactLease(a, store, pack, cancellation, cached) catch |err| switch (err) {
-            // Optional read-ahead must not make unrelated damaged bytes or
-            // memory pressure poison an independently authenticated range.
-            error.ArtifactIntegrityMismatch, error.OutOfMemory => return null,
-            else => return err,
+        break :cold artifacts.readArtifactLease(a, store, pack, cancellation, cached) catch |err| {
+            try cached.context.ensureActive();
+            try cancellation.check();
+            if (err == error.Canceled or err == error.DeadlineExceeded) return err;
+            // Optional provider failures cannot replace the required range's
+            // own result. Remember failures only within this outer request.
+            trace.failReadAhead(failure_key);
+            return null;
         };
     };
     var owns = true;
@@ -979,6 +988,12 @@ fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, canc
         const length: usize = @intCast(piece.ref.byte_len);
         const digest = try stores.sha256DigestFromChecksum(piece.ref.checksum);
         if (try cache.cache.lookupImmutableBlockLease(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context)) |lease| return lease;
+        // A completed coalesced flight is already verified demand data.
+        // Reuse it before considering another speculative whole-pack fetch.
+        if (coalesced) |group| if (group.shared) |lease| {
+            const result: *PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
+            if (try result.get(piece)) |value| return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, try PhysicalPin.retain(lease, value));
+        };
         if (!publication) if (try readAheadPiece(a, store, piece, cancellation, cache)) |verified| return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, verified);
         const verified = if (coalesced) |group| try group.verifiedLease(a, piece, cache) else direct: {
             const bytes = try artifacts.readPhysicalRange(a, store, piece.pack.?.artifact_id, piece.pack_offset, length, cancellation, cache);
@@ -2947,6 +2962,9 @@ test "external lake demanded pack read ahead reuses distant blocks and respects 
     var surviving = try readPieceLeaseCoalesced(a, damaged, owner.directory.blocks[15], .none, fallback, null, false);
     defer surviving.deinit();
     try std.testing.expectEqualSlices(u8, bytes[15 * block_bytes ..][0..block_bytes], surviving.bytes());
+    var next_survivor = try readPieceLeaseCoalesced(a, damaged, owner.directory.blocks[7], .none, fallback, null, false);
+    defer next_survivor.deinit();
+    try std.testing.expectEqualSlices(u8, bytes[7 * block_bytes ..][0..block_bytes], next_survivor.bytes());
     try std.testing.expectEqual(@as(u64, 1), fresh.snapshot().provider_errors);
     var expired = cached;
     expired.context.deadline_ns = 0;

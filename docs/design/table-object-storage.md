@@ -250,8 +250,11 @@ are checked first, so upgrading does not discard their restart benefit.
 
 Text and source windows share one atomic 8 MiB reservation allowance across all
 composed leaves and refills; failed admissions also consume it. Each widened
-read additionally obtains conservative node-wide I/O memory admission. Small
-caches, exhausted allowances and saturated nodes retain the exact-range path.
+read additionally obtains conservative node-wide I/O memory admission. A bounded
+request-local failure memo prevents repeated failed speculation across refills;
+provider errors fall back to the exact required read, while cancellation,
+deadlines and reader authority failures remain precise. Already verified
+coalesced demand data takes precedence over new speculation. Small caches, exhausted allowances and saturated nodes retain the exact-range path.
 No archive-wide segment traversal or arbitrary neighbouring file fetch is
 introduced. A failed optional whole-pack checksum falls back to independently
 authenticated required ranges. Parquet page-index discovery runs inside admitted

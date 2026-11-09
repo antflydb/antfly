@@ -23,6 +23,29 @@ const Allocator = std.mem.Allocator;
 /// a selective query into an unbounded speculative scan.
 pub const ReadAheadBudget = struct {
     used: std.atomic.Value(u64) = .init(0),
+    failure_mutex: std.atomic.Mutex = .unlocked,
+    failures: [16]?[32]u8 = @splat(null),
+    failure_cursor: usize = 0,
+    pub fn hasFailure(self: *ReadAheadBudget, key: [32]u8) bool {
+        while (!self.failure_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.failure_mutex.unlock();
+        for (self.failures) |entry| if (entry) |value| if (std.mem.eql(u8, &value, &key)) return true;
+        return false;
+    }
+    pub fn recordFailure(self: *ReadAheadBudget, key: [32]u8) void {
+        while (!self.failure_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.failure_mutex.unlock();
+        for (&self.failures) |*entry| {
+            if (entry.*) |value| {
+                if (std.mem.eql(u8, &value, &key)) return;
+            } else {
+                entry.* = key;
+                return;
+            }
+        }
+        self.failures[self.failure_cursor] = key;
+        self.failure_cursor = (self.failure_cursor + 1) % self.failures.len;
+    }
     pub fn reserve(self: *ReadAheadBudget, bytes: u64) bool {
         const maximum = 8 * 1024 * 1024;
         var used = self.used.load(.monotonic);
@@ -69,6 +92,12 @@ pub const IoTrace = struct {
     read_ahead_budget: ReadAheadBudget = .{},
     /// Composed leaves/refills share their outer request's one allowance.
     read_ahead_shared: ?*ReadAheadBudget = null,
+    pub fn readAheadFailed(self: *IoTrace, key: [32]u8) bool {
+        return (self.read_ahead_shared orelse &self.read_ahead_budget).hasFailure(key);
+    }
+    pub fn failReadAhead(self: *IoTrace, key: [32]u8) void {
+        (self.read_ahead_shared orelse &self.read_ahead_budget).recordFailure(key);
+    }
     pub fn reserveReadAhead(self: *IoTrace, bytes: u64) bool {
         const budget = self.read_ahead_shared orelse &self.read_ahead_budget;
         if (!budget.reserve(bytes)) return false;
@@ -310,6 +339,10 @@ test "external lake read ahead reservations are bounded across retries and reade
         try std.testing.expect(fresh.reserveReadAhead(1024 * 1024));
         try std.testing.expect(!trace.reserveReadAhead(1));
         try std.testing.expect(!fresh.reserveReadAhead(1));
+        trace.failReadAhead(@splat(42));
+        try std.testing.expect(fresh.readAheadFailed(@splat(42)));
+        var independent: IoTrace = .{};
+        try std.testing.expect(!independent.readAheadFailed(@splat(42)));
     }
 }
 
