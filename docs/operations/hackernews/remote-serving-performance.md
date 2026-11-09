@@ -1111,3 +1111,48 @@ these matching artifacts, including hierarchy, pending enrichment, maintenance,
 pagination and restart. The existing 180-second maintenance deadline and reader
 grace remain unchanged, and the strict background-log assertion found no
 `InvalidSocketOption`.
+
+### Demand-read candidate qualification (2026-11-09)
+
+Native revision `d2cd8141f9` passed the 98-step ReleaseSafe server/Lite build and
+141-function export check. Server SHA-256:
+`c83e22558ffa46bd9e7dbdfc0f6408e034359a20d5a318a5abf32da300bd9799`;
+Lite SHA-256:
+`aa83c3dcad3751ea846d787fb50965f850c292f16e9682bee4978ff38bd56ac3`.
+The final selected regression gates passed 14 focused and 85 broader cases
+(overlapping selections), with zero failures, skips or leaks.
+
+Both real-GCS cases passed using the same original settings above. Parentheses
+contain the preceding candidate; these are individual developer-host samples,
+not a controlled A/B or full-archive qualification.
+
+| Mode | Warm median | First after restart | Cache-cleared query |
+|---|---:|---:|---:|
+| Stored source | 12.14 ms (7.86) | 1.80 s (2.36) | 4.38 s (5.26) |
+| Parquet hydration | 7.66 ms (9.09) | 1.73 s (1.28) | 4.75 s (5.78) |
+
+Cold sampled RSS was 161/268 MiB and footprint was 188/238 MiB
+(stored/hydration). Both cases verified two preparations across three leaf calls,
+including resumed pending cursors, and concurrent ingestion/publication.
+
+Cold query CPU was 368/355 ms (stored/hydration); most elapsed time remains
+outside CPU execution. The stored-source leaf recorded opening at 262 ms,
+ranking at 2.02 s and 21 covered artifact loads (5.01 MB), compared with
+630 ms and 36 loads (2.88 MB) previously. Read-ahead trades fewer requests for
+more bytes. Its fresh-process native-hydration aggregate was 1.90 s.
+The Parquet leaf recorded opening at 289 ms and ranking at 2.15 s, with eight
+covered artifact loads (0.62 MB) and 33 source loads (3.89 MB). Its fresh-process
+source-hydration aggregate was 2.01 s. Process aggregates can include startup or
+background work; overlapping provider durations are not wall time, and these
+counters do not cover every authentication, catalog or billing operation.
+
+The cold samples are 17–18% lower; warm and restart changes are mixed. The
+sub-second and 10x goals remain unmet. Next work should reduce the remaining
+dependent ranking reads and batch/prefetch identity and winning-row hydration
+blocks, guided by these request profiles rather than larger speculative reads.
+
+The assembled Hacker News HTTP regression passed in 175 seconds, including
+hierarchy, pending enrichment, maintenance, pagination and restart, with the
+existing deadlines and strict background-log assertion unchanged. All 1,690
+task-owned GCS versions were deleted, absence verified, and credential files
+removed. Raw qualification artifacts remain outside the PR.
