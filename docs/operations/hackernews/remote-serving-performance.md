@@ -1054,3 +1054,60 @@ Main at `7db8b07aee` subsequently merged cleanly, without changing the transport
 sources or this HN fixture. The HTTP library gate passed again using its verified
 cache. The optimized binaries above precede that merge; full CI must validate
 the final merged revision after maintainer approval.
+
+### Publication opening bundles and restart inventory
+
+Candidate `a16071381e` implements the [cold-opening design](../../design/table-object-storage.md#cold-opening-and-restart-recovery):
+publication-wide verified metadata/range bundles, bounded parallel admission,
+clean disk-inventory recovery, early optional restoration and request-owned I/O
+profiles. Reader protocol 98 retains protocol-97 compatibility; metadata
+capability 85 fences new catalog writes. Existing publications gain bundles on
+publication/rebuild. Source authority, reader protection and memory limits remain
+mandatory.
+
+The fresh ReleaseSafe server/Lite build passed 98/98 steps and the export boundary
+check: 141 public functions, no internal exports. Server SHA-256:
+`0ef8ca80e16596f70a003c4a3d6a22dd0b34a5940e4211aa0c5051bfd70fc845`.
+Matching Lite SHA-256:
+`74c0e520529977814720d06367aebd4fb7ebf051b3039f786b8c5832a925fc04`.
+All 104 final focused query, recovery, cancellation, preparation-budget and
+metric-exposition regressions passed without failures, skips or leaks.
+
+Both real-GCS composed cases passed with the same 10,000-comment corpus,
+`database`, highlights, a 64 MiB cache, zero additional pending rows and five warm
+samples. Parentheses contain the preceding original-settings candidate above;
+these are developer-machine samples with different host loads, not a matched A/B.
+
+| Mode | Warm median | First after restart | Cache-cleared query |
+|---|---:|---:|---:|
+| Stored source | 7.86 ms (7.47) | 2.36 s (2.76) | 5.26 s (7.36) |
+| Parquet hydration | 9.09 ms (9.04) | 1.28 s (0.72) | 5.78 s (7.82) |
+
+Restart-plus-query totals were 2.75/1.73 s; empty-cache startup-plus-query totals
+were 5.58/6.10 s (stored/hydration). Sampled peak RSS was 220/261 MiB and footprint
+193/230 MiB. One-minute host loads were 11.3/33.6 with two/one other Zig compilers.
+Both cases verified two preparations across three leaf calls, retained pending
+pagination, concurrent ingestion/publication and exact highlighted hits. All
+1,710 task-owned GCS object versions were deleted, absence verified, and private
+credential files removed.
+
+The retained request profiles show bundle opening at 0.63/0.51 s with an empty
+cache and below 7 ms after restart. The stored-source cold request recorded 36
+covered artifact loads (2.88 MB), 5.86 s summed provider time and peak concurrency
+four; overlapping I/O sums are not wall time. Hydration recorded 11 covered
+artifact loads (0.35 MB); its Parquet data reads are outside this artifact trace.
+These profiles cover immutable Antfly artifact/cache loads, not every provider
+metadata/authentication operation, Parquet read, HTTP request or billing event.
+
+The empty-cache samples are 26–29% lower than the preceding samples, while restart
+results are mixed and warm latency remains about 8–9 ms. This does not establish a
+10× improvement, DuckDB parity or archive-wide latency. Further cold work should
+use the remaining on-demand artifact and Parquet reads identified by these
+profiles. The fixture retains only bounded diagnostic snapshots; its inventory
+counter prefix filter was corrected without rerunning these timing cases.
+
+The assembled Hacker News managed-lake HTTP regression passed in 174 seconds on
+these matching artifacts, including hierarchy, pending enrichment, maintenance,
+pagination and restart. The existing 180-second maintenance deadline and reader
+grace remain unchanged, and the strict background-log assertion found no
+`InvalidSocketOption`.

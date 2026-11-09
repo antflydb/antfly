@@ -602,7 +602,9 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             return {
                 k: float(v)
                 for line in r.text.splitlines()
-                if line.startswith("antfly_lake_query_")
+                if line.startswith(
+                    ("antfly_lake_query_", "antfly_lake_disk_cache_inventory_")
+                )
                 for k, v in [line.split()]
             }
 
