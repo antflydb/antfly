@@ -18,5 +18,6 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 pub const local_test_sources = @import("local_test_sources.zig");
 test {
     _ = @import("api/public_table_http.zig");
+    _ = @import("api/table_contract.zig");
     _ = @import("serverless/api/http_handler.zig");
 }

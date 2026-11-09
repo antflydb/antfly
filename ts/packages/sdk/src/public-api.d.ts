@@ -18529,6 +18529,12 @@ export interface components {
             template?: string;
             /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor). */
             source_artifact_name?: string;
+            /**
+             * @description pdf_page_images requires kind=embedding and a dense index. It consumes an original PDF URI selected by field or template and embeds its rendered pages. Upstream artifacts (source_artifact_name) and text chunking are not supported. Native field selectors address literal root keys; use a raw template for nested resource URIs.
+             * @default text
+             * @enum {string}
+             */
+            embedding_input?: "text" | "pdf_page_images";
             /** @description Expected embedding dimension for embedding enrichments. */
             expected_dims?: number;
             /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently. */
@@ -20212,6 +20218,11 @@ export interface components {
             template?: string;
             source_artifact_name?: string;
             expected_dims?: number;
+            /**
+             * @description Effective embedding input mode; PDF pages are rasterized before embedding.
+             * @enum {string}
+             */
+            embedding_input?: "text" | "pdf_page_images";
             /** @description Optional stable model/token-space identifier asserted for this embedding artifact. */
             vector_space?: string;
             chunk_size?: number;
