@@ -8975,9 +8975,19 @@ test "memory streaming reads and proposal preparation preserve the final resourc
         store.resource_digest = @splat(3);
         var svc = store.service("alice", true, 10);
         _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"external\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"assertions\":[{\"id\":\"fact\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"Approved production policy\",\"evidence\":[{\"id\":\"external\"}]}]}", "external");
+        if (action == .prepare_consolidation) {
+            for ([_][]const u8{ "peer-1", "peer-2" }) |id| {
+                const claim: m.types.Assertion = .{ .id = id, .subject = "s", .predicate = "p", .value = "v", .statement = "Approved production policy", .evidence = &.{.{ .id = "external" }} };
+                _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{claim} }, .{}), id);
+            }
+        }
         svc.context.final_check_ptr = &store;
         svc.context.final_check_fn = ChangeAtFinish.finish;
+        const revision = store.revision;
         try std.testing.expectError(error.MemoryResourceChanged, svc.execute(a, action, "", "{}", if (action == .prepare_consolidation) "prepare" else ""));
+        try std.testing.expectEqual(revision, store.revision);
+        const proposals = try Store.scan(&store, a, "supersession-proposal/", null, 32);
+        try std.testing.expectEqual(@as(usize, 0), proposals.rows.len);
     }
 }
 
@@ -9536,4 +9546,127 @@ test "postmerge review utility migration bounds wide outcome bindings without sk
     const usage = try std.json.parseFromSliceLeaky(m.types.Usage, a, try alice.execute(a, .usage, ids[0], "{}", ""), .{});
     try std.testing.expect(usage.utility.complete);
     try std.testing.expectEqual(@as(u32, 5), usage.utility.successes);
+}
+
+test "memory utility migration final page stays on the retention lane" {
+    const NoModels = struct {
+        fn embed(ptr: *anyopaque, _: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.document_batches += 1;
+            return error.Forbidden;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = SemanticFixture.service(&store, 1);
+    const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"text\":\"Knowledge graph\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    var state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    state.utility_owner_ready = false;
+    try store.values.put(a, "control", try std.json.Stringify.valueAlloc(a, state, .{}));
+    _ = store.values.remove("cleanup");
+    const kind = try @import("scheduling.zig").maintenanceKind(svc.backend, a, 1, state);
+    try std.testing.expectEqual(.retention, kind);
+    svc.backend.embed_document = NoModels.embed;
+    svc.backend.embed = NoModels.embed;
+    _ = try svc.execute(a, .advance, "", "{}", "migration");
+    state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    std.debug.print("migration model calls={d} ready={any}\n", .{ store.document_batches, state.utility_owner_ready });
+    try std.testing.expectEqual(@as(usize, 0), store.document_batches);
+    try std.testing.expect(state.utility_owner_ready);
+}
+
+test "memory utility migration cleanup preserves live fork feedback" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const admin = store.service("admin", true, 500);
+    _ = try admin.execute(a, .create, "", "{\"features\":{\"lineage\":true}}", "create");
+    var alice = store.service("alice", false, 500);
+    alice.context.curator = true;
+    _ = try alice.execute(a, .fork_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageFork{ .id = "fork", .expected_revision = try SupersessionFixture.revision(admin, a) }, .{}), "fork");
+    alice.context.branch = "fork";
+    _ = try alice.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"fork-source\",\"text\":\"Fork fact\"}],\"assertions\":[{\"id\":\"fork-memory\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"Fork fact\",\"evidence\":[{\"id\":\"fork-source\"}]}]}", "source");
+    _ = try alice.execute(a, .outcome, "", "{\"id\":\"fork-outcome\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[\"fork-memory\"]}", "feedback");
+    const before = try std.json.parseFromSliceLeaky(m.types.Usage, a, try alice.execute(a, .usage, "fork-memory", "{}", ""), .{});
+    try std.testing.expectEqual(@as(u32, 1), before.utility.successes);
+    var state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    state.utility_owner_ready = false;
+    try store.values.put(a, "control", try std.json.Stringify.valueAlloc(a, state, .{}));
+    for (0..64) |i| _ = try admin.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "migration-cleanup-{d}", .{i}));
+    _ = try alice.execute(a, .get, "fork-memory", "{}", "");
+    const after = try std.json.parseFromSliceLeaky(m.types.Usage, a, try alice.execute(a, .usage, "fork-memory", "{}", ""), .{});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("\"fork-outcome\"", &digest, .{});
+    const path = try std.fmt.allocPrint(a, "outcome/{s}", .{std.fmt.bytesToHex(digest, .lower)});
+    const fence = try std.fmt.allocPrint(a, "forgotten-outcome/{s}", .{std.fmt.bytesToHex(digest, .lower)});
+    std.debug.print("migration live fork success before={d} after={d}, outcome_exists={any}, forgotten={any}\n", .{ before.utility.successes, after.utility.successes, store.values.contains(path), store.values.contains(fence) });
+    try std.testing.expectEqual(before.utility.successes, after.utility.successes);
+    try std.testing.expect(store.values.contains(path));
+    try std.testing.expect(!store.values.contains(fence));
+}
+
+test "memory preparation caches shared payload fingerprints and frozen pins" {
+    const Meter = struct {
+        fn get(ptr: *anyopaque, allocator: A, path: []const u8) !?m.Row {
+            const row = (try Store.get(ptr, allocator, path)) orelse return null;
+            if (std.mem.startsWith(u8, path, "assertion/") or std.mem.startsWith(u8, path, "history/")) {
+                const store: *Store = @ptrCast(@alignCast(ptr));
+                store.document_batches += row.json.len;
+                if (row.json.len > 64 * 1024) store.query_batches += 1;
+            }
+            return row;
+        }
+        fn metadata(ptr: *anyopaque, allocator: A, path: []const u8) !?m.Row {
+            const row = (try Store.get(ptr, allocator, path)) orelse return null;
+            var record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, allocator, row.json, .{});
+            record.assertion.steps = &.{};
+            return .{ .key = row.key, .json = try std.json.Stringify.valueAlloc(allocator, record, .{}), .version = row.version };
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    var svc = store.service("alice", true, 500);
+    const payload = try a.alloc(u8, 64 * 1024);
+    @memset(payload, 'x');
+    var first_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("\"a\"", &first_digest, .{});
+    var ids: std.ArrayList([]const u8) = .empty;
+    try ids.append(a, "a");
+    for (0..4096) |i| {
+        const id = try std.fmt.allocPrint(a, "z-{d}", .{i});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, id, .{}), &digest, .{});
+        if (!std.mem.lessThan(u8, &first_digest, &digest)) continue;
+        try ids.append(a, id);
+        if (ids.items.len == 32) break;
+    }
+    for (ids.items, 0..) |id, i| {
+        const claim: m.types.Assertion = .{ .id = id, .subject = "s", .predicate = "p", .value = "same", .statement = "Same useful procedure", .kind = .procedural, .steps = if (i == 0) &.{ payload, payload } else &.{}, .evidence = &.{.{ .id = "e1" }} };
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{claim} }, .{}), id);
+        _ = try svc.execute(a, .pin, "", try std.json.Stringify.valueAlloc(a, m.types.Pin{ .id = id }, .{}), try std.fmt.allocPrint(a, "pin-{d}", .{i}));
+    }
+    svc.backend.get = Meter.get;
+    svc.backend.get_metadata = Meter.metadata;
+    for (0..2) |attempt| {
+        store.document_batches = 0;
+        store.query_batches = 0;
+        const response = try svc.execute(a, .prepare_consolidation, "", "{}", if (attempt == 0) "prepare" else "reuse");
+        const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, response, .{});
+        std.debug.print("preparation attempt={d} shared payload={d} full hydration={d} heavy reads={d} proposals={d} response={d}\n", .{ attempt, payload.len * 2, store.document_batches, store.query_batches, receipt.proposal_ids.len, response.len });
+        try std.testing.expectEqual(@as(usize, 31), receipt.proposal_ids.len);
+        try std.testing.expectEqual(attempt + 1, store.query_batches);
+        try std.testing.expect(store.document_batches < 4 * payload.len * 2);
+        const detail = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalDetail, a, try svc.execute(a, .supersession_proposal, receipt.proposal_ids[0], "{}", ""), .{});
+        const shared = if (std.mem.eql(u8, detail.incoming.memory.assertion.id, "a")) detail.incoming else detail.previous;
+        try std.testing.expectEqual(@as(usize, 2), shared.memory.assertion.steps.len);
+        try std.testing.expectEqualStrings(payload, shared.memory.assertion.steps[0]);
+        try std.testing.expectEqualStrings(payload, shared.memory.assertion.steps[1]);
+        const pin = try SupersessionFixture.pin(svc, a, "a");
+        try std.testing.expectEqualStrings(pin.fingerprint, shared.fingerprint);
+    }
 }
