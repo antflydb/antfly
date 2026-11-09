@@ -85,8 +85,9 @@ hints and decoding options on the recognition stage.
 ## Downloaded apps and local engine
 
 Official downloads are Apple Silicon only and include a pinned, released Antfly runtime. New installations use **On this Mac** by default. In Settings, explicitly
-download Whisper Tiny. The current pinned release does not contain native Apple
-providers; use an external Apple-enabled server for that route. The app handles startup,
+download Whisper Tiny, or use native Apple speech and cleanup on macOS 26+
+when the required assets and Apple Intelligence are ready. The bundled rc.13
+runtime includes the Apple bridge. The app handles startup,
 authentication, model discovery, and shutdown. No separate server install is needed.
 Existing configurations keep their chosen external server. See [updates and
 managed runtime](UPDATES.md#managed-runtime-for-downloaded-apps) for lifecycle,

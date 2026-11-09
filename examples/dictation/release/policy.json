@@ -8,14 +8,14 @@
   "storage_prefix": "antfly-dictation",
   "public_base_url": "https://releases.antfly.io/antfly-dictation",
   "runtime": {
-    "tag": "v0.3.0-rc.12",
-    "source_commit": "ec9ddbf7fe673fede4c45ee023aa8e126d84e128",
-    "ledger_sha256": "535279cd7d32edc71dd608b4ceea59b8ce832a07d37b27de92cf0f432fdd3f83",
-    "archive": "antfly_0.3.0-rc.12_Darwin_arm64.tar.gz",
-    "sha256": "206096a60a5a239625231c0cbc2eb7b54346942ffa6339acbb07a67975b15312",
-    "size": 145285186,
+    "tag": "v0.3.0-rc.13",
+    "source_commit": "7db8b07aee4ac18dedef2112b3b7d9b340a41fd0",
+    "ledger_sha256": "a59d47def179f920dba0b3a1a3ff02cc637f145cb8778f6cdcf75fc37399e5b0",
+    "archive": "antfly_0.3.0-rc.13_Darwin_arm64.tar.gz",
+    "sha256": "e89ea23e74c42e6dcb65acdda94d5f775107e7c3e9dbf09ffd07fa14e52d8a5f",
+    "size": 147518449,
     "architecture": "arm64",
-    "apple_providers": false,
-    "payload_sha256": "8891edc4f0f26281801d4c6f0bdaf1723331b28eb0260468bfde26f627113dba"
+    "apple_providers": true,
+    "payload_sha256": "2f582f01691906c50260271da547fbfcf7db4ffc1cfbcb7392d7fe8bd5340277"
   }
 }

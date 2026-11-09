@@ -262,7 +262,7 @@ archive paths and links, and verifies the staged payload, including licenses.
 Cached downloads are verified before reuse. It never follows a mutable latest URL
 at app startup and never invokes Zig or builds Antfly from source.
 
-The current pin is **v0.3.0-rc.12**, the published next-channel release used for
+The current pin is **v0.3.0-rc.13**, the published next-channel release used for
 this app's compatibility qualification. The app and runtime require macOS 15 and
 Apple Silicon. Intel app builds and runtime fallbacks are not supported.
 The signed app contains the released CLI and its notices, not a separately built
@@ -273,11 +273,11 @@ is required. Build-time execution checks happen before signing credentials are
 available; the signing job only inspects the unsigned artifact as data.
 
 Updating the pin requires a reviewed policy change and compatibility smoke tests.
-The current released archive does **not** include the native Apple provider
-bridge. Local mode therefore offers Whisper; native Apple selection stays disabled.
-An external Antfly server built with Apple providers remains supported. When
-upstream publishes a release containing the bridge, qualify it and update the pin
-and capability metadata; do not silently substitute a source-built sidecar.
+The pinned release includes the native Apple provider bridge. Local mode offers
+Whisper and native Apple speech and cleanup. Apple transcription and generation
+require macOS 26 or newer and appropriate speech assets or Apple Intelligence
+readiness; macOS 15 users can use Whisper. The bridge comes from the verified
+release archive, never from a separately source-built sidecar.
 
 The app launches a headless copy of itself as a supervisor. An exclusive lock
 protects the runtime data directory. Its Antfly child binds only to
