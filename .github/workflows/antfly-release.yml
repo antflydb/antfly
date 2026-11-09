@@ -91,7 +91,7 @@ jobs:
 
       - name: Download CLI snapshot from the completed build
         if: ${{ github.event_name == 'workflow_run' }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        uses: ./.github/actions/download-ci-artifact
         with:
           name: antfly-cli-snapshot
           path: dist/cli-snapshot
@@ -266,7 +266,7 @@ jobs:
 
       - name: Download independently fetchable Apache Zig source
         if: ${{ github.event_name == 'workflow_run' && steps.source-capabilities.outputs.embedded_zig_source == 'true' }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        uses: ./.github/actions/download-ci-artifact
         with:
           name: antfly-embedded-zig-source
           path: dist/embedded-zig-source
@@ -560,29 +560,12 @@ jobs:
             --commit "$RELEASE_COMMIT"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: ${{ steps.identity.outputs.publish_npm == 'true' || steps.identity.outputs.publish_pypi == 'true' }}
         with:
-          name: antfly-cli-snapshot
-          path: dist/verified-cli-snapshot/
-          if-no-files-found: error
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: antfly-release-runtime-archives
-          path: dist/release-runtime/
-          if-no-files-found: error
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
+          retention-days: 14
           name: antfly-release-ledger
           path: dist/release-ledger/
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: antfly-release-payload
-          path: dist/release-payload/
-          if-no-files-found: error
 
   publish-cli-pypi:
     name: Publish antfly-cli to PyPI
@@ -605,10 +588,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: ./.github/actions/restore-release-scope
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
         with:
-          name: antfly-cli-snapshot
+          tag: ${{ needs.prepare-release-promotion.outputs.tag }}
+          commit: ${{ needs.prepare-release-promotion.outputs.commit }}
+          ledger-sha256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
+          scope: cli
           path: dist/cli-snapshot
+
       - name: Select digest-verified Python distributions
         id: pypi
         env:
@@ -658,10 +649,18 @@ jobs:
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: ./.github/actions/restore-release-scope
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
         with:
-          name: antfly-cli-snapshot
+          tag: ${{ needs.prepare-release-promotion.outputs.tag }}
+          commit: ${{ needs.prepare-release-promotion.outputs.commit }}
+          ledger-sha256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
+          scope: cli
           path: dist/cli-snapshot
+
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
@@ -723,10 +722,18 @@ jobs:
           echo "$compiler_description"
           grep -q 'dynamically linked' <<<"$compiler_description"
           echo "$zig_path/bin" >> "$GITHUB_PATH"
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: ./.github/actions/restore-release-scope
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
         with:
-          name: antfly-release-runtime-archives
+          tag: ${{ needs.prepare-release-promotion.outputs.tag }}
+          commit: ${{ needs.prepare-release-promotion.outputs.commit }}
+          ledger-sha256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
+          scope: runtime
           path: dist/release-archives
+
       - name: Render formula
         env:
           VERSION: ${{ needs.prepare-release-promotion.outputs.version }}
@@ -740,6 +747,7 @@ jobs:
             --out "$RUNNER_TEMP/antfly.rb"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 14
           name: antfly-homebrew-formula
           path: ${{ runner.temp }}/antfly.rb
           if-no-files-found: error
@@ -875,11 +883,19 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: ./.github/actions/restore-release-scope
         if: ${{ needs.prepare-release-promotion.outputs.publish_npm == 'true' || needs.prepare-release-promotion.outputs.publish_pypi == 'true' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
         with:
-          name: antfly-cli-snapshot
+          tag: ${{ needs.prepare-release-promotion.outputs.tag }}
+          commit: ${{ needs.prepare-release-promotion.outputs.commit }}
+          ledger-sha256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
+          scope: cli
           path: dist/cli-snapshot
+
       - name: Preflight exact PyPI release contents
         if: ${{ needs.prepare-release-promotion.outputs.publish_pypi == 'true' }}
         env:
@@ -1061,10 +1077,18 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: ./.github/actions/restore-release-scope
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
         with:
-          name: antfly-release-payload
+          tag: ${{ needs.prepare-release-promotion.outputs.tag }}
+          commit: ${{ needs.prepare-release-promotion.outputs.commit }}
+          ledger-sha256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
+          scope: all
           path: dist/release-payload
+
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: ${{ needs.prepare-release-promotion.outputs.publish_homebrew == 'true' }}
         with:
@@ -1259,11 +1283,19 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: ./.github/actions/restore-release-scope
         if: ${{ needs.prepare-release-promotion.outputs.publish_pypi == 'true' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
         with:
-          name: antfly-cli-snapshot
+          tag: ${{ needs.prepare-release-promotion.outputs.tag }}
+          commit: ${{ needs.prepare-release-promotion.outputs.commit }}
+          ledger-sha256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
+          scope: cli
           path: dist/cli-snapshot
+
       - name: Authenticate to Google Cloud for final container verification
         id: auth
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3

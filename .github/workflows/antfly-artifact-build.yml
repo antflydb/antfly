@@ -247,6 +247,7 @@ jobs:
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 14
           name: ${{ matrix.artifact_name }}
           path: dist/release-archives/*.tar.gz
           if-no-files-found: error
@@ -255,6 +256,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 14
           name: release-diagnostics-${{ matrix.artifact_name }}
           path: |
             ${{ runner.temp }}/antfly-zig-release-*/*attempt*.log
@@ -312,6 +314,7 @@ jobs:
         if: ${{ always() && (inputs.release_line == '0.3' || inputs.release_line == 'nightly') }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 14
           name: release-v02-upgrade-evidence
           path: ${{ runner.temp }}/v02-upgrade/evidence
           if-no-files-found: warn
@@ -322,7 +325,11 @@ jobs:
       - release-plan
       - build-zig-runtime-archives
     uses: ./.github/workflows/cli-package.yml
+    permissions:
+      contents: read
+      id-token: write
     with:
+      build_controller_commit: ${{ inputs.build_controller_commit }}
       version: ${{ inputs.tag_name }}
       source_commit: ${{ inputs.source_commit }}
       python_build: ${{ needs.release-plan.outputs.python_build }}
@@ -337,11 +344,15 @@ jobs:
       - build-zig-runtime-archives
     uses: ./.github/workflows/embedded-package.yml
     with:
+      retain_snapshot: ${{ needs.release-plan.outputs.channel == 'stable' }}
       version: ${{ inputs.tag_name }}
       source_commit: ${{ inputs.source_commit }}
       python_build: ${{ needs.release-plan.outputs.python_build }}
 
   package-embedded-zig-source:
+    permissions:
+      contents: read
+      id-token: write
     if: ${{ needs.release-plan.outputs.embedded_zig_source == 'true' }}
     name: Package independently fetchable Apache Zig sources
     needs: release-plan
@@ -363,11 +374,10 @@ jobs:
           python3 scripts/packaging/package_embedded_zig_source.py \
             --commit "$SOURCE_COMMIT" --version "${RELEASE_TAG#v}" \
             --out-dir dist/embedded-zig-source
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: ./.github/actions/upload-ci-artifact
         with:
           name: antfly-embedded-zig-source
           path: dist/embedded-zig-source/
-          if-no-files-found: error
 
   package-release-source:
     name: Stage commit-bound release support files
@@ -386,6 +396,7 @@ jobs:
             --out-dir dist/release-source
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 14
           name: antfly-release-source
           path: dist/release-source/
           if-no-files-found: error
@@ -430,6 +441,7 @@ jobs:
             > dist/release-request/release-request.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 14
           name: antfly-release-request
           path: dist/release-request/release-request.json
           if-no-files-found: error

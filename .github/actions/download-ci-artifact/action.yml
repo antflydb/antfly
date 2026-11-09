@@ -1,0 +1,71 @@
+name: Download temporary CI artifact
+description: Restore verified GCS files or historical Actions-only artifacts
+inputs:
+  name:
+    description: Artifact name (exclusive with pattern)
+    default: ''
+  pattern:
+    description: Artifact name pattern (exclusive with name)
+    default: ''
+  path:
+    description: Empty destination directory
+    required: true
+  run-id:
+    description: Producer workflow run
+    default: ''
+  github-token:
+    description: Token for cross-run downloads
+    default: ''
+  merge-multiple:
+    description: Retained for compatibility; files are always merged with collision rejection
+    default: 'true'
+  namespace:
+    description: release or vopr (separate bucket-scoped identities)
+    default: release
+runs:
+  using: composite
+  steps:
+    - id: staging
+      shell: bash
+      run: echo "path=$(mktemp -d "$RUNNER_TEMP/ci-download.XXXXXX")" >> "$GITHUB_OUTPUT"
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: ${{ inputs.name }}
+        pattern: ${{ inputs.pattern }}
+        merge-multiple: true
+        path: ${{ steps.staging.outputs.path }}
+        run-id: ${{ inputs.run-id }}
+        github-token: ${{ inputs.github-token }}
+    - id: receipt
+      shell: bash
+      env:
+        STAGING: ${{ steps.staging.outputs.path }}
+      run: |
+        if compgen -G "$STAGING/_ci-artifact-*.json" > /dev/null; then
+          echo 'present=true' >> "$GITHUB_OUTPUT"
+        fi
+    - if: ${{ steps.receipt.outputs.present == 'true' }}
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+      id: auth
+      with:
+        workload_identity_provider: projects/281947489474/locations/global/workloadIdentityPools/antfly-ci-artifacts/providers/github
+        service_account: ci-${{ inputs.namespace }}-artifacts@antfly-image-artifacts.iam.gserviceaccount.com
+        token_format: access_token
+        access_token_scopes: https://www.googleapis.com/auth/devstorage.read_only
+        create_credentials_file: false
+        export_environment_variables: false
+    - shell: bash
+      env:
+        CI_ARTIFACT_TOKEN: ${{ steps.auth.outputs.access_token }}
+        STAGING: ${{ steps.staging.outputs.path }}
+        DESTINATION: ${{ inputs.path }}
+        ARTIFACT_NAMESPACE: ${{ inputs.namespace }}
+        ARTIFACT_NAME: ${{ inputs.name }}
+        ARTIFACT_PATTERN: ${{ inputs.pattern }}
+        PRODUCER_RUN_ID: ${{ inputs.run-id || github.run_id }}
+        ACTION_ROOT: ${{ github.action_path }}
+      run: |
+        python3 "$ACTION_ROOT/../../../scripts/ci/artifact_exchange.py" restore \
+          --name "$ARTIFACT_NAME" --pattern "$ARTIFACT_PATTERN" \
+          --run-id "$PRODUCER_RUN_ID" --staging "$STAGING" --destination "$DESTINATION" \
+          --namespace "$ARTIFACT_NAMESPACE"
