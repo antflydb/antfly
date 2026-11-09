@@ -434,7 +434,12 @@ def main():
         mutation=True,
     )
     operation(prefix + "/{space}", "get", "getMemorySpace", response="MemoryInspection")
-    operation(prefix + "/{space}/memories/{id}/usage", "get", "getMemoryUsage", response="MemoryUsage")
+    operation(
+        prefix + "/{space}/memories/{id}/usage",
+        "get",
+        "getMemoryUsage",
+        response="MemoryUsage",
+    )
     operation(
         prefix + "/{space}",
         "patch",
@@ -451,7 +456,11 @@ def main():
         ("outcomes", "recordMemoryOutcome", "MemoryOutcome"),
         ("pins", "pinMemory", "MemoryPin"),
         ("accesses", "recordMemoryAccess", "MemoryAccess"),
-        ("consolidation-proposals", "prepareMemoryConsolidation", "MemoryConsolidationRequest"),
+        (
+            "consolidation-proposals",
+            "prepareMemoryConsolidation",
+            "MemoryConsolidationRequest",
+        ),
     ):
         operation(prefix + "/{space}/" + suffix, "post", name, request, mutation=True)
     operation(

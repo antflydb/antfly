@@ -74,7 +74,7 @@ pub fn build(b: *std.Build) void {
         }
         if (artifact.kind.isTest()) {
             var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
-            rejectMetadata(artifact.root_module, inference.build_info_object, &seen);
+            rejectMetadata(artifact.root_module, inference.build_info_object, &seen, artifact.name);
             test_count += 1;
         }
         if (artifact.root_module.root_source_file) |source| switch (source) {
@@ -361,16 +361,16 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
     }
 }
 
-fn rejectMetadata(module: *std.Build.Module, metadata: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
+fn rejectMetadata(module: *std.Build.Module, metadata: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Module, void), owner: []const u8) void {
     if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
     for (module.link_objects.items) |object| switch (object) {
         .other_step => |artifact| {
-            if (artifact == metadata) @panic("unit test depends on release metadata");
-            rejectMetadata(artifact.root_module, metadata, seen);
+            if (artifact == metadata) std.debug.panic("unit test depends on release metadata: {s} via {s}", .{ owner, if (module.root_source_file) |source| source.getDisplayName() else "link-only module" });
+            rejectMetadata(artifact.root_module, metadata, seen, owner);
         },
         else => {},
     };
-    for (module.import_table.values()) |dependency| rejectMetadata(dependency, metadata, seen);
+    for (module.import_table.values()) |dependency| rejectMetadata(dependency, metadata, seen, owner);
 }
 
 fn isSqlGenerator(b: *std.Build, artifact: *std.Build.Step.Compile) bool {

@@ -519,14 +519,20 @@ class RuntimeCacheTest(unittest.TestCase):
             audio.read_bytes()
             + b'\npub const cache_test_profile = @import("builtin").mode;\n'
         )
+        baseline_sources = {}
         for name in ("prometheus", "structlog"):
             source = self.own(f"zig/lib/{name}/src/root.zig")
             source.write_bytes(
                 source.read_bytes()
                 + b"\npub const cache_test_observability_revision: u8 = 1;\n"
             )
+            baseline_sources[name] = source.read_bytes()
         for standalone in (False, True):
             with self.subTest(standalone=standalone):
+                # Each composition starts from the same fixture revision,
+                # even if the other composition failed before its edit probes.
+                for name, baseline in baseline_sources.items():
+                    self.own(f"zig/lib/{name}/src/root.zig").write_bytes(baseline)
                 if standalone:
                     self.use_standalone()
                 target = "cache-inference" if standalone else "runtime-unit-inference"
@@ -556,7 +562,7 @@ class RuntimeCacheTest(unittest.TestCase):
                         source = self.own(f"zig/lib/{name}/src/root.zig")
                         # Change a value consumed by the tiny entry bodies;
                         # comments and unused declarations need not recompile.
-                        before = 1 + int(standalone)
+                        before = 1
                         contents = source.read_bytes().replace(
                             f"cache_test_observability_revision: u8 = {before};".encode(),
                             f"cache_test_observability_revision: u8 = {before + 1};".encode(),
