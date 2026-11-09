@@ -68,7 +68,7 @@ set -eu
 [ "$ANTFLY_LITE_REQUIRE_LIBRARY" = 1 ]
 [ "$ANTFLY_LIB_DIR" = "$EXPECTED_NATIVE_LIB" ]
 [ "$(dirname "$ANTFLY_LIBRARY")" = "$EXPECTED_NATIVE_LIB" ]
-[ "$*" = "run --locked pytest -v -o faulthandler_timeout=120 --durations=25 --durations-min=1 --junitxml=$ANTFLY_SDK_NATIVE_REPORT_DIR/python.xml --ignore=tests/test_inference.py" ]
+[ "$*" = "run --locked pytest -v -o faulthandler_timeout=120 -o tmp_path_retention_policy=failed --durations=25 --durations-min=1 --junitxml=$ANTFLY_SDK_NATIVE_REPORT_DIR/python.xml --ignore=tests/test_inference.py" ]
 [ -d "$ANTFLY_SDK_NATIVE_REPORT_DIR" ]
 [ -s "$ANTFLY_LIBRARY" ]
 printf 'native-test-invoked\n'

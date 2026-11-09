@@ -64,7 +64,12 @@ def refusal_summary(error):
     accepted = headers.get("X-Accepted-GitHub-Permissions", "")
     required = [
         permission
-        for permission in ("actions=read", "contents=read", "contents=write")
+        for permission in (
+            "actions=read",
+            "checks=read",
+            "contents=read",
+            "contents=write",
+        )
         if permission
         in [value.strip() for value in accepted.replace(";", ",").split(",")]
     ]
@@ -98,7 +103,13 @@ class GitHub:
             with self.opener.open(request, timeout=30) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
-            area = "Actions read" if "/actions/" in path else "repository contents"
+            area = (
+                "validation check read"
+                if "/check-runs?" in path
+                else "Actions read"
+                if "/actions/" in path
+                else "repository contents"
+            )
             raise PublicationError(
                 f"GitHub {method} {area} failed with HTTP {exc.code}; {refusal_summary(exc)}; no token/body logged"
             ) from None

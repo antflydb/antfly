@@ -312,6 +312,27 @@ class PublisherTests(unittest.TestCase):
                 for private in ("SENTINEL_TOKEN", "PRIVATE", "https://", body):
                     self.assertNotIn(private, summary)
 
+    def test_check_refusal_identifies_the_missing_permission_without_private_data(self):
+        api = p.GitHub("SENTINEL_TOKEN")
+        error = urllib.error.HTTPError(
+            "https://api.github.com/PRIVATE",
+            403,
+            "PRIVATE",
+            {
+                "X-GitHub-Request-Id": "id",
+                "X-Accepted-GitHub-Permissions": "checks=read",
+            },
+            io.BytesIO(b"Resource not accessible by personal access token PRIVATE"),
+        )
+        with patch.object(api.opener, "open", side_effect=error):
+            with self.assertRaises(p.PublicationError) as caught:
+                api.request(f"repos/{p.COLONY}/commits/{BASE}/check-runs?filter=all")
+        message = str(caught.exception)
+        self.assertIn("validation check read", message)
+        self.assertIn("required=checks=read", message)
+        for private in ("SENTINEL_TOKEN", "PRIVATE", p.COLONY, BASE):
+            self.assertNotIn(private, message)
+
     def test_requests_identify_the_publisher_and_keep_credentials_off_redirects(self):
         api = p.GitHub("SENTINEL_TOKEN")
         with patch.object(api.opener, "open", return_value=io.BytesIO(b"{}")) as send:

@@ -63,7 +63,10 @@ if [[ "$sdk" == rust || "$sdk" == all ]]; then
     --features antfly-embedded/libantfly,antfly-embedded/sqlx ${rust_args[@]+"${rust_args[@]}"}
 fi
 if [[ "$sdk" == python || "$sdk" == all ]]; then
-  python_args=(--durations=25 --durations-min=1)
+  # Passed physical-work fixtures otherwise accumulate for the entire run.
+  # Pytest removes these only after dependent database fixtures have closed;
+  # failed cases and their diagnostics remain available for inspection.
+  python_args=(-o tmp_path_retention_policy=failed --durations=25 --durations-min=1)
   if [[ -n "${ANTFLY_SDK_NATIVE_REPORT_DIR:-}" ]]; then
     mkdir -p "$ANTFLY_SDK_NATIVE_REPORT_DIR"
     python_args+=(--junitxml="$ANTFLY_SDK_NATIVE_REPORT_DIR/python.xml")
