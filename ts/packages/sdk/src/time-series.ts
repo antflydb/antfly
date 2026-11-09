@@ -372,12 +372,19 @@ export function seriesBatch(
   return { inserts };
 }
 
+export interface SeriesSQLOptions {
+  fieldPaths?: Record<string, readonly string[]>;
+  /** Explicit output name for the time bucket. Must not overlap a group or measure.
+   * By default, uses "bucket", appending underscores to avoid collisions. */
+  bucketAlias?: string;
+}
+
 /** Parameterized SQL equivalent for populated buckets (empty filling is a JSON
  * presentation option). Identifier quoting preserves names without SQL injection.
  */
 export function seriesSQL(
   options: SeriesQueryOptions,
-  sqlOptions: { fieldPaths?: Record<string, readonly string[]> } = {}
+  sqlOptions: SeriesSQLOptions = {}
 ): SQLRequest {
   // SQL emits populated buckets, so JSON presentation limits do not apply.
   seriesQuery({ ...options, emptyBuckets: false });
@@ -388,11 +395,32 @@ export function seriesSQL(
     return `$${parameters.length}`;
   };
   const groupBy = options.groupBy ?? [];
+  const outputNames = new Set(groupBy);
+  if (outputNames.size !== groupBy.length)
+    throw new TypeError("SQL group fields must have distinct output names");
+  for (const name of Object.keys(options.measures)) {
+    if (outputNames.has(name))
+      throw new TypeError(
+        `SQL measurement output name ${JSON.stringify(name)} overlaps a group field`
+      );
+    outputNames.add(name);
+  }
+  let bucketAlias = sqlOptions.bucketAlias ?? "bucket";
+  if (sqlOptions.bucketAlias !== undefined) {
+    if (typeof sqlOptions.bucketAlias !== "string" || !bucketAlias || outputNames.has(bucketAlias))
+      throw new TypeError(
+        "SQL bucketAlias must be nonempty and distinct from group and measurement output names"
+      );
+  } else {
+    while (outputNames.has(bucketAlias)) bucketAlias += "_";
+  }
+
   const used = new Set([
     options.table,
     options.timestamp,
     ...groupBy,
     ...Object.keys(options.measures),
+    bucketAlias,
   ]);
   const internal = (base: string) => {
     let name = base;
@@ -450,7 +478,7 @@ export function seriesSQL(
       const expression = column(field, `${source}.`);
       return segments(field).length > 1 ? `${expression} AS ${quote(field)}` : expression;
     }),
-    `${bucket} AS "bucket"`,
+    `${bucket} AS ${quote(bucketAlias)}`,
     ...Object.entries(options.measures).map(([name, metric]) => {
       const argument = metric.op === "count" ? "*" : column(metric.field, `${source}.`);
       const aggregate = `${metric.op.toUpperCase()}(${metric.op !== "count" && segments(metric.field).length > 1 ? `(${argument})::double precision` : argument})`;

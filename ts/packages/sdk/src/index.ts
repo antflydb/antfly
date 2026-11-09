@@ -564,6 +564,7 @@ export type {
   SeriesPoint,
   SeriesQueryOptions,
   SeriesRange,
+  SeriesSQLOptions,
   TimeSeries,
 } from "./time-series.js";
 export {

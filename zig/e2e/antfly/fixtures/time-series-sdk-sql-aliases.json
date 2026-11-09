@@ -1,0 +1,355 @@
+{
+  "table": {
+    "num_shards": 2,
+    "schema": {
+      "index_sort": [
+        {
+          "field": "observed_at",
+          "order": "desc"
+        }
+      ],
+      "default_type": "reading",
+      "document_schemas": {
+        "reading": {
+          "schema": {
+            "type": "object",
+            "required": [
+              "observed_at",
+              "bucket",
+              "bucket_"
+            ],
+            "properties": {
+              "observed_at": {
+                "type": "string",
+                "format": "date-time",
+                "x-antfly-field": {
+                  "type": "date",
+                  "sortable": true
+                }
+              },
+              "bucket": {
+                "type": "string",
+                "x-antfly-field": {
+                  "type": "keyword",
+                  "sortable": true
+                }
+              },
+              "bucket_": {
+                "type": "string",
+                "x-antfly-field": {
+                  "type": "keyword",
+                  "sortable": true
+                }
+              },
+              "temperature": {
+                "type": "number",
+                "x-antfly-field": {
+                  "type": "number",
+                  "sortable": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "indexes": {
+      "series_aggregates": {
+        "type": "algebraic",
+        "derive_from_schema": true,
+        "aggregates": [
+          {
+            "name": "reading_count",
+            "op": "count",
+            "group_by": [
+              "bucket",
+              "bucket_"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          },
+          {
+            "name": "m0_sum",
+            "op": "sum",
+            "measure": "temperature",
+            "group_by": [
+              "bucket",
+              "bucket_"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          },
+          {
+            "name": "m0_avg",
+            "op": "avg",
+            "measure": "temperature",
+            "group_by": [
+              "bucket",
+              "bucket_"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          },
+          {
+            "name": "m0_min",
+            "op": "min",
+            "measure": "temperature",
+            "group_by": [
+              "bucket",
+              "bucket_"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          },
+          {
+            "name": "m0_max",
+            "op": "max",
+            "measure": "temperature",
+            "group_by": [
+              "bucket",
+              "bucket_"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          }
+        ]
+      }
+    }
+  },
+  "readings": {
+    "a": {
+      "bucket": "sensor",
+      "bucket_": "west",
+      "observed_at": "2026-11-06T12:01:00Z",
+      "temperature": 10
+    },
+    "b": {
+      "bucket": "sensor",
+      "bucket_": "west",
+      "observed_at": "2026-11-06T12:06:00Z",
+      "temperature": 20
+    },
+    "c": {
+      "bucket": "other",
+      "bucket_": "west",
+      "observed_at": "2026-11-06T12:01:00Z",
+      "temperature": 5
+    },
+    "outside": {
+      "bucket": "sensor",
+      "bucket_": "west",
+      "observed_at": "2026-11-06T13:01:00Z",
+      "temperature": 999
+    }
+  },
+  "cases": [
+    {
+      "name": "group fields occupy default aliases",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T13:00:00Z",
+        "bucket": {
+          "every": "5m"
+        },
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          }
+        },
+        "maxSeries": 10,
+        "groupBy": [
+          "bucket",
+          "bucket_"
+        ]
+      },
+      "columns": [
+        "bucket",
+        "bucket_",
+        "bucket__",
+        "average"
+      ],
+      "rows": [
+        [
+          "sensor",
+          "west",
+          "2026-11-06T12:00:00.000000000Z",
+          10
+        ],
+        [
+          "sensor",
+          "west",
+          "2026-11-06T12:05:00.000000000Z",
+          20
+        ],
+        [
+          "other",
+          "west",
+          "2026-11-06T12:00:00.000000000Z",
+          5
+        ]
+      ],
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket\", \"bucket_\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket\") AND \"bucket\" IS NOT NULL AND NOT is_missing(\"bucket_\") AND \"bucket_\" IS NOT NULL GROUP BY \"bucket\", \"bucket_\" ORDER BY COUNT(*) DESC, concat('[', COALESCE(to_jsonb(\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"bucket_\")::text, 'null'), ']') ASC LIMIT $5) SELECT \"__antfly_series_source\".\"bucket\", \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket__\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"bucket\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket\" AND \"__antfly_series_source\".\"bucket_\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket_\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"bucket\") AND \"__antfly_series_source\".\"bucket\" IS NOT NULL AND NOT is_missing(\"__antfly_series_source\".\"bucket_\") AND \"__antfly_series_source\".\"bucket_\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"bucket\", \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, concat('[', COALESCE(to_jsonb(\"__antfly_series_source\".\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"__antfly_series_source\".\"bucket_\")::text, 'null'), ']') ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T13:00:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z",
+          10
+        ]
+      }
+    },
+    {
+      "name": "measurement and group occupy default aliases",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T13:00:00Z",
+        "bucket": {
+          "every": "5m"
+        },
+        "measures": {
+          "bucket": {
+            "op": "avg",
+            "field": "temperature"
+          }
+        },
+        "maxSeries": 10,
+        "groupBy": [
+          "bucket_"
+        ]
+      },
+      "columns": [
+        "bucket_",
+        "bucket__",
+        "bucket"
+      ],
+      "rows": [
+        [
+          "west",
+          "2026-11-06T12:00:00.000000000Z",
+          7.5
+        ],
+        [
+          "west",
+          "2026-11-06T12:05:00.000000000Z",
+          20
+        ]
+      ],
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket_\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket_\") AND \"bucket_\" IS NOT NULL GROUP BY \"bucket_\" ORDER BY COUNT(*) DESC, \"bucket_\" ASC LIMIT $5) SELECT \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket__\", AVG(\"__antfly_series_source\".\"temperature\") AS \"bucket\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"bucket_\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket_\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"bucket_\") AND \"__antfly_series_source\".\"bucket_\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, \"__antfly_series_source\".\"bucket_\" ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T13:00:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z",
+          10
+        ]
+      }
+    },
+    {
+      "name": "explicit quoted bucket alias",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T13:00:00Z",
+        "bucket": {
+          "every": "5m"
+        },
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          }
+        },
+        "maxSeries": 10,
+        "groupBy": [
+          "bucket"
+        ]
+      },
+      "sqlOptions": {
+        "bucketAlias": "at\"time"
+      },
+      "columns": [
+        "bucket",
+        "at\"time",
+        "average"
+      ],
+      "rows": [
+        [
+          "sensor",
+          "2026-11-06T12:00:00.000000000Z",
+          10
+        ],
+        [
+          "sensor",
+          "2026-11-06T12:05:00.000000000Z",
+          20
+        ],
+        [
+          "other",
+          "2026-11-06T12:00:00.000000000Z",
+          5
+        ]
+      ],
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket\") AND \"bucket\" IS NOT NULL GROUP BY \"bucket\" ORDER BY COUNT(*) DESC, \"bucket\" ASC LIMIT $5) SELECT \"__antfly_series_source\".\"bucket\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"at\"\"time\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"bucket\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"bucket\") AND \"__antfly_series_source\".\"bucket\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"bucket\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, \"__antfly_series_source\".\"bucket\" ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T13:00:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z",
+          10
+        ]
+      }
+    },
+    {
+      "name": "ungrouped measurement named bucket",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T13:00:00Z",
+        "bucket": {
+          "every": "5m"
+        },
+        "measures": {
+          "bucket": {
+            "op": "avg",
+            "field": "temperature"
+          }
+        },
+        "maxSeries": 10,
+        "groupBy": []
+      },
+      "columns": [
+        "bucket_",
+        "bucket"
+      ],
+      "rows": [
+        [
+          "2026-11-06T12:00:00.000000000Z",
+          7.5
+        ],
+        [
+          "2026-11-06T12:05:00.000000000Z",
+          20
+        ]
+      ],
+      "sql": {
+        "statement": "SELECT date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket_\", AVG(\"__antfly_series_source\".\"temperature\") AS \"bucket\" FROM \"fixture\" AS \"__antfly_series_source\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime GROUP BY date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) ORDER BY date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T13:00:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z"
+        ]
+      }
+    }
+  ]
+}

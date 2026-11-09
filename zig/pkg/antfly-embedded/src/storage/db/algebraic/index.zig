@@ -12409,22 +12409,26 @@ pub const Index = struct {
         return try self.scanDerivedJoinFoldEntriesTxn(txn, join_cfg, request, law_id, null);
     }
 
-    fn expressionRawValueForMaterializationTxn(
+    const PreparedMaterializedExpressionRead = struct {
+        law_id: law_mod.Id,
+        expression_id: []u8,
+    };
+
+    fn prepareMaterializedExpressionRead(self: *Index, mat: MaterializationConfig) !?PreparedMaterializedExpressionRead {
+        const op = algebra.Op.parse(mat.op) orelse return null;
+        const law_id = self.materializationLawId(mat, op);
+        return .{ .law_id = law_id, .expression_id = try self.materializedExpressionIdForLawAlloc(materializationExpression(mat, law_id), law_id) };
+    }
+
+    fn expressionRawValueForPreparedMaterializationTxn(
         self: *Index,
         txn: anytype,
-        materialization: []const u8,
+        prepared: PreparedMaterializedExpressionRead,
         axes_canonical: []const u8,
         bucket: ?[]const u8,
     ) !?[]u8 {
-        const mat_idx = self.materializationIndex(materialization) orelse return null;
-        const mat = self.config().materializations[mat_idx];
-        const op = algebra.Op.parse(mat.op) orelse return null;
-        const law_id = self.materializationLawId(mat, op);
-        const expr = materializationExpression(mat, law_id);
-        const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
-        defer self.alloc.free(expr_id);
         const key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
-            .expr_id = expr_id,
+            .expr_id = prepared.expression_id,
             .axes_canonical = axes_canonical,
             .bucket = bucket,
         });
@@ -12433,10 +12437,23 @@ pub const Index = struct {
             error.NotFound => return null,
             else => return err,
         };
-        var row = try tensor_mod.rowFromBytesOrLayoutAlloc(self.alloc, raw_row, &.{law_id});
+        var row = try tensor_mod.rowFromBytesOrLayoutAlloc(self.alloc, raw_row, &.{prepared.law_id});
         defer row.deinit(self.alloc);
         if (row.slots.len == 0) return null;
         return if (row.slots[0].value) |value| try self.alloc.dupe(u8, value) else null;
+    }
+
+    fn expressionRawValueForMaterializationTxn(
+        self: *Index,
+        txn: anytype,
+        materialization: []const u8,
+        axes_canonical: []const u8,
+        bucket: ?[]const u8,
+    ) !?[]u8 {
+        const mat_idx = self.materializationIndex(materialization) orelse return null;
+        const prepared = (try self.prepareMaterializedExpressionRead(self.config().materializations[mat_idx])) orelse return null;
+        defer self.alloc.free(prepared.expression_id);
+        return self.expressionRawValueForPreparedMaterializationTxn(txn, prepared, axes_canonical, bucket);
     }
 
     pub fn scanMaterializedExpressionRowsBounded(self: *Index, store: *docstore_mod.DocStore, materializations: []const []const u8, budget: *TemporalScanBudget) !?[]MaterializedExpressionRowEntry {
@@ -12451,17 +12468,33 @@ pub const Index = struct {
     }
 
     fn scanMaterializedExpressionRowsBudgetedTxn(self: *Index, txn: anytype, materializations: []const []const u8, budget: ?*TemporalScanBudget) !?[]MaterializedExpressionRowEntry {
-        const first_mat_idx = self.materializationIndex(materializations[0]) orelse return null;
-        const first_mat = self.config().materializations[first_mat_idx];
-        const first_op = algebra.Op.parse(first_mat.op) orelse return null;
-        const first_law_id = self.materializationLawId(first_mat, first_op);
-        const first_expr = materializationExpression(first_mat, first_law_id);
-        const first_expr_id = try self.materializedExpressionIdForLawAlloc(first_expr, first_law_id);
-        defer self.alloc.free(first_expr_id);
-        for (materializations[1..]) |name| {
-            const mat_idx = self.materializationIndex(name) orelse return null;
-            if (!sameLayoutShape(first_mat, self.config().materializations[mat_idx])) return null;
+        if (materializations.len == 0) return null;
+        // Resolve catalog names, law IDs and expression identities once. Per-row
+        // reads must not scan the catalog or recompile expression identities.
+        var by_name: std.StringHashMapUnmanaged(usize) = .empty;
+        defer by_name.deinit(self.alloc);
+        for (self.config().materializations, 0..) |mat, i| {
+            if (budget) |limit| try limit.control.check();
+            try by_name.put(self.alloc, mat.name, i);
         }
+        const first_mat_idx = by_name.get(materializations[0]) orelse return null;
+        const first_mat = self.config().materializations[first_mat_idx];
+        const columns = try self.alloc.alloc(PreparedMaterializedExpressionRead, materializations.len);
+        var prepared_count: usize = 0;
+        defer {
+            for (columns[0..prepared_count]) |column| self.alloc.free(column.expression_id);
+            self.alloc.free(columns);
+        }
+        for (materializations, 0..) |name, i| {
+            if (budget) |limit| try limit.control.check();
+            const mat_idx = by_name.get(name) orelse return null;
+            const mat = self.config().materializations[mat_idx];
+            if (!sameLayoutShape(first_mat, mat)) return null;
+            columns[i] = (try self.prepareMaterializedExpressionRead(mat)) orelse return null;
+            prepared_count += 1;
+        }
+        const first_law_id = columns[0].law_id;
+        const first_expr_id = columns[0].expression_id;
         const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, first_expr_id);
         defer self.alloc.free(prefix);
 
@@ -12544,8 +12577,9 @@ pub const Index = struct {
                 values[0] = if (row.slots[0].value) |value| try self.alloc.dupe(u8, value) else null;
             }
             var any_value = values[0] != null;
-            for (materializations[1..], 1..) |name, i| {
-                values[i] = try self.expressionRawValueForMaterializationTxn(txn, name, canonical_group, bucket_start);
+            for (columns[1..], 1..) |column, i| {
+                if (budget) |limit| try limit.control.check();
+                values[i] = try self.expressionRawValueForPreparedMaterializationTxn(txn, column, canonical_group, bucket_start);
                 if (values[i] != null) any_value = true;
             }
             if (!any_value) {
@@ -30578,4 +30612,31 @@ test "algebraic adaptive backfill supports configured join tensors" {
     var expr_after_delete = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, recommendation, axes, null)).?;
     defer expr_after_delete.deinit(idx.alloc);
     try std.testing.expectEqual(@as(f64, 32), try algebra.parseF64(expr_after_delete.raw.?));
+}
+
+test "time series prepared materialized scans release metadata on every allocation failure" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+            defer backend.close();
+            var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+            defer store.close();
+            var index = try Index.open(a, "series",
+                \\{"version":1,"table":"readings","time_fields":[{"name":"ts","path":"ts","type":"timestamp"}],"measure_fields":[{"name":"v","path":"v","type":"number"}],"materializations":[{"name":"rows","op":"count","time":"ts","bucket":"5m"},{"name":"total","op":"sum","measure":"v","time":"ts","bucket":"5m"}]}
+            );
+            defer index.close();
+            var budget = TemporalScanBudget{};
+            const rows = (try index.scanMaterializedExpressionRowsBounded(&store, &.{ "rows", "total" }, &budget)) orelse return error.MissingTemporalResult;
+            defer {
+                for (rows) |*row| row.deinit(a);
+                a.free(rows);
+            }
+            try std.testing.expectEqual(@as(usize, 0), rows.len);
+            try std.testing.expectEqual(@as(usize, 1_000_000), budget.remaining_cells);
+            try std.testing.expect((try index.scanMaterializedExpressionRowsBounded(&store, &.{ "rows", "total", "missing" }, &budget)) == null);
+            try std.testing.expect((try index.scanMaterializedExpressionRowsBounded(&store, &.{}, &budget)) == null);
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.run, .{});
 }

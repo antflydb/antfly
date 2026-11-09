@@ -800,3 +800,44 @@ it.each([
   ).rejects.toThrow();
   expect(query).toHaveBeenCalledTimes(4);
 });
+
+it("keeps SQL bucket output distinct from group and measurement names", () => {
+  const grouped = seriesSQL({ ...options, groupBy: ["bucket", "bucket_"] });
+  expect(grouped.statement).toContain('AS "bucket__"');
+  const measured = seriesSQL({
+    ...options,
+    measures: { bucket: { op: "avg", field: "temperature" } },
+  });
+  expect(measured.statement).toContain('AS "bucket_"');
+  expect(measured.statement).toContain('AS "bucket"');
+  const explicit = seriesSQL(options, { bucketAlias: 'time"bin' });
+  expect(explicit.statement).toContain('AS "time""bin"');
+  expect(explicit.parameters).toEqual(seriesSQL(options).parameters);
+  const scoped = seriesSQL(options, { bucketAlias: "__antfly_series_source" });
+  expect(scoped.statement).toContain('AS "__antfly_series_source_"');
+  expect(scoped.statement).toContain('AS "__antfly_series_source"');
+});
+
+it("rejects ambiguous explicit SQL output names before querying", () => {
+  expect(() => seriesSQL(options, { bucketAlias: "" })).toThrow(/nonempty/);
+  expect(() => seriesSQL(options, { bucketAlias: "device_id" })).toThrow(/distinct/);
+  expect(() => seriesSQL(options, { bucketAlias: "temperature" })).toThrow(/distinct/);
+  expect(() => seriesSQL({ ...options, groupBy: ["device_id", "device_id"] })).toThrow(/distinct/);
+  expect(() =>
+    seriesSQL({ ...options, measures: { device_id: { op: "avg", field: "temperature" } } })
+  ).toThrow(/overlaps/);
+});
+
+it("shares executable SQL alias fixtures with native API tests", () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../../../zig/e2e/antfly/fixtures/time-series-sdk-sql-aliases.json",
+        import.meta.url
+      ),
+      "utf8"
+    )
+  );
+  for (const item of fixture.cases)
+    expect(seriesSQL(item.options, item.sqlOptions)).toEqual(item.sql);
+});
