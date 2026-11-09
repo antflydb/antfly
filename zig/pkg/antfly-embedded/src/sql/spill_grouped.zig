@@ -1237,8 +1237,14 @@ fn bitmapSpillScenario(backing: Allocator, exact: bool, repeats: usize) !void {
 }
 
 test "SQL bitmap DISTINCT spill unions words with scalar and generic partials" {
+    // Enumerate every failing allocation with the same safety and leak checks,
+    // without repeatedly unwinding allocation/free backtraces thousands of
+    // times. The ordinary stress run retains full std.testing diagnostics.
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (checked.deinit() != 0) @panic("bitmap spill allocation fixture leaked");
+    const fault_allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else checked.allocator();
     inline for (.{ false, true }) |exact| {
         try bitmapSpillScenario(std.testing.allocator, exact, 64);
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, bitmapSpillScenario, .{ exact, @as(usize, 2) });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(fault_allocator, bitmapSpillScenario, .{ exact, @as(usize, 2) });
     }
 }
