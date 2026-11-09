@@ -661,7 +661,10 @@ restore the exact ledger-selected runtime, CLI, or full payload directly from
 its sealed R2 version prefix. They do not upload another full promotion payload,
 runtime subset, or CLI snapshot to Actions. The small ledger and Homebrew formula
 remain Actions handoffs. Restores verify the ledger digest, tag, source commit,
-mirror member set, and each selected file's digest and size.
+mirror member set, and each selected file's digest and size. If recovery uses
+GitHub Releases, prepare repairs the immutable R2 mirror from the fully verified
+payload before releasing downstream jobs. Existing conflicting objects fail
+closed; repair never advances a channel alias.
 
 Temporary CLI and Zig-source snapshots and VOPR data use the private
 `antfly-image-artifacts-ci-artifacts` GCS exchange when repository variable
@@ -671,12 +674,16 @@ reject path traversal/collisions, and verify downloaded bytes. Identical files
 share create-only SHA-256 objects within a fourteen-day namespace window.
 Separate release/VOPR service accounts can only read/create their own object
 prefix; neither receives R2 or registry authority. PR VOPR access still requires
-the existing default-branch admission controller; GitHub cache writes remain
+the existing default-branch admission controller. The existing Cloud Build/GAR
+builder federation must also be restricted to trusted publishers before enabling
+source-job OIDC, so staging tokens cannot switch providers to gain publish
+access. GitHub cache writes remain
 restricted by `cache-mode: read` in approved PR runs.
 
 Receipts and ordinary intermediate artifacts expire after fourteen days. Existing
 VOPR replay windows stay at ninety days. GCS short objects expire at thirty days,
-and replay objects at 120 days; both include headroom for reuse near the end of
+and all objects expire within 120 days, including paths outside known tiers.
+Both tiers include headroom for reuse near the end of
 a fourteen-day namespace window. Native release archives remain Actions handoffs because embedded registry
 preflight deliberately has no OIDC permission: fourteen days for RC/nightly,
 ninety for stable registry retries. Small release identity/ledger records also

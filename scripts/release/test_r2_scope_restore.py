@@ -17,12 +17,21 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 
-from download_objectstorage import restore_verified_payload
-from test_release_scope_materialization import fixture, TAG, COMMIT
+from download_objectstorage import (
+    LocalReader,
+    restore_payload,
+    restore_verified_payload,
+)
+from recover_release_payload import recover_payload
+from test_release_scope_materialization import fixture, TAG, COMMIT, ROOT
 
 
 class Reader:
@@ -39,6 +48,91 @@ class Reader:
 
 
 class R2ScopeTests(unittest.TestCase):
+    def test_github_recovery_repairs_missing_r2_before_downstream_scope_restore(self):
+        for conflict in (False, True):
+            with (
+                self.subTest(conflict=conflict),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                source, ledger = fixture(root / "github")
+                checksum = hashlib.sha256(ledger.read_bytes()).hexdigest()
+                recovered = root / "dist/release-payload"
+                self.assertEqual(
+                    recover_payload(
+                        [("github-release", lambda: Reader(source))],
+                        recovered,
+                        TAG,
+                        COMMIT,
+                        checksum,
+                    ),
+                    "github-release",
+                )
+                store = root / "r2"
+                prefix = f"antfly/{TAG}"
+                remote = store / "antfly-releases" / prefix
+                if conflict:
+                    remote.mkdir(parents=True)
+                    (remote / "antfly_test.tar.gz").write_bytes(
+                        b"conflicting immutable bytes"
+                    )
+                (root / "scripts").symlink_to(
+                    ROOT / "scripts", target_is_directory=True
+                )
+                (root / "bin").mkdir()
+                (root / "bin/python").symlink_to(sys.executable)
+                workflow = (ROOT / ".github/workflows/antfly-release.yml").read_text()
+                step = workflow.split(
+                    "      - name: Repair the R2 mirror from verified GitHub recovery\n",
+                    1,
+                )[1].split("\n      - name:", 1)[0]
+                self.assertIn("steps.recovery.outputs.source == 'github-release'", step)
+                # Execute the production handoff, substituting only its storage adapter.
+                shell = textwrap.dedent(step.split("        run: |\n", 1)[1]).replace(
+                    "--provider s3", '--provider local --local-root "$LOCAL_ROOT"'
+                )
+                result = subprocess.run(
+                    ["bash", "-c", shell],
+                    cwd=root,
+                    env={
+                        **os.environ,
+                        "PATH": str(root / "bin") + os.pathsep + os.environ["PATH"],
+                        "RELEASE_TAG": TAG,
+                        "LOCAL_ROOT": str(store),
+                        "AWS_ENDPOINT_URL": "unused",
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if conflict:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("immutable object differs", result.stderr)
+                    self.assertEqual(
+                        (remote / "antfly_test.tar.gz").read_bytes(),
+                        b"conflicting immutable bytes",
+                    )
+                else:
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+                    restore_payload(
+                        LocalReader(store, "antfly-releases"),
+                        prefix,
+                        root / "runtime",
+                        TAG,
+                        COMMIT,
+                        checksum,
+                        "runtime",
+                    )
+                    self.assertEqual(
+                        (root / "runtime/antfly_test.tar.gz").read_bytes(),
+                        b"server runtime",
+                    )
+                # Repair must never advance mutable channel pointers.
+                self.assertFalse((store / "antfly-releases/antfly/latest").exists())
+                self.assertFalse((store / "antfly-releases/antfly/next").exists())
+
     def test_only_requested_scope_is_downloaded_from_current_and_legacy_releases(self):
         for legacy in (False, True):
             for scope in ("runtime", "cli", None):
