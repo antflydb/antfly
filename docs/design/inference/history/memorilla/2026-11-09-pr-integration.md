@@ -40,6 +40,8 @@ remains `c3499c3645d5a42dacdf43c4131e6680a65fa22287016de18a5e5bc6b91cb80b`.
 Local receipts live under
 `.benchmark-results/memorilla/pr-preparation-20261109/` and are intentionally
 excluded from Git along with model weights, environments and build output.
+The local `validation-receipts.json` manifest binds the receipts by SHA256; its
+hash is `27d1309c739a9b110810526ed7392c824df2812d22491243bf1b10e8837d7e83`.
 
 | Check | Result | Receipt |
 | --- | --- | --- |
@@ -50,6 +52,7 @@ excluded from Git along with model weights, environments and build output.
 | Memorilla Python tooling with rebuilt native verifiers | 420 passed, zero skipped | `python-tests-final.log` |
 | Focused CUDA test artifact | 114 passed, zero skipped | `focused-cuda-tests.log` |
 | Broader inference build/test graph | 802 passed, 41 skipped | `integration-tests-build.log` |
+| Integrated inference gateway | 127 passed, one skipped; zero failures/leaks | `gateway-tests.log` |
 | Embedded memory admission policy | 7 passed | `policy-tests.log` |
 | Frozen-helper provenance tests | 3 passed | `provenance-tests-final.log` |
 | Python SDK | 819 passed | `python-sdk-tests.log` |
@@ -71,6 +74,12 @@ Stage3 profile switching, concurrent profiles, static and in-flight artifact
 drift rejection, recovery, and deadline recovery. The source-verified smoke also
 checks known answers, A/B/A isolation, concurrent isolation and the unchanged
 legacy schema. The harness records no owned server processes left alive.
+
+The gateway build completes all 59 steps. Its main artifact passes 87 tests;
+the local artifact passes 40 and skips one model-dependent ASR case. This covers
+Memorilla authorization, normalized execution paths, exact profile forwarding,
+buffered route inventory and the existing gateway contracts. The watch process
+is stopped after the successful run.
 
 The composed verifier SHA256 is
 `d58933c535fe3d4bf2432854f2875659c8316346b4f476218170012df829e559`.
@@ -96,7 +105,9 @@ fixed warm short-answer workload. Native includes question encoding, memory
 readout, decoder prefill and answer generation using supplied document vectors.
 Cold model load and document embedding production are excluded. The small
 observed median advantage and intervals crossing zero support **near parity**,
-not a general speedup claim. The vLLM comparison also differs in precision.
+not a general speedup claim. The vLLM comparison also differs in precision:
+40/48 native/vLLM output sequences match, so it does not establish bitwise
+generation parity between those engines.
 See the [paired latency report](2026-11-09-native-python-latency.md) and
 [official vLLM qualification](2026-11-09-vllm-engine-qualification.md).
 
