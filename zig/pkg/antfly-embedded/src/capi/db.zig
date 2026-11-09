@@ -5343,7 +5343,22 @@ pub fn antfly_db_get_transaction_status(
     out.* = 0;
     const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": transaction ID pointer must not be null");
-    const status = handle.database().*.getTransactionStatus(txn_id.*) catch |err| return capi.mapError(err);
+    const database = handle.database();
+    const status = database.*.getTransactionStatus(txn_id.*) catch |err| switch (err) {
+        // lite-single-commit-write-path.md §3.3c: not a two-phase decision
+        // id -- check whether it is a fused `commitCoordinatedLocal`
+        // ambiguous-outcome marker id instead. `guard.lock_handle` is
+        // already the root (never a table handle's own non-root catalog),
+        // matching this id's own resolution contract: the caller must use
+        // the same handle/table context the original ambiguous commit
+        // did, exactly as for an ordinary two-phase `TxnId`.
+        error.TxnNotFound => blk: {
+            const connection = guard.lock_handle.lite_connection orelse return capi.mapError(err);
+            const expected = connection.owner.last_ambiguous_fused_marker orelse return capi.mapError(err);
+            break :blk database.*.outcomeMarkerFallbackStatus(txn_id.*, expected) catch |fallback_err| return capi.mapError(fallback_err);
+        },
+        else => return capi.mapError(err),
+    };
     out.* = @backingInt(status);
     return .ok;
 }

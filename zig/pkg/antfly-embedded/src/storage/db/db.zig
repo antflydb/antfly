@@ -7667,8 +7667,21 @@ pub const DB = struct {
     /// outcome classification as `batchTrackedWithMarkerAndWriterLaneHook`:
     /// `primary_committed` distinguishes a durable write from one that
     /// never applied when this returns `error.OutcomeUnknown`.
-    pub fn batchLocalCoordinated(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
+    ///
+    /// `marker` (optional, mirrors `batchTrackedWithMarkerAndWriterLaneHook`):
+    /// the caller's writer-keyed outcome marker, committed atomically with
+    /// the primary write when set. Session COMMIT on this fused path
+    /// (`sql_session.zig`'s `commit`) uses this to give an ambiguous
+    /// outcome a resolvable, bounded receipt -- the retired writer id
+    /// doubles as `transaction_id` -- without a separate durable intent
+    /// record. Autocommit (`sql.zig`'s `mutate`) passes `null`: its own
+    /// ambiguous-outcome contract is the plain receipt-text scheme
+    /// (`outcome_receipts.zig`), not a `transaction_id`.
+    pub fn batchLocalCoordinated(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker) anyerror!void {
         primary_committed.* = false;
+        var marker_key: [apply_receipts.outcome_marker_key_len]u8 = undefined;
+        var marker_value: [apply_receipts.outcome_marker_value_len]u8 = undefined;
+        const marker_write: ?docstore_mod.KVPair = if (marker) |m| apply_receipts.outcomeMarkerWrite(m, &marker_key, &marker_value) else null;
         var progress: backend_types.CommitProgress = .{};
         const previous = backend_types.commit_progress;
         backend_types.commit_progress = &progress;
@@ -7676,6 +7689,7 @@ pub const DB = struct {
         const opts: BatchExecutionOptions = .{
             .primary_committed = primary_committed,
             .integrity_authority = .local_decision,
+            .outcome_marker_write = marker_write,
         };
         self.batchInternal(req, null, opts) catch |err| {
             if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
@@ -26533,6 +26547,27 @@ pub const DB = struct {
     pub fn getTransactionStatus(self: *DB, txn_id: transactions_mod.TxnId) !transactions_mod.TxnStatus {
         if (comptime storage_engine.enabled) return storage_engine.call("getTransactionStatus", .{ self, txn_id });
         return try self.core.getTransactionStatus(txn_id);
+    }
+
+    /// lite-single-commit-write-path.md §3.3c: `antfly_db_get_transaction_status`'s
+    /// fallback for an id that is not a known two-phase decision --
+    /// `expected` is the exact marker `commitCoordinatedLocal` retired on
+    /// an ambiguous outcome (`capi/sql.zig`), remembered on the
+    /// connection's `Owner` (not on `*DB`, which a post-ambiguous-commit
+    /// reconciliation may replace before this is ever checked -- see
+    /// `Owner.last_ambiguous_fused_marker`'s doc comment). The exact
+    /// sequence is needed because the bare 16-byte writer id alone
+    /// (this path's `transaction_id`) cannot disambiguate "this call's
+    /// own sequence landed" from "an earlier call on the same writer
+    /// already had", since nothing else about a retired writer's marker
+    /// key is resolvable from its id alone.
+    pub fn outcomeMarkerFallbackStatus(self: *DB, txn_id: transactions_mod.TxnId, expected: apply_receipts.OutcomeMarker) !transactions_mod.TxnStatus {
+        if (!std.mem.eql(u8, &expected.writer, &txn_id)) return error.TxnNotFound;
+        const persisted = try apply_receipts.readOutcomeMarker(self.alloc, self.core.store, txn_id);
+        return switch (try apply_receipts.outcomeDisposition(persisted, expected.sequence)) {
+            .applied => .committed,
+            .not_applied => .aborted,
+        };
     }
 
     pub fn getCommitVersion(self: *DB, txn_id: transactions_mod.TxnId) !u64 {
