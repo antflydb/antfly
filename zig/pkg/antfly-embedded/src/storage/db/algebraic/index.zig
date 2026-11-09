@@ -18460,7 +18460,8 @@ pub const Index = struct {
         // write txn never overlaps a foreground applyBatch write (single-writer
         // store). The dirty re-check inside the lock collapses redundant jobs.
         self.lockWrites();
-        defer self.unlockWrites();
+        var locked = true;
+        defer if (locked) self.unlockWrites();
         if (builtin.is_test) if (self.test_hll_hooks) |hooks| hooks.maintenance_locked(hooks.context);
         if (!try self.anyHllCardinalityDirty(store)) return false;
         var storage_accounting = self.storageAccountingScope();
@@ -18475,6 +18476,21 @@ pub const Index = struct {
         defer txn.deinit();
         const tick = try self.runHllMaintenanceTxn(&txn, self.config().max_hll_maintenance_rows_per_tick);
         try txn.finish();
+        // Release the write lock before the durability wait (WS3: "release
+        // the apply lock before the wait," the same reasoning
+        // `InlineAlgebraicPublication.stage` already applies). Staging
+        // (runHllMaintenanceTxn/txn.finish above) is done; only the
+        // physical commit and its ticket.wait() remain, and neither
+        // touches this Index's in-memory state. Holding the lock through
+        // the wait is a real deadlock, not just a missed optimization: a
+        // foreground write to this same index needs this same lock to
+        // even stage its own commit, so if nothing else is ever going to
+        // drain this ride-along ticket's group (the idle-flush timer
+        // disabled or set long enough not to matter -- see the
+        // write-amplification harness's algebraic-overwrite modes), that
+        // foreground write can never arrive to drain it either.
+        self.unlockWrites();
+        locked = false;
         const wal_trace_scope = wal_trace.scope(.algebraic_hll_maintenance);
         defer wal_trace_scope.end();
         try raw_txn.commit();
@@ -18590,7 +18606,8 @@ pub const Index = struct {
         if (self.hll_pending_observations.count() == 0) return;
 
         self.lockWrites();
-        defer self.unlockWrites();
+        var locked = true;
+        defer if (locked) self.unlockWrites();
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
         // Telemetry counters: safe to lose on a crash (observation history
@@ -18615,6 +18632,13 @@ pub const Index = struct {
             try txn.put(entry.key_ptr.*, next_text);
         }
         try txn.finish();
+        // See `runHllMaintenance`'s identical fix: release before the
+        // durability wait, not after. The post-commit cleanup below only
+        // touches `hll_pending_observations`/`hll_pending_observation_bytes`,
+        // guarded by `hll_observation_mutex` (held for this whole function
+        // via the outer `defer` above), not `lockWrites()`.
+        self.unlockWrites();
+        locked = false;
         const wal_trace_scope = wal_trace.scope(.algebraic_hll_maintenance);
         defer wal_trace_scope.end();
         try raw_txn.commit();
@@ -18835,7 +18859,8 @@ pub const Index = struct {
         var work_units: u64 = 0;
 
         self.lockWrites();
-        defer self.unlockWrites();
+        var locked = true;
+        defer if (locked) self.unlockWrites();
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
         // Backfill progress is catch-up progress: losing it in a crash only
@@ -18930,6 +18955,11 @@ pub const Index = struct {
         }
 
         try txn.finish();
+        // See `runHllMaintenance`'s identical fix: release before the
+        // durability wait, not after. `registry`'s own lock (released by
+        // its own `defer` above, at function exit) is unaffected.
+        self.unlockWrites();
+        locked = false;
         try raw_txn.commit();
         return work_units;
     }
