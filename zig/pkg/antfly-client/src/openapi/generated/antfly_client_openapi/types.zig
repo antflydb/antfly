@@ -36053,7 +36053,7 @@ pub const LeannIndexConfig = struct {
     bound_scale: ?f32 = null,
     /// Candidates recomputed per batch. 0 uses k.
     batch_size: ?i64 = null,
-    /// Time a query may spend re-embedding candidates whose stored vectors were dropped. Once spent, the remaining candidates are ranked by their code estimates instead, so the query still returns results. 0 means no limit.
+    /// Time a query may spend re-embedding candidates whose stored vectors were dropped. If the budget is spent before scoring finishes, the search returns an incomplete-coverage error; retry with a larger budget. 0 means no limit.
     reembed_budget_ms: ?i64 = null,
     /// How vectors that cannot be re-embedded from text (images, audio windows, model outputs) are kept once the graph covers them. "full" keeps the stored float32 vector. "int8" replaces it with a stub holding an int8 copy (about a quarter of the size), read back instead of re-embedding. Requires "auto" or "transient" storage.
     media_vectors: ?[]const u8 = null,

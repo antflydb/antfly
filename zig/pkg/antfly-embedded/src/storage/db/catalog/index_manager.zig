@@ -33500,7 +33500,7 @@ pub const IndexManager = struct {
                                 found[i] = true;
                                 continue;
                             }
-                            const source_hash = identity.source_hash orelse return error.ReembedProvenanceUnavailable;
+                            const source_hash = identity.source_hash;
                             try elided_slots.append(alloc, i);
                             try elided_keys.append(alloc, meta);
                             try source_hashes.append(alloc, source_hash);
@@ -33530,7 +33530,7 @@ pub const IndexManager = struct {
         {
             const started = platform_time.monotonicNs();
             defer reembed_ns.* +|= platform_time.monotonicNs() -| started;
-            try manager.reembedDenseDocuments(alloc, entry, elided_keys.items, source_hashes.items, vectors, ok);
+            try manager.reembedDenseDocuments(alloc, entry, elided_keys.items, source_hashes.items, elided_digests.items, vectors, ok);
         }
         for (elided_slots.items, 0..) |slot, j| {
             if (!ok[j]) continue;
@@ -33578,7 +33578,7 @@ pub const IndexManager = struct {
 
     /// Embeds documents' source text the way the index's dense producer
     /// does, for a transient LEANN index whose stored vectors were elided.
-    fn reembedDenseDocuments(self: *IndexManager, alloc: Allocator, entry: *const DenseIndex, doc_keys: []const []const u8, source_hashes: []const ?u64, out: []f32, found: []bool) !void {
+    fn reembedDenseDocuments(self: *IndexManager, alloc: Allocator, entry: *const DenseIndex, doc_keys: []const []const u8, source_hashes: []const ?u64, digests: []const ?u64, out: []f32, found: []bool) !void {
         const reembedder = self.dense_reembedder orelse return error.ReembedUnavailable;
         const generator = (try parseDenseGeneratorConfig(alloc, entry.config.config_json)) orelse return error.InvalidIndexConfig;
         defer generator.deinit(alloc);
@@ -33587,7 +33587,7 @@ pub const IndexManager = struct {
         const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
         const requests = try alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, doc_keys.len);
         defer alloc.free(requests);
-        for (doc_keys, source_hashes, requests) |doc_key, source_hash, *request| request.* = .{
+        for (doc_keys, source_hashes, digests, requests) |doc_key, source_hash, digest, *request| request.* = .{
             .kind = .dense_embedding,
             .index_name = entry.config.name,
             .artifact_name = chunk_cfg.artifact_name,
@@ -33601,6 +33601,7 @@ pub const IndexManager = struct {
             .source_template = chunk_cfg.source_template,
             .expected_dims = entry.dims,
             .expected_source_hash = source_hash,
+            .expected_vector_digest = digest,
             .chunk_size = chunk_cfg.chunk_size,
             .chunk_overlap = chunk_cfg.chunk_overlap,
             .chunker_json = chunk_cfg.chunker_json,
@@ -33640,9 +33641,9 @@ pub const IndexManager = struct {
         const store = self.primary_store orelse return error.ReembedProvenanceUnavailable;
         const name = entry.embedding_name orelse return error.ReembedProvenanceUnavailable;
         const identity = (try leannStubIdentity(alloc, store, doc_key, name)) orelse return error.ReembedProvenanceUnavailable;
-        const source_hash = identity.source_hash orelse return error.ReembedProvenanceUnavailable;
-        const hashes = [_]?u64{source_hash};
-        try self.reembedDenseDocuments(alloc, entry, &keys, &hashes, out, &found);
+        const hashes = [_]?u64{identity.source_hash};
+        const digests = [_]?u64{identity.digest};
+        try self.reembedDenseDocuments(alloc, entry, &keys, &hashes, &digests, out, &found);
         if (!found[0]) return error.NotFound;
         return out;
     }

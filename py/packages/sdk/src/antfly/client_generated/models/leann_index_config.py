@@ -37,8 +37,8 @@ class LeannIndexConfig:
             and loses fewer true neighbors. Default: 1.0.
         batch_size (int | Unset): Candidates recomputed per batch. 0 uses k. Default: 0.
         reembed_budget_ms (int | Unset): Time a query may spend re-embedding candidates whose stored vectors were
-            dropped. Once spent, the remaining candidates are ranked by their code estimates instead, so the query still
-            returns results. 0 means no limit. Default: 0.
+            dropped. If the budget is spent before scoring finishes, the search returns an incomplete-coverage error;
+            retry with a larger budget. 0 means no limit. Default: 0.
         media_vectors (LeannIndexConfigMediaVectors | Unset): How vectors that cannot be re-embedded from text (images,
             audio windows, model outputs) are kept once the graph covers them. "full" keeps the stored float32 vector.
             "int8" replaces it with a stub holding an int8 copy (about a quarter of the size), read back instead of re-

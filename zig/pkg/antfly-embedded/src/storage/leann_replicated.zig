@@ -743,7 +743,7 @@ pub const ReplicatedState = struct {
                 .gate = gate.recomputeGate(),
             }, ctx.keyLoader());
             defer alloc.free(hits);
-            if (budget_exhausted and search_types.requiresExhaustiveCoverage(req)) return error.IncompletePublishedSnapshot;
+            if (budget_exhausted) return error.IncompletePublishedSnapshot;
             var passed: usize = 0;
             for (hits) |h| {
                 const vector_id = self.bindings.get(h.key) orelse continue;

@@ -202,6 +202,8 @@ pub const GeneratedEnrichmentRequest = struct {
     expected_dims: u32 = 0,
     /// Provenance of an elided embedding; checked before re-embedding.
     expected_source_hash: ?u64 = null,
+    /// Fallback proof for legacy artifacts without an immutable producer revision.
+    expected_vector_digest: ?u64 = null,
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",

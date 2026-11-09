@@ -1617,13 +1617,16 @@ pub const Index = struct {
             // Out of budget: rank the rest by estimate rather than return
             // fewer than k results.
             stats.budget_exhausted = true;
-            for (pool.items[from..], from..) |p, position| {
-                if (self.isDeleted(p.id) or (!opts.verify_source and !opts.exhaustive and position < i and self.upper_vectors.contains(p.id))) continue;
-                const c = Cand{ .dist = p.est, .id = p.id };
-                if (top.len() < k) {
-                    try top.push(alloc, c);
-                } else if (c.dist < top.top().dist) {
-                    top.replaceTop(c);
+            // Unscored source-backed candidates may no longer exist.
+            if (!opts.verify_source) {
+                for (pool.items[from..], from..) |p, position| {
+                    if (self.isDeleted(p.id) or (!opts.exhaustive and position < i and self.upper_vectors.contains(p.id))) continue;
+                    const c = Cand{ .dist = p.est, .id = p.id };
+                    if (top.len() < k) {
+                        try top.push(alloc, c);
+                    } else if (c.dist < top.top().dist) {
+                        top.replaceTop(c);
+                    }
                 }
             }
         }

@@ -18495,7 +18495,7 @@ export interface components {
              */
             batch_size?: number;
             /**
-             * @description Time a query may spend re-embedding candidates whose stored vectors were dropped. Once spent, the remaining candidates are ranked by their code estimates instead, so the query still returns results. 0 means no limit.
+             * @description Time a query may spend re-embedding candidates whose stored vectors were dropped. If the budget is spent before scoring finishes, the search returns an incomplete-coverage error; retry with a larger budget. 0 means no limit.
              * @default 0
              */
             reembed_budget_ms?: number;

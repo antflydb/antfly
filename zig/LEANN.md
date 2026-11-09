@@ -142,11 +142,11 @@ search walks using code estimates and scores allowed candidates exactly.
 Cancellation is checked during traversal and the fallback scan. The
 re-embedding budget counts time spent regenerating vectors, including
 re-chunking and source preparation, rather than graph or stored-vector reads.
-When fewer than `ef` live nodes pass a filter, this fallback can inspect all
-`node_count` nodes, so its worst-case CPU time is linear in the index size even
-when the result contains only one node. It does not re-embed rejected nodes.
-Size `search_ef` with this tradeoff in mind; benchmarks on representative
-large collections are needed before relying on selective-filter latency.
+If it is exhausted before scoring finishes, the search returns an
+incomplete-coverage error instead of including unverified candidates.
+Best-effort predicate searches cap the walk and fallback scan; full-effort
+queries can inspect all `node_count` nodes. Explicit ID filters look up their
+candidates directly. Rejected nodes are not re-embedded.
 
 ### Differences from the paper
 
@@ -471,8 +471,8 @@ and rescores leaf members near the admission cutoff with extended codes
   selective filter can return fewer than `k`; search effort `1.0` instead
   exhausts the graph for complete coverage. Missing candidates are omitted
   from best-effort results; complete-coverage requests fail if a live vector
-  cannot be loaded. Source identity mismatches fail with
-  `ReembedRevisionMismatch` rather than scoring a different revision.
+  cannot be loaded. Source identity mismatches are treated as unavailable
+  candidates rather than scoring a different revision.
 - **Persistence.** `sync` (called from `IndexManager.syncAll`, before the
   applied sequence is recorded) writes `leann.store` atomically with a CRC:
   the key map, the exact buffer, and the serialized graph. When at least
@@ -552,7 +552,9 @@ Three modes:
   the same parent reuse one indexed source set per batch. A recomputed vector
   enters the LRU only after its source identity is checked against the stub,
   preventing an edit made ahead of enrichment from poisoning a previous
-  revision's cache entry without requiring bit-identical floating-point output.
+  revision's cache entry. When a legacy stub does not bind an immutable
+  provider revision, its recomputed vector must also match the stored digest;
+  a non-identical result is unavailable until the embedding is regenerated.
   Without an enrichment runtime, reads of stubs fail with `error.ReembedUnavailable`.
 - **Vector blocks.** LEANN indexes stay out of HBC's shared vector-block
   plane (`IndexManager.denseIndexUsesVectorBlocks`): it would otherwise keep

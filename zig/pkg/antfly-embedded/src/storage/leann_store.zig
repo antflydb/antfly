@@ -713,7 +713,7 @@ pub const LeannStore = struct {
                 .gate = gate.recomputeGate(),
             });
             defer resp.deinit(alloc);
-            if (resp.stats.budget_exhausted and search_types.requiresExhaustiveCoverage(req)) return error.IncompletePublishedSnapshot;
+            if (resp.stats.budget_exhausted) return error.IncompletePublishedSnapshot;
             var passed: usize = 0;
             for (resp.results) |r| {
                 const node = self.nodes.items[r.id];
@@ -1389,10 +1389,8 @@ test "leann search forwards reembedding time from batch loader" {
     store.setLoader(.{ .ctx = &source, .load = Timed.load, .load_batch_timed = Timed.batch });
     try addAll(alloc, store, data, dims, 0, 300);
     source.calls = 0;
-    var result = try store.search(alloc, .{ .query = data[0..dims], .k = 50 });
-    defer result.deinit();
+    try testing.expectError(error.IncompletePublishedSnapshot, store.search(alloc, .{ .query = data[0..dims], .k = 50 }));
     try testing.expectEqual(@as(usize, 1), source.calls);
-    try testing.expectEqual(@as(usize, 50), result.items.items.len);
     source.calls = 0;
     try testing.expectError(error.IncompletePublishedSnapshot, store.search(alloc, .{ .query = data[0..dims], .k = 50, .search_effort = 1 }));
     try testing.expectEqual(@as(usize, 1), source.calls);

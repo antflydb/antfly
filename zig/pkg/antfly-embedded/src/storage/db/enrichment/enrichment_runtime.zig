@@ -1804,6 +1804,14 @@ pub fn reembedDenseDocuments(
     }
     var slots: std.ArrayList(usize) = .empty;
     defer slots.deinit(alloc);
+    var legacy_digests: std.ArrayList(?u64) = .empty;
+    defer legacy_digests.deinit(alloc);
+    var generations = std.StringHashMapUnmanaged(u64).empty;
+    defer {
+        var iterator = generations.keyIterator();
+        while (iterator.next()) |key| runtime.alloc.free(key.*);
+        generations.deinit(runtime.alloc);
+    }
     var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
     defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
     var source_cache = ReembedChunkSourceCache{};
@@ -1817,7 +1825,17 @@ pub fn reembedDenseDocuments(
         else
             try runtime.alloc.dupe(u8, request.doc_key);
         defer runtime.alloc.free(parent_key);
-        request.reprocess_generation = try embeddingReprocessGeneration(runtime, parent_key, requestEmbeddingName(request), request.producer_json);
+        const cache_key = try workerChunkCacheTupleKeyAlloc(runtime.alloc, &.{ parent_key, requestEmbeddingName(request), request.producer_json });
+        defer runtime.alloc.free(cache_key);
+        if (generations.get(cache_key)) |value| {
+            request.reprocess_generation = value;
+        } else {
+            request.reprocess_generation = try embeddingReprocessGeneration(runtime, parent_key, requestEmbeddingName(request), request.producer_json);
+            const owned_key = try runtime.alloc.dupe(u8, cache_key);
+            errdefer runtime.alloc.free(owned_key);
+            try generations.put(runtime.alloc, owned_key, request.reprocess_generation);
+        }
+        var require_digest = request.expected_source_hash == null;
         // Page-image inputs embed rendered pages, not the document source;
         // such indexes must keep their vectors.
         if (request.embedding_input == .pdf_page_images) return error.ReembedUnsupportedInput;
@@ -1827,14 +1845,18 @@ pub fn reembedDenseDocuments(
                 const actual = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
                 if (actual != expected) {
                     runtime.alloc.free(text);
-                    return error.ReembedRevisionMismatch;
+                    continue;
                 }
+                // Chunk identities written by older producers did not include
+                // the immutable provider revision; prove those by vector digest.
+                require_digest = true;
             }
             texts.append(alloc, text) catch |err| {
                 runtime.alloc.free(text);
                 return err;
             };
             try slots.append(alloc, i);
+            try legacy_digests.append(alloc, if (require_digest) request.expected_vector_digest else null);
             continue;
         }
         const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
@@ -1848,12 +1870,16 @@ pub fn reembedDenseDocuments(
             .parts => |parts| {
                 if (request.expected_source_hash) |expected| {
                     const actual = (try densePartsSourceHash(alloc, request, parts, generation.revision)) orelse return error.ReembedProvenanceUnavailable;
-                    if (actual != expected) return error.ReembedRevisionMismatch;
+                    if (actual != expected) continue;
+                    require_digest = generation.revision == null;
                 }
                 const vector = try embedDensePartsTracked(runtime, &index_names, alloc, pinned_embedder, requestEmbeddingName(request), parts, dims);
                 defer alloc.free(vector);
                 try dense_embedder.requireTextGeneration(alloc, requestEmbeddingName(request), generation);
                 if (vector.len != dims) return error.InvalidVectorDimensions;
+                if (require_digest) if (request.expected_vector_digest) |expected| {
+                    if (@import("../../leann_store.zig").vectorDigest(vector) != expected) continue;
+                };
                 @memcpy(out[i * dims ..][0..dims], vector);
                 found[i] = true;
                 continue;
@@ -1862,20 +1888,23 @@ pub fn reembedDenseDocuments(
                 if (request.expected_source_hash) |expected| {
                     const actual = retainedTextEmbeddingHashAtRevision(request, text, generation.revision);
                     const legacy = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
-                    if (actual != expected and legacy != expected) return error.ReembedRevisionMismatch;
+                    if (actual != expected and legacy != expected) continue;
+                    require_digest = generation.revision == null or legacy == expected;
                 }
                 try texts.append(alloc, text);
                 prepared = .empty; // The text list owns it now.
             },
         }
         try slots.append(alloc, i);
+        try legacy_digests.append(alloc, if (require_digest) request.expected_vector_digest else null);
     }
     if (texts.items.len == 0) return;
     const vectors = try embedDenseBatchTracked(runtime, &index_names, alloc, pinned_embedder, requestEmbeddingName(requests[0]), texts.items, dims);
     defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
     try dense_embedder.requireTextGeneration(alloc, requestEmbeddingName(requests[0]), generation);
-    for (slots.items, vectors) |slot, vector| {
+    for (slots.items, legacy_digests.items, vectors) |slot, digest, vector| {
         if (vector.len != dims) return error.InvalidVectorDimensions;
+        if (digest) |expected| if (@import("../../leann_store.zig").vectorDigest(vector) != expected) continue;
         @memcpy(out[slot * dims ..][0..dims], vector);
         found[slot] = true;
     }
@@ -6150,10 +6179,32 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
     try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
     try std.testing.expectEqual(@as(usize, 1), probe.texts.items.len);
     requests[0].expected_source_hash = requests[0].expected_source_hash.? ^ 1;
-    try std.testing.expectError(error.ReembedRevisionMismatch, reembedDenseDocuments(&runtime, alloc, &requests, 2, &out, &found));
+    @memset(&found, false);
+    try reembedDenseDocuments(&runtime, alloc, &requests, 2, &out, &found);
+    try std.testing.expect(!found[0]);
     requests[0].expected_source_hash = requests[0].expected_source_hash.? ^ 1;
     try std.testing.expectEqualStrings(wanted.text, probe.texts.items[0]);
     try std.testing.expectEqual(@as(f32, @floatFromInt(wanted.text.len)), out[0]);
+    {
+        var mixed = [_]enrichment_types.GeneratedEnrichmentRequest{ requests[0], requests[0] };
+        mixed[0].expected_source_hash = mixed[0].expected_source_hash.? ^ 1;
+        var mixed_out: [4]f32 = undefined;
+        var mixed_found = [_]bool{ false, false };
+        try reembedDenseDocuments(&runtime, alloc, &mixed, 2, &mixed_out, &mixed_found);
+        try std.testing.expect(!mixed_found[0] and mixed_found[1]);
+    }
+
+    // Historical stubs can be recovered only when the recomputed vector
+    // matches their durable digest. A changed model must not be accepted.
+    requests[0].expected_source_hash = null;
+    requests[0].expected_vector_digest = @import("../../leann_store.zig").vectorDigest(out[0..2]);
+    @memset(&found, false);
+    try reembedDenseDocuments(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1]);
+    try std.testing.expect(found[0]);
+    requests[0].expected_vector_digest = requests[0].expected_vector_digest.? ^ 2;
+    @memset(&found, false);
+    try reembedDenseDocuments(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1]);
+    try std.testing.expect(!found[0]);
 
     // Several requested keys from one parent reuse one indexed source set.
     {
