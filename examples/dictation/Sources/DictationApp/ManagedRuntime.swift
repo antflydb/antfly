@@ -68,7 +68,7 @@ import Security
     ready = false
     busy = true
     status = "Starting local engine…"
-    startup = Task {
+    startup = Task { [self] in
       defer {
         if generation == revision {
           startup = nil
@@ -131,7 +131,7 @@ import Security
         child.standardError = FileHandle.nullDevice
         child.terminationHandler = { [weak self] child in
           let code = child.terminationStatus
-          Task { @MainActor [weak self] in self?.exited(revision: revision, code: code) }
+          Task { @MainActor in self?.exited(revision: revision, code: code) }
         }
         _ = fcntl(pipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         try child.run()
@@ -196,7 +196,7 @@ import Security
       return
     }
     status = "Local engine exited (\(code)); restarting (\(failures)/3)…"
-    startup = Task {
+    startup = Task { [self] in
       try? await Task.sleep(for: .seconds(1 << failures))
       guard !Task.isCancelled, desired, generation == restartRevision else { return }
       startup = nil
