@@ -1943,14 +1943,30 @@ test "lite allocator v4 allocation failures release every private owner" {
             defer tmp.cleanup();
             const path = try testPath(backing, tmp, "reuse-allocation-failures.aflite");
             defer backing.free(path);
-            var file = try NativeFile.createWithIo(backing, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+            // Create and close through the same wrapper `a` for the whole
+            // lifecycle. NativeFile's own long-lived state (ledger,
+            // manifest_builder, free-map bookkeeping) is built up starting
+            // at creation and only ever fully freed later, by `close()`;
+            // creating with `backing` and only switching `self.allocator`
+            // to `a` afterward (or switching back to `backing` before
+            // `close()`, tried first) makes some of those bytes allocated
+            // through one wrapper and freed through the other. Both are
+            // real `std.testing.allocator` bytes either way (`a` only ever
+            // forwards to `backing`) -- replaying this exact body,
+            // fail_index by fail_index, directly against
+            // std.testing.allocator's own leak-tracking GPA never reported
+            // a leak under any allocator-swapping arrangement -- but
+            // checkAllAllocationFailures' own per-wrapper-instance
+            // allocated/freed byte counters see a false mismatch (a "leak"
+            // or, as bad, a free with no matching tracked allocation)
+            // whenever creation and close disagree on which wrapper to use.
+            // One allocator for the full lifecycle removes the mismatch.
+            var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
             file.invalidateLedger();
-            file.page_cache.clear(backing);
+            file.page_cache.clear(a);
             file.page_cache_enabled.store(false, .monotonic);
-            file.allocator = a;
             defer {
                 file.abortTransaction();
-                file.allocator = backing;
                 file.close();
             }
             const value: [8192]u8 = @splat('v');
