@@ -408,32 +408,36 @@ class RuntimeCacheTest(unittest.TestCase):
                     )
 
     def test_compute_owner_ignores_storage_abi_changes(self):
+        # Both owners have storage-independent contracts. Local query dispatch
+        # depends on its opaque operation ABI, not physical DB/Raft layouts.
+        units = ("enrichment_compute", "local_query")
+        targets = tuple(f"runtime-unit-{unit}" for unit in units)
         contract = self.own("zig/pkg/antfly-embedded/src/storage/kernel_owner_abi.zig")
-        self.assert_compile(
-            self.build("runtime-unit-enrichment_compute"),
-            "enrichment_compute",
-            "success",
-        )
-        self.assert_compile(
-            self.build("runtime-unit-enrichment_compute"),
-            "enrichment_compute",
-            "cached",
-        )
+        for status in ("success", "cached"):
+            output = self.build(*targets)
+            for unit in units:
+                self.assert_compile(output, unit, status)
         contract.write_bytes(
             contract.read_bytes() + b"\n// storage ABI cache regression\n"
         )
-        self.assert_compile(
-            self.build("runtime-unit-enrichment_compute"),
-            "enrichment_compute",
-            "cached",
+        for missing in (False, True):
+            if missing:
+                contract.unlink()
+            output = self.build(*targets)
+            for unit in units:
+                self.assert_compile(output, unit, "cached")
+
+        # Positive control: changing the opaque query ABI rebuilds its dispatcher
+        # while leaving the independent compute owner cached.
+        query = self.own("zig/pkg/antfly-embedded/src/storage/local_query_abi.zig")
+        query.write_bytes(
+            query.read_bytes() + b"\npub const cache_test_owner_revision: u8 = 1;\n"
         )
-        # Compute must remain buildable without declaring this storage-only
-        # contract, rather than merely avoiding semantic use of its types.
-        contract.unlink()
-        self.assert_compile(
-            self.build("runtime-unit-enrichment_compute"),
-            "enrichment_compute",
-            "cached",
+        output = self.build(*targets)
+        self.assert_compile(output, "local_query", "success")
+        self.assert_compile(output, "enrichment_compute", "cached")
+        self.assertIn(
+            "FileNotFound", self.build("runtime-unit-storage_kernel", succeeds=False)
         )
 
     def test_control_consumers_ignore_physical_db_implementation(self):
@@ -454,7 +458,7 @@ class RuntimeCacheTest(unittest.TestCase):
             ("zig/lib/a2a/src/root.zig", ("api_kernel",)),
             (
                 "zig/lib/raft/src/root.zig",
-                ("distributed", "storage_kernel", "local_query", "api_kernel"),
+                ("distributed", "storage_kernel", "api_kernel"),
             ),
         )
         for relative, _ in owners:
@@ -480,19 +484,23 @@ class RuntimeCacheTest(unittest.TestCase):
                 self.assertNotEqual(after, before)
                 before = after
                 self.assert_archives(self.build("cache-probe"))
-                source.unlink()
-                # Unrelated owners keep compiling without the dependency. Its
-                # real consumers must fail instead of silently dropping it.
-                unrelated = [unit for unit in UNITS if unit not in consumers]
-                output = self.build(*(f"runtime-unit-{unit}" for unit in unrelated))
-                for unit in unrelated:
-                    self.assert_compile(output, unit, "cached")
-                for unit in consumers:
-                    self.assertIn(
-                        "FileNotFound",
-                        self.build(f"runtime-unit-{unit}", succeeds=False),
-                    )
-                source.write_bytes(contents)
+                hidden = source.with_name(source.name + ".cache-test-hidden")
+                source.rename(hidden)
+                try:
+                    # Unrelated owners remain buildable; actual consumers must
+                    # fail. Preserve the source inode when restoring it so this
+                    # availability probe does not also change file identity.
+                    unrelated = [unit for unit in UNITS if unit not in consumers]
+                    output = self.build(*(f"runtime-unit-{unit}" for unit in unrelated))
+                    for unit in unrelated:
+                        self.assert_compile(output, unit, "cached")
+                    for unit in consumers:
+                        self.assertIn(
+                            "FileNotFound",
+                            self.build(f"runtime-unit-{unit}", succeeds=False),
+                        )
+                finally:
+                    hidden.rename(source)
                 self.assert_archives(self.build("cache-probe"))
 
     def test_lite_capability_options(self):
@@ -503,9 +511,7 @@ class RuntimeCacheTest(unittest.TestCase):
         baseline = self.build("cache-probe", settings=enabled)
         self.assert_archives(self.build("cache-probe", settings=enabled))
         changed = self.build("cache-probe", settings=disabled)
-        self.assert_archives(
-            changed, rebuilt=("distributed", "storage_kernel", "local_query")
-        )
+        self.assert_archives(changed, rebuilt=("distributed", "storage_kernel"))
         # The actual capability implementation must still report the new value.
         self.assertNotEqual(self.probe(baseline), self.probe(changed))
         self.assert_archives(self.build("cache-probe", settings=disabled))
@@ -1564,7 +1570,9 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assert_archives(
             output,
             rebuilt=tuple(
-                unit for unit in UNITS if unit not in ("cli", "enrichment_compute")
+                unit
+                for unit in UNITS
+                if unit not in ("cli", "enrichment_compute", "local_query")
             ),
         )
         self.assertNotEqual(self.probe(output, "TOKENIZER_PROBE"), tokenizer_before)
@@ -1585,7 +1593,9 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assert_archives(
             output,
             rebuilt=tuple(
-                unit for unit in UNITS if unit not in ("cli", "enrichment_compute")
+                unit
+                for unit in UNITS
+                if unit not in ("cli", "enrichment_compute", "local_query")
             ),
         )
 
@@ -1603,7 +1613,9 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assertIn("state: u32 = 1,", text)
         shared.write_text(text.replace("state: u32 = 1,", "state: u32 = 2,"))
         changed = self.build("cache-probe", version="cache-after")
-        self.assert_archives(changed, rebuilt=UNITS)
+        self.assert_archives(
+            changed, rebuilt=tuple(unit for unit in UNITS if unit != "local_query")
+        )
         self.assertNotEqual(
             self.probe(changed).split()[1:5], self.probe(versioned).split()[1:5]
         )
