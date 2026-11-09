@@ -23391,7 +23391,10 @@ pub const ApiHttpServer = struct {
                 }
             };
             var runner: Runner = .{ .server = self, .profile = &composed_profile, .lake_scope = .init(self.alloc), .identity = authenticated_identity, .cancellation = cancellation, .overlay = overlay, .deadline = deadline };
-            defer runner.lake_scope.deinit();
+            defer {
+                composed_profile.io = runner.lake_scope.ioSnapshot();
+                runner.lake_scope.deinit();
+            }
             return composed.execute(self.alloc, composed_body, .{ .ptr = &runner, .execute = Runner.execute, .checkpoint = Runner.checkpoint, .save_cursor = Runner.saveCursor, .load_cursor = Runner.loadCursor }) catch |err| return self.publicQueryOperationErrorResponse("", body, err);
         }
         return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation, null, null);

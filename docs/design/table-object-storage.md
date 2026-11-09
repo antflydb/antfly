@@ -217,7 +217,9 @@ bundle-opening time. They attach to the prepared reader's lifetime, not a leaf's
 scratch arena, and survive only through the request's bounded diagnostic
 snapshot. Process counters continue to cover all provider traffic; these request
 profiles specifically attribute immutable index/cache reads. Slow-request health
-metrics expose the profile without table names, object paths, or credentials.
+metrics expose both individual leaves and accumulated composed-request I/O
+without table names, object paths, or credentials. Refill calls contribute only
+their new work, and serial leaf peaks combine by maximum rather than sum.
 Disk metrics distinguish checkpoint recovery from scanned inventory entries.
 
 This follows [Lance's upfront metadata size hints and reading strategy](https://lance.org/format/file/#reading-strategy),

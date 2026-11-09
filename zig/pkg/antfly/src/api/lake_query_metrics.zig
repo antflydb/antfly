@@ -310,6 +310,10 @@ pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: any
         }
     }
     if (query.slowest_composed) |profile| {
+        inline for (@typeInfo(local.serverless_query_lake_read_context.IoTrace.Snapshot).@"struct".field_names) |field| {
+            try prom.appendPromMetric(writer, "antfly_lake_query_slowest_composed_io_" ++ field, "gauge", "Request-owned covered lake immutable I/O across serial composed leaves; parallel elapsed sums overlap", @field(profile.io, field));
+        }
+
         inline for (.{ "total", "definition", "leaf", "native_leaf", "cursor" }) |phase| {
             try prom.appendPromMetric(writer, "antfly_lake_query_slowest_composed_" ++ phase ++ "_nanoseconds", "gauge", "Request-local phase of the slowest composed request above 750 ms since startup; nested phases overlap", profile.duration(@field(Phase, "composed_" ++ phase)));
         }
@@ -433,6 +437,7 @@ test "external lake slow composed profiles isolate interleaved requests and neve
     second.add(&metrics, .composed_native_leaf, 800 * std.time.ns_per_ms);
     first.add(&metrics, .composed_total, 300 * std.time.ns_per_ms);
     second.add(&metrics, .composed_total, 1000 * std.time.ns_per_ms);
+    second.io = .{ .provider_reads = 3, .provider_bytes = 128, .peak_inflight = 2 };
     metrics.retainSlow(first);
     try std.testing.expect(metrics.snapshot().slowest_composed == null);
     metrics.retainSlow(second);
@@ -459,6 +464,8 @@ test "external lake slow composed profiles isolate interleaved requests and neve
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_slowest_composed_total_nanoseconds 2000000000") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_slowest_composed_native_leaf_nanoseconds 800000000") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_slowest_composed_composition_nanoseconds 1100000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_slowest_composed_io_provider_reads 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_slowest_composed_io_peak_inflight 2") != null);
 }
 
 test "external lake metrics expose fallback and disk write reasons without paths" {

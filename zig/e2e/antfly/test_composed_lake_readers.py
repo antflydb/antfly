@@ -911,14 +911,21 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             time.sleep(6)
             profile_after = metrics()
             record_property(
-                "slowest_lake_io_after_restart",
+                "slowest_immutable_io_after_restart",
                 json.dumps(
                     {
                         name: value
                         for name, value in profile_after.items()
-                        if name.startswith("antfly_lake_query_slowest_lake_io_")
+                        if name.startswith(
+                            (
+                                "antfly_lake_query_slowest_lake_io_",
+                                "antfly_lake_query_slowest_composed_io_",
+                            )
+                        )
                         or name
                         in {
+                            "antfly_lake_query_slowest_lake_total_nanoseconds",
+                            "antfly_lake_query_slowest_composed_total_nanoseconds",
                             "antfly_lake_disk_cache_inventory_checkpoint_hits_total",
                             "antfly_lake_disk_cache_inventory_scan_entries_total",
                         }
@@ -991,19 +998,28 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 "cold_cache_startup_and_query_ms",
                 (time.monotonic() - cold_started) * 1000,
             )
-            # This is the slowest retained leaf profile since process start;
+            # These are the slowest retained leaf/composed profiles since process start;
             # its total identifies whether it corresponds to the measured cold
             # request. Preserve that bounded diagnostic profile, not
             # a full process metrics dump or another timing series.
             time.sleep(6)
             record_property(
-                "slowest_lake_io_after_cold",
+                "slowest_immutable_io_after_cold",
                 json.dumps(
                     {
                         name: value
                         for name, value in metrics().items()
-                        if name.startswith("antfly_lake_query_slowest_lake_io_")
-                        or name == "antfly_lake_query_slowest_lake_total_nanoseconds"
+                        if name.startswith(
+                            (
+                                "antfly_lake_query_slowest_lake_io_",
+                                "antfly_lake_query_slowest_composed_io_",
+                            )
+                        )
+                        or name
+                        in {
+                            "antfly_lake_query_slowest_lake_total_nanoseconds",
+                            "antfly_lake_query_slowest_composed_total_nanoseconds",
+                        }
                     }
                 ),
             )

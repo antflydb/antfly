@@ -104,11 +104,24 @@ pub fn reconcileRecent(a: A, server: *server_api.ApiHttpServer, table: local.com
 /// One bounded owner per composed request. Tables remain authorized and bound
 /// by the HTTP runner on every leaf; only immutable, cut-bound readers are shared.
 pub const Scope = struct {
+    io: local.serverless_query_lake_read_context.IoTrace.Snapshot = .{},
     budget: local.sql_memory_budget,
     entries: [16]*Prepared = undefined,
     len: usize = 0,
     pub fn init(a: A) Scope {
         return .{ .budget = .{ .backing = a, .limit = 64 * 1024 * 1024 } };
+    }
+    /// Cached readers are sampled once at request completion, including all
+    /// refills. Preserve deltas only for failed/uncached readers whose owners
+    /// are already gone. No request trace pointer escapes into metrics.
+    pub fn recordIo(self: *Scope, owner: ?*const Prepared, value: local.serverless_query_lake_read_context.IoTrace.Snapshot) void {
+        if (owner) |reader| for (self.entries[0..self.len]) |entry| if (entry == reader) return;
+        self.io.add(value);
+    }
+    pub fn ioSnapshot(self: *const Scope) local.serverless_query_lake_read_context.IoTrace.Snapshot {
+        var result = self.io;
+        for (self.entries[0..self.len]) |entry| result.add(entry.io_trace.snapshot());
+        return result;
     }
     pub fn deinit(self: *Scope) void {
         for (self.entries[0..self.len]) |entry| entry.deinit();
@@ -277,7 +290,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     var retained_pin: ?retained_api.Pinned = null;
     defer if (!transferred) if (retained_pin) |pin| pin.deinit();
     const normalized = try request.platformDeadline();
-    prepared.retained_context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+    prepared.retained_context = .{ .trace = &prepared.io_trace, .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
     const retained_cancellation = retainedCancellation(&prepared.retained_context);
     const now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
     prepared.native_owner = owner: {
@@ -323,7 +336,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
         cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
         var artifacts = cut_store.artifactStore();
         try server.prepareLakeCache();
-        retained_pin = try retained_api.loadWithGroups(ra, &artifacts, cut_store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, retained_cancellation, &server.lake_read_cache.decoded, &server.lake_retained_groups, .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+        retained_pin = try retained_api.loadWithGroups(ra, &artifacts, cut_store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, retained_cancellation, &server.lake_read_cache.decoded, &server.lake_retained_groups, prepared.retained_context);
         retained = retained_pin.?.descriptor;
         table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
     };
@@ -579,8 +592,10 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     const total_started = @import("antfly_platform").time.monotonicNs();
     var request_profile: @import("lake_query_metrics.zig").ComposedProfile = .{};
     var is_lake = false;
+    var trace_owner: ?*const Prepared = null;
     defer if (is_lake) {
         request_profile.record(&server.lake_query_metrics, .total, total_started);
+        if (scope) |owner| owner.recordIo(trace_owner, request_profile.io);
         server.lake_query_metrics.retainSlowLake(request_profile);
     };
     // The public full_text_index selector normalizes one text query into a
@@ -596,6 +611,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     }
     const cache = shared != null and reused == null and shared.?.len < shared.?.entries.len;
     const prepared = reused orelse (try prepare(if (cache) shared.?.budget.allocator() else a, server, current_table, req, request, &request_profile, &is_lake, !build_recent) orelse return null);
+    trace_owner = prepared;
     if (cache) {
         prepared.local_id = shared.?.len;
         shared.?.entries[shared.?.len] = prepared;
@@ -6695,4 +6711,29 @@ test "lake artifact derivation uses pinned recipe and materialized unit input" {
     try std.testing.expect(!std.mem.eql(u8, &digest, &(try lakeArtifactDerivationDigest(a, @splat(2), first))));
     try std.testing.expect(!std.mem.eql(u8, &digest, &(try lakeArtifactDerivationDigest(a, @splat(1), changed))));
     try std.testing.expectError(error.InvalidChunkArtifact, lakeArtifactDerivationDigest(a, @splat(1), "{}"));
+}
+
+test "external lake opening composed I/O profiles include refills once and preserve uncached work" {
+    const a = std.testing.allocator;
+    var first: Prepared = .{ .backing = a, .arena = .init(a) };
+    defer first.arena.deinit();
+    var second: Prepared = .{ .backing = a, .arena = .init(a) };
+    defer second.arena.deinit();
+    var scope = Scope.init(a);
+    scope.entries[0] = &first;
+    scope.entries[1] = &second;
+    scope.len = 2;
+    first.io_trace.add("provider_reads", 2);
+    second.io_trace.add("provider_reads", 3);
+    scope.recordIo(&first, first.io_trace.snapshot());
+    scope.recordIo(&second, second.io_trace.snapshot());
+    // Later reads through a reused owner appear once in the final snapshot.
+    first.io_trace.add("ram_hits", 1);
+    scope.recordIo(&first, .{ .ram_hits = 1 });
+    // Failed or uncached owners are destroyed before scope completion.
+    scope.recordIo(null, .{ .provider_reads = 1, .peak_inflight = 2 });
+    const result = scope.ioSnapshot();
+    try std.testing.expectEqual(@as(u64, 6), result.provider_reads);
+    try std.testing.expectEqual(@as(u64, 2), result.peak_inflight);
+    try std.testing.expectEqual(@as(u64, 1), result.ram_hits);
 }
