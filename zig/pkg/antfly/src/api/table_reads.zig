@@ -31916,10 +31916,18 @@ fn implementationTests() type {
                 test_alloc,
                 7,
                 "docs",
-                "{\"fields\":[{\"field\":\"body\",\"terms\":[\"alpha\"]}]}",
+                "{\"_privacy_policy_version\":\"none\",\"fields\":[{\"field\":\"body\",\"terms\":[\"alpha\"]}]}",
             )) orelse unreachable;
             defer response.deinit(test_alloc);
 
+            // A coordinator expecting a protected version cannot read stats
+            // from this unprotected owner, even though the wire parses.
+            try std.testing.expectError(error.IndexRebuilding, hosted.source().textStatsGroupLocal(
+                test_alloc,
+                7,
+                "docs",
+                "{\"_privacy_policy_version\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"fields\":[{\"field\":\"body\",\"terms\":[\"alpha\"]}]}",
+            ));
             try std.testing.expectEqual(@as(usize, 0), executor_state.call_count);
             try std.testing.expect(std.mem.indexOf(u8, response.json, "\"global_doc_count\":3") != null);
             try std.testing.expect(std.mem.indexOf(u8, response.json, "\"field\":\"body\"") != null);

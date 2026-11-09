@@ -69,7 +69,7 @@ if [[ "$sdk" == python || "$sdk" == all ]]; then
     python_args+=(--junitxml="$ANTFLY_SDK_NATIVE_REPORT_DIR/python.xml")
   fi
   if [[ "$inference" == 0 ]]; then python_args+=(--ignore=tests/test_inference.py); fi
-  (cd "$repo_root/py/packages/embedded" && uv run --locked pytest -q ${python_args[@]+"${python_args[@]}"})
+  (cd "$repo_root/py/packages/embedded" && uv run --locked pytest -v -o faulthandler_timeout=120 ${python_args[@]+"${python_args[@]}"})
 fi
 if [[ "$sdk" == typescript || "$sdk" == all ]]; then
   ts_args=()
