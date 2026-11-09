@@ -41,6 +41,7 @@ class MemoryEvaluationRun:
         revision (int):
         recorded_at (int):
         version (int | Unset):  Default: 1.
+        feedback_revision (int | Unset):  Default: 0.
         thresholds (MemoryEvaluationRunThresholdsType0 | None | Unset):
         prompt_revision (str | Unset):
         phase (MemoryEvaluationRunPhase | Unset):  Default: MemoryEvaluationRunPhase.PENDING.
@@ -69,6 +70,7 @@ class MemoryEvaluationRun:
     revision: int
     recorded_at: int
     version: int | Unset = 1
+    feedback_revision: int | Unset = 0
     thresholds: MemoryEvaluationRunThresholdsType0 | None | Unset = UNSET
     prompt_revision: str | Unset = UNSET
     phase: MemoryEvaluationRunPhase | Unset = MemoryEvaluationRunPhase.PENDING
@@ -122,6 +124,8 @@ class MemoryEvaluationRun:
         recorded_at = self.recorded_at
 
         version = self.version
+
+        feedback_revision = self.feedback_revision
 
         thresholds: dict[str, Any] | None | Unset
         if isinstance(self.thresholds, Unset):
@@ -190,6 +194,8 @@ class MemoryEvaluationRun:
         )
         if version is not UNSET:
             field_dict["version"] = version
+        if feedback_revision is not UNSET:
+            field_dict["feedback_revision"] = feedback_revision
         if thresholds is not UNSET:
             field_dict["thresholds"] = thresholds
         if prompt_revision is not UNSET:
@@ -269,6 +275,8 @@ class MemoryEvaluationRun:
         recorded_at = d.pop("recorded_at")
 
         version = d.pop("version", UNSET)
+
+        feedback_revision = d.pop("feedback_revision", UNSET)
 
         def _parse_thresholds(data: object) -> MemoryEvaluationRunThresholdsType0 | None | Unset:
             if data is None:
@@ -353,6 +361,7 @@ class MemoryEvaluationRun:
             revision=revision,
             recorded_at=recorded_at,
             version=version,
+            feedback_revision=feedback_revision,
             thresholds=thresholds,
             prompt_revision=prompt_revision,
             phase=phase,

@@ -62,7 +62,11 @@ proposal, verdict and entity curation operations. It does not include arbitrary
 table writes, configuration, ontology changes, source-wide forgetting or
 embedding publication. Admin includes curator; write alone does not.
 
-HTTP and `/memory/v1/mcp` share this authorization. Operations retain their
+Pinning a team-visible memory into the session brief also requires curator,
+because it changes every principal's injected context; owners pin their private
+memories with write.
+
+HTTP, `/memory/v1/mcp` and `/memory/v1/mcp/agent` share this authorization. Operations retain their
 required grant and recheck the live credential at publication and receipt replay.
 Revocation applies to admitted work as well as new requests. Private records
 remain in their owner's audience. Lite's database owner retains full rights.

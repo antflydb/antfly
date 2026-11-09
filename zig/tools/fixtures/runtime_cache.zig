@@ -74,7 +74,7 @@ pub fn build(b: *std.Build) void {
         }
         if (artifact.kind.isTest()) {
             var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
-            rejectMetadata(artifact.root_module, inference.build_info_object, &seen);
+            rejectMetadata(artifact.root_module, inference.build_info_object, &seen, artifact.name);
             test_count += 1;
         }
         if (artifact.root_module.root_source_file) |source| switch (source) {
@@ -209,7 +209,9 @@ pub fn build(b: *std.Build) void {
                 "observabilityRevision(@import(\"cache_prometheus\")) ^ (observabilityRevision(@import(\"cache_structlog\")) << 8)"
         else if (unit == .distributed)
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @intFromBool(@import(\"cache_lite_capabilities\").capabilitiesForProfile(.native).local_inference_runtime) ^ ownerRevision(@import(\"raft_engine\"))"
-        else if (unit == .storage_kernel or unit == .local_query)
+        else if (unit == .local_query)
+            "@import(\"local_query_abi\").abi_version ^ ownerRevision(@import(\"local_query_abi\"))"
+        else if (unit == .storage_kernel)
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ ownerRevision(@import(\"raft_engine\"))"
         else
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\")";
@@ -286,6 +288,7 @@ pub fn build(b: *std.Build) void {
             return std.mem.lessThan(u8, config.stringSlice(a.sub_path), config.stringSlice(c.sub_path));
         }
     }.lessThan);
+    profiles.retainCacheTargets(b, "cache-probe");
 }
 
 fn inferenceIdentityPath(b: *std.Build, module: *std.Build.Module, seen: *std.AutoHashMap(*std.Build.Module, void), path: []const u8) ?[]const u8 {
@@ -344,12 +347,12 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
             std.debug.panic("{s} archive depends on simulation test support", .{@tagName(unit)});
         if (std.mem.eql(u8, name, "lmdb_engine"))
             std.debug.panic("{s} archive depends on disabled LMDB", .{@tagName(unit)});
-        if (unit != .distributed and unit != .storage_kernel and unit != .local_query and std.mem.eql(u8, name, "antfly_lite_options"))
+        if (unit != .distributed and unit != .storage_kernel and std.mem.eql(u8, name, "antfly_lite_options"))
             std.debug.panic("{s} archive depends on Lite capability settings", .{@tagName(unit)});
         if (unit != .api_kernel and (std.mem.eql(u8, name, "antfly_mcp") or std.mem.eql(u8, name, "antfly_a2a")))
             std.debug.panic("{s} archive depends on API protocol adapters", .{@tagName(unit)});
-        if (unit == .serverless and std.mem.eql(u8, name, "raft_engine"))
-            @panic("serverless archive depends on Raft");
+        if ((unit == .serverless or unit == .local_query) and std.mem.eql(u8, name, "raft_engine"))
+            std.debug.panic("{s} archive depends on Raft", .{@tagName(unit)});
         if (unit != .api_kernel and std.mem.eql(u8, name, "antfly_openapi_specs"))
             std.debug.panic("{s} archive depends on served schemas", .{@tagName(unit)});
         if (unit != .inference and (std.mem.eql(u8, name, "metal_jit_identity") or std.mem.eql(u8, name, "cuda_jit_identity")))
@@ -361,16 +364,16 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
     }
 }
 
-fn rejectMetadata(module: *std.Build.Module, metadata: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
+fn rejectMetadata(module: *std.Build.Module, metadata: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Module, void), owner: []const u8) void {
     if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
     for (module.link_objects.items) |object| switch (object) {
         .other_step => |artifact| {
-            if (artifact == metadata) @panic("unit test depends on release metadata");
-            rejectMetadata(artifact.root_module, metadata, seen);
+            if (artifact == metadata) std.debug.panic("unit test depends on release metadata: {s} via {s}", .{ owner, if (module.root_source_file) |source| source.getDisplayName() else "link-only module" });
+            rejectMetadata(artifact.root_module, metadata, seen, owner);
         },
         else => {},
     };
-    for (module.import_table.values()) |dependency| rejectMetadata(dependency, metadata, seen);
+    for (module.import_table.values()) |dependency| rejectMetadata(dependency, metadata, seen, owner);
 }
 
 fn isSqlGenerator(b: *std.Build, artifact: *std.Build.Step.Compile) bool {

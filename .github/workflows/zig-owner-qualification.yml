@@ -39,7 +39,7 @@ on:
         default: ''
   push:
     branches: [main]
-    paths: ['zig/**', 'scripts/test-lake-s3-integration.sh', '.github/workflows/zig-owner-qualification.yml', '.github/workflows/pr-ci.yml']
+    paths: ['zig/**', '.github/actions/setup-native-build-tools/**', 'scripts/test-lake-s3-integration.sh', '.github/workflows/zig-owner-qualification.yml', '.github/workflows/pr-ci.yml']
   merge_group:
     types: [checks_requested]
   schedule:
@@ -90,7 +90,7 @@ jobs:
           else
             git fetch --no-tags --depth=1 origin "$BASE_SHA"
             git diff --name-only FETCH_HEAD HEAD > changed-paths.txt
-            if grep -Eq '^(zig/|scripts/test-lake-s3-integration.sh|.github/workflows/(zig-owner-qualification|pr-ci).yml)' changed-paths.txt; then
+            if grep -Eq '^(zig/|.github/actions/setup-native-build-tools/|scripts/test-lake-s3-integration.sh|.github/workflows/(zig-owner-qualification|pr-ci).yml)' changed-paths.txt; then
               echo 'owners=true' >> "$GITHUB_OUTPUT"
             else
               echo 'owners=false' >> "$GITHUB_OUTPUT"
@@ -119,13 +119,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - name: Install Zig archive extractor
-        if: runner.os == 'Linux'
-        run: |
-          if ! command -v xz >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends -y xz-utils
-          fi
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -181,13 +176,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - name: Install Zig archive extractor
-        if: runner.os == 'Linux'
-        run: |
-          if ! command -v xz >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends -y xz-utils
-          fi
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -282,13 +272,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - name: Install Zig archive extractor
-        if: runner.os == 'Linux'
-        run: |
-          if ! command -v xz >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends -y xz-utils
-          fi
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -346,13 +331,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - name: Install Zig archive extractor
-        if: runner.os == 'Linux'
-        run: |
-          if ! command -v xz >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends -y xz-utils
-          fi
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -417,13 +397,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - name: Install Zig archive extractor
-        if: runner.os == 'Linux'
-        run: |
-          if ! command -v xz >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends -y xz-utils
-          fi
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}

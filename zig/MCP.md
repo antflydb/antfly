@@ -29,6 +29,13 @@ credential projection, live grants, private provenance, retention, cancellation
 and deadlines apply there. The memory endpoint selects memory API v1, independently
 of the negotiated MCP protocol revision. See [MEMORY.md](MEMORY.md).
 
+**`/memory/v1/mcp/agent`** serves the agent profile on the same session store:
+`memory_brief`, `memory_recall`, `memory_observe`, `memory_correct`,
+`memory_forget`, `memory_outcome`, `memory_get` and `memory_explain`, with
+purpose-oriented descriptions. Mutating agent tools accept an omitted
+`idempotency_key` and derive a content-addressed key from the tool arguments,
+so an identical retry replays the first receipt. Grants are unchanged.
+
 ## Implemented
 
 - `zig/lib/mcp`
@@ -48,6 +55,7 @@ of the negotiated MCP protocol revision. See [MEMORY.md](MEMORY.md).
   - `GET /memory/v1/mcp`
   - `POST /memory/v1/mcp`
   - `DELETE /memory/v1/mcp`
+  - `GET|POST|DELETE /memory/v1/mcp/agent`
 - Trusted-principal auth
   - Antfly can accept `X-Antfly-Trusted-Principal: <token>` from a trusted upstream proxy when
     `ANTFLY_TRUSTED_PRINCIPAL_SECRET` is configured.

@@ -63,3 +63,17 @@ fn memory_generated_read_types_decode_native_service_fixtures() {
     assert_eq!(details["inputs"]["entities"][0]["revision"], 3);
     assert_eq!(details["stale_configuration"], false);
 }
+
+#[test]
+fn memory_brief_pin_and_consolidation_types_apply_native_defaults() {
+    use antfly_sdk::types::{MemoryBriefRequest, MemoryConsolidationRequest, MemoryPin};
+    let brief: MemoryBriefRequest = serde_json::from_str("{}").unwrap();
+    assert_eq!((brief.limit, brief.token_budget), (16, 1024));
+    assert!(!brief.include_provisional);
+    let consolidation: MemoryConsolidationRequest = serde_json::from_str("{}").unwrap();
+    assert_eq!(consolidation.limit, 32);
+    let pin: MemoryPin = serde_json::from_str(r#"{"id":"m"}"#).unwrap();
+    assert!(pin.pinned);
+    let recall: MemoryRecallRequest = serde_json::from_str(r#"{"utility_weight":0.25}"#).unwrap();
+    assert_eq!(recall.utility_weight, Some(0.25));
+}

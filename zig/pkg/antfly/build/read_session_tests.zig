@@ -35,7 +35,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     consumer.addImport("read_session_provider", provider);
     const tests = @import("linked_tests.zig").add(b, .{ .name = "read-session-compiled-client-tests", .root_module = consumer, .filters = &.{"opaque read session"} });
     tests.executable.root_module.linkLibrary(archive);
-    imports.build_info.link(tests.executable.root_module);
+    imports.build_info.linkTest(tests.executable.root_module);
     b.step("opaque-read-session-abi-integration-test", "Exercise production session handles across independently compiled allocator and error domains")
         .dependOn(&tests.run(b).step);
 }

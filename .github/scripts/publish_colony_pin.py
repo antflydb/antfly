@@ -13,10 +13,12 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from urllib.parse import quote
 
 COLONY = "antflydb/colony"
 UPSTREAM = "antflydb/antfly"
 WORKFLOW = "update-antfly-submodule.yml"
+MANIFEST_CHECK = "Antfly pin validation manifest"
 API_ROOT = "https://api.github.com/"
 USER_AGENT = "antfly-colony-pin-publisher"
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -139,6 +141,10 @@ def read_manifest(data):
         require(archive.namelist() == ["pin.json"], "Unexpected artifact members")
         require(archive.getinfo("pin.json").file_size <= 4096, "Manifest is too large")
         result = json.loads(archive.read("pin.json"))
+    return validate_manifest(result)
+
+
+def validate_manifest(result):
     require(
         set(result)
         == {"version", "request", "base_sha", "old_sha", "target_sha", "changed"},
@@ -160,6 +166,36 @@ def read_manifest(data):
         "Inconsistent change flag",
     )
     return result
+
+
+def check_manifest(api, run, request):
+    # This report is emitted by a separate trusted job after the read-only
+    # docs job succeeds. Its small control record must not require blob quota.
+    checks = api.request(
+        f"repos/{COLONY}/commits/{run['head_sha']}/check-runs?check_name={quote(MANIFEST_CHECK)}&filter=all&per_page=100"
+    )["check_runs"]
+    identity = f"antfly-pin:{request}:{run['id']}:{run.get('run_attempt', 1)}"
+    selected = [check for check in checks if check.get("external_id") == identity]
+    if not selected:
+        return None  # Older Colony validators publish the bounded ZIP instead.
+    require(len(selected) == 1, "Ambiguous validation reports")
+    check = selected[0]
+    require(
+        check.get("name") == MANIFEST_CHECK
+        and check.get("app", {}).get("slug") == "github-actions"
+        and check.get("head_sha") == run["head_sha"]
+        and check.get("details_url")
+        == f"https://github.com/{COLONY}/actions/runs/{run['id']}"
+        and check.get("status") == "completed"
+        and check.get("conclusion") == "success",
+        "Untrusted validation report",
+    )
+    text = check.get("output", {}).get("text")
+    require(
+        isinstance(text, str) and len(text.encode()) <= 4096,
+        "Invalid validation report size",
+    )
+    return validate_manifest(json.loads(text))
 
 
 def wait_for_validation(api, request, timeout=2100):
@@ -186,19 +222,21 @@ def wait_for_validation(api, request, timeout=2100):
                     run["conclusion"] == "success",
                     "Candidate validation did not succeed; main unchanged",
                 )
-                artifacts = api.request(
-                    f"repos/{COLONY}/actions/runs/{run['id']}/artifacts"
-                )["artifacts"]
-                selected = [
-                    a
-                    for a in artifacts
-                    if a["name"] == "antfly-pin-" + request and not a["expired"]
-                ]
-                require(
-                    len(selected) == 1,
-                    "Expected exactly one successful validation manifest",
-                )
-                manifest = read_manifest(api.archive(selected[0]["id"]))
+                manifest = check_manifest(api, run, request)
+                if manifest is None:
+                    artifacts = api.request(
+                        f"repos/{COLONY}/actions/runs/{run['id']}/artifacts"
+                    )["artifacts"]
+                    selected = [
+                        a
+                        for a in artifacts
+                        if a["name"] == "antfly-pin-" + request and not a["expired"]
+                    ]
+                    require(
+                        len(selected) == 1,
+                        "Expected exactly one successful validation manifest",
+                    )
+                    manifest = read_manifest(api.archive(selected[0]["id"]))
                 require(
                     manifest["request"] == request
                     and manifest["base_sha"] == run["head_sha"],

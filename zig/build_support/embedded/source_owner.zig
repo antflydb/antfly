@@ -124,15 +124,15 @@ pub fn finalize(b: *std.Build) void {
         binding.local.link_libc = binding.consumer.link_libc;
     }
     @import("../antfly/test_partitions.zig").add(b);
-    // A Module can feed production and builtin.is_test compilations. Fork only
-    // affected graphs, after every late storage owner option has been applied.
-    finalizeReadSessionModules(b);
     // Static consumers compile with unresolved engine calls. Provider code is
     // a final-link input, never a prerequisite for their LLVM object emission.
     if (storage_provider) |provider| {
         var steps: std.AutoHashMap(*std.Build.Step, void) = .init(b.allocator);
         for (b.top_level_steps.values()) |root| attachStorageFinalLinks(b, &root.step, provider, &steps);
     }
+    // A Module can feed production and builtin.is_test compilations. Fork only
+    // affected graphs, after late storage options and final-link inputs exist.
+    finalizeReadSessionModules(b);
 }
 
 /// Cloned consumer graphs retain their own late-bound source configuration.
@@ -419,13 +419,26 @@ fn bindSessionCompile(b: *std.Build, artifact: *std.Build.Step.Compile) void {
     session_compile_roots.put(b.allocator, key, artifact.root_module) catch @panic("OOM");
 }
 
-fn visitSessionCompiles(b: *std.Build, step: *std.Build.Step, seen: *std.AutoHashMap(*std.Build.Step, void)) void {
+fn visitSessionLinks(b: *std.Build, module: *std.Build.Module, seen: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
+    if ((modules.getOrPut(module) catch @panic("OOM")).found_existing) return;
+    // linkLibrary records module inputs before Zig materializes their Step
+    // dependencies. Independently compiled providers need their own binding.
+    for (module.link_objects.items) |input| if (input == .other_step)
+        visitSessionCompiles(b, &input.other_step.step, seen, modules);
+    for (module.import_table.values()) |imported| visitSessionLinks(b, imported, seen, modules);
+}
+
+fn visitSessionCompiles(b: *std.Build, step: *std.Build.Step, seen: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
     if ((seen.getOrPut(step) catch @panic("OOM")).found_existing) return;
-    if (step.cast(std.Build.Step.Compile)) |artifact| bindSessionCompile(b, artifact);
-    for (step.dependencies.items) |dependency| visitSessionCompiles(b, dependency, seen);
+    if (step.cast(std.Build.Step.Compile)) |artifact| {
+        bindSessionCompile(b, artifact);
+        visitSessionLinks(b, artifact.root_module, seen, modules);
+    }
+    for (step.dependencies.items) |dependency| visitSessionCompiles(b, dependency, seen, modules);
 }
 
 fn finalizeReadSessionModules(b: *std.Build) void {
     var seen: std.AutoHashMap(*std.Build.Step, void) = .init(b.allocator);
-    for (b.top_level_steps.values()) |root| visitSessionCompiles(b, &root.step, &seen);
+    var modules: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
+    for (b.top_level_steps.values()) |root| visitSessionCompiles(b, &root.step, &seen, &modules);
 }

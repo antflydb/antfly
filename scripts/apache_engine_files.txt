@@ -2,4 +2,5 @@
 # Package roots are declared in scripts/source_license_roots.json; server sources have no exceptions.
 zig/build.focused.zig
 zig/build_memory_profile_test.zig
+zig/build_read_session_graph_test.zig
 zig/embedded.build.zig

@@ -39,7 +39,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     consumer.addOptions("lake_execution_options", consumer_options);
     const tests = @import("linked_tests.zig").add(b, .{ .name = "lake-execution-abi-integration", .root_module = consumer, .filters = &.{"external lake execution"} });
     tests.executable.root_module.linkLibrary(archive);
-    imports.build_info.link(tests.executable.root_module);
+    imports.build_info.linkTest(tests.executable.root_module);
     const runtime_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/lake_execution_runtime_probe_root.zig"), .target = target, .optimize = optimize, .pic = true });
     test_imports.configure(b, runtime_module, true, true);
     runtime_module.addOptions("lake_execution_options", consumer_options);

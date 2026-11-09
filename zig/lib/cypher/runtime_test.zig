@@ -711,6 +711,13 @@ test "row dependent string predicates pay each scan while immutable Unicode func
     var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &cached, &.{.{ .name = "s", .value = .{ .string = text } }}, .{ .intermediate_states = 30_000 });
     defer result.deinit();
     try std.testing.expectEqual(@as(i64, 400_000_000), result.rows[0][0].integer);
+    // Invariant searches are a single certified operation, even when nested
+    // in a large reducer; varying needles below must still pay for each scan.
+    var invariant = try c.compile(std.testing.allocator, "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS 'z' THEN 1 ELSE 0 END)", .{}, &diagnostic);
+    defer invariant.deinit();
+    var invariant_result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &invariant, &.{.{ .name = "s", .value = .{ .string = text } }}, .{ .intermediate_states = 30_000 });
+    defer invariant_result.deinit();
+    try std.testing.expectEqual(@as(i64, 0), invariant_result.rows[0][0].integer);
     for ([_][]const u8{
         "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS toString(i) THEN 1 ELSE 0 END)",
         "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN ($s+toString(i)) STARTS WITH $s THEN 1 ELSE 0 END)",
