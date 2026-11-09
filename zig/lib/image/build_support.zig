@@ -183,6 +183,16 @@ pub fn addBenchmark(b: *std.Build, options: AddBenchmarkOptions) *std.Build.Step
     return lib_image_bench;
 }
 
+/// The benchmark owns one ReleaseFast graph, independent of product/test mode.
+pub fn addWebpBenchmark(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget) *std.Build.Step.Compile {
+    const module = b.createModule(.{ .root_source_file = root.path(b, "src/webp_bench.zig"), .target = target, .optimize = .fast, .link_libc = true });
+    const codec = b.createModule(.{ .root_source_file = root.path(b, "src/webp.zig"), .target = target, .optimize = .fast });
+    codec.addImport("image_work_control", createWorkControlModule(b, root, target, .fast));
+    codec.addImport("image_values", createValuesModule(b, root, target, .fast));
+    module.addImport("antfly_webp", codec);
+    return b.addExecutable(.{ .name = "lib-image-webp-bench", .root_module = module });
+}
+
 pub const AddConformanceOptions = struct {
     root: std.Build.LazyPath,
     add_test_run: *const fn (*std.Build, *std.Build.Step.Compile) *std.Build.Step.Run = std.Build.addRunArtifact,
@@ -330,10 +340,14 @@ pub fn createWorkControlModule(b: *std.Build, root: std.Build.LazyPath, target: 
 }
 
 pub fn attachValues(b: *std.Build, module: *std.Build.Module, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, control: *std.Build.Module) void {
-    const values = b.createModule(.{ .root_source_file = root.path(b, "src/values.zig"), .target = target, .optimize = optimize });
+    const values = createValuesModule(b, root, target, optimize);
     const processing = b.createModule(.{ .root_source_file = root.path(b, "src/processing.zig"), .target = target, .optimize = optimize });
     processing.addImport("image_values", values);
     processing.addImport("image_work_control", control);
     module.addImport("image_values", values);
     module.addImport("image_processing", processing);
+}
+
+fn createValuesModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = root.path(b, "src/values.zig"), .target = target, .optimize = optimize });
 }
