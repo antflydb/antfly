@@ -18,6 +18,7 @@
 import io
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -239,6 +240,106 @@ class ArtifactExchangeTests(unittest.TestCase):
             with self.assertRaises(HTTPError) as result:
                 store.put("key", self.source / "a.tar.gz")
             self.assertEqual(result.exception.code, 403)
+
+    def test_duplicate_verification_retries_transient_reads_without_reuploading(self):
+        path = self.source / "a.tar.gz"
+        for conflict_code in (403, 412):
+            for failure in (
+                HTTPError(
+                    "https://storage.googleapis.com", 503, "unavailable", {}, None
+                ),
+                OSError("connection reset"),
+            ):
+                with self.subTest(
+                    conflict=conflict_code, failure=type(failure).__name__
+                ):
+                    store = exchange.GCS("fake-token")
+                    conflict = HTTPError(
+                        "https://storage.googleapis.com",
+                        conflict_code,
+                        "exists",
+                        {},
+                        None,
+                    )
+                    with (
+                        patch.object(
+                            store,
+                            "request",
+                            side_effect=[
+                                conflict,
+                                failure,
+                                io.BytesIO(path.read_bytes()),
+                            ],
+                        ) as request,
+                        patch.object(exchange.time, "sleep") as sleep,
+                    ):
+                        store.put("key", path)
+                    self.assertEqual(
+                        [
+                            call.kwargs.get("method", "GET")
+                            for call in request.call_args_list
+                        ],
+                        ["POST", "GET", "GET"],
+                    )
+                    sleep.assert_called_once_with(1)
+
+    def test_duplicate_verification_exhaustion_and_corruption_fail_closed(self):
+        path = self.source / "a.tar.gz"
+        for response in ("unavailable", "corrupt"):
+            with self.subTest(response=response):
+                store = exchange.GCS("fake-token")
+                conflict = HTTPError(
+                    "https://storage.googleapis.com", 412, "exists", {}, None
+                )
+                failures = [
+                    HTTPError(
+                        "https://storage.googleapis.com", 503, "unavailable", {}, None
+                    )
+                    for _ in range(3)
+                ]
+                if response == "corrupt":
+                    failures[1] = io.BytesIO(b"poisoned")
+                with (
+                    patch.object(
+                        store, "request", side_effect=[conflict, *failures]
+                    ) as request,
+                    patch.object(exchange.time, "sleep") as sleep,
+                ):
+                    with self.assertRaises(
+                        HTTPError if response == "unavailable" else ValueError
+                    ) as result:
+                        store.put("key", path)
+                if response == "unavailable":
+                    self.assertEqual(result.exception.code, 503)
+                self.assertEqual(
+                    request.call_count, 4 if response == "unavailable" else 3
+                )
+                self.assertEqual(
+                    sleep.call_count, 2 if response == "unavailable" else 1
+                )
+
+    def test_replay_downloads_both_runner_and_traces_through_exchange(self):
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/zig-vopr-replay-diagnostics.yml"
+        ).read_text()
+        for artifact, destination in (
+            ("vopr-runner", "original-runner"),
+            ("${{ inputs.shard_artifact }}", "original-traces"),
+        ):
+            step = next(
+                step
+                for step in re.split(r"\n      - ", workflow)
+                if f"name: {artifact}\n" in step
+            )
+            self.assertIn(
+                "uses: ./ci-storage-controller/.github/actions/download-ci-artifact",
+                step,
+            )
+            self.assertIn("namespace: vopr\n", step)
+            self.assertIn("run-id: ${{ inputs.run_id }}\n", step)
+            self.assertIn("github-token: ${{ github.token }}\n", step)
+            self.assertIn(f"path: ${{{{ runner.temp }}}}/{destination}", step)
 
     def test_upload_uses_create_only_precondition_and_streamed_file_length(self):
         store = exchange.GCS("fake-token")

@@ -74,8 +74,9 @@ jobs:
           run-id: ${{ inputs.run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/original-runner
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: ./ci-storage-controller/.github/actions/download-ci-artifact
         with:
+          namespace: vopr
           name: ${{ inputs.shard_artifact }}
           run-id: ${{ inputs.run_id }}
           github-token: ${{ github.token }}

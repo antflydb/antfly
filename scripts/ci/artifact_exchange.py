@@ -42,6 +42,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 BUCKET = "antfly-image-artifacts-ci-artifacts"
 WINDOW_SECONDS = 14 * 86400
 RECEIPT_PREFIX = "_ci-artifact-"
+RETRYABLE_HTTP_CODES = {408, 429, 500, 502, 503, 504}
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -101,30 +102,39 @@ class GCS:
         )
 
     def put(self, key: str, path: Path):
+        conflict = None
         for attempt in range(3):
             try:
-                with (
-                    path.open("rb") as stream,
-                    self.request(key, data=stream, method="POST") as response,
-                ):
-                    response.read()
+                if conflict is None:
+                    try:
+                        with (
+                            path.open("rb") as stream,
+                            self.request(key, data=stream, method="POST") as response,
+                        ):
+                            response.read()
+                        return
+                    except HTTPError as exc:
+                        if exc.code not in {403, 412}:
+                            raise
+                        conflict = exc
+                # A create-only identity may receive either a precondition
+                # failure or an overwrite-permission denial for an existing
+                # object. Verify its actual bytes, retrying transient reads
+                # without uploading the same file again.
+                try:
+                    with self.request(key) as stream:
+                        actual = hashlib.file_digest(stream, "sha256").hexdigest()
+                except HTTPError as exc:
+                    if exc.code not in RETRYABLE_HTTP_CODES:
+                        raise conflict from exc
+                    raise
+                if actual != digest(path):
+                    raise ValueError(
+                        "existing CI object differs from its digest"
+                    ) from conflict
                 return
             except HTTPError as exc:
-                if exc.code in {403, 412}:
-                    # A create-only identity may receive either a precondition
-                    # failure or an overwrite-permission denial for an existing
-                    # object. Accept neither without verifying the actual bytes.
-                    try:
-                        with self.request(key) as stream:
-                            actual = hashlib.file_digest(stream, "sha256").hexdigest()
-                    except HTTPError:
-                        raise exc
-                    if actual != digest(path):
-                        raise ValueError(
-                            "existing CI object differs from its digest"
-                        ) from exc
-                    return
-                if exc.code not in {408, 429, 500, 502, 503, 504} or attempt == 2:
+                if exc.code not in RETRYABLE_HTTP_CODES or attempt == 2:
                     raise
                 time.sleep(2**attempt)
             except (OSError, HTTPException):
@@ -139,7 +149,7 @@ class GCS:
                     shutil.copyfileobj(stream, out, length=1024 * 1024)
                 return
             except HTTPError as exc:
-                if exc.code not in {408, 429, 500, 502, 503, 504} or attempt == 2:
+                if exc.code not in RETRYABLE_HTTP_CODES or attempt == 2:
                     raise
                 time.sleep(2**attempt)
             except (OSError, HTTPException):
