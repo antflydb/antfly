@@ -253,7 +253,7 @@ pub const GenerateResult = struct {
     }
 };
 
-pub fn appleGenerationRequestAlloc(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: []const ChatMessage, require_completion: bool) ![]u8 {
+pub fn appleGenerationRequestAlloc(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: []const ChatMessage) ![]u8 {
     try cfg.validate();
     if (cfg.provider != .apple) return error.InvalidGeneratorConfig;
     if (messages.len == 0 or messages.len > 128) return error.UnsupportedAppleGenerationOptions;
@@ -300,15 +300,27 @@ pub fn appleGenerationRequestAlloc(alloc: std.mem.Allocator, cfg: GeneratorConfi
         .messages = normalized,
         .max_tokens = cfg.max_tokens,
         .temperature = cfg.temperature,
-        .require_completion = require_completion,
+        // Foundation Models cannot report a token-cap finish reason. Always
+        // verify natural completion, including generic /generate callers.
+        .require_completion = true,
     }, .{});
     return request;
 }
 
 pub fn generateApple(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: []const ChatMessage, limit: usize, control: apple_native.Control) !GenerateResult {
-    const request = try appleGenerationRequestAlloc(alloc, cfg, messages, control.require_completion);
+    const request = try appleGenerationRequestAlloc(alloc, cfg, messages);
     defer alloc.free(request);
-    return .{ .content = try apple_native.invoke(alloc, .generate, request, &.{}, limit, control), .allocator = alloc, .finish_reason = if (control.require_completion) .stop else null };
+    return .{ .content = try apple_native.invoke(alloc, .generate, request, &.{}, limit, control), .allocator = alloc, .finish_reason = .stop };
+}
+
+test "generic Apple generation always requests verified natural completion" {
+    const a = std.testing.allocator;
+    const request = try appleGenerationRequestAlloc(a, .{ .provider = .apple, .model = "", .url = "", .max_tokens = 32 }, &.{.{ .role = .user, .content = .{ .text = "Hello" } }});
+    defer a.free(request);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, request, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("require_completion").?.bool);
+    try std.testing.expectEqual(@as(i64, 32), parsed.value.object.get("max_tokens").?.integer);
 }
 
 test "Apple generation configuration is local and rejects unsupported options" {
@@ -346,6 +358,7 @@ test "Apple generation reports readiness or generates bounded text" {
     var result = try generateApple(alloc, cfg, &messages, 1024, .{ .timeout_ms = 60_000 });
     defer result.deinit();
     try std.testing.expect(result.content.len > 0 and result.content.len <= 1024);
+    try std.testing.expect(result.finish_reason == .stop);
     var history_result = try generateApple(alloc, cfg, &.{
         .{ .role = .system, .content = .{ .text = "Answer the user's question in one word." } },
         .{ .role = .user, .content = .{ .text = "Remember the word pear." } },
@@ -354,7 +367,10 @@ test "Apple generation reports readiness or generates bounded text" {
     }, 1024, .{ .timeout_ms = 60_000 });
     defer history_result.deinit();
     try std.testing.expect(std.ascii.findIgnoreCase(history_result.content, "pear") != null);
-    try std.testing.expectError(error.ResponseTooLarge, generateApple(alloc, cfg, &messages, 1, .{ .timeout_ms = 60_000 }));
+    try std.testing.expectError(error.InferenceOutputIncomplete, generateApple(alloc, cfg, &messages, 1, .{ .timeout_ms = 60_000 }));
+    var tiny = cfg;
+    tiny.max_tokens = 1;
+    try std.testing.expectError(error.InferenceOutputIncomplete, generateApple(alloc, tiny, &.{.{ .role = .user, .content = .{ .text = "Return exactly these five words: alpha beta gamma delta epsilon." } }}, 1024, .{ .timeout_ms = 60_000 }));
 }
 
 test "Apple generation cancellation and disabled provider" {

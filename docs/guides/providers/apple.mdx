@@ -199,6 +199,13 @@ enrichment:
 System instructions and alternating user and assistant turns keep their roles.
 Tools, image or audio attachments, and other sampling options are rejected.
 
+Non-streaming Apple generation verifies natural completion for every caller,
+including `/generate`. Foundation Models does not distinguish a token-cap stop
+from a natural stop, so Antfly lets the response complete and checks its budget.
+An over-budget or incomplete response returns `InferenceOutputIncomplete` rather
+than partial text labeled `stop`. macOS 27 checks reported output tokens; macOS 26
+uses a conservative bounded byte limit because token usage is unavailable.
+
 macOS must have Apple Intelligence enabled and its model downloaded; on macOS 27
 the setting is under **Siri**. Antfly never downloads the model or falls back to
 the cloud. `AppleModelNotReady` means the model isn't available yet, and
