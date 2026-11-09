@@ -2851,6 +2851,32 @@ test "native backend renders embedded fixture pdf first page png" {
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
 }
 
+test "OCR continuous-tone profile smooths PDF images without contaminating exact rendering" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/continuous_sampling_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    var exact = try renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &parsed, 1, 72, 64, 8, .exact);
+    defer exact.deinit(alloc);
+    var ocr = try renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &parsed, 1, 72, 64, 8, .ocr);
+    defer ocr.deinit(alloc);
+    var exact_again = try renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &parsed, 1, 72, 64, 8, .exact);
+    defer exact_again.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, exact.png, exact_again.png);
+    try std.testing.expectEqual(@as(u32, 4), exact.width);
+    try std.testing.expectEqual(exact.width, ocr.width);
+    try std.testing.expectEqual(exact.height, ocr.height);
+
+    const nearest = try image.png.decodeRgba(alloc, exact.png);
+    defer alloc.free(nearest.rgba);
+    const smoothed = try image.png.decodeRgba(alloc, ocr.png);
+    defer alloc.free(smoothed.rgba);
+    try std.testing.expect(!std.mem.eql(u8, nearest.rgba, smoothed.rgba));
+    // The middle samples contain both colors only in the OCR profile.
+    try std.testing.expect(nearest.rgba[4] == 0 or nearest.rgba[6] == 0);
+    try std.testing.expect(smoothed.rgba[4] > 0 and smoothed.rgba[6] > 0);
+}
+
 test "parsed rendering releases reader-owned runs with the reader allocator" {
     const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
 

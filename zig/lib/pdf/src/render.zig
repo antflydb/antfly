@@ -1246,10 +1246,10 @@ fn drawImageRunCancelable(
     const y0 = floorToCanvas(margin_f + max_y - bounds.max_y, canvas_h);
     const y1 = ceilToCanvas(margin_f + max_y - bounds.min_y, canvas_h);
     const has_clip = run.clip_box != null or run.clip_points != null;
-    // PDF interpolation is opt-in. In particular, preserve hard sample
-    // boundaries for bilevel scans and line art when /Interpolate is absent
-    // or false, even when the image is minified.
-    const filtered = run.interpolate;
+    // Exact PDF interpolation is opt-in. The OCR preparation pass may
+    // separately smooth continuous-tone samples without changing /Interpolate.
+    // Bilevel scans retain their coverage-preserving OCR path below.
+    const filtered = run.interpolate or run.ocr_interpolate;
     const projected_width = @sqrt(run.a * run.a + run.b * run.b);
     const projected_height = @sqrt(run.c * run.c + run.d * run.d);
     const coverage_minify = run.ocr_coverage_minify and run.bilevel and
@@ -4282,6 +4282,45 @@ test "image minification honors explicit interpolation policy" {
     try std.testing.expect(filtered[0] > 0 and filtered[2] > 0);
     try std.testing.expectEqual(@as(u8, 0), filtered[1]);
     try std.testing.expectEqual(@as(u8, 0xff), filtered[3]);
+}
+
+test "OCR continuous-tone sampling smooths magnification and minification without changing PDF policy" {
+    var rgba = [_]u8{ 255, 0, 0, 255, 0, 0, 255, 255 };
+    for ([_]usize{ 1, 4 }) |width| {
+        const base: reader.ImageRun = .{
+            .rgba = &rgba,
+            .width = 2,
+            .height = 1,
+            .a = @floatFromInt(width),
+            .b = 0,
+            .c = 0,
+            .d = 1,
+            .e = 0,
+            .f = 0,
+            .x = 0,
+            .y = 0,
+            .draw_width = @floatFromInt(width),
+            .draw_height = 1,
+        };
+        var prepared = [_]reader.ImageRun{base};
+        try reader.prepareOcrRenderRunsAlloc(std.testing.allocator, &prepared, &.{}, .{});
+        try std.testing.expect(!prepared[0].interpolate);
+        try std.testing.expect(prepared[0].ocr_interpolate);
+
+        var exact: [16]u8 = @splat(255);
+        var ocr: [16]u8 = @splat(255);
+        drawImageRun(exact[0 .. width * 4], width, 1, 0, 0, 1, base);
+        drawImageRun(ocr[0 .. width * 4], width, 1, 0, 0, 1, prepared[0]);
+        var mixed_pixels: usize = 0;
+        for (0..width) |x| {
+            try std.testing.expect(exact[x * 4] == 0 or exact[x * 4] == 255);
+            try std.testing.expect(exact[x * 4 + 2] == 0 or exact[x * 4 + 2] == 255);
+            if (ocr[x * 4] > 0 and ocr[x * 4 + 2] > 0) mixed_pixels += 1;
+            try std.testing.expectEqual(@as(u8, 255), ocr[x * 4 + 3]);
+        }
+        try std.testing.expect(mixed_pixels > 0);
+    }
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255, 0, 0, 255, 255 }, &rgba);
 }
 
 test "image mask stencil paints decoded coverage with its occurrence color" {

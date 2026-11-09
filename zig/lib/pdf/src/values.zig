@@ -206,6 +206,9 @@ pub const ImageRun = struct {
     width: u32,
     height: u32,
     interpolate: bool = false,
+    /// OCR-only smoothing for continuous-tone images. Kept separate from the
+    /// PDF's /Interpolate value so exact rendering preserves source semantics.
+    ocr_interpolate: bool = false,
     /// True when the source is one-bit scan/line-art data. OCR rendering may
     /// use coverage-preserving minification without changing exact PDF mode.
     bilevel: bool = false,
@@ -590,7 +593,8 @@ pub const RenderProfile = enum {
     /// Preserve PDF sampling semantics exactly, including nearest-neighbor
     /// minification when /Interpolate is absent.
     exact,
-    /// Preserve bilevel ink coverage during minification for OCR inputs.
+    /// Smooth continuous-tone samples and preserve bilevel ink coverage during
+    /// minification for OCR inputs, independently of exact PDF sampling rules.
     ocr,
 };
 

@@ -98,6 +98,32 @@ Retry affected source versions after the policy change and require complete
 artifact coverage before semantic or graph enrichment. Avoid automatic image
 tiling without a tested ordering/deduplication policy.
 
+## Diagnose repeated output before raising token limits
+
+Use the native PDF raster in the reader comparison, alongside a reference
+renderer. A photo page can induce invented or repeated tables when small
+lettering is aliased; an `OUTPUT_TRUNCATED` response does not by itself mean
+the legitimate transcription needs more tokens. Keep incomplete OCR unresolved.
+
+The OCR rendering profile smooths continuous-tone images independently of the
+PDF's `/Interpolate` setting. Exact rendering retains PDF sampling semantics,
+and one-bit scans retain coverage-preserving minification. Smoothing operates
+on the existing decoded image; it adds no full-page buffer or output pixels.
+It increases sampling work and can increase PNG size, so include rendering and
+transport in throughput measurements.
+
+For a bounded A100 reproduction on rc.13, the native 150-DPI raster of
+`EFTA00001227.pdf` (PDF SHA-256
+`d00cd4de31cea68991ae53508df4b78f5f0fd7c424c571388a747aa3746b41fa`)
+exhausted 2048 tokens with both pinned reader sizes while continuing invented
+table rows. With OCR-profile smoothing, 4B stopped at 528 tokens and 0.8B at
+10 tokens under the same ceiling and image-only greedy generation request.
+These are renderer-to-reader diagnostics using the deployed CUDA runtime,
+not proof of full-corpus accuracy or of a deployed server containing the
+rendering change. Inspect actual visible text, not only completion status.
+The corpus artifact definition and pool limits need not change for this fix;
+retry native extraction only after deploying a runtime with the rendering fix.
+
 ## Large-page vLLM comparison
 
 The reader throughput target is parity with vLLM, preferably faster, while

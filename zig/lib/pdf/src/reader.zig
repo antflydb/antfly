@@ -2513,6 +2513,11 @@ fn prepareOcrImageRunsWithSummariesAlloc(
 ) !void {
     for (image_runs, 0..) |*run, index| {
         if (index & 255 == 0) try cancellation.check();
+        // OCR consumes a resampled image rather than an exact PDF painting.
+        // Smooth continuous-tone samples before the vision encoder resizes the
+        // page again; nearest-neighbour magnification aliases small lettering.
+        // One-bit scans retain their separate coverage-preserving policy.
+        run.ocr_interpolate = !run.bilevel and run.stencil_color == null;
         run.ocr_coverage_minify = run.bilevel;
         if (!run.bilevel or run.rgba.len == 0) continue;
         const key = @intFromPtr(run.rgba.ptr);
@@ -2547,8 +2552,8 @@ fn prepareOcrPatternRunsWithSummariesAlloc(
     }
 }
 
-/// Prepare every bilevel resource reachable by OCR rendering, including
-/// pattern-cell images and image masks retained as Pattern paint targets.
+/// Prepare OCR sampling for every reachable image: continuous-tone smoothing
+/// and bilevel coverage, including pattern-cell images and retained masks.
 /// Shared decoded XObjects use one summary regardless of how many occurrences
 /// reference them.
 pub fn prepareOcrRenderRunsAlloc(
@@ -23251,6 +23256,8 @@ test "OCR bilevel summaries are prepared lazily and reused by decoded buffer" {
     try std.testing.expectEqual(runs[0].bilevel_fallback, runs[1].bilevel_fallback);
     try std.testing.expect(runs[0].ocr_coverage_minify);
     try std.testing.expect(runs[1].ocr_coverage_minify);
+    try std.testing.expect(!runs[0].ocr_interpolate);
+    try std.testing.expect(!runs[1].ocr_interpolate);
 }
 
 test "OCR preparation reaches retained pattern stencils and tile images" {
