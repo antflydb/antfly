@@ -345,3 +345,10 @@ the receipt; omission may retain physical vector bytes, but source search hides
 them. This prevents an unchanged receipt from reauthorizing an old vector after a
 parent edit. Direct text presets use literal fields or unescaped nested-path text projection,
 preserving quotes, angle brackets, and resource URLs without HTML escaping.
+
+Local asset consumers capture a digest of the complete stored upstream before
+rendering producer input. Field selection, neighbor context and prior context
+remain inputs to provider execution and skip-state identity; they never replace
+the raw upstream identity checked in the publication transaction. Empty-input
+retirement removes the output, skip state and local publication receipt under
+the same source and producer fences.

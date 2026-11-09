@@ -5674,6 +5674,9 @@ const AssetProducerBatchItem = struct {
     raw_doc: []u8,
     source_text: []const u8,
     source_parts_json: ?[]u8 = null,
+    // Captured from stored upstream bytes before projection/context rendering.
+    // Producer input and upstream publication identity are different domains.
+    upstream_digest: ?[32]u8 = null,
     artifact_key: []u8,
     state_key: []u8,
     state_value: []u8,
@@ -16262,6 +16265,11 @@ fn processAsset(
     };
     var source_text_owned = true;
     defer if (source_text_owned) runtime.alloc.free(@constCast(source_text));
+    const upstream_digest: ?[32]u8 = digest: {
+        const privacy = @import("../../../privacy/document.zig");
+        if (context != null or !consumes_upstream or privacy.isProtectedArtifactName(request.upstream_artifact_name) or privacy.consumerPolicyVersion(request.upstream_artifact_name) != null) break :digest null;
+        break :digest sourceRecordDigest(source_text);
+    };
     if (consumes_upstream and context == null) {
         const privacy = @import("../../../privacy/document.zig");
         const root = privacy.isProtectedArtifactName(request.upstream_artifact_name);
@@ -16289,7 +16297,7 @@ fn processAsset(
             if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
             const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
             defer runtime.alloc.free(state_key);
-            try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
+            try retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest });
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
             try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
             try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
@@ -16316,7 +16324,7 @@ fn processAsset(
         if (producer_cfg.type == .document_extraction) {
             try deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window);
         } else {
-            try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
+            try retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest });
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         }
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
@@ -16373,9 +16381,7 @@ fn processAsset(
         defer runtime.alloc.free(receipt_key);
         const producer_recipe = local.requestRecipe(request);
         const receipt = local.encode(producer_recipe, raw, source_text);
-        const privacy = @import("../../../privacy/document.zig");
-        const generic_upstream = consumes_upstream and !privacy.isProtectedArtifactName(request.upstream_artifact_name) and privacy.consumerPolicyVersion(request.upstream_artifact_name) == null;
-        try storePutBatchGuardedWithRetry(runtime, &.{ .{ .key = key, .value = source_text }, .{ .key = receipt_key, .value = &receipt } }, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = if (generic_upstream) sourceRecordDigest(source_text) else null, .producer_name = artifact_name, .producer_recipe = producer_recipe });
+        try storePutBatchGuardedWithRetry(runtime, &.{ .{ .key = key, .value = source_text }, .{ .key = receipt_key, .value = &receipt } }, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest, .producer_name = artifact_name, .producer_recipe = producer_recipe });
         try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
         try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
@@ -16469,6 +16475,7 @@ fn processAsset(
         .raw_doc = if (context == null) raw else @constCast(""),
         .source_text = source_text,
         .source_parts_json = source_parts_json,
+        .upstream_digest = upstream_digest,
         .artifact_key = key,
         .state_key = state_key,
         .state_value = state_value,
@@ -18065,9 +18072,7 @@ fn applyAssetProducerBatchOutput(
     const producer_recipe = local.requestRecipe(item.request);
     const receipt = local.encode(producer_recipe, item.raw_doc, validated);
     try writes.append(runtime.alloc, .{ .key = receipt_key, .value = &receipt });
-    const privacy = @import("../../../privacy/document.zig");
-    const generic_upstream = item.request.upstream_artifact_name.len != 0 and !privacy.isProtectedArtifactName(item.request.upstream_artifact_name) and privacy.consumerPolicyVersion(item.request.upstream_artifact_name) == null;
-    try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = if (generic_upstream) sourceRecordDigest(item.source_text) else null, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe });
+    try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe });
 
     try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, item.artifact_key);
 
@@ -38136,6 +38141,16 @@ fn validateLocalSourceFence(runtime: *EnrichmentRuntime, txn: anytype, guard: Lo
     }
 }
 
+fn retireLocalAssetOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, key: []const u8, state_key: []const u8, source: LocalSourceFence) !void {
+    const local = @import("../artifact_local_publication.zig");
+    const receipt_key = try local.key(runtime.alloc, key);
+    defer runtime.alloc.free(receipt_key);
+    var guard = source;
+    guard.producer_name = requestArtifactName(request);
+    guard.producer_recipe = local.requestRecipe(request);
+    try storePutBatchGuardedWithRetry(runtime, &.{}, &.{ key, state_key, receipt_key }, guard);
+}
+
 fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
     return storePutBatchGuarded(runtime, writes, deletes, null);
 }
@@ -41405,6 +41420,162 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
     adoptLaneRetryIdentity(&runtime, LaneOutcome.of(&sequential_scope, error.EmbedRateLimited));
     try std.testing.expectEqual(requestFailureFingerprint(request), runtime.active_failure_fingerprint);
     try std.testing.expect(runtime.retry_error_has_request_identity);
+}
+
+test "generic contextual asset publication keeps raw upstream identity" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+    const doc_key = "entities/org/black_mountain_college";
+
+    const Harness = struct {
+        calls: usize = 0,
+        publications: u64 = 0,
+        last_input: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn produce(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_input.clearRetainingCapacity();
+            try self.last_input.appendSlice(std.testing.allocator, request.source_text);
+            return try a.dupe(u8, "{\"entities\":[{\"id\":\"c1\",\"label\":\"concept\",\"text\":\"college\"}]}");
+        }
+        fn canBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
+            return false;
+        }
+        fn write(
+            ptr: *anyopaque,
+            _: derived_types.DerivedBatch,
+            _: []const GeneratedArtifactPromotion,
+            _: []const []const u8,
+            _: []const GeneratedSourceGuard,
+            _: ?GeneratedWriteFence,
+        ) !GeneratedRecordCommit {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.publications += 1;
+            return .{ .sequence = self.publications };
+        }
+        fn notify(_: *anyopaque, _: u64) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const db_path = try std.fmt.bufPrint(&db_path_buf, ".zig-cache/tmp/{s}/graph-db", .{tmp.sub_path});
+    var db = try DB.open(alloc, db_path, .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "taxonomy", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .graph_writes = &.{
+        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/john_andrew_rice", .edge_type = "started_by", .weight = 0.98 },
+        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/place/north_carolina", .edge_type = "located_in", .weight = 0.5 },
+    }, .sync_level = .full_index });
+
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var harness = Harness{};
+    defer harness.last_input.deinit(std.testing.allocator);
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = db.core.index_manager,
+        .write_ctx = &harness,
+        .write_fn = Harness.write,
+        .notify_ctx = &harness,
+        .notify_fn = Harness.notify,
+        .config = .{ .asset_producer = .{ .ptr = &harness, .vtable = &.{
+            .produce = Harness.produce,
+            .can_produce_batch = Harness.canBatch,
+            .invocation_memory_for_requests = testInvocationMemoryForRequests,
+        } }, .inline_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+    defer clearPublishedGeneratedArtifacts(&runtime);
+    defer clearIsolatedFailedIndexes(&runtime);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+
+    const doc_store_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    defer alloc.free(doc_store_key);
+    try storePutPrivateBatchWithRetry(&runtime, &runtime.store, &.{
+        .{ .key = doc_store_key, .value = "{\"name\":\"Black Mountain College\"}" },
+    }, &.{});
+
+    var request: enrichment_types.GeneratedEnrichmentRequest = .{
+        .kind = .asset,
+        .index_name = "conceptualize_v1",
+        .artifact_name = "conceptualize_v1",
+        .doc_key = doc_key,
+        .source_field = "",
+        .upstream_artifact_name = "upstream",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .neighbor_context_json = "{\"graph_index\":\"taxonomy\",\"direction\":\"out\",\"limit\":8}",
+        .sequence = 3,
+    };
+    var prepared_sources = PreparedDocumentSourceCache.init(&runtime);
+    defer prepared_sources.deinit();
+
+    const runOnce = struct {
+        fn run(rt: *EnrichmentRuntime, req: enrichment_types.GeneratedEnrichmentRequest, sources: *PreparedDocumentSourceCache, win: *GeneratedReplayWindow) !void {
+            var batch = PreparedAssetBatch{};
+            defer batch.deinit(rt.alloc);
+            var scope = FailureScope{ .fingerprint = requestFailureFingerprint(req) };
+            try processAsset(rt, req, &batch, sources, win, &scope);
+            try batch.flush(rt, win, &scope);
+            try std.testing.expect(batch.retry_error == null);
+        }
+    }.run;
+
+    try db.core.index_manager.addEnrichment(&store, .{ .name = "upstream", .kind = .asset, .field = "name", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.core.index_manager.addEnrichment(&store, .{ .name = request.artifact_name, .kind = .asset, .source_artifact_name = "upstream", .content_type = request.content_type, .producer_json = request.producer_json, .neighbor_context = .{ .graph_index = "taxonomy", .direction = .out, .limit = 8 } });
+    request.neighbor_context_json = db.core.index_manager.getEnrichment(.asset, request.artifact_name).?.neighbor_context_json;
+    const local = @import("../artifact_local_publication.zig");
+    const upstream = db.core.index_manager.getEnrichment(.asset, "upstream").?;
+    const upstream_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", "upstream");
+    defer alloc.free(upstream_key);
+    const receipt_key = try local.key(alloc, upstream_key);
+    defer alloc.free(receipt_key);
+    const parent = "{\"name\":\"Black Mountain College\"}";
+    const raw_upstream = "upstream input";
+    const receipt = local.encode(local.recipe(upstream), parent, raw_upstream);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = upstream_key, .value = raw_upstream }, .{ .key = receipt_key, .value = &receipt } }, &.{});
+    try runOnce(&runtime, request, &prepared_sources, &window);
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    try std.testing.expect(std.mem.startsWith(u8, harness.last_input.items, "upstream input\n{\"neighbors\":"));
+    // An unchanged contextual input does not invoke the model twice.
+    try runOnce(&runtime, request, &prepared_sources, &window);
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    try db.batch(.{ .graph_writes = &.{.{ .index_name = "taxonomy", .source = doc_key, .target = "changed-neighbor", .edge_type = "mentions" }}, .sync_level = .full_index });
+    var batch = PreparedAssetBatch{};
+    defer batch.deinit(alloc);
+    var scope = FailureScope{ .fingerprint = requestFailureFingerprint(request) };
+    try processAsset(&runtime, request, &batch, &prepared_sources, &window, &scope);
+    try std.testing.expectEqual(@as(usize, 1), batch.items.items.len);
+    try std.testing.expectEqual(sourceRecordDigest(raw_upstream), batch.items.items[0].upstream_digest.?);
+    // A newer upstream must reject a result captured from the older bytes.
+    try storePutWithRetry(&runtime, upstream_key, "new input");
+    try std.testing.expectError(error.EnrichmentSourceChanged, applyAssetProducerBatchOutput(&runtime, &batch.items.items[0], "{\"entities\":[]}", &window));
+    // Empty input retires the output and its receipt atomically.
+    const missing = "";
+    const missing_receipt = local.encode(local.recipe(upstream), parent, missing);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = upstream_key, .value = missing }, .{ .key = receipt_key, .value = &missing_receipt } }, &.{});
+    try runOnce(&runtime, request, &prepared_sources, &window);
+    const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", request.artifact_name);
+    defer alloc.free(output_key);
+    const output_receipt = try local.key(alloc, output_key);
+    defer alloc.free(output_receipt);
+    const retired_output = try storeGetOptionalAllocWithRetry(&runtime, output_key);
+    defer if (retired_output) |value| alloc.free(value);
+    const retired_receipt = try storeGetOptionalAllocWithRetry(&runtime, output_receipt);
+    defer if (retired_receipt) |value| alloc.free(value);
+    try std.testing.expect(retired_output == null and retired_receipt == null);
 }
 
 test "asset producer neighbor context samples local graph adjacency into the input and skip state" {
