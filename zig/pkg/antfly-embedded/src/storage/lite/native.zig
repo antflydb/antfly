@@ -3985,6 +3985,14 @@ const TransactionWrites = struct {
     // reclaimed; they stay allocated-but-unreferenced until the next vacuum.
     undo: std.ArrayListUnmanaged(UndoEntry) = .empty,
     undo_depth: usize = 0,
+    // Every key/value `stageMutation` stages (and every undo-log snapshot of
+    // one it replaces) dies at the exact same moment: this instance's own
+    // `clear`/`deinit`, called once per flush window. Individually
+    // `allocator.free`-ing each of them bought nothing but 2-4 extra
+    // allocator calls per staged write; one arena reclaims all of them in a
+    // single `deinit`. `self.pages`/`self.undo`/`self.maps`/`self.appends`
+    // are unrelated containers with their own, unchanged lifecycles.
+    value_arena: std.heap.ArenaAllocator,
 
     const UndoEntry = struct {
         root: usize,
@@ -4000,23 +4008,10 @@ const TransactionWrites = struct {
             map.* = .empty;
         }
         self.append_count = 0;
-        for (self.undo.items) |item| {
-            if (item.previous) |previous| {
-                allocator.free(previous.key);
-                allocator.free(previous.value);
-            }
-            allocator.free(item.key);
-        }
+        self.value_arena.deinit();
         self.undo.clearRetainingCapacity();
         self.undo_depth = 0;
-        for (&self.maps) |*map| {
-            var it = map.valueIterator();
-            while (it.next()) |mutation| {
-                allocator.free(mutation.key);
-                allocator.free(mutation.value);
-            }
-            map.clearRetainingCapacity();
-        }
+        for (&self.maps) |*map| map.clearRetainingCapacity();
         self.bytes = 0;
         self.count = 0;
     }
@@ -7982,7 +7977,9 @@ pub const NativeFile = struct {
         const ref = try state.finish();
         const mutation = writes.maps[@backingInt(root)].getPtr(key).?;
         writes.bytes -= mutation.value.len;
-        self.allocator.free(mutation.value);
+        // `mutation.value` came from `writes.value_arena` (stageMutation),
+        // reclaimed in one shot with everything else at `writes.clear` --
+        // not individually freed here.
         mutation.value = &.{};
         mutation.external_value_root_page = ref.page;
         mutation.external_value_len = state.len;
@@ -12641,7 +12638,7 @@ pub const NativeFile = struct {
         if (self.transaction_writes) |writes| return writes;
         const writes = try self.allocator.create(TransactionWrites);
         errdefer self.allocator.destroy(writes);
-        writes.* = .{ .pages = try self.pageAllocatorFromFreeMap(self.activeCheckpoint()) };
+        writes.* = .{ .pages = try self.pageAllocatorFromFreeMap(self.activeCheckpoint()), .value_arena = std.heap.ArenaAllocator.init(self.allocator) };
         self.transaction_writes = writes;
         self.transaction_writes_generation +%= 1;
         return writes;
@@ -12658,28 +12655,40 @@ pub const NativeFile = struct {
             return error.InvalidArtifactLeaseMutation;
         // Acquire ownership before a spill: callers may be appending/renaming
         // an entry borrowed from the write set that the spill will release.
-        var owned = mutation;
-        owned.key = try self.allocator.dupe(u8, mutation.key);
-        errdefer self.allocator.free(owned.key);
         const inline_value = !mutation.is_delete and mutation.external_value_root_page == 0 and
             (if (root == .documents) self.documentEntryFitsInline(mutation.key, mutation.value) else self.catalogEntryFitsInline(mutation.key, mutation.value));
-        owned.value = try self.allocator.dupe(u8, if (inline_value) mutation.value else "");
-        errdefer self.allocator.free(owned.value);
-        const spill_copy = if (!mutation.is_delete and !inline_value and mutation.external_value_root_page == 0 and mutation.value.len <= self.maxPagePayloadBytes()) try self.allocator.dupe(u8, mutation.value) else null;
-        defer if (spill_copy) |bytes| self.allocator.free(bytes);
-        const source_value = spill_copy orelse mutation.value;
+        // The eventual owned value is either the real inline bytes or "" (an
+        // out-of-line value is written below and tracked only by its page
+        // reference) -- compute its length now, before any allocation, so
+        // the capacity check and a possible flush-and-replace of `writes`
+        // (and its arena) can happen before anything is staged into it.
+        const owned_value_len: usize = if (inline_value) mutation.value.len else 0;
         var writes = try self.transactionWrites();
-        const replaced = writes.maps[@backingInt(root)].get(owned.key);
+        const replaced = writes.maps[@backingInt(root)].get(mutation.key);
         const replaced_bytes = if (replaced) |old| old.key.len + old.value.len else 0;
-        if ((replaced == null and writes.count >= TransactionWrites.max_keys) or writes.bytes - replaced_bytes + owned.key.len + owned.value.len > TransactionWrites.max_bytes) {
+        if ((replaced == null and writes.count >= TransactionWrites.max_keys) or writes.bytes - replaced_bytes + mutation.key.len + owned_value_len > TransactionWrites.max_bytes) {
             try self.flushTransactionWrites();
             writes = try self.transactionWrites();
         }
+        // Acquire ownership from this transaction's own arena: every entry
+        // staged here (and every undo-log snapshot of one it replaces) dies
+        // together at `writes.clear`/`deinit` (one per flush window), so
+        // there is nothing to free individually and no failure-path
+        // `errdefer` to register -- an arena allocation that is never
+        // stored anywhere just becomes unreferenced garbage, reclaimed at
+        // the same point a successful one would have been anyway. Writing
+        // `mutation.value` into pages below (not duping it first: those
+        // writers only read it synchronously within this call) no longer
+        // needs its own temporary copy either.
+        const arena = writes.value_arena.allocator();
+        var owned = mutation;
+        owned.key = try arena.dupe(u8, mutation.key);
+        owned.value = try arena.dupe(u8, if (inline_value) mutation.value else "");
         if (!mutation.is_delete and mutation.external_value_root_page == 0 and !inline_value) {
             owned.external_value_root_page = if (root == .documents)
-                try self.writeDocumentValue(&writes.pages, source_value)
+                try self.writeDocumentValue(&writes.pages, mutation.value)
             else
-                try self.writeCatalogValue(&writes.pages, source_value, options);
+                try self.writeCatalogValue(&writes.pages, mutation.value, options);
             owned.external_value_len = mutation.value.len;
             try self.flushTransactionPayloads();
         }
@@ -12690,38 +12699,25 @@ pub const NativeFile = struct {
             const old = slot.value_ptr.*;
             writes.bytes -= old.key.len + old.value.len;
             if (recording) {
-                // Transfer ownership of the replaced entry into the undo log
-                // instead of freeing it, so a savepoint rollback can restore
-                // it verbatim.
-                const undo_key = try self.allocator.dupe(u8, owned.key);
-                // If `append` below fails (e.g. the allocator-v4 injected
-                // failure test), `undo_key` has no other owner yet -- nothing
-                // reachable from `writes.undo` or the map references it, so
-                // without this it leaks on every such failure.
-                errdefer self.allocator.free(undo_key);
+                // Transfer the replaced entry into the undo log instead of
+                // dropping it, so a savepoint rollback can restore it
+                // verbatim. Both live in the same arena either way.
+                const undo_key = try arena.dupe(u8, owned.key);
                 try writes.undo.append(self.allocator, .{ .root = @backingInt(root), .key = undo_key, .previous = old });
-            } else {
-                self.allocator.free(old.key);
-                self.allocator.free(old.value);
             }
         } else {
             // `getOrPut` already wrote `owned.key` into `slot.key_ptr` for a
             // new entry (its own contract: "if (!found_existing) gop.key_ptr.*
             // = key"), but `slot.value_ptr` is still whatever garbage backed
             // that slot -- this function doesn't fill it in until the very
-            // end. If the undo-log append below fails, unwind through the
-            // two `errdefer`s above frees `owned.key`/`owned.value`, which
-            // would otherwise leave this half-initialized slot in the map
-            // with a dangling key and an uninitialized value. Remove it
-            // before that happens; `owned.key` is still valid here since
-            // `errdefer`s run in reverse registration order.
+            // end. If the undo-log append below fails, remove the
+            // half-initialized slot before that happens so a dangling key
+            // never lingers in the map; `owned.key` itself needs no cleanup
+            // (arena memory).
             errdefer _ = map.remove(owned.key);
             writes.count += 1;
             if (recording) {
-                const undo_key = try self.allocator.dupe(u8, owned.key);
-                // Same leak as the `found_existing` branch above: `append`
-                // failing here must not strand this dupe.
-                errdefer self.allocator.free(undo_key);
+                const undo_key = try arena.dupe(u8, owned.key);
                 try writes.undo.append(self.allocator, .{ .root = @backingInt(root), .key = undo_key, .previous = null });
             }
         }
@@ -12976,16 +12972,10 @@ pub const NativeFile = struct {
         if (self.transaction_writes_generation != sp.writes_generation) return; // a flush already retired sp's undo log.
         std.debug.assert(writes.undo_depth > 0);
         writes.undo_depth -= 1;
-        var i = writes.undo.items.len;
-        while (i > sp.undo_mark) {
-            i -= 1;
-            const item = writes.undo.items[i];
-            if (item.previous) |previous| {
-                self.allocator.free(previous.key);
-                self.allocator.free(previous.value);
-            }
-            self.allocator.free(item.key);
-        }
+        // The discarded entries' key/previous.key/previous.value all came
+        // from `writes.value_arena` (stageMutation); it reclaims them with
+        // everything else at `writes.clear`, so there is nothing to free
+        // here now -- just stop tracking them for rollback.
         writes.undo.shrinkRetainingCapacity(sp.undo_mark);
     }
 
@@ -13048,27 +13038,23 @@ pub const NativeFile = struct {
         if (self.transaction_writes_generation != sp.writes_generation) return; // already superseded by the checkpoint restore above.
         std.debug.assert(writes.undo_depth > 0);
         writes.undo_depth -= 1;
+        // Every key/value touched below (the popped undo entry's own key,
+        // whatever `current`/`previous` it restores or discards) came from
+        // `writes.value_arena` (stageMutation); it reclaims all of them
+        // together at `writes.clear`, so none of them are freed here --
+        // only the map/undo-log bookkeeping changes.
         while (writes.undo.items.len > sp.undo_mark) {
             const item = writes.undo.pop().?;
-            defer self.allocator.free(item.key);
             const map = &writes.maps[item.root];
             if (item.previous) |previous| {
                 if (map.getPtr(item.key)) |current| {
                     writes.bytes -= current.key.len + current.value.len;
-                    self.allocator.free(current.key);
-                    self.allocator.free(current.value);
                     current.* = previous;
                     writes.bytes += previous.key.len + previous.value.len;
-                } else {
-                    // The key was removed by a later undo entry already;
-                    // the replaced value still needs freeing.
-                    self.allocator.free(previous.key);
-                    self.allocator.free(previous.value);
                 }
+                // else: the key was removed by a later undo entry already.
             } else if (map.fetchRemove(item.key)) |kv| {
                 writes.bytes -= kv.value.key.len + kv.value.value.len;
-                self.allocator.free(kv.value.key);
-                self.allocator.free(kv.value.value);
                 writes.count -= 1;
             }
         }
