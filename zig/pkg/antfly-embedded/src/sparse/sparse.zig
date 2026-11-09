@@ -804,17 +804,47 @@ fn forEachFwdTermId(data: []const u8, comptime Context: type, context: *Context,
 // Term metadata encoding
 // ============================================================================
 
-fn encodeTermMeta(max_weight: f32, chunk_count: u32) [8]u8 {
-    var buf: [8]u8 = undefined;
+// v2 (perf/lwa-commit-eff2): a term's meta (max_weight, chunk_count) and
+// its doc-id range (min/max across all chunks) used to live in two
+// separate records (this one, and termRangeKey's own, encoded via
+// encodeChunkRangeMeta) even though every call site in this file reads
+// or writes them as a pair -- bulk append, incremental insert/delete,
+// segment handoff/prune/split-planning, and the deferred term-range
+// recompute all touch both together. Merging them into one record under
+// the SAME key (invMetaKey; termRangeKey is retired) halves the put
+// count for every one of those call sites. A term with chunk_count == 0
+// is never actually stored (the whole record is deleted once the last
+// chunk goes), so min/max are always present when this decodes
+// successfully.
+fn encodeTermMeta(alloc: Allocator, max_weight: f32, chunk_count: u32, min_doc_id: []const u8, max_doc_id: []const u8) ![]u8 {
+    const buf = try alloc.alloc(u8, 16 + min_doc_id.len + max_doc_id.len);
     std.mem.writeInt(u32, buf[0..4], @bitCast(max_weight), .little);
     std.mem.writeInt(u32, buf[4..8], chunk_count, .little);
+    std.mem.writeInt(u32, buf[8..12], @intCast(min_doc_id.len), .little);
+    std.mem.writeInt(u32, buf[12..16], @intCast(max_doc_id.len), .little);
+    @memcpy(buf[16..][0..min_doc_id.len], min_doc_id);
+    @memcpy(buf[16 + min_doc_id.len ..][0..max_doc_id.len], max_doc_id);
     return buf;
 }
 
-fn decodeTermMeta(data: []const u8) struct { max_weight: f32, chunk_count: u32 } {
+const TermMeta = struct { max_weight: f32, chunk_count: u32, min_doc_id: []const u8, max_doc_id: []const u8 };
+
+fn decodeTermMeta(data: []const u8) !TermMeta {
+    if (data.len < 16) return error.InvalidChunk;
     const mw_bits = std.mem.readInt(u32, data[0..4], .little);
     const cc = std.mem.readInt(u32, data[4..8], .little);
-    return .{ .max_weight = @bitCast(mw_bits), .chunk_count = cc };
+    const min_len = std.mem.readInt(u32, data[8..12], .little);
+    const max_len = std.mem.readInt(u32, data[12..16], .little);
+    const min_start: usize = 16;
+    const min_end = min_start + min_len;
+    const max_end = min_end + max_len;
+    if (max_end > data.len) return error.InvalidChunk;
+    return .{
+        .max_weight = @bitCast(mw_bits),
+        .chunk_count = cc,
+        .min_doc_id = data[min_start..min_end],
+        .max_doc_id = data[min_end..max_end],
+    };
 }
 
 const ChunkRangeMeta = struct {
@@ -1937,7 +1967,7 @@ fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector,
             error.NotFound => continue,
             else => return err,
         };
-        const metadata = decodeTermMeta(bytes);
+        const metadata = try decodeTermMeta(bytes);
         for (0..metadata.chunk_count) |i| {
             try checkSearchCancellation(cancellation);
             if (streams.items.len == max_streams) return null;
@@ -2395,8 +2425,14 @@ fn termCatalogKey(buf: []u8, term_id: u32) []const u8 {
     return buf[0..5];
 }
 
-fn parseTermRangeKey(key: []const u8) ?u32 {
-    if (key.len != 6 or key[0] != key_inv or key[5] != inv_kind_term_range) return null;
+// inv_kind_term_range itself is retired (v2, perf/lwa-commit-eff2): a
+// term's range now lives in its combined invMetaKey record (inv_kind_meta)
+// instead of its own key. parseInvMetaKey replaces parseTermRangeKey's
+// own use (a cursor scan singling out the one `key_inv`-prefixed entry per
+// term cheap enough to check a range against before paying for a full
+// accumulateSplitPlanningStats call).
+fn parseInvMetaKey(key: []const u8) ?u32 {
+    if (key.len != 6 or key[0] != key_inv or key[5] != inv_kind_meta) return null;
     return std.mem.readInt(u32, key[1..][0..4], .big);
 }
 
@@ -2869,7 +2905,14 @@ pub const SparseIndex = struct {
         var scratch_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch_arena.deinit();
         const scratch = scratch_arena.allocator();
-        var touched_terms = std.AutoHashMapUnmanaged(u32, void).empty;
+        // Value is `true` when a delete touched this term (needs the
+        // expensive recompute-from-chunks pass below) or `false` for an
+        // insert-only touch (already fully, correctly updated in place by
+        // addToPostings itself -- see its own doc comment). The set is
+        // still populated for every touch either way, insert or delete,
+        // so `stats.touched_terms = term_ids.len`-style batch-level
+        // bookkeeping is unaffected.
+        var touched_terms = std.AutoHashMapUnmanaged(u32, bool).empty;
         defer touched_terms.deinit(self.alloc);
         const touched_terms_ptr = if (options.defer_term_range_updates) &touched_terms else null;
         var physical_maps: PhysicalMaps = .{ .a = self.alloc };
@@ -2899,6 +2942,7 @@ pub const SparseIndex = struct {
         if (touched_terms_ptr) |map| {
             var it = map.iterator();
             while (it.next()) |entry| {
+                if (!entry.value_ptr.*) continue; // insert-only: already correct.
                 try self.refreshTermRangeMeta(scratch, txn, entry.key_ptr.*);
                 _ = scratch_arena.reset(.retain_capacity);
             }
@@ -4484,22 +4528,14 @@ pub const SparseIndex = struct {
             else => return err,
         };
         if (meta_data) |data| {
-            const tm = decodeTermMeta(data);
+            const tm = try decodeTermMeta(data);
             chunk_count = tm.chunk_count;
             max_weight = tm.max_weight;
+            updateBorrowedRangeBounds(&term_min_doc_id, &term_max_doc_id, tm.min_doc_id, tm.max_doc_id);
         } else {
             created_term = true;
         }
         for (postings) |posting| max_weight = @max(max_weight, posting.weight);
-        var range_key_buf: [256]u8 = undefined;
-        const existing_range_data = txnGet(txn, self.dbi, termRangeKey(&range_key_buf, term_id)) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
-        if (existing_range_data) |data| {
-            const range = try decodeChunkRangeMeta(data);
-            updateBorrowedRangeBounds(&term_min_doc_id, &term_max_doc_id, range.min_doc_id, range.max_doc_id);
-        }
         self.write_profile.term_meta_ns += elapsedSince(phase_start_ns);
 
         var cursor: usize = 0;
@@ -4573,11 +4609,11 @@ pub const SparseIndex = struct {
         }
 
         phase_start_ns = nowNs();
-        const meta = encodeTermMeta(max_weight, chunk_count);
-        try txnAppendPut(txn, self.dbi, mk, &meta);
-        if (term_min_doc_id != null and term_max_doc_id != null) {
-            try self.writeTermRangeMeta(alloc, txn, term_id, term_min_doc_id.?, term_max_doc_id.?);
-        }
+        // postings.len > 0 (checked at entry) guarantees at least one chunk
+        // write happened above, so both bounds are always set here.
+        const meta = try encodeTermMeta(alloc, max_weight, chunk_count, term_min_doc_id.?, term_max_doc_id.?);
+        defer alloc.free(meta);
+        try txnAppendPut(txn, self.dbi, mk, meta);
         self.write_profile.term_meta_ns += elapsedSince(phase_start_ns);
         return created_term;
     }
@@ -4597,7 +4633,7 @@ pub const SparseIndex = struct {
         alloc: Allocator,
         txn: anytype,
         doc_id: []const u8,
-        touched_terms: ?*std.AutoHashMapUnmanaged(u32, void),
+        touched_terms: ?*std.AutoHashMapUnmanaged(u32, bool),
     ) !DeleteEffect {
         // Read forward entry
         var key_buf: [256]u8 = undefined;
@@ -4635,7 +4671,7 @@ pub const SparseIndex = struct {
         doc_id: []const u8,
         vec: SparseVector,
         preferred_doc_num: ?u32,
-        touched_terms: ?*std.AutoHashMapUnmanaged(u32, void),
+        touched_terms: ?*std.AutoHashMapUnmanaged(u32, bool),
     ) !void {
         // If doc_id already exists, delete the old mapping first to avoid orphaning
         self.applyDeleteEffect(try self.processDelete(alloc, txn, doc_id, touched_terms));
@@ -4696,7 +4732,7 @@ pub const SparseIndex = struct {
         doc_id: []const u8,
         doc_num: u32,
         weight: f32,
-        touched_terms: ?*std.AutoHashMapUnmanaged(u32, void),
+        touched_terms: ?*std.AutoHashMapUnmanaged(u32, bool),
     ) !bool {
         // Read term metadata
         var meta_key_buf: [256]u8 = undefined;
@@ -4705,14 +4741,26 @@ pub const SparseIndex = struct {
         var max_weight: f32 = weight;
         var created_term = false;
 
+        // Owned (not borrowed): a `txn.put` below (the chunk writes) can
+        // free the node backing `meta_data` on a persistent-tree backend
+        // (.native_catalog) -- see `writeChunkWithRangeMetaProfiled`'s own
+        // doc comment on this exact hazard, previously a real segfault
+        // under concurrent load. Freed explicitly after the final combined
+        // write below, which is the last use.
+        var old_min_doc_id: ?[]u8 = null;
+        defer if (old_min_doc_id) |m| alloc.free(m);
+        var old_max_doc_id: ?[]u8 = null;
+        defer if (old_max_doc_id) |m| alloc.free(m);
         const meta_data = txnGet(txn, self.dbi, mk) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
         if (meta_data) |d| {
-            const tm = decodeTermMeta(d);
+            const tm = try decodeTermMeta(d);
             chunk_count = tm.chunk_count;
             max_weight = @max(tm.max_weight, weight);
+            old_min_doc_id = try alloc.dupe(u8, tm.min_doc_id);
+            old_max_doc_id = try alloc.dupe(u8, tm.max_doc_id);
         } else {
             created_term = true;
         }
@@ -4764,14 +4812,32 @@ pub const SparseIndex = struct {
             }
         }
 
-        // Update term metadata
-        const meta = encodeTermMeta(max_weight, chunk_count);
-        try txnPut(txn, self.dbi, mk, &meta);
+        // Update term metadata (meta + range combined, see encodeTermMeta's
+        // doc comment). An insert only ever extends the range, which is
+        // always correct to apply immediately -- unlike a delete, which can
+        // only shrink it and needs every remaining chunk's own range
+        // rescanned to do that correctly (see removeFromPostings/
+        // refreshTermRangeMeta/recomputeTermRangeMeta below). So this
+        // writes the combined record right here, every time, regardless of
+        // `touched_terms`: deferring it (as removeFromPostings still does)
+        // would buy nothing for an insert (there is no "later, cheaper"
+        // way to compute the same extend-only update) while costing an
+        // extra put. `touched_terms`, when given, still gets this term
+        // added -- purely for the batch-level touched-term-count bookkeeping
+        // callers rely on -- but is never consulted here to decide whether
+        // to write.
+        const min_doc_id = if (old_min_doc_id) |m| (if (std.mem.order(u8, doc_id, m) == .lt) doc_id else m) else doc_id;
+        const max_doc_id = if (old_max_doc_id) |m| (if (std.mem.order(u8, doc_id, m) == .gt) doc_id else m) else doc_id;
+        const meta = try encodeTermMeta(alloc, max_weight, chunk_count, min_doc_id, max_doc_id);
+        defer alloc.free(meta);
+        try txnPut(txn, self.dbi, mk, meta);
         if (created_term) _ = try self.ensureTermCatalogEntry(txn, term_id);
         if (touched_terms) |map| {
-            try map.put(self.alloc, term_id, {});
-        } else {
-            try self.updateTermRangeMetaOnInsert(alloc, txn, term_id, doc_id);
+            // Never overwrite an existing `true` (a delete already touched
+            // this term in this same batch and still needs its own full
+            // recompute at the end): `getOrPutValue` only inserts `false`
+            // when the key is absent.
+            _ = try map.getOrPutValue(self.alloc, term_id, false);
         }
         return created_term;
     }
@@ -4782,7 +4848,7 @@ pub const SparseIndex = struct {
         txn: anytype,
         term_id: u32,
         doc_num: u32,
-        touched_terms: ?*std.AutoHashMapUnmanaged(u32, void),
+        touched_terms: ?*std.AutoHashMapUnmanaged(u32, bool),
     ) !bool {
         var meta_key_buf: [256]u8 = undefined;
         const mk = invMetaKey(&meta_key_buf, term_id);
@@ -4791,7 +4857,16 @@ pub const SparseIndex = struct {
             error.NotFound => return false,
             else => return err,
         };
-        const tm = decodeTermMeta(meta_data);
+        const decoded_tm = try decodeTermMeta(meta_data);
+        // Owned: the txnDelete/txnPut calls below can free the node backing
+        // `meta_data` on a persistent-tree backend; see addToPostings's
+        // identical note. `tm.max_weight`/`tm.chunk_count` are plain values
+        // (copied, not borrowed) so only the doc-id slices need this.
+        const old_min_doc_id = try alloc.dupe(u8, decoded_tm.min_doc_id);
+        defer alloc.free(old_min_doc_id);
+        const old_max_doc_id = try alloc.dupe(u8, decoded_tm.max_doc_id);
+        defer alloc.free(old_max_doc_id);
+        const tm = .{ .max_weight = decoded_tm.max_weight, .chunk_count = decoded_tm.chunk_count };
 
         for (0..tm.chunk_count) |ci| {
             var ck_buf: [256]u8 = undefined;
@@ -4816,19 +4891,23 @@ pub const SparseIndex = struct {
                     txnDelete(txn, self.dbi, ck) catch {};
                     var meta_ck_buf: [256]u8 = undefined;
                     txnDelete(txn, self.dbi, invChunkMetaKey(&meta_ck_buf, term_id, @intCast(ci))) catch {};
-                    // Update metadata chunk_count
-                    const new_meta = encodeTermMeta(tm.max_weight, tm.chunk_count - 1);
-                    var term_range_buf: [256]u8 = undefined;
                     if (tm.chunk_count - 1 == 0) {
                         txnDelete(txn, self.dbi, mk) catch {};
-                        txnDelete(txn, self.dbi, termRangeKey(&term_range_buf, term_id)) catch {};
                         var catalog_buf: [16]u8 = undefined;
                         txnDelete(txn, self.dbi, termCatalogKey(&catalog_buf, term_id)) catch {};
                         return true;
                     } else {
-                        try txnPut(txn, self.dbi, mk, &new_meta);
+                        // Provisional: chunk_count/max_weight updated, range
+                        // still the old (possibly now-stale-wide) one until
+                        // the recompute below -- immediate or deferred --
+                        // corrects it. Still a safe intermediate state: a
+                        // too-wide range never excludes a live posting, see
+                        // recomputeTermRangeMeta's own doc comment.
+                        const provisional = try encodeTermMeta(alloc, tm.max_weight, tm.chunk_count - 1, old_min_doc_id, old_max_doc_id);
+                        defer alloc.free(provisional);
+                        try txnPut(txn, self.dbi, mk, provisional);
                         if (touched_terms) |map| {
-                            try map.put(self.alloc, term_id, {});
+                            try map.put(self.alloc, term_id, true);
                         } else {
                             try self.recomputeTermRangeMeta(alloc, txn, term_id, tm.chunk_count - 1);
                         }
@@ -4857,7 +4936,7 @@ pub const SparseIndex = struct {
                     }
                     try self.writeChunkWithRangeMeta(alloc, txn, term_id, @intCast(ci), new_dns, new_ws, range.min_doc_id, range.max_doc_id);
                     if (touched_terms) |map| {
-                        try map.put(self.alloc, term_id, {});
+                        try map.put(self.alloc, term_id, true);
                     } else {
                         try self.recomputeTermRangeMeta(alloc, txn, term_id, tm.chunk_count);
                     }
@@ -4933,27 +5012,16 @@ pub const SparseIndex = struct {
         if (profile) |active_profile| active_profile.range_meta_put_ns += elapsedSince(phase_start_ns);
     }
 
-    fn writeTermRangeMeta(self: *SparseIndex, alloc: Allocator, txn: anytype, term_id: u32, min_doc_id: []const u8, max_doc_id: []const u8) !void {
-        const meta = try encodeChunkRangeMeta(alloc, min_doc_id, max_doc_id);
-        defer alloc.free(meta);
-        var key_buf: [256]u8 = undefined;
-        try txnAppendPut(txn, self.dbi, termRangeKey(&key_buf, term_id), meta);
-    }
-
-    fn updateTermRangeMetaOnInsert(self: *SparseIndex, alloc: Allocator, txn: anytype, term_id: u32, doc_id: []const u8) !void {
-        var key_buf: [256]u8 = undefined;
-        const existing = txnGet(txn, self.dbi, termRangeKey(&key_buf, term_id)) catch null;
-        if (existing) |raw_meta| {
-            const range = try decodeChunkRangeMeta(raw_meta);
-            const min_doc_id = if (std.mem.order(u8, doc_id, range.min_doc_id) == .lt) doc_id else range.min_doc_id;
-            const max_doc_id = if (std.mem.order(u8, doc_id, range.max_doc_id) == .gt) doc_id else range.max_doc_id;
-            try self.writeTermRangeMeta(alloc, txn, term_id, min_doc_id, max_doc_id);
-            return;
-        }
-
-        try self.writeTermRangeMeta(alloc, txn, term_id, doc_id, doc_id);
-    }
-
+    /// Rescans every chunk's own range (never the term's own prior range,
+    /// which is what a delete needs: it can only shrink the true range,
+    /// and the only way to shrink it correctly is to recompute from what
+    /// remains) and writes the combined term record with that fresh range
+    /// plus the chunk_count/max_weight already in `mk` (both already
+    /// correct -- the caller wrote them, provisionally for max_weight,
+    /// before calling this; see removeFromPostings and
+    /// stageIncrementalMutations' deferred pass). `chunk_count` is the
+    /// caller's own already-updated count, not re-derived from `mk`, so
+    /// this works whether or not `mk` has been written yet this call.
     fn recomputeTermRangeMeta(self: *SparseIndex, alloc: Allocator, txn: anytype, term_id: u32, chunk_count: u32) !void {
         var min_doc_id: ?[]const u8 = null;
         var max_doc_id: ?[]const u8 = null;
@@ -4968,30 +5036,46 @@ pub const SparseIndex = struct {
             }
         }
 
-        var key_buf: [256]u8 = undefined;
+        var meta_key_buf: [256]u8 = undefined;
+        const mk = invMetaKey(&meta_key_buf, term_id);
         if (min_doc_id == null or max_doc_id == null) {
-            txnDelete(txn, self.dbi, termRangeKey(&key_buf, term_id)) catch {};
+            txnDelete(txn, self.dbi, mk) catch {};
             return;
         }
 
-        try self.writeTermRangeMeta(alloc, txn, term_id, min_doc_id.?, max_doc_id.?);
+        const existing = txnGet(txn, self.dbi, mk) catch |err| switch (err) {
+            // No record yet (chunk_count>0 but mk was never written) should
+            // not happen -- every caller writes mk before or passes a
+            // chunk_count consistent with an existing record -- but fall
+            // back to max_weight 0 rather than erroring, since a wrong
+            // (too-low) max_weight is a ranking quality issue, not a
+            // correctness one, and this path recomputing a range at all
+            // means the term is known to still have live postings.
+            error.NotFound => null,
+            else => return err,
+        };
+        const max_weight = if (existing) |data| (try decodeTermMeta(data)).max_weight else 0;
+        const combined = try encodeTermMeta(alloc, max_weight, chunk_count, min_doc_id.?, max_doc_id.?);
+        defer alloc.free(combined);
+        try txnAppendPut(txn, self.dbi, mk, combined);
     }
 
+    /// The deferred pass's entry point (design: `stageIncrementalMutations`
+    /// calls this once per term a delete marked dirty in `touched_terms`,
+    /// after every insert/delete in the batch has run). An insert-only
+    /// touch never reaches here: `addToPostings` already wrote the
+    /// correct combined record itself, immediately -- see its own doc
+    /// comment for why deferring that would buy nothing.
     fn refreshTermRangeMeta(self: *SparseIndex, alloc: Allocator, txn: anytype, term_id: u32) !void {
         var meta_key_buf: [256]u8 = undefined;
         const mk = invMetaKey(&meta_key_buf, term_id);
         const meta_data = txnGet(txn, self.dbi, mk) catch |err| switch (err) {
-            error.NotFound => {
-                var key_buf: [256]u8 = undefined;
-                txnDelete(txn, self.dbi, termRangeKey(&key_buf, term_id)) catch {};
-                return;
-            },
+            error.NotFound => return,
             else => return err,
         };
-        const tm = decodeTermMeta(meta_data);
+        const tm = try decodeTermMeta(meta_data);
         if (tm.chunk_count == 0) {
-            var key_buf: [256]u8 = undefined;
-            txnDelete(txn, self.dbi, termRangeKey(&key_buf, term_id)) catch {};
+            txnDelete(txn, self.dbi, mk) catch {};
             return;
         }
         try self.recomputeTermRangeMeta(alloc, txn, term_id, tm.chunk_count);
@@ -5896,7 +5980,7 @@ pub const SparseIndex = struct {
                 var meta_key_buf: [256]u8 = undefined;
                 const mk = invMetaKey(&meta_key_buf, term_id);
                 const meta_data = txn.get(mk) catch continue;
-                const tm = decodeTermMeta(meta_data);
+                const tm = try decodeTermMeta(meta_data);
 
                 // Scan all chunks for this term
                 for (0..tm.chunk_count) |ci| {
@@ -6290,7 +6374,7 @@ pub const SparseIndex = struct {
             var entry = first_term;
             while (true) {
                 if (entry.key.len == 0 or entry.key[0] != key_inv) break;
-                const term_id = parseTermRangeKey(entry.key) orelse {
+                const term_id = parseInvMetaKey(entry.key) orelse {
                     entry = (try src_cur.next()) orelse break;
                     continue;
                 };
@@ -6298,8 +6382,8 @@ pub const SparseIndex = struct {
                     entry = (try src_cur.next()) orelse break;
                     continue;
                 }
-                const range = try decodeChunkRangeMeta(entry.value);
-                switch (classifyChunkRange(range, lower, upper)) {
+                const range = try decodeTermMeta(entry.value);
+                switch (classifyChunkRange(.{ .min_doc_id = range.min_doc_id, .max_doc_id = range.max_doc_id }, lower, upper)) {
                     .outside => {},
                     .right_only, .mixed => {
                         try accumulateSplitPlanningStats(alloc, &src_txn, self.dbi, term_id, lower, upper, &collected.selected_doc_nums, &out);
@@ -6451,12 +6535,12 @@ pub const SparseIndex = struct {
             var entry = first;
             while (true) {
                 if (entry.key.len == 0 or entry.key[0] != key_inv) break;
-                const term_id = parseTermRangeKey(entry.key) orelse {
+                const term_id = parseInvMetaKey(entry.key) orelse {
                     entry = (try cur.next()) orelse break;
                     continue;
                 };
-                const range = try decodeChunkRangeMeta(entry.value);
-                switch (classifyChunkRange(range, lower, upper)) {
+                const range = try decodeTermMeta(entry.value);
+                switch (classifyChunkRange(.{ .min_doc_id = range.min_doc_id, .max_doc_id = range.max_doc_id }, lower, upper)) {
                     .outside => {},
                     .right_only, .mixed => try term_ids.append(alloc, term_id),
                 }
@@ -6604,7 +6688,7 @@ fn handoffTermPostings(
         error.NotFound => return,
         else => return err,
     };
-    const tm = decodeTermMeta(meta_data);
+    const tm = try decodeTermMeta(meta_data);
 
     var out_chunk_count: u32 = 0;
     var out_max_weight: f32 = 0;
@@ -6674,15 +6758,19 @@ fn handoffTermPostings(
     }
 
     if (out_chunk_count == 0) return;
-    const out_meta = encodeTermMeta(out_max_weight, out_chunk_count);
-    try txnPut(dest_txn, dest_dbi, mk, &out_meta);
-    const out_range_meta = try encodeChunkRangeMeta(alloc, out_min_doc_id.?, out_max_doc_id.?);
-    defer alloc.free(out_range_meta);
-    var range_key_buf: [256]u8 = undefined;
-    try txnPut(dest_txn, dest_dbi, termRangeKey(&range_key_buf, term_id), out_range_meta);
+    const out_meta = try encodeTermMeta(alloc, out_max_weight, out_chunk_count, out_min_doc_id.?, out_max_doc_id.?);
+    defer alloc.free(out_meta);
+    try txnPut(dest_txn, dest_dbi, mk, out_meta);
 }
 
+// No current caller (kept compiling through the v2 term-record merge
+// below rather than removed, since it is not this change's call to
+// delete unrelated dead code). `term_range_meta` is the old, standalone
+// encodeChunkRangeMeta-format payload a caller would have sourced
+// separately; decoded here and folded into the combined record this
+// index now stores under `mk` instead of writing it to its own key.
 fn handoffWholeTermPostings(
+    alloc: Allocator,
     src_txn: anytype,
     src_dbi: anytype,
     dest_txn: anytype,
@@ -6696,11 +6784,11 @@ fn handoffWholeTermPostings(
         error.NotFound => return,
         else => return err,
     };
-    const tm = decodeTermMeta(meta_data);
-
-    try txnPut(dest_txn, dest_dbi, mk, meta_data);
-    var range_key_buf: [256]u8 = undefined;
-    try txnPut(dest_txn, dest_dbi, termRangeKey(&range_key_buf, term_id), term_range_meta);
+    const tm = try decodeTermMeta(meta_data);
+    const range = try decodeChunkRangeMeta(term_range_meta);
+    const combined = try encodeTermMeta(alloc, tm.max_weight, tm.chunk_count, range.min_doc_id, range.max_doc_id);
+    defer alloc.free(combined);
+    try txnPut(dest_txn, dest_dbi, mk, combined);
 
     for (0..tm.chunk_count) |ci| {
         var ck_buf: [256]u8 = undefined;
@@ -6729,7 +6817,7 @@ fn pruneTermPostings(
         error.NotFound => return,
         else => return err,
     };
-    const tm = decodeTermMeta(meta_data);
+    const tm = try decodeTermMeta(meta_data);
 
     var kept = std.ArrayListUnmanaged(RetainedChunk).empty;
     defer {
@@ -6821,10 +6909,8 @@ fn pruneTermPostings(
         txnDelete(txn, dbi, invChunkMetaKey(&meta_ck_buf, term_id, @intCast(ci))) catch {};
     }
 
-    var range_key_buf: [256]u8 = undefined;
     if (kept.items.len == 0) {
         txnDelete(txn, dbi, mk) catch {};
-        txnDelete(txn, dbi, termRangeKey(&range_key_buf, term_id)) catch {};
         return;
     }
 
@@ -6835,11 +6921,9 @@ fn pruneTermPostings(
         try txnPut(txn, dbi, invChunkMetaKey(&meta_ck_buf, term_id, @intCast(out_idx)), chunk.meta_bytes);
     }
 
-    const out_meta = encodeTermMeta(out_max_weight, @intCast(kept.items.len));
-    try txnPut(txn, dbi, mk, &out_meta);
-    const out_range_meta = try encodeChunkRangeMeta(alloc, out_min_doc_id.?, out_max_doc_id.?);
-    defer alloc.free(out_range_meta);
-    try txnPut(txn, dbi, termRangeKey(&range_key_buf, term_id), out_range_meta);
+    const out_meta = try encodeTermMeta(alloc, out_max_weight, @intCast(kept.items.len), out_min_doc_id.?, out_max_doc_id.?);
+    defer alloc.free(out_meta);
+    try txnPut(txn, dbi, mk, out_meta);
 }
 
 fn shouldKeepDocNumOutsideRange(
@@ -6879,7 +6963,7 @@ fn accumulateSplitPlanningStats(
         error.NotFound => return,
         else => return err,
     };
-    const tm = decodeTermMeta(meta_data);
+    const tm = try decodeTermMeta(meta_data);
 
     for (0..tm.chunk_count) |ci| {
         var ck_buf: [256]u8 = undefined;
