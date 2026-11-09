@@ -76,6 +76,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const privacy_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{ "privacy", "artifact publication upload", "ordered artifact inventory publication queue", "snappy", "lsm.table_file", "vector replay coalescing cancels and revives" } });
     const privacy_step = b.step("antfly-privacy-test", "Run privacy scan, evidence and transport fence contracts");
     privacy_step.dependOn(&b.addRunArtifact(privacy_tests).step);
+    const owner_readiness_transport_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{"privacy compact owner readiness transport"} });
+    b.step("cypher-owner-readiness-transport-test", "Verify compact selected-owner HTTP transport budgets and namespaces")
+        .dependOn(&b.addRunArtifact(owner_readiness_transport_tests).step);
     const public_api_parity_default_filters = [_][]const u8{
         "empty activation page validates source catalog without probing external parents",
         "SQL API cross-table MERGE retains both source and target range proofs",

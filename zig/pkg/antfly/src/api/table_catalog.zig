@@ -113,6 +113,7 @@ pub const CatalogSource = struct {
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         /// Fresh metadata barrier with a fixed-size result, independent of jobs.
+        owner_readiness: ?*const fn (*anyopaque, metadata_api.OwnerReadinessRequest, RoutingBudget) anyerror!metadata_api.OwnerReadiness = null,
         privacy_policy_binding: ?*const fn (*anyopaque, []const u8, ?u64) anyerror!metadata_api.PrivacyPolicyBinding = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         /// Request-scoped route capabilities may pin DB identity through this
@@ -224,6 +225,7 @@ pub const CatalogSource = struct {
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
+                .owner_readiness = metadataServiceOwnerReadiness,
                 .privacy_policy_binding = metadataServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServiceWaitForRoutingChange,
@@ -247,6 +249,7 @@ pub const CatalogSource = struct {
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
+                .owner_readiness = metadataHttpServiceOwnerReadiness,
                 .privacy_policy_binding = metadataHttpServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
@@ -270,6 +273,7 @@ pub const CatalogSource = struct {
                 .table_routing_snapshot = metadataServerTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServerLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServerLinearizableTableRoutingSnapshot,
+                .owner_readiness = metadataServerOwnerReadiness,
                 .privacy_policy_binding = metadataServerPrivacyPolicyBinding,
                 .free_routing_snapshot = metadataServerFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServerWaitForRoutingChange,
@@ -1820,6 +1824,27 @@ fn rangeGroupBelongsToTable(ranges: []const metadata_table_manager.RangeRecord, 
     return false;
 }
 
+/// Foreign adapters retain a selected-owner compatibility check. First-party
+/// sources implement the compact capability and never request admin snapshots.
+pub fn validateOwnerReadiness(_: std.mem.Allocator, catalog: CatalogSource, request: metadata_api.OwnerReadinessRequest, budget: RoutingBudget) !void {
+    try budget.checkpoint();
+    if (catalog.vtable.owner_readiness) |capture| {
+        if (!(try capture(catalog.ptr, request, budget)).ready) return error.DocIdentityNamespaceMismatch;
+    } else {
+        var snapshot = try catalog.adminSnapshot();
+        defer catalog.freeAdminSnapshot(&snapshot);
+        for (request.owners) |owner| {
+            try budget.checkpoint();
+            const range = findRangeForTableGroup(snapshot.ranges, request.table_id, owner.group_id) orelse return error.DocIdentityNamespaceMismatch;
+            if (metadata_table_manager.rangeDocIdentityShardId(range) != owner.shard_id or metadata_table_manager.rangeDocIdentityRangeId(range) != owner.range_id) return error.DocIdentityNamespaceMismatch;
+            if (findMergedGroupStatus(snapshot.merged_group_statuses, owner.group_id)) |status| {
+                if (!ownerIdentityReady(status, range)) return error.DocIdentityNamespaceMismatch;
+            }
+        }
+    }
+    try budget.checkpoint();
+}
+
 pub fn validateDocIdentityReadyForTable(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,
@@ -2919,6 +2944,11 @@ fn metadataServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: 
     return try svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
 }
 
+fn metadataServiceOwnerReadiness(ptr: *anyopaque, request: metadata_api.OwnerReadinessRequest, budget: RoutingBudget) !metadata_api.OwnerReadiness {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return svc.ownerReadiness(request, budget);
+}
+
 fn metadataServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
@@ -3012,6 +3042,11 @@ fn metadataHttpServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_na
         else => return err,
     };
     return try svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
+}
+
+fn metadataHttpServiceOwnerReadiness(ptr: *anyopaque, request: metadata_api.OwnerReadinessRequest, budget: RoutingBudget) !metadata_api.OwnerReadiness {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return svc.ownerReadiness(request, budget);
 }
 
 fn metadataHttpServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
@@ -3109,6 +3144,11 @@ fn metadataServerLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: [
     return try srv.svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
 }
 
+fn metadataServerOwnerReadiness(ptr: *anyopaque, request: metadata_api.OwnerReadinessRequest, budget: RoutingBudget) !metadata_api.OwnerReadiness {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return srv.svc.ownerReadiness(request, budget);
+}
+
 fn metadataServerPrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     srv.svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
@@ -3204,6 +3244,10 @@ fn runtimeDocIdentityCanAcceptNamespace(
     return stats.namespace_table_id == namespace_table_id and
         stats.namespace_shard_id == namespace_shard_id and
         stats.namespace_range_id == namespace_range_id;
+}
+
+pub fn ownerIdentityReady(status: metadata_reconciler.MergedGroupStatus, range: metadata_table_manager.RangeRecord) bool {
+    return !status.doc_identity_reassignment_active and !status.doc_identity_namespace_conflict and !status.doc_identity.rebuild_required and runtimeDocIdentityMatchesRange(status.doc_identity, range);
 }
 
 fn runtimeDocIdentityMatchesRange(

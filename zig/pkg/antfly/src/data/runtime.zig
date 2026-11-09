@@ -26491,6 +26491,7 @@ const RemoteMetadataSource = struct {
                 .table_routing_snapshot = remoteTableRoutingSnapshot,
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = remoteLinearizableTableRoutingSnapshot,
+                .owner_readiness = remoteOwnerReadiness,
                 .privacy_policy_binding = remotePrivacyPolicyBinding,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .wait_for_routing_change = remoteWaitForRoutingChange,
@@ -27481,6 +27482,38 @@ const RemoteMetadataSource = struct {
     fn remoteTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         return try self.remoteTableRoutingSnapshotWithMode(table_name, deadline_ns, false);
+    }
+
+    fn remoteOwnerReadiness(ptr: *anyopaque, input: antfly.metadata_api.OwnerReadinessRequest, routing_budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.OwnerReadiness {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        try routing_budget.checkpoint();
+        const deadline_ns = routing_budget.deadline_ns;
+        const outer_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| .{ .deadline_ns = deadline, .io = self.io } else null;
+        var last_err: anyerror = error.MissingMetadataApi;
+        for (0..self.base_uris.len) |attempt| {
+            try routing_budget.checkpoint();
+            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+            const index = self.metadataReadApiIndexForAttempt(attempt);
+            const budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| .{ .deadline_ns = catalogRoutingAttemptDeadline(self.awakeNs(), deadline, self.base_uris.len - attempt), .io = self.io } else null;
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var client = self.metadataClient(arena.allocator());
+            var parsed = client.fetchOwnerReadiness(self.base_uris[index], input, budget) catch |err| {
+                last_err = if (err == error.UnsupportedOperation) error.StorageReadTemporarilyUnavailable else normalizeCatalogRoutingSnapshotError(err);
+                continue;
+            };
+            defer parsed.deinit();
+            try routing_budget.checkpoint();
+            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+            self.acceptMetadataIdentityWithBudget(parsed.value.metadata_group_id, parsed.value.metadata_incarnation, budget) catch |err| {
+                last_err = err;
+                continue;
+            };
+            self.noteMetadataReadSuccess(index);
+            return parsed.value;
+        }
+        ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+        return last_err;
     }
 
     fn remotePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {

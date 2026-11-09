@@ -25,8 +25,27 @@ const A = std.mem.Allocator;
 pub const max_keys = 4096;
 pub const Options = struct {
     max_work: usize = 65536,
+    budget: ?*Budget = null,
     checkpoint: ?struct { ptr: *const anyopaque, call: *const fn (*const anyopaque) anyerror!void } = null,
 };
+/// Invocation-wide proof and union work. Exhaustion falls back to full domains;
+/// cancellation remains an error and must never be converted to a fallback.
+pub const Budget = struct {
+    remaining: usize = 65536,
+    checkpoint: ?struct { ptr: *const anyopaque, call: *const fn (*const anyopaque) anyerror!void } = null,
+    pub fn spend(self: *Budget, amount: usize) !bool {
+        if (self.checkpoint) |check| {
+            if (amount >= 256 or self.remaining / 256 != (self.remaining -| amount) / 256 or self.remaining == 0) try check.call(check.ptr);
+        }
+        if (amount > self.remaining) {
+            self.remaining = 0;
+            return false;
+        }
+        self.remaining -= amount;
+        return true;
+    }
+};
+
 /// Keys are an unordered physical identity set, never a row ordering promise.
 pub const Domain = struct { table: []const u8, keys: ?[]const []const u8 };
 pub const Plan = struct {
@@ -58,6 +77,10 @@ const Builder = struct {
         if (self.options.checkpoint) |check| {
             if (self.remaining == self.options.max_work or amount / 256 != 0 or self.remaining / 256 != (self.remaining -| amount) / 256) try check.call(check.ptr);
         }
+        if (self.options.budget) |budget| if (!try budget.spend(amount)) {
+            self.exhausted = true;
+            return false;
+        };
         if (amount > self.remaining) {
             self.exhausted = true;
             return false;
@@ -571,4 +594,24 @@ test "point domain materialization meters physical fanout and cancels key hashin
     var builder: Builder = .{ .a = a, .graph = graph, .parameters = parameters, .remaining = 65536, .options = .{ .checkpoint = .{ .ptr = &guard, .call = Guard.check } } };
     try std.testing.expectError(error.Canceled, builder.add("docs", keys));
     try std.testing.expectEqual(@as(usize, 2), guard.calls);
+}
+
+test "point domains share one invocation budget across plans and union work" {
+    const compiler = @import("compiler.zig");
+    var diagnostic: compiler.Diagnostic = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "MATCH(n:D) WHERE antfly.documentKey(n)=$key RETURN n", .{}, &diagnostic);
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} };
+    const parameters = &.{v.Entry{ .name = "key", .value = .{ .string = "a" } }};
+    var budget: Budget = .{};
+    const first = try plan(arena.allocator(), graph, compiled.query, parameters, .{ .budget = &budget });
+    try std.testing.expect(first.table("docs").?.keys != null);
+    const used = 65536 - budget.remaining;
+    budget.remaining = used - 1;
+    const second = try plan(arena.allocator(), graph, compiled.query, parameters, .{ .budget = &budget });
+    try std.testing.expect(second.table("docs").?.keys == null);
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining);
+    try std.testing.expect(!try budget.spend(1));
 }

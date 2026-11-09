@@ -24,7 +24,10 @@ const port = local.storage_statement_read_fence;
 
 pub const WriteOutcome = enum { not_started, aborted, committed, unknown };
 pub fn readDomains(a: std.mem.Allocator, graph: cypher.catalog.Graph, query: cypher.ast.Query, parameters: []const cypher.value.Entry, context: operation.RequestContext) !cypher.read_domains.Plan {
-    return cypher.read_domains.plan(a, graph, query, parameters, .{ .checkpoint = .{ .ptr = &context, .call = struct {
+    return readDomainsWithBudget(a, graph, query, parameters, context, null);
+}
+pub fn readDomainsWithBudget(a: std.mem.Allocator, graph: cypher.catalog.Graph, query: cypher.ast.Query, parameters: []const cypher.value.Entry, context: operation.RequestContext, budget: ?*cypher.read_domains.Budget) !cypher.read_domains.Plan {
+    return cypher.read_domains.plan(a, graph, query, parameters, .{ .budget = budget, .checkpoint = .{ .ptr = &context, .call = struct {
         fn check(ptr: *const anyopaque) !void {
             const current: *const operation.RequestContext = @ptrCast(@alignCast(ptr));
             try current.ensureActive();

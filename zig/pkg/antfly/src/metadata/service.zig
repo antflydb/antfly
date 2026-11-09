@@ -5902,6 +5902,70 @@ fn reconcileLeaseCacheNextRefreshAtMs(
         now_ms;
 }
 
+// Merge inventory is indexed once per transition publication, independently
+// of query arrival and tenant/range count. Queries observe only selected owners.
+const OwnerTransitionIndex = struct {
+    mutex: std.Io.Mutex = .init,
+    epoch: ?u64 = null,
+    groups: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(Check)) = .empty,
+    const Check = struct { id: u64, reassignment: bool };
+    fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        var values = self.groups.valueIterator();
+        while (values.next()) |value| value.deinit(a);
+        self.groups.deinit(a);
+        self.epoch = null;
+    }
+    fn select(self: *@This(), service: anytype, request: metadata_api.OwnerReadinessRequest, budget: @import("../api/table_catalog.zig").RoutingBudget) ![]Check {
+        const a = service.alloc;
+        while (!self.mutex.tryLock()) {
+            try budget.checkpoint();
+            try budget.sleepNs(std.time.ns_per_ms);
+        }
+        defer self.mutex.unlock(std.Options.debug_io);
+        try budget.checkpoint();
+        const epoch = service.transition_epoch.load(.acquire);
+        if (self.epoch == null or self.epoch.? != epoch) {
+            var next: OwnerTransitionIndex = .{};
+            errdefer next.deinit(a);
+            const records = try service.listProjectedMergeTransitions(a);
+            defer service.freeProjectedMergeTransitions(a, records);
+            for (records) |record| {
+                try budget.checkpoint();
+                if (record.phase == .finalized or record.phase == .rolled_back) continue;
+                for ([_]u64{ record.donor_group_id, record.receiver_group_id }) |id| {
+                    const slot = try next.groups.getOrPut(a, id);
+                    if (!slot.found_existing) slot.value_ptr.* = .empty;
+                    try slot.value_ptr.append(a, .{ .id = record.transition_id, .reassignment = record.allow_doc_identity_reassignment });
+                }
+            }
+            if (epoch != service.transition_epoch.load(.acquire)) return error.TopologyChanged;
+            self.deinit(a);
+            self.groups = next.groups;
+            self.epoch = epoch;
+        }
+        var selected: std.ArrayListUnmanaged(Check) = .empty;
+        errdefer selected.deinit(a);
+        for (request.owners) |owner| {
+            try budget.checkpoint();
+            if (self.groups.get(owner.group_id)) |checks| try selected.appendSlice(a, checks.items);
+        }
+        return selected.toOwnedSlice(a);
+    }
+};
+
+fn selectedOwnersAllowIdentityRead(service: anytype, request: metadata_api.OwnerReadinessRequest, budget: @import("../api/table_catalog.zig").RoutingBudget) !bool {
+    const checks = try service.owner_transition_index.select(service, request, budget);
+    defer service.alloc.free(checks);
+    for (checks) |check| {
+        try budget.checkpoint();
+        if (check.reassignment) return false;
+        if (try service.observeMergeTransition(check.id)) |observation| {
+            if ((observation.donor.allow_doc_identity_reassignment or observation.receiver.allow_doc_identity_reassignment)) return false;
+        }
+    }
+    return true;
+}
+
 pub const MetadataService = struct {
     online_merge_runtime: ?@import("online_merge_driver.zig").Runtime = null,
     alloc: std.mem.Allocator,
@@ -5955,6 +6019,7 @@ pub const MetadataService = struct {
     catalog_mutation_mutex: std.Io.RwLock = .init,
     table_catalog_mutation_lanes: [table_catalog_mutation_lane_count]std.Io.Mutex = @splat(.init),
     catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader = .{},
+    owner_transition_index: OwnerTransitionIndex = .{},
     local_group_status_provider: ?LocalGroupStatusProvider = null,
     local_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     routed_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
@@ -6060,6 +6125,7 @@ pub const MetadataService = struct {
         self.raft.deinit();
         self.embedding_activity_cache.deinit(self.alloc);
         self.catalog_projection_reader.deinit(self.alloc);
+        self.owner_transition_index.deinit(self.alloc);
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
         self.lifecycle_signal.deinit();
@@ -7757,6 +7823,19 @@ pub const MetadataService = struct {
         );
     }
 
+    pub fn ownerReadiness(self: *MetadataService, request: metadata_api.OwnerReadinessRequest, budget: @import("../api/table_catalog.zig").RoutingBudget) !metadata_api.OwnerReadiness {
+        try budget.checkpoint();
+        try self.ensureLinearizableReadWithContext(.{ .deadline_ns = budget.deadline_ns, .deadline_io = budget.io, .cancellation = budget.cancellation });
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const allowed = try selectedOwnersAllowIdentityRead(self, request, budget);
+        var result = try store.ownerReadiness(self.alloc, self.metadata_group_id, request, budget);
+        result.ready = result.ready and allowed;
+        result.metadata_group_id = self.metadata_group_id;
+        result.metadata_incarnation = try self.metadataIncarnation();
+        try budget.checkpoint();
+        return result;
+    }
+
     pub fn privacyPolicyBinding(self: *MetadataService, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
         return self.catalog_projection_reader.privacyPolicyBinding(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), table_name, deadline_ns);
     }
@@ -8712,6 +8791,7 @@ pub const MetadataHttpService = struct {
     lifecycle_listener_registration: ?metadata_storage.raft_apply_store.LifecycleListenerRegistration = null,
     embedding_activity_cache: EmbeddingActivityCache = .{},
     catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader = .{},
+    owner_transition_index: OwnerTransitionIndex = .{},
     cdc_write_source_override: ?api_table_writes.TableWriteSource = null,
     local_group_status_provider: ?LocalGroupStatusProvider = null,
     local_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
@@ -8855,6 +8935,7 @@ pub const MetadataHttpService = struct {
         self.raft.deinit();
         self.embedding_activity_cache.deinit(self.alloc);
         self.catalog_projection_reader.deinit(self.alloc);
+        self.owner_transition_index.deinit(self.alloc);
         self.projected_core_snapshot_cache.deinit(self.alloc);
         self.projected_component_snapshot_cache.deinit(self.alloc);
         self.transition_readiness_cache.deinit(self.alloc);
@@ -11825,6 +11906,19 @@ pub const MetadataHttpService = struct {
             self.catalogProjectionSource(),
             deadline_ns,
         );
+    }
+
+    pub fn ownerReadiness(self: *MetadataHttpService, request: metadata_api.OwnerReadinessRequest, budget: @import("../api/table_catalog.zig").RoutingBudget) !metadata_api.OwnerReadiness {
+        try budget.checkpoint();
+        try self.ensureLinearizableReadWithContext(.{ .deadline_ns = budget.deadline_ns, .deadline_io = budget.io, .cancellation = budget.cancellation });
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const allowed = try selectedOwnersAllowIdentityRead(self, request, budget);
+        var result = try store.ownerReadiness(self.alloc, self.metadata_group_id, request, budget);
+        result.ready = result.ready and allowed;
+        result.metadata_group_id = self.metadata_group_id;
+        result.metadata_incarnation = try self.metadataIncarnation();
+        try budget.checkpoint();
+        return result;
     }
 
     pub fn privacyPolicyBinding(self: *MetadataHttpService, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
@@ -23617,4 +23711,38 @@ test "metadata.lake combined table features retain the highest decoder floor" {
         table.lake_index_catalog_json = "";
         try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = before, .replacement = table } }));
     }
+}
+
+test "selected owner readiness transition index reuses publications and isolates owners" {
+    const Fake = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
+        transition_epoch: std.atomic.Value(u64) = .init(1),
+        calls: usize = 0,
+        records: [1]transition_state.MergeTransitionRecord = .{.{ .transition_id = 9, .donor_group_id = 3, .receiver_group_id = 4, .allow_doc_identity_reassignment = true }},
+        pub fn listProjectedMergeTransitions(self: *@This(), _: std.mem.Allocator) ![]transition_state.MergeTransitionRecord {
+            self.calls += 1;
+            return &self.records;
+        }
+        pub fn freeProjectedMergeTransitions(_: *@This(), _: std.mem.Allocator, _: []transition_state.MergeTransitionRecord) void {}
+    };
+    var fake: Fake = .{};
+    var index: OwnerTransitionIndex = .{};
+    defer index.deinit(fake.alloc);
+    const request: metadata_api.OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{.{ .group_id = 1, .shard_id = 1, .range_id = 1 }} };
+    for (0..3) |_| {
+        const checks = try index.select(&fake, request, .{});
+        defer fake.alloc.free(checks);
+        try std.testing.expectEqual(@as(usize, 0), checks.len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    const checks = try index.select(&fake, .{ .table_id = 7, .owners = &.{.{ .group_id = 3, .shard_id = 3, .range_id = 3 }} }, .{});
+    defer fake.alloc.free(checks);
+    try std.testing.expectEqual(@as(usize, 1), checks.len);
+    try std.testing.expect(checks[0].reassignment);
+    fake.records[0].phase = .finalized;
+    _ = fake.transition_epoch.fetchAdd(1, .release);
+    const finalized = try index.select(&fake, request, .{});
+    defer fake.alloc.free(finalized);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, index.select(&fake, request, .{ .deadline_ns = 0 }));
 }

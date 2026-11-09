@@ -29,6 +29,46 @@ test {
     _ = @import("sql_memory_owner.zig");
 }
 
+// Parsed syntax equality excludes diagnostic positions and is charged to the
+// invocation budget. Binding types are checked separately before proof reuse.
+fn sameGraphSyntax(comptime T: type, left: T, right: T, budget: *@import("cypher").read_domains.Budget) anyerror!bool {
+    if (!try budget.spend(1)) return false;
+    return switch (@typeInfo(T)) {
+        .@"struct" => blk: {
+            inline for (@typeInfo(T).@"struct".field_names) |name| {
+                if (comptime !std.mem.eql(u8, name, "span") and !(T == @import("cypher").ast.Query and std.mem.eql(u8, name, "source"))) {
+                    if (!try sameGraphSyntax(@FieldType(T, name), @field(left, name), @field(right, name), budget)) break :blk false;
+                }
+            }
+            break :blk true;
+        },
+        .@"union" => blk: {
+            if (std.meta.activeTag(left) != std.meta.activeTag(right)) break :blk false;
+            inline for (@typeInfo(T).@"union".field_names) |name| {
+                if (std.meta.activeTag(left) == @field(std.meta.Tag(T), name))
+                    break :blk try sameGraphSyntax(@FieldType(T, name), @field(left, name), @field(right, name), budget);
+            }
+            unreachable;
+        },
+        .pointer => |pointer| switch (pointer.size) {
+            .one => try sameGraphSyntax(pointer.child, left.*, right.*, budget),
+            .slice => blk: {
+                if (left.len != right.len) break :blk false;
+                for (left, right) |l, r| if (!try sameGraphSyntax(pointer.child, l, r, budget)) break :blk false;
+                break :blk true;
+            },
+            else => @compileError("unsupported graph syntax pointer"),
+        },
+        .optional => if (left) |l| if (right) |r| try sameGraphSyntax(@typeInfo(T).optional.child, l, r, budget) else false else right == null,
+        .array => blk: {
+            for (left, right) |l, r| if (!try sameGraphSyntax(@typeInfo(T).array.child, l, r, budget)) break :blk false;
+            break :blk true;
+        },
+        .void => true,
+        else => left == right,
+    };
+}
+
 const SettingOverlaySource = enum { durable_session, connection };
 
 fn attachedSettingOverlay(source: SettingOverlaySource, caller: []const setting_catalog.OverlayEntry, durable: []const setting_catalog.OverlayEntry) ![]const setting_catalog.OverlayEntry {
@@ -2034,38 +2074,40 @@ pub const Adapter = struct {
         const client: *@import("cypher").rpc.Client = @ptrCast(@alignCast(ptr));
         return (try client.projectDocument(a, .{ .table = table, .key = key }, document, json_null_fields, false)).node != null;
     }
-    fn graphParametersForScan(self: *Adapter, a: std.mem.Allocator, binding: *const catalog.graph_relation.Binding, request: catalog.Scan) ![]const @import("cypher").value.Entry {
+    const GraphParameterKey = struct { index: usize, kind: ?ast.ColumnType };
+    const GraphParameterCache = std.AutoHashMapUnmanaged(GraphParameterKey, @import("cypher").value.Value);
+    fn graphParametersForScan(self: *Adapter, a: std.mem.Allocator, binding: *const catalog.graph_relation.Binding, request: catalog.Scan, cache: *GraphParameterCache) ![]const @import("cypher").value.Entry {
         const cypher = @import("cypher");
         const parameters = try a.alloc(cypher.value.Entry, binding.definition.parameters.len);
         for (binding.definition.parameters, parameters) |name, *parameter| {
             const index = std.fmt.parseUnsigned(usize, name, 10) catch return error.InvalidSqlParameters;
+            const cache_kind = if (index > 0 and index <= request.graph_parameter_types.len) request.graph_parameter_types[index - 1] else null;
+            const slot = try cache.getOrPut(a, .{ .index = index, .kind = cache_kind });
+            if (slot.found_existing) {
+                parameter.* = .{ .name = name, .value = slot.value_ptr.* };
+                continue;
+            }
             var value = try self.graphParameter(a, index);
             if (index <= request.graph_parameter_types.len) if (request.graph_parameter_types[index - 1]) |kind| {
-                if (value == .string) value = switch (kind) {
-                    .integer => .{ .integer = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidSqlParameters },
-                    .number => .{ .float = std.fmt.parseFloat(f64, value.string) catch return error.InvalidSqlParameters },
-                    .boolean => if (std.ascii.eqlIgnoreCase(value.string, "true")) .{ .bool = true } else if (std.ascii.eqlIgnoreCase(value.string, "false")) .{ .bool = false } else return error.InvalidSqlParameters,
-                    else => value,
-                };
+                if (value == .string) {
+                    const text = value.string;
+                    value = switch (kind) {
+                        .integer => .{ .integer = std.fmt.parseInt(i64, text, 10) catch return error.InvalidSqlParameters },
+                        .number => .{ .float = std.fmt.parseFloat(f64, text) catch return error.InvalidSqlParameters },
+                        .boolean => if (std.ascii.eqlIgnoreCase(text, "true")) .{ .bool = true } else if (std.ascii.eqlIgnoreCase(text, "false")) .{ .bool = false } else return error.InvalidSqlParameters,
+                        else => value,
+                    };
+                }
             };
-            parameter.* = .{ .name = name, .value = try cypher.value.Value.fromJson(a, value) };
+            slot.value_ptr.* = try cypher.value.Value.fromJson(a, value);
+            parameter.* = .{ .name = name, .value = slot.value_ptr.* };
         }
         return parameters;
     }
-    /// Determine which physical tables can receive staged graph projection.
+    /// Projection and cohort planning use the same physical read dependencies.
     fn graphReadsTable(graph: @import("cypher").catalog.Graph, needed: ?[]const []const u8, table: []const u8) bool {
         if (!@import("cypher").dependencies.contains(needed, table)) return false;
         for (graph.labels) |label| if (std.mem.eql(u8, label.table, table)) return true;
-        return false;
-    }
-    fn hasStagedGraphWrites(self: *const Adapter, graph: @import("cypher").catalog.Graph, needed: ?[]const []const u8) bool {
-        const staged = self.staged orelse return false;
-        for (staged.tables) |entry| {
-            const batch = entry.batch;
-            if (batch.writes.len == 0 and batch.deletes.len == 0 and batch.graph_writes.len == 0 and batch.graph_deletes.len == 0) continue;
-            const physical = staged.physicalName(entry.table_name);
-            if (graphReadsTable(graph, needed, physical)) return true;
-        }
         return false;
     }
     fn openGraphStatement(self: *Adapter, a: std.mem.Allocator, requests: []const catalog.StatementScan) !catalog.StatementRead {
@@ -2088,9 +2130,7 @@ pub const Adapter = struct {
         const owned = arena.allocator();
         const needed_rows = try owned.alloc(?[]const []const u8, requests.len);
         for (requests, needed_rows) |request, *needed| needed.* = if (request.table.graph) |binding| try cypher.dependencies.required(owned, binding.definition.query, binding.graph) else null;
-        const prune_cohort = self.range_reads == null and for (requests, needed_rows) |request, needed| {
-            if (request.table.graph) |binding| if (self.hasStagedGraphWrites(binding.graph, needed)) break false;
-        } else true;
+        const prune_cohort = self.range_reads == null;
         var records: std.ArrayList(system_catalog.Resource) = .empty;
         for (requests) |request| if (request.table.graph) |binding| {
             var duplicate = false;
@@ -2126,13 +2166,31 @@ pub const Adapter = struct {
         // each graph cursor. A prepared SQL query never stores bound domains.
         const parameter_rows = try owned.alloc([]const cypher.value.Entry, requests.len);
         const domain_plans = try owned.alloc(?cypher.read_domains.Plan, requests.len);
-        for (requests, parameter_rows, domain_plans) |request, *parameters, *domains| {
+        var parameter_cache: GraphParameterCache = .empty;
+        var proof_budget: cypher.read_domains.Budget = .{ .checkpoint = .{ .ptr = &self.context, .call = struct {
+            fn check(ptr: *const anyopaque) !void {
+                const context: *const operation.RequestContext = @ptrCast(@alignCast(ptr));
+                try context.ensureActive();
+            }
+        }.check } };
+        for (requests, parameter_rows, domain_plans, 0..) |request, *parameters, *domains, request_index| {
             parameters.* = &.{};
             domains.* = null;
             if (request.table.graph) |binding| {
                 try self.verify(owned, request.table);
-                parameters.* = try self.graphParametersForScan(owned, binding, request.request);
-                if (prune_cohort) domains.* = try @import("graph_execution.zig").readDomains(owned, binding.graph, binding.definition.query, parameters.*, self.context);
+                parameters.* = try self.graphParametersForScan(owned, binding, request.request, &parameter_cache);
+                if (prune_cohort) {
+                    for (requests[0..request_index], domain_plans[0..request_index]) |prior, prior_plan| {
+                        const previous = prior.table.graph orelse continue;
+                        if (prior_plan == null or previous.graph.incarnation != binding.graph.incarnation or previous.graph.revision != binding.graph.revision) continue;
+                        if (!std.mem.eql(?ast.ColumnType, prior.request.graph_parameter_types, request.request.graph_parameter_types)) continue;
+                        if (try sameGraphSyntax(cypher.ast.Query, previous.definition.query, binding.definition.query, &proof_budget)) {
+                            domains.* = prior_plan;
+                            break;
+                        }
+                    }
+                    if (domains.* == null) domains.* = try @import("graph_execution.zig").readDomainsWithBudget(owned, binding.graph, binding.definition.query, parameters.*, self.context, &proof_budget);
+                }
             }
         }
         const inputs = try owned.alloc(port.GraphTable, tables.items.len);
@@ -2153,11 +2211,17 @@ pub const Adapter = struct {
                 }
                 selected = unioned.items;
             }
-            input.indexes = if (prune_cohort) selected else null;
-            if (prune_cohort) {
+            const staged_table = if (self.staged) |staged| for (staged.tables) |entry| {
+                const batch = entry.batch;
+                if (std.mem.eql(u8, staged.physicalName(entry.table_name), input.name) and
+                    (batch.writes.len != 0 or batch.deletes.len != 0 or batch.graph_writes.len != 0 or batch.graph_deletes.len != 0)) break true;
+            } else false else false;
+            input.indexes = if (prune_cohort and !staged_table) selected else null;
+            if (prune_cohort and !staged_table) {
                 var keys: std.StringHashMapUnmanaged(void) = .empty;
                 var full = false;
                 var observed = false;
+                var seen_domains: std.AutoHashMapUnmanaged(usize, void) = .empty;
                 for (requests, domain_plans) |request, domains| {
                     if (request.table.graph == null) {
                         if (request.table.id == input.table_id) full = true;
@@ -2170,7 +2234,16 @@ pub const Adapter = struct {
                             full = true;
                             break;
                         }
-                        for (d.keys.?) |key| try keys.put(owned, key, {});
+                        const seen = try seen_domains.getOrPut(owned, @intFromPtr(d.keys.?.ptr));
+                        if (seen.found_existing) continue;
+                        for (d.keys.?) |key| {
+                            if (!try proof_budget.spend(1 + key.len / 64)) {
+                                full = true;
+                                break;
+                            }
+                            try keys.put(owned, key, {});
+                        }
+                        if (full) break;
                         if (keys.count() > cypher.read_domains.max_keys) {
                             full = true;
                             break;
@@ -2180,8 +2253,14 @@ pub const Adapter = struct {
                 if (observed and !full and keys.count() != 0) {
                     const names = try owned.alloc([]const u8, keys.count());
                     var iterator = keys.keyIterator();
-                    for (names) |*name| name.* = iterator.next().?.*;
-                    input.keys = names;
+                    for (names) |*name| {
+                        if (!try proof_budget.spend(1)) {
+                            full = true;
+                            break;
+                        }
+                        name.* = iterator.next().?.*;
+                    }
+                    if (!full) input.keys = names;
                 }
             }
         }
@@ -4510,6 +4589,7 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
     const port = @import("antfly_local_sources").storage_statement_read_fence;
     const Fake = struct {
         const Self = @This();
+        mixed: bool = false,
         captures: usize = 0,
         points: bool = false,
         expect_full_overlay: bool = false,
@@ -4577,6 +4657,20 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
         fn open(ptr: *anyopaque, a: std.mem.Allocator, input: port.GraphStatement) !port.GraphRead {
             const self: *Self = @ptrCast(@alignCast(ptr));
             try std.testing.expect(input.partial_graph);
+            if (self.mixed) {
+                try std.testing.expectEqual(@as(usize, 2), input.tables.len);
+                for (input.tables) |table| {
+                    if (std.mem.eql(u8, table.name, "docs")) {
+                        try std.testing.expectEqual(@as(usize, 1), table.keys.?.len);
+                        try std.testing.expectEqualStrings("a", table.keys.?[0]);
+                        try std.testing.expectEqual(@as(usize, 0), table.indexes.?.len);
+                    } else {
+                        try std.testing.expectEqualStrings("other", table.name);
+                        try std.testing.expect(table.keys == null and table.indexes == null);
+                    }
+                }
+                return error.CypherObservationsUnavailable;
+            }
             try std.testing.expectEqual(@as(usize, 1), input.tables.len);
             try std.testing.expectEqualStrings("docs", input.tables[0].name);
             if (self.expect_full_overlay) {
@@ -4664,6 +4758,12 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
     }
     try std.testing.expectEqual(@as(usize, 6), fake.captures);
     try std.testing.expectEqual(fake.captures, fake.releases);
+    staged_tables[0].table_name = @constCast("other");
+    staged_tables[0].batch.deletes = &deletes;
+    fake.mixed = true;
+    var mixed = try @import("antfly_local_sources").sql_compiler.compile(a, "SELECT g.key,h.key FROM GRAPH_TABLE(knowledge MATCH(n IS Document) WHERE antfly.documentKey(n)=$1 COLUMNS(antfly.documentKey(n) AS key)) g JOIN GRAPH_TABLE(knowledge MATCH(n IS Unused) WHERE antfly.documentKey(n)=$1 COLUMNS(antfly.documentKey(n) AS key)) h ON true", .{});
+    defer mixed.deinit();
+    try std.testing.expectError(error.CypherObservationsUnavailable, adapter.execute(a, &mixed, &.{.{ .string = "a" }}, .{}, null));
 }
 
 test "SQL pgwire native graph arguments borrow scalars without materializing unrelated parameters" {
@@ -4790,4 +4890,35 @@ test "lake SQL GRAPH_TABLE guards ordinary joined table privileges before metada
     // Denial must precede catalog access. Graph grants cannot authorize an
     // ordinary SQL table through the shared statement authority channel.
     try std.testing.expectError(error.Forbidden, Adapter.GraphStatement.validateCatalog(&statement, std.testing.allocator));
+}
+
+test "lake SQL GRAPH_TABLE shared graph joins reuse typed bindings and bounded syntax proofs" {
+    const cypher = @import("cypher");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var adapter: Adapter = undefined;
+    adapter.graph_parameters = &.{.{ .string = "42" }};
+    adapter.graph_parameter_cells = null;
+    var binding: catalog.graph_relation.Binding = undefined;
+    binding.definition.parameters = &.{"1"};
+    var cache: Adapter.GraphParameterCache = .empty;
+    const first = try adapter.graphParametersForScan(a, &binding, .{ .fields = &.{}, .limit = 1 }, &cache);
+    const again = try adapter.graphParametersForScan(a, &binding, .{ .fields = &.{}, .limit = 1 }, &cache);
+    try std.testing.expectEqual(first[0].value.string.ptr, again[0].value.string.ptr);
+    const typed = try adapter.graphParametersForScan(a, &binding, .{ .graph_parameter_types = &.{.integer}, .fields = &.{}, .limit = 1 }, &cache);
+    try std.testing.expectEqual(@as(i64, 42), typed[0].value.integer);
+    try std.testing.expectEqual(@as(usize, 2), cache.count());
+    var graph_diagnostic: cypher.compiler.Diagnostic = .{};
+    var one = try cypher.compiler.compile(a, "MATCH(n:D) WHERE antfly.documentKey(n)=$1 RETURN n", .{}, &graph_diagnostic);
+    defer one.deinit();
+    var two = try cypher.compiler.compile(a, "  MATCH (n:D) WHERE antfly.documentKey(n) = $1 RETURN n", .{}, &graph_diagnostic);
+    defer two.deinit();
+    var different = try cypher.compiler.compile(a, "MATCH(n:D) WHERE antfly.documentKey(n)=$2 RETURN n", .{}, &graph_diagnostic);
+    defer different.deinit();
+    var budget: cypher.read_domains.Budget = .{};
+    try std.testing.expect(try sameGraphSyntax(cypher.ast.Query, one.query, two.query, &budget));
+    try std.testing.expect(!try sameGraphSyntax(cypher.ast.Query, one.query, different.query, &budget));
+    budget.remaining = 0;
+    try std.testing.expect(!try sameGraphSyntax(cypher.ast.Query, one.query, one.query, &budget));
 }

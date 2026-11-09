@@ -1088,6 +1088,7 @@ const LocalStandaloneMetadata = struct {
                 .linearizable_routing_snapshot = catalogRoutingSnapshot,
                 .table_routing_snapshot = catalogTableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = catalogTableRoutingSnapshot,
+                .owner_readiness = catalogOwnerReadiness,
                 .privacy_policy_binding = catalogPrivacyPolicyBinding,
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .wait_for_routing_change = catalogWaitForRoutingChange,
@@ -2068,6 +2069,18 @@ const LocalStandaloneMetadata = struct {
         if (self.lifecycle_store) |store| if (try store.standaloneRevision() != self.durable_revision) try self.reloadLifecycleProjectionLocked();
 
         return self.routingSnapshotLocked(deadline_ns);
+    }
+
+    fn catalogOwnerReadiness(ptr: *anyopaque, request: antfly.metadata_api.OwnerReadinessRequest, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.OwnerReadiness {
+        try budget.checkpoint();
+        const generation = try acquireRoutingGeneration(ptr, budget.deadline_ns, true);
+        defer generation.release();
+        for (request.owners) |owner| {
+            const range = try generation.indexed.rangeForGroup(request.table_id, owner.group_id, budget);
+            if (antfly.metadata.table_manager.rangeDocIdentityShardId(range.*) != owner.shard_id or antfly.metadata.table_manager.rangeDocIdentityRangeId(range.*) != owner.range_id) return .{ .ready = false };
+        }
+        try budget.checkpoint();
+        return .{ .ready = true, .metadata_group_id = group_ids.main_metadata_group_id, .metadata_incarnation = generation.indexed.snapshot.value.metadata_incarnation };
     }
 
     fn catalogPrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {

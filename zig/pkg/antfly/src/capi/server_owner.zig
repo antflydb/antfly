@@ -2131,6 +2131,15 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.reportBaselineProgressForKey(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .owner_readiness => |input| {
+                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    const budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget = .{
+                        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+                        .cancellation = ownerQueryCancellation(&request.control),
+                    };
+                    const value = handle.store.ownerReadiness(a, group_id, input, budget) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .read_control_stores => |groups| {
                     const value = handle.store.readControlStores(a, group_id, groups) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

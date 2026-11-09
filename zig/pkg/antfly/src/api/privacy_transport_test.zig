@@ -452,3 +452,38 @@ test "privacy reply transport failures distinguish unsent requests from possible
         try std.testing.expectEqual(@as(usize, 1), fake.calls);
     };
 }
+
+test "privacy compact owner readiness transport bounds replies and preserves selected namespaces" {
+    const api = @import("../metadata/api.zig");
+    const Fake = struct {
+        status: u16 = 200,
+        malformed: bool = false,
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/catalog/owner-readiness"));
+            try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
+            var parsed = try std.json.parseFromSlice(api.OwnerReadinessRequest, a, request.body.?, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u64, 7), parsed.value.table_id);
+            try std.testing.expectEqual(@as(usize, 2), parsed.value.owners.len);
+            try std.testing.expectEqual(@as(u64, 71), parsed.value.owners[0].range_id);
+            return .{ .status = self.status, .body = if (self.malformed) try a.dupe(u8, "{}") else try std.json.Stringify.valueAlloc(a, api.OwnerReadiness{ .ready = true, .metadata_group_id = 9, .metadata_incarnation = @splat('1') }, .{}) };
+        }
+    };
+    const a = std.testing.allocator;
+    var fake: Fake = .{};
+    var client = @import("../metadata/http_client.zig").MetadataHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    const request: api.OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{ .{ .group_id = 1, .shard_id = 7, .range_id = 71 }, .{ .group_id = 2, .shard_id = 7, .range_id = 72 } } };
+    var result = try client.fetchOwnerReadiness("http://metadata", request, null);
+    defer result.deinit();
+    try std.testing.expect(result.value.ready);
+    fake.malformed = true;
+    try std.testing.expectError(error.MissingField, client.fetchOwnerReadiness("http://metadata", request, null));
+    fake.status = 404;
+    try std.testing.expectError(error.UnsupportedOperation, client.fetchOwnerReadiness("http://metadata", request, null));
+    const calls = fake.calls;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchOwnerReadiness("http://metadata", request, .{ .deadline_ns = 1 }));
+    try std.testing.expectEqual(calls, fake.calls);
+}

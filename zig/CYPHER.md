@@ -5929,3 +5929,24 @@ while distinct-table fanout remains budgeted. Regressions cover 4,096 wide keys,
 64 aliases, physical-table fanout and cancellation during key insertion. Borrowed
 range tests require zero lookup allocations with 1, 1,000 and 10,000 catalog
 tables and verify gaps, overlaps, invalid ranges and expired routing budgets.
+
+SQL graph relations share an invocation-owned typed parameter cache keyed by
+SQL slot and inferred type. Equivalent parsed graph syntax (ignoring diagnostic
+positions, preserving parameter slots and graph identity/revision) reuses its
+physical-domain proof. Analysis, syntax comparison, physical-key unions and
+materialization consume one statement budget; exhaustion conservatively retains
+full cohorts and cancellation remains an error. Reused domain sets are unioned
+only once per physical table. No bound value or proof survives the invocation.
+Staged writes disable key and index pruning only for their physical table;
+unrelated graph inputs retain pruning. Serializable range tracking continues to
+require the full cohort.
+
+Multi-owner graph capture checks selected owners through a compact metadata
+readiness capability, including the private HTTP transport. Requests pin table,
+group and document-identity namespaces from the routing generation. Metadata
+crosses its read barrier, reads selected report pages and placement prefixes,
+and verifies namespace/rebuild/conflict state without an administrative snapshot.
+Active merge transitions are indexed by owner once per transition publication;
+only selected transitions are observed for identity reassignment. Foreign
+catalog adapters retain a budgeted selected-owner compatibility check. Readiness
+never replaces the live topology, read-index or retained-capture fences.

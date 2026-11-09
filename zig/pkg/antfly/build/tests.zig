@@ -365,6 +365,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
     const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
+    const cypher_owner_readiness = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{"selected owner readiness"} });
+    const cypher_owner_readiness_step = b.step("cypher-owner-readiness-test", "Verify compact selected-owner report and namespace readiness");
+    cypher_owner_readiness_step.dependOn(&b.addRunArtifact(cypher_owner_readiness).step);
+    const cypher_owner_transitions = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"selected owner readiness transition index"} });
+    cypher_owner_readiness_step.dependOn(&b.addRunArtifact(cypher_owner_transitions).step);
     const cypher_metadata_frames = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{"metadata durable job state and transaction sessions retain distinct command frames"},
@@ -3234,7 +3239,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
     const cypher_capture_tests = b.addTest(.{
         .root_module = lake_integration_mod,
-        .filters = &.{ "external lake Cypher execution reads immutable native document and graph cuts", "statement cut cleanup protects readers and immediately frees admission", "lake SQL GRAPH_TABLE shared graph joins release every provider allocation", "graph statements bind privacy versions before capturing owners" },
+        .filters = &.{ "external lake Cypher execution reads immutable native document and graph cuts", "statement cut cleanup protects readers and immediately frees admission", "lake SQL GRAPH_TABLE shared graph joins", "graph statements bind privacy versions before capturing owners" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("cypher-native-capture-test", "Verify immutable materialization and native capture capabilities")

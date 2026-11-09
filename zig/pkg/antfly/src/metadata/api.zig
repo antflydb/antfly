@@ -310,6 +310,14 @@ pub const CatalogRoutingSnapshot = struct {
     ranges: []table_manager.RangeRecord,
 };
 
+/// Selected physical owners, bound to the same namespace as their routing cut.
+pub const OwnerReadinessRequest = struct {
+    table_id: u64,
+    owners: []const Owner,
+    pub const Owner = struct { group_id: u64, shard_id: u64, range_id: u64 };
+};
+pub const OwnerReadiness = struct { ready: bool, metadata_group_id: u64 = 0, metadata_incarnation: ?MetadataClusterIncarnation = null };
+
 /// Fixed-size authoritative privacy binding; no schema, producer or job bytes.
 /// Required fields make unsupported/malformed replies fail closed.
 pub const PrivacyPolicyBinding = struct {
