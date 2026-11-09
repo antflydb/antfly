@@ -232,6 +232,11 @@ final class CaptureConverter: @unchecked Sendable {
     format = output
     self.sink = sink
   }
+  /// Construct the tap outside Microphone's main-actor context. AVAudioEngine
+  /// calls it on its audio queue; an actor-inheriting closure traps on delivery.
+  nonisolated func makeTap() -> @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void {
+    { @Sendable [self] block, _ in append(block) }
+  }
   func append(_ input: AVAudioPCMBuffer) {
     let capacity =
       AVAudioFrameCount(ceil(Double(input.frameLength) * 16000 / input.format.sampleRate)) + 256
@@ -322,9 +327,7 @@ final class CaptureConverter: @unchecked Sendable {
     sampleRate = 16000
     let conversion = try CaptureConverter(input: format, sink: buffer)
     self.conversion = conversion
-    input.installTap(onBus: 0, bufferSize: 4096, format: format) { block, _ in
-      conversion.append(block)
-    }
+    input.installTap(onBus: 0, bufferSize: 4096, format: format, block: conversion.makeTap())
     tapped = true
     do {
       engine.prepare()

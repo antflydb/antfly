@@ -75,6 +75,20 @@ remains independent of build inclusion. `-Dapple-providers=false` disables OCR,
 transcription and generation together; `-Dapple-ocr` is no longer a separate knob.
 See the [Apple provider guide](docs/guides/providers/apple.mdx).
 
+## Independent dictation app releases
+
+The macOS dictation app has independent `dictation/vX.Y.Z` and
+`dictation/vX.Y.Z-{beta,rc}.N` tags. Its default-branch controller builds a
+Apple Silicon app with a pinned, released ARM64 Antfly runtime, without
+compiling the server or exposing credentials, then uses a protected `dictation-release`
+environment for Developer ID signing, notarization, and signed Sparkle updates.
+Publication consumes the exact signed artifact and advances stable/beta feeds
+on `releases.antfly.io/antfly-dictation` after immutable R2 downloads exist.
+App updates replace the bundled runtime but do not update user-selected external
+servers, model weights, or the repository-wide Latest release. See
+[dictation updates and release setup](examples/dictation/UPDATES.md).
+
+
 ## Release Artifacts
 
 The canonical Zig runtime artifacts are tarballs named:

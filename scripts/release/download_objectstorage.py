@@ -23,6 +23,8 @@ import json
 import os
 from pathlib import Path
 from typing import Protocol
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from verify_release_ledger import verify_payload
 
@@ -101,6 +103,36 @@ class S3Reader:
                     raise SystemExit("object-storage listing returned an invalid key")
                 names.add(key.removeprefix(prefix))
         return names
+
+
+class PublicReader:
+    def __init__(self, base_url: str, max_bytes: int = 256 * 1024) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.max_bytes = max_bytes
+
+    def read_optional(self, key: str) -> bytes | None:
+        if key.startswith("/") or ".." in key.split("/") or "\\" in key:
+            raise ValueError("Invalid public release object key")
+        try:
+            with urlopen(
+                Request(
+                    self.base_url + "/" + key,
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "User-Agent": "Antfly-Release/1.0",
+                    },
+                ),
+                timeout=30,
+            ) as response:
+                body = response.read(self.max_bytes + 1)
+        except HTTPError as exc:
+            if exc.code != 404:
+                raise
+            exc.close()
+            return None
+        if len(body) > self.max_bytes:
+            raise ValueError("Public release metadata exceeds its size limit")
+        return body
 
 
 class LocalReader:

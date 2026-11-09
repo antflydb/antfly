@@ -109,7 +109,13 @@ pub fn build(b: *std.Build) void {
                     b.step("cache-vopr-tests", "Exercise actual simulation test imports").dependOn(&b.addRunArtifact(artifact).step);
                     vopr_test_found = true;
                 }
-                if (std.mem.endsWith(u8, path.sub_path, "/template_test_root.zig")) template = artifact;
+                // The same source also has independently linked test objects.
+                // Only a complete test artifact is executable here; pointer-map
+                // iteration must never select an object file as the runner.
+                if (artifact.kind == .@"test" and std.mem.endsWith(u8, path.sub_path, "/template_test_root.zig")) {
+                    if (template != null) @panic("ambiguous runnable template suite");
+                    template = artifact;
+                }
             },
             else => {},
         };
@@ -156,6 +162,7 @@ pub fn build(b: *std.Build) void {
     template_tests.root_module.root_source_file = sources.add("template_test.zig",
         \\test "unit metadata is stable without a release object" {
         \\    try @import("std").testing.expectEqualStrings("test", @import("build_info").version());
+        \\    @import("std").debug.print("UNIT_METADATA_PROBE {s}\n", .{@import("build_info").version()});
         \\}
     );
     unit_tests.dependOn(&b.addRunArtifact(template_tests).step);
@@ -209,7 +216,9 @@ pub fn build(b: *std.Build) void {
                 "observabilityRevision(@import(\"cache_prometheus\")) ^ (observabilityRevision(@import(\"cache_structlog\")) << 8)"
         else if (unit == .distributed)
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @intFromBool(@import(\"cache_lite_capabilities\").capabilitiesForProfile(.native).local_inference_runtime) ^ ownerRevision(@import(\"raft_engine\"))"
-        else if (unit == .storage_kernel or unit == .local_query)
+        else if (unit == .local_query)
+            "@import(\"local_query_abi\").abi_version ^ ownerRevision(@import(\"local_query_abi\"))"
+        else if (unit == .storage_kernel)
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ ownerRevision(@import(\"raft_engine\"))"
         else
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\")";
@@ -286,6 +295,7 @@ pub fn build(b: *std.Build) void {
             return std.mem.lessThan(u8, config.stringSlice(a.sub_path), config.stringSlice(c.sub_path));
         }
     }.lessThan);
+    profiles.retainCacheTargets(b, "cache-probe");
 }
 
 fn inferenceIdentityPath(b: *std.Build, module: *std.Build.Module, seen: *std.AutoHashMap(*std.Build.Module, void), path: []const u8) ?[]const u8 {
@@ -344,12 +354,12 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
             std.debug.panic("{s} archive depends on simulation test support", .{@tagName(unit)});
         if (std.mem.eql(u8, name, "lmdb_engine"))
             std.debug.panic("{s} archive depends on disabled LMDB", .{@tagName(unit)});
-        if (unit != .distributed and unit != .storage_kernel and unit != .local_query and std.mem.eql(u8, name, "antfly_lite_options"))
+        if (unit != .distributed and unit != .storage_kernel and std.mem.eql(u8, name, "antfly_lite_options"))
             std.debug.panic("{s} archive depends on Lite capability settings", .{@tagName(unit)});
         if (unit != .api_kernel and (std.mem.eql(u8, name, "antfly_mcp") or std.mem.eql(u8, name, "antfly_a2a")))
             std.debug.panic("{s} archive depends on API protocol adapters", .{@tagName(unit)});
-        if (unit == .serverless and std.mem.eql(u8, name, "raft_engine"))
-            @panic("serverless archive depends on Raft");
+        if ((unit == .serverless or unit == .local_query) and std.mem.eql(u8, name, "raft_engine"))
+            std.debug.panic("{s} archive depends on Raft", .{@tagName(unit)});
         if (unit != .api_kernel and std.mem.eql(u8, name, "antfly_openapi_specs"))
             std.debug.panic("{s} archive depends on served schemas", .{@tagName(unit)});
         if (unit != .inference and (std.mem.eql(u8, name, "metal_jit_identity") or std.mem.eql(u8, name, "cuda_jit_identity")))
