@@ -250,10 +250,11 @@ pub fn scoreDocument(
         for (prepared_images.items) |*img| img.deinit();
         prepared_images.deinit(allocator);
     }
+    try prepared_images.ensureTotalCapacity(allocator, images.len);
     for (images, 0..) |img, index| {
         if (execution_control) |control|
             try control.update(.tokenizing, @intCast(index), @intCast(images.len));
-        try prepared_images.append(allocator, try qwen2vl.prepareImage(allocator, img, prep_cfg));
+        prepared_images.appendAssumeCapacity(try qwen2vl.prepareImage(allocator, img, prep_cfg));
     }
 
     var prepared_doc = try prepareDocumentPrompt(allocator, tok, prompt_cfg, gpt_cfg, prepared_images.items, document_text, max_length, add_bos_token);

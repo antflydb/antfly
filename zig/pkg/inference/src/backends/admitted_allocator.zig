@@ -112,7 +112,7 @@ pub const AdmittedAllocator = struct {
         const minimum = try std.math.add(usize, needed - capacity, @sizeOf(Reservation));
         var amount = @max(minimum, quantum);
         var lease = self.reserve(amount) catch |err| blk: {
-            if (amount == minimum or (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable)) return err;
+            if (amount == minimum or (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable and err != error.MemoryBudgetExceeded)) return err;
             amount = minimum; // Slack must not reject requests fitting tight limits.
             break :blk try self.reserve(amount);
         };

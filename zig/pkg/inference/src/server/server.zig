@@ -6534,6 +6534,7 @@ pub const Node = struct {
             .cb = cb,
             .session = model.session,
             .media_run_budget = &run_budget,
+            .media_prepaid_host_bytes = prompt_estimate.media_admission.host_scratch_bytes,
             .explicit_scratch_limit = self.config.generation_budget_overrides.scratch_limit_bytes,
             .gpt_config = gpt_config,
             .kv_dtype = kv_dtype,
@@ -15303,6 +15304,9 @@ pub const Node = struct {
         }
         var image_permit = model.session.admitHostPreprocess(image_working_bytes) catch |err| return inferenceFailureResponse(ctx, err);
         defer image_permit.deinit();
+        var image_memory = @import("../pipelines/preprocessing_memory.zig").Scope.init(ctx.allocator, model.session, image_working_bytes, null);
+        defer image_memory.deinit();
+        const image_allocator = try image_memory.allocator();
 
         // The compute backend and resident slots below share the loaded
         // model's stateful GPU runtime. Hold the target-model lane for their
@@ -15318,7 +15322,7 @@ pub const Node = struct {
         defer compute.deinit();
 
         var mm_pipeline = multimodal_reranker.Pipeline.init(
-            ctx.allocator,
+            image_allocator,
             &compute.backend,
             vision_session,
             model.getTokenizer(),
@@ -15337,7 +15341,7 @@ pub const Node = struct {
                 break :tokens text_pipeline.maxInputTokensPerItem(query, &.{doc.text}) catch |err|
                     return inferenceFailureResponse(ctx, err);
             } else mm_pipeline.maxInputTokensPerItem(query, doc.text, doc.images) catch |err|
-                return inferenceFailureResponse(ctx, err);
+                return inferenceFailureResponse(ctx, image_memory.failure(err));
             input_tokens_for_limit = @max(input_tokens_for_limit, item_tokens);
         }
         validateInferenceExecutorInvocation(executor_contract, .{
@@ -15353,7 +15357,7 @@ pub const Node = struct {
         }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
         var query_encoded = mm_pipeline.encodeQueryText(query) catch |err|
-            return inferenceFailureResponse(ctx, err);
+            return inferenceFailureResponse(ctx, image_memory.failure(err));
         defer query_encoded.deinit();
 
         const scores = try ctx.allocator.alloc(f32, parsed_docs.items.len);
@@ -15379,7 +15383,7 @@ pub const Node = struct {
             ) catch |err| switch (err) {
                 error.InvalidImageDataUri, error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
                 error.ImageTokenLengthMismatch, error.ImageProjectionSizeMismatch, error.UnexpectedOutputShape => return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) }),
-                else => return inferenceFailureResponse(ctx, err),
+                else => return inferenceFailureResponse(ctx, image_memory.failure(err)),
             };
         }
 
@@ -17474,6 +17478,7 @@ pub const Node = struct {
             .cb = cb,
             .session = model.session,
             .media_run_budget = &run_budget,
+            .media_prepaid_host_bytes = prompt_estimate.?.media_admission.host_scratch_bytes,
             .explicit_scratch_limit = self.config.generation_budget_overrides.scratch_limit_bytes,
             .gpt_config = gpt_config,
             .kv_dtype = kv_dtype,

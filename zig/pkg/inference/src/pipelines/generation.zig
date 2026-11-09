@@ -4185,6 +4185,8 @@ pub const NativeGenerationPipeline = struct {
     /// Borrowed invocation budget; portable video scratch is additional to the
     /// generation estimate and must also respect offline CLI memory limits.
     media_run_budget: ?*runtime.tier.memory.RunBudget = null,
+    /// Borrowed process credit for media preparation, held until generate returns.
+    media_prepaid_host_bytes: usize = 0,
     /// An operator's scratch cap. Zero leaves the automatic cap free to grow.
     explicit_scratch_limit: usize = 0,
     gpt_config: gpt_mod.Config,
@@ -5743,6 +5745,8 @@ pub const NativeGenerationPipeline = struct {
             .{ prompt.len, actual_prompt_tokens },
         );
 
+        var image_memory = @import("preprocessing_memory.zig").Scope.init(allocator, self.session, self.media_prepaid_host_bytes, self.media_run_budget);
+        defer image_memory.deinit();
         var prepared_multimodal_prompt: ?gemma3_mm.PreparedPrompt = null;
         defer if (prepared_multimodal_prompt) |*prepared| {
             var execution_scope = if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex) else null;
@@ -6023,14 +6027,14 @@ pub const NativeGenerationPipeline = struct {
                     if (qwen_prompt_tokens == 0) return error.EmptyPrompt;
 
                     debugGenerationStage("qwen3.5 multimodal prepare embeddings prompt_tokens={d}", .{qwen_prompt_tokens});
-                    const qwen_prepared = try qwen2vl_mm.prepareExpandedPromptEmbeddings(
+                    const qwen_prepared = qwen2vl_mm.prepareExpandedPromptEmbeddings(
                         &self.cb,
-                        allocator,
+                        try image_memory.allocator(),
                         self.gpt_config,
                         prep_cfg,
                         qwen_encoded.ids[0..qwen_prompt_tokens],
                         images,
-                    );
+                    ) catch |err| return image_memory.failure(err);
                     debugGenerationStage("qwen3.5 multimodal prepared tokens={d}", .{qwen_prepared.token_ids.len});
                     prepared_multimodal_prompt = .{
                         .allocator = qwen_prepared.allocator,
@@ -6039,6 +6043,9 @@ pub const NativeGenerationPipeline = struct {
                         .input_embeddings = qwen_prepared.input_embeddings,
                         .attn_or_mask = qwen_prepared.attn_or_mask,
                     };
+                    // Decoder scratch has retired. Keep output credit, but do
+                    // not hold unused growth throughout a long generation.
+                    image_memory.trim() catch {};
                 } else {
                     const expanded_prompt = try gemma3_mm.expandPromptText(allocator, prompt, self.gpt_config, images.len);
                     defer allocator.free(expanded_prompt);

@@ -28,11 +28,11 @@ pinned model explicitly and verify discovery and the selected route agree.
 Gemma 4 generation is a separate capability; enabling it is not a prerequisite
 for the initial full-text, embedding, and GLiNER graph pipeline.
 
-For focused Zig checks, use one compile-time substring (for example
+For focused Zig checks, use compile-time substrings (for example
 `zig build test-bin -Dcuda=true -Dcuda-artifacts=fatbin -Dtest-filter=LightOn`),
-then run the installed binary with `--test-filter LightOn`. Multiple Zig
-compile-time filters intersect; the runtime runner combines its filters as a
-union. `-Druntime-test-filter=true` deliberately compiles the full suite and is
+then run the installed binary with `--test-filter LightOn`. On the current
+Zig 0.17 toolchain, both compile-time filters and the runtime runner combine
+multiple filters as a union. `-Druntime-test-filter=true` deliberately compiles the full suite and is
 expensive. Require named cases and nonzero runtime matches; declaration-wrapper
 checks alone do not establish numerical or policy coverage.
 
@@ -200,9 +200,21 @@ The separable resizer retains an 8-bit horizontal row window, rather than a
 full-height intermediate. This preserves the reference quantization boundary.
 Coefficient storage is allocated exactly; Pillow only retains one row of f64
 coefficients, while Torchvision retains the axis needed for its global precision
-selection. Geometry-based admission includes source decoding, normalized images
+selection. Geometry-based admission initially forecasts source decoding, normalized images
 retained earlier in the batch, filter tables and the row window. Both the native
-ColQwen reranker and the Qwen3.5 fallback generation route reserve this work.
+ColQwen reranker and the Qwen3.5 fallback generation route borrow that process
+credit through an admitted allocator. Actual codec scratch, allocation metadata
+and retained tensors acquire additional capacity before allocating. A
+bytes-per-pixel forecast is not a decoder ceiling: PNG scanlines, bit depth,
+compressed-buffer growth and other codec storage can exceed it. Growth is
+chunked and reused across serial preparation, with no extra image copies or
+resampling passes. Generation returns unused growth after prompt preparation
+while keeping output ownership; serial reranking reuses its capacity. Outputs
+release before their allocation owner; additional
+leases release before the original borrowed permit. Generation also charges
+the same preparation capacity to its invocation budget, including offline
+callers. Admission failures preserve permanent-limit versus transient-contention
+errors, while actual backing-allocator failures remain distinct.
 Reranker token preflight inspects image headers and uses the execution geometry;
 it no longer decodes/resizes the same image before execution.
 
@@ -219,7 +231,7 @@ not a performance threshold or hosted-GPU measurement.
 
 The million-row regression (1×1000000 → 28×35840) fits a preprocessing
 allocation budget below 32 MiB. Previously the horizontal buffer alone required
-84 MB, excluding tensors and coefficients. Source decoding is admitted separately.
+84 MB, excluding tensors and coefficients. Source decoding is admitted as part of actual preparation ownership.
 
 To compare actual native PDF painting and PNG transport sizes, build
 `zig build lib-pdf-bench -Doptimize=safe -j2` from `zig/`, then run from the
@@ -610,3 +622,23 @@ forms and leaves consumers for normal dependency validation to reject.
 
 These storage and catalog regressions are distinct from the outstanding
 complete-page A100 output and memory qualification above.
+
+## Decoder allocation regressions
+
+Run the focused allocation and model-processor contracts from
+`zig/pkg/inference`:
+
+```sh
+zig build test-bin -Dtest-filter="image decode admission" -Dtest-filter="model processor resampling" -Doptimize=safe -j2
+./zig-out/bin/antfly-inference-tests --test-filter "image decode admission" --test-filter "model processor resampling"
+```
+
+The fixtures include short, wide 8-bit and 16-bit RGBA PNGs, retained multi-image
+outputs, permanent and contended denials, offline-budget quantum tails, backing
+allocation failure, cancellation and allocation-failure cleanup. A generated
+4,000,000×1 PNG exercises the original default-Qwen-geometry reproduction:
+its initial forecast is about 60 MB, while decoding alone needs over 64 MB.
+Extraction must grow its admission rather than allocate that difference outside
+the resource ledger. Prompt preparation also exercises failure after image
+preparation so retained images are destroyed exactly once. These are local
+CPU ownership checks; they do not qualify GPU reader accuracy or throughput.
