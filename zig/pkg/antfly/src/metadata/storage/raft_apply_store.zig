@@ -12186,11 +12186,11 @@ pub const RaftApplyStore = struct {
             try budget.checkpoint();
             var key: [192]u8 = undefined;
             const encoded = txn.get(try rangeKeyForGroup(&key, metadata_group_id, owner.group_id)) catch |err| switch (err) {
-                error.NotFound => return .{ .ready = false },
+                error.NotFound => return .{ .status = .topology_changed },
                 else => return err,
             };
             const range = try decodeRangeRecord(a, encoded);
-            if (range.table_id != request.table_id or metadata_table_manager.rangeDocIdentityShardId(range) != owner.shard_id or metadata_table_manager.rangeDocIdentityRangeId(range) != owner.range_id) return .{ .ready = false };
+            if (range.table_id != request.table_id or metadata_table_manager.rangeDocIdentityShardId(range) != owner.shard_id or metadata_table_manager.rangeDocIdentityRangeId(range) != owner.range_id) return .{ .status = .topology_changed };
             try ranges.append(a, range);
             const prefix = try std.fmt.bufPrint(&key, "\x00\x00__metadata__:metadata_placement:{d}:{d}:", .{ metadata_group_id, owner.group_id });
             const rows = try docstore.DocStore.scanPrefixTxn(a, &txn, prefix);
@@ -12202,10 +12202,10 @@ pub const RaftApplyStore = struct {
         }
         const statuses = try @import("../state.zig").mergeHealthyGroupStatuses(a, &.{}, ranges.items, placements.items, &.{}, stores, &.{}, &.{}, &.{}, &.{});
         for (ranges.items) |range| for (statuses) |status| {
-            if (status.group_id == range.group_id and !@import("../../api/table_catalog.zig").ownerIdentityReady(status, range)) return .{ .ready = false };
+            if (status.group_id == range.group_id and !@import("../../api/table_catalog.zig").ownerIdentityReady(status, range)) return .{ .status = .identity_unavailable };
         };
         try budget.checkpoint();
-        return .{ .ready = true };
+        return .{ .status = .ready };
     }
 
     pub fn readStore(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, store_id: u64, reports: bool) !?metadata.StoreRecord {
@@ -44878,10 +44878,12 @@ test "selected owner readiness reads indexed namespaces and ignores unrelated un
         try txn.commit();
     }
     var request: @import("../api.zig").OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{ .{ .group_id = 1, .shard_id = 1, .range_id = 1 }, .{ .group_id = 2, .shard_id = 2, .range_id = 2 } } };
-    try std.testing.expect((try store.ownerReadiness(a, 21, request, .{})).ready);
+    try std.testing.expectEqual(.ready, (try store.ownerReadiness(a, 21, request, .{})).status);
     request.owners = &.{.{ .group_id = 3, .shard_id = 3, .range_id = 3 }};
-    try std.testing.expect(!(try store.ownerReadiness(a, 21, request, .{})).ready);
+    try std.testing.expectEqual(.identity_unavailable, (try store.ownerReadiness(a, 21, request, .{})).status);
     request.owners = &.{.{ .group_id = 1, .shard_id = 99, .range_id = 1 }};
-    try std.testing.expect(!(try store.ownerReadiness(a, 21, request, .{})).ready);
+    try std.testing.expectEqual(.topology_changed, (try store.ownerReadiness(a, 21, request, .{})).status);
+    request.owners = &.{.{ .group_id = 99, .shard_id = 99, .range_id = 99 }};
+    try std.testing.expectEqual(.topology_changed, (try store.ownerReadiness(a, 21, request, .{})).status);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.ownerReadiness(a, 21, request, .{ .deadline_ns = 0 }));
 }

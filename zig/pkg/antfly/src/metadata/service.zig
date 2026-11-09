@@ -7829,7 +7829,7 @@ pub const MetadataService = struct {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const allowed = try selectedOwnersAllowIdentityRead(self, request, budget);
         var result = try store.ownerReadiness(self.alloc, self.metadata_group_id, request, budget);
-        result.ready = result.ready and allowed;
+        if (result.status == .ready and !allowed) result.status = .identity_unavailable;
         result.metadata_group_id = self.metadata_group_id;
         result.metadata_incarnation = try self.metadataIncarnation();
         try budget.checkpoint();
@@ -11914,7 +11914,7 @@ pub const MetadataHttpService = struct {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const allowed = try selectedOwnersAllowIdentityRead(self, request, budget);
         var result = try store.ownerReadiness(self.alloc, self.metadata_group_id, request, budget);
-        result.ready = result.ready and allowed;
+        if (result.status == .ready and !allowed) result.status = .identity_unavailable;
         result.metadata_group_id = self.metadata_group_id;
         result.metadata_incarnation = try self.metadataIncarnation();
         try budget.checkpoint();

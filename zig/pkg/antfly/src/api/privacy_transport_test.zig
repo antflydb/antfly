@@ -458,6 +458,8 @@ test "privacy compact owner readiness transport bounds replies and preserves sel
     const Fake = struct {
         status: u16 = 200,
         malformed: bool = false,
+        legacy: bool = false,
+        disposition: @FieldType(api.OwnerReadiness, "status") = .ready,
         calls: usize = 0,
         fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -469,7 +471,7 @@ test "privacy compact owner readiness transport bounds replies and preserves sel
             try std.testing.expectEqual(@as(u64, 7), parsed.value.table_id);
             try std.testing.expectEqual(@as(usize, 2), parsed.value.owners.len);
             try std.testing.expectEqual(@as(u64, 71), parsed.value.owners[0].range_id);
-            return .{ .status = self.status, .body = if (self.malformed) try a.dupe(u8, "{}") else try std.json.Stringify.valueAlloc(a, api.OwnerReadiness{ .ready = true, .metadata_group_id = 9, .metadata_incarnation = @splat('1') }, .{}) };
+            return .{ .status = self.status, .body = if (self.legacy) try a.dupe(u8, "{\"ready\":true}") else if (self.malformed) try a.dupe(u8, "{}") else try std.json.Stringify.valueAlloc(a, api.OwnerReadiness{ .status = self.disposition, .metadata_group_id = 9, .metadata_incarnation = @splat('1') }, .{}) };
         }
     };
     const a = std.testing.allocator;
@@ -478,9 +480,20 @@ test "privacy compact owner readiness transport bounds replies and preserves sel
     const request: api.OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{ .{ .group_id = 1, .shard_id = 7, .range_id = 71 }, .{ .group_id = 2, .shard_id = 7, .range_id = 72 } } };
     var result = try client.fetchOwnerReadiness("http://metadata", request, null);
     defer result.deinit();
-    try std.testing.expect(result.value.ready);
+    try std.testing.expectEqual(.ready, result.value.status);
+    fake.disposition = .topology_changed;
+    var changed = try client.fetchOwnerReadiness("http://metadata", request, null);
+    defer changed.deinit();
+    try std.testing.expectEqual(.topology_changed, changed.value.status);
+    fake.disposition = .identity_unavailable;
+    var unhealthy = try client.fetchOwnerReadiness("http://metadata", request, null);
+    defer unhealthy.deinit();
+    try std.testing.expectEqual(.identity_unavailable, unhealthy.value.status);
     fake.malformed = true;
-    try std.testing.expectError(error.MissingField, client.fetchOwnerReadiness("http://metadata", request, null));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchOwnerReadiness("http://metadata", request, null));
+    fake.malformed = false;
+    fake.legacy = true;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchOwnerReadiness("http://metadata", request, null));
     fake.status = 404;
     try std.testing.expectError(error.UnsupportedOperation, client.fetchOwnerReadiness("http://metadata", request, null));
     const calls = fake.calls;

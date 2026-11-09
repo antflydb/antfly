@@ -473,7 +473,12 @@ pub const MetadataHttpClient = struct {
     pub fn fetchOwnerReadiness(self: *MetadataHttpClient, base_uri: []const u8, request: metadata_api.OwnerReadinessRequest, budget: ?RequestBudget) !std.json.Parsed(metadata_api.OwnerReadiness) {
         const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
         defer self.alloc.free(body);
-        return self.fetchCatalogReadAt(metadata_api.OwnerReadiness, base_uri, .POST, routes.Routes.internal_owner_readiness, body, budget);
+        return self.fetchCatalogReadAt(metadata_api.OwnerReadiness, base_uri, .POST, routes.Routes.internal_owner_readiness, body, budget) catch |err| switch (err) {
+            error.OutOfMemory, error.CatalogRoutingSnapshotTimeout, error.Canceled, error.DeadlineExceeded, error.UnsupportedOperation => return err,
+            // Legacy/malformed readiness replies are a peer capability or
+            // availability failure, never an invalid public graph query.
+            else => return error.StorageReadTemporarilyUnavailable,
+        };
     }
 
     pub fn fetchPrivacyPolicyBinding(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.PrivacyPolicyBinding) {

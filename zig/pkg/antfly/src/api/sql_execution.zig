@@ -2161,6 +2161,22 @@ pub const Adapter = struct {
                 try writes.activateRangeTracking(owned, table.physical_name, self.context);
             }
         }
+        // Resolve physical capture requirements before spending proof work.
+        // A staged or ordinary SQL input already requires a full key cohort.
+        var staged_tables: cypher.read_domains.TableSet = .empty;
+        if (self.staged) |staged| for (staged.tables) |entry| {
+            const batch = entry.batch;
+            if (batch.writes.len != 0 or batch.deletes.len != 0 or batch.graph_writes.len != 0 or batch.graph_deletes.len != 0)
+                try staged_tables.put(owned, staged.physicalName(entry.table_name), {});
+        };
+        var prunable_tables: cypher.read_domains.TableSet = .empty;
+        if (prune_cohort) for (tables.items) |table| {
+            if (staged_tables.contains(table.physical_name)) continue;
+            const ordinary_scan = for (requests) |request| {
+                if (request.table.graph == null and request.table.id == table.id) break true;
+            } else false;
+            if (!ordinary_scan) try prunable_tables.put(owned, table.physical_name, {});
+        };
         const role_revision = if (self.identity.*) |principal| if (principal.live_user_manager) |manager| @as(?u64, manager.rowPolicyRoleRevision()) else null else null;
         // Bind once before cohort planning, then reuse those exact values in
         // each graph cursor. A prepared SQL query never stores bound domains.
@@ -2179,7 +2195,10 @@ pub const Adapter = struct {
             if (request.table.graph) |binding| {
                 try self.verify(owned, request.table);
                 parameters.* = try self.graphParametersForScan(owned, binding, request.request, &parameter_cache);
-                if (prune_cohort) {
+                const needs_proof = for (binding.dependencies) |table| {
+                    if (cypher.dependencies.contains(needed_rows[request_index], table.physical_name) and prunable_tables.contains(table.physical_name)) break true;
+                } else false;
+                if (needs_proof) {
                     for (requests[0..request_index], domain_plans[0..request_index]) |prior, prior_plan| {
                         const previous = prior.table.graph orelse continue;
                         if (prior_plan == null or previous.graph.incarnation != binding.graph.incarnation or previous.graph.revision != binding.graph.revision) continue;
@@ -2189,13 +2208,17 @@ pub const Adapter = struct {
                             break;
                         }
                     }
-                    if (domains.* == null) domains.* = try @import("graph_execution.zig").readDomainsWithBudget(owned, binding.graph, binding.definition.query, parameters.*, self.context, &proof_budget);
+                    if (domains.* == null) domains.* = try @import("graph_execution.zig").readDomainsForTables(owned, binding.graph, binding.definition.query, parameters.*, self.context, &proof_budget, &prunable_tables);
                 }
             }
         }
         const inputs = try owned.alloc(port.GraphTable, tables.items.len);
         for (tables.items, inputs) |table, *input| input.* = .{ .name = table.physical_name, .table_id = table.id, .schema_version = table.schema_version, .principal_proof = (try self.rowPolicyProof(owned, table)) orelse "", .database = table.scope.?.database, .filter_query_json = (try http_server.resolveEffectiveRowFilterJson(owned, self.identity.*, table.physical_name)) orelse "" };
         for (inputs) |*input| {
+            if (!prune_cohort or staged_tables.contains(input.name)) {
+                input.indexes = null;
+                continue;
+            }
             var selected: ?[]const []const u8 = &.{};
             for (requests) |request| {
                 const binding = request.table.graph orelse continue;
@@ -2211,13 +2234,8 @@ pub const Adapter = struct {
                 }
                 selected = unioned.items;
             }
-            const staged_table = if (self.staged) |staged| for (staged.tables) |entry| {
-                const batch = entry.batch;
-                if (std.mem.eql(u8, staged.physicalName(entry.table_name), input.name) and
-                    (batch.writes.len != 0 or batch.deletes.len != 0 or batch.graph_writes.len != 0 or batch.graph_deletes.len != 0)) break true;
-            } else false else false;
-            input.indexes = if (prune_cohort and !staged_table) selected else null;
-            if (prune_cohort and !staged_table) {
+            input.indexes = selected;
+            if (prunable_tables.contains(input.name)) {
                 var keys: std.StringHashMapUnmanaged(void) = .empty;
                 var full = false;
                 var observed = false;
@@ -4590,6 +4608,7 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
     const Fake = struct {
         const Self = @This();
         mixed: bool = false,
+        wide: bool = false,
         captures: usize = 0,
         points: bool = false,
         expect_full_overlay: bool = false,
@@ -4661,8 +4680,10 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
                 try std.testing.expectEqual(@as(usize, 2), input.tables.len);
                 for (input.tables) |table| {
                     if (std.mem.eql(u8, table.name, "docs")) {
-                        try std.testing.expectEqual(@as(usize, 1), table.keys.?.len);
-                        try std.testing.expectEqualStrings("a", table.keys.?[0]);
+                        try std.testing.expectEqual(@as(usize, if (self.wide) 4096 else 1), table.keys.?.len);
+                        if (self.wide) {
+                            for (table.keys.?) |key| try std.testing.expectEqual(@as(usize, 224), key.len);
+                        } else try std.testing.expectEqualStrings("a", table.keys.?[0]);
                         try std.testing.expectEqual(@as(usize, 0), table.indexes.?.len);
                     } else {
                         try std.testing.expectEqualStrings("other", table.name);
@@ -4764,6 +4785,22 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
     var mixed = try @import("antfly_local_sources").sql_compiler.compile(a, "SELECT g.key,h.key FROM GRAPH_TABLE(knowledge MATCH(n IS Document) WHERE antfly.documentKey(n)=$1 COLUMNS(antfly.documentKey(n) AS key)) g JOIN GRAPH_TABLE(knowledge MATCH(n IS Unused) WHERE antfly.documentKey(n)=$1 COLUMNS(antfly.documentKey(n) AS key)) h ON true", .{});
     defer mixed.deinit();
     try std.testing.expectError(error.CypherObservationsUnavailable, adapter.execute(a, &mixed, &.{.{ .string = "a" }}, .{}, null));
+    // A staged-only relation must not consume another wide-domain proof. A
+    // mixed relation must still prove its unstaged physical dependency.
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var keys = std.json.Array.init(sa);
+    for (0..4096) |i| try keys.append(.{ .string = try std.fmt.allocPrint(sa, "{d:0>224}", .{i}) });
+    fake.wide = true;
+    for ([_][]const u8{
+        "SELECT g.key,h.key FROM GRAPH_TABLE(knowledge MATCH(o IS Unused) WHERE antfly.documentKey(o) IN $1 COLUMNS(antfly.documentKey(o) AS key)) h JOIN GRAPH_TABLE(knowledge MATCH(n IS Document) WHERE antfly.documentKey(n) IN $1 COLUMNS(antfly.documentKey(n) AS key)) g ON true",
+        "SELECT g.key FROM GRAPH_TABLE(knowledge MATCH(n IS Document),(o IS Unused) WHERE antfly.documentKey(n) IN $1 AND antfly.documentKey(o) IN $1 COLUMNS(antfly.documentKey(n) AS key)) g",
+    }) |text| {
+        var wide = try @import("antfly_local_sources").sql_compiler.compile(a, text, .{});
+        defer wide.deinit();
+        try std.testing.expectError(error.CypherObservationsUnavailable, adapter.execute(a, &wide, &.{.{ .array = keys }}, .{}, null));
+    }
 }
 
 test "SQL pgwire native graph arguments borrow scalars without materializing unrelated parameters" {

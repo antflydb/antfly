@@ -17643,7 +17643,7 @@ fn consumerTests() type {
     const Suite = struct {
         test "certified graph point cohorts use selected readiness without administrative snapshots" {
             const Fixture = struct {
-                ready: bool = true,
+                status: @FieldType(metadata_api.OwnerReadiness, "status") = .ready,
                 calls: usize = 0,
                 fn capture(ptr: *anyopaque, request: metadata_api.OwnerReadinessRequest, budget: table_catalog.RoutingBudget) !metadata_api.OwnerReadiness {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -17653,7 +17653,7 @@ fn consumerTests() type {
                     try std.testing.expectEqual(@as(usize, 2), request.owners.len);
                     try std.testing.expectEqual(@as(u64, 1), request.owners[0].group_id);
                     try std.testing.expectEqual(@as(u64, 2), request.owners[1].group_id);
-                    return .{ .ready = self.ready };
+                    return .{ .status = self.status };
                 }
             };
             var fixture: Fixture = .{};
@@ -17661,11 +17661,83 @@ fn consumerTests() type {
             const request: metadata_api.OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{ .{ .group_id = 1, .shard_id = 1, .range_id = 1 }, .{ .group_id = 2, .shard_id = 2, .range_id = 2 } } };
             var refusing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
             try table_catalog.validateOwnerReadiness(refusing.allocator(), catalog, request, .{});
-            fixture.ready = false;
+            fixture.status = .identity_unavailable;
             try std.testing.expectError(error.DocIdentityNamespaceMismatch, table_catalog.validateOwnerReadiness(refusing.allocator(), catalog, request, .{}));
+            fixture.status = .topology_changed;
+            try std.testing.expectError(error.TopologyChanged, table_catalog.validateOwnerReadiness(refusing.allocator(), catalog, request, .{}));
             try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, table_catalog.validateOwnerReadiness(refusing.allocator(), catalog, request, .{ .deadline_ns = 0 }));
-            try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+            try std.testing.expectEqual(@as(usize, 3), fixture.calls);
             try std.testing.expectEqual(@as(usize, 0), refusing.allocations);
+        }
+
+        test "certified graph point cohorts refresh a generation changed during readiness" {
+            const a = std.testing.allocator;
+            const Fixture = struct {
+                current: *table_catalog.RoutingGeneration,
+                next: *table_catalog.RoutingGeneration,
+                acquisitions: usize = 0,
+                readiness_calls: usize = 0,
+                admitted: std.ArrayList(u64) = .empty,
+                fn acquire(raw: *anyopaque, _: ?u64, _: bool) !*table_catalog.RoutingGeneration {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.acquisitions += 1;
+                    self.current.retain();
+                    return self.current;
+                }
+                fn snapshot(raw: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.current.indexed.snapshot.value;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+                fn ready(raw: *anyopaque, request: metadata_api.OwnerReadinessRequest, _: table_catalog.RoutingBudget) !metadata_api.OwnerReadiness {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.readiness_calls += 1;
+                    try std.testing.expectEqual(@as(usize, 2), request.owners.len);
+                    if (self.readiness_calls == 1) {
+                        try std.testing.expectEqual(@as(u64, 1), request.owners[0].group_id);
+                        // Publish a replacement after routing validation and
+                        // before a single owner cut has been opened.
+                        self.current = self.next;
+                        return .{ .status = .topology_changed };
+                    }
+                    try std.testing.expectEqual(@as(u64, 3), request.owners[0].group_id);
+                    try std.testing.expectEqual(@as(u64, 4), request.owners[1].group_id);
+                    // Stop before physical IO, while independently checking
+                    // that actual identity health failures remain fail-closed.
+                    return .{ .status = .identity_unavailable };
+                }
+                fn wait(raw: *anyopaque, id: u64, _: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.admitted.append(std.testing.allocator, id);
+                }
+            };
+            var tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+            var before = [_]metadata_table_manager.RangeRecord{
+                .{ .table_id = 7, .group_id = 1, .start_key = "", .end_key = "m" },
+                .{ .table_id = 7, .group_id = 2, .start_key = "m" },
+            };
+            var after = before;
+            after[0].group_id = 3;
+            after[1].group_id = 4;
+            const old = try table_catalog.RoutingGeneration.create(a, .{ .tables = &tables, .ranges = &before }, .{});
+            defer old.release();
+            const fresh = try table_catalog.RoutingGeneration.create(a, .{ .tables = &tables, .ranges = &after }, .{});
+            defer fresh.release();
+            var fixture: Fixture = .{ .current = old, .next = fresh };
+            defer fixture.admitted.deinit(a);
+            const source: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .acquire_routing_generation = Fixture.acquire, .routing_snapshot = Fixture.snapshot, .linearizable_routing_snapshot = Fixture.snapshot, .free_routing_snapshot = Fixture.free, .owner_readiness = Fixture.ready } };
+            var provider = ProvisionedTableReadSource.init("unused", source, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.wait } });
+            const input: @import("antfly_local_sources").storage_statement_read_fence.GraphStatement = .{
+                .catalog_json = "",
+                .tables = &.{.{ .name = "docs", .table_id = 7, .schema_version = 1, .keys = &.{ "a", "z" } }},
+                .cut_id = @splat('a'),
+                .expires_ms = std.math.maxInt(u64),
+                .ttl_now_ns = 1,
+            };
+            try std.testing.expectError(error.DocIdentityNamespaceMismatch, ProvisionedTableReadSource.openCypherStatement(&provider, a, input));
+            try std.testing.expectEqual(@as(usize, 2), fixture.readiness_calls);
+            try std.testing.expect(fixture.acquisitions >= 2);
+            try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4 }, fixture.admitted.items);
         }
 
         test "certified graph point cohorts borrow ranges without catalog-sized allocations" {

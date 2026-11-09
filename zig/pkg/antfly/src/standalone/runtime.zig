@@ -2077,10 +2077,10 @@ const LocalStandaloneMetadata = struct {
         defer generation.release();
         for (request.owners) |owner| {
             const range = try generation.indexed.rangeForGroup(request.table_id, owner.group_id, budget);
-            if (antfly.metadata.table_manager.rangeDocIdentityShardId(range.*) != owner.shard_id or antfly.metadata.table_manager.rangeDocIdentityRangeId(range.*) != owner.range_id) return .{ .ready = false };
+            if (antfly.metadata.table_manager.rangeDocIdentityShardId(range.*) != owner.shard_id or antfly.metadata.table_manager.rangeDocIdentityRangeId(range.*) != owner.range_id) return .{ .status = .topology_changed };
         }
         try budget.checkpoint();
-        return .{ .ready = true, .metadata_group_id = group_ids.main_metadata_group_id, .metadata_incarnation = generation.indexed.snapshot.value.metadata_incarnation };
+        return .{ .status = .ready, .metadata_group_id = group_ids.main_metadata_group_id, .metadata_incarnation = generation.indexed.snapshot.value.metadata_incarnation };
     }
 
     fn catalogPrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {

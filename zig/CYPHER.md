@@ -5950,3 +5950,19 @@ Active merge transitions are indexed by owner once per transition publication;
 only selected transitions are observed for identity reassignment. Foreign
 catalog adapters retain a budgeted selected-owner compatibility check. Readiness
 never replaces the live topology, read-index or retained-capture fences.
+
+Readiness replies carry a required disposition: `ready`, `topology_changed`,
+or `identity_unavailable`. Missing owners and changed routing namespaces trigger
+a fresh generation and a new whole-cohort capture attempt before any rows are
+exposed. Actual identity-health failures remain fail-closed. Exhausted topology
+retries and unavailable identity state return temporary graph-read availability
+errors, including through the private HTTP/native projection boundaries.
+
+SQL computes its physically prunable table set before domain analysis. Staged
+and ordinary SQL scans already require full key cohorts, so staged-only graph
+relations perform no domain proof or proof-cache comparison. Mixed graph
+relations analyze only eligible physical nodes while still walking nested reads
+and validating residual predicates. Excluded table domains cannot consume key
+hashing/materialization work needed by unrelated bounded inputs. Regression
+coverage includes 4,096 wide keys in separate and mixed staged graph relations,
+concurrent topology replacement during readiness, and wire disposition decoding.

@@ -23,9 +23,13 @@ const catalog = @import("catalog.zig");
 const v = @import("value.zig");
 const A = std.mem.Allocator;
 pub const max_keys = 4096;
+pub const TableSet = std.StringHashMapUnmanaged(void);
 pub const Options = struct {
     max_work: usize = 65536,
     budget: ?*Budget = null,
+    /// Host-selected physical tables eligible for key pruning. Null analyzes
+    /// every table; excluded tables are already captured in full by the host.
+    prunable_tables: ?*const TableSet = null,
     checkpoint: ?struct { ptr: *const anyopaque, call: *const fn (*const anyopaque) anyerror!void } = null,
 };
 /// Invocation-wide proof and union work. Exhaustion falls back to full domains;
@@ -88,6 +92,23 @@ const Builder = struct {
         self.remaining -= amount;
         return true;
     }
+    fn wanted(self: *Builder, table_name: []const u8) !bool {
+        const demand = self.options.prunable_tables orelse return true;
+        // Exhaustion installs conservative full domains even if the demand
+        // lookup itself cannot finish under the budget.
+        if (!try self.spend(1 + table_name.len / 64)) return true;
+        return demand.contains(table_name);
+    }
+    fn nodeWanted(self: *Builder, n: ast.Node) !bool {
+        if (self.options.prunable_tables == null) return true;
+        if (n.labels.len == 0) {
+            for (self.graph.labels) |label| if (try self.wanted(label.table)) return true;
+        } else for (n.labels) |name| {
+            if (!try self.spend(1 + name.len / 64)) return true;
+            if (self.graph.label(name)) |label| if (try self.wanted(label.table)) return true;
+        }
+        return false;
+    }
     fn appendKey(self: *Builder, list: *std.ArrayList([]const u8), key: []const u8) !bool {
         // Appending borrows a span; hashing its bytes is charged by add().
         if (!try self.spend(1)) return false;
@@ -95,6 +116,7 @@ const Builder = struct {
         return true;
     }
     fn add(self: *Builder, table_name: []const u8, keys: ?[]const []const u8) !void {
+        if (!try self.wanted(table_name)) return;
         if (!self.exhausted) _ = try self.spend(1 + table_name.len / 64);
         // Full domains must still be installed after exhaustion, so the
         // conservative fallback cannot retain partially proved key sets.
@@ -126,6 +148,7 @@ const Builder = struct {
         if (!slot.found_existing) try self.add(table, keys);
     }
     fn node(self: *Builder, n: ast.Node, predicate: ?*const ast.Expr, aliases: Aliases) !void {
+        if (!try self.nodeWanted(n)) return;
         const literal_properties = for (n.properties) |property| {
             if (!try self.spend(1) or (try self.constant(property.value)) == null) break false;
         } else true;
@@ -404,6 +427,10 @@ const Builder = struct {
 /// The invocation-arena result borrows graph and parameter strings. It must
 /// never be stored in a prepared query or reused with different bindings.
 pub fn plan(a: A, graph: catalog.Graph, query: ast.Query, parameters: []const v.Entry, options: Options) !Plan {
+    if (options.prunable_tables) |demand| if (demand.count() == 0) {
+        if (options.checkpoint) |check| try check.call(check.ptr);
+        return .{ .domains = &.{} };
+    };
     var builder: Builder = .{ .a = a, .graph = graph, .parameters = parameters, .options = options, .remaining = options.max_work };
     try builder.clauses(query.clauses);
     for (query.unions) |arm| try builder.clauses(arm.clauses);
@@ -614,4 +641,43 @@ test "point domains share one invocation budget across plans and union work" {
     try std.testing.expect(second.table("docs").?.keys == null);
     try std.testing.expectEqual(@as(usize, 0), budget.remaining);
     try std.testing.expect(!try budget.spend(1));
+}
+
+test "point domains restrict proof work to physically prunable tables" {
+    const compiler = @import("compiler.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{ .{ .name = "D", .table = "docs" }, .{ .name = "O", .table = "other" } }, .relationships = &.{} };
+    const values = try a.alloc(v.Value, max_keys);
+    for (values, 0..) |*value, i| value.* = .{ .string = try std.fmt.allocPrint(a, "{d:0>224}", .{i}) };
+    const parameters = &.{v.Entry{ .name = "keys", .value = .{ .list = values } }};
+    var demand: TableSet = .empty;
+    try demand.put(a, "docs", {});
+    var diagnostic: compiler.Diagnostic = .{};
+    for ([_][]const u8{
+        "MATCH(n:D),(o:O) WHERE antfly.documentKey(n) IN $keys AND antfly.documentKey(o) IN $keys RETURN n",
+        "MATCH(o:O) RETURN EXISTS {MATCH(n:D) WHERE antfly.documentKey(n) IN $keys RETURN n}",
+    }) |text| {
+        var compiled = try compiler.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var budget: Budget = .{};
+        const result = try plan(a, graph, compiled.query, parameters, .{ .budget = &budget, .prunable_tables = &demand });
+        try std.testing.expect(result.table("other") == null);
+        try std.testing.expectEqual(@as(usize, max_keys), result.table("docs").?.keys.?.len);
+        // The host can still hash and materialize the entire surviving keyset.
+        try std.testing.expect(budget.remaining >= max_keys * 5);
+        budget.remaining = 0;
+        const fallback = try plan(a, graph, compiled.query, parameters, .{ .budget = &budget, .prunable_tables = &demand });
+        try std.testing.expect(fallback.table("docs").?.keys == null);
+    }
+    var excluded = try compiler.compile(a, "MATCH(o:O) WHERE antfly.documentKey(o) IN $keys RETURN o", .{}, &diagnostic);
+    defer excluded.deinit();
+    var budget: Budget = .{};
+    const result = try plan(a, graph, excluded.query, parameters, .{ .budget = &budget, .prunable_tables = &demand });
+    try std.testing.expectEqual(@as(usize, 0), result.domains.len);
+    try std.testing.expect(budget.remaining > 65000);
+    var empty: TableSet = .empty;
+    const skipped = try plan(a, graph, excluded.query, parameters, .{ .budget = &budget, .prunable_tables = &empty });
+    try std.testing.expectEqual(@as(usize, 0), skipped.domains.len);
 }

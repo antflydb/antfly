@@ -1829,14 +1829,18 @@ fn rangeGroupBelongsToTable(ranges: []const metadata_table_manager.RangeRecord, 
 pub fn validateOwnerReadiness(_: std.mem.Allocator, catalog: CatalogSource, request: metadata_api.OwnerReadinessRequest, budget: RoutingBudget) !void {
     try budget.checkpoint();
     if (catalog.vtable.owner_readiness) |capture| {
-        if (!(try capture(catalog.ptr, request, budget)).ready) return error.DocIdentityNamespaceMismatch;
+        switch ((try capture(catalog.ptr, request, budget)).status) {
+            .ready => {},
+            .topology_changed => return error.TopologyChanged,
+            .identity_unavailable => return error.DocIdentityNamespaceMismatch,
+        }
     } else {
         var snapshot = try catalog.adminSnapshot();
         defer catalog.freeAdminSnapshot(&snapshot);
         for (request.owners) |owner| {
             try budget.checkpoint();
-            const range = findRangeForTableGroup(snapshot.ranges, request.table_id, owner.group_id) orelse return error.DocIdentityNamespaceMismatch;
-            if (metadata_table_manager.rangeDocIdentityShardId(range) != owner.shard_id or metadata_table_manager.rangeDocIdentityRangeId(range) != owner.range_id) return error.DocIdentityNamespaceMismatch;
+            const range = findRangeForTableGroup(snapshot.ranges, request.table_id, owner.group_id) orelse return error.TopologyChanged;
+            if (metadata_table_manager.rangeDocIdentityShardId(range) != owner.shard_id or metadata_table_manager.rangeDocIdentityRangeId(range) != owner.range_id) return error.TopologyChanged;
             if (findMergedGroupStatus(snapshot.merged_group_statuses, owner.group_id)) |status| {
                 if (!ownerIdentityReady(status, range)) return error.DocIdentityNamespaceMismatch;
             }

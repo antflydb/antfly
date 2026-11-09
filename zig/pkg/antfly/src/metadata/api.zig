@@ -316,7 +316,12 @@ pub const OwnerReadinessRequest = struct {
     owners: []const Owner,
     pub const Owner = struct { group_id: u64, shard_id: u64, range_id: u64 };
 };
-pub const OwnerReadiness = struct { ready: bool, metadata_group_id: u64 = 0, metadata_incarnation: ?MetadataClusterIncarnation = null };
+pub const OwnerReadiness = struct {
+    // Required on wire: a legacy boolean reply cannot license a capture.
+    status: enum { ready, topology_changed, identity_unavailable },
+    metadata_group_id: u64 = 0,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
+};
 
 /// Fixed-size authoritative privacy binding; no schema, producer or job bytes.
 /// Required fields make unsupported/malformed replies fail closed.
