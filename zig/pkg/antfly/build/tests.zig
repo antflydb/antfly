@@ -251,10 +251,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "public table create index preserves permanent inference budget",
             "public artifact enrichment preserves permanent inference budget",
+            "PDF embedding input public contract",
             "public table query returns hierarchy validation pointers",
             "embedding validation failures share",
             "hierarchy validation body survives",
             "serverless create index normalization resolves and persists",
+            "serverless aggregation errors preserve invalid and unsupported classes",
+            "time series public aggregation failures retain client and operational classes",
         },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -2021,6 +2024,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const root_test_step = b.step("root-test", "Run root-module contracts and HTTP runtime regressions");
     root_test_step.dependOn(&run_lib_unit_tests.step);
+    // Rendering policy contracts do not need the broad API/metadata anchors.
+    // Keep this inexpensive owner available for schema/provenance changes.
+    const render_policy_tests = b.addTest(.{
+        .name = "document-render-policy-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{"OCR sampling"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-render-policy-test", "Run focused OCR rendering configuration, identity and provenance contracts")
+        .dependOn(&addFilteredTestRunArtifact(b, render_policy_tests).step);
+
+    // Keep the real ordered apply/child-publication migration check separate
+    // from the inexpensive policy/codec owner above.
+    const unit_upgrade_tests = b.addTest(.{
+        .name = "document-unit-upgrade-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{"ordered artifact inventory unit chunk callback reconstructs publishes and retires accepted inputs"},
+        // Measured safe native compilation peaked at 8.64 GB. Keep this
+        // explicit integration owner bounded without inflating the codec gate.
+        .max_rss = 10 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-unit-upgrade-test", "Verify persisted v5 child publication and subsequent v6 replacement through ordered apply")
+        .dependOn(&addFilteredTestRunArtifact(b, unit_upgrade_tests).step);
 
     const graph_capability_filters = selectTestFilters(b, &.{
         "unsupported graph diagnostics identify the rejected operation feature",
@@ -3544,6 +3572,39 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
+    const time_series_filters = selectTestFilters(b, &.{"time series"});
+    const time_series_tests = b.addTest(.{
+        .name = "time-series-tests",
+        .root_module = antfly_test_mod,
+        .filters = time_series_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    // Expanded native snapshot coverage peaks at 10.83 GB on macOS
+    // ReleaseFast. Reserve 12 GiB for bounded compiler scheduling.
+    time_series_tests.step.max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024;
+    b.step("time-series-test", "Verify fixed temporal buckets, bounds and empty measurements").dependOn(&b.addRunArtifact(time_series_tests).step);
+    const time_series_storage_tests = b.addTest(.{
+        .name = "time-series-storage-tests",
+        .root_module = antfly_test_mod,
+        .filters = selectTestFilters(b, &.{ "date histogram", "storage.ttl.", "storage.backup_codec.", "storage.portable_backup.", "storage.retained_effects.", "storage.document_mutation_revision.", "storage.db.maintenance.ttl_runtime.", "time series portable document codec preserves signed TTL and write versions" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    // Portable archive and legacy histogram coverage peaks around 6.6 GB on
+    // native macOS ReleaseFast. Reserve enough for bounded build scheduling.
+    time_series_storage_tests.step.max_rss = 8 * 1024 * 1024 * 1024;
+    b.step("time-series-storage-test", "Verify histogram limits, TTL metadata, retained replay, and portable archive compatibility").dependOn(&b.addRunArtifact(time_series_storage_tests).step);
+    const time_series_runtime_tests = b.addTest(.{
+        .name = "time-series-runtime-tests",
+        .root_module = api_http_runtime_test_mod,
+        .filters = time_series_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    // Expanded revision/recovery and retained-tail coverage measured a
+    // 12.92 GB native macOS ReleaseFast peak. Reserve 16 GiB with headroom;
+    // the physical local partition inherits this scheduling claim.
+    time_series_runtime_tests.step.max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 8) * 1024 * 1024 * 1024;
+    b.step("time-series-runtime-test", "Verify temporal predicate proof, owner fanout and fallback contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, time_series_runtime_tests, time_series_filters).step);
+
     const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");
     const graph_ttl_migration_tests = b.addTest(.{
         .name = "graph-ttl-migration-tests",
@@ -6809,6 +6870,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-authority-invalidation-test", "Verify cohort invalidation across schema and policy publication")
         .dependOn(&addFilteredTestRunArtifact(b, authority_invalidation_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const source_vector_contract_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "external vector compatibility declaration", "scalar text asset chunks", "generic scalar chunks reject stale upstream and fence publication", "generic contextual asset publication", "asset producer neighbor context samples", "source semantic media input", "transcript chunk public provenance", "transcript timing stamps", "diarized phrases carry", "transcript spans locate", "grouped artifact text filters use parent ordinals" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("source-vector-contract-test", "Verify authored source vector compatibility and text-asset chunk lifecycle")
+        .dependOn(&addFilteredTestRunArtifact(b, source_vector_contract_tests).step);
+
     const lite_external_dimension_tests = b.addTest(.{
         .root_module = db_test_mod,
         .max_rss = 12 * 1024 * 1024 * 1024,

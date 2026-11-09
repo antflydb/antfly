@@ -22,6 +22,7 @@ from .aggregation_bucket_sub_aggregations import AggregationBucketSubAggregation
 from .aggregation_date_range import AggregationDateRange
 from .aggregation_range import AggregationRange
 from .aggregation_request import AggregationRequest
+from .aggregation_request_date_bounds import AggregationRequestDateBounds
 from .aggregation_request_sub_aggregations import AggregationRequestSubAggregations
 from .aggregation_result import AggregationResult
 from .aggregation_type import AggregationType
@@ -254,6 +255,7 @@ from .created_embeddings_index import CreatedEmbeddingsIndex
 from .created_embeddings_index_config import CreatedEmbeddingsIndexConfig
 from .created_embeddings_index_type import CreatedEmbeddingsIndexType
 from .created_enrichment_config import CreatedEnrichmentConfig
+from .created_enrichment_config_embedding_input import CreatedEnrichmentConfigEmbeddingInput
 from .created_full_text_index import CreatedFullTextIndex
 from .created_full_text_index_config import CreatedFullTextIndexConfig
 from .created_full_text_index_type import CreatedFullTextIndexType
@@ -378,6 +380,7 @@ from .document_extraction_reader_config_provider import DocumentExtractionReader
 from .document_extraction_reader_config_recognition_level import DocumentExtractionReaderConfigRecognitionLevel
 from .document_extraction_render_config import DocumentExtractionRenderConfig
 from .document_extraction_render_config_resolution import DocumentExtractionRenderConfigResolution
+from .document_extraction_render_config_sampling import DocumentExtractionRenderConfigSampling
 from .document_extraction_route import DocumentExtractionRoute
 from .document_extraction_route_extractor import DocumentExtractionRouteExtractor
 from .document_extraction_route_extractor_type import DocumentExtractionRouteExtractorType
@@ -440,6 +443,7 @@ from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
+from .enrichment_config_embedding_input import EnrichmentConfigEmbeddingInput
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
@@ -2546,6 +2550,8 @@ from .table_restore_status import TableRestoreStatus
 from .table_restore_status_status import TableRestoreStatusStatus
 from .table_schema import TableSchema
 from .table_schema_document_schemas import TableSchemaDocumentSchemas
+from .table_schema_index_sort_item import TableSchemaIndexSortItem
+from .table_schema_index_sort_item_order import TableSchemaIndexSortItemOrder
 from .table_schema_patch import TableSchemaPatch
 from .table_shards import TableShards
 from .table_statistics import TableStatistics
@@ -2711,6 +2717,7 @@ __all__ = (
     "AggregationDateRange",
     "AggregationRange",
     "AggregationRequest",
+    "AggregationRequestDateBounds",
     "AggregationRequestSubAggregations",
     "AggregationResult",
     "AggregationType",
@@ -2924,6 +2931,7 @@ __all__ = (
     "CreatedEmbeddingsIndexConfig",
     "CreatedEmbeddingsIndexType",
     "CreatedEnrichmentConfig",
+    "CreatedEnrichmentConfigEmbeddingInput",
     "CreatedFullTextIndex",
     "CreatedFullTextIndexConfig",
     "CreatedFullTextIndexType",
@@ -3065,6 +3073,7 @@ __all__ = (
     "DocumentExtractionReaderConfigRecognitionLevel",
     "DocumentExtractionRenderConfig",
     "DocumentExtractionRenderConfigResolution",
+    "DocumentExtractionRenderConfigSampling",
     "DocumentExtractionRoute",
     "DocumentExtractionRouteExtractor",
     "DocumentExtractionRouteExtractorType",
@@ -3127,6 +3136,7 @@ __all__ = (
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
+    "EnrichmentConfigEmbeddingInput",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",
@@ -5011,6 +5021,8 @@ __all__ = (
     "TableRestoreStatusStatus",
     "TableSchema",
     "TableSchemaDocumentSchemas",
+    "TableSchemaIndexSortItem",
+    "TableSchemaIndexSortItemOrder",
     "TableSchemaPatch",
     "TableShards",
     "TablespaceCatalogRecord",

@@ -1484,6 +1484,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (schema.ttl_duration_ns != 0) try prepared.requireLogicalField(schema.ttl_field);
             if (plan) |snapshot| {
+                if (snapshot.external_vector_spaces.count() != 0) try prepared.requireLogicalField("metadata");
                 if (snapshot.group_sources) |group_plan| for (group_plan.entries) |entry| {
                     if (entry.source.filter != .null) {
                         try prepared.requireLogicalRoot();
@@ -1517,7 +1518,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             schema: schema_mod.TableSchema,
             fallback_timestamp_ns: u64,
             value: std.json.Value,
-        ) !u64 {
+        ) !i128 {
             if (schema.ttl_duration_ns == 0) return fallback_timestamp_ns;
             const root = switch (value) {
                 .object => |object| object,
@@ -1528,15 +1529,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try ttlTimestampNsFromJsonValue(ttl_value);
         }
 
-        pub fn resolveWriteTimestampFromValue(self: anytype, fallback_timestamp_ns: u64, value: std.json.Value) !u64 {
+        pub fn resolveWriteTimestampFromValue(self: anytype, fallback_timestamp_ns: u64, value: std.json.Value) !i128 {
             const schema = S.ownerField(self, "core").*.schema orelse return fallback_timestamp_ns;
             return try resolveWriteTimestampForSchemaValue(schema, fallback_timestamp_ns, value);
         }
 
-        pub fn resolveWriteTimestampNs(self: anytype, fallback_timestamp_ns: u64, value_json: []const u8) !u64 {
+        pub fn resolveWriteTimestampNs(self: anytype, fallback_timestamp_ns: u64, value_json: []const u8) !i128 {
             const schema = S.ownerField(self, "core").*.schema orelse return fallback_timestamp_ns;
             if (schema.ttl_duration_ns == 0) return fallback_timestamp_ns;
-            return (try ttlTimestampNsFromDocumentValue(S.ownerField(self, "alloc").*, schema, value_json)) orelse fallback_timestamp_ns;
+            return (try ttlTimestampNsFromDocumentValue(S.ownerField(self, "alloc").*, schema, value_json)) orelse @as(i128, fallback_timestamp_ns);
         }
 
         pub fn retainPreparedTextRoots(sync_level: types.SyncLevel, has_text_consumers: bool, split_shadow: bool) bool {
@@ -1560,6 +1561,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // the composed neighbor input/skip hash. Retain this request for postcommit
             // replay; synchronous levels still wait for its generated coverage there.
             if (request.requires_committed_graph or request.neighbor_context_json.len != 0) return false;
+            // An upstream asset's field is not a field of the primary row.
+            // Chunk/vector descendants must consume accepted producer bytes
+            // after commit, with the upstream causal witness. Precomputing them
+            // here could publish empty chunks and incorrectly settle coverage.
+            if (request.kind != .asset and request.upstream_artifact_name.len != 0) return false;
             // PDF page embeddings require their renderer, page-stage namespace
             // and capability lease. The ordinary text precompute path must not
             // embed the source URL as if it were document text.
@@ -1591,8 +1597,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             alloc: Allocator,
             schema: schema_mod.TableSchema,
             value_json: []const u8,
-        ) !?u64 {
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+        ) !?i128 {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
             defer parsed.deinit();
             const root = switch (parsed.value) {
                 .object => |object| object,
@@ -1603,24 +1609,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try ttlTimestampNsFromJsonValue(ttl_value);
         }
 
-        pub fn ttlTimestampNsFromJsonValue(value: std.json.Value) !u64 {
-            return switch (value) {
-                .integer => |integer| blk: {
-                    if (integer < 0) return error.InvalidArgument;
-                    break :blk std.math.cast(u64, integer) orelse return error.InvalidArgument;
-                },
-                .number_string => |text| std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch return error.InvalidArgument,
-                .string => |text| ttlTimestampNsFromString(text),
-                else => error.InvalidArgument,
-            };
+        pub fn ttlTimestampNsFromJsonValue(value: std.json.Value) !i128 {
+            return @import("../ttl.zig").parseSourceTimestamp(value) catch return error.InvalidArgument;
         }
 
-        pub fn ttlTimestampNsFromString(text: []const u8) !u64 {
-            const trimmed = std.mem.trim(u8, text, " \t\r\n");
-            if (trimmed.len == 0) return error.InvalidArgument;
-            if (std.fmt.parseInt(u64, trimmed, 10)) |ts| return ts else |_| {}
-            if (try parsePatternRfc3339ToNs(trimmed)) |ts| return ts;
-            return error.InvalidArgument;
+        pub fn ttlTimestampNsFromString(text: []const u8) !i128 {
+            return ttlTimestampNsFromJsonValue(.{ .string = text });
+        }
+
+        pub fn encodeDocumentTimestampValue(alloc: Allocator, fallback_version: u64, source: i128, restored_version: ?u64) ![]u8 {
+            // Event time is immutable across corrections; it cannot fence a
+            // mutation. Only replay restores a version from the source owner.
+            const version = restored_version orelse fallback_version;
+            return @import("../ttl.zig").encodeTimestampAlloc(alloc, version, source);
         }
 
         pub fn prepareRelationalRows(
@@ -1809,6 +1810,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 return;
                             };
                         }
+                        if (ctx.write_plan) |pinned_write_plan| {
+                            pinned_write_plan.validateExternalVectorSpacesParsed(scratch_arena.allocator(), prepared.extracted.dense_embeddings, prepared.parsedValue()) catch |err| {
+                                prepared.deinit(owner_alloc);
+                                ctx.fail(err);
+                                return;
+                            };
+                        }
                         if (prepared.extracted.hasDocument()) {
                             if (ctx.db) |owner_db| if (ctx.write_plan) |pinned_write_plan|
                                 owner_db.validateInlineSources(
@@ -1832,7 +1840,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     ctx.fail(err);
                                     return;
                                 });
-                                prepared.finalizeMetadata(write_timestamp_ns) catch |err| {
+                                const write_version = std.math.cast(u64, write_timestamp_ns) orelse {
+                                    prepared.deinit(owner_alloc);
+                                    ctx.fail(error.InvalidArgument);
+                                    return;
+                                };
+                                prepared.finalizeMetadata(write_version) catch |err| {
                                     prepared.deinit(owner_alloc);
                                     ctx.fail(err);
                                     return;

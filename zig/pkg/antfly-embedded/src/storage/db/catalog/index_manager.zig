@@ -6057,6 +6057,7 @@ pub const IndexManager = struct {
         text_requires_root: bool = true,
         text_fields: [][]u8 = &.{},
         dense_fields: []DenseFieldWritePlan,
+        external_vector_spaces: std.StringHashMapUnmanaged([]u8) = .empty,
         sparse_fields: []SparseFieldWritePlan,
         graph_fields: []GraphFieldWritePlan,
         /// Catalog-derived provider work compiled once for this generation.
@@ -6073,6 +6074,12 @@ pub const IndexManager = struct {
         chunk_dependents: [][]u32,
 
         pub fn deinit(self: *WritePlanSnapshot) void {
+            var spaces = self.external_vector_spaces.iterator();
+            while (spaces.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            self.external_vector_spaces.deinit(self.alloc);
             if (self.group_sources) |*plan| plan.deinit();
             if (self.completion_plan) |*plan| plan.deinit();
             if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
@@ -6230,6 +6237,12 @@ pub const IndexManager = struct {
             });
             sparse_vec.indices = &.{};
             sparse_vec.values = &.{};
+        }
+
+        /// Validate against the same immutable catalog used to prepare this row.
+        /// The caller owns scratch allocation and the parsed document lifetime.
+        pub fn validateExternalVectorSpacesParsed(self: WritePlanSnapshot, alloc: Allocator, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
+            try validateExternalVectorSpacesInPlan(&self, alloc, embeddings, document);
         }
 
         pub fn appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(
@@ -6614,9 +6627,32 @@ pub const IndexManager = struct {
         errdefer alloc.free(catalog_resolvers);
         var completion_plan = try @import("../artifact_completion_plan.zig").Plan.init(alloc, .{ .indexes = catalog_indexes, .enrichments = catalog_enrichments, .resolvers = catalog_resolvers }, generated_templates);
         errdefer completion_plan.deinit();
+        // Compile admission identities once per immutable catalog generation.
+        var external_spaces: std.StringHashMapUnmanaged([]u8) = .empty;
+        errdefer {
+            var spaces = external_spaces.iterator();
+            while (spaces.next()) |entry| {
+                alloc.free(entry.key_ptr.*);
+                alloc.free(entry.value_ptr.*);
+            }
+            external_spaces.deinit(alloc);
+        }
+        for (self.dense_indexes.items) |entry| {
+            if (!entry.external) continue;
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, entry.config.config_json, .{});
+            defer parsed.deinit();
+            const value = parsed.value.object.get("external_vector_space") orelse continue;
+            if (value != .string or value.string.len == 0) return error.InvalidIndexConfig;
+            const name = try alloc.dupe(u8, entry.config.name);
+            errdefer alloc.free(name);
+            const identity = try alloc.dupe(u8, value.string);
+            errdefer alloc.free(identity);
+            try external_spaces.put(alloc, name, identity);
+        }
         return .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
+            .external_vector_spaces = external_spaces,
             .artifact_catalogs = .{ .indexes = catalog_indexes, .enrichments = catalog_enrichments, .resolvers = catalog_resolvers },
             .catalog_empty = .{ self.count() == 0, self.enrichments.items.len == 0, self.resolvers.items.len == 0 and self.retired_resolvers.items.len == 0 },
             .has_text_consumers = blk: {
@@ -16404,6 +16440,7 @@ pub const IndexManager = struct {
                 }
                 try appendOwnedGeneratedRequest(alloc, &requests, .{
                     .kind = .sparse_embedding,
+                    .embedding_input = embedding_cfg.embedding_input,
                     .index_name = entry.config.name,
                     .artifact_name = chunk_cfg.artifact_name,
                     .embedding_name = embedding_name,
@@ -16436,6 +16473,7 @@ pub const IndexManager = struct {
                         if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try appendOwnedGeneratedRequest(alloc, &requests, .{
                                 .kind = .sparse_embedding,
+                                .embedding_input = embedding_cfg.embedding_input,
                                 .index_name = entry.config.name,
                                 .artifact_name = chunk_cfg.name,
                                 .embedding_name = embedding_name,
@@ -16454,6 +16492,7 @@ pub const IndexManager = struct {
                     } else if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
                         try appendOwnedGeneratedRequest(alloc, &requests, .{
                             .kind = .sparse_embedding,
+                            .embedding_input = embedding_cfg.embedding_input,
                             .index_name = entry.config.name,
                             .artifact_name = "",
                             .embedding_name = embedding_name,
@@ -17860,7 +17899,7 @@ pub const IndexManager = struct {
                 else
                     null;
                 if (referenced_embedding) |embedding_cfg| {
-                    if (embedding_cfg.expected_dims != 0) return error.InvalidIndexConfig;
+                    if (embedding_cfg.expected_dims != 0 or embedding_cfg.embedding_input != .text) return error.InvalidIndexConfig;
                 }
                 return .{
                     .chunk_name = if (sparse_generator) |generator| blk: {
@@ -18300,7 +18339,7 @@ pub const IndexManager = struct {
         const config = self.getEnrichment(.asset, name) orelse return false;
         var producer = asset_producer_mod.parseProducerConfig(self.alloc, config.producer_json) catch return false;
         defer producer.deinit(self.alloc);
-        return producer.type == .media_output;
+        return asset_producer_mod.supportsScalarTextProjection(producer.type, config.content_type);
     }
 
     fn artifactSourceSupportsUnitGrouping(self: *const IndexManager, artifact_name: []const u8) bool {
@@ -19837,6 +19876,53 @@ pub const IndexManager = struct {
             return entry.managed_direct_field;
         }
         return false;
+    }
+
+    /// Caller holds the catalog read/apply fence. The immutable write plan owns
+    /// indexed expected identities; ordinary writes do no index/config scans.
+    pub fn validateExternalVectorSpaces(self: *IndexManager, alloc: Allocator, embeddings: []const mapper.DenseEmbeddingWrite, document_json: []const u8) !void {
+        var plan = try self.acquireWritePlanSnapshot();
+        defer plan.release();
+        if (plan.plan().external_vector_spaces.count() == 0) return;
+        const document = std.json.parseFromSlice(std.json.Value, alloc, document_json, .{}) catch return error.InvalidEmbedding;
+        defer document.deinit();
+        try validateExternalVectorSpacesInPlan(plan.plan(), alloc, embeddings, document.value);
+    }
+
+    pub fn validateExternalVectorSpacesParsed(self: *IndexManager, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
+        var plan = try self.acquireWritePlanSnapshot();
+        defer plan.release();
+        try validateExternalVectorSpacesInPlan(plan.plan(), plan.plan().alloc, embeddings, document);
+    }
+
+    fn validateExternalVectorSpacesInPlan(plan: *const WritePlanSnapshot, alloc: Allocator, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
+        if (plan.external_vector_spaces.count() == 0) return;
+        // A receipt is an assertion about this authored row. Omitting vectors
+        // retains native bytes, but must not retain an assertion for a new row.
+        var supplied_names: std.StringHashMapUnmanaged(void) = .empty;
+        defer supplied_names.deinit(alloc);
+        for (embeddings) |embedding| {
+            const expected = plan.external_vector_spaces.get(embedding.index_name) orelse continue;
+            try supplied_names.put(alloc, embedding.index_name, {});
+            if (document != .object) return error.InvalidEmbedding;
+            const metadata = document.object.get("metadata") orelse return error.InvalidEmbedding;
+            if (metadata != .object) return error.InvalidEmbedding;
+            const spaces = metadata.object.get("embedding_spaces") orelse return error.InvalidEmbedding;
+            if (spaces != .object) return error.InvalidEmbedding;
+            const supplied = spaces.object.get(embedding.index_name) orelse return error.InvalidEmbedding;
+            if (supplied != .string or !std.mem.eql(u8, supplied.string, expected)) return error.InvalidEmbedding;
+        }
+        if (document != .object) return;
+        const metadata = document.object.get("metadata") orelse return;
+        if (metadata != .object) return;
+        const spaces = metadata.object.get("embedding_spaces") orelse return;
+        if (spaces != .object) return;
+        var receipts = spaces.object.iterator();
+        while (receipts.next()) |receipt| {
+            const expected = plan.external_vector_spaces.get(receipt.key_ptr.*) orelse continue;
+            if (receipt.value_ptr.* != .string or !std.mem.eql(u8, receipt.value_ptr.string, expected)) continue;
+            if (!supplied_names.contains(receipt.key_ptr.*)) return error.InvalidEmbedding;
+        }
     }
 
     pub fn denseIndexUsesExternalCoverage(self: *const IndexManager, index_name: []const u8) bool {
@@ -24018,7 +24104,7 @@ pub const IndexManager = struct {
                     return error.InvalidIndexConfig;
                 }
                 if (referenced_embedding) |embedding_cfg| {
-                    if (embedding_cfg.expected_dims != 0) return error.InvalidIndexConfig;
+                    if (embedding_cfg.expected_dims != 0 or embedding_cfg.embedding_input != .text) return error.InvalidIndexConfig;
                 }
                 var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
                 var multi_source_supports_unit_grouping = sparse_cfg.embedding_names.len > 0;
@@ -24027,7 +24113,7 @@ pub const IndexManager = struct {
                 var multi_source_implicit_producer: ?[]const u8 = null;
                 for (sparse_cfg.embedding_names) |embedding_name| {
                     const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
-                    if (embedding_cfg.expected_dims != 0) return error.InvalidIndexConfig;
+                    if (embedding_cfg.expected_dims != 0 or embedding_cfg.embedding_input != .text) return error.InvalidIndexConfig;
                     if (sparse_cfg.embedding_names.len > 1) {
                         if (embedding_cfg.vector_space.len == 0) {
                             multi_source_has_implicit_vector_space = true;
@@ -25402,6 +25488,7 @@ pub const IndexManager = struct {
                 defer if (semantic_producer) |value| self.alloc.free(value);
                 if (try parseDenseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
                     defer generator.deinit(self.alloc);
+                    try enrichment_types.validateEmbeddingInputShape(generator.embedding_input, true, generatorHasChunking(generator));
                     const chunk_cfg = resolveChunkGenerator(self, generator);
                     if (generatorHasChunking(chunk_cfg)) {
                         changed = (try self.ensureChunkEnrichment(.{
@@ -25552,6 +25639,7 @@ pub const IndexManager = struct {
 
     fn validateEnrichmentConfig(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
         if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
+        try enrichment_config_validation.validateEmbeddingInput(internalEnrichmentKindToPublic(cfg.kind), cfg.embedding_input, cfg.source_artifact_name, cfg.chunk_size, cfg.chunker_json);
         if (cfg.group_source_json.len > 0 or cfg.prior_context_json.len > 0) {
             var public = try enrichmentToPublic(self.alloc, cfg);
             defer public.deinit(self.alloc);
@@ -25570,11 +25658,6 @@ pub const IndexManager = struct {
                 }
             },
             .embedding => {
-                if (cfg.embedding_input == .pdf_page_images and
-                    (cfg.source_template.len > 0 or cfg.chunk_size > 0 or cfg.chunker_json.len > 0))
-                {
-                    return error.InvalidEnrichmentConfig;
-                }
                 if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.chunk, cfg.source_artifact_name) == null and self.assetGroupRoot(cfg.source_artifact_name).len == 0) {
                     return error.InvalidEnrichmentConfig;
                 }
@@ -25696,11 +25779,14 @@ pub const IndexManager = struct {
                 if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
             }
             if (entry.embedding_name) |embedding_name| {
-                if (!entry.external and !entry.managed_direct_field and self.getEnrichment(.embedding, embedding_name) == null) return error.InvalidEnrichmentConfig;
+                if (!entry.external and !entry.managed_direct_field) {
+                    const enrichment = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidEnrichmentConfig;
+                    if (enrichment.expected_dims != 0 or enrichment.embedding_input != .text) return error.InvalidEnrichmentConfig;
+                }
             }
             for (entry.embedding_names) |embedding_name| {
                 const enrichment = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidEnrichmentConfig;
-                if (enrichment.expected_dims != 0) return error.InvalidEnrichmentConfig;
+                if (enrichment.expected_dims != 0 or enrichment.embedding_input != .text) return error.InvalidEnrichmentConfig;
             }
         }
         for (self.graph_indexes.items) |entry| {
@@ -29226,6 +29312,7 @@ pub const IndexManager = struct {
                     parsed.doc_key,
                     parsed.edge_id,
                     if (parsed.edge_id.len > 0 and parsed.logical_source.len > 0) parsed.doc_key else "",
+                    0,
                     &snapshots,
                 );
                 try state.entry.index.replaceContributionSnapshots(snapshots.items);
@@ -29347,16 +29434,18 @@ pub const IndexManager = struct {
         // again rather than treating that intermediate sidecar as current.
         if (batch_writes.items.len > 0 or batch_deletes.items.len > 0)
             entry.invalidateNeighborSource();
-        try entry.index.batchApply(batch_writes.items, batch_deletes.items);
+        // Retain the freshness fence even if authoritative validation fails.
+        // Decode and validate authoritative contributions before changing the
+        // graph. A malformed timestamp must not leave a partially applied edge.
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
         if (entry.ttl_duration_ns != 0 or graphEntryHasContributors(entry)) {
             const primary = self.primary_store orelse return error.MissingPrimaryStore;
-            var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
             var field_cache: GraphFieldSnapshotCache = .{};
             for (batch_writes.items) |write| {
-                try self.appendGraphContributionSnapshot(arena, &field_cache, primary, entry, write.source, write.edge_type, write.target, write.owner, write.edge_id, write.owner_document, &snapshots);
+                try self.appendGraphContributionSnapshot(arena, &field_cache, primary, entry, write.source, write.edge_type, write.target, write.owner, write.edge_id, write.owner_document, write.ttl_created_ns, &snapshots);
             }
             for (batch_deletes.items) |delete| {
                 if (snapshot_mode == .retire_owner) {
@@ -29370,16 +29459,16 @@ pub const IndexManager = struct {
                         .contributions = &.{},
                     });
                 } else {
-                    try self.appendGraphContributionSnapshot(arena, &field_cache, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, delete.edge_id, delete.owner_document, &snapshots);
+                    try self.appendGraphContributionSnapshot(arena, &field_cache, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, delete.edge_id, delete.owner_document, 0, &snapshots);
                 }
             }
-            try entry.index.replaceContributionSnapshots(snapshots.items);
         }
+        try entry.index.batchApply(batch_writes.items, batch_deletes.items);
+        if (snapshots.items.len != 0) try entry.index.replaceContributionSnapshots(snapshots.items);
     }
 
     const GraphFieldSnapshot = struct {
         targets: std.StringHashMapUnmanaged(void) = .empty,
-        ttl_created_ns: u64 = 0,
     };
     const GraphFieldSnapshotCache = std.StringHashMapUnmanaged(GraphFieldSnapshot);
 
@@ -29419,8 +29508,10 @@ pub const IndexManager = struct {
         if (entry.ttl_duration_ns != 0 and result.value_ptr.targets.count() != 0) {
             const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, source);
             const timestamp = primary.get(alloc, timestamp_key) catch |err| if (err == error.NotFound) return error.GraphEdgeTtlMigrationRequired else return err;
-            if (timestamp.len != 8) return error.GraphEdgeTtlMigrationRequired;
-            result.value_ptr.ttl_created_ns = std.mem.readInt(u64, timestamp[0..8], .little);
+            const metadata = @import("../../ttl.zig").decodeTimestamp(timestamp) orelse return error.GraphEdgeTtlMigrationRequired;
+            // Validate the document fence, but never interpret it as a clock.
+            // Event time and logical revisions are both independent of edge TTL.
+            if (metadata.version == 0) return error.GraphEdgeTtlMigrationRequired;
         }
         return result.value_ptr;
     }
@@ -29437,6 +29528,7 @@ pub const IndexManager = struct {
         owner: []const u8,
         edge_id: []const u8,
         owner_document: []const u8,
+        admitted_lifetime_ns: u64,
         snapshots: *std.ArrayListUnmanaged(graph_mod.ContributionSnapshot),
     ) !void {
         const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (owner_document.len > 0) owner_document else if (owner.len > 0) owner else source, entry.config.name, edge_type, target, source, edge_id);
@@ -29488,7 +29580,27 @@ pub const IndexManager = struct {
             const field = try self.graphFieldSnapshot(alloc, field_cache, primary, entry, source, edge_type);
             if (field.targets.contains(target)) {
                 const field_state = try internal_keys.graphDirectStateKeyAlloc(alloc, source, entry.config.name);
-                try contributors.append(alloc, .{ .state_key = field_state, .source_priority = std.math.maxInt(u64), .weight = 1, .created_at = 0, .updated_at = 0, .ttl_created_ns = field.ttl_created_ns, .metadata_json = "" });
+                const lifetime = if (entry.ttl_duration_ns != 0) blk: {
+                    // The primary lifetime survives artifact expiration and is
+                    // specific to this edge/contributor, not the whole document.
+                    const key = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(alloc, artifact_key, entry.config.name, entry.config.coverage_generation, field_state);
+                    const raw_lifetime = primary.get(alloc, key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (raw_lifetime) |bytes| {
+                        if (bytes.len != 8) return error.InvalidGraphEdgeTtlLifetime;
+                        const timestamp = std.mem.readInt(u64, bytes[0..8], .big);
+                        if (timestamp == 0) return error.InvalidGraphEdgeTtlLifetime;
+                        break :blk timestamp;
+                    }
+                    // An ordered producer may already carry its admitted edge
+                    // clock. A field-only repair has no such authority: require
+                    // explicit re-admission through the normal write path.
+                    if (admitted_lifetime_ns == 0) return error.GraphEdgeTtlMigrationRequired;
+                    break :blk admitted_lifetime_ns;
+                } else 0;
+                try contributors.append(alloc, .{ .state_key = field_state, .source_priority = std.math.maxInt(u64), .weight = 1, .created_at = 0, .updated_at = 0, .ttl_created_ns = lifetime, .metadata_json = "" });
             }
         }
         try snapshots.append(alloc, .{
@@ -36548,6 +36660,7 @@ fn hasGeneratedSparseEmbeddingRequest(
 }
 
 fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) GeneratorConfig {
+    if (generator.embedding_input == .pdf_page_images) return generator;
     if (self.getEnrichment(.chunk, generator.artifact_name)) |cfg| {
         return .{
             .source_field = @constCast(cfg.source_field),
@@ -36570,6 +36683,9 @@ fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) 
 /// Runtime and replay code must consume this explicit shape rather than infer
 /// it from the overloaded artifact name.
 fn embeddingInputKind(self: *const IndexManager, generator: GeneratorConfig) enrichment_types.EmbeddingInputKind {
+    // PDF artifact_name identifies the generated page output. An unrelated
+    // chunk with that name cannot turn the original document into chunk input.
+    if (generator.embedding_input == .pdf_page_images) return .document;
     if (generator.artifact_name.len > 0) {
         if (self.getEnrichment(.chunk, generator.artifact_name)) |cfg|
             return embeddingInputKindForChunkEnrichment(cfg);

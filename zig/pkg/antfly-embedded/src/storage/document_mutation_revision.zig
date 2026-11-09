@@ -112,8 +112,7 @@ pub fn loadWindowWithRevisions(txn: anytype, a: std.mem.Allocator, physical: []c
             revisions[entry.row] = std.mem.readInt(u64, raw[0..8], .little);
         },
         .timestamp => {
-            if (raw.len != 8) return error.InvalidTimestamp;
-            timestamps[entry.row] = std.mem.readInt(u64, raw[0..8], .little);
+            timestamps[entry.row] = @import("ttl.zig").writeVersion(raw) orelse return error.InvalidTimestamp;
         },
     };
     if (mutation_revisions) |out| @memcpy(out, revisions[0..out.len]);

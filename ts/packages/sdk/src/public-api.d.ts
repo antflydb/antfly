@@ -10245,6 +10245,11 @@ export interface components {
             /** @description Ordered field list for multi-field terms aggregations. Each bucket key is a JSON string containing the serialized value array in the same order; clients should parse bucket.key as JSON. */
             fields?: string[];
             /**
+             * @description Exclude explicit nulls from terms grouping keys (including array elements). Missing fields are always skipped. Series helpers enable this so scan, temporal indexes, and SQL use the same non-null dimension model.
+             * @default false
+             */
+            exclude_null?: boolean;
+            /**
              * @description Maximum number of buckets to return (for bucketing aggregations)
              * @example 10
              */
@@ -10258,6 +10263,20 @@ export interface components {
              * @description Fixed interval for histogram aggregations
              */
             interval?: number;
+            /** @description Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets per histogram and 100000 generated cells (buckets plus metrics) per request. Only scalar metric sub-aggregations are supported with these bounds. */
+            date_bounds?: {
+                /** Format: date-time */
+                start: string;
+                /** Format: date-time */
+                end: string;
+            };
+            /** @description Positive elapsed duration for date_histogram (for example 30s, 5m, 1h30m). Mutually exclusive with calendar_interval. Nanosecond precision; UTC epoch alignment by default. */
+            fixed_interval?: string;
+            /**
+             * Format: date-time
+             * @description RFC3339 alignment origin for fixed_interval. Calendar buckets use calendar boundaries and reject this field.
+             */
+            bucket_origin?: string;
             /** @description Calendar-aware interval for date_histogram aggregations */
             calendar_interval?: components["schemas"]["CalendarInterval"];
             /**
@@ -10322,51 +10341,51 @@ export interface components {
         };
         AggregationResult: {
             /**
-             * Format: float
+             * Format: double
              * @description Single value for metric aggregations (sum, avg, min, max, count, cardinality)
              */
             value?: number;
             /** @description For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations. */
             approximate?: boolean;
             /**
-             * Format: float
+             * Format: double
              * @description For an approximate cardinality value, the relative standard error of the estimate. Present only when approximate is true.
              */
             relative_error?: number;
             /** @description Document count for stats aggregations */
             count?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Minimum value for stats aggregations
              */
             min?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Maximum value for stats aggregations
              */
             max?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Sum for stats aggregations
              */
             sum?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Sum of squares for stats aggregations
              */
             sum_of_squares?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Average for stats aggregations
              */
             avg?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Standard deviation for stats aggregations
              */
             std_deviation?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Variance for stats aggregations
              */
             variance?: number;
@@ -14386,6 +14405,8 @@ export interface components {
          *     when the request sets `profile: true`.
          */
         QueryProfile: {
+            /** @description Aggregation execution path, such as materialized_temporal or scan. Present when the executor reports it. */
+            aggregation_execution?: string;
             /** @description Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard. */
             value_verification?: {
                 /** Format: int64 */
@@ -17879,6 +17900,17 @@ export interface components {
         /** @description How PDF pages are rasterized for OCR. */
         DocumentExtractionRenderConfig: {
             /**
+             * @description PDF image sampling, separate from model resizing and normalization.
+             *     `auto` smooths continuous-tone images while preserving one-bit scan
+             *     coverage during minification. `pdf` honors the PDF's interpolation
+             *     declarations. `smooth` uses bilinear sampling even for one-bit images
+             *     (except stencil masks), which can soften fine lines. Effective policy,
+             *     version, resolution, DPI and geometry are recorded in unit provenance.
+             * @default auto
+             * @enum {string}
+             */
+            sampling?: "auto" | "pdf" | "smooth";
+            /**
              * @description Render resolution in dots per inch.
              * @default 150
              */
@@ -18266,6 +18298,12 @@ export interface components {
             template?: string;
             /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor). */
             source_artifact_name?: string;
+            /**
+             * @description pdf_page_images requires kind=embedding and a dense index. It consumes an original PDF URI selected by field or template and embeds its rendered pages. Upstream artifacts (source_artifact_name) and text chunking are not supported. Native field selectors address literal root keys; use a raw template for nested resource URIs.
+             * @default text
+             * @enum {string}
+             */
+            embedding_input?: "text" | "pdf_page_images";
             /** @description Expected embedding dimension for embedding enrichments. */
             expected_dims?: number;
             /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently. */
@@ -18483,6 +18521,8 @@ export interface components {
              * @default false
              */
             external?: boolean;
+            /** @description Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model. */
+            external_vector_space?: string;
             /**
              * @description When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
              * @default false
@@ -18973,6 +19013,10 @@ export interface components {
             /** @enum {string} */
             op: "count" | "sum" | "avg" | "min" | "max";
             group_by?: string[];
+            /** @description Schema datetime column used for temporal grouping. Requires bucket. */
+            time?: string;
+            /** @description UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch. */
+            bucket?: string;
             /** @description Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values. */
             measure?: string;
         };
@@ -19668,6 +19712,15 @@ export interface components {
              * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
              */
             readonly version?: number;
+            /** @description Physical document index order. Fields must have sortable scalar mappings. Changing the order requires rebuilding physical coverage. Relational tables use relational_indexes instead. */
+            index_sort?: {
+                field: string;
+                /**
+                 * @default asc
+                 * @enum {string}
+                 */
+                order?: "asc" | "desc";
+            }[];
             storage_mode?: components["schemas"]["TableStorageMode"];
             /** @description External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables. */
             base_source?: components["schemas"]["ExternalLakeTableSource"];
@@ -19759,6 +19812,11 @@ export interface components {
             template?: string;
             source_artifact_name?: string;
             expected_dims?: number;
+            /**
+             * @description Effective embedding input mode; PDF pages are rasterized before embedding.
+             * @enum {string}
+             */
+            embedding_input?: "text" | "pdf_page_images";
             /** @description Optional stable model/token-space identifier asserted for this embedding artifact. */
             vector_space?: string;
             chunk_size?: number;
@@ -19847,6 +19905,7 @@ export interface components {
             coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
             /** @default false */
             external?: boolean;
+            external_vector_space?: string;
             /** @default false */
             sparse?: boolean;
             dimension?: number;

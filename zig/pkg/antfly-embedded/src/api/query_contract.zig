@@ -639,6 +639,7 @@ pub const QueryResponseMeta = struct {
     merge: ?MergeProfile = null,
     dense_search: ?DenseSearchProfile = null,
     aggregation_results: []aggregations_mod.SearchAggregationResult = &.{},
+    aggregation_execution: ?[]const u8 = null,
 
     pub fn deinit(self: *QueryResponseMeta, alloc: std.mem.Allocator) void {
         if (self.evaluation_json) |data| alloc.free(data);
@@ -5022,7 +5023,7 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
     if (hit.stored_data) |stored_data| {
         const match_projection_configured = !req.hierarchy_match_include_all_fields;
         const source = if (req.defer_stored_projection or match_projection_configured)
-            try projectPublicStoredSourceValue(alloc, stored_data, .{
+            try projectHierarchyMemberSource(alloc, stored_data, .{
                 .fields = if (match_projection_configured) req.hierarchy_match_fields else req.fields,
                 .include_all_fields = if (match_projection_configured) false else req.include_all_fields,
             })
@@ -5046,6 +5047,42 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
     }
 
     return .{ .object = obj };
+}
+
+// Copy/text assets retain raw UTF-8, whereas chunks and extraction units are
+// JSON objects. Apply the same explicit projection to a synthetic text field
+// instead of feeding raw bytes into the JSON-only document projector.
+fn projectHierarchyMemberSource(alloc: std.mem.Allocator, raw: []const u8, options: db_mod.types.LookupOptions) !std.json.Value {
+    var value = try parseStoredSourceValue(alloc, raw);
+    defer db_mod.types.deinitJsonValue(alloc, &value);
+    if (value != .object) {
+        var object = std.json.ObjectMap.empty;
+        var scalar_field: []const u8 = "$";
+        if (!options.include_all_fields) for (options.fields) |field| {
+            if (std.mem.eql(u8, field, "text")) scalar_field = "text";
+            if (std.mem.eql(u8, field, "$")) {
+                scalar_field = "$";
+                break;
+            }
+        };
+        try object.put(alloc, try alloc.dupe(u8, scalar_field), try db_mod.types.cloneJsonValue(alloc, value));
+        db_mod.types.deinitJsonValue(alloc, &value);
+        value = .{ .object = object };
+    }
+    return try document_query.projectLookupValue(alloc, value, options);
+}
+
+test "api query contract projects raw text asset evidence without exposing unrequested fields" {
+    const a = std.testing.allocator;
+    var projected = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"text"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &projected);
+    try std.testing.expectEqualStrings("launch at 04:12", projected.object.get("text").?.string);
+    var scalar = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"$"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &scalar);
+    try std.testing.expectEqualStrings("launch at 04:12", scalar.object.get("$").?.string);
+    var hidden = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"provenance"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &hidden);
+    try std.testing.expectEqual(@as(usize, 0), hidden.object.count());
 }
 
 fn hierarchyAncestorsJsonValue(
@@ -5461,6 +5498,9 @@ pub fn freeAggregationRequests(
         if (request.fields.len > 0) alloc.free(@constCast(request.fields));
         if (request.calendar_interval.len > 0) alloc.free(request.calendar_interval);
         if (request.fixed_interval.len > 0) alloc.free(request.fixed_interval);
+        if (request.bucket_origin.len > 0) alloc.free(request.bucket_origin);
+        if (request.date_bounds_start.len > 0) alloc.free(request.date_bounds_start);
+        if (request.date_bounds_end.len > 0) alloc.free(request.date_bounds_end);
         if (request.significance_algorithm.len > 0) alloc.free(request.significance_algorithm);
         if (request.bucket_path.len > 0) alloc.free(request.bucket_path);
         if (request.sort_order.len > 0) alloc.free(request.sort_order);
@@ -5518,6 +5558,9 @@ fn parseAggregationRequestsAlloc(
             if (request.fields.len > 0) alloc.free(@constCast(request.fields));
             if (request.calendar_interval.len > 0) alloc.free(request.calendar_interval);
             if (request.fixed_interval.len > 0) alloc.free(request.fixed_interval);
+            if (request.bucket_origin.len > 0) alloc.free(request.bucket_origin);
+            if (request.date_bounds_start.len > 0) alloc.free(request.date_bounds_start);
+            if (request.date_bounds_end.len > 0) alloc.free(request.date_bounds_end);
             if (request.significance_algorithm.len > 0) alloc.free(request.significance_algorithm);
             if (request.bucket_path.len > 0) alloc.free(request.bucket_path);
             if (request.sort_order.len > 0) alloc.free(request.sort_order);
@@ -5564,6 +5607,7 @@ fn parseAggregationRequestsAlloc(
         out[initialized] = try parseSingleAggregationRequestAlloc(alloc, name, aggregation);
         initialized += 1;
     }
+    aggregations_mod.validateTemporalRequests(out) catch return error.InvalidQueryRequest;
     return out;
 }
 
@@ -5671,6 +5715,24 @@ fn parseSingleAggregationRequestAlloc(
         center_lon = std.fmt.parseFloat(f64, std.mem.trim(u8, lon_text, &std.ascii.whitespace)) catch return error.InvalidQueryRequest;
     }
 
+    if (aggregation.type == .date_histogram) {
+        const calendar = if (aggregation.calendar_interval) |value| blk: {
+            if (value != .string) return error.InvalidQueryRequest;
+            break :blk value.string;
+        } else "";
+        _ = @import("../search/aggregation.zig").parseDateInterval(calendar, aggregation.fixed_interval orelse "", aggregation.bucket_origin orelse "") catch return error.InvalidQueryRequest;
+    } else if (aggregation.fixed_interval != null or aggregation.bucket_origin != null or aggregation.date_bounds != null) return error.InvalidQueryRequest;
+    if (aggregation.date_bounds) |bounds| {
+        if (bounds != .object or bounds.object.count() != 2 or (aggregation.min_doc_count orelse 0) != 0) return error.InvalidQueryRequest;
+        const start = bounds.object.get("start") orelse return error.InvalidQueryRequest;
+        const end = bounds.object.get("end") orelse return error.InvalidQueryRequest;
+        if (start != .string or end != .string) return error.InvalidQueryRequest;
+        const first = @import("../datetime.zig").parseRfc3339ToSignedNs(start.string) orelse return error.InvalidQueryRequest;
+        const last = @import("../datetime.zig").parseRfc3339ToSignedNs(end.string) orelse return error.InvalidQueryRequest;
+        if (first >= last) return error.InvalidQueryRequest;
+    }
+
+    if ((aggregation.exclude_null orelse false) and aggregation.type != .terms) return error.InvalidQueryRequest;
     const cardinality_mode = try parseCardinalityModeJson(alloc, aggregation.mode);
 
     return .{
@@ -5679,12 +5741,17 @@ fn parseSingleAggregationRequestAlloc(
         .field = try alloc.dupe(u8, primary_field),
         .cardinality_mode = cardinality_mode,
         .fields = fields,
+        .exclude_null = aggregation.exclude_null orelse false,
         .size = aggregation.size orelse 0,
         .interval = if (aggregation.interval) |value| value else 0,
         .calendar_interval = if (aggregation.calendar_interval) |value|
             try jsonValueToFlatStringAlloc(alloc, value)
         else
             "",
+        .date_bounds_start = if (aggregation.date_bounds) |bounds| try aggregationDateBoundAlloc(alloc, bounds, "start") else "",
+        .date_bounds_end = if (aggregation.date_bounds) |bounds| try aggregationDateBoundAlloc(alloc, bounds, "end") else "",
+        .fixed_interval = if (aggregation.fixed_interval) |value| try alloc.dupe(u8, value) else "",
+        .bucket_origin = if (aggregation.bucket_origin) |value| try alloc.dupe(u8, value) else "",
         .min_doc_count = aggregation.min_doc_count orelse 0,
         .significance_algorithm = if (aggregation.algorithm) |value|
             try jsonValueToFlatStringAlloc(alloc, value)
@@ -5710,6 +5777,13 @@ fn parseSingleAggregationRequestAlloc(
         .algebraic_join = algebraic_join,
         .aggregations = nested,
     };
+}
+
+fn aggregationDateBoundAlloc(alloc: std.mem.Allocator, value: std.json.Value, field: []const u8) ![]u8 {
+    if (value != .object) return error.InvalidQueryRequest;
+    const bound = value.object.get(field) orelse return error.InvalidQueryRequest;
+    if (bound != .string or @import("../datetime.zig").parseRfc3339ToSignedNs(bound.string) == null) return error.InvalidQueryRequest;
+    return alloc.dupe(u8, bound.string);
 }
 
 fn parseAlgebraicAggregationJoinAlloc(
@@ -5824,22 +5898,22 @@ fn toOpenApiAggregationResult(
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
         defer parsed.deinit();
         switch (parsed.value) {
-            .float => |value| out.value = @floatCast(value),
+            .float => |value| out.value = value,
             .integer => |value| out.value = @floatFromInt(value),
             .object => |object| {
-                if (object.get("value")) |value| out.value = try jsonValueToF32(value);
+                if (object.get("value")) |value| out.value = try jsonValueToF64(value);
                 if (object.get("approximate")) |value| {
                     if (value == .bool) out.approximate = value.bool;
                 }
-                if (object.get("relative_error")) |value| out.relative_error = try jsonValueToF32(value);
+                if (object.get("relative_error")) |value| out.relative_error = try jsonValueToF64(value);
                 if (object.get("count")) |value| out.count = try jsonValueToI64(value);
-                if (object.get("min")) |value| out.min = try jsonValueToF32(value);
-                if (object.get("max")) |value| out.max = try jsonValueToF32(value);
-                if (object.get("sum")) |value| out.sum = try jsonValueToF32(value);
-                if (object.get("sum_squares")) |value| out.sum_of_squares = try jsonValueToF32(value);
-                if (object.get("avg")) |value| out.avg = try jsonValueToF32(value);
-                if (object.get("variance")) |value| out.variance = try jsonValueToF32(value);
-                if (object.get("std_dev")) |value| out.std_deviation = try jsonValueToF32(value);
+                if (object.get("min")) |value| out.min = try jsonValueToF64(value);
+                if (object.get("max")) |value| out.max = try jsonValueToF64(value);
+                if (object.get("sum")) |value| out.sum = try jsonValueToF64(value);
+                if (object.get("sum_squares")) |value| out.sum_of_squares = try jsonValueToF64(value);
+                if (object.get("avg")) |value| out.avg = try jsonValueToF64(value);
+                if (object.get("variance")) |value| out.variance = try jsonValueToF64(value);
+                if (object.get("std_dev")) |value| out.std_deviation = try jsonValueToF64(value);
             },
             else => {},
         }
@@ -5929,6 +6003,15 @@ fn jsonValueToBucketKeyAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![
 }
 
 fn jsonValueToF32(value: std.json.Value) !?f32 {
+    return switch (value) {
+        .null => null,
+        .integer => @floatFromInt(value.integer),
+        .float => @floatCast(value.float),
+        else => error.InvalidQueryRequest,
+    };
+}
+
+fn jsonValueToF64(value: std.json.Value) !?f64 {
     return switch (value) {
         .null => null,
         .integer => @floatFromInt(value.integer),
@@ -7192,6 +7275,7 @@ fn buildProfileValue(
         try parsed.value.object.put(alloc, "sort", try buildSortProfileValue(alloc, req, sort_profile));
     }
     if (result.document_authority_version != 0) try parsed.value.object.put(alloc, "document_authority_version", .{ .integer = result.document_authority_version });
+    if (meta.aggregation_execution) |execution| try parsed.value.object.put(alloc, "aggregation_execution", .{ .string = execution });
     return parsed.value;
 }
 
@@ -20906,4 +20990,77 @@ test "native member traversal requires producer and private parent admission" {
     defer json.deinit();
     try json.value.object.put(json.arena.allocator(), "_hierarchy_parent_admitted", .{ .bool = true });
     try std.testing.expect(objectHasInternalShardField(json.value.object));
+}
+
+test "time series public query preserves duration origin and bounded extent" {
+    const a = std.testing.allocator;
+    const requests = try parseAggregationRequestsJson(a,
+        \\{"points":{"type":"date_histogram","field":"ts","fixed_interval":"5m","bucket_origin":"1970-01-01T00:02:00Z","date_bounds":{"start":"2026-11-06T12:00:00Z","end":"2026-11-06T13:00:00Z"},"sub_aggregations":{"average":{"type":"avg","field":"value"}}}}
+    );
+    defer freeAggregationRequests(a, requests);
+    try std.testing.expectEqualStrings("5m", requests[0].fixed_interval);
+    try std.testing.expectEqualStrings("1970-01-01T00:02:00Z", requests[0].bucket_origin);
+    try std.testing.expectEqualStrings("2026-11-06T12:00:00Z", requests[0].date_bounds_start);
+    try std.testing.expectEqual(@as(usize, 1), requests[0].aggregations.len);
+}
+
+test "time series JSON aggregation keeps SQL float64 measurement precision" {
+    const a = std.testing.allocator;
+    const result = try toOpenApiAggregationResult(a, null, .{
+        .name = "average",
+        .field = "temperature",
+        .type = "avg",
+        .value_json = "{\"count\":1,\"sum\":23.123456789,\"avg\":23.123456789}",
+    });
+    try std.testing.expectEqual(@as(f64, 23.123456789), result.avg.?);
+    try std.testing.expectEqual(@as(f64, 23.123456789), result.sum.?);
+}
+
+test "time series range proof preserves the exact source predicate" {
+    const a = std.testing.allocator;
+    const execution = @import("query_execution_contract.zig");
+    var request = try parseQueryRequest(a, null, "readings",
+        \\{"limit":0,"timeout_ms":30000,"filter_query":{"conjuncts":[{"field":"ts","start":"2026-11-06T12:00:00Z","end":"2026-11-06T12:20:00Z","inclusive_start":true,"inclusive_end":false},{"field":"device_id","equals":"sensor"}]},"aggregations":{"series":{"type":"terms","fields":["device_id"],"size":20,"sub_aggregations":{"points":{"type":"date_histogram","field":"ts","fixed_interval":"5m","date_bounds":{"start":"2026-11-06T12:00:00Z","end":"2026-11-06T12:20:00Z"},"sub_aggregations":{"average":{"type":"avg","field":"v"}}}}}}}
+    );
+    defer request.deinit(a);
+    try std.testing.expect(execution.canConsiderAlgebraicAggregations(request.req));
+    const constraints = (try execution.algebraicConstraintsForRequestAlloc(a, request.req)) orelse return error.MissingTemporalRangeProof;
+    defer execution.freeAlgebraicConstraints(a, constraints);
+    try std.testing.expectEqual(@as(usize, 2), constraints.len);
+    var found = false;
+    for (constraints) |constraint| if (constraint.time_range != null) {
+        found = true;
+    };
+    try std.testing.expect(found);
+    var populated = request.req;
+    populated.aggregations_json = "{\"points\":{\"type\":\"date_histogram\",\"field\":\"ts\",\"fixed_interval\":\"300s\",\"min_doc_count\":1,\"sub_aggregations\":{\"average\":{\"type\":\"avg\",\"field\":\"v\"}}}}";
+    const populated_constraints = (try execution.algebraicConstraintsForRequestAlloc(a, populated)) orelse return error.MissingTemporalRangeProof;
+    defer execution.freeAlgebraicConstraints(a, populated_constraints);
+    try std.testing.expectEqual(constraints.len, populated_constraints.len);
+    var malformed = request.req;
+    malformed.filter_query_json = "{\"date_range\":{\"field\":\"ts\",\"start\":\"2026-11-06T12:00:00Z\",\"end\":\"2026-11-06T12:20:00Z\"},\"term\":{\"path\":\"tenant\",\"value\":\"restricted\"}}";
+    const rejected = try execution.algebraicConstraintsForRequestAlloc(a, malformed);
+    defer if (rejected) |items| execution.freeAlgebraicConstraints(a, items);
+    try std.testing.expect(rejected == null);
+}
+
+test "api query contract scalar evidence preserves JSON-shaped plaintext bytes" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "123", "true", "\"quoted\"", "{\"text\":\"launch\"}" }) |raw| {
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .@"$" = raw }, .{});
+        defer a.free(encoded);
+        var projected = try projectHierarchyMemberSource(a, encoded, .{ .fields = &.{"$"}, .include_all_fields = false });
+        defer db_mod.types.deinitJsonValue(a, &projected);
+        try std.testing.expectEqualStrings(raw, projected.object.get("$").?.string);
+    }
+}
+
+test "api query contract structured dollar projection never exposes internal fields" {
+    const a = std.testing.allocator;
+    var projected = try projectHierarchyMemberSource(a, "{\"text\":\"visible\",\"_artifact_unit_fingerprint\":\"private-proof\",\"_resolution_work\":{}}", .{ .fields = &.{"$"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &projected);
+    const wire = try std.json.Stringify.valueAlloc(a, projected, .{});
+    defer a.free(wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "private-proof") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "_resolution_work") == null);
 }

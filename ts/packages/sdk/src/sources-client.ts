@@ -26,7 +26,11 @@ export interface SourceDefinition {
   config: Record<string, unknown>;
   permissions: { public: boolean; readers: string[] };
   permission_ttl_seconds?: number;
-  publication?: "text" | "media";
+  publication?: "native" | "text" | "media";
+  search_version?: 1 | 2;
+  streams?: SearchStream[];
+  artifacts?: ArtifactBinding[];
+  processing?: ProcessingDeclaration;
   identity?: { namespace?: string };
 }
 
@@ -212,23 +216,43 @@ export class StandaloneSourcesClient extends SourceTransport {
 }
 
 export type {
+  ArtifactBinding,
   Capabilities,
   Mutation,
+  ProcessingDeclaration,
+  ProcessingJobRequest,
+  ProcessingPreset,
+  ProcessingPreview,
+  RetrievalBindings,
   Run,
   RunInput,
   RunPage,
+  SearchStatus,
+  SearchStream,
   Source,
   SourcePage,
+  TextStream,
+  VectorSpace,
 } from "./sources-types.js";
 
 import type {
+  ArtifactBinding,
   Capabilities,
   Mutation,
+  ProcessingDeclaration,
+  ProcessingJobRequest,
+  ProcessingPreset,
+  ProcessingPreview,
+  RetrievalBindings,
   Run,
   RunInput,
   RunPage,
+  SearchStatus,
+  SearchStream,
   Source,
   SourcePage,
+  TextStream,
+  VectorSpace,
 } from "./sources-types.js";
 
 /** Common management API. baseUrl includes the runtime's /sources/v1 mount. */
@@ -247,8 +271,33 @@ export class SourcesClient extends SourceTransport {
   source(id: string, signal?: AbortSignal): Promise<Source> {
     return this.request("GET", `/sources/${encodeURIComponent(id)}`, undefined, signal);
   }
+  previewProcessing(
+    id: string,
+    input: ProcessingPreset,
+    signal?: AbortSignal
+  ): Promise<ProcessingPreview> {
+    return this.request(
+      "POST",
+      `/sources/${encodeURIComponent(id)}/processing-preview`,
+      input,
+      signal
+    );
+  }
+  processingJob(
+    id: string,
+    input: ProcessingJobRequest,
+    signal?: AbortSignal
+  ): Promise<Record<string, unknown>> {
+    return this.request(
+      "POST",
+      `/sources/${encodeURIComponent(id)}/processing-jobs`,
+      input,
+      signal
+    );
+  }
   putSource(source: Source, signal?: AbortSignal): Promise<Source> {
-    return this.request("PUT", `/sources/${encodeURIComponent(source.id)}`, source, signal);
+    const { search_status: _observed, ...desired } = source;
+    return this.request("PUT", `/sources/${encodeURIComponent(source.id)}`, desired, signal);
   }
   removeSource(
     id: string,

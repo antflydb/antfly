@@ -636,21 +636,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .spng_paths = lib_image_spng_paths,
     });
     b.step("lib-image-bench", "Build and install lib-image-bench").dependOn(&b.addInstallArtifact(image_benchmark, .{}).step);
-    const webp_bench_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/webp_bench.zig"),
-        .target = target,
-        .optimize = .fast,
-        .link_libc = true,
-    });
-    const webp_codec_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/webp.zig"),
-        .target = target,
-        .optimize = .fast,
-    });
-    webp_codec_mod.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
-    webp_codec_mod.addImport("image_values", image_mod.import_table.get("image_values").?);
-    webp_bench_mod.addImport("antfly_webp", webp_codec_mod);
-    const webp_bench = b.addExecutable(.{ .name = "lib-image-webp-bench", .root_module = webp_bench_mod });
+    const webp_bench = image_build.addWebpBenchmark(b, b.path("lib/image"), target);
     b.step("lib-image-webp-bench", "Build the bounded WebP decode batch benchmark").dependOn(&b.addInstallArtifact(webp_bench, .{}).step);
 
     const pdf_bench_optimize = b.option(std.lang.Optimize, "pdf-optimize", "Optimization for the isolated PDF executable") orelse .fast;

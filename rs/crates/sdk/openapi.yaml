@@ -29782,6 +29782,12 @@ components:
           description: Ordered field list for multi-field terms aggregations. Each bucket key is a JSON
             string containing the serialized value array in the same order; clients should parse bucket.key
             as JSON.
+        exclude_null:
+          type: boolean
+          default: false
+          description: Exclude explicit nulls from terms grouping keys (including array elements). Missing
+            fields are always skipped. Series helpers enable this so scan, temporal indexes, and SQL use
+            the same non-null dimension model.
         size:
           type: integer
           x-go-type-skip-optional-pointer: false
@@ -29803,6 +29809,32 @@ components:
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Fixed interval for histogram aggregations
+        date_bounds:
+          type: object
+          additionalProperties: false
+          required:
+            - start
+            - end
+          description: Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter
+            documents; use a matching date range filter. Limited to 10000 buckets per histogram and 100000
+            generated cells (buckets plus metrics) per request. Only scalar metric sub-aggregations are
+            supported with these bounds.
+          properties:
+            start:
+              type: string
+              format: date-time
+            end:
+              type: string
+              format: date-time
+        fixed_interval:
+          type: string
+          description: Positive elapsed duration for date_histogram (for example 30s, 5m, 1h30m). Mutually
+            exclusive with calendar_interval. Nanosecond precision; UTC epoch alignment by default.
+        bucket_origin:
+          type: string
+          format: date-time
+          description: RFC3339 alignment origin for fixed_interval. Calendar buckets use calendar boundaries
+            and reject this field.
         calendar_interval:
           x-go-type-skip-optional-pointer: false
           allOf:
@@ -29908,7 +29940,7 @@ components:
       properties:
         value:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Single value for metric aggregations (sum, avg, min, max, count, cardinality)
@@ -29920,7 +29952,7 @@ components:
             aggregations.
         relative_error:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: For an approximate cardinality value, the relative standard error of the estimate.
@@ -29931,43 +29963,43 @@ components:
           description: Document count for stats aggregations
         min:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Minimum value for stats aggregations
         max:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Maximum value for stats aggregations
         sum:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Sum for stats aggregations
         sum_of_squares:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Sum of squares for stats aggregations
         avg:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Average for stats aggregations
         std_deviation:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Standard deviation for stats aggregations
         variance:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Variance for stats aggregations
@@ -36754,6 +36786,10 @@ components:
 
         when the request sets `profile: true`.
       properties:
+        aggregation_execution:
+          type: string
+          description: Aggregation execution path, such as materialized_temporal or scan. Present when
+            the executor reports it.
         value_verification:
           type: object
           description: Actual logical value verification work, summed across participating shards; plans
@@ -42627,6 +42663,25 @@ components:
       type: object
       description: How PDF pages are rasterized for OCR.
       properties:
+        sampling:
+          type: string
+          enum:
+            - auto
+            - pdf
+            - smooth
+          default: auto
+          description: >-
+            PDF image sampling, separate from model resizing and normalization.
+
+            `auto` smooths continuous-tone images while preserving one-bit scan
+
+            coverage during minification. `pdf` honors the PDF's interpolation
+
+            declarations. `smooth` uses bilinear sampling even for one-bit images
+
+            (except stencil masks), which can soften fine lines. Effective policy,
+
+            version, resolution, DPI and geometry are recorded in unit provenance.
         dpi:
           type: integer
           minimum: 72
@@ -43270,6 +43325,16 @@ components:
             consume other asset artifacts (the upstream asset''s produced bytes become this producer''s
             source, so field and template must be omitted and the producer must consume text: copy, generator,
             or extractor).'
+        embedding_input:
+          type: string
+          enum:
+            - text
+            - pdf_page_images
+          default: text
+          description: pdf_page_images requires kind=embedding and a dense index. It consumes an original
+            PDF URI selected by field or template and embeds its rendered pages. Upstream artifacts (source_artifact_name)
+            and text chunking are not supported. Native field selectors address literal root keys; use
+            a raw template for nested resource URIs.
         expected_dims:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -43696,6 +43761,14 @@ components:
           default: false
           description: When true, embeddings are supplied externally via _embeddings and the index does
             not derive prompts from a field or template.
+        external_vector_space:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Optional immutable compatibility declaration for an external dense index. Only
+            valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName]
+            with this exact identity; dimensions and finite values are checked independently. This is
+            an assertion by the writer, not proof of the generating model.
         sparse:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -44785,6 +44858,13 @@ components:
           items:
             type: string
             minLength: 1
+        time:
+          type: string
+          description: Schema datetime column used for temporal grouping. Requires bucket.
+        bucket:
+          type: string
+          description: UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed
+            elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch.
         measure:
           type: string
           minLength: 1
@@ -46124,6 +46204,27 @@ components:
           readOnly: true
           description: Backend-managed schema generation used for migrations. Omit it from create and
             update requests.
+        index_sort:
+          type: array
+          maxItems: 32
+          description: Physical document index order. Fields must have sortable scalar mappings. Changing
+            the order requires rebuilding physical coverage. Relational tables use relational_indexes
+            instead.
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - field
+            properties:
+              field:
+                type: string
+                minLength: 1
+              order:
+                type: string
+                enum:
+                  - asc
+                  - desc
+                default: asc
         storage_mode:
           $ref: '#/components/schemas/TableStorageMode'
         base_source:
@@ -46288,6 +46389,12 @@ components:
         expected_dims:
           type: integer
           minimum: 0
+        embedding_input:
+          type: string
+          enum:
+            - text
+            - pdf_page_images
+          description: Effective embedding input mode; PDF pages are rasterized before embedding.
         vector_space:
           type: string
           minLength: 1
@@ -46455,6 +46562,8 @@ components:
         external:
           type: boolean
           default: false
+        external_vector_space:
+          type: string
         sparse:
           type: boolean
           default: false

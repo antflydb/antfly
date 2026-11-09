@@ -183,6 +183,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server does not retry authoritative metadata table-exists conflict",
         "api http server retries interrupted metadata restore publication",
         "api query contract parses direct JSON-pointer path aliases",
+        "api query contract scalar evidence preserves JSON-shaped plaintext bytes",
+        "api query contract structured dollar projection never exposes internal fields",
         "api query contract serializes derived hierarchy ancestry",
         "api query contract serializes mention evidence hierarchy",
         "api query contract validates canonical hierarchy controls",

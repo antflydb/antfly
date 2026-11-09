@@ -39,7 +39,7 @@ on:
         default: ''
   push:
     branches: [main]
-    paths: ['zig/**', 'scripts/test-lake-s3-integration.sh', '.github/workflows/zig-owner-qualification.yml', '.github/workflows/pr-ci.yml']
+    paths: ['zig/**', '.github/actions/setup-native-build-tools/**', 'scripts/test-lake-s3-integration.sh', '.github/workflows/zig-owner-qualification.yml', '.github/workflows/pr-ci.yml']
   merge_group:
     types: [checks_requested]
   schedule:
@@ -90,7 +90,7 @@ jobs:
           else
             git fetch --no-tags --depth=1 origin "$BASE_SHA"
             git diff --name-only FETCH_HEAD HEAD > changed-paths.txt
-            if grep -Eq '^(zig/|scripts/test-lake-s3-integration.sh|.github/workflows/(zig-owner-qualification|pr-ci).yml)' changed-paths.txt; then
+            if grep -Eq '^(zig/|.github/actions/setup-native-build-tools/|scripts/test-lake-s3-integration.sh|.github/workflows/(zig-owner-qualification|pr-ci).yml)' changed-paths.txt; then
               echo 'owners=true' >> "$GITHUB_OUTPUT"
             else
               echo 'owners=false' >> "$GITHUB_OUTPUT"
@@ -119,13 +119,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - name: Install Zig archive extractor
-        if: runner.os == 'Linux'
-        run: |
-          if ! command -v xz >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends -y xz-utils
-          fi
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -181,13 +176,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - name: Install Zig archive extractor
-        if: runner.os == 'Linux'
-        run: |
-          if ! command -v xz >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends -y xz-utils
-          fi
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -252,11 +242,13 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
+          retention-days: 14
           name: lake-s3-compatible-linux
           path: .benchmark-results/lake-s3/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
+          retention-days: 14
           name: operation-owner-linux-x86_64
           path: .benchmark-results/owner-qualification/
 
@@ -282,13 +274,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - name: Install Zig archive extractor
-        if: runner.os == 'Linux'
-        run: |
-          if ! command -v xz >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends -y xz-utils
-          fi
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -321,6 +308,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
+          retention-days: 14
           name: media-owner-cache-linux-x86_64
           path: .benchmark-results/owner-cache/
 
@@ -346,13 +334,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - name: Install Zig archive extractor
-        if: runner.os == 'Linux'
-        run: |
-          if ! command -v xz >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends -y xz-utils
-          fi
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -396,6 +379,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
+          retention-days: 14
           name: production-operation-owners-linux-x86_64
           path: .benchmark-results/production-owners/
 
@@ -417,13 +401,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - name: Install Zig archive extractor
-        if: runner.os == 'Linux'
-        run: |
-          if ! command -v xz >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends -y xz-utils
-          fi
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -457,5 +436,6 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
+          retention-days: 14
           name: production-lake-cache-macos-arm64
           path: .benchmark-results/owner-cache/

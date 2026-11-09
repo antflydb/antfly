@@ -32,6 +32,14 @@ pub struct Capabilities {
     pub media_proxy: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serialized_runs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_versions: Option<Vec<i64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_discovery: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_presets: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_jobs: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +65,15 @@ pub struct Source {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_ttl_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub streams: Option<Vec<TextStream>>,
+    pub streams: Option<Vec<SearchStream>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<ArtifactBinding>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_status: Option<SearchStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing: Option<ProcessingDeclaration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,20 +133,154 @@ pub struct RunInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TextStream {
+pub struct SearchStream {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<String>,
-    pub field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location_field: Option<String>,
-    pub default: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boundary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<RetrievalBindings>,
+}
+
+pub type TextStream = SearchStream;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalBindings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<ExactRetrieval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_text: Option<FullTextRetrieval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<SemanticRetrieval>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExactRetrieval {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullTextRetrieval {
+    pub index: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorSpace {
+    pub id: String,
+    pub dimension: i64,
+    pub metric: String,
+    pub model: String,
+    pub revision: String,
+    pub query_preprocessing: String,
+    pub document_preprocessing: String,
+    pub query_modality: String,
+    pub document_modality: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticRetrieval {
+    pub index: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_artifacts: Option<Vec<String>>,
+    pub vector_space: VectorSpace,
+    pub query_inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_field: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactBinding {
+    pub name: String,
+    pub artifact: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    pub content_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepresentationStatus {
+    pub name: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchStatus {
+    pub version: i64,
+    pub streams: Vec<RepresentationStatus>,
+    pub artifacts: Vec<RepresentationStatus>,
+    pub observed_at: i64,
+    pub consistency: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeIndexDeclaration {
+    pub name: String,
+    pub config: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessingDeclaration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexes: Option<Vec<NativeIndexDeclaration>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessingPreset {
+    pub name: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_config: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedder: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessingPreview {
+    pub processing: ProcessingDeclaration,
+    pub stream: SearchStream,
+    pub artifact: ArtifactBinding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessingJobRequest {
+    pub artifact: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
 }

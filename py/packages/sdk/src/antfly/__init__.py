@@ -46,6 +46,9 @@ from .client_generated.models import (
     CurationProposalState,
     DerivedCoveragePolicy,
     DistanceMetric,
+    EntityDistinctRequest,
+    EntitySuppressRequest,
+    EntitySuppressRequestAbsorbed,
     GraphCatalogEntry,
     GraphDefinition,
     GraphLabelMapping,
@@ -56,9 +59,6 @@ from .client_generated.models import (
     GraphRelationshipMapping,
     GraphWireValue,
     GraphWriteReceipt,
-    EntityDistinctRequest,
-    EntitySuppressRequest,
-    EntitySuppressRequestAbsorbed,
     IndexMaintenanceOwnerProof,
     IndexMaintenanceRequest,
     IndexMaintenanceResponse,
@@ -295,7 +295,6 @@ __all__ = [
     "__version__",
 ]
 
-from .cypher import GraphOperations, decode_graph_value, encode_graph_parameter
 from .client_generated.models import (
     EntityConsumerProgressPage,
     EntityCurationResult,
@@ -320,6 +319,7 @@ from .client_generated.models import (
     ResolverUnmergeRequest,
     ResolverWait,
 )
+from .cypher import GraphOperations, decode_graph_value, encode_graph_parameter
 from .resolvers import CurationProposalOperations, EntityOperations, ResolverOperations
 
 __all__ += [
@@ -357,3 +357,7 @@ __all__ += ["resource_reference", "trace_event"]
 from .exceptions import AntflyHTTPError, AntflyNotFoundError, AntflyResponseError
 
 __all__ += ["AntflyHTTPError", "AntflyNotFoundError", "AntflyResponseError"]
+
+from .time_series import fixed_duration_nanoseconds, series_query
+
+__all__ += ["fixed_duration_nanoseconds", "series_query"]

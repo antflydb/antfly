@@ -15120,7 +15120,7 @@ pub const ApiHttpServer = struct {
                 bound_join,
                 resolver,
                 resolver.delivery,
-            ) catch |err| switch (err) {
+            ) catch |err| switch (public_table_http.normalizePublicAggregationError(err)) {
                 error.IndexRebuilding,
                 error.DocIdentityNamespaceMismatch,
                 error.IdentityReadGenerationChanged,
@@ -15144,9 +15144,8 @@ pub const ApiHttpServer = struct {
                 error.Timeout => {
                     return error.Timeout;
                 },
-                error.InvalidQueryRequest => {
-                    return err;
-                },
+                error.InvalidQueryRequest => return error.InvalidQueryRequest,
+                error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
                 else => return err,
             };
         }

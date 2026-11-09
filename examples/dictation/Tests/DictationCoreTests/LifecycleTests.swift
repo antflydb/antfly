@@ -53,6 +53,7 @@ private func lifecycleDirectory(_ config: Configuration = Configuration()) throw
   let store = Store(
     directory: directory, registerHotkey: false, shortcutManager: shortcut,
     credentialWriter: { credentials.append(($0, $1)) })
+  store.config.connectionMode = .external
   store.config.server = "https://saved.example"
   store.config.dictionary = ["Persisted"]
   store.token = "test-only-secret"
@@ -125,6 +126,7 @@ private actor LifecycleSignal {
       reads.append($0)
       return ""
     })
+  store.config.connectionMode = .external
   for host in ["https://o.example", "https://ol.example", "https://old.example"] {
     store.config.server = host
     store.connectionChanged()
@@ -158,6 +160,7 @@ private final class DiscoveryProtocol: URLProtocol, @unchecked Sendable {
     directory: directory, registerHotkey: false,
     credentialReader: { credentials[$0] ?? "" },
     credentialWriter: { credentials[$1] = $0 })
+  store.config.connectionMode = .external
   store.config.server = "https://saved.example"
   store.connectionChanged()
   store.save()
