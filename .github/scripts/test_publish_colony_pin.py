@@ -97,6 +97,38 @@ class FakeAPI:
 
 
 class PublisherTests(unittest.TestCase):
+    def test_repository_credentials_stay_with_their_own_authority(self):
+        api = p.GitHub("COLONY_SENTINEL", "ANTFLY_SENTINEL")
+        paths = [
+            (f"repos/{p.COLONY}/git/ref/heads/main", "COLONY_SENTINEL"),
+            (f"repos/{p.UPSTREAM}/compare/{OLD}...{TARGET}", "ANTFLY_SENTINEL"),
+            (f"repos/{p.UPSTREAM}/compare/{TARGET}...main", "ANTFLY_SENTINEL"),
+            (f"repos/{p.COLONY}/git/commits/{BASE}", "COLONY_SENTINEL"),
+        ]
+        with patch.object(
+            api.opener, "open", side_effect=lambda *args, **kwargs: io.BytesIO(b"{}")
+        ) as opened:
+            for path, _ in paths:
+                api.request(path)
+        for call, (path, token) in zip(opened.call_args_list, paths):
+            request = call.args[0]
+            self.assertEqual(request.full_url, p.API_ROOT + path)
+            self.assertEqual(request.get_header("Authorization"), "Bearer " + token)
+
+    def test_upstream_reads_never_fall_back_to_private_writer_credentials(self):
+        api = p.GitHub("COLONY_SENTINEL")
+        with patch.object(api.opener, "open", return_value=io.BytesIO(b"{}")) as opened:
+            api.request(f"repos/{p.UPSTREAM}/compare/{OLD}...{TARGET}")
+        self.assertIsNone(opened.call_args.args[0].get_header("Authorization"))
+        with patch.object(api.opener, "open") as opened:
+            for path, method in [
+                (f"repos/{p.UPSTREAM}/git/refs/heads/main", "PATCH"),
+                ("repos/other/repository/git/ref/heads/main", "GET"),
+            ]:
+                with self.assertRaises(p.PublicationError):
+                    api.request(path, method)
+            opened.assert_not_called()
+
     def report(self, api):
         return {
             "name": p.MANIFEST_CHECK,
