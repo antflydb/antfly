@@ -149815,3 +149815,28 @@ test "source semantic media input PDF producers cannot be bound to sparse consum
     defer retained.deinit(a);
     try std.testing.expectEqual(@TypeOf(retained.embedding_input).text, retained.embedding_input);
 }
+
+test "source semantic media input PDF page output cannot bind unrelated chunk definitions" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-pdf-output-name");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.close();
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addIndex(.{ .name = "invalid_pdf_chunks", .kind = .dense_vector, .config_json = "{\"field\":\"_unused\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"uri\",\"artifact_name\":\"bad_pages\",\"embedding_name\":\"bad_visual\",\"input\":\"pdf_page_images\",\"chunk_size\":128}}" }));
+    try std.testing.expect((try db.getEnrichment(a, .embedding, "bad_visual")) == null);
+    try std.testing.expect((try db.getEnrichment(a, .chunk, "bad_pages")) == null);
+    try db.addEnrichment(.{ .name = "pages", .kind = .chunk, .field = "body", .chunk_size = 512 });
+    try db.addIndex(.{ .name = "pdf_vectors", .kind = .dense_vector, .config_json = "{\"field\":\"_unused\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"uri\",\"artifact_name\":\"pages\",\"embedding_name\":\"visual\",\"input\":\"pdf_page_images\"}}" });
+    const source = "{\"body\":\"unrelated text\",\"uri\":\"https://example.org/original.pdf\"}";
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = source }}, .sync_level = .write });
+    const requests = try db.core.index_manager.planGeneratedEnrichments(a, "doc", source, &.{}, &.{});
+    defer @import("enrichment/enrichment_types.zig").deinitGeneratedRequests(a, requests);
+    try std.testing.expectEqual(@as(usize, 1), requests.len);
+    const request = requests[0];
+    try std.testing.expectEqual(@TypeOf(request.kind).dense_embedding, request.kind);
+    try std.testing.expectEqual(@TypeOf(request.embedding_input).pdf_page_images, request.embedding_input);
+    try std.testing.expectEqual(@TypeOf(request.input_kind).document, request.input_kind);
+    try std.testing.expectEqualStrings("uri", request.source_field);
+    try std.testing.expectEqual(@as(u32, 0), request.chunk_size);
+    try @import("enrichment/enrichment_types.zig").validateGeneratedEmbeddingInput(request);
+}

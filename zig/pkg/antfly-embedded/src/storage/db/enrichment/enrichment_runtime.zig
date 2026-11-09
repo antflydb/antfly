@@ -10624,6 +10624,7 @@ const SharedPdfWindowScheduler = struct {
     fn prepareConsumer(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !void {
         consumer.prepared = true;
         if (std.mem.indexOfScalar(u64, self.delayed_requests, logicalRequestFingerprint(request)) != null) return;
+        try enrichment_types.validateGeneratedEmbeddingInput(request);
         if (requestHasChunkSource(request)) return;
         if (request.kind == .asset) return self.prepareTextConsumer(consumer, request, raw);
         // Page-vector publication has a separate precommit sink. Never send
@@ -47018,6 +47019,12 @@ test "source semantic media input retained PDF chunk requests fail before replay
     var window = GeneratedReplayWindow{ .alloc = a };
     defer window.deinit();
     var scope = FailureScope{};
+    var invalid_document = request;
+    invalid_document.input_kind = .document;
+    var scheduler = SharedPdfWindowScheduler.init(&runtime, &.{invalid_document}, 0);
+    defer scheduler.deinit();
+    var consumer = SharedPdfWindowScheduler.Consumer{};
+    try std.testing.expectError(error.InvalidEnrichmentConfig, scheduler.prepareConsumer(&consumer, invalid_document, "{}"));
     try std.testing.expectError(error.InvalidEnrichmentConfig, processDenseEmbedding(&runtime, request, &cache, &sources, &window));
     try std.testing.expectError(error.InvalidEnrichmentConfig, processChunkedDenseWindow(&runtime, &.{request}, &cache, &window, &scope));
     request.kind = .sparse_embedding;

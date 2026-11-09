@@ -25482,6 +25482,7 @@ pub const IndexManager = struct {
                 defer if (semantic_producer) |value| self.alloc.free(value);
                 if (try parseDenseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
                     defer generator.deinit(self.alloc);
+                    try enrichment_types.validateEmbeddingInputShape(generator.embedding_input, true, generatorHasChunking(generator));
                     const chunk_cfg = resolveChunkGenerator(self, generator);
                     if (generatorHasChunking(chunk_cfg)) {
                         changed = (try self.ensureChunkEnrichment(.{
@@ -36627,6 +36628,7 @@ fn hasGeneratedSparseEmbeddingRequest(
 }
 
 fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) GeneratorConfig {
+    if (generator.embedding_input == .pdf_page_images) return generator;
     if (self.getEnrichment(.chunk, generator.artifact_name)) |cfg| {
         return .{
             .source_field = @constCast(cfg.source_field),
@@ -36649,6 +36651,9 @@ fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) 
 /// Runtime and replay code must consume this explicit shape rather than infer
 /// it from the overloaded artifact name.
 fn embeddingInputKind(self: *const IndexManager, generator: GeneratorConfig) enrichment_types.EmbeddingInputKind {
+    // PDF artifact_name identifies the generated page output. An unrelated
+    // chunk with that name cannot turn the original document into chunk input.
+    if (generator.embedding_input == .pdf_page_images) return .document;
     if (generator.artifact_name.len > 0) {
         if (self.getEnrichment(.chunk, generator.artifact_name)) |cfg|
             return embeddingInputKindForChunkEnrichment(cfg);
