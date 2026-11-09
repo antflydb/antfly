@@ -635,6 +635,7 @@
           },
           "processing": {
             "$ref": "#/components/schemas/ProcessingDeclaration",
+            "description": "Native processing desired state. Hosted reads expose this only to table administrators. On update, omission or null preserves existing processing; an explicit empty indexes list clears the declaration and requires table administration. Native indexes are retired separately through native administration.",
             "x-go-type-skip-optional-pointer": false
           }
         },

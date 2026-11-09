@@ -45015,7 +45015,12 @@ pub const DB = struct {
                 }
             }
         }
-        const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution;
+        // Grouped artifacts share their primary row's ordinal, but never its
+        // index-local document number. Resolve parent predicates to ordinals
+        // before scoring the member postings; this also preserves exact paging.
+        const grouped_artifact_filter = req.return_mode != .member and req.return_mode != .chunk and
+            try self.core.textIndexIsChunkBacked(alloc, req.index_name);
+        const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution or grouped_artifact_filter;
         var algebraic_filter = if (needs_algebraic_doc_filter)
             try self.searchRequestWithAlgebraicDocFilterAlloc(req)
         else
@@ -79645,6 +79650,53 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
     const after_delete = try db.getEdges(alloc, "selected_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, after_delete);
     try std.testing.expectEqual(@as(usize, 0), after_delete.len);
+}
+
+test "db grouped artifact text filters use parent ordinals across indexes" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.close();
+    try db.addIndex(.{ .name = "parents", .kind = .full_text, .config_json = "{}" });
+    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addEnrichment(.{ .name = "passages", .kind = .chunk, .source_artifact_name = "units", .field = "text", .chunk_size = 8, .chunk_overlap = 0 });
+    try db.addIndex(.{ .name = "passage_text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"passages\",\"field\":\"text\"}]}" });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:drop", .value = "{\"body\":\"alpha alpha alpha alpha alpha alpha\",\"source_id\":\"other\"}" },
+        .{ .key = "doc:keep", .value = "{\"body\":\"alpha launch alpha launch alpha launch\",\"source_id\":\"wanted\"}" },
+    }, .sync_level = .full_index });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    {
+        var all = try db.search(alloc, .{ .index_name = "passage_text", .full_text = .{ .match = .{ .field = "text", .text = "alpha" } } });
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 2), all.hits.len);
+    }
+    // The first parent's many members deliberately separate the member and
+    // parent document-number spaces. Both direct and composed dispatch must
+    // filter before selecting their one-result page, including exclusions.
+    for ([_]bool{ false, true }) |composed| {
+        for ([_]bool{ false, true }) |exclude| {
+            var req: types.SearchRequest = .{
+                .index_name = "passage_text",
+                .primary_text_index_name = "parents",
+                .full_text = .{ .match = .{ .field = "text", .text = "alpha" } },
+                .limit = 1,
+                .return_mode = .parent,
+            };
+            if (exclude) req.exclusion_query_json = "{\"term\":{\"source_id\":\"other\"}}" else req.filter_query_json = "{\"term\":{\"source_id\":\"wanted\"}}";
+            const named = [_]types.NamedFullTextQuery{.{ .name = "passages", .index_name = "passage_text", .query = req.full_text.? }};
+            if (composed) {
+                req.full_text = null;
+                req.index_name = null;
+                req.full_text_queries = &named;
+            }
+            var result = try db.search(alloc, req);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+            try std.testing.expectEqualStrings("doc:keep", result.hits[0].id);
+        }
+    }
 }
 
 test "db member-mode chunk hits filter through the parent row on the full-text arm" {

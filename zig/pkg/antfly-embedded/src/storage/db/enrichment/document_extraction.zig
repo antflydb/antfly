@@ -1115,7 +1115,16 @@ pub fn applyTranscriptTiming(unit: Unit, chunks: anytype) void {
         // when spans are built, and crediting the chunk to the speakers on
         // either side of it would put words in their mouths.
         var covered_to = start;
-        for (unit.transcript_spans) |span| {
+        // Spans are disjoint and ordered in text coordinates. Seek directly
+        // to this chunk so long recordings do not scan every phrase per chunk.
+        var low: usize = 0;
+        var high: usize = unit.transcript_spans.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (unit.transcript_spans[mid].char_end <= start) low = mid + 1 else high = mid;
+        }
+        for (unit.transcript_spans[low..]) |span| {
+            if (span.char_start >= end) break;
             if (span.char_end <= start or span.char_start >= end) continue;
             if (first == null) first = span.start_ms;
             last = span.end_ms;

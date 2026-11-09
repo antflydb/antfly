@@ -527,10 +527,22 @@ func validateProcessingSecretsDepth(value any, depth int) error {
 	switch v := value.(type) {
 	case map[string]any:
 		for key, value := range v {
+			if text, ok := value.(string); ok && text != "" && strings.HasSuffix(key, "_json") {
+				var decoded any
+				if err := json.Unmarshal([]byte(text), &decoded); err != nil {
+					return fmt.Errorf("invalid native processing JSON configuration")
+				}
+				if err := validateProcessingSecretsDepth(decoded, depth+1); err != nil {
+					return err
+				}
+			}
 			if processingCredentialField(key) {
-				if text, ok := value.(string); ok && text != "" && !strings.HasPrefix(text, "${secret:") {
+				if text, ok := value.(string); ok && text != "" && !processingSecretReference(text) {
 					return fmt.Errorf("processing credentials require native secret references")
 				}
+			}
+			if text, ok := value.(string); ok && processingEndpointField(key) && processingURLCredentials(text) {
+				return fmt.Errorf("processing endpoint credentials require native secret references")
 			}
 			if err := validateProcessingSecretsDepth(value, depth+1); err != nil {
 				return err
@@ -587,17 +599,6 @@ func pureFieldTemplate(template string) (string, bool) {
 		}
 	}
 	return field, true
-}
-
-// These are execution credentials, never encoder settings. Keep validation,
-// compatibility and public readback comparison on the same boundary. Opaque
-// producer documents are separately protected by content-addressed names.
-func processingCredentialField(key string) bool {
-	switch strings.ToLower(key) {
-	case "api_key", "token", "access_token", "client_secret", "private_key", "password", "secret_access_key", "access_key_id", "session_token", "authorization":
-		return true
-	}
-	return false
 }
 
 var errSearchMetadataBudget = errors.New("native metadata budget exceeded")

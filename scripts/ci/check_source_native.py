@@ -21,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import shlex
 import subprocess
 import tempfile
 import time
@@ -32,6 +33,7 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     if not args.no_build:
+        build_flags = shlex.split(os.environ.get("ZIG_BUILD_FLAGS", ""))
         subprocess.run(
             [
                 "python3",
@@ -42,6 +44,7 @@ def main():
                 "build",
                 "antfly-inference-managed-embedder-test",
                 "-Dtest-filter=managed embedder preserves coverage policy in storage config",
+                *build_flags,
             ],
             cwd=root / "zig",
             check=True,
@@ -56,6 +59,7 @@ def main():
                 "build",
                 "source-vector-contract-test",
                 "query-contract-test",
+                *build_flags,
             ],
             cwd=root / "zig",
             check=True,
@@ -76,10 +80,19 @@ def main():
         config.write_text(
             json.dumps(
                 {
+                    # This disposable owner only fetches the local fixture.
+                    # Production content security defaults remain unchanged.
+                    "remote_content": {
+                        "security": {
+                            "allowed_hosts": ["127.0.0.1"],
+                            "block_private_ips": False,
+                            "max_download_size_bytes": 2 << 20,
+                        }
+                    },
                     "inference": {
                         "models_dir": str(state / "models"),
                         "ml_dir": str(state / "ml"),
-                    }
+                    },
                 }
             )
         )
@@ -139,7 +152,7 @@ def main():
                         "-count=1",
                         "-v",
                         "-run",
-                        "^TestNativeSourceSearchStreams$",
+                        "^TestNative(SourceSearchStreams|TranscriptSearchEvidence)$",
                         "-timeout",
                         "4m",
                     ],

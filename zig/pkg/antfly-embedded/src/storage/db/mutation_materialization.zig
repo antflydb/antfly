@@ -4522,6 +4522,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .transcript_confidence = unit.transcript_confidence,
                 .extraction_warning = unit.extraction_warning,
             });
+            try chunk_artifact_mod.appendTranscriptSpans(alloc, &obj, unit.transcript_spans, chunk);
             return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
         }
 

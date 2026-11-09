@@ -145,6 +145,16 @@ func (b localManagement) PutSource(ctx context.Context, input management.Source)
 	if err = json.Unmarshal(raw, &mutation); err != nil {
 		return management.Source{}, err
 	}
+	// Omitted processing preserves the current private declaration atomically
+	// in the legacy mutation. Reconcile the persisted result, not the request.
+	b.s.mu.Lock()
+	for _, configured := range cloneProfile(b.s.profile).Sources {
+		if configured.ID == input.Id {
+			source = configured
+			break
+		}
+	}
+	b.s.mu.Unlock()
 	if source.Processing != nil {
 		publisher := b.searchPublisher()
 		if err := publisher.EnsureTable(ctx, source.Table); err != nil {

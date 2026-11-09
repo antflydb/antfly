@@ -118,6 +118,34 @@ Colony requires **table.admin** to install native processing, including through
 legacy import-job creation. Binding-only edits keep the existing table-write
 requirement. Source detail's **Search and processing** panel shows observed
 representation states and applies declarations without queuing a provider sync.
+Hosted GET/list responses include opaque processing declarations only for table
+administrators. Other table readers retain streams, artifacts and observed
+readiness. On either runtime, omitted/null `processing` in an update preserves
+the stored declaration atomically. An explicit empty plan clears desired
+processing and requires table administration in Colony; physical shared indexes
+are retired separately through native administration. Writer binding-only edits
+never replay private native processing installation.
+
+Credential classification follows native credential safety, including bearer and
+capability tokens, alternate key spellings and ADC paths. Literal credentials
+and credential-bearing endpoint URLs are rejected before desired state is saved;
+opaque `*_json` provider configurations receive the same recursive validation.
+Use complete native `${secret:name}` references.
+
+Transcription presets use native document extraction with an explicit transcript
+route and the supplied transcriber configuration. The existing unit protocol
+retains timing and speaker spans, and versions the new recipe without changing
+acquisition identity. Unit provenance exposes transcript spans. Chunk provenance
+includes the covering time interval and only the overlapping unit-relative spans;
+a single-speaker label is present only when the whole chunk is attributable to
+that speaker. Segment timing is preserved rather than interpolated into invented
+word timings. Chunk span selection and timing propagation use bounded range
+lookups, avoiding a scan of every recording segment for each chunk. Reapply the
+preset to migrate older raw-STT-JSON declarations to the new immutable recipe.
+Grouped passage queries resolve source predicates in parent identity space and
+apply shared parent ordinals to artifact postings before ranking and pagination.
+Index-local document numbers are never reused across distinct retrieval indexes.
+
 Native index backfill is durable; cancellation/reprocessing of artifact jobs uses
 the existing native job APIs rather than the provider sync cancellation API.
 

@@ -49,6 +49,19 @@ func BuildTextProcessing(preset TextProcessingPreset) (ProcessingDeclaration, Se
 		input = preset.ResourceField + ".uri"
 	}
 	producer := preset.Producer
+	// Transcription is a native unit-producing pipeline. Its existing unit
+	// protocol preserves segment timing/speakers for exact, ranked and chunk
+	// consumers, instead of treating the whole STT response as generic JSON.
+	if producer != nil && producer["type"] == "transcriber" {
+		if preset.ContentType != "" && preset.ContentType != "application/json" || preset.OutputField != "" && preset.OutputField != "text" {
+			return ProcessingDeclaration{}, SearchStream{}, ArtifactBinding{}, fmt.Errorf("transcript units require the native JSON text projection")
+		}
+		producer = map[string]any{"type": "document_extraction", "config": map[string]any{
+			"route_preset":  "explicit_only",
+			"transcription": map[string]any{"transcriber": producer["config"]},
+			"routes":        []any{map[string]any{"extractor": map[string]any{"type": "transcript", "unit": "transcript_segment"}}},
+		}}
+	}
 	if preset.ResourceField != "" && producer == nil {
 		return ProcessingDeclaration{}, SearchStream{}, ArtifactBinding{}, fmt.Errorf("resource processing requires an explicit native producer")
 	}

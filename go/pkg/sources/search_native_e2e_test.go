@@ -178,6 +178,14 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 	media["metadata"] = map[string]any{"embedding_spaces": map[string]any{ext.Name: "different-recipe"}}
 	_, err = p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": map[string]any{"image": media}, "sync_level": "full_index"})
 	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		for _, status := range ObserveSearch(ctx, p, binding).Streams {
+			if status.State != "ready" {
+				return false
+			}
+		}
+		return true
+	}, 60*time.Second, 100*time.Millisecond)
 	raw, err = p.Search(ctx, binding, request)
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(raw, &wire))
