@@ -3414,6 +3414,16 @@ pub const DB = struct {
     pub const lockApplyForPortableRuntime = local_mutation.lockApplyForPortableRuntime;
     pub const tryLockApplyForPortableRuntime = local_mutation.tryLockApplyForPortableRuntime;
 
+    /// lite-single-commit-write-path.md §7.5 (FK coordinator): exposes
+    /// `mutation_commit.zig`'s `prepareLocalIntegrityDecision` against this
+    /// `*DB` directly, for `capi/sql.zig`'s
+    /// `commitCoordinatedFusedMultiTable` to validate/prepare a NON-leader
+    /// participant table's integrity commands (e.g. a parent's `.attach`/
+    /// `.detach` Reference) while the coordinator holds that table's
+    /// `core.apply_mutex` itself -- never called against a table whose
+    /// lock this function would need to acquire on its own.
+    pub const prepareLocalIntegrityDecision = local_mutation.prepareLocalIntegrityDecision;
+
     fn lockApplySharedForPortableRuntime(self: *DB) !void {
         try self.enforcePortableRuntimeGate();
         lockApplyShared(self);
