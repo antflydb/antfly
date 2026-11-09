@@ -116,14 +116,17 @@ public actor AntflyClient {
   }
   public func cleanupText(
     _ text: String, preset: Preset, dictionary: [String],
-    formatting: VoiceFormatting.Options? = nil,
+    formatting: VoiceFormatting.Options? = nil, context: CleanupContext? = nil,
     events: @Sendable @escaping (DictationProgress) async -> Void = { _ in }
   ) async throws -> DictationResult {
     guard text.utf8.count <= 65536 else {
       throw DictationError.invalid("Transcript exceeds the cleanup limit.")
     }
-    if let formatting {
-      let plan = VoiceFormatting.Plan(text, options: formatting)
+    if let formatting = formatting
+      ?? context.map({ _ in VoiceFormatting.Options(commands: false, pressEnter: false) })
+    {
+      let context = context ?? CleanupContext()
+      let plan = VoiceFormatting.Plan(text, options: formatting, namespace: context.namespace)
       var result: DictationResult
       if !preset.runsCleanup || !plan.hasCleanupText {
         result = DictationResult(raw: text, text: plan.render().text)
@@ -145,7 +148,6 @@ public actor AntflyClient {
           protectedPreset.instructions = combinedInstructions
           protectedPreset.mode = .rewrite
         }
-        var cleaned = ""
         let requiresWhole =
           preset.outputMode == .rewrite || preset.processingStrategy == .wholeUtterance
         guard !requiresWhole || plan.input.utf8.count <= VoiceFormatting.Plan.maxCleanupBatchBytes
@@ -154,28 +156,23 @@ public actor AntflyClient {
             "This transcript exceeds the whole-utterance cleanup capacity. Use Clean with Automatic processing, shorten the recording, or insert the original transcript."
           )
         }
-        let batches = try plan.batches()
-        for batch in batches {
-          try Task.checkCancellation()
-          guard batch.needsCleanup else {
-            cleaned += batch.text
-            continue
-          }
-          let leading = String(batch.text.prefix(while: { $0.isWhitespace }))
-          let trailing = String(batch.text.reversed().prefix(while: { $0.isWhitespace }).reversed())
-          let content = batch.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectivePreset = protectedPreset
+        let cleaned = try await context.process(plan) { window in
+          let leading = String(window.prefix(while: { $0.isWhitespace }))
+          let trailing = String(window.reversed().prefix(while: { $0.isWhitespace }).reversed())
+          let content = window.trimmingCharacters(in: .whitespacesAndNewlines)
           let chunk: String
           if portable {
-            chunk = try await portableCleanup(
+            chunk = try await self.portableCleanup(
               content, preset: preset, dictionary: dictionary,
               protectedInstructions: plan.instructions)
           } else {
-            chunk = try await cleanupText(
-              content, preset: protectedPreset, dictionary: dictionary,
+            chunk = try await self.cleanupText(
+              content, preset: effectivePreset, dictionary: dictionary,
               events: { event in await events(DictationProgress(phase: event.phase, raw: text)) }
             ).text
           }
-          cleaned += leading + chunk + trailing
+          return leading + chunk + trailing
         }
         result = DictationResult(raw: text, text: cleaned)
         let restored = try plan.restore(result.text)

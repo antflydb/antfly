@@ -362,10 +362,20 @@ extension ClientTests {
   }
 }
 
-private func portableReply(_ text: String, finish: String = "stop") throws -> String {
-  String(
+private func completionToken(_ body: [String: Any]) throws -> String {
+  let messages = body["messages"] as! [[String: String]]
+  let rules = messages[0]["content"]!
+  let regex = try NSRegularExpression(pattern: #"\[DC_[A-F0-9]{32}\]"#)
+  let match = regex.firstMatch(in: rules, range: NSRange(rules.startIndex..., in: rules))!
+  return (rules as NSString).substring(with: match.range)
+}
+private func portableReply(_ text: String, finish: String = "stop", body: [String: Any]? = nil)
+  throws -> String
+{
+  let content = try body.map { text + "\n" + (try completionToken($0)) } ?? text
+  return String(
     decoding: try JSONSerialization.data(withJSONObject: [
-      "choices": [["finish_reason": finish, "message": ["role": "assistant", "content": text]]]
+      "choices": [["finish_reason": finish, "message": ["role": "assistant", "content": content]]]
     ]), as: UTF8.self)
 }
 extension ClientTests {
@@ -400,7 +410,9 @@ extension ClientTests {
       let text = String(messages[1]["content"]!.dropFirst("Transcript:\n".count))
       #expect(!text.contains("new paragraph") && !text.contains("press enter"))
       return (
-        200, "application/json", try portableReply("```text\nCleaned text: \"" + text + "\"\n```")
+        200, "application/json",
+        try portableReply(
+          "```text\nCleaned text: \"" + text + "\"\n" + (try completionToken(body)) + "\n```")
       )
     }
     var preset = Configuration().presets[0]
@@ -425,7 +437,8 @@ extension ClientTests {
       #expect(messages[0]["content"]!.contains("Preserve every token"))
       return (
         200, "application/json",
-        try portableReply(String(messages[1]["content"]!.dropFirst("Transcript:\n".count)))
+        try portableReply(
+          String(messages[1]["content"]!.dropFirst("Transcript:\n".count)), body: body)
       )
     }
     var preset = Configuration().presets[0]
@@ -523,7 +536,7 @@ extension ClientTests {
         return (200, "application/json", try portableReply("partial", finish: "length"))
       }
       return runtime
-        ? (200, "application/json", try portableReply(text))
+        ? (200, "application/json", try portableReply(text, body: body))
         : (200, "text/event-stream", try formattingEvents(raw: text, text: text))
     }
     var preset = Configuration().presets[0]
@@ -555,7 +568,8 @@ extension ClientTests {
       let messages = body["messages"] as! [[String: String]]
       return (
         200, "application/json",
-        try portableReply(String(messages[1]["content"]!.dropFirst("Transcript:\n".count)))
+        try portableReply(
+          String(messages[1]["content"]!.dropFirst("Transcript:\n".count)), body: body)
       )
     }
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -571,5 +585,136 @@ extension ClientTests {
     store.retryCleanup()
     await store.requestTask?.value
     #expect(store.result == "Hello\n\nworld" && store.phase == .ready && !store.canRecoverRaw)
+  }
+}
+
+extension ClientTests {
+  @Test(arguments: [false, true])
+  func contextualBatchesPreserveCorrectionsAndUnicodeOnBothBackends(runtime: Bool) async throws {
+    FixtureProtocol.reply = { request in
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      let text: String
+      if runtime {
+        let messages = body["messages"] as! [[String: String]]
+        text = String(messages[1]["content"]!.dropFirst("Transcript:\n".count))
+      } else {
+        text = body["transcript_text"] as! String
+      }
+      #expect(text.utf8.count <= VoiceFormatting.Plan.maxCleanupBatchBytes)
+      let cleaned = text.replacingOccurrences(
+        of: "staging no I mean production", with: "production")
+      return runtime
+        ? (200, "application/json", try portableReply(cleaned, body: body))
+        : (200, "text/event-stream", try formattingEvents(raw: text, text: cleaned))
+    }
+    var preset = Configuration().presets[0]
+    preset.cleanupModel = "generators/cleanup"
+    if runtime {
+      preset.model = "openai/whisper-tiny"
+      preset.transcriberRoute = .runtime
+      preset.cleanupModel = "google/gemma-3-1b-it"
+    }
+    let prefix = String(repeating: "x ", count: 1532)
+    let raw = prefix + "staging no I mean production"
+    let result = try await client().cleanupText(
+      raw, preset: preset, dictionary: [], formatting: .init())
+    #expect(result.text == prefix + "production")
+    let chinese = String(repeating: "这是一个中文句子。", count: 200)
+    let unicode = try await client().cleanupText(
+      chinese, preset: preset, dictionary: [], formatting: .init())
+    #expect(unicode.text == chinese && unicode.raw == chinese)
+  }
+
+  @Test func liveCumulativeCleanupRevisesPreviousSegmentWithoutDuplicatingOutput() async throws {
+    FixtureProtocol.reply = { request in
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      let raw = body["transcript_text"] as! String
+      let cleaned = raw.replacingOccurrences(of: "staging no I mean production", with: "production")
+      return (200, "text/event-stream", try formattingEvents(raw: raw, text: cleaned))
+    }
+    let connection = try client()
+    let context = CleanupContext()
+    let phases = FormattingPhaseLog()
+    var config = Configuration()
+    config.presets[0].cleanupModel = "generators/cleanup"
+    let preset = config.presets[0]
+    let pipeline = LiveDictation(
+      incremental: true, needsCleanup: true, formatting: .init(), cumulativeCleanup: true,
+      recognize: { data, commit in
+        if commit { return [] }
+        let first = data.first == 1
+        return [
+          RecognitionEvent(
+            type: "final", sequence: first ? 1 : 2,
+            text: first ? "We deploy to staging" : "no I mean production",
+            start: first ? 0 : 100, end: first ? 100 : 200)
+        ]
+      },
+      clean: { raw in
+        let result = try await connection.cleanupText(
+          raw, preset: preset, dictionary: [], formatting: .init(), context: context)
+        await phases.add(.cleaning)
+        return result
+      })
+    try await pipeline.append(Data([1]))
+    while await phases.values.isEmpty { await Task.yield() }
+    try await pipeline.append(Data([2]))
+    let result = try await pipeline.finish(Data())
+    #expect(result.raw == "We deploy to staging no I mean production")
+    #expect(result.text == "We deploy to production")
+  }
+}
+
+extension ClientTests {
+  @Test(arguments: ["missing", "wrong", "duplicate", "trailing", "empty"])
+  func portableCleanupRejectsUnverifiedStopsBeforeEnterCanBeProduced(kind: String) async throws {
+    FixtureProtocol.reply = { request in
+      #expect(request.url?.path == "/ai/v1/generate")
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      let messages = body["messages"] as! [[String: String]]
+      let input = String(messages[1]["content"]!.dropFirst("Transcript:\n".count))
+      let token = try completionToken(body)
+      let response: String
+      switch kind {
+      case "wrong": response = input + "\n[DC_00000000000000000000000000000000]"
+      case "duplicate": response = input + "\n" + token + "\n" + token
+      case "trailing": response = input + "\n" + token + "extra text"
+      case "empty": response = token
+      default: response = input  // Legacy Apple token cap with synthesized stop.
+      }
+      return (200, "application/json", try portableReply(response))
+    }
+    var preset = Configuration().presets[0]
+    preset.mode = .rewrite
+    preset.instructions = String(repeating: "x", count: 4096)
+    preset.cleanupModel = "generators/apple"
+    let raw = "Hello new line this is the rest of the sentence press enter"
+    do {
+      _ = try await client().cleanupText(
+        raw, preset: preset, dictionary: [], formatting: .init(pressEnter: true))
+      Issue.record("Unverified portable output became eligible for insertion")
+    } catch let error as DictationError { #expect(error.rawTranscript == raw) }
+  }
+}
+
+extension ClientTests {
+  @Test func explicitCleanupContextWorksWithoutEnablingVoiceCommands() async throws {
+    FixtureProtocol.reply = { request in
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      let raw = body["transcript_text"] as! String
+      let text = raw.replacingOccurrences(of: "staging no I mean production", with: "production")
+      return (200, "text/event-stream", try formattingEvents(raw: raw, text: text))
+    }
+    let context = CleanupContext()
+    let connection = try client()
+    var preset = Configuration().presets[0]
+    preset.cleanupModel = "generators/cleanup"
+    _ = try await connection.cleanupText(
+      "We deploy to staging", preset: preset, dictionary: [], context: context)
+    let result = try await connection.cleanupText(
+      "We deploy to staging no I mean production new line", preset: preset, dictionary: [],
+      context: context)
+    #expect(result.text == "We deploy to production new line")
+    #expect(result.formatting?.pressEnter == false)
   }
 }

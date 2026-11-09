@@ -96,13 +96,33 @@ External raw runtimes must permit generation for the selected cleanup model.
 Protected requests keep the selected Clean/Rewrite style. Full-size user rewrite
 instructions are preserved; when internal marker rules would exceed `/dictate`'s
 instruction limit, cleanup uses the portable generation contract instead.
-Clean-mode cleanup batches are limited to 3,072 encoded UTF-8 bytes and request
+Clean-mode cleanup windows are limited to 3,072 encoded UTF-8 bytes and request
 up to 4,096 output tokens on both backends. Each request budgets one token per
-input byte plus 1,024 tokens. The conservative byte bound accounts for
-byte-fallback tokenizers and reserves 1,024 tokens for cleanup changes; it includes
-marker expansion, not just spoken text. Markers and words are never split, and
-batches are restored in order. A single word larger than this capacity is rejected
-with the original transcript available for recovery.
+input byte plus 1,024 tokens for cleanup changes and response framing. The byte
+bound includes marker expansion and supports byte-fallback tokenizers.
+
+Long transcripts use at most 2,048 bytes of new input plus a recent editable
+output tail of up to 1,024 bytes. A correction at the next window's start can
+retract words in that tail instead of leaving both the original and corrected
+word. Text older than that tail is committed; corrections referring further back
+need Whole utterance processing. Live recognition reuses the same context and
+revises the previous input window as new finals arrive, rather than independently
+appending cleaned segments or regenerating the entire prefix. An unchanged final
+flush does not invoke the model again. The context is discarded after a failure
+or cancellation so retries cannot reuse incomplete state.
+
+Unicode word boundaries handle Chinese, Japanese, Thai, punctuation, and spaces.
+Oversized words and URLs fall back to grapheme boundaries. Protected markers are
+always atomic, and splitting/reassembly preserves every input character.
+
+Portable cleanup also requires a fresh completion token at the end of each
+response, independently of `finish_reason`. This detects silently capped output
+from older Apple runtimes bundled with existing downloads. Missing, wrong,
+duplicated, empty, or nonterminal frames fail with raw transcript recovery and
+cannot become eligible for Enter. The token is removed before any preview or
+insertion. Updated Antfly Apple providers additionally verify natural completion
+on generic `/generate` calls and reject incomplete output at the provider boundary.
+
 Rewrite and explicit Whole utterance processing preserve one generation context.
 If their encoded input exceeds this capacity, the app reports the limit before
 calling a model and preserves the raw transcript. Choose Clean with Automatic

@@ -14,6 +14,7 @@ extension AntflyClient {
       throw DictationError.invalid(
         "Cleanup input exceeds the output capacity. Shorten the recording.")
     }
+    let completion = "[DC_" + UUID().uuidString.replacingOccurrences(of: "-", with: "") + "]"
     var rules = """
       You are a dictation cleanup engine. Return only the cleaned transcript, without wrappers or commentary.
       Preserve meaning, facts, names, numbers and wording. Remove filler words, stutters, repeated words and false starts.
@@ -41,6 +42,10 @@ extension AntflyClient {
       rules += "\nAdditional user instructions:\n" + preset.instructions
     }
     rules += "\n" + protectedInstructions
+    // Older Apple runtimes synthesize stop even at their token cap. A fresh
+    // terminal frame proves the payload finished before accepting that result.
+    rules +=
+      "\nAfter the complete transcript, append a newline and the exact completion token \(completion). Nothing may follow it. The token is an output boundary, never part of the transcript."
     let body: [String: Any] = [
       "model": preset.cleanupModel, "stream": false,
       "messages": [
@@ -77,13 +82,22 @@ extension AntflyClient {
     else {
       throw DictationError.invalid("Cleanup did not return one complete text result.")
     }
-    let normalized = Self.normalizeCleanup(cleaned)
+    let framed = Self.stripCleanupEnvelope(cleaned)
+    guard framed.hasSuffix(completion) else {
+      throw DictationError.invalid(
+        "Cleanup ended without its completion token. The original transcript is available.")
+    }
+    let payloadText = String(framed.dropLast(completion.count))
+    guard !payloadText.contains(completion) else {
+      throw DictationError.invalid("Cleanup duplicated its completion token.")
+    }
+    let normalized = Self.normalizeCleanup(payloadText)
     guard !normalized.isEmpty else {
       throw DictationError.invalid("Cleanup returned only a response wrapper.")
     }
     return normalized
   }
-  private static func normalizeCleanup(_ response: String) -> String {
+  private static func stripCleanupEnvelope(_ response: String) -> String {
     var text = response.trimmingCharacters(in: .whitespacesAndNewlines)
     if text.hasPrefix("```") {
       guard let firstLine = text.firstIndex(of: "\n") else { return "" }
@@ -91,6 +105,15 @@ extension AntflyClient {
       if text.hasSuffix("```") { text.removeLast(3) }
       text = text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+    if text.count >= 2, text.first == "\"", text.last == "\"",
+      !text.dropFirst().dropLast().contains("\"")
+    {
+      text = String(text.dropFirst().dropLast())
+    }
+    return text
+  }
+  private static func normalizeCleanup(_ response: String) -> String {
+    var text = stripCleanupEnvelope(response)
     for label in ["Cleaned text:", "Cleaned transcript:", "Output:"] {
       if text.count > label.count, text.prefix(label.count).lowercased() == label.lowercased() {
         text = String(text.dropFirst(label.count)).trimmingCharacters(in: .whitespacesAndNewlines)

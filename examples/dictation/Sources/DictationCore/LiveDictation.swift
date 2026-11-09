@@ -23,6 +23,7 @@ public actor LiveDictation {
   private let formatting: VoiceFormatting.Options?
   private var cleanupBoundaries: [Int] = []
   private var cleanedRawUTF16 = 0
+  private let cumulativeCleanup: Bool
   private let incremental: Bool
   private let needsCleanup: Bool
   private var segments: [Segment] = []
@@ -46,10 +47,12 @@ public actor LiveDictation {
 
   public init(
     incremental: Bool, needsCleanup: Bool, formatting: VoiceFormatting.Options? = nil,
+    cumulativeCleanup: Bool = false,
     recognize: @escaping Recognize,
     clean: @escaping Clean, close: @escaping @Sendable () async -> Void = {},
     observe: @escaping Observe = { _ in }
   ) {
+    self.cumulativeCleanup = cumulativeCleanup
     self.formatting = formatting
     self.incremental = incremental && formatting?.pressEnter != true
     self.needsCleanup = needsCleanup
@@ -67,15 +70,18 @@ public actor LiveDictation {
       await client.closeSession(id)
       throw CancellationError()
     }
+    let context = CleanupContext()
+    let cleanupFormatting = formatting ?? .init(commands: false, pressEnter: false)
     return LiveDictation(
       incremental: plan.incrementalCleanup, needsCleanup: preset.runsCleanup,
-      formatting: formatting,
+      formatting: formatting, cumulativeCleanup: true,
       recognize: {
         try await client.appendSessionEvents(id, audio: $0, sampleRate: 16000, commit: $1)
       },
       clean: {
         try await client.cleanupText(
-          $0, preset: preset, dictionary: dictionary, formatting: formatting)
+          $0, preset: preset, dictionary: dictionary, formatting: cleanupFormatting,
+          context: context)
       },
       close: { await client.closeSession(id) }, observe: observe)
   }
@@ -152,7 +158,8 @@ public actor LiveDictation {
     {
       // Coalesce any backlog to avoid one model invocation per short phrase.
       let end = segments.count
-      let input = segments[index..<end].map(\.raw).joined(separator: " ")
+      let first = cumulativeCleanup ? 0 : index
+      let input = segments[first..<end].map(\.raw).joined(separator: " ")
       do {
         let began = ProcessInfo.processInfo.systemUptime
         let output = try await clean(input)
@@ -165,10 +172,14 @@ public actor LiveDictation {
         else {
           throw DictationError.invalid("Cleanup returned empty text for speech.")
         }
-        cleanedRawUTF16 += (index == 0 ? 0 : 1) + input.utf16.count
+        if cumulativeCleanup {
+          cleanedRawUTF16 = input.utf16.count
+        } else {
+          cleanedRawUTF16 += (index == 0 ? 0 : 1) + input.utf16.count
+        }
         cleanupBoundaries.append(cleanedRawUTF16)
-        segments[index].cleaned = output.text
-        if index + 1 < end { for offset in (index + 1)..<end { segments[offset].cleaned = "" } }
+        segments[first].cleaned = output.text
+        if first + 1 < end { for offset in (first + 1)..<end { segments[offset].cleaned = "" } }
         await observe(
           DictationProgress(
             phase: committed ? .cleaning : .listening,

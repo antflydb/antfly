@@ -23,7 +23,6 @@ public enum VoiceFormatting {
   }
   private static let trailingEnter = try! NSRegularExpression(
     pattern: #"(?i)\bpress\s+enter[.!?]*\s*$"#)
-  private static let atoms = try! NSRegularExpression(pattern: #"\S+|\s+"#)
   private static let breaks = try! NSRegularExpression(
     pattern:
       #"(?i)\b(start a new paragraph|new paragraph|new line|next line|line break|skip a line)\b"#)
@@ -93,7 +92,6 @@ public enum VoiceFormatting {
     private let markers: [String]
     private let spans: [NSRange]
     private let namespace: String
-    private let pieces: [(text: String, literal: Bool)]
     public struct Batch: Sendable {
       public let text: String
       public let needsCleanup: Bool
@@ -105,6 +103,9 @@ public enum VoiceFormatting {
         : "Preserve every token beginning with \(namespace) exactly once, unchanged and in its original order. Tokens containing _P_ mark paragraph boundaries, _L_ mark line boundaries, and _Q_ stand for literal quoted text. Format surrounding prose appropriately, but never interpret, edit, delete, or reorder tokens, or move text across them."
     }
     public init(_ raw: String, options: Options = Options()) {
+      self.init(raw, options: options, namespace: UUID())
+    }
+    init(_ raw: String, options: Options, namespace id: UUID) {
       let original = raw as NSString
       let quoted = quotations(original)
       var end = original.length
@@ -149,25 +150,22 @@ public enum VoiceFormatting {
         }
       }
       protected.sort { $0.0.location < $1.0.location }
-      namespace = "[VF_" + UUID().uuidString.replacingOccurrences(of: "-", with: "") + "_"
+      namespace = "[VF_" + id.uuidString.replacingOccurrences(of: "-", with: "") + "_"
       var values: [String] = []
       var tokens: [String] = []
       var ranges: [NSRange] = []
       var encoded = ""
       var ordinary = ""
       var cursor = 0
-      var pieces: [(text: String, literal: Bool)] = []
       for (range, value) in protected {
         let start = max(cursor, range.location)
         let finish = NSMaxRange(range)
         guard finish >= start else { continue }
         let plain = text.substring(with: NSRange(location: cursor, length: start - cursor))
-        pieces.append((plain, false))
         encoded += plain
         ordinary += plain
         let kind = value == "\n\n" ? "P_" : (value == "\n" ? "L_" : "Q_")
         let token = namespace + kind + String(tokens.count) + "]"
-        pieces.append((token, true))
         encoded += token
         tokens.append(token)
         values.append(value)
@@ -177,8 +175,6 @@ public enum VoiceFormatting {
       let tail = text.substring(from: cursor)
       encoded += tail
       ordinary += tail
-      pieces.append((tail, false))
-      self.pieces = pieces
       input = encoded
       markers = tokens
       originals = values
@@ -189,10 +185,55 @@ public enum VoiceFormatting {
         action
         && (!ordinary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !values.isEmpty)
     }
-    /// Size the wire form, not the transcript. Never split a marker or UTF-8
-    /// word; callers preserve boundary whitespace across independent cleanups.
+    /// Lossless Unicode word boundaries, with a grapheme-safe fallback for
+    /// oversized words/URLs. Only protected markers are indivisible wire atoms.
     public func batches(maxBytes: Int = Plan.maxCleanupBatchBytes) throws -> [Batch] {
+      try partition(input, maxBytes: maxBytes)
+    }
+    func partition(_ source: String, maxBytes: Int, fromEnd: Bool = false) throws -> [Batch] {
       guard maxBytes > 0 else { throw DictationError.invalid("Invalid cleanup batch limit.") }
+      var atoms: [(text: String, literal: Bool)] = []
+      func atom(_ value: String, literal: Bool) throws {
+        guard value.utf8.count <= maxBytes else {
+          throw DictationError.invalid(
+            "A cleanup character or protected marker exceeds the request limit.")
+        }
+        if !value.isEmpty { atoms.append((value, literal)) }
+      }
+      func word(_ value: Substring) throws {
+        if value.utf8.count <= maxBytes {
+          try atom(String(value), literal: false)
+        } else {
+          for character in value { try atom(String(character), literal: false) }
+        }
+      }
+      func prose(_ value: Substring) throws {
+        let plain = String(value)
+        var ranges: [Range<String.Index>] = []
+        plain.enumerateSubstrings(
+          in: plain.startIndex..<plain.endIndex, options: [.byWords, .substringNotRequired]
+        ) {
+          _, range, _, _ in ranges.append(range)
+        }
+        var cursor = plain.startIndex
+        for range in ranges {
+          try word(plain[cursor..<range.lowerBound])
+          try word(plain[range])
+          cursor = range.upperBound
+        }
+        try word(plain[cursor...])
+      }
+      var cursor = source.startIndex
+      while let start = source.range(of: namespace, range: cursor..<source.endIndex) {
+        try prose(source[cursor..<start.lowerBound])
+        guard let end = source[start.upperBound...].firstIndex(of: "]") else {
+          throw DictationError.invalid("Cleanup changed protected formatting.")
+        }
+        let next = source.index(after: end)
+        try atom(String(source[start.lowerBound..<next]), literal: true)
+        cursor = next
+      }
+      try prose(source[cursor...])
       var result: [Batch] = []
       var text = ""
       var bytes = 0
@@ -203,32 +244,17 @@ public enum VoiceFormatting {
         bytes = 0
         speech = false
       }
-      func append(_ atom: String, literal: Bool) throws {
-        let size = atom.utf8.count
-        guard size <= maxBytes else {
-          throw DictationError.invalid("A cleanup word exceeds the request limit.")
-        }
+      for item in (fromEnd ? Array(atoms.reversed()) : atoms) {
+        let size = item.text.utf8.count
         if bytes + size > maxBytes { flush() }
-        text += atom
+        text = fromEnd ? item.text + text : text + item.text
         bytes += size
-        if !literal && !atom.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !item.literal && !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
           speech = true
         }
       }
-      for piece in pieces {
-        if piece.literal {
-          try append(piece.text, literal: true)
-        } else {
-          let source = piece.text as NSString
-          for match in VoiceFormatting.atoms.matches(
-            in: piece.text, range: NSRange(location: 0, length: source.length))
-          {
-            try append(source.substring(with: match.range), literal: false)
-          }
-        }
-      }
       flush()
-      return result
+      return fromEnd ? Array(result.reversed()) : result
     }
     public func restore(_ cleaned: String) throws -> Output {
       guard hasCleanupText || cleaned == input else {

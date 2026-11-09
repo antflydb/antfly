@@ -30,8 +30,13 @@ separate opt-in: it can submit a message and requires a confirmed paste into the
 original field. See the example README for supported commands and limitations.
 
 With voice formatting enabled, Clean-mode cleanup uses bounded batches that
-account for both formatting markers and the model's output budget. Rewrite and
-Whole utterance modes preserve a single generation context; oversized inputs are
+account for both formatting markers and the model's output budget. A recent
+editable tail lets a correction retract words from the previous batch or live
+segment. Older text is committed; corrections referring further back need Whole
+utterance processing. Unicode word/grapheme boundaries support text without
+spaces. Portable cleanup requires a request-specific completion token before
+accepting output, including from older Apple runtimes. Rewrite and Whole utterance
+modes preserve a single generation context; oversized inputs are
 rejected before generation with the raw transcript available to insert or copy.
 Enter requires a readable cursor position before any paste is sent. Failed or
 canceled insertion attempts preserve the clipboard payload for the normal
