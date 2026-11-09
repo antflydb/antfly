@@ -47,7 +47,8 @@ Settings → Voice formatting, spoken breaks and insertion spacing default on:
 
 Commands can be spoken alone. Straight, curly, nested, escaped, and unclosed
 quoted phrases are preserved as literal text; apostrophes inside words are not
-quotation delimiters. Turn spoken formatting off when dictating text that discusses these commands. This is
+quotation delimiters. For fully literal dictation, choose Verbatim and turn
+spoken formatting off. This is
 a deterministic English command vocabulary, so unquoted occurrences are treated
 as commands. It does not reproduce every Wispr Flow editing or formatting feature.
 
@@ -87,6 +88,27 @@ recognition streaming but defers cleanup until release, because its terminal
 position cannot be established earlier. The processing note explains this choice.
 Recorded-audio cleanup likewise runs after recognition so commands can be
 protected first. These paths use the configured inference concurrency limit.
+
+Named transcribers retain their text-cleanup `/dictate` path. Raw runtime models
+use the portable `/generate` contract for cleanup, which preserves compatibility
+with runtimes that reject `/dictate` requests containing `transcript_text`.
+External raw runtimes must permit generation for the selected cleanup model.
+Protected requests keep the selected Clean/Rewrite style. Full-size user rewrite
+instructions are preserved; when internal marker rules would exceed `/dictate`'s
+instruction limit, cleanup uses the portable generation contract instead.
+Expanded Clean-mode transcripts are batched by encoded UTF-8 size, without
+splitting markers or words, and restored in order. Rewrite and explicit Whole
+utterance processing retain one generation context using the portable contract;
+model context/output limits still apply, and incomplete output fails closed. Response sizes are bounded, and truncated or
+incomplete generation cannot become insertable text. Formatting markers own
+surrounding line-break whitespace; quoted literal contents remain unchanged.
+
+Clipboard intent is reserved before preservation or preparation begins. A newer
+operation immediately invalidates older key actions without losing the original
+clipboard snapshot. Provider waits are cancellable and time out after five
+seconds. A nonresponding lazy clipboard provider is not allowed to spawn more
+provider reads or block shutdown; at most one provider read remains in flight,
+and completed snapshots are released rather than cached indefinitely.
 
 These features implement the common spacing/break/Enter workflow in Wispr Flow;
 they do not add recognition vocabulary bias or dictionary replacement rules.

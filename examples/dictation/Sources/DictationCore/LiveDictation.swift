@@ -81,10 +81,11 @@ public actor LiveDictation {
   }
   private var raw: String { segments.map(\.raw).joined(separator: " ") }
   private var draft: String {
-    segments.compactMap(\.cleaned).filter { !$0.isEmpty }.reduce("") { joined, next in
-      joined
-        + (joined.isEmpty || joined.last?.isNewline == true || next.first?.isNewline == true
-          ? "" : " ") + next
+    segments.compactMap(\.cleaned).filter { !$0.isEmpty }.reduce(into: "") { joined, next in
+      if !joined.isEmpty && joined.last?.isNewline != true && next.first?.isNewline != true {
+        joined.append(" ")
+      }
+      joined.append(next)
     }
   }
   public func append(_ audio: Data, commit: Bool = false) async throws {

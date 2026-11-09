@@ -4,6 +4,7 @@
 import Foundation
 import Testing
 
+@testable import DictationApp
 @testable import DictationCore
 
 final class FixtureProtocol: URLProtocol, @unchecked Sendable {
@@ -358,5 +359,175 @@ extension ClientTests {
     #expect(
       result.raw == raw && result.text == "First.\n\nsecond"
         && result.formatting?.pressEnter == true)
+  }
+}
+
+private func portableReply(_ text: String, finish: String = "stop") throws -> String {
+  String(
+    decoding: try JSONSerialization.data(withJSONObject: [
+      "choices": [["finish_reason": finish, "message": ["role": "assistant", "content": text]]]
+    ]), as: UTF8.self)
+}
+extension ClientTests {
+  @Test func cleanOutputDoesNotReviveAStoredRewriteTone() async throws {
+    FixtureProtocol.reply = { request in
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      #expect(request.url?.path == "/ai/v1/dictate")
+      #expect(body["style"] as? String == "clean")
+      let text = body["transcript_text"] as! String
+      return (200, "text/event-stream", try formattingEvents(raw: text, text: text))
+    }
+    var preset = Configuration().presets[0]
+    preset.mode = .clean
+    preset.style = "formal"
+    preset.cleanupModel = "generators/cleanup"
+    let result = try await client().cleanupText(
+      "Hello new paragraph world", preset: preset, dictionary: [], formatting: .init())
+    #expect(result.text == "Hello\n\nworld")
+  }
+  @Test func rawRuntimeModelsUsePortableCleanupAfterRecognition() async throws {
+    let raw = "Hello new paragraph world press enter"
+    FixtureProtocol.reply = { request in
+      let data = try fixtureBody(request)
+      if data.prefix(8) == Data("AFATT001".utf8) {
+        return (200, "text/event-stream", try formattingEvents(raw: raw, text: raw))
+      }
+      #expect(request.url?.path == "/ai/v1/generate")
+      let body = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+      #expect(body["model"] as? String == "google/gemma-3-1b-it")
+      let messages = body["messages"] as! [[String: String]]
+      #expect(messages[0]["content"]!.contains("Antfly"))
+      let text = String(messages[1]["content"]!.dropFirst("Transcript:\n".count))
+      #expect(!text.contains("new paragraph") && !text.contains("press enter"))
+      return (
+        200, "application/json", try portableReply("```text\nCleaned text: \"" + text + "\"\n```")
+      )
+    }
+    var preset = Configuration().presets[0]
+    preset.model = "openai/whisper-tiny"
+    preset.transcriberRoute = .runtime
+    preset.cleanupModel = "google/gemma-3-1b-it"
+    let phases = FormattingPhaseLog()
+    let result = try await client().dictate(
+      audio: Data([1]), preset: preset, dictionary: ["Antfly"], formatting: .init(pressEnter: true),
+      events: { await phases.add($0.phase) }, progress: { _ in })
+    #expect(await phases.values.contains(.cleaning))
+    #expect(
+      result.raw == raw && result.text == "Hello\n\nworld" && result.formatting?.pressEnter == true)
+  }
+  @Test func maximumRewriteInstructionsArePreservedOutsideDictateBudget() async throws {
+    let instructions = String(repeating: "x", count: 4096)
+    FixtureProtocol.reply = { request in
+      #expect(request.url?.path == "/ai/v1/generate")
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      let messages = body["messages"] as! [[String: String]]
+      #expect(messages[0]["content"]!.contains(instructions))
+      #expect(messages[0]["content"]!.contains("Preserve every token"))
+      return (
+        200, "application/json",
+        try portableReply(String(messages[1]["content"]!.dropFirst("Transcript:\n".count)))
+      )
+    }
+    var preset = Configuration().presets[0]
+    preset.mode = .rewrite
+    preset.instructions = instructions
+    preset.cleanupModel = "generators/cleanup"
+    let result = try await client().cleanupText(
+      "Hello new paragraph world", preset: preset, dictionary: [], formatting: .init())
+    #expect(result.text == "Hello\n\nworld")
+  }
+  @Test func expandedFormattingUsesBoundedRequestsWithoutSplittingMarkers() async throws {
+    FixtureProtocol.reply = { request in
+      #expect(request.url?.path == "/ai/v1/dictate")
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      let text = body["transcript_text"] as! String
+      #expect(text.utf8.count <= 65536)
+      return (200, "text/event-stream", try formattingEvents(raw: text, text: text))
+    }
+    var preset = Configuration().presets[0]
+    preset.cleanupModel = "generators/cleanup"
+    let raw = String(repeating: "word new paragraph ", count: 1400)
+    #expect(VoiceFormatting.Plan(raw).input.utf8.count > 65536)
+    let result = try await client().cleanupText(
+      raw, preset: preset, dictionary: [], formatting: .init())
+    #expect(result.raw == raw && result.text == String(repeating: "word\n\n", count: 1400))
+  }
+  @Test func portableCleanupRejectsTruncatedAndOversizedResults() async throws {
+    var preset = Configuration().presets[0]
+    preset.model = "openai/whisper-tiny"
+    preset.transcriberRoute = .runtime
+    preset.cleanupModel = "google/gemma-3-1b-it"
+    for finish in ["length", "tool_calls"] {
+      FixtureProtocol.reply = { _ in
+        (200, "application/json", try portableReply("partial", finish: finish))
+      }
+      do {
+        _ = try await client().cleanupText(
+          "hello", preset: preset, dictionary: [], formatting: .init())
+        Issue.record("Accepted incomplete generation")
+      } catch let failure as DictationError { #expect(failure.rawTranscript == "hello") }
+    }
+    FixtureProtocol.reply = { _ in
+      (200, "application/json", String(repeating: "x", count: 1_048_577))
+    }
+    do {
+      _ = try await client().cleanupText(
+        "hello", preset: preset, dictionary: [], formatting: .init())
+      Issue.record("Accepted oversized generation")
+    } catch let failure as DictationError { #expect(failure.rawTranscript == "hello") }
+  }
+}
+
+extension ClientTests {
+  @Test func oversizedWholeUtteranceRewriteKeepsOneGenerationContext() async throws {
+    FixtureProtocol.reply = { request in
+      #expect(request.url?.path == "/ai/v1/generate")
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      let messages = body["messages"] as! [[String: String]]
+      #expect(messages[0]["content"]!.contains("Preserve the whole argument"))
+      let text = String(messages[1]["content"]!.dropFirst("Transcript:\n".count))
+      #expect(text.utf8.count > 65536)
+      return (200, "application/json", try portableReply(text))
+    }
+    var preset = Configuration().presets[0]
+    preset.mode = .rewrite
+    preset.instructions = "Preserve the whole argument"
+    preset.cleanupModel = "generators/cleanup"
+    let raw = String(repeating: "word new paragraph ", count: 1400)
+    let result = try await client().cleanupText(
+      raw, preset: preset, dictionary: [], formatting: .init())
+    #expect(result.text == String(repeating: "word\n\n", count: 1400))
+  }
+}
+
+private actor FormattingPhaseLog {
+  var values: [DictationPhase] = []
+  func add(_ phase: DictationPhase) { values.append(phase) }
+}
+
+extension ClientTests {
+  @Test @MainActor func rawRuntimeCleanupCanRetryWithoutRecordingAgain() async throws {
+    FixtureProtocol.reply = { request in
+      #expect(request.url?.path == "/ai/v1/generate")
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      let messages = body["messages"] as! [[String: String]]
+      return (
+        200, "application/json",
+        try portableReply(String(messages[1]["content"]!.dropFirst("Transcript:\n".count)))
+      )
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let connection = try client()
+    let store = Store(
+      directory: directory, registerHotkey: false, clientFactory: { _ in connection })
+    store.config.presets[0].model = "openai/whisper-tiny"
+    store.config.presets[0].transcriberRoute = .runtime
+    store.config.presets[0].cleanupModel = "google/gemma-3-1b-it"
+    store.preview = "Hello new paragraph world"
+    store.canRecoverRaw = true
+    store.retryCleanup()
+    await store.requestTask?.value
+    #expect(store.result == "Hello\n\nworld" && store.phase == .ready && !store.canRecoverRaw)
   }
 }

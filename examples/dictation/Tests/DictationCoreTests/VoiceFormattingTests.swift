@@ -126,3 +126,21 @@ import Testing
   #expect(plan.crosses([9]))
   #expect(!plan.crosses([5]))
 }
+
+@Test func structuralMarkersOwnTheirWhitespaceWithoutChangingLiterals() throws {
+  let plan = VoiceFormatting.Plan("Hello new paragraph ‘ new line ’ please")
+  let paragraph = try NSRegularExpression(pattern: #"\[VF_[A-F0-9]+_P_[0-9]+\]"#)
+  let padded = paragraph.stringByReplacingMatches(
+    in: plan.input, range: NSRange(plan.input.startIndex..., in: plan.input), withTemplate: "  $0  "
+  )
+  #expect(try plan.restore(padded).text == "Hello\n\n‘ new line ’ please")
+  #expect(VoiceFormatting.format("Hello new line next line world").text == "Hello\n\nworld")
+}
+@Test func encodedBatchesPreserveMarkersWordsAndUTF8() throws {
+  let plan = VoiceFormatting.Plan(
+    String(repeating: "Résumé new paragraph ‘new line’ ", count: 2000))
+  let batches = try plan.batches()
+  #expect(batches.count > 1 && batches.allSatisfy { $0.text.utf8.count <= 65536 })
+  #expect(batches.map(\.text).joined() == plan.input)
+  #expect(try plan.restore(batches.map(\.text).joined()).text == plan.render().text)
+}

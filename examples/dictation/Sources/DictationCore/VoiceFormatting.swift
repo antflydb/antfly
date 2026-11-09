@@ -23,6 +23,7 @@ public enum VoiceFormatting {
   }
   private static let trailingEnter = try! NSRegularExpression(
     pattern: #"(?i)\bpress\s+enter[.!?]*\s*$"#)
+  private static let atoms = try! NSRegularExpression(pattern: #"\S+|\s+"#)
   private static let breaks = try! NSRegularExpression(
     pattern:
       #"(?i)\b(start a new paragraph|new paragraph|new line|next line|line break|skip a line)\b"#)
@@ -82,6 +83,11 @@ public enum VoiceFormatting {
     private let markers: [String]
     private let spans: [NSRange]
     private let namespace: String
+    private let pieces: [(text: String, literal: Bool)]
+    public struct Batch: Sendable {
+      public let text: String
+      public let needsCleanup: Bool
+    }
     public var hasProtectedSpans: Bool { !markers.isEmpty }
     public var instructions: String {
       markers.isEmpty
@@ -140,15 +146,18 @@ public enum VoiceFormatting {
       var encoded = ""
       var ordinary = ""
       var cursor = 0
+      var pieces: [(text: String, literal: Bool)] = []
       for (range, value) in protected {
         let start = max(cursor, range.location)
         let finish = NSMaxRange(range)
         guard finish >= start else { continue }
         let plain = text.substring(with: NSRange(location: cursor, length: start - cursor))
+        pieces.append((plain, false))
         encoded += plain
         ordinary += plain
         let kind = value == "\n\n" ? "P_" : (value == "\n" ? "L_" : "Q_")
         let token = namespace + kind + String(tokens.count) + "]"
+        pieces.append((token, true))
         encoded += token
         tokens.append(token)
         values.append(value)
@@ -158,6 +167,8 @@ public enum VoiceFormatting {
       let tail = text.substring(from: cursor)
       encoded += tail
       ordinary += tail
+      pieces.append((tail, false))
+      self.pieces = pieces
       input = encoded
       markers = tokens
       originals = values
@@ -168,6 +179,47 @@ public enum VoiceFormatting {
         action
         && (!ordinary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !values.isEmpty)
     }
+    /// Size the wire form, not the transcript. Never split a marker or UTF-8
+    /// word; callers preserve boundary whitespace across independent cleanups.
+    public func batches(maxBytes: Int = 65536) throws -> [Batch] {
+      guard maxBytes > 0 else { throw DictationError.invalid("Invalid cleanup batch limit.") }
+      var result: [Batch] = []
+      var text = ""
+      var bytes = 0
+      var speech = false
+      func flush() {
+        if !text.isEmpty { result.append(Batch(text: text, needsCleanup: speech)) }
+        text = ""
+        bytes = 0
+        speech = false
+      }
+      func append(_ atom: String, literal: Bool) throws {
+        let size = atom.utf8.count
+        guard size <= maxBytes else {
+          throw DictationError.invalid("A cleanup word exceeds the request limit.")
+        }
+        if bytes + size > maxBytes { flush() }
+        text += atom
+        bytes += size
+        if !literal && !atom.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          speech = true
+        }
+      }
+      for piece in pieces {
+        if piece.literal {
+          try append(piece.text, literal: true)
+        } else {
+          let source = piece.text as NSString
+          for match in VoiceFormatting.atoms.matches(
+            in: piece.text, range: NSRange(location: 0, length: source.length))
+          {
+            try append(source.substring(with: match.range), literal: false)
+          }
+        }
+      }
+      flush()
+      return result
+    }
     public func restore(_ cleaned: String) throws -> Output {
       guard hasCleanupText || cleaned == input else {
         throw DictationError.invalid("Cleanup invented text for a formatting-only utterance.")
@@ -176,6 +228,7 @@ public enum VoiceFormatting {
       var result = ""
       result.reserveCapacity(cleaned.utf8.count)
       var cursor = 0
+      var afterBreak = false
       for (index, marker) in markers.enumerated() {
         let found = source.range(
           of: marker, options: [], range: NSRange(location: cursor, length: source.length - cursor))
@@ -184,16 +237,26 @@ public enum VoiceFormatting {
             "Cleanup changed protected formatting. Retry cleanup or insert the original transcript."
           )
         }
-        let plain = source.substring(
+        var plain = source.substring(
           with: NSRange(location: cursor, length: found.location - cursor))
+        if afterBreak {
+          plain = String(plain.drop(while: { $0 == " " || $0 == "\t" || $0 == "\n" || $0 == "\r" }))
+        }
+        let isBreak = originals[index] == "\n" || originals[index] == "\n\n"
+        if isBreak { plain = String(plain.reversed().drop(while: { $0.isWhitespace }).reversed()) }
         guard !plain.contains(namespace) else {
           throw DictationError.invalid("Cleanup duplicated or reordered protected formatting.")
         }
         result += plain
+        if isBreak && !afterBreak {
+          while result.last?.isWhitespace == true { result.removeLast() }
+        }
         result += originals[index]
+        afterBreak = isBreak
         cursor = NSMaxRange(found)
       }
-      let tail = source.substring(from: cursor)
+      var tail = source.substring(from: cursor)
+      if afterBreak { tail = String(tail.drop(while: { $0.isWhitespace })) }
       guard !tail.contains(namespace) else {
         throw DictationError.invalid("Cleanup duplicated or reordered protected formatting.")
       }

@@ -212,7 +212,7 @@ struct SettingsView: View {
               get: { store.config.usesVoiceFormatting }, set: { store.config.voiceFormatting = $0 })
           )
           Text(
-            "Say new line, next line, line break, skip a line, or new paragraph. Works without a cleanup model. Quote a phrase to keep it literal, or turn this off for literal dictation."
+            "Say new line, next line, line break, skip a line, or new paragraph. Works without a cleanup model. Quote a phrase to keep it literal. For fully literal dictation, choose Verbatim and turn this off."
           )
           .font(.caption).foregroundStyle(.secondary)
           Toggle(

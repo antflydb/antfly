@@ -7,7 +7,7 @@ public actor AntflyClient {
   let origin: URL
   let token: String
   private let basicPassword: String?
-  private let inferenceGate: InferenceGate
+  let inferenceGate: InferenceGate
   let session: URLSession
   public init(
     server: String, token: String = "", basicPassword: String? = nil, session: URLSession? = nil,
@@ -34,7 +34,7 @@ public actor AntflyClient {
     settings.timeoutIntervalForResource = 300
     self.session = session ?? URLSession(configuration: settings)
   }
-  private func request(_ path: String, method: String = "POST", body: Data? = nil) -> URLRequest {
+  func request(_ path: String, method: String = "POST", body: Data? = nil) -> URLRequest {
     var request = URLRequest(url: origin.appendingPathComponent(path))
     request.httpMethod = method
     request.httpBody = body
@@ -131,21 +131,60 @@ public actor AntflyClient {
         return result
       }
       do {
+        let cleanupStarted = ProcessInfo.processInfo.systemUptime
+        await events(DictationProgress(phase: .cleaning, raw: text))
         var protectedPreset = preset
+        var combinedInstructions = preset.outputMode == .rewrite ? preset.instructions : ""
         if !plan.instructions.isEmpty {
-          protectedPreset.instructions =
-            (preset.outputMode == .rewrite ? preset.instructions + "\n" : "") + plan.instructions
+          if !combinedInstructions.isEmpty { combinedInstructions += "\n" }
+          combinedInstructions += plan.instructions
+        }
+        let portable = !preset.usesNamedTranscriber || combinedInstructions.utf8.count > 4096
+        if !plan.instructions.isEmpty && !portable {
+          protectedPreset.style = preset.requestStyle
+          protectedPreset.instructions = combinedInstructions
           protectedPreset.mode = .rewrite
         }
-        result = try await cleanupText(
-          plan.input, preset: protectedPreset, dictionary: dictionary,
-          events: { event in
-            await events(DictationProgress(phase: event.phase, raw: text))
-          })
+        var cleaned = ""
+        let batches = try plan.batches()
+        let requiresWhole =
+          preset.outputMode == .rewrite || preset.processingStrategy == .wholeUtterance
+        if requiresWhole && batches.count > 1 {
+          // The generation contract has no transcript_text limit. Preserve the
+          // whole rewrite context; incomplete model output still fails closed.
+          cleaned = try await portableCleanup(
+            plan.input, preset: preset, dictionary: dictionary,
+            protectedInstructions: plan.instructions)
+        }
+        for batch in (requiresWhole && batches.count > 1 ? [] : batches) {
+          try Task.checkCancellation()
+          guard batch.needsCleanup else {
+            cleaned += batch.text
+            continue
+          }
+          let leading = String(batch.text.prefix(while: { $0.isWhitespace }))
+          let trailing = String(batch.text.reversed().prefix(while: { $0.isWhitespace }).reversed())
+          let content = batch.text.trimmingCharacters(in: .whitespacesAndNewlines)
+          let chunk: String
+          if portable {
+            chunk = try await portableCleanup(
+              content, preset: preset, dictionary: dictionary,
+              protectedInstructions: plan.instructions)
+          } else {
+            chunk = try await cleanupText(
+              content, preset: protectedPreset, dictionary: dictionary,
+              events: { event in await events(DictationProgress(phase: event.phase, raw: text)) }
+            ).text
+          }
+          cleaned += leading + chunk + trailing
+        }
+        result = DictationResult(raw: text, text: cleaned)
         let restored = try plan.restore(result.text)
         result.raw = text
         result.text = restored.text
         result.formatting = restored
+        let elapsed = ProcessInfo.processInfo.systemUptime - cleanupStarted
+        result.timing = DictationTiming(cleanup: elapsed, total: elapsed)
         return result
       } catch is CancellationError { throw CancellationError() } catch {
         throw DictationError.cleanupFailed(raw: text, message: error.localizedDescription)

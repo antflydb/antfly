@@ -862,9 +862,8 @@ import SwiftUI
       var snapshot = try config.validated()
       let preset =
         snapshot.presets.first(where: { $0.id == retryPreset?.id }) ?? snapshot.preset(for: nil)
-      guard preset.usesNamedTranscriber, preset.runsCleanup else {
-        throw DictationError.invalid(
-          "Choose a named transcriber and cleanup generator before retrying cleanup.")
+      guard preset.runsCleanup else {
+        throw DictationError.invalid("Choose a cleanup generator before retrying cleanup.")
       }
       let original = preview
       snapshot.autoPaste = false

@@ -275,3 +275,100 @@ private actor ReadFailure {
   } catch {}
   #expect(board.text == "external" && board.restores == 0)
 }
+
+@Test @MainActor func newerPreparationImmediatelyInvalidatesOldActionAndRetainsSnapshot()
+  async throws
+{
+  let board = FakeClipboard()
+  let firstGate = ClipboardClock()
+  let preparing = ClipboardClock()
+  let coordinator = ClipboardCoordinator(
+    read: { await board.snapshot() }, count: { board.count }, writeText: { board.write($0) },
+    restore: { board.restore($0) })
+  var oldAction = false
+  var newAction = false
+  let first = Task { @MainActor in
+    try await coordinator.withPaste("first", restoreAfterOperation: true) { ownership in
+      await firstGate.sleep()
+      try ownership()
+      oldAction = true
+    }
+  }
+  while await firstGate.pending() == 0 { await Task.yield() }
+  let second = Task { @MainActor in
+    try await coordinator.withPaste(
+      "second", restoreAfterOperation: true,
+      prepare: { text in
+        await preparing.sleep()
+        return text
+      }
+    ) { ownership in
+      try ownership()
+      newAction = true
+    }
+  }
+  while await preparing.pending() == 0 { await Task.yield() }
+  await firstGate.advance()
+  do {
+    try await first.value
+    Issue.record("Old action survived newer intent")
+  } catch is CancellationError {}
+  #expect(!oldAction && board.text == "first" && board.restores == 0)
+  await preparing.advance()
+  try await second.value
+  #expect(newAction && board.text == "original" && board.restores == 1)
+}
+@Test @MainActor func canceledProviderReadDoesNotBlockShutdownOrSpawnAnotherProvider() async throws
+{
+  let board = FakeClipboard()
+  let provider = ClipboardClock()
+  let coordinator = ClipboardCoordinator(
+    read: {
+      await provider.sleep()
+      return await board.snapshot()
+    }, count: { board.count }, writeText: { board.write($0) }, restore: { board.restore($0) })
+  let first = Task { @MainActor in
+    try await coordinator.withPaste("first") { _ in Issue.record("Canceled read pasted") }
+  }
+  while await provider.pending() == 0 { await Task.yield() }
+  first.cancel()
+  do {
+    try await first.value
+    Issue.record("Canceled provider read accepted")
+  } catch is CancellationError {}
+  await coordinator.finishRestoration()  // Provider is deliberately still blocked.
+  #expect(board.text == "original" && board.restores == 0)
+  var secondDone = false
+  let second = Task { @MainActor in
+    try await coordinator.withPaste("second", restoreAfterOperation: true) { ownership in
+      try ownership()
+      secondDone = true
+    }
+  }
+  for _ in 0..<20 { await Task.yield() }
+  #expect(await provider.pending() == 1)  // Reuses the single still-running provider.
+  await provider.advance()
+  try await second.value
+  #expect(secondDone && board.text == "original" && board.restores == 1)
+}
+
+@Test @MainActor func nonrespondingProviderTimesOutBeforeAnyClipboardWrite() async throws {
+  let board = FakeClipboard()
+  let provider = ClipboardClock()
+  let coordinator = ClipboardCoordinator(
+    read: {
+      await provider.sleep()
+      return await board.snapshot()
+    }, count: { board.count }, writeText: { board.write($0) }, restore: { board.restore($0) },
+    preservationTimeout: .milliseconds(10))
+  do {
+    try await coordinator.withPaste("dictation") { _ in Issue.record("Timed out provider pasted") }
+    Issue.record("Provider never timed out")
+  } catch let failure as DictationError {
+    #expect(failure.localizedDescription.contains("provider"))
+  }
+  await coordinator.finishRestoration()
+  #expect(board.text == "original" && board.count == 0)
+  while await provider.pending() == 0 { await Task.yield() }
+  await provider.advance()
+}
