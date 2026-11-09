@@ -113,12 +113,94 @@ const ApplyCtx = struct {
     }
 };
 
+/// Deep-copies `items` so the caller's own buffer (`NamespaceTxn.pending`'s
+/// arena) may be freed the moment `submitDeferred` returns, independent of
+/// when the staged group-commit it joins actually applies. Mirrors
+/// `sparse/sparse.zig`'s `dupeOwnedSparseMutationsAlloc` for the same
+/// `native_catalog_backend.Mutation` shape.
+fn dupeMutationsAlloc(allocator: Allocator, items: []const native_catalog_backend.Mutation) ![]native_catalog_backend.Mutation {
+    const out = try allocator.alloc(native_catalog_backend.Mutation, items.len);
+    errdefer allocator.free(out);
+    var filled: usize = 0;
+    errdefer freeMutationFields(allocator, out[0..filled]);
+    for (items, 0..) |m, i| {
+        out[i] = .{
+            .namespace = if (m.namespace) |n| try allocator.dupe(u8, n) else null,
+            .key = try allocator.dupe(u8, m.key),
+            .value = if (m.is_delete) "" else try allocator.dupe(u8, m.value),
+            .is_delete = m.is_delete,
+        };
+        filled = i + 1;
+    }
+    return out;
+}
+
+fn freeMutationFields(allocator: Allocator, items: []const native_catalog_backend.Mutation) void {
+    for (items) |m| {
+        if (m.namespace) |n| allocator.free(n);
+        allocator.free(m.key);
+        if (!m.is_delete) allocator.free(m.value);
+    }
+}
+
+fn freeDupedMutations(allocator: Allocator, items: []const native_catalog_backend.Mutation) void {
+    freeMutationFields(allocator, items);
+    allocator.free(items);
+}
+
+/// Heap-owned context for a ride-along (`durable = false`) commit staged
+/// via `Store.stageRideAlong` without waiting (`Sink.submitDeferred`).
+/// Unlike the stack-allocated `ApplyCtx` above (valid only for the duration
+/// of a blocking `submit` call), this must stay valid from `submitDeferred`
+/// until whichever thread eventually drains the group-commit queue calls
+/// `apply` -- arbitrarily later, possibly after `submitDeferred` has long
+/// since returned -- so it owns a deep copy of `scope`/`mutations` and frees
+/// itself only once, in `wait`, after that `apply` has definitely already
+/// run (`Store.Ticket.wait` only returns once its group is durable/failed).
+const DeferredApplyCtx = struct {
+    allocator: Allocator,
+    scope: []u8,
+    mutations: []native_catalog_backend.Mutation,
+    ticket: docstore.Store.Ticket,
+
+    fn apply(ptr: *anyopaque, file: *native.NativeFile) anyerror!void {
+        const self: *DeferredApplyCtx = @ptrCast(@alignCast(ptr));
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const batch = try a.alloc(native.CatalogMutation, self.mutations.len);
+        for (self.mutations, batch) |m, *out| {
+            out.* = .{
+                .key = try durableKeyAlloc(a, self.scope, m.namespace, m.key),
+                .value = m.value,
+                .is_delete = m.is_delete,
+            };
+        }
+        try file.putIndexCatalogBatch(batch);
+    }
+
+    /// `native_catalog_backend.Pending.waitFn`: waits for this ride-along
+    /// commit's group, then frees this context -- called exactly once, by
+    /// whichever caller `wait()`s the `Pending` `submitDeferred` returned
+    /// (directly, or via `Backend.pending_ride_along`'s batched drain).
+    fn wait(ptr: *anyopaque) anyerror!void {
+        const self: *DeferredApplyCtx = @ptrCast(@alignCast(ptr));
+        defer {
+            freeDupedMutations(self.allocator, self.mutations);
+            self.allocator.free(self.scope);
+            self.allocator.destroy(self);
+        }
+        return self.ticket.wait();
+    }
+};
+
 pub const Sink = struct {
     store: *docstore.Store,
     allocator: Allocator,
 
     pub fn sink(self: *Sink) native_catalog_backend.Sink {
-        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
+        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc, .submitDeferred = submitDeferred };
     }
 
     fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
@@ -134,6 +216,43 @@ pub const Sink = struct {
         // publication path) -- the ride-along commit this backend's
         // `NamespaceTxn.setDurable(false)` asks for.
         try self.store.submitIndexMutation(&ctx, ApplyCtx.apply, durable);
+    }
+
+    /// `native_catalog_backend.Sink.submitDeferred`: like `submit` with
+    /// `durable = false`, but never blocks. Routes through
+    /// `Store.stageRideAlong` directly (not `submitIndexMutation`, which
+    /// always leads -- and closes -- its own one-member group via
+    /// `Store.stage`, exactly the "11 metric-build passes -> 11 commits"
+    /// problem the design doc's §3.2a "group membership, not standalone
+    /// commits" note describes): this lets several ride-along commits
+    /// issued back to back (one per background maintenance pass) join the
+    /// SAME eventual group-commit instead of each leading its own.
+    fn submitDeferred(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation) anyerror!native_catalog_backend.Pending {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        const ctx = try self.allocator.create(DeferredApplyCtx);
+        errdefer self.allocator.destroy(ctx);
+        const owned_scope = try self.allocator.dupe(u8, scope);
+        errdefer self.allocator.free(owned_scope);
+        const owned_mutations = try dupeMutationsAlloc(self.allocator, mutations);
+        errdefer freeDupedMutations(self.allocator, owned_mutations);
+        ctx.* = .{
+            .allocator = self.allocator,
+            .scope = owned_scope,
+            .mutations = owned_mutations,
+            .ticket = undefined,
+        };
+        // `stageRideAlong` only enqueues (it never leads, so this never
+        // blocks on another group's fsync, or on this one's); `ctx.ticket`
+        // is written here, on this thread, before `submitDeferred` returns
+        // the `Pending` that exposes it -- `apply` above never reads
+        // `ctx.ticket`, so there is no race with whichever other thread
+        // eventually drains the queue and calls it.
+        ctx.ticket = try self.store.stageRideAlong(.{
+            .context = ctx,
+            .apply = DeferredApplyCtx.apply,
+            .index_only = true,
+        });
+        return .{ .ptr = ctx, .waitFn = DeferredApplyCtx.wait };
     }
 
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
