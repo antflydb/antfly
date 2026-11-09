@@ -150182,7 +150182,7 @@ test "external vector compatibility declaration rejects missing and mismatched w
     try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
 }
 
-test "time series prepared rows validate external vector field receipts" {
+test "time series prepared rows validate external vector receipts" {
     for ([_][]const u8{ "document", "relational" }) |mode| {
         const alloc = std.testing.allocator;
         const io = std.testing.io;
@@ -150192,26 +150192,28 @@ test "time series prepared rows validate external vector field receipts" {
         defer alloc.free(path);
         var db = try DB.open(alloc, path, .{});
         defer db.close();
-        const schema = try std.fmt.allocPrint(alloc,
-            \\{{"version":1,"storage_mode":"{s}","default_type":"row","document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"embedding":{{"type":"array","items":{{"type":"number"}}}},"metadata":{{"type":"object"}},"revision":{{"type":"keyword"}}}},"additionalProperties":false}}}}}}}}
-        , .{mode});
-        defer alloc.free(schema);
-        try db.setSchemaJson(alloc, schema);
+        if (std.mem.eql(u8, mode, "relational")) {
+            const columns = [_]schema_mod.RelationalColumn{
+                .{ .name = "metadata", .path = "metadata", .column_type = .json, .is_json = true, .json_kind = .any, .allows_null = true },
+                .{ .name = "revision", .path = "revision", .column_type = .string, .allows_null = true },
+            };
+            try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        }
         try db.addIndex(.{
             .name = "external_v1",
             .kind = .dense_vector,
             .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"external_vector_space\":\"recipe-v1\"}",
         });
         try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
-            .writes = &.{.{ .key = "missing", .value = "{\"embedding\":[1,0,0]}" }},
+            .writes = &.{.{ .key = "missing", .value = "{\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
             .sync_level = .full_index,
         }));
         try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
-            .writes = &.{.{ .key = "wrong", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"other\"}},\"embedding\":[1,0,0]}" }},
+            .writes = &.{.{ .key = "wrong", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"other\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
             .sync_level = .full_index,
         }));
         try db.batch(.{
-            .writes = &.{.{ .key = "matched", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}},\"embedding\":[1,0,0]}" }},
+            .writes = &.{.{ .key = "matched", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
             .sync_level = .full_index,
         });
         try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
