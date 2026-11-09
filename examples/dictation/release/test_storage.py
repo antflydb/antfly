@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import base64
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,6 +30,120 @@ SIGNATURE = base64.b64encode(bytes(range(64))).decode()
 
 
 class R2PublicationTests(unittest.TestCase):
+    def public_reader_factory(self, identity, reads):
+        storage = self.storage
+        prefix = r.release_prefix(identity)
+        expected_base = r.POLICY["public_base_url"] + "/releases/" + identity["version"]
+
+        class Reader:
+            def __init__(self, base, max_bytes=256 * 1024):
+                if base != expected_base:
+                    raise AssertionError("Unexpected public release URL")
+                self.max_bytes = max_bytes
+
+            def read_optional(self, name):
+                reads.append((name, self.max_bytes))
+                data = storage.reader.read_optional(prefix + "/" + name)
+                if data is not None and len(data) > self.max_bytes:
+                    raise ValueError("Public release metadata exceeds its size limit")
+                return data
+
+        return Reader
+
+    def test_public_mirror_restores_exact_signed_bytes_without_storage_credentials(
+        self,
+    ):
+        identity, directory = self.payload()
+        self.publish(identity, directory)
+        reads = []
+        output = self.root / "public-mirror"
+        r.restore_published(
+            identity,
+            r.digest(directory / "artifacts.json"),
+            output,
+            self.public_reader_factory(identity, reads),
+        )
+        self.assertEqual(
+            {p.name: p.read_bytes() for p in output.iterdir()},
+            {p.name: p.read_bytes() for p in directory.iterdir()},
+        )
+        self.assertEqual(reads[0], ("artifacts.json", 256 * 1024))
+        for name, limit in reads[1:]:
+            self.assertEqual(limit, (directory / name).stat().st_size)
+
+    def test_public_mirror_rejects_untrusted_ledger_before_payload_reads(self):
+        for index, damage in enumerate(("digest", "identity", "members", "size")):
+            with self.subTest(damage=damage):
+                identity, directory = self.payload(f"dictation/v1.0.{index}")
+                self.publish(identity, directory)
+                ledger = directory / "artifacts.json"
+                document = json.loads(ledger.read_bytes())
+                if damage == "identity":
+                    document["identity"]["source_commit"] = "c" * 40
+                elif damage == "members":
+                    document["artifacts"][0]["name"] = "../outside"
+                elif damage == "size":
+                    document["artifacts"][0]["size"] = -1
+                raw = json.dumps(document).encode()
+                remote = (
+                    self.root
+                    / "objects"
+                    / r.POLICY["bucket"]
+                    / r.release_prefix(identity)
+                    / "artifacts.json"
+                )
+                remote.write_bytes(raw)
+                checksum = (
+                    "0" * 64 if damage == "digest" else hashlib.sha256(raw).hexdigest()
+                )
+                reads = []
+                output = self.root / ("rejected-" + damage)
+                with self.assertRaises(ValueError):
+                    r.restore_published(
+                        identity,
+                        checksum,
+                        output,
+                        self.public_reader_factory(identity, reads),
+                    )
+                self.assertEqual([name for name, _ in reads], ["artifacts.json"])
+                self.assertFalse(output.exists())
+
+    def test_public_mirror_rejects_missing_truncated_and_corrupt_payloads(self):
+        for index, damage in enumerate(
+            ("missing", "truncated", "corrupt", "oversized")
+        ):
+            with self.subTest(damage=damage):
+                identity, directory = self.payload(f"dictation/v1.0.{index}")
+                self.publish(identity, directory)
+                archive = next(directory.glob("*.zip"))
+                remote = (
+                    self.root
+                    / "objects"
+                    / r.POLICY["bucket"]
+                    / r.release_prefix(identity)
+                    / archive.name
+                )
+                if damage == "missing":
+                    remote.unlink()
+                else:
+                    data = archive.read_bytes()
+                    remote.write_bytes(
+                        data[:-1]
+                        if damage == "truncated"
+                        else (
+                            b"x" * len(data) if damage == "corrupt" else data + b"extra"
+                        )
+                    )
+                output = self.root / ("rejected-" + damage)
+                with self.assertRaises((ValueError, SystemExit)):
+                    r.restore_published(
+                        identity,
+                        r.digest(directory / "artifacts.json"),
+                        output,
+                        self.public_reader_factory(identity, []),
+                    )
+                self.assertFalse(output.exists())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -269,9 +385,11 @@ class R2PublicationTests(unittest.TestCase):
                         self.storage,
                         identity["tag"],
                         "c" * 40 if change == "source" else identity["source_commit"],
-                        "0" * 64
-                        if change == "digest"
-                        else r.digest(directory / "artifacts.json"),
+                        (
+                            "0" * 64
+                            if change == "digest"
+                            else r.digest(directory / "artifacts.json")
+                        ),
                         out,
                     )
                 self.assertFalse(out.exists())

@@ -2,6 +2,8 @@ name: Dictation release
 
 # Signing and publication tools always come from the default branch.
 on:
+  # Manual dispatch only exercises CI storage; it cannot sign or publish.
+  workflow_dispatch:
   workflow_run:
     workflows: ['Dictation release request']
     types: [completed]
@@ -11,15 +13,32 @@ permissions:
   actions: read
 
 concurrency:
-  group: dictation-release-${{ github.event.workflow_run.head_branch }}
+  group: dictation-release-${{ github.event_name == 'workflow_dispatch' && 'storage-probe' || github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 env:
   DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
 
 jobs:
+  artifact-storage-probe:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/probe-ci-artifact
+        with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
+          namespace: release
+
   resolve:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -44,6 +63,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dictation-identity
+          retention-days: 90
           path: dist/identity/identity.json
           if-no-files-found: error
 
@@ -54,11 +74,22 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.source_commit }}
           persist-credentials: false
+      - name: Check out pinned CI artifact exchange tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: release-controller
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/upload-ci-artifact
+            scripts/ci/artifact_exchange.py
+          sparse-checkout-cone-mode: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -77,11 +108,12 @@ jobs:
           examples/dictation/build-app.sh
           DICTATION_TEST_APP="$PWD/examples/dictation/dist/Antfly Dictation.app/Contents/MacOS/AntflyDictation" DICTATION_TEST_RUNTIME="$PWD/examples/dictation/dist/Antfly Dictation.app/Contents/Resources/Runtime/antfly" python3 -m unittest discover -s examples/dictation/release -p 'test_runtime.py'
           ditto -c -k --sequesterRsrc --keepParent 'examples/dictation/dist/Antfly Dictation.app' dist-unsigned.zip
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: ./release-controller/.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           name: dictation-unsigned
           path: dist-unsigned.zip
-          if-no-files-found: error
+          retention-days: 90
 
   sign:
     needs: [resolve, build]
@@ -91,6 +123,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -100,7 +133,7 @@ jobs:
         with:
           name: dictation-identity
           path: dist/identity
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: ./.github/actions/download-ci-artifact
         with:
           name: dictation-unsigned
           path: dist/unsigned
@@ -126,19 +159,23 @@ jobs:
           SIGNING_IDENTITY: ${{ vars.DICTATION_SIGNING_IDENTITY }}
           APPLE_TEAM_ID: ${{ vars.DICTATION_APPLE_TEAM_ID }}
         run: bash examples/dictation/release/sign-release.sh "$PWD/dist/identity/identity.json" "$PWD/dist/unsigned/dist-unsigned.zip"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: ./.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           name: dictation-signed
           path: examples/dictation/dist/release
-          if-no-files-found: error
+          retention-days: 90
   publish:
     needs: [resolve, sign]
+    outputs:
+      ledger_sha256: ${{ steps.publish.outputs.ledger_sha256 }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release-promotion
     permissions:
       contents: read
       actions: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -148,7 +185,7 @@ jobs:
         with:
           name: dictation-identity
           path: dist/identity
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: ./.github/actions/download-ci-artifact
         with:
           name: dictation-signed
           path: dist/signed
@@ -160,12 +197,16 @@ jobs:
       - name: Install locked release dependencies
         run: python3 -m pip install --require-hashes -r scripts/release/requirements.lock
       - name: Publish immutable downloads, then advance signed channel feeds
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
-        run: python3 examples/dictation/release/release.py publish dist/identity/identity.json dist/signed
+        run: |
+          set -euo pipefail
+          python3 examples/dictation/release/release.py publish dist/identity/identity.json dist/signed
+          echo "ledger_sha256=$(sha256sum dist/signed/artifacts.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
   github-mirror:
     if: ${{ vars.DICTATION_GITHUB_MIRROR == 'true' }}
@@ -185,10 +226,17 @@ jobs:
         with:
           name: dictation-identity
           path: dist/identity
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          name: dictation-signed
-          path: dist/signed
+          python-version: ${{ steps.toolchain.outputs.python_build }}
+      - name: Restore the sealed signed payload from public R2
+        env:
+          LEDGER_SHA256: ${{ needs.publish.outputs.ledger_sha256 }}
+        run: |
+          python3 examples/dictation/release/release.py restore-published dist/identity/identity.json \
+            --ledger-sha256 "$LEDGER_SHA256" --out-dir dist/signed
       - name: Mirror sealed downloads without controlling the update channel
         env:
           GH_TOKEN: ${{ github.token }}
