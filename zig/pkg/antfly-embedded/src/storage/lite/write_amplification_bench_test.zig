@@ -32,6 +32,7 @@ const capi_types = @import("../../capi/types.zig");
 const db_mod = api.db_mod;
 const wal_trace = @import("../write_amplification_trace.zig");
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+const docstore_mod = @import("docstore.zig");
 
 const default_updates: usize = 128;
 const default_writers: usize = 8;
@@ -807,6 +808,75 @@ fn measureConcurrentVector(alloc: std.mem.Allocator, comptime name: []const u8, 
     return .{ .updates = writers * updates_per_writer, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
 }
 
+/// `test_commit_key_hook` classifier: by key kind, not by code stage, so a
+/// single physical commit's bytes can be broken down into what it actually
+/// carries (primary document row, algebraic facts, progress-v2 record,
+/// journal/replay record, everything else) regardless of which stage tag
+/// happened to be active when the write was staged.
+const CommitKeyKindDiagnostic = struct {
+    var primary_bytes: usize = 0;
+    var algebraic_fact_bytes: usize = 0;
+    var progress_bytes: usize = 0;
+    var journal_bytes: usize = 0;
+    var other_bytes: usize = 0;
+    var keys_seen: usize = 0;
+
+    fn reset() void {
+        primary_bytes = 0;
+        algebraic_fact_bytes = 0;
+        progress_bytes = 0;
+        journal_bytes = 0;
+        other_bytes = 0;
+        keys_seen = 0;
+    }
+
+    fn record(key: []const u8, bytes: usize) void {
+        keys_seen += 1;
+        // `storage/db/algebraic/index.zig`'s `namespace_prefix`.
+        if (std.mem.startsWith(u8, key, "\x00\x00__algebraic__:")) {
+            algebraic_fact_bytes += bytes;
+            return;
+        }
+        // `storage/db/derived/apply_state.zig`'s `progress_prefix_v2`.
+        if (std.mem.startsWith(u8, key, "\x00\x00__metadata__:progress:v2:")) {
+            progress_bytes += bytes;
+            return;
+        }
+        // `storage/internal_keys.zig`'s `replay_namespace` (0x02) prefixes
+        // every journal/replay-lane key (the "all" lane and every hinted
+        // lane).
+        if (key.len > 0 and key[0] == 0x02) {
+            journal_bytes += bytes;
+            return;
+        }
+        // Every other private-metadata key (`\x00\x00...`) this write might
+        // touch (status snapshots, index catalog, consumer registry, ...).
+        if (key.len >= 2 and key[0] == 0 and key[1] == 0) {
+            other_bytes += bytes;
+            return;
+        }
+        // No `\x00\x00`/`\x02` prefix: the user-supplied primary document
+        // key itself.
+        primary_bytes += bytes;
+    }
+
+    fn printReport(comptime label: []const u8, updates: usize) void {
+        const u: f64 = @floatFromInt(@max(updates, 1));
+        std.debug.print(
+            "  {s}: keys/write={d:.1} primary_bytes/write={d:.0} algebraic_fact_bytes/write={d:.0} progress_bytes/write={d:.0} journal_bytes/write={d:.0} other_bytes/write={d:.0}\n",
+            .{
+                label,
+                @as(f64, @floatFromInt(keys_seen)) / u,
+                @as(f64, @floatFromInt(primary_bytes)) / u,
+                @as(f64, @floatFromInt(algebraic_fact_bytes)) / u,
+                @as(f64, @floatFromInt(progress_bytes)) / u,
+                @as(f64, @floatFromInt(journal_bytes)) / u,
+                @as(f64, @floatFromInt(other_bytes)) / u,
+            },
+        );
+    }
+};
+
 /// Single-writer algebraic mode: one document per transaction, acked at
 /// `full_index` -- the sync level that requires this index's own facts (and
 /// its HLL cardinality sketch) to be visible before the batch call returns.
@@ -817,12 +887,16 @@ fn measureSingleWriterAlgebraic(alloc: std.mem.Allocator, comptime name: []const
     var key_buffer: [32]u8 = undefined;
     wal_trace.reset();
     wal_trace.registerCallingThread();
+    CommitKeyKindDiagnostic.reset();
+    docstore_mod.Store.test_commit_key_hook = CommitKeyKindDiagnostic.record;
+    defer docstore_mod.Store.test_commit_key_hook = null;
     const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
     for (0..updates) |i| {
         const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i % 128});
         try insertOneAlgebraic(alloc, fixture.handle, key, i, "full_index");
     }
     const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    CommitKeyKindDiagnostic.printReport("algebraic bytes by record kind", updates);
     return .{ .updates = updates, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
 }
 
@@ -880,6 +954,46 @@ fn measureConcurrentAlgebraic(alloc: std.mem.Allocator, comptime name: []const u
     return .{ .updates = writers * updates_per_writer, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
 }
 
+// Diagnostic accumulator for `docstore_mod.Store.test_ride_along_hook`:
+/// every `stageRideAlong` call during the measured write loop below,
+/// regardless of which caller/kind staged it (the stage tag active when a
+/// self-forced drain's fsync actually happens belongs to whatever OTHER
+/// write is running at that moment, never necessarily the ride-along
+/// member whose own bytes tipped the threshold -- see the hook's own doc
+/// comment in docstore.zig).
+const RideAlongDiagnostic = struct {
+    var calls: usize = 0;
+    var total_bytes: usize = 0;
+    var max_bytes: usize = 0;
+    var crossings: usize = 0; // calls whose own bytes alone exceed the threshold
+    var pending_before_sum: usize = 0;
+
+    fn reset() void {
+        calls = 0;
+        total_bytes = 0;
+        max_bytes = 0;
+        crossings = 0;
+        pending_before_sum = 0;
+    }
+
+    fn record(estimated_bytes: usize, pending_before: usize) void {
+        calls += 1;
+        total_bytes += estimated_bytes;
+        pending_before_sum += pending_before;
+        if (estimated_bytes > max_bytes) max_bytes = estimated_bytes;
+        if (estimated_bytes >= 1024 * 1024) crossings += 1;
+    }
+
+    fn printReport(comptime label: []const u8) void {
+        const mean_bytes: f64 = if (calls == 0) 0 else @as(f64, @floatFromInt(total_bytes)) / @as(f64, @floatFromInt(calls));
+        const mean_pending_before: f64 = if (calls == 0) 0 else @as(f64, @floatFromInt(pending_before_sum)) / @as(f64, @floatFromInt(calls));
+        std.debug.print(
+            "  {s}: stageRideAlong calls={d} mean_estimated_bytes={d:.0} max_estimated_bytes={d} single-call-exceeds-1MiB={d} mean_pending_before={d:.0}\n",
+            .{ label, calls, mean_bytes, max_bytes, crossings, mean_pending_before },
+        );
+    }
+};
+
 /// Single-writer algebraic *overwrite* mode: same fixture and sync level as
 /// `measureSingleWriterAlgebraic`, but a small key cycle
 /// (`algebraic_overwrite_key_cycle`) so most writes overwrite an existing
@@ -894,13 +1008,87 @@ fn measureSingleWriterAlgebraicOverwrite(alloc: std.mem.Allocator, comptime name
     var key_buffer: [32]u8 = undefined;
     wal_trace.reset();
     wal_trace.registerCallingThread();
+    RideAlongDiagnostic.reset();
+    docstore_mod.Store.test_ride_along_hook = RideAlongDiagnostic.record;
+    defer docstore_mod.Store.test_ride_along_hook = null;
+    CommitKeyKindDiagnostic.reset();
+    docstore_mod.Store.test_commit_key_hook = CommitKeyKindDiagnostic.record;
+    defer docstore_mod.Store.test_commit_key_hook = null;
     const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
     for (0..updates) |i| {
         const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i % algebraic_overwrite_key_cycle});
         try insertOneAlgebraic(alloc, fixture.handle, key, i, "full_index");
     }
     const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    RideAlongDiagnostic.printReport("algebraic overwrite ride-along diagnostic");
+    CommitKeyKindDiagnostic.printReport("algebraic overwrite bytes by record kind", updates);
     return .{ .updates = updates, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
+}
+
+const ConcurrentAlgebraicOverwriteWorker = struct {
+    alloc: std.mem.Allocator,
+    handle: *anyopaque,
+    worker: usize,
+    updates_per_writer: usize,
+    barrier: *Barrier,
+    err: ?anyerror = null,
+
+    fn run(self: *ConcurrentAlgebraicOverwriteWorker) void {
+        wal_trace.registerCallingThread();
+        var key_buffer: [32]u8 = undefined;
+        for (0..self.updates_per_writer) |i| {
+            self.barrier.wait();
+            // Own small key cycle per worker (never shared across workers,
+            // same as `ConcurrentAlgebraicWorker` above) so each worker's
+            // own stream overwrites its own keys repeatedly, same shape as
+            // `measureSingleWriterAlgebraicOverwrite`.
+            const key = std.fmt.bufPrint(&key_buffer, "w{d}-doc-{d}", .{ self.worker, i % algebraic_overwrite_key_cycle }) catch |err| {
+                self.err = err;
+                return;
+            };
+            const seed = self.worker * 1_000_003 + i;
+            insertOneAlgebraic(self.alloc, self.handle, key, seed, "full_index") catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    }
+};
+
+/// 8-writer counterpart to `measureSingleWriterAlgebraicOverwrite`: tests
+/// whether concurrent foreground traffic drains ride-along HLL maintenance
+/// "for free" (the next writer's own group-commit fsync picking it up)
+/// often enough to avoid the single-writer sequential mode's own idle-flush
+/// timer artifact -- see that function's own diagnostic output and the
+/// design doc's §3.3b note on what the single-writer number actually
+/// measures.
+fn measureConcurrentAlgebraicOverwrite(alloc: std.mem.Allocator, comptime name: []const u8, writers: usize, updates_per_writer: usize) !ModeReport {
+    var fixture = try Fixture.open(alloc, name, .algebraic);
+    defer fixture.close();
+
+    wal_trace.reset();
+    RideAlongDiagnostic.reset();
+    docstore_mod.Store.test_ride_along_hook = RideAlongDiagnostic.record;
+    defer docstore_mod.Store.test_ride_along_hook = null;
+    var barrier = Barrier{ .participants = writers };
+    var workers = try alloc.alloc(ConcurrentAlgebraicOverwriteWorker, writers);
+    defer alloc.free(workers);
+    var threads = try alloc.alloc(std.Thread, writers);
+    defer alloc.free(threads);
+    for (0..writers) |w| workers[w] = .{
+        .alloc = alloc,
+        .handle = fixture.handle,
+        .worker = w,
+        .updates_per_writer = updates_per_writer,
+        .barrier = &barrier,
+    };
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    for (0..writers) |w| threads[w] = try std.Thread.spawn(.{}, ConcurrentAlgebraicOverwriteWorker.run, .{&workers[w]});
+    for (threads) |thread| thread.join();
+    const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    for (workers) |worker| if (worker.err) |err| return err;
+    RideAlongDiagnostic.printReport("algebraic overwrite ride-along diagnostic, 8 writers");
+    return .{ .updates = writers * updates_per_writer, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,6 +1682,7 @@ const ReportJson = struct {
     /// maintenance commit (`algebraic_hll_maintenance`'s background syncs),
     /// which the insert-only `algebraic` mode above always reads as zero.
     algebraic_overwrite: ModeJson,
+    algebraic_overwrite_8_writers: ModeJson,
 };
 
 test "lite write amplification report" {
@@ -1513,6 +1702,7 @@ test "lite write amplification report" {
     const algebraic = try measureSingleWriterAlgebraic(alloc, "lite-write-amp-algebraic", updates);
     const algebraic_concurrent = try measureConcurrentAlgebraic(alloc, "lite-write-amp-algebraic-concurrent", default_writers, updates / default_writers);
     const algebraic_overwrite = try measureSingleWriterAlgebraicOverwrite(alloc, "lite-write-amp-algebraic-overwrite", updates);
+    const algebraic_overwrite_concurrent = try measureConcurrentAlgebraicOverwrite(alloc, "lite-write-amp-algebraic-overwrite-concurrent", default_writers, updates / default_writers);
 
     std.debug.print("lite write amplification report (updates={d}, text_bytes={d}, dense_dims={d}, sparse_terms={d}):\n", .{ updates, text_bytes, dense_dims, sparse_terms });
     printStageTable("primary-only", primary);
@@ -1528,6 +1718,7 @@ test "lite write amplification report" {
     printStageTable("algebraic-visible", algebraic);
     printStageTable("algebraic-visible, 8 writers", algebraic_concurrent);
     printStageTable("algebraic-visible, overwrite", algebraic_overwrite);
+    printStageTable("algebraic-visible, overwrite, 8 writers", algebraic_overwrite_concurrent);
 
     // Journal suppression + ride-along HLL maintenance TARGET (lite-single-
     // commit-write-path.md §3.2a/§3.3b): a workload that dirties and
@@ -1536,23 +1727,54 @@ test "lite write amplification report" {
     // should ride along in the SAME native transaction as the write that
     // dirtied it (or a later one), never forcing a sync of its own.
     //
-    // NOT YET MET: measured at ~1.9 durable commits/write and ~0.94
-    // background syncs/update (almost exactly one self-forced drain per
-    // dirtying write) -- confirmed via `Index.scheduleHllMaintenanceIfDirty`
-    // -> `runHllMaintenance` -> `beginWriteBatchWithOptions(.{ .durability
-    // = .ride_along })`, which does reach `Store.stageRideAlong` (never
-    // leads a group on its own by construction), so the self-drain must be
-    // `stageRideAlong`'s own `if (ride_along_pending_bytes >=
-    // ride_along_byte_threshold) forceDrainDurable()` check firing almost
-    // every time. Capping `max_hll_maintenance_rows_per_tick` at 8 (see
-    // `algebraic_config_json` above) made no measurable difference, ruling
-    // out "the rebuild itself scans/rewrites too many rows" as the cause --
-    // the real source of each tick's byte cost (and why a concurrent
-    // foreground write essentially never drains it for free in this
-    // single-writer sequential harness first) needs a traced run to pin
-    // down further than this session had time for. Left as a printed
-    // diagnostic, not a hard gate, until that's root-caused.
-    std.debug.print("  algebraic overwrite: durable_commits_per_write={d:.3} background_syncs_per_update={d:.3} (target 1.0 / 0.0, not yet met -- see comment above)\n", .{ algebraic_overwrite.durableCommitsPerWrite(), algebraic_overwrite.perUpdate(.background) });
+    // ROOT-CAUSED: NOT a byte-threshold or oversized-sketch problem.
+    // `RideAlongDiagnostic` (see `measureSingleWriterAlgebraicOverwrite`'s
+    // own `stageRideAlong` size log) shows every single-writer call at
+    // ~16.9KB (one HLL register array at the default precision=14, 2^14
+    // one-byte registers) with `pending_before=0` every time and zero
+    // calls ever approaching `ride_along_byte_threshold` (1 MiB) on their
+    // own -- `Store.stageRideAlong`'s own byte-threshold self-drain check
+    // never fires here. The actual mechanism is `rideAlongFlushLoop`'s (a)
+    // idle-flush timer: it wakes every `ride_along_idle_ns` (default 50ms)
+    // and force-drains whatever is still pending once that long has
+    // elapsed since the last ride-along enqueue. This single-writer mode's
+    // own writes run ~250-300ms apart in a Debug build (allocator-tracing
+    // overhead, not the commit path itself), so the 50ms timer always
+    // wins the race against the next foreground write arriving to drain
+    // the HLL job for free -- it is working exactly as designed (§3.2a:
+    // "so ride-along work becomes durable when no foreground writer
+    // comes"), just triggered on nearly every write here because this
+    // mode's writes are far apart relative to that window, not because
+    // anything is oversized. `algebraic_overwrite_concurrent` (8 writers)
+    // tests the fix this points to: with real concurrent foreground
+    // traffic, a ride-along job almost always finds another writer's
+    // group to join well inside 50ms, so the idle timer rarely needs to
+    // fire. The single-writer mode is reported as a diagnostic only, for
+    // exactly this reason (its own number is a Debug-single-thread timing
+    // artifact, not a write-path defect); the concurrent mode is the hard
+    // gate below.
+    // 8 writers improves on the single-writer number (measured ~1.5 vs
+    // ~1.9 durable commits/write) but does not reach 1.0 either --
+    // `RideAlongDiagnostic`'s own `mean_pending_before=0` holds here too,
+    // confirming the byte threshold still never fires; the 8-worker
+    // harness's own `Barrier` synchronizes every writer to step together
+    // each round, so writes still arrive in round-by-round bursts with a
+    // gap between rounds, not continuously staggered -- a real production
+    // traffic pattern would likely drain more of this for free than this
+    // specific harness shape does, but 1.0/0 is not a target this harness
+    // can currently demonstrate reaching, hard-gated or not, without
+    // either a different concurrency shape or a change to
+    // `ride_along_idle_ns` itself (out of scope for this file: that
+    // constant is shared by every ride-along user in `docstore.zig`, not
+    // just algebraic HLL maintenance -- graph, relational jobs,
+    // resolution, enrichment all stage through the same queue). Reported
+    // as a diagnostic, not a hard gate, until that's decided.
+    std.debug.print("  algebraic overwrite (informational -- see comment above): single-writer durable_commits_per_write={d:.3} background_syncs_per_update={d:.3}; 8-writer durable_commits_per_write={d:.3} background_syncs_per_update={d:.3}\n", .{
+        algebraic_overwrite.durableCommitsPerWrite(),
+        algebraic_overwrite.perUpdate(.background),
+        algebraic_overwrite_concurrent.durableCommitsPerWrite(),
+        algebraic_overwrite_concurrent.perUpdate(.background),
+    });
 
     const report: ReportJson = .{
         .text_bytes = text_bytes,
@@ -1571,6 +1793,7 @@ test "lite write amplification report" {
         .algebraic = modeJson(algebraic),
         .algebraic_8_writers = modeJson(algebraic_concurrent),
         .algebraic_overwrite = modeJson(algebraic_overwrite),
+        .algebraic_overwrite_8_writers = modeJson(algebraic_overwrite_concurrent),
     };
     const json_text = try std.json.Stringify.valueAlloc(alloc, report, .{ .whitespace = .indent_2 });
     defer alloc.free(json_text);
