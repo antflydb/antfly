@@ -2440,11 +2440,28 @@ test "lite write amplification report: relational write surface" {
     try expectAtMost(sql_insert_update.durableCommitsPerWrite(), 2.0, "SQL INSERT/UPDATE via C API durable commits/write");
     // `foreign_key` still spans two physical tables (the child row plus an
     // `.attach` inbound-reference record against the parent -- see
-    // `Plan.expand` in `api/relational_integrity.zig`), so it still takes
-    // the full cross-database protocol and is unchanged by this pass
-    // (~16, not yet ~4). Gated loosely to catch a regression, not to claim
-    // this mode improved.
-    try expectAtMost(foreign_key.durableCommitsPerWrite(), 20.0, "relational foreign-key durable commits/write");
+    // `Plan.expand` in `api/relational_integrity.zig`), but
+    // `capi/sql.zig`'s `commitCoordinatedFusedMultiTable` (lite-single-
+    // commit-write-path.md §7.5's FK multi-table coordinator) now drives
+    // this case too instead of the full cross-database two-phase
+    // protocol: it locks the parent's `core.apply_mutex` directly
+    // (ascending `table_id` order, parent before child), validates and
+    // stages the `.attach` record as a ride-along commit against the
+    // parent's own store, then drives the child's row insert through its
+    // existing, unmodified single-table `commitCoordinatedLocal`. Measured
+    // ~16 -> ~1.9 (1 writer) / ~2.3 (8 writers), down from the untouched
+    // baseline this gate used to allow. The residual above 1.0 is the
+    // same `ride_along_flush` idle-timer dynamic already documented for
+    // the algebraic overwrite case (§3.3b): the parent's ride-along
+    // `.attach` write usually, but not always, gets swept into the SAME
+    // fsync as the child's own foreground commit; when it loses that
+    // race it becomes durable on the next foreground commit or the
+    // idle-flush timer instead, costing close to a second commit. Not
+    // addressed here (closing that gap needs the same cross-cutting
+    // ride-along-timing work §3.3b/§7.5 already flagged as follow-up, not
+    // a change specific to FK).
+    try expectAtMost(foreign_key.durableCommitsPerWrite(), 3.0, "relational foreign-key durable commits/write");
+    try expectAtMost(foreign_key_concurrent.durableCommitsPerWrite(), 3.5, "relational foreign-key 8-writer durable commits/write");
 }
 
 // ---------------------------------------------------------------------------
@@ -2547,6 +2564,163 @@ test "lite write amplification concurrency: concurrent FK child inserts against 
     }
     try std.testing.expectEqual(@as(usize, 0), wins);
     try std.testing.expectEqual(@as(usize, 0), try countMatchingRows(alloc, fixture.handle, "SELECT _id FROM children"));
+}
+
+// lite-single-commit-write-path.md §7.5: `commitCoordinatedFusedMultiTable`
+// locks the parent's `core.apply_mutex` directly (never through its own
+// `batchInternal` re-entry) for the whole duration of validating and
+// staging a child insert's `.attach` record, exactly where a parent
+// DELETE's own single-table `commitCoordinatedLocal` call also takes that
+// same lock to check for live references before deleting. Half of
+// `race_writers` threads race to DELETE the one seeded parent this test
+// targets; the other half race to INSERT a new child referencing it. The
+// correctness invariant is "no orphan": a parent that ends up durably
+// deleted may never leave a live child row still referencing it,
+// regardless of how the two kinds of operations interleaved.
+test "lite write amplification concurrency: parent DELETE races child INSERT, no orphan and no lost reject" {
+    const alloc = std.testing.allocator;
+    var fixture = try openRelationalFixture(alloc, "lite-write-amp-rel-fk-parent-race", .foreign_key);
+    defer fixture.close();
+    const parent_id: usize = 0;
+
+    const Role = enum { delete_parent, insert_child };
+    const Worker = struct {
+        alloc: std.mem.Allocator,
+        handle: *anyopaque,
+        id: usize,
+        role: Role,
+        outcome: capi_types.ErrorCode = .internal,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var stmt_buf: [192]u8 = undefined;
+            const stmt = switch (self.role) {
+                .delete_parent => std.fmt.bufPrint(&stmt_buf, "DELETE FROM parents WHERE id = {d}", .{parent_id}) catch |err| {
+                    self.err = err;
+                    return;
+                },
+                .insert_child => std.fmt.bufPrint(&stmt_buf, "INSERT INTO children (_id, id, parent_id) VALUES ('race-parent-child-{d}', {d}, {d})", .{ self.id, self.id, parent_id }) catch |err| {
+                    self.err = err;
+                    return;
+                },
+            };
+            self.outcome = execSqlOutcome(self.alloc, self.handle, stmt) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var workers: [race_writers]Worker = undefined;
+    for (&workers, 0..) |*worker, i| worker.* = .{
+        .alloc = alloc,
+        .handle = fixture.handle,
+        .id = i,
+        .role = if (i % 2 == 0) .delete_parent else .insert_child,
+    };
+    var threads: [race_writers]std.Thread = undefined;
+    for (&threads, &workers) |*thread, *worker| thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    for (&threads) |*thread| thread.join();
+
+    // A DELETE whose WHERE clause matches zero rows still reports `.ok`
+    // (standard SQL semantics: it is a no-op, not an error), so more than
+    // one `delete_parent` worker legitimately reporting success is
+    // expected whenever a single winner deletes the row first and every
+    // later DELETE then matches nothing -- outcome codes alone cannot
+    // distinguish "I deleted it" from "it was already gone", only the
+    // final durable state can. Check that instead.
+    for (workers) |worker| if (worker.err) |err| return err;
+    var parent_stmt_buf: [128]u8 = undefined;
+    const parent_count_stmt = try std.fmt.bufPrint(&parent_stmt_buf, "SELECT id FROM parents WHERE id = {d}", .{parent_id});
+    const parent_still_present = (try countMatchingRows(alloc, fixture.handle, parent_count_stmt)) == 1;
+    var child_stmt_buf: [128]u8 = undefined;
+    const child_count_stmt = try std.fmt.bufPrint(&child_stmt_buf, "SELECT _id FROM children WHERE parent_id = {d}", .{parent_id});
+    const live_children = try countMatchingRows(alloc, fixture.handle, child_count_stmt);
+    // No orphan: a deleted parent can never leave a live (durable) child
+    // row still referencing it. This also IS the no-lost-reject
+    // invariant restated: a child reference can only be durably live if
+    // its parent is durably present, i.e. RESTRICT never let an attach
+    // through against a parent that was (or became) absent.
+    if (!parent_still_present) try std.testing.expectEqual(@as(usize, 0), live_children);
+    // At least one side of the race must have made progress: either the
+    // parent is gone, or at least one child successfully attached (ruling
+    // out a lock-ordering bug that makes every concurrent attempt on this
+    // table pair spuriously fail).
+    try std.testing.expect(!parent_still_present or live_children > 0);
+}
+
+// lite-single-commit-write-path.md §7.5: two tables with FOREIGN KEYs
+// pointing at each other in opposite directions. `eligibleForFusedMultiTable`
+// in `capi/sql.zig` only drives the direction whose leader (the table
+// receiving the row write) has the LARGER `table_id` of the two through
+// the fused coordinator; the opposite direction falls back to
+// `sql_commit.zig`'s cross-database two-phase coordinator, which already
+// serializes through `handle.sql_commit_mutex`. Concurrent writers in BOTH
+// directions must still complete without a deadlock between the fused
+// path's direct `core.apply_mutex` locking (ascending `table_id`) and the
+// two-phase path's own lock acquisition.
+test "lite write amplification concurrency: mutual FK tables, concurrent writers in both directions complete without deadlock" {
+    const alloc = std.testing.allocator;
+    var fixture = try Fixture.open(alloc, "lite-write-amp-rel-fk-mutual", .primary_only);
+    defer fixture.close();
+
+    try execSql(alloc, fixture.handle, "CREATE TABLE node_a (id BIGINT PRIMARY KEY, b_ref BIGINT)");
+    try execSql(alloc, fixture.handle, "CREATE TABLE node_b (id BIGINT PRIMARY KEY, a_ref BIGINT)");
+    try execSql(alloc, fixture.handle, "INSERT INTO node_a (_id, id) VALUES ('seed-a', 0)");
+    try execSql(alloc, fixture.handle, "INSERT INTO node_b (_id, id) VALUES ('seed-b', 0)");
+    try execSql(alloc, fixture.handle, "ALTER TABLE node_a ADD CONSTRAINT node_a_b_fkey FOREIGN KEY (b_ref) REFERENCES node_b (id)");
+    try execSql(alloc, fixture.handle, "ALTER TABLE node_b ADD CONSTRAINT node_b_a_fkey FOREIGN KEY (a_ref) REFERENCES node_a (id)");
+    _ = api.antfly_db_run_until_idle(fixture.handle);
+
+    const Direction = enum { a_references_b, b_references_a };
+    const Worker = struct {
+        alloc: std.mem.Allocator,
+        handle: *anyopaque,
+        id: usize,
+        direction: Direction,
+        outcome: capi_types.ErrorCode = .internal,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var stmt_buf: [192]u8 = undefined;
+            const stmt = switch (self.direction) {
+                .a_references_b => std.fmt.bufPrint(&stmt_buf, "INSERT INTO node_a (_id, id, b_ref) VALUES ('mutual-a-{d}', {d}, 0)", .{ self.id, self.id + 1 }) catch |err| {
+                    self.err = err;
+                    return;
+                },
+                .b_references_a => std.fmt.bufPrint(&stmt_buf, "INSERT INTO node_b (_id, id, a_ref) VALUES ('mutual-b-{d}', {d}, 0)", .{ self.id, self.id + 1 }) catch |err| {
+                    self.err = err;
+                    return;
+                },
+            };
+            self.outcome = execSqlOutcome(self.alloc, self.handle, stmt) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var workers: [race_writers]Worker = undefined;
+    for (&workers, 0..) |*worker, i| worker.* = .{
+        .alloc = alloc,
+        .handle = fixture.handle,
+        .id = i,
+        .direction = if (i % 2 == 0) .a_references_b else .b_references_a,
+    };
+    var threads: [race_writers]std.Thread = undefined;
+    for (&threads, &workers) |*thread, *worker| thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    // `thread.join()` below hangs forever on a genuine deadlock; this
+    // test's own bound is the harness's outer test timeout, exactly like
+    // every other concurrency test in this file.
+    for (&threads) |*thread| thread.join();
+
+    for (workers) |worker| {
+        if (worker.err) |err| return err;
+        // Every insert references a parent row that was live the whole
+        // time (never deleted by this test), so RESTRICT/existence
+        // checks have no reason to reject any of them.
+        try std.testing.expectEqual(capi_types.ErrorCode.ok, worker.outcome);
+    }
+    try std.testing.expectEqual(race_writers / 2, try countMatchingRows(alloc, fixture.handle, "SELECT _id FROM node_a WHERE b_ref = 0"));
+    try std.testing.expectEqual(race_writers / 2, try countMatchingRows(alloc, fixture.handle, "SELECT _id FROM node_b WHERE a_ref = 0"));
 }
 
 fn expectAtMost(actual: f64, ceiling: f64, comptime label: []const u8) !void {

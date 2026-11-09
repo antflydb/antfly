@@ -4837,12 +4837,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.mem.startsWith(u8, key, protection.index_writer_prefix);
         }
 
-        /// lite-single-commit-write-path.md §3.3c: validates and
-        /// materializes UNIQUE-constraint integrity effects for a single
-        /// table write deciding them for the first time in this one call
-        /// (`BatchExecutionOptions.integrity_authority == .local_decision`,
-        /// set only by `capi/sql.zig`'s `commitCoordinated` fast path) --
-        /// no durable intent record, no begin record. Runs the same
+        /// lite-single-commit-write-path.md §3.3c/§7.5 (FK coordinator):
+        /// validates and materializes UNIQUE- and FOREIGN-KEY-constraint
+        /// integrity effects for a table write deciding them for the first
+        /// time in this one call (`BatchExecutionOptions.integrity_authority
+        /// == .local_decision`, set only by `capi/sql.zig`'s
+        /// `commitCoordinated` fast path and its multi-table FK coordinator)
+        /// -- no durable intent record, no begin record. Runs the same
         /// `relational_integrity.prepare`/`validatePreparedEffects`/
         /// `checkVersionPredicates` sequence `storage/db/db.zig`'s
         /// `writeTransactionInternalOnce` runs for `req.integrity_commands`,
@@ -4850,14 +4851,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         /// caller must already be holding the SAME apply-exclusive lock
         /// this commit is about to write under (this never acquires or
         /// releases it), so the check and the write land in one native
-        /// batch with no gap a concurrent writer could land in between. A
-        /// `.foreign` generation command is refused: cross-table FK
-        /// bookkeeping (the parent's own `.attach`/`.detach` record) still
-        /// needs a multi-table coordinator, never this single-table path.
-        /// Returned intents are allocated from `alloc` and remain valid
-        /// for the caller's own commit lifetime (the same `preparation_alloc`
-        /// arena every other per-call buffer in this function uses).
-        fn prepareLocalIntegrityDecision(
+        /// batch with no gap a concurrent writer could land in between.
+        /// Both `.unique` and `.foreign_key` generation commands are
+        /// accepted: a single-table call (`prepared.tables.len == 1`) is
+        /// self-contained by construction (the dependency-catalog
+        /// preparation in `api/relational_integrity_commit.zig` only
+        /// attributes a command to a table whose own store must receive
+        /// it), and a cross-table FK command (e.g. a child's `.attach`
+        /// against a parent's claim) is safe here too as long as the
+        /// caller also holds every OTHER participant table's apply-
+        /// exclusive lock for the duration -- `capi/sql.zig`'s
+        /// `commitCoordinatedFusedMultiTable` is the only caller that
+        /// invokes this against a table other than the one driving the
+        /// enclosing native commit, and it establishes that lock
+        /// discipline itself (ascending `identity_namespace.table_id`)
+        /// before calling in. Returned intents are allocated from `alloc`
+        /// and remain valid for the caller's own commit lifetime (the
+        /// same `preparation_alloc` arena every other per-call buffer in
+        /// this function uses, for the single-table caller; the
+        /// multi-table coordinator passes its own longer-lived arena).
+        pub fn prepareLocalIntegrityDecision(
             self: anytype,
             alloc: Allocator,
             schema_version: ?u32,
@@ -4901,7 +4914,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!std.mem.eql(u8, &incarnation, &catalog.incarnation)) return error.IntegrityCatalogIncarnationMismatch;
             for (commands) |command| {
                 const generation = catalog.findGeneration(command.address.generation) orelse return error.IntegrityCatalogChanged;
-                if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
+                if (generation.definition.kind != .unique and generation.definition.kind != .foreign_key) return error.InvalidIntegrityOperation;
                 if (generation.retired and (command.operation == .establish or command.operation == .attach)) return error.IntegrityCatalogChanged;
             }
 
@@ -4920,7 +4933,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try shadow_mod.requireServing(&integrity_read, byte_range, operation.routing_key);
                 const parsed = try integrity_mod.parseKey(operation.key);
                 const generation = catalog.findGeneration(parsed.address.generation) orelse return error.IntegrityCatalogChanged;
-                if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
+                if (generation.definition.kind != .unique and generation.definition.kind != .foreign_key) return error.InvalidIntegrityOperation;
                 if (generation.retired and operation.kind != .delete) return error.IntegrityCatalogChanged;
                 try predicates.append(alloc, integrity_mod.predicate(operation));
                 if (operation.kind != .guard) {

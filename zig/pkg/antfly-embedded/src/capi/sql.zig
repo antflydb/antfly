@@ -685,6 +685,227 @@ pub fn Adapter(comptime native: type) type {
             return .committed;
         }
 
+        /// lite-single-commit-write-path.md §7.5: the shape
+        /// `commitCoordinatedFusedMultiTable` can drive -- exactly one
+        /// participant table with real row writes/deletes (the leader,
+        /// e.g. an FK child insert's own row), every other participant
+        /// pure integrity bookkeeping (no row writes/deletes of its own,
+        /// e.g. a parent's `.attach`/`.detach` Reference) and otherwise
+        /// eligible for the same fast path `eligibleForLocalDecision`
+        /// already gates for the single-table case. Lock-order safety
+        /// (every follower's `table_id` must be smaller than the
+        /// leader's) is checked once the tables are resolved to their
+        /// `*DB`s in `commitCoordinatedFusedMultiTable` itself, since
+        /// this only has the request shape, not real table identities.
+        fn eligibleForFusedMultiTable(tables: []const contract.TableCommitRequest) ?usize {
+            if (tables.len < 2 or tables.len > 64) return null;
+            var leader_index: ?usize = null;
+            for (tables, 0..) |table, i| {
+                if (!eligibleForLocalDecision(table)) return null;
+                if (table.writes.len != 0 or table.deletes.len != 0) {
+                    if (leader_index != null) return null;
+                    leader_index = i;
+                } else if (table.integrity_commands.len == 0) {
+                    // A participant with no row writes and no integrity
+                    // work to decide has no reason to be here.
+                    return null;
+                }
+            }
+            return leader_index;
+        }
+
+        /// One key this coordinator wrote for a non-leader (follower)
+        /// participant, and the bytes to restore there if the leader's
+        /// own commit (or a later follower's own validation) ultimately
+        /// fails. `prior_value = null` means the key did not exist before
+        /// (revert deletes it); otherwise revert restores exactly these
+        /// bytes.
+        const FollowerRevertEntry = struct { key: []const u8, prior_value: ?[]const u8 };
+
+        /// lite-single-commit-write-path.md §7.5's FK multi-table
+        /// coordinator. `tables` is `integrity.prepareWithRepairAdmission`'s
+        /// already-computed per-table split (one `TableCommitRequest` per
+        /// physical table the write touches); `leader_index` names the one
+        /// table with real row writes/deletes, as established by
+        /// `eligibleForFusedMultiTable`.
+        ///
+        /// Lock discipline: every OTHER (follower) participant's
+        /// `core.apply_mutex` is locked here, directly, in ascending
+        /// `table_id` order, before anything else happens; the leader's
+        /// own lock is never touched directly here -- `commitCoordinatedLocal`
+        /// below acquires and releases it internally, exactly as the
+        /// single-table fast path already does. This is only safe because
+        /// every follower's `table_id` is smaller than the leader's
+        /// (checked immediately below, falling back to the general
+        /// two-phase coordinator otherwise): the sequence of lock
+        /// acquisitions this call makes -- every follower (ascending),
+        /// then the leader (internally, strictly last and strictly
+        /// larger) -- is itself in ascending `table_id` order, matching
+        /// what a concurrent operation on the same table pair (e.g. a
+        /// parent DELETE's own single-table `commitCoordinatedLocal` call,
+        /// or another insert in the opposite FK direction that this same
+        /// check routes through the two-phase coordinator instead) also
+        /// follows, so no inversion -- and so no deadlock -- is possible.
+        ///
+        /// A follower's validated integrity effects are written through a
+        /// ride-along commit (`durability = .ride_along`) against that
+        /// follower's OWN `core.store`. Every table of one Lite single-
+        /// file backend shares one underlying `docstore.Store`, so a
+        /// ride-along entry is swept into the very next foreground commit
+        /// on ANY table of that store -- here, the leader's own
+        /// `commitCoordinatedLocal` call immediately below, landing both
+        /// in the same one fsync (lite-single-commit-write-path.md
+        /// §3.2a/§7.2's existing ride-along pattern, not a new commit
+        /// primitive). If the leader's commit then fails -- or a LATER
+        /// follower's own validation fails, with an EARLIER follower
+        /// already written -- every follower write already staged is
+        /// undone with an explicit, synchronous (foreground) revert
+        /// restoring the prior bytes (or deleting a key that did not
+        /// exist before): that revert's own commit forces the sync that
+        /// sweeps up the earlier, still-undurable ride-along entry
+        /// together with its own undo, netting to "as if nothing
+        /// happened" durably. This costs one extra commit only on the
+        /// (expected to be rare) failure path; the success path stays at
+        /// the leader's one fsync.
+        fn commitCoordinatedFusedMultiTable(
+            self: *Self,
+            alloc: std.mem.Allocator,
+            tables: []const contract.TableCommitRequest,
+            leader_index: usize,
+        ) !catalog.MutationOutcome {
+            const outcomes = dependencies.sql_errors;
+            const handle = self.handle orelse return error.UnsupportedSqlExecution;
+            if (tables.len > 64) return error.SqlProgramLimitExceeded;
+            var dbs: [64]*DB = undefined;
+            for (tables, 0..) |table, i| dbs[i] = @import("tables.zig").get(handle, table.table_name) catch |err| return outcomes.notApplied(err);
+            const db_slice: []const *DB = dbs[0..tables.len];
+            const leader_id = db_slice[leader_index].core.identity_namespace.table_id;
+            for (db_slice, 0..) |db, i| {
+                if (i == leader_index) continue;
+                // Lock-ordering safety (see the doc comment above): a
+                // follower with an id larger than the leader's cannot be
+                // driven safely by this call. Fall back to the general
+                // coordinator instead of risking an inverted lock order.
+                if (db.core.identity_namespace.table_id >= leader_id) return error.FusedMultiTableIneligible;
+            }
+            var follower_order: [64]usize = undefined;
+            var follower_count: usize = 0;
+            for (tables, 0..) |_, i| {
+                if (i == leader_index) continue;
+                follower_order[follower_count] = i;
+                follower_count += 1;
+            }
+            const followers = follower_order[0..follower_count];
+            std.mem.sort(usize, followers, db_slice, struct {
+                fn less(ctx: []const *DB, a: usize, b: usize) bool {
+                    return ctx[a].core.identity_namespace.table_id < ctx[b].core.identity_namespace.table_id;
+                }
+            }.less);
+            var follower_reverts: [64][]const FollowerRevertEntry = undefined;
+            for (follower_reverts[0..follower_count]) |*entry| entry.* = &.{};
+            var locked_count: usize = 0;
+            // Always unlock every follower this call locked, in reverse
+            // (descending table_id) order -- on every return path.
+            defer {
+                var i = locked_count;
+                while (i != 0) {
+                    i -= 1;
+                    db_slice[followers[i]].core.unlockApplyExclusive();
+                }
+            }
+            for (followers) |idx| {
+                db_slice[idx].core.lockApplyExclusive();
+                locked_count += 1;
+            }
+            // Preparing and staging follower writes (block-scoped so this
+            // errdefer never fires for the leader call below): only on an
+            // error return FROM THIS LOOP, undo every follower write
+            // already staged, in reverse order, while every lock above is
+            // still held.
+            {
+                var prepared_through: usize = 0;
+                errdefer {
+                    var i = prepared_through;
+                    while (i != 0) {
+                        i -= 1;
+                        revertFollower(db_slice[followers[i]], follower_reverts[i]) catch {};
+                    }
+                }
+                for (followers, 0..) |idx, pos| {
+                    const table = tables[idx];
+                    if (table.integrity_commands.len == 0) {
+                        prepared_through = pos + 1;
+                        continue;
+                    }
+                    const schema_version = table.relational_schema_version orelse table.schema_version;
+                    const intents = db_slice[idx].prepareLocalIntegrityDecision(alloc, schema_version, table.relational_integrity_generation_set, table.integrity_commands) catch |err| {
+                        if (err == error.VersionConflict) return error.SqlWriteConflict;
+                        return outcomes.notApplied(err);
+                    };
+                    if (intents.len == 0) {
+                        prepared_through = pos + 1;
+                        continue;
+                    }
+                    const reverts = try alloc.alloc(FollowerRevertEntry, intents.len);
+                    var batch = try db_slice[idx].core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
+                    errdefer batch.abort();
+                    for (intents, reverts) |intent, *revert| {
+                        const prior = batch.get(intent.key) catch |err| switch (err) {
+                            error.NotFound => null,
+                            else => return err,
+                        };
+                        revert.* = .{ .key = intent.key, .prior_value = if (prior) |p| try alloc.dupe(u8, p) else null };
+                        if (intent.value) |value| try batch.put(intent.key, value) else try batch.delete(intent.key);
+                    }
+                    try batch.commit();
+                    follower_reverts[pos] = reverts;
+                    prepared_through = pos + 1;
+                }
+            }
+            var leader_adapter = try self.selected(tables[leader_index].table_name);
+            defer self.outcome_transaction_id = leader_adapter.outcome_transaction_id;
+            return leader_adapter.commitCoordinatedLocal(alloc, tables[leader_index]) catch |err| {
+                // An ambiguous ("outcome unknown") failure here means the
+                // leader's own write MAY actually have become durable --
+                // reverting the follower in that case could durably erase
+                // a Reference whose child row is in fact live, trading a
+                // merely uncertain outcome for a definite, worse
+                // inconsistency (see the crash-sweep regression this
+                // fixes: `crash sweep: relational foreign-key child
+                // insert, child row and attach record are all-or-nothing`).
+                // Leave every follower write exactly as staged and
+                // propagate the same uncertainty outward instead; resolving
+                // it is this call's existing ambiguous-outcome contract,
+                // the same one `commitCoordinatedLocal` itself already has
+                // for its own single-table callers.
+                if (!outcomes.isUnknownOutcome(err)) {
+                    var i = follower_count;
+                    while (i != 0) {
+                        i -= 1;
+                        revertFollower(db_slice[followers[i]], follower_reverts[i]) catch {};
+                    }
+                }
+                return err;
+            };
+        }
+
+        /// Best-effort synchronous undo of `commitCoordinatedFusedMultiTable`'s
+        /// ride-along follower writes. Its own foreground (durable) commit
+        /// forces the sync that sweeps up the earlier, still-undurable
+        /// ride-along entries this reverts, together with their own undo,
+        /// in the SAME physical commit -- the net durable state is as if
+        /// those writes never happened, even though the original
+        /// ride-along commit already returned successfully.
+        fn revertFollower(db: *DB, reverts: []const FollowerRevertEntry) !void {
+            if (reverts.len == 0) return;
+            var batch = try db.core.store.beginWriteBatchWithOptions(.{});
+            errdefer batch.abort();
+            for (reverts) |revert| {
+                if (revert.prior_value) |value| try batch.put(revert.key, value) else try batch.delete(revert.key);
+            }
+            try batch.commit();
+        }
+
         /// The durable three-commit path (begin, write the intents, resolve
         /// them to real rows), kept for requests `commitCoordinatedLocal`
         /// does not cover -- see `eligibleForLocalDecision`.
@@ -1406,12 +1627,36 @@ pub fn Adapter(comptime native: type) type {
                 // recovery-hint record, root coordinator-role transaction,
                 // and extra per-participant recovery round trip (lite-
                 // single-commit-write-path.md §3.3c). A write whose prepared
-                // plan spans more than one table (e.g. a cascading FK
-                // bookkeeping write into a different table) still needs the
-                // general cross-database coordinator.
+                // plan spans more than one table (e.g. an FK child insert's
+                // own row plus the parent's `.attach` Reference bookkeeping)
+                // still stays on this store: `commitCoordinatedFusedMultiTable`
+                // below locks every participant table's `core.apply_mutex`
+                // in ascending `table_id` order and folds the non-leader
+                // participants' writes in as ride-along commits that share
+                // the leader's one foreground fsync (§7.5's FK coordinator).
+                // It only applies when exactly one table owns real row
+                // writes and every other participant is pure integrity
+                // bookkeeping with the leader's table_id the largest among
+                // them (the lock-ordering direction this call can safely
+                // drive without re-entering an already-locked table); any
+                // other shape -- or a plain multi-database handle -- still
+                // needs the general cross-database two-phase coordinator.
                 if (self.handle) |handle| {
                     if (handle.owned_lite_backend != null and prepared.?.tables.len == 1 and std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) {
                         return self.commitCoordinated(temporary, prepared.?.tables[0], true);
+                    }
+                    if (handle.owned_lite_backend != null) {
+                        if (eligibleForFusedMultiTable(prepared.?.tables)) |leader_index| {
+                            if (self.commitCoordinatedFusedMultiTable(temporary, prepared.?.tables, leader_index) catch |err| blk: {
+                                if (err == error.FusedMultiTableIneligible) break :blk null;
+                                return err;
+                            }) |outcome| return outcome;
+                            // Ineligible after all (e.g. an inverted
+                            // table_id order between leader and a
+                            // follower): fall through to the general
+                            // two-phase coordinator below, nothing was
+                            // written by the attempt above.
+                        }
                     }
                     return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
                 }

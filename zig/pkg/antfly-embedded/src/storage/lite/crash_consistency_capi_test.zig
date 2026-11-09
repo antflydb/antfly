@@ -266,6 +266,137 @@ test "crash sweep: relational session COMMIT on the fused path" {
     try reportFailures(&report);
 }
 
+fn execOutcome(alloc: Allocator, id: ?*anyopaque, statement: []const u8) !h.capi.ErrorCode {
+    const request = try std.fmt.allocPrint(alloc, "{{\"statement\":\"{s}\"}}", .{statement});
+    defer alloc.free(request);
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&output);
+    return api.antfly_db_sql_json(id, .fromSlice(request), &output);
+}
+
+/// `parent_id`'s value for the child row named `id_value` in table
+/// `children`, or `null` if no such row exists.
+fn selectChildParentId(alloc: Allocator, id: ?*anyopaque, id_value: []const u8) !?i64 {
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&output);
+    const request = try std.fmt.allocPrint(alloc, "{{\"statement\":\"SELECT parent_id FROM children WHERE _id = '{s}'\"}}", .{id_value});
+    defer alloc.free(request);
+    const code = api.antfly_db_sql_json(id, .fromSlice(request), &output);
+    if (code != .ok) {
+        std.debug.print("crash-consistency capi FK: SELECT failed {s}: {s}\n", .{ @tagName(code), std.mem.span(h.capi.lastErrorDetail()) });
+        return error.CapiSqlUnexpectedResult;
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, output.ptr.?[0..output.len], .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("rows").?.array.items;
+    if (rows.len == 0) return null;
+    return try jsonToI64(rows[0].array.items[0]);
+}
+
+/// `Scenario.custom_check` for the FK child-insert scenario below: the
+/// same acknowledged/in-flight split and atomicity check as `checkViaSql`,
+/// reading `children.parent_id` instead of `t.n`, plus the invariant
+/// `commitCoordinatedFusedMultiTable` (lite-single-commit-write-path.md
+/// §7.5) exists to preserve: if a child row ended up durably committed,
+/// its `.attach` Reference -- written as a ride-along commit against the
+/// parent's own store, swept into the child's own foreground fsync --
+/// must have survived WITH it, never independently lost. That is checked
+/// by attempting to DELETE the one parent every acknowledged child
+/// references: RESTRICT must still refuse it, proving the Reference
+/// record is durable, not just the child row by itself.
+fn checkViaSqlForeignKeyChild(allocator: Allocator, path: []const u8, outcome: ?crash.CrashOutcome, checkpoints: []const Checkpoint) !void {
+    const acknowledged = if (outcome == null or checkpoints.len == 0) checkpoints else checkpoints[0 .. checkpoints.len - 1];
+    const in_flight: ?Checkpoint = if (outcome == null or checkpoints.len == 0) null else checkpoints[checkpoints.len - 1];
+
+    var handle = CapiHandle.open(allocator, path, std.testing.io, false) catch |err| {
+        if (acknowledged.len != 0) return err;
+        return;
+    };
+    defer handle.close();
+
+    var required = std.StringHashMapUnmanaged(?i64).empty;
+    defer required.deinit(allocator);
+    for (acknowledged) |cp| for (cp.expectations) |exp| {
+        try required.put(allocator, exp.key, try parseExpected(exp.after));
+    };
+
+    var any_child_committed = false;
+    var it = required.iterator();
+    while (it.next()) |entry| {
+        // A key the in-flight checkpoint also names is covered by the
+        // atomic check below instead.
+        if (in_flight) |cp| if (checkpointCoversKey(cp, entry.key_ptr.*)) continue;
+        const got = try selectChildParentId(allocator, handle.id, entry.key_ptr.*);
+        if (got != entry.value_ptr.*) {
+            std.debug.print("crash-consistency capi FK: acknowledged child not visible id={s} want={?d} got={?d}\n", .{ entry.key_ptr.*, entry.value_ptr.*, got });
+            return error.CrashConsistencyAcknowledgedWriteLost;
+        }
+        if (got != null) any_child_committed = true;
+    }
+
+    if (in_flight) |cp| {
+        var resolution: ?bool = null; // true => resolved to `after`
+        for (cp.expectations) |exp| {
+            const got = try selectChildParentId(allocator, handle.id, exp.key);
+            const want_after = try parseExpected(exp.after);
+            const want_before = try parseExpected(exp.before);
+            const matches_after = got == want_after;
+            const matches_before = got == want_before;
+            if (!matches_after and !matches_before) {
+                std.debug.print("crash-consistency capi FK: torn child id={s} got={?d} allowed_before={?d} allowed_after={?d}\n", .{ exp.key, got, want_before, want_after });
+                return error.CrashConsistencyTornWrite;
+            }
+            if (matches_after and matches_before) continue;
+            if (resolution) |r| {
+                if (r != matches_after) {
+                    std.debug.print("crash-consistency capi FK: batch not atomic id={s}\n", .{exp.key});
+                    return error.CrashConsistencyBatchNotAtomic;
+                }
+            } else resolution = matches_after;
+            if (matches_after and got != null) any_child_committed = true;
+        }
+    }
+
+    if (any_child_committed) {
+        const code = try execOutcome(allocator, handle.id, "DELETE FROM parents WHERE id = 0");
+        if (code == .ok) {
+            std.debug.print("crash-consistency capi FK: parent DELETE succeeded despite a surviving child reference\n", .{});
+            return error.CrashConsistencyAcknowledgedWriteLost;
+        }
+    }
+}
+
+/// INSERT a parent, then INSERT two children referencing it, all
+/// autocommit -- through `commitCoordinatedFusedMultiTable` (lite-single-
+/// commit-write-path.md §7.5): each child INSERT is the leader (foreground)
+/// commit; the parent's own `.attach` Reference rides along in the same
+/// fsync. Crashed at every sync point, a child row and its Reference must
+/// be all-or-nothing.
+fn runRelationalForeignKeyChildInsert(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var handle = try CapiHandle.open(allocator, path, io, true);
+    defer handle.close();
+
+    try sqlOk(handle.id, "{\"statement\":\"CREATE TABLE parents (id BIGINT PRIMARY KEY)\"}");
+    try sqlOk(handle.id, "{\"statement\":\"CREATE TABLE children (id BIGINT, parent_id BIGINT REFERENCES parents (id))\"}");
+    try sqlOk(handle.id, "{\"statement\":\"INSERT INTO parents (_id, id) VALUES ('parent-0', 0)\"}");
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "child-0", .before = null, .after = "0" }} });
+    try sqlOk(handle.id, "{\"statement\":\"INSERT INTO children (_id, id, parent_id) VALUES ('child-0', 0, 0)\"}");
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "child-1", .before = null, .after = "0" }} });
+    try sqlOk(handle.id, "{\"statement\":\"INSERT INTO children (_id, id, parent_id) VALUES ('child-1', 1, 0)\"}");
+}
+
+test "crash sweep: relational foreign-key child insert, child row and attach record are all-or-nothing" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "relational-fk-child-insert",
+        .run = runRelationalForeignKeyChildInsert,
+        .custom_check = checkViaSqlForeignKeyChild,
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
 test "crash sweep exhaustive: relational unique autocommit two inserts and an update" {
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "relational-unique-autocommit",

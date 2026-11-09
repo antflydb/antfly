@@ -275,6 +275,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const notifyResolverReplayRuntimesForced = commit.notifyResolverReplayRuntimesForced;
         pub const pendingRowPolicyReceipt = commit.pendingRowPolicyReceipt;
         pub const preflightReplicationBatchSyncCommit = commit.preflightReplicationBatchSyncCommit;
+        pub const prepareLocalIntegrityDecision = commit.prepareLocalIntegrityDecision;
         pub const prepareMergeArtifactEffects = preparation.prepareMergeArtifactEffects;
         pub const projectedBatchLsmAdmissionBytes = preparation.projectedBatchLsmAdmissionBytes;
         pub const rememberBulkIngestAllNewIdentityUpserts = commit.rememberBulkIngestAllNewIdentityUpserts;
