@@ -206,6 +206,9 @@ pub const ImageRun = struct {
     width: u32,
     height: u32,
     interpolate: bool = false,
+    /// OCR-only smoothing for continuous-tone images. Kept separate from the
+    /// PDF's /Interpolate value so exact rendering preserves source semantics.
+    ocr_interpolate: bool = false,
     /// True when the source is one-bit scan/line-art data. OCR rendering may
     /// use coverage-preserving minification without changing exact PDF mode.
     bilevel: bool = false,
@@ -586,18 +589,46 @@ pub const RenderQuality = enum {
     compatibility_backend,
 };
 
+pub const ImageSamplingPolicy = enum(u16) {
+    auto,
+    pdf,
+    smooth,
+
+    pub fn profile(self: @This()) RenderProfile {
+        return switch (self) {
+            .auto => .ocr,
+            .pdf => .exact,
+            .smooth => .smooth,
+        };
+    }
+};
+
+/// Versioned pixel preparation, independent of the reader's own processor.
+pub const RenderPolicy = struct {
+    version: u16 = 1,
+    sampling: ImageSamplingPolicy = .auto,
+    /// Null when a platform compatibility renderer supplied the pixels.
+    resolved_profile: ?RenderProfile = .ocr,
+    resolution: RenderResolutionPolicy = .requested_dpi,
+};
+
 pub const RenderProfile = enum {
     /// Preserve PDF sampling semantics exactly, including nearest-neighbor
     /// minification when /Interpolate is absent.
     exact,
-    /// Preserve bilevel ink coverage during minification for OCR inputs.
+    /// Smooth continuous-tone samples and preserve bilevel ink coverage during
+    /// minification for OCR inputs, independently of exact PDF sampling rules.
     ocr,
+    /// Explicit bilinear sampling for image color, including one-bit images.
+    /// Stencil coverage retains PDF semantics.
+    smooth,
 };
 
 pub const RenderResolutionPolicy = enum { requested_dpi, model_input };
 
 pub const PageRenderRequest = struct {
     page_number: usize,
+    sampling: ImageSamplingPolicy = .auto,
     requested_dpi: u16 = 150,
     max_pixels: u64 = 40_000_000,
     max_dimension: u32 = 4096,

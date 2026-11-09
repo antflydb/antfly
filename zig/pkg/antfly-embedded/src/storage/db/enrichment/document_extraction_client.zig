@@ -105,6 +105,7 @@ fn cloneUnit(alloc: Allocator, unit: extraction.Unit) !extraction.Unit {
     out.ocr_used = unit.ocr_used;
     out.ocr_attempted = unit.ocr_attempted;
     out.ocr_render_dpi = unit.ocr_render_dpi;
+    out.ocr_render_policy = unit.ocr_render_policy;
     out.ocr_effective_render_dpi = unit.ocr_effective_render_dpi;
     out.ocr_rendered_width = unit.ocr_rendered_width;
     out.ocr_rendered_height = unit.ocr_rendered_height;
@@ -356,7 +357,7 @@ pub fn renderPdfPagePngAdaptiveAllocWithFailure(
     max_working_set_bytes: usize,
     out_failure: *abi.FailureIdentity,
 ) !extraction.RenderedPdfPage {
-    return renderPdfPagePngAdaptiveControlledAllocWithFailure(alloc, alloc, pdf_bytes, page_number, dpi, max_pixels, max_dimension, max_decoded_stream_bytes, max_working_set_bytes, 0, out_failure);
+    return renderPdfPagePngAdaptiveControlledAllocWithFailure(alloc, alloc, pdf_bytes, page_number, dpi, max_pixels, max_dimension, max_decoded_stream_bytes, max_working_set_bytes, 0, .auto, out_failure);
 }
 
 pub fn renderPdfPagePngAdaptiveControlledAllocWithFailure(
@@ -370,6 +371,7 @@ pub fn renderPdfPagePngAdaptiveControlledAllocWithFailure(
     max_decoded_stream_bytes: usize,
     max_working_set_bytes: usize,
     render_timeout_ms: u64,
+    sampling: extraction.ImageSamplingPolicy,
     out_failure: *abi.FailureIdentity,
 ) !extraction.RenderedPdfPage {
     out_failure.* = .{};
@@ -384,6 +386,7 @@ pub fn renderPdfPagePngAdaptiveControlledAllocWithFailure(
         .pdf_bytes = .fromSlice(pdf_bytes),
         .page_number = @intCast(page_number),
         .dpi = dpi,
+        .sampling = @backingInt(sampling),
         .max_pixels = max_pixels,
         .max_dimension = max_dimension,
         .max_decoded_stream_bytes = @intCast(max_decoded_stream_bytes),

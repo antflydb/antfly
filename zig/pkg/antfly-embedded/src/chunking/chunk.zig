@@ -146,6 +146,18 @@ pub const NativeTextDiagnosticsProvenance = struct {
     has_unrendered_annotations: bool,
 };
 
+pub const RenderPolicyProvenance = struct {
+    version: u16,
+    sampling: []const u8,
+    resolved_profile: ?[]const u8,
+    resolution: []const u8,
+
+    pub fn from(policy: anytype) ?@This() {
+        const value = policy orelse return null;
+        return .{ .version = value.version, .sampling = @tagName(value.sampling), .resolved_profile = if (value.resolved_profile) |profile| @tagName(profile) else null, .resolution = @tagName(value.resolution) };
+    }
+};
+
 pub const ProvenanceOptions = struct {
     scope: ProvenanceScope = .document,
     parent_doc_key: ?[]const u8 = null,
@@ -165,6 +177,7 @@ pub const ProvenanceOptions = struct {
     ocr_used: bool = false,
     ocr_attempted: bool = false,
     ocr_render_dpi: ?u16 = null,
+    ocr_render_policy: ?RenderPolicyProvenance = null,
     ocr_effective_render_dpi: ?u16 = null,
     ocr_rendered_width: ?u32 = null,
     ocr_rendered_height: ?u32 = null,
@@ -321,6 +334,7 @@ fn appendProvenanceFields(
     try provenance.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
     try provenance.put(alloc, try alloc.dupe(u8, "ocr_attempted"), .{ .bool = options.ocr_attempted });
     if (options.ocr_render_dpi) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_render_dpi"), .{ .integer = value });
+    if (options.ocr_render_policy) |value| try putStructJsonValue(alloc, &provenance, "ocr_render_policy", value);
     if (options.ocr_effective_render_dpi) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_effective_render_dpi"), .{ .integer = value });
     if (options.ocr_rendered_width) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_rendered_width"), .{ .integer = value });
     if (options.ocr_rendered_height) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_rendered_height"), .{ .integer = value });
@@ -392,6 +406,7 @@ fn appendFormatProvenance(
     try format.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
     try format.put(alloc, try alloc.dupe(u8, "ocr_attempted"), .{ .bool = options.ocr_attempted });
     if (options.ocr_render_dpi) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_render_dpi"), .{ .integer = value });
+    if (options.ocr_render_policy) |value| try putStructJsonValue(alloc, &format, "ocr_render_policy", value);
     if (options.ocr_effective_render_dpi) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_effective_render_dpi"), .{ .integer = value });
     if (options.ocr_rendered_width) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_rendered_width"), .{ .integer = value });
     if (options.ocr_rendered_height) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_rendered_height"), .{ .integer = value });
@@ -422,6 +437,20 @@ fn putStructJsonValue(alloc: Allocator, object: *std.json.ObjectMap, key: []cons
     try object.put(alloc, owned_key, encoded);
 }
 
+fn provenanceScalarJsonValueAlloc(alloc: Allocator, value: anytype) !std.json.Value {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .optional => if (value) |item| try provenanceScalarJsonValueAlloc(alloc, item) else .null,
+        .bool => .{ .bool = value },
+        .int => .{ .integer = std.math.cast(i64, value) orelse return error.Overflow },
+        .float => .{ .float = value },
+        .pointer => |pointer| blk: {
+            if (pointer.size != .slice or pointer.child != u8) @compileError("unsupported provenance field");
+            break :blk .{ .string = try alloc.dupe(u8, value) };
+        },
+        else => @compileError("unsupported provenance field"),
+    };
+}
+
 fn structJsonValueAlloc(alloc: Allocator, value: anytype) !std.json.Value {
     const T = @TypeOf(value);
     const info = switch (@typeInfo(T)) {
@@ -437,18 +466,8 @@ fn structJsonValueAlloc(alloc: Allocator, value: anytype) !std.json.Value {
         }
         object.deinit(alloc);
     }
-    inline for (info.field_names, info.field_types) |field_name, Field| {
-        const item = @field(value, field_name);
-        const encoded: std.json.Value = switch (@typeInfo(Field)) {
-            .bool => .{ .bool = item },
-            .int => .{ .integer = std.math.cast(i64, item) orelse return error.Overflow },
-            .float => .{ .float = item },
-            .pointer => |pointer| blk: {
-                if (pointer.size != .slice or pointer.child != u8) @compileError("unsupported provenance field");
-                break :blk .{ .string = try alloc.dupe(u8, item) };
-            },
-            else => @compileError("unsupported provenance field"),
-        };
+    inline for (info.field_names) |field_name| {
+        const encoded = try provenanceScalarJsonValueAlloc(alloc, @field(value, field_name));
         errdefer freeJsonValue(alloc, encoded);
         const key = try alloc.dupe(u8, field_name);
         errdefer alloc.free(key);

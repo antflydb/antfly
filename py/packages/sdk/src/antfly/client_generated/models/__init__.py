@@ -375,6 +375,7 @@ from .document_extraction_reader_config_provider import DocumentExtractionReader
 from .document_extraction_reader_config_recognition_level import DocumentExtractionReaderConfigRecognitionLevel
 from .document_extraction_render_config import DocumentExtractionRenderConfig
 from .document_extraction_render_config_resolution import DocumentExtractionRenderConfigResolution
+from .document_extraction_render_config_sampling import DocumentExtractionRenderConfigSampling
 from .document_extraction_route import DocumentExtractionRoute
 from .document_extraction_route_extractor import DocumentExtractionRouteExtractor
 from .document_extraction_route_extractor_type import DocumentExtractionRouteExtractorType
@@ -3061,6 +3062,7 @@ __all__ = (
     "DocumentExtractionReaderConfigRecognitionLevel",
     "DocumentExtractionRenderConfig",
     "DocumentExtractionRenderConfigResolution",
+    "DocumentExtractionRenderConfigSampling",
     "DocumentExtractionRoute",
     "DocumentExtractionRouteExtractor",
     "DocumentExtractionRouteExtractorType",
