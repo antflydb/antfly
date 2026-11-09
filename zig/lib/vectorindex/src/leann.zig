@@ -3537,6 +3537,30 @@ test "leann: filtered search walks past rejected nodes to fill k allowed results
     }
 }
 
+test "leann: sparse filter exhausts the graph without extra recomputes" {
+    const alloc = testing.allocator;
+    const n = 10000;
+    const dims = 16;
+    var fx = try Fixture.init(alloc, n, 1, dims, 16, 47);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = dims };
+    const One = struct {
+        fn allows(_: *const anyopaque, id: u32) anyerror!bool {
+            return id == 1;
+        }
+    };
+    var index = try Index.build(alloc, .{ .dims = dims, .quantizer = .rabitq, .max_degree = 16 }, fx.data);
+    defer index.deinit();
+    const dummy: u8 = 0;
+    var resp = try index.search(alloc, src.source(), fx.query(0), .{ .k = 1, .ef = 64, .filter = .{ .ctx = &dummy, .allows_fn = One.allows } });
+    defer resp.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(u32, 1), resp.results[0].id);
+    try testing.expect(resp.stats.expanded > n / 2);
+    try testing.expect(resp.stats.recomputed <= 1);
+    std.debug.print("sparse filter n={d} expanded={d} estimates={d} recomputed={d}\n", .{ n, resp.stats.expanded, resp.stats.approx_evaluated, resp.stats.recomputed });
+}
+
 test "leann: a closed recompute gate ranks the rest by estimate, an error cancels" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc, 1000, 5, 64, 16, 43);
