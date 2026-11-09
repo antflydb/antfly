@@ -2964,9 +2964,19 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
         }
         var result: [32]u8 = undefined;
         hash.final(&result);
-        return result;
+        return imagePreprocessingRevision(manifest, result);
     }
-    return resolutionModelRevision(a, io, manifest);
+    return imagePreprocessingRevision(manifest, try resolutionModelRevision(a, io, manifest));
+}
+
+fn imagePreprocessingRevision(manifest: manifest_mod.ModelManifest, artifacts: [32]u8) [32]u8 {
+    // Embedding pipelines permit images when modality declarations are absent;
+    // conservatively fence those models until loading resolves their executor.
+    if (manifest.inputs.len != 0 and !model_caps.modelAcceptsInput(&manifest, "image") and !manifest.hasInput("video")) return artifacts;
+    const shared = @import("antfly_image").processing.executionRevision(artifacts);
+    if (manifest.isColqwenBundle() or std.mem.eql(u8, manifest.config_model_arch, "qwen2_vl"))
+        return @import("../architectures/qwen2vl_types.zig").preprocessingRevision(shared);
+    return shared;
 }
 
 const native_kv_identity = @import("../runtime/kv/attention_match_identity.zig");
@@ -16703,8 +16713,14 @@ test "capi resolver model identity uses receipt digests before load and survives
     defer a.free(first_path);
     const second_path = try second.dir.realPathFileAlloc(io, ".", a);
     defer a.free(second_path);
-    const manifest: manifest_mod.ModelManifest = .{ .allocator = a };
+    var text_inputs = [_][]const u8{"text"};
+    const manifest: manifest_mod.ModelManifest = .{ .allocator = a, .inputs = &text_inputs };
     const original = try modelIdentity(a, io, first_path, manifest);
+    var vision_inputs = [_][]const u8{"image"};
+    const vision_manifest: manifest_mod.ModelManifest = .{ .allocator = a, .config_model_arch = "siglip", .model_type = .embedder, .inputs = &vision_inputs };
+    const vision_identity = try modelIdentity(a, io, first_path, vision_manifest);
+    try std.testing.expectEqual(@import("antfly_image").processing.executionRevision(original), vision_identity);
+    try std.testing.expectEqual(vision_identity, try modelIdentity(a, io, second_path, vision_manifest));
     const copied = try modelIdentity(a, io, second_path, manifest);
     try std.testing.expectEqualSlices(u8, &original, &copied);
     LegacyArtifactDigestCache.entries = @splat(null); // a reopened owner/process
@@ -20194,4 +20210,38 @@ test "model selection many-file ONNX model loads within a bounded descriptor bud
         a.free(actual);
     }
     try std.testing.expectEqualSlices(f32, &.{96}, actual[0].asFloat32());
+}
+
+test "model processor resampling fences declared and implicit image routes" {
+    var inputs = [_][]const u8{"image"};
+    const artifacts: [32]u8 = @splat(7);
+    var manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .config_model_arch = "qwen2_vl", .inputs = &inputs };
+    const revision = imagePreprocessingRevision(manifest, artifacts);
+    try std.testing.expect(!std.mem.eql(u8, &artifacts, &revision));
+    inputs[0] = "text";
+    try std.testing.expectEqual(artifacts, imagePreprocessingRevision(manifest, artifacts));
+    inputs[0] = "image";
+    manifest.config_model_arch = "qwen3_5";
+    try std.testing.expect(!std.mem.eql(u8, &artifacts, &imagePreprocessingRevision(manifest, artifacts)));
+    manifest.config_model_arch = "siglip";
+    const siglip = imagePreprocessingRevision(manifest, artifacts);
+    try std.testing.expect(!std.mem.eql(u8, &artifacts, &siglip));
+    try std.testing.expect(!std.mem.eql(u8, &revision, &siglip));
+    try std.testing.expectEqual(@import("antfly_image").processing.executionRevision(artifacts), siglip);
+    // Resolved implicit vision inputs use the same fence as declared inputs.
+    manifest.inputs = &.{};
+    manifest.model_type = .reader;
+    try std.testing.expectEqual(siglip, imagePreprocessingRevision(manifest, artifacts));
+    manifest.model_type = .embedder;
+    manifest.visual_model_path = "vision.onnx";
+    try std.testing.expectEqual(siglip, imagePreprocessingRevision(manifest, artifacts));
+    manifest.visual_model_path = null;
+    try std.testing.expectEqual(siglip, imagePreprocessingRevision(manifest, artifacts));
+    inputs[0] = "text";
+    manifest.inputs = &inputs;
+    try std.testing.expectEqual(artifacts, imagePreprocessingRevision(manifest, artifacts));
+    inputs[0] = "video";
+    try std.testing.expectEqual(siglip, imagePreprocessingRevision(manifest, artifacts));
+    inputs[0] = "audio";
+    try std.testing.expectEqual(artifacts, imagePreprocessingRevision(manifest, artifacts));
 }

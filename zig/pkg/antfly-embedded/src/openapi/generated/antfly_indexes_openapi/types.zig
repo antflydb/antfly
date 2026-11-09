@@ -3324,6 +3324,8 @@ pub const DocumentExtractionReaderConfig = struct {
 
 /// How PDF pages are rasterized for OCR.
 pub const DocumentExtractionRenderConfig = struct {
+    /// PDF image sampling, separate from model resizing and normalization. `auto` smooths continuous-tone images while preserving one-bit scan coverage during minification. `pdf` honors the PDF's interpolation declarations. `smooth` uses bilinear sampling even for one-bit images (except stencil masks), which can soften fine lines. Effective policy, version, resolution, DPI and geometry are recorded in unit provenance.
+    sampling: ?[]const u8 = null,
     /// Render resolution in dots per inch.
     dpi: ?i64 = null,
     /// `requested_dpi` renders at `dpi` within the caps. `model_input` renders near the model's preferred input size.
@@ -3335,6 +3337,7 @@ pub const DocumentExtractionRenderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "sampling", "sampling", true },
         .{ "dpi", "dpi", true },
         .{ "resolution", "resolution", true },
         .{ "max_pixels", "max_pixels", true },
@@ -3351,6 +3354,10 @@ pub const DocumentExtractionRenderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.sampling) |value| {
+            try jw.objectField("sampling");
+            try jw.write(value);
+        }
         if (self.dpi) |value| {
             try jw.objectField("dpi");
             try jw.write(value);

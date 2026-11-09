@@ -141,6 +141,7 @@ fn cloneUnit(alloc: Allocator, unit: extraction.Unit) !extraction.Unit {
     out.ocr_used = unit.ocr_used;
     out.ocr_attempted = unit.ocr_attempted;
     out.ocr_render_dpi = unit.ocr_render_dpi;
+    out.ocr_render_policy = unit.ocr_render_policy;
     out.ocr_effective_render_dpi = unit.ocr_effective_render_dpi;
     out.ocr_rendered_width = unit.ocr_rendered_width;
     out.ocr_rendered_height = unit.ocr_rendered_height;
@@ -301,7 +302,7 @@ pub fn pdfSessionRenderPng(
     out_failure.* = .{};
     if (request.version != abi.abi_version)
         return fail(error.InvalidAbiVersion, .pdf_session_render, out_failure);
-    if (request._reserved0 != 0 or request._reserved1 != 0)
+    if (request._reserved0 != 0)
         return fail(error.InvalidArgument, .pdf_session_render, out_failure);
     if (request.output_allocator) |allocator| if (!allocator.valid())
         return fail(error.InvalidArgument, .pdf_session_render, out_failure);
@@ -311,12 +312,14 @@ pub fn pdfSessionRenderPng(
     const state: *PdfSessionState = @ptrCast(@alignCast(session));
     state.resetDeadline(request.timeout_ms, request.cancellation);
     defer state.cancellation = .{};
-    const rendered = state.pdf.renderPagePngAdaptiveAlloc(
+    const sampling = std.enums.fromInt(extraction.ImageSamplingPolicy, request.sampling) orelse return fail(error.InvalidArgument, .pdf_session_render, out_failure);
+    const rendered = state.pdf.renderPagePngAdaptiveWithSamplingAlloc(
         output_allocator,
         page_number,
         request.dpi,
         request.max_pixels,
         request.max_dimension,
+        sampling,
     ) catch |err| return fail(err, .pdf_session_render, out_failure);
     out_png.* = .{ .ptr = rendered.png.ptr, .len = @intCast(rendered.png.len) };
     out_page.* = .{
@@ -362,6 +365,7 @@ pub fn renderPdfPagePng(
         .timeout_ms = request.render_timeout_ms,
         .page_number = request.page_number,
         .dpi = request.dpi,
+        .sampling = request.sampling,
         .max_pixels = request.max_pixels,
         .max_dimension = request.max_dimension,
     }, out_png, out_page, out_failure);

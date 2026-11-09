@@ -2509,12 +2509,18 @@ fn prepareOcrImageRunsWithSummariesAlloc(
     alloc: Allocator,
     image_runs: []ImageRun,
     summaries: *std.AutoHashMapUnmanaged(usize, [4]u8),
+    profile: @import("pdf_values").RenderProfile,
     cancellation: CancellationProbe,
 ) !void {
     for (image_runs, 0..) |*run, index| {
         if (index & 255 == 0) try cancellation.check();
-        run.ocr_coverage_minify = run.bilevel;
-        if (!run.bilevel or run.rgba.len == 0) continue;
+        // OCR consumes a resampled image rather than an exact PDF painting.
+        // Smooth continuous-tone samples before the vision encoder resizes the
+        // page again; nearest-neighbour magnification aliases small lettering.
+        // One-bit scans retain their separate coverage-preserving policy.
+        run.ocr_interpolate = profile != .exact and (profile == .smooth or !run.bilevel) and run.stencil_color == null;
+        run.ocr_coverage_minify = profile == .ocr and run.bilevel;
+        if (!run.ocr_coverage_minify or run.rgba.len == 0) continue;
         const key = @intFromPtr(run.rgba.ptr);
         const entry = try summaries.getOrPut(alloc, key);
         if (!entry.found_existing) {
@@ -2531,6 +2537,7 @@ fn prepareOcrPatternRunsWithSummariesAlloc(
     alloc: Allocator,
     pattern_runs: []PatternRun,
     summaries: *std.AutoHashMapUnmanaged(usize, [4]u8),
+    profile: @import("pdf_values").RenderProfile,
     cancellation: CancellationProbe,
     depth: u8,
 ) !void {
@@ -2541,14 +2548,14 @@ fn prepareOcrPatternRunsWithSummariesAlloc(
     for (pattern_runs, 0..) |*pattern, index| {
         if (index & 63 == 0) try cancellation.check();
         if (pattern.stencil_mask) |*mask|
-            try prepareOcrImageRunsWithSummariesAlloc(alloc, @as(*[1]ImageRun, @ptrCast(mask))[0..], summaries, cancellation);
-        try prepareOcrImageRunsWithSummariesAlloc(alloc, pattern.tile_image_runs, summaries, cancellation);
-        try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern.tile_pattern_runs, summaries, cancellation, depth + 1);
+            try prepareOcrImageRunsWithSummariesAlloc(alloc, @as(*[1]ImageRun, @ptrCast(mask))[0..], summaries, profile, cancellation);
+        try prepareOcrImageRunsWithSummariesAlloc(alloc, pattern.tile_image_runs, summaries, profile, cancellation);
+        try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern.tile_pattern_runs, summaries, profile, cancellation, depth + 1);
     }
 }
 
-/// Prepare every bilevel resource reachable by OCR rendering, including
-/// pattern-cell images and image masks retained as Pattern paint targets.
+/// Prepare OCR sampling for every reachable image: continuous-tone smoothing
+/// and bilevel coverage, including pattern-cell images and retained masks.
 /// Shared decoded XObjects use one summary regardless of how many occurrences
 /// reference them.
 pub fn prepareOcrRenderRunsAlloc(
@@ -2557,10 +2564,20 @@ pub fn prepareOcrRenderRunsAlloc(
     pattern_runs: []PatternRun,
     cancellation: CancellationProbe,
 ) !void {
+    return prepareRenderRunsAlloc(alloc, image_runs, pattern_runs, .ocr, cancellation);
+}
+
+pub fn prepareRenderRunsAlloc(
+    alloc: Allocator,
+    image_runs: []ImageRun,
+    pattern_runs: []PatternRun,
+    profile: @import("pdf_values").RenderProfile,
+    cancellation: CancellationProbe,
+) !void {
     var summaries = std.AutoHashMapUnmanaged(usize, [4]u8).empty;
     defer summaries.deinit(alloc);
-    try prepareOcrImageRunsWithSummariesAlloc(alloc, image_runs, &summaries, cancellation);
-    try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern_runs, &summaries, cancellation, 0);
+    try prepareOcrImageRunsWithSummariesAlloc(alloc, image_runs, &summaries, profile, cancellation);
+    try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern_runs, &summaries, profile, cancellation, 0);
 }
 
 /// Compatibility helper for callers that render only standalone images.
@@ -23251,6 +23268,8 @@ test "OCR bilevel summaries are prepared lazily and reused by decoded buffer" {
     try std.testing.expectEqual(runs[0].bilevel_fallback, runs[1].bilevel_fallback);
     try std.testing.expect(runs[0].ocr_coverage_minify);
     try std.testing.expect(runs[1].ocr_coverage_minify);
+    try std.testing.expect(!runs[0].ocr_interpolate);
+    try std.testing.expect(!runs[1].ocr_interpolate);
 }
 
 test "OCR preparation reaches retained pattern stencils and tile images" {

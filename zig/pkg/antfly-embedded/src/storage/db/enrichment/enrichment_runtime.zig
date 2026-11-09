@@ -10195,6 +10195,8 @@ const CapturedInputFailure = struct {
 const SharedPdfTransform = struct {
     dpi: u16,
     resolution_policy: @FieldType(document_extraction_mod.Config, "ocr_render_resolution"),
+    sampling: document_extraction_mod.ImageSamplingPolicy,
+    policy_version: u16 = (document_extraction_mod.RenderPolicy{}).version,
     max_pixels: u64,
     max_dimension: u32,
     width: ?u32,
@@ -10210,6 +10212,7 @@ const SharedPdfTransform = struct {
         return .{
             .dpi = config.ocr_render_dpi,
             .resolution_policy = config.ocr_render_resolution,
+            .sampling = config.ocr_render_sampling,
             .max_pixels = @min(@min(config.ocr_max_rendered_pixels, @as(u64, config.ocr_max_rendered_dimension) * config.ocr_max_rendered_dimension), pixels),
             .max_dimension = config.ocr_max_rendered_dimension,
             .width = if (config.ocr_render_resolution == .model_input) width else null,
@@ -11362,7 +11365,7 @@ const SharedPdfWindowScheduler = struct {
             defer borrowed.deinit();
             const downloaded = borrowed.entry().content;
             try document_extraction_mod.verifyChecksumDigest(config, &borrowed.entry().content_sha256);
-            break :blk try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded.content_type) orelse try documentExtractionFingerprintFromDigestAlloc(alloc, &borrowed.entry().source_identity, config_json, config.native_text, config.content_type, config.filename, downloaded.content_type, &borrowed.entry().content_sha256);
+            break :blk try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded.content_type) orelse try documentExtractionFingerprintFromDigestAlloc(alloc, &borrowed.entry().source_identity, config_json, config, config.content_type, config.filename, downloaded.content_type, &borrowed.entry().content_sha256);
         };
         defer alloc.free(fingerprint);
         return skipRuntimeDocumentExtractionByFingerprint(self.runtime, request.doc_key, artifact, fingerprint, state, manifest, try documentExtractionManifestGeneration(alloc, manifest), request.producer_json);
@@ -11617,9 +11620,11 @@ const SharedPdfWindowScheduler = struct {
                 errdefer if (clone_owned) clone.deinit(alloc);
                 clone.ocr_attempted = true;
                 clone.ocr_render_dpi = consumer.config.ocr_render_dpi;
+                clone.ocr_render_policy = document_extraction_mod.renderPolicy(consumer.config);
                 switch (rendered) {
                     inline else => |batch| {
                         const page = batch.results[cursor].rendered.?;
+                        if (page.quality == .compatibility_backend) clone.ocr_render_policy.?.resolved_profile = null;
                         clone.ocr_effective_render_dpi = page.effective_dpi;
                         clone.ocr_rendered_width = page.width;
                         clone.ocr_rendered_height = page.height;
@@ -12144,10 +12149,13 @@ const RuntimePdfPageTextSpool = struct {
     }
 };
 
-test "shared PDF transform identity includes decoder and spatial limits" {
+test "shared PDF transform identity includes decoder spatial and OCR sampling limits" {
     var config = document_extraction_mod.Config{};
     const baseline = SharedPdfTransform.init(config, 1_000_000, null, null, 100, false);
     try std.testing.expect(std.meta.eql(baseline, SharedPdfTransform.init(config, 1_000_000, 224, 224, 100, false)));
+    config.ocr_render_sampling = .pdf;
+    try std.testing.expect(!baseline.canSupply(SharedPdfTransform.init(config, 1_000_000, null, null, 100, false)));
+    config.ocr_render_sampling = .auto;
     config.ocr_render_resolution = .model_input;
     try std.testing.expect(!std.meta.eql(baseline, SharedPdfTransform.init(config, 1_000_000, 224, 224, 100, false)));
     config.ocr_render_resolution = .requested_dpi;
@@ -12249,7 +12257,7 @@ test "shared PDF enrollment skips completed metadata and byte fingerprints befor
         defer scheduler.deinit();
         var config = try document_extraction_mod.parseConfig(alloc, config_json);
         defer config.deinit(alloc);
-        const fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, url, config_json, config) orelse try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, url, config_json, config, "application/pdf") orelse try documentExtractionFingerprintAlloc(alloc, url, config_json, config.native_text, config.content_type, config.filename, "application/pdf", source);
+        const fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, url, config_json, config) orelse try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, url, config_json, config, "application/pdf") orelse try documentExtractionFingerprintAlloc(alloc, url, config_json, config, config.content_type, config.filename, "application/pdf", source);
         defer alloc.free(fingerprint);
         const state = try documentExtractionStateValueAlloc(alloc, fingerprint, &.{}, &.{}, &.{}, "", 0, true);
         defer alloc.free(state);
@@ -13713,12 +13721,14 @@ const DocumentPreparationPipeline = struct {
                 .encoded => |batch| {
                     if (batch.results.len != 1) return;
                     const page = batch.results[0].rendered orelse return;
+                    unit.ocr_render_policy = document_extraction_mod.renderPolicy(self.config);
                     try recordRuntimePdfOcrPage(self.allocator(), unit, page);
                     media[0] = .{ .bytes = page.png, .mime_type = "image/png" };
                 },
                 .raster => |batch| {
                     if (batch.results.len != 1) return;
                     const page = batch.results[0].rendered orelse return;
+                    unit.ocr_render_policy = document_extraction_mod.renderPolicy(self.config);
                     try recordRuntimePdfOcrPage(self.allocator(), unit, page);
                     rasters[0] = .{ .bytes = page.bytes, .width = page.width, .height = page.height, .stride_bytes = page.stride, .format = .rgba8, .mime_type = antfly_image.rgba8_raster_mime_type, .item_id = unit.unit_id, .source_fingerprint = self.fingerprint.?, .page_number = unit.page_number };
                 },
@@ -13756,7 +13766,7 @@ const DocumentPreparationPipeline = struct {
             self.window = null;
         }
         fn samePolicy(a: document_extraction_mod.Config, b: document_extraction_mod.Config) bool {
-            return a.ocr_render_dpi == b.ocr_render_dpi and a.ocr_render_resolution == b.ocr_render_resolution and
+            return a.ocr_render_dpi == b.ocr_render_dpi and a.ocr_render_resolution == b.ocr_render_resolution and a.ocr_render_sampling == b.ocr_render_sampling and
                 a.ocr_max_rendered_pixels == b.ocr_max_rendered_pixels and a.ocr_max_rendered_dimension == b.ocr_max_rendered_dimension and
                 std.meta.eql(a.native_text, b.native_text) and std.meta.eql(a.ocr_quality, b.ocr_quality) and std.meta.eql(a.pdf_decode_limits, b.pdf_decode_limits) and
                 a.ocr_mode == b.ocr_mode and std.mem.eql(u8, document_extraction_mod.effectiveOcrPrompt(a), document_extraction_mod.effectiveOcrPrompt(b));
@@ -18316,7 +18326,7 @@ fn processDocumentExtractionAsset(
         return;
     };
     const byte_source_fingerprint = if (metadata_fingerprint == null)
-        try document_extraction_mod.downloadedMetadataFingerprintAlloc(runtime.alloc, source_url, config_json, config, downloaded.content_type) orelse try documentExtractionFingerprintFromDigestAlloc(runtime.alloc, &prepared_source.source_identity, config_json, config.native_text, config.content_type, config.filename, downloaded.content_type, &prepared_source.content_sha256)
+        try document_extraction_mod.downloadedMetadataFingerprintAlloc(runtime.alloc, source_url, config_json, config, downloaded.content_type) orelse try documentExtractionFingerprintFromDigestAlloc(runtime.alloc, &prepared_source.source_identity, config_json, config, config.content_type, config.filename, downloaded.content_type, &prepared_source.content_sha256)
     else
         null;
     defer if (byte_source_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
@@ -18916,12 +18926,13 @@ fn renderDocumentPdfPagePngAdaptiveAlloc(
             config.pdf_decode_limits.max_decoded_stream_bytes,
             config.pdf_decode_limits.max_working_set_bytes,
             0,
+            config.ocr_render_sampling,
             out_failure,
         );
     }
     var session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(decoder_alloc, pdf_bytes, config.pdf_decode_limits);
     defer session.deinit();
-    return session.renderPagePngAdaptiveAlloc(alloc, page_number, config.ocr_render_dpi, max_pixels, max_dimension);
+    return session.renderPagePngAdaptiveWithSamplingAlloc(alloc, page_number, config.ocr_render_dpi, max_pixels, max_dimension, config.ocr_render_sampling);
 }
 
 fn boundaryFailureErrorName(failure: *const runtime_failure_abi.FailureIdentity, fallback: anyerror) []const u8 {
@@ -22363,6 +22374,7 @@ fn renderRuntimePdfWindow(
         try requests.append(alloc, .{
             .page_number = unit.page_number orelse 1,
             .requested_dpi = config.ocr_render_dpi,
+            .sampling = config.ocr_render_sampling,
             .max_pixels = @min(@min(config.ocr_max_rendered_pixels, dimension_pixels), batch_policy.max_pixels),
             .resolution_policy = config.ocr_render_resolution,
             .max_dimension = config.ocr_max_rendered_dimension,
@@ -22952,6 +22964,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             units[idx].ocr_attempted = true;
             if (std.mem.eql(u8, route_type, "pdf")) {
                 units[idx].ocr_render_dpi = config.ocr_render_dpi;
+                units[idx].ocr_render_policy = document_extraction_mod.renderPolicy(config);
                 if (pdf_render_window == null or pdf_render_cursor >= pdf_render_window.?.unit_indices.len) {
                     if (pdf_render_window) |*window| {
                         const window_alloc = window.allocator();
@@ -23182,6 +23195,9 @@ fn validateRuntimeGeneratedTextRequest(policy: GeneratedTextBatchPolicy, request
 }
 
 fn recordRuntimePdfOcrPage(alloc: Allocator, unit: *document_extraction_mod.Unit, page: anytype) !void {
+    if (page.quality == .compatibility_backend) if (unit.ocr_render_policy) |*policy| {
+        policy.resolved_profile = null;
+    };
     unit.ocr_render_dpi = page.requested_dpi;
     unit.ocr_effective_render_dpi = page.effective_dpi;
     unit.ocr_rendered_width = page.width;
@@ -24257,6 +24273,7 @@ fn runtimeDocumentGeneratedTextPartsJsonAlloc(
         .source_sha256 = unit.source_sha256,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_render_policy = unit.ocr_render_policy,
         .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
         .ocr_rendered_width = unit.ocr_rendered_width,
         .ocr_rendered_height = unit.ocr_rendered_height,
@@ -24526,6 +24543,7 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
         .ocr_used = unit.ocr_used,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_render_policy = unit.ocr_render_policy,
         .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
         .ocr_rendered_width = unit.ocr_rendered_width,
         .ocr_rendered_height = unit.ocr_rendered_height,
@@ -26993,6 +27011,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .ocr_used = unit.ocr_used,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_render_policy = chunk_artifact_mod.RenderPolicyProvenance.from(unit.ocr_render_policy),
         .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
         .ocr_rendered_width = unit.ocr_rendered_width,
         .ocr_rendered_height = unit.ocr_rendered_height,
@@ -31173,6 +31192,8 @@ fn pdfPageEmbeddingSourceHash(
     hasher.update(content_sha256);
     updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(page_number));
     updatePdfPageEmbeddingHashInt(&hasher, u16, render_config.ocr_render_dpi);
+    updatePdfPageEmbeddingHashInt(&hasher, u16, (document_extraction_mod.RenderPolicy{}).version);
+    updatePdfPageEmbeddingHashInt(&hasher, u16, @backingInt(render_config.ocr_render_sampling));
     updatePdfPageEmbeddingHashInt(&hasher, u8, @backingInt(render_config.ocr_render_resolution));
     updatePdfPageEmbeddingHashInt(&hasher, u64, render_config.ocr_max_rendered_pixels);
     updatePdfPageEmbeddingHashInt(&hasher, u32, render_config.ocr_max_rendered_dimension);
@@ -31439,6 +31460,7 @@ const PdfEmbeddingWindowPreparer = struct {
         for (requests, 0..) |*page_request, i| page_request.* = .{
             .page_number = self.pending_pages[first_item + i],
             .requested_dpi = self.render_config.ocr_render_dpi,
+            .sampling = self.render_config.ocr_render_sampling,
             .resolution_policy = self.render_config.ocr_render_resolution,
             .max_pixels = @min(self.render_config.ocr_max_rendered_pixels, model_pixel_cap),
             .max_dimension = self.render_config.ocr_max_rendered_dimension,
@@ -34110,7 +34132,7 @@ fn documentExtractionFingerprintAlloc(
     alloc: Allocator,
     source_url: []const u8,
     config_json: []const u8,
-    native_text: document_extraction_mod.NativeTextConfig,
+    config: document_extraction_mod.Config,
     configured_content_type: []const u8,
     configured_filename: []const u8,
     downloaded_content_type: []const u8,
@@ -34119,10 +34141,10 @@ fn documentExtractionFingerprintAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
     const identity = PreparedDocumentSourceCache.sourceIdentity(source_url);
-    return documentExtractionFingerprintFromDigestAlloc(alloc, &identity, config_json, native_text, configured_content_type, configured_filename, downloaded_content_type, &digest);
+    return documentExtractionFingerprintFromDigestAlloc(alloc, &identity, config_json, config, configured_content_type, configured_filename, downloaded_content_type, &digest);
 }
 
-test "document extraction runtime fingerprints independent native quality and policy without OCR" {
+test "OCR sampling byte fingerprints also preserve independent native quality without OCR" {
     const alloc = std.testing.allocator;
     var native_only = try document_extraction_mod.parseConfig(alloc,
         \\{"native_text":{"policy":"page","quality":{"min_chars":1}}}
@@ -34146,12 +34168,12 @@ test "document extraction runtime fingerprints independent native quality and po
     try std.testing.expect(!std.mem.eql(u8, left, right));
     var visible_native = document_extraction_mod.NativeTextConfig{};
     visible_native.policy = .visible;
-    const visible = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", visible_native, "application/pdf", "file.pdf", "application/pdf", &digest);
+    const visible = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", .{ .native_text = visible_native }, "application/pdf", "file.pdf", "application/pdf", &digest);
     defer alloc.free(visible);
     try std.testing.expect(!std.mem.eql(u8, prepared, visible));
     var tuned_native = document_extraction_mod.NativeTextConfig{};
     tuned_native.quality.min_chars += 1;
-    const tuned = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", tuned_native, "application/pdf", "file.pdf", "application/pdf", &digest);
+    const tuned = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", .{ .native_text = tuned_native }, "application/pdf", "file.pdf", "application/pdf", &digest);
     defer alloc.free(tuned);
     try std.testing.expect(!std.mem.eql(u8, prepared, tuned));
     digest[0] ^= 1;
@@ -34173,13 +34195,15 @@ fn documentExtractionFingerprintFromDigestAlloc(
     alloc: Allocator,
     source_identity: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
     config_json: []const u8,
-    native_text: document_extraction_mod.NativeTextConfig,
+    config: document_extraction_mod.Config,
     configured_content_type: []const u8,
     configured_filename: []const u8,
     downloaded_content_type: []const u8,
     content_digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
 ) ![]u8 {
+    const native_text = config.native_text;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    document_extraction_mod.hashRenderPolicy(&hasher, config);
     hasher.update("antfly.document-extraction.fingerprint.v4\x00");
     hasher.update(source_identity);
     for ([_][]const u8{ config_json, document_extraction_mod.native_text_extraction_identity, @tagName(native_text.policy), configured_content_type, configured_filename, downloaded_content_type }) |field| {
@@ -39613,7 +39637,9 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
     const unit: document_extraction_mod.Unit = .{ .unit_id = @constCast("page-1"), .unit_type = @constCast("page"), .text = @constCast("hello world"), .method = @constCast("text"), .page_number = 7, .char_start = 30, .char_end = 41 };
     const unit_fingerprint = try document_unit_fingerprint.fingerprintAlloc(alloc, unit);
     defer alloc.free(unit_fingerprint);
-    const payload = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, unit_fingerprint, "input", "text/plain", .{ .range_id = "units-0" });
+    // This authenticated v5 row was emitted by the pre-upgrade writer.
+    // Child computation must work before any v6 parent re-extraction.
+    const payload = try alloc.dupe(u8, @embedFile("testdata/unit_v5.json"));
     defer alloc.free(payload);
     try Harness.parent(&db, unit_key, payload, 4);
     try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
@@ -39661,6 +39687,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
         defer alloc.free(key);
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, try read.get(key), .{});
         defer parsed.deinit();
+        try std.testing.expectEqualStrings("duf5:acda8ad8765b4ad978ed1792837bb279b11ea01f7a3509605320b8b26d1c7122", parsed.value.object.get(hierarchy_navigation.unit_fingerprint_field).?.string);
         try std.testing.expectEqualStrings(unit_key, parsed.value.object.get("_parent_unit_key").?.string);
         try std.testing.expectEqualStrings("units-0", parsed.value.object.get("_artifact_range_id").?.string);
         try std.testing.expectEqualStrings("local_committed", parsed.value.object.get("_artifact_route_status").?.string);
@@ -39668,24 +39695,42 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
     }
     try publishOrderedUnitChunks(runtime, request, "chunks", unit_key);
     try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    // A later v6 parent publication invalidates the old child's source proof.
+    // The same callback replaces it and then idempotently reuses acceptance.
+    const migrated = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, unit_fingerprint, "input", "text/plain", .{ .range_id = "units-0" });
+    defer alloc.free(migrated);
+    try Harness.parent(&db, unit_key, migrated, 7);
+    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+    try harness.apply(&db, 8);
+    try publishOrderedUnitChunks(runtime, request, "chunks", unit_key);
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc", "chunks", "page-1", 0);
+        defer alloc.free(key);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, try read.get(key), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(unit_fingerprint, parsed.value.object.get(hierarchy_navigation.unit_fingerprint_field).?.string);
+    }
     const remote_unit = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, unit_fingerprint, "input", "text/plain", .{ .range_id = "units-0", .route_status = "remote_committed", .owner_group_id = 7002 });
     defer alloc.free(remote_unit);
-    try Harness.parent(&db, unit_key, remote_unit, 7);
+    try Harness.parent(&db, unit_key, remote_unit, 9);
     try std.testing.expectError(error.OnlineMergeArtifactTailsUnsupported, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
-    try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
     // Even an accepted fixture cannot bypass the typed unit contract. The
     // receiver will share this decoder; consumers must not propagate a stale
     // fingerprint or overwrite a previously accepted child set meanwhile.
     const corrupt_unit = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, "wrong-fingerprint", "input", "text/plain", .{ .range_id = "units-0" });
     defer alloc.free(corrupt_unit);
-    try Harness.parent(&db, unit_key, corrupt_unit, 8);
+    try Harness.parent(&db, unit_key, corrupt_unit, 10);
     try std.testing.expectError(error.InvalidDocumentExtractionManifest, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
-    try std.testing.expectEqual(@as(usize, 2), harness.calls);
-    try Harness.parent(&db, unit_key, null, 9);
-    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
-    try harness.apply(&db, 10);
-    try publishOrderedUnitChunks(runtime, request, "chunks", unit_key);
     try std.testing.expectEqual(@as(usize, 3), harness.calls);
+    try Harness.parent(&db, unit_key, null, 11);
+    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+    try harness.apply(&db, 12);
+    try publishOrderedUnitChunks(runtime, request, "chunks", unit_key);
+    try std.testing.expectEqual(@as(usize, 4), harness.calls);
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectEqual(@as(u32, 0), (try manifest.Manifest.decode(try read.get(manifest_key))).count);
@@ -46849,4 +46894,93 @@ test "generic scalar chunks reject stale upstream and fence publication" {
     try std.testing.expectError(error.EnrichmentSourceChanged, storePutBatchGuarded(&runtime, &.{}, &.{}, .{ .doc_key = "doc", .digest = accepted.source_record_digest, .upstream_name = "units", .upstream_digest = accepted.upstream_digest }));
     // Cache reuse must validate the receipt again, not reuse the old proof.
     try std.testing.expectError(error.EnrichmentSourceChanged, getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null));
+}
+
+test "OCR sampling reuse gate requires current state before skipping extraction" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "upgrade" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(a, store);
+    defer erased.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/upgrade-indexes", .{tmp.sub_path});
+    defer a.free(path);
+    var manager = try index_manager_mod.IndexManager.init(a, path);
+    defer manager.deinit();
+    var runtime = EnrichmentRuntime{ .alloc = a, .io_impl = null, .store = erased, .owns_store = false, .change_journal = undefined, .replay_source = undefined, .index_manager = &manager, .write_ctx = undefined, .write_fn = undefined, .failure_ctx = undefined, .failure_fn = undefined, .notify_ctx = undefined, .notify_fn = undefined, .config = .{}, .ownership = undefined, .lease_fencing_enabled = false };
+    const source = "Freshly extracted text after upgrading the renderer.";
+    var initial = try document_extraction_mod.extractDownloadedAlloc(a, .{ .data = source, .content_type = "text/plain" }, "source.txt", .{});
+    defer initial.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), initial.units.len);
+    const unit_id = initial.units[0].unit_id;
+    const key = try internal_keys.documentUnitArtifactKeyAlloc(a, "doc", "units", unit_id);
+    defer a.free(key);
+    const state_key = try assetStateKeyAlloc(a, "doc", "units");
+    defer a.free(state_key);
+    const old_marker = "duf5:0000000000000000000000000000000000000000000000000000000000000000";
+    const old_state = try std.json.Stringify.valueAlloc(a, .{ .fingerprint = "source-version", .unit_keys = &.{key}, .unit_descriptors = &.{.{ .key = key, .fingerprint = old_marker }}, .chunk_keys = &.{}, .chunk_unit_fingerprint_version = 5 }, .{});
+    defer a.free(old_state);
+    // This synthetic row is never decoded: this test isolates the state-version
+    // reuse gate. The ordered child-publication test uses authentic v5 bytes.
+    try storePutWithRetry(&runtime, key, "{\"_artifact_unit_fingerprint\":\"" ++ old_marker ++ "\",\"text\":\"stale output\"}");
+    try storePutWithRetry(&runtime, state_key, old_state);
+    var extractions: usize = 0;
+    for (0..2) |_| {
+        const state = try storeGetAllocWithRetry(&runtime, state_key);
+        defer a.free(state);
+        if (try skipRuntimeDocumentExtractionByFingerprint(&runtime, "doc", "units", "source-version", state, "{}", 1, "{}")) continue;
+        extractions += 1;
+        var extracted = try document_extraction_mod.extractDownloadedAlloc(a, .{ .data = source, .content_type = "text/plain" }, "source.txt", .{});
+        defer extracted.deinit(a);
+        const unit = extracted.units[0];
+        const fingerprint = try document_unit_fingerprint.fingerprintAlloc(a, unit);
+        defer a.free(fingerprint);
+        const payload = try documentUnitPayloadAlloc(a, "doc", "units", unit, fingerprint, "source.txt", "text/plain", .{ .range_id = "units-0" });
+        defer a.free(payload);
+        const descriptors = [_]DocumentExtractionUnitDescriptor{.{ .key = key, .fingerprint = fingerprint }};
+        const digest = try hierarchy_navigation.artifactDigestAlloc(a, &descriptors);
+        defer a.free(digest);
+        const next_state = try documentExtractionStateValueAlloc(a, "source-version", &.{key}, &descriptors, &.{}, digest, 1, true);
+        defer a.free(next_state);
+        const summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(a, "doc", "units");
+        defer a.free(summary_key);
+        const summary = try hierarchy_navigation.summaryValueAlloc(a, 1, digest, 1, 1);
+        defer a.free(summary);
+        const block_key = try internal_keys.documentUnitNavigationBlockKeyAlloc(a, "doc", "units", 0);
+        defer a.free(block_key);
+        const block = try hierarchy_navigation.blockValueAlloc(a, 0, &descriptors);
+        defer a.free(block);
+        try storePutBatchWithRetry(&runtime, &.{ .{ .key = key, .value = payload }, .{ .key = state_key, .value = next_state }, .{ .key = summary_key, .value = summary }, .{ .key = block_key, .value = block } }, &.{});
+    }
+    try std.testing.expectEqual(@as(usize, 1), extractions);
+    try std.testing.expectEqual(@as(u64, 1), runtime.skip_by_hash_count);
+    const stored = try storeGetAllocWithRetry(&runtime, key);
+    defer a.free(stored);
+    var decoded = try @import("document_unit_payload.zig").decodeAlloc(a, stored, .{ .document = "doc", .producer = "units", .unit = unit_id });
+    defer decoded.deinit();
+    try std.testing.expect(std.mem.startsWith(u8, decoded.fingerprint, "duf6:"));
+    try std.testing.expectEqualStrings(source, decoded.unit.text);
+}
+
+test "OCR sampling byte fingerprint binds resolved render recipe" {
+    const a = std.testing.allocator;
+    const identity = PreparedDocumentSourceCache.sourceIdentity("source.pdf");
+    const digest: [32]u8 = @splat(1);
+    const automatic = try documentExtractionFingerprintFromDigestAlloc(a, &identity, "{}", .{ .ocr_enabled = true }, "application/pdf", "source.pdf", "application/pdf", &digest);
+    defer a.free(automatic);
+    const variants = [_]document_extraction_mod.Config{
+        .{ .ocr_enabled = true, .ocr_render_sampling = .pdf },
+        .{ .ocr_enabled = true, .ocr_render_dpi = 300 },
+        .{ .ocr_enabled = true, .ocr_render_resolution = .model_input },
+        .{ .ocr_enabled = true, .ocr_max_rendered_pixels = 1000 },
+        .{ .ocr_enabled = true, .ocr_max_rendered_dimension = 1000 },
+    };
+    for (variants) |config| {
+        const exact = try documentExtractionFingerprintFromDigestAlloc(a, &identity, "{}", config, "application/pdf", "source.pdf", "application/pdf", &digest);
+        defer a.free(exact);
+        try std.testing.expect(!std.mem.eql(u8, automatic, exact));
+    }
 }

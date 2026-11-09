@@ -202,6 +202,13 @@ uses a 512-token reader policy by default; pass
 exact rejection boundary. Its synthetic pass does not establish corpus coverage.
 The LightOnOCR models return
 Markdown, including table structure, through the same native reader API.
+`ocr.render.sampling` defaults to `auto`: smooth continuous-tone PDF images
+and retain one-bit scan coverage. Use `pdf` to preserve PDF interpolation rules,
+or `smooth` to explicitly interpolate one-bit image color too (which can blur
+thin strokes). Model resizing, DPI and resource caps remain independent. Native
+unit and chunk provenance records the versioned rendering policy. A completed
+decode is not proof of transcription accuracy; compare visible text before backfill.
+
 Set `ANTFLY_INFERENCE_URL` to a server-reachable inference root or `/ai/v1` URL;
 `--inference-url` binds the LightOnOCR profile and relation extractor to that endpoint.
 The Cloud connection uses the existing `antfly.antfly_inference.api_key` server
