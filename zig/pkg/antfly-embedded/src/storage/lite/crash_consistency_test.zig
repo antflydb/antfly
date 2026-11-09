@@ -528,6 +528,32 @@ pub fn checkCheckpointsViaNative(allocator: Allocator, path: []const u8, outcome
     for (split.non_durable_acknowledged) |cp| try checkInFlightResolution(cp, allocator, Lookup, lookup_ctx, Lookup.get);
 }
 
+/// Diagnostic only (never fails the test itself): reads `key` directly off
+/// the physical file through a brand-new read-only `NativeFile`, bypassing
+/// `db_mod.DB.lookup()`'s own replay/catch-up materialization entirely.
+/// Logged whenever `checkCheckpointsViaDb` finds an acknowledged write not
+/// visible through the DB layer, to separate "the raw store really lost
+/// it" (this also shows the stale value) from "db.lookup()'s own replay
+/// path is what's wrong" (this shows the correct, acknowledged value).
+fn rawNativeReadDiagnostic(allocator: Allocator, handle: *DbHandle, key: []const u8, want: ?[]const u8) !void {
+    const store = handle.backend.native_docstore orelse return;
+    const internal_keys = @import("../internal_keys.zig");
+    const encoded = try internal_keys.documentKeyAlloc(allocator, key);
+    defer allocator.free(encoded);
+    var txn = try store.beginRead();
+    defer txn.abort();
+    const raw = txn.get(encoded) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const got = raw orelse "<missing>";
+    const matches_db_layer_view = if (want) |w| std.mem.indexOf(u8, got, w) != null else raw == null;
+    std.debug.print(
+        "crash-consistency: raw native read key={s} active_checkpoint_commit_sequence={d} got={s} matches_acknowledged_value={}\n",
+        .{ key, store.file.activeCheckpoint().commit_sequence, got, matches_db_layer_view },
+    );
+}
+
 /// Library entry point for scenarios that go through `db_mod.DB` (full-text
 /// visible writes). Mirrors `checkCheckpointsViaNative` but also verifies
 /// full-text searchability for checkpoints that name `searchable_after`,
@@ -584,6 +610,18 @@ pub fn checkCheckpointsViaDb(
                 "crash-consistency: acknowledged write not visible key={s} want_contains={s} got={s}\n",
                 .{ exp.key, formatValue(exp.after), formatValue(got) },
             );
+            // Hypothesis (c) vs genuine durability loss: read the SAME key
+            // directly off the physical file (bypassing db_mod.DB's lookup
+            // path -- any replay/catch-up materialization it does -- via a
+            // brand-new read-only NativeFile against this same, already-
+            // reopened path). If this agrees with `got` (the reverted
+            // value), the data really is gone from the raw store. If it
+            // instead shows the acknowledged value, db.lookup()'s own
+            // replay/catch-up materialization is what's wrong, not the
+            // commit's durability.
+            rawNativeReadDiagnostic(allocator, &handle, exp.key, exp.after) catch |err| {
+                std.debug.print("crash-consistency: raw native read diagnostic failed err={s}\n", .{@errorName(err)});
+            };
             return error.CrashConsistencyAcknowledgedWriteLost;
         }
         if (exp.searchable_after) |text| try assertSearchable(&handle, allocator, search_index, search_field, exp.key, text);
@@ -2890,6 +2928,48 @@ fn assertAcknowledgedWriteIsDurable(handle: *DbHandle) !void {
     }
 }
 
+/// Regression-B hypothesis (c) check: stale-base lost update. Reads `key`
+/// straight off the physical B-tree at the store's *current* active
+/// checkpoint through a brand-new read transaction (`Store.beginRead`),
+/// bypassing `db_mod.DB`'s own document/catalog caches and any replay/
+/// catch-up materialization entirely -- same live `Store`/`NativeFile`
+/// (a second, independent `NativeFile.open` on the same path conflicts
+/// with the live writer's own lock: confirmed via `error.WouldBlock`), but
+/// a strictly lower layer than anything `db.lookup()` goes through. If
+/// this ever disagrees with what was just acknowledged -- with no crash,
+/// no power loss, nothing dropped -- some commit between the ack and this
+/// check published a document-index root built from a base that predates
+/// the acknowledged write, i.e. a lost update from committing against a
+/// stale snapshot.
+fn assertFreshOnDiskValueContains(allocator: Allocator, handle: *DbHandle, key: []const u8, want_contains: []const u8) !void {
+    const store = handle.backend.native_docstore orelse return;
+    const internal_keys = @import("../internal_keys.zig");
+    const encoded = try internal_keys.documentKeyAlloc(allocator, key);
+    defer allocator.free(encoded);
+    var txn = try store.beginRead();
+    defer txn.abort();
+    const raw = txn.get(encoded) catch |err| switch (err) {
+        error.NotFound => null,
+        else => {
+            std.debug.print("[native-recovery] fresh on-disk read: get failed key={s} err={s}\n", .{ key, @errorName(err) });
+            return err;
+        },
+    };
+    const got = raw orelse "<missing>";
+    const commit_sequence = store.file.activeCheckpoint().commit_sequence;
+    if (native.recovery_debug_log) std.debug.print(
+        "[native-recovery] fresh on-disk read key={s} commit_sequence={d} got={s}\n",
+        .{ key, commit_sequence, got },
+    );
+    if (std.mem.indexOf(u8, got, want_contains) == null) {
+        std.debug.print(
+            "crash-consistency: STALE-BASE DIVERGENCE (hypothesis c) -- fresh on-disk read (no crash, no power loss) key={s} want_contains={s} got={s} active_checkpoint_commit_sequence={d}\n",
+            .{ key, want_contains, got, commit_sequence },
+        );
+        return error.StaleBaseLostUpdate;
+    }
+}
+
 fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
     if (native.recovery_debug_log) std.debug.print("[native-recovery] === subrun start path={s} ===\n", .{path});
     var handle = try openDbWithIo(allocator, path, io, true);
@@ -2921,14 +3001,30 @@ fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const 
                 store.file.durable_header != null,
             });
         };
-        try assertAcknowledgedWriteIsDurable(&handle);
+        // Stale-base (hypothesis c) check: fresh on-disk read, bypassing
+        // every live cache. Kept as the active, trusted assertion.
+        try assertFreshOnDiskValueContains(allocator, &handle, step.key, step.after);
+        // `assertAcknowledgedWriteIsDurable` is NOT called here anymore:
+        // comparing durableSequence() against activeCheckpoint() at ack
+        // time is comparing against the *latest* commit of anyone, not
+        // this write's own -- a legitimate, unrelated non-durable
+        // ride-along bookkeeping commit (e.g. __metadata__:index_status)
+        // landing right after this write's own (already durable) commit
+        // produces exactly this false positive, confirmed by the fresh
+        // on-disk read above still finding the correct, acknowledged
+        // value every time this fired. Left defined, not wired in, until
+        // it captures the write's own ticket/group commit sequence
+        // instead of activeCheckpoint()'s.
 
         // Mirrors production: a WS5 retirement turn driven explicitly here
         // (this harness bypasses the Owner/pool layer that normally drives
         // it from the ack path) interleaved with sustained full_index
         // writes and the segment merges they trigger. No checkpoint: a
         // retirement turn touches no document key.
-        if (step.retire_after) try runRetirementTurn(allocator, &handle);
+        if (step.retire_after) {
+            try runRetirementTurn(allocator, &handle);
+            try assertFreshOnDiskValueContains(allocator, &handle, step.key, step.after);
+        }
     }
 }
 
