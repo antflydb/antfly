@@ -9,7 +9,6 @@ const manager_mod = @import("model_manager.zig");
 const selection = @import("../registry/model_selection.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const qualified = @import("../models/memorilla_qualification.zig");
-const reader_mod = @import("../models/memorilla_runtime.zig");
 const encoder = @import("../pipelines/memorilla_encoder.zig");
 const memory_pipeline = @import("../pipelines/memorilla.zig");
 const decode = @import("../pipelines/memorilla_generation.zig");
@@ -27,6 +26,99 @@ const A = std.mem.Allocator;
 pub const Profile = platform.inference_settings.MemorillaProfile;
 pub const Paths = struct { encoder: selection.ResolvedModel, decoder: selection.ResolvedModel };
 pub const Stage = enum { prepared, encoder_loaded, question_encoded, decoder_loaded, reader_loaded, decoded };
+
+/// Warm preflight borrows the already admitted tokenizer without loading a
+/// backend on cold or invalid requests. The pin outlives every use of the
+/// tokenizer and chat template, including source-only decoder preparation.
+pub const GenerationAssets = union(enum) {
+    loaded: manager_mod.ModelHandle,
+    owned: struct { manifest: manifest_mod.ModelManifest, assets: manager_mod.ModelManager.TokenizerAssets },
+
+    pub fn tokenizer(self: *GenerationAssets) @import("inference_tokenizer").Tokenizer {
+        return switch (self.*) {
+            .loaded => |*handle| handle.get().getTokenizer(),
+            .owned => |*entry| entry.assets.tokenizer(),
+        };
+    }
+
+    pub fn chatTemplate(self: *GenerationAssets) ?*generation.ChatTemplate {
+        return switch (self.*) {
+            .loaded => |*handle| handle.get().chat_tmpl,
+            .owned => |*entry| entry.assets.chat_tmpl,
+        };
+    }
+
+    pub fn manifest(self: *GenerationAssets) *const manifest_mod.ModelManifest {
+        return switch (self.*) {
+            .loaded => |*handle| &handle.get().manifest,
+            .owned => |*entry| &entry.manifest,
+        };
+    }
+
+    pub fn decoderConfig(self: *GenerationAssets, a: A, directory: []const u8) !gpt_model.Config {
+        var config = switch (self.*) {
+            .loaded => |*handle| try factory.requireMemorillaDecoderF32(handle.get().session),
+            .owned => blk: {
+                const bytes = try file.readFileMax(a, self.manifest().config_path orelse return error.UnsupportedMemorillaArtifact, 4096);
+                defer a.free(bytes);
+                break :blk try gpt_model.parseConfig(a, bytes);
+            },
+        };
+        // Preserve generation-config overlays even when the structural model
+        // config is borrowed. The loaded generation fence covers this file.
+        const path = try std.fs.path.join(a, &.{ directory, "generation_config.json" });
+        defer a.free(path);
+        const bytes = try file.readFileMax(a, path, 4096);
+        defer a.free(bytes);
+        try gpt_model.applyGenerationConfigJson(a, &config, bytes);
+        return config;
+    }
+
+    pub fn deinit(self: *GenerationAssets) void {
+        switch (self.*) {
+            .loaded => |*handle| handle.release(),
+            .owned => |*entry| {
+                entry.assets.deinit();
+                entry.manifest.deinit();
+            },
+        }
+        self.* = undefined;
+    }
+};
+
+pub fn acquireGenerationAssets(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: selection.ResolvedModel, expected: qualified.Profile, control: Control) !GenerationAssets {
+    try control.check();
+    if (try manager.acquireCachedFromDirWithControl(selected.path, control)) |cached| {
+        var handle = cached;
+        errdefer handle.release();
+        const model = handle.get();
+        try qualified.requireRecipe(expected, model.manifest);
+        // Cold construction authenticated every consumed metadata path and
+        // byte. Reuse that immutable manifest only while its complete current
+        // artifact generation still matches and the owning model is pinned.
+        try model.verifyMemorillaIdentityWithControl(control);
+        if (model.hf_tok == null and model.sp_tok == null) return error.UnsupportedMemorillaArtifact;
+        try control.check();
+        return .{ .loaded = handle };
+    }
+    var manifest = try manifest_mod.loadFromDir(a, selected.path);
+    errdefer manifest.deinit();
+    try qualified.requireRecipe(expected, manifest);
+    try qualified.verifySelectedPaths(a, io, selected.path, manifest);
+    if (!std.meta.eql(manifest.managed_publication, selected.publication)) return error.ModelArtifactsChanging;
+    var assets = try manager.loadGenerationTokenizerAssets(selected.path, &manifest);
+    errdefer assets.deinit();
+    try control.check();
+    return .{ .owned = .{ .manifest = manifest, .assets = assets } };
+}
+
+/// Same backend/publication policy as normal loading, without constructing an
+/// unused cold-load flight key when the exact resident variant already exists.
+pub fn acquireResidentModel(manager: *manager_mod.ModelManager, directory: []const u8, control: Control) !manager_mod.ModelHandle {
+    try control.check();
+    return (try manager.acquireCachedFromDirWithControl(directory, control)) orelse
+        try manager.acquireFromDirWithControl(directory, control);
+}
 
 /// Request limits come from operator policy. Diagnostic callbacks/forced
 /// tokens are internal and are never decoded from the HTTP request body.
@@ -151,28 +243,16 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     const backing = platform.allocator.reclaimingScratch(a);
     const preflight_question_tokens = try preflightQuestion(backing, io, manager, paths.encoder, canonical, encoder_control);
     try validateInputTokenLimit(options.request_limits, preflight_question_tokens);
-    var manifest = try manifest_mod.loadFromDir(backing, paths.decoder.path);
-    defer manifest.deinit();
-    try qualified.requireRecipe(.qwen3_decoder_f32_kv_f32_v1, manifest);
-    try qualified.verifySelectedPaths(backing, io, paths.decoder.path, manifest);
-    if (!std.meta.eql(manifest.managed_publication, paths.decoder.publication)) return error.ModelArtifactsChanging;
-    const config_bytes = try file.readFileMax(backing, manifest.config_path orelse return error.UnsupportedMemorillaArtifact, 4096);
-    defer backing.free(config_bytes);
-    var config = try gpt_model.parseConfig(backing, config_bytes);
-    const generation_path = try std.fs.path.join(backing, &.{ paths.decoder.path, "generation_config.json" });
-    defer backing.free(generation_path);
-    const generation_bytes = try file.readFileMax(backing, generation_path, 4096);
-    defer backing.free(generation_bytes);
-    try gpt_model.applyGenerationConfigJson(backing, &config, generation_bytes);
-    var assets = try manager.loadGenerationTokenizerAssets(paths.decoder.path, &manifest);
+    var assets = try acquireGenerationAssets(backing, io, manager, paths.decoder, .qwen3_decoder_f32_kv_f32_v1, decoder_control);
     defer assets.deinit();
+    const config = try assets.decoderConfig(backing, paths.decoder.path);
     const bounded = decode.Limits{ .max_new_tokens = profile.max_new_tokens };
-    var text = try decode.prepareText(backing, assets.tokenizer(), assets.chat_tmpl orelse return error.MemorillaChatTemplateRequired, config, canonical, .{}, bounded, decoder_control);
+    var text = try decode.prepareText(backing, assets.tokenizer(), assets.chatTemplate() orelse return error.MemorillaChatTemplateRequired, config, canonical, .{}, bounded, decoder_control);
     defer text.deinit();
     try validateInputTokenLimit(options.request_limits, text.input_ids.len);
     if (options.prepared_text) |callback| try callback(options.context, &text);
     const plan = try decode.ResourcePlan.create(config, .cuda, text.input_ids.len, text.rendered.len, 16, max_new_tokens, bounded);
-    // The reader is independently request-owned. Cover all activation/cache
+    // Reader execution has separate request admission. Cover activation/cache
     // retirement plus its uploaded inputs and returned sixteen memory rows.
     const reader_request = memory.AdmissionAmounts{ .host_scratch_bytes = 16 * 1024 * 1024, .backend_scratch_bytes = 128 * 1024 * 1024 + documents.len * qualified.width * 16 * @sizeOf(f32) };
     const decoder_request = try memory.AdmissionAmounts.fromEstimate(plan.decoder).merge(.fromEstimate(plan.host));
@@ -189,13 +269,9 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     const reader_host_estimate = memory.Estimate{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = reader_request.host_scratch_bytes, .scratch_tier = .host };
     try reader_budget.reserveEstimate(reader_host_estimate);
     defer reader_budget.releaseEstimate(reader_host_estimate);
-    // The complete reader model lease precedes model construction. Its owner
-    // is destroyed before this lease is released, including every error path.
-    var reader_lease = try manager.acquireRunResourceAmounts(.gpu, limits, reader_mod.weightPlan());
-    defer reader_lease.release();
     try notify(options, .prepared, manager);
 
-    var encoder_handle = try manager.acquireFromDirWithControl(paths.encoder.path, encoder_control);
+    var encoder_handle = try acquireResidentModel(manager, paths.encoder.path, encoder_control);
     defer encoder_handle.release();
     const encoder_model = encoder_handle.get();
     try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
@@ -210,7 +286,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     try paths.encoder.verify(a, io);
     try paths.decoder.verify(a, io);
 
-    var decoder_handle = try manager.acquireFromDirWithControl(paths.decoder.path, decoder_control);
+    var decoder_handle = try acquireResidentModel(manager, paths.decoder.path, decoder_control);
     defer decoder_handle.release();
     const decoder_model = decoder_handle.get();
     try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
@@ -219,8 +295,13 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     // the reader and retain protection through its final physical destruction.
     var native_guard = try control.enterUninterruptible(.uninterruptible);
     defer native_guard.deinit();
-    var reader = try reader_mod.Owner.open(backing, io, profile.memory_module_path, &reader_lease, limits, control);
-    defer reader.deinit();
+    // The decoder handle pins the cached reader and its persistent admission.
+    // Release this borrow after all request tensors, budgets and scopes drain.
+    var reader_handle = try decoder_model.memorilla_reader_cache.acquire(decoder_model.allocator, io, manager, profile.memory_module_path, limits, control);
+    defer reader_handle.deinit();
+    var reader_request_clean = false;
+    defer if (!reader_request_clean) reader_handle.invalidate();
+    const reader = reader_handle.owner();
     try reader.bundle.config.validate(true);
     try notify(options, .reader_loaded, manager);
     const module_sha256 = reader.bundle.weights_sha256;
@@ -246,7 +327,10 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     try reader_scope.bind(reader_backend);
     // All CT defers below precede reader cleanup and admission refunds.
     const output = blk: {
-        defer reader.releaseRequestResources() catch @panic("Memorilla reader request cleanup failed; worker restart required");
+        defer {
+            reader.releaseRequestResources() catch @panic("Memorilla reader request cleanup failed; worker restart required");
+            reader_request_clean = true;
+        }
         const docs = try reader_backend.fromFloat32Shape(flat, &.{ @intCast(documents.len), @intCast(qualified.width) });
         defer reader_backend.free(docs);
         const query = try reader_backend.fromFloat32Shape(features.question, &.{ 1, @intCast(qualified.width) });
@@ -276,6 +360,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
     try paths.encoder.verify(a, io);
     try paths.decoder.verify(a, io);
+    try reader_handle.verify(control);
     try control.check();
     try notify(options, .decoded, manager);
     try control.check();
@@ -286,12 +371,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
 
 fn preflightQuestion(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: selection.ResolvedModel, canonical: []const u8, control: Control) !usize {
     try control.check();
-    var manifest = try manifest_mod.loadFromDir(a, selected.path);
-    defer manifest.deinit();
-    try qualified.requireRecipe(.qwen3_encoder_f32_v1, manifest);
-    try qualified.verifySelectedPaths(a, io, selected.path, manifest);
-    if (!std.meta.eql(manifest.managed_publication, selected.publication)) return error.ModelArtifactsChanging;
-    var assets = try manager.loadGenerationTokenizerAssets(selected.path, &manifest);
+    var assets = try acquireGenerationAssets(a, io, manager, selected, .qwen3_encoder_f32_v1, control);
     defer assets.deinit();
     var tokens = try assets.tokenizer().encodeForModel(a, canonical, qualified.max_text_tokens + 1);
     defer tokens.deinit();

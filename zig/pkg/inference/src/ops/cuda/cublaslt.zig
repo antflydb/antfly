@@ -247,8 +247,25 @@ const AttentionPlan = struct {
 /// the ordinary exact-shape heuristic through the caller's .off profile.
 pub const LightOnProjectionProfile = enum { off, sm121 };
 
+const MemorillaF32Projection = enum { ordinary, probe256, second_heuristic };
+
+fn memorillaF32Projection(enabled: bool, kind: TensorCorePlanKind, input_type: c_int, output_type: c_int, batch: usize, rows: usize, in_dim: usize, out_dim: usize, tuning: MatmulTuning) MemorillaF32Projection {
+    if (!enabled or kind != .dense or input_type != CUDA_R_32F or output_type != CUDA_R_32F or
+        batch != 1 or rows < 33 or rows > 128 or tuning.enabled) return .ordinary;
+    // GB10's exact-shape first SGEMM heuristic rereads these wide F32
+    // projections unnecessarily. These are descriptor preferences only:
+    // AlgoCheck and every launch still use the real, unpadded matrix layouts.
+    if (out_dim == 4096 and (in_dim == 4096 or in_dim == 12288)) return .probe256;
+    if (in_dim == 4096 and out_dim == 12288) return .second_heuristic;
+    return .ordinary;
+}
+
 pub const CublasLt = struct {
     // Immutable serving policy, scoped by the owning CUDA model profile.
+    memorilla_f32_prefill: bool = false,
+    memorilla_f32_probe_calls: usize = 0,
+    memorilla_f32_probe_plans: usize = 0,
+    memorilla_f32_ffn_plans: usize = 0,
     florence_canonical_f16_decode: bool = false,
     lighton_projection_profile: LightOnProjectionProfile = .off,
     lighton_projection_probe_calls: usize = 0,
@@ -702,6 +719,7 @@ pub const CublasLt = struct {
     }
 
     fn canonicalDecodeRows(self: *const CublasLt, kind: TensorCorePlanKind, input_type: c_int, output_type: c_int, batch_count: usize, rows: usize, in_dim: usize, out_dim: usize, tuning: MatmulTuning) u32 {
+        if (memorillaF32Projection(self.memorilla_f32_prefill, kind, input_type, output_type, batch_count, rows, in_dim, out_dim, tuning) == .probe256) return 256;
         // Only the CPU heuristic descriptor changes. AlgoCheck validates the
         // original layouts, and launches still read/write exactly real rows.
         if (self.lighton_projection_profile == .sm121 and kind == .dense and input_type == CUDA_R_16BF and
@@ -748,7 +766,9 @@ pub const CublasLt = struct {
             .canonical_rows = self.canonicalDecodeRows(kind, input_type, output_type, batch_count, rows, in_dim, out_dim, effective_tuning),
         };
         if (key.canonical_rows != 0) {
-            if (key.input_type == CUDA_R_16BF) {
+            if (key.input_type == CUDA_R_32F) {
+                self.memorilla_f32_probe_calls += 1;
+            } else if (key.input_type == CUDA_R_16BF) {
                 if (originalLightOnGdnProbe(key)) self.canonical_gdn_calls += 1 else self.lighton_projection_probe_calls += 1;
             } else self.canonical_f16_calls += 1;
         }
@@ -883,9 +903,12 @@ pub const CublasLt = struct {
         var heuristics: [maximum_matmul_heuristics]MatmulHeuristicResult = undefined;
         var returned: c_int = 0;
         const lighton_probe = key.canonical_rows != 0 and key.input_type == CUDA_R_16BF;
+        const memorilla_probe = key.canonical_rows != 0 and key.input_type == CUDA_R_32F and self.memorilla_f32_prefill;
+        const projection_probe = lighton_probe or memorilla_probe;
+        const memorilla_projection = memorillaF32Projection(self.memorilla_f32_prefill, key.kind, key.input_type, key.output_type, key.batch_count, key.rows, key.in_dim, key.out_dim, tuning);
         const requested: c_int = if (tuning.enabled)
             @intCast(tuning.candidate_count)
-        else if (lighton_probe and key.rows != key.canonical_rows) 2 else 1;
+        else if ((projection_probe and key.rows != key.canonical_rows) or memorilla_projection == .second_heuristic) 2 else 1;
         if (key.canonical_rows != 0 and key.rows != key.canonical_rows) {
             // Query only descriptors at the canonical row count. No probe
             // GEMM executes and no extra device storage is allocated. The
@@ -894,7 +917,7 @@ pub const CublasLt = struct {
             probe_key.rows = key.canonical_rows;
             probe_key.canonical_rows = 0;
             const probe = self.createTensorCorePlan(probe_key, .{}, ctx, invocation) catch |err| {
-                if (!lighton_probe or err != error.CublasLtUnsupported) return err;
+                if (!projection_probe or err != error.CublasLtUnsupported) return err;
                 // A library may decline the descriptor probe while supporting
                 // the real shape. Preserve its ordinary cuBLAS route.
                 var ordinary_key = key;
@@ -906,7 +929,7 @@ pub const CublasLt = struct {
             defer self.destroyTensorCorePlan(probe);
             heuristics[0] = .{ .algo = probe.algo, .workspace_size = probe.workspace_size, .state = CUBLAS_STATUS_SUCCESS, .waves_count = 0, .reserved = @splat(0) };
             returned = 1;
-            if (lighton_probe) {
+            if (projection_probe) {
                 // Keep the ordinary exact-shape heuristic as a fallback when
                 // the preferred tile cannot execute these actual buffers.
                 var ordinary_count: c_int = 0;
@@ -955,12 +978,21 @@ pub const CublasLt = struct {
             return error.CublasLtUnsupported;
         };
         if (key.canonical_rows != 0) {
-            if (lighton_probe) {
+            if (memorilla_probe) {
+                self.memorilla_f32_probe_plans += 1;
+            } else if (lighton_probe) {
                 if (originalLightOnGdnProbe(key)) self.canonical_gdn_plans += 1 else self.lighton_projection_probe_plans += 1;
             } else self.canonical_f16_plans += 1;
         }
 
         var selected = fallback;
+        if (memorilla_projection == .second_heuristic and checked_count > 1) {
+            // The second zero-workspace FP32 recommendation selects the
+            // measured GB10 FFN tile. A declined/absent recommendation keeps
+            // the ordinary validated candidate; no timing runs in requests.
+            selected = 1;
+            self.memorilla_f32_ffn_plans += 1;
+        }
         var timed_selection = false;
         var timed_candidate_count: usize = 0;
         var selected_elapsed_us: u64 = 0;
@@ -1728,6 +1760,7 @@ test "LightOnOCR3 CUDA channel GEMM alignment accounts for every strided group" 
 
 test "LightOnOCR3 CUDA projection descriptor policy keeps actual rows and conservative dtype scope" {
     var blas: CublasLt = undefined;
+    blas.memorilla_f32_prefill = false;
     blas.lighton_projection_profile = .sm121;
     blas.florence_canonical_f16_decode = false;
     const Case = struct { rows: usize, inner: usize, out: usize, query: u32 };
@@ -1758,4 +1791,27 @@ test "LightOnOCR3 CUDA projection descriptor policy keeps actual rows and conser
     try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(.dense, CUDA_R_16BF, CUDA_R_32F, 1, 85, 2560, 4096, .{ .enabled = true }));
     blas.lighton_projection_profile = .off;
     try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(.dense, CUDA_R_16BF, CUDA_R_32F, 1, 85, 2560, 4096, .{}));
+}
+
+test "Memorilla CUDA F32 projection policy preserves dtype geometry and decode boundaries" {
+    var blas = CublasLt{ .lib = undefined, .handle = undefined, .owner_context = undefined, .owner_device = undefined, .fns = undefined };
+    try std.testing.expect(!blas.memorilla_f32_prefill);
+    try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(.dense, CUDA_R_32F, CUDA_R_32F, 1, 64, 4096, 4096, .{}));
+    blas.memorilla_f32_prefill = true;
+    for ([_]usize{ 33, 53, 64, 96, 128 }) |rows| {
+        try std.testing.expectEqual(@as(u32, 256), blas.canonicalDecodeRows(.dense, CUDA_R_32F, CUDA_R_32F, 1, rows, 4096, 4096, .{}));
+        try std.testing.expectEqual(@as(u32, 256), blas.canonicalDecodeRows(.dense, CUDA_R_32F, CUDA_R_32F, 1, rows, 12288, 4096, .{}));
+        try std.testing.expectEqual(MemorillaF32Projection.second_heuristic, memorillaF32Projection(true, .dense, CUDA_R_32F, CUDA_R_32F, 1, rows, 4096, 12288, .{}));
+    }
+    for ([_]usize{ 0, 1, 16, 32, 129, 256, 1024 }) |rows|
+        try std.testing.expectEqual(MemorillaF32Projection.ordinary, memorillaF32Projection(true, .dense, CUDA_R_32F, CUDA_R_32F, 1, rows, 4096, 12288, .{}));
+    for ([_]TensorCorePlanKind{ .dense_bias, .dense_input_gradient, .strided_batched }) |kind|
+        try std.testing.expectEqual(MemorillaF32Projection.ordinary, memorillaF32Projection(true, kind, CUDA_R_32F, CUDA_R_32F, 1, 64, 12288, 4096, .{}));
+    try std.testing.expectEqual(MemorillaF32Projection.ordinary, memorillaF32Projection(true, .dense, CUDA_R_32F, CUDA_R_32F, 2, 64, 12288, 4096, .{}));
+    try std.testing.expectEqual(MemorillaF32Projection.ordinary, memorillaF32Projection(true, .dense, CUDA_R_16BF, CUDA_R_32F, 1, 64, 12288, 4096, .{}));
+    try std.testing.expectEqual(MemorillaF32Projection.ordinary, memorillaF32Projection(true, .dense, CUDA_R_16F, CUDA_R_32F, 1, 64, 12288, 4096, .{}));
+    try std.testing.expectEqual(MemorillaF32Projection.ordinary, memorillaF32Projection(true, .dense, CUDA_R_32F, CUDA_R_16BF, 1, 64, 12288, 4096, .{}));
+    try std.testing.expectEqual(MemorillaF32Projection.ordinary, memorillaF32Projection(true, .dense, CUDA_R_32F, CUDA_R_32F, 1, 64, 4096, 1024, .{}));
+    try std.testing.expectEqual(MemorillaF32Projection.ordinary, memorillaF32Projection(true, .dense, CUDA_R_32F, CUDA_R_32F, 1, 64, 2560, 4096, .{}));
+    try std.testing.expectEqual(MemorillaF32Projection.ordinary, memorillaF32Projection(true, .dense, CUDA_R_32F, CUDA_R_32F, 1, 64, 4096, 12288, .{ .enabled = true }));
 }

@@ -3005,6 +3005,7 @@ pub const LoadedModel = struct {
     embedding_prototype_cache: ?*@import("../extractors/embedding_prototypes.zig").Cache = null,
     embedding_prototype_cache_lease: ?runtime.tier.memory.AdmissionLease = null,
     embedding_prototype_cache_mutex: std.atomic.Mutex = .unlocked,
+    memorilla_reader_cache: @import("memorilla_reader_cache.zig").Cache = .{},
     /// Last complete optional-session JIT snapshot. Metrics use it when a
     /// cold sidecar load owns embedding_session_lock, keeping scrapes bounded
     /// without racing publication of the optional session handles.
@@ -3879,6 +3880,7 @@ pub const LoadedModel = struct {
         for (optional_sessions, 1..) |session, index| {
             if (session) |component| close_scopes[index] = component.beginClose();
         }
+        self.memorilla_reader_cache.deinit();
         self.native_generation_graph_cache.deinit();
         self.prompt_prefix_cache.deinit();
         self.session.close();

@@ -18,6 +18,7 @@ const safe = inference.models.safetensors;
 const Tensor = inference.backends.Tensor;
 const file = inference.util.c_file;
 const A = std.mem.Allocator;
+const CudaCompute = if (@import("build_options").enable_cuda) inference.native_compute.cuda.CudaCompute else void;
 
 const Args = struct {
     mode: enum { prepare, verify } = .verify,
@@ -175,6 +176,9 @@ const Context = struct {
     a: A,
     io: std.Io,
     label: []const u8 = "",
+    manager: *manager_mod.ModelManager,
+    decoder_path: []const u8,
+    decoder_compute: ?*CudaCompute = null,
     oracle: ?*Oracle = null,
     config: ?inference.models.gpt.Config = null,
     validate: bool = true,
@@ -198,13 +202,23 @@ const Context = struct {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         const admitted = model_manager.currentAdmissionAmounts();
         const decoder_cached = !std.mem.eql(u8, self.label, "prepare") and !std.mem.eql(u8, self.label, "cold_a");
+        const reader_cached = decoder_cached;
         const expected_weights: ?usize = switch (stage_id) {
-            .encoder_loaded, .question_encoded => inference.models.memorilla_runtime.parameter_bytes + qualified.encoder_weight_bytes + (if (decoder_cached) qualified.decoder_weight_bytes else 0),
-            .decoder_loaded, .reader_loaded, .decoded => inference.models.memorilla_runtime.parameter_bytes + qualified.encoder_weight_bytes + qualified.decoder_weight_bytes,
+            .encoder_loaded, .question_encoded => (if (reader_cached) inference.models.memorilla_runtime.parameter_bytes else @as(usize, 0)) + qualified.encoder_weight_bytes + (if (decoder_cached) qualified.decoder_weight_bytes else 0),
+            .decoder_loaded => (if (reader_cached) inference.models.memorilla_runtime.parameter_bytes else @as(usize, 0)) + qualified.encoder_weight_bytes + qualified.decoder_weight_bytes,
+            .reader_loaded, .decoded => inference.models.memorilla_runtime.parameter_bytes + qualified.encoder_weight_bytes + qualified.decoder_weight_bytes,
             .prepared => null,
         };
         if (expected_weights) |expected| if (admitted.backend_weight_bytes != expected) return error.MemorillaModelWeightAdmissionMissing;
         try emit(self.a, self.io, .{ .event = "stage", .run = self.label, .stage = @tagName(stage_id), .admitted = admitted, .expected_backend_weight_bytes = expected_weights, .process_memory = processMemory(self.a, self.io) });
+        if (comptime @import("build_options").enable_cuda) {
+            if (stage_id == .decoded) if (self.decoder_compute) |compute| {
+                const blas = &(compute.cublaslt orelse return error.MissingMemorillaF32ProjectionPolicy);
+                const active = blas.memorilla_f32_prefill and blas.memorilla_f32_probe_calls > 0 and blas.memorilla_f32_probe_plans > 0 and blas.memorilla_f32_ffn_plans > 0;
+                try emit(self.a, self.io, .{ .event = "f32_projection_policy", .run = self.label, .active = active, .probe_calls = blas.memorilla_f32_probe_calls, .probe_plans = blas.memorilla_f32_probe_plans, .ffn_plans = blas.memorilla_f32_ffn_plans });
+                if (!active) return error.MissingMemorillaF32ProjectionPolicy;
+            };
+        }
     }
     fn question(raw: ?*anyopaque, features: *const encoder.Features) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -259,6 +273,16 @@ const Context = struct {
     }
     fn preparedText(raw: ?*anyopaque, text: *const decode.PreparedText) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (!std.mem.eql(u8, self.label, "prepare") and !std.mem.eql(u8, self.label, "cold_a")) {
+            // No execution handle has been acquired yet. The tokenizer borrow
+            // alone must pin this model throughout framing and preflight.
+            var temporary = (try self.manager.acquireCachedFromDirWithControl(self.decoder_path, .{})) orelse return error.MissingWarmDecoder;
+            const id = temporary.get().runtime_id;
+            temporary.release();
+            const protected = self.manager.unloadRuntime(id) == .in_use;
+            try emit(self.a, self.io, .{ .event = "tokenizer_preflight_pin", .run = self.label, .protected = protected });
+            if (!protected) return error.UnpinnedMemorillaTokenizer;
+        }
         self.memory_start = text.memory_start;
         if (self.validate) if (self.oracle) |oracle| {
             if (!std.mem.eql(i64, text.input_ids, oracle.input_ids.asInt64())) return error.ComposedPromptTokenMismatch;
@@ -272,6 +296,9 @@ const Context = struct {
     }
     fn inputEmbeddings(raw: *anyopaque, cb: *const CB, tensor: CT) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        if (comptime @import("build_options").enable_cuda) {
+            if (cb.kind() == .cuda) self.decoder_compute = @ptrCast(@alignCast(cb.ptr));
+        }
         const values = try cb.toFloat32(tensor, self.a);
         defer self.a.free(values);
         self.embedding_digest = inference.models.memorilla.digest(std.mem.sliceAsBytes(values));
@@ -378,7 +405,7 @@ pub fn main(init: std.process.Init) !void {
     const query_reference = if (query_bytes) |bytes| try std.json.parseFromSlice(std.json.Value, a, bytes, .{}) else null;
     defer if (query_reference) |value| value.deinit();
     const query_value = if (query_reference) |*value| &value.value else null;
-    var context = Context{ .a = a, .io = init.io, .label = if (opts.mode == .prepare) "prepare" else "cold_a", .oracle = if (oracle) |*value| value else null, .config = config, .query_reference = query_value, .query_output = if (opts.mode == .prepare) opts.query_output else null };
+    var context = Context{ .a = a, .io = init.io, .manager = &models, .decoder_path = paths.decoder.path, .label = if (opts.mode == .prepare) "prepare" else "cold_a", .oracle = if (oracle) |*value| value else null, .config = config, .query_reference = query_value, .query_output = if (opts.mode == .prepare) opts.query_output else null };
     const control = Control{ .io = init.io, .native_call_policy = .in_process, .ptr = &context, .check_fn = Context.check };
     const options = service.Options{ .context = &context, .question_features = Context.question, .prepared_text = Context.preparedText, .reader_physical_resources = Context.readerPhysical, .stage = Context.stage, .trace = .{ .context = &context, .input_embeddings = Context.inputEmbeddings, .logits = Context.logit, .physical_resources = Context.decoderPhysical }, .teacher_forced_ids = if (oracle) |*value| value.decode_ids.asInt64() else null, .ignore_eos = true };
     try emit(a, init.io, .{ .event = "ready", .scope = "actual-managed-memorilla-service", .mode = @tagName(opts.mode), .operator_cap_bytes = cap, .documents = documents.len, .supplied_document_origin = "independent-CPU-F32-encoder-reference-normalized-rows-1-and-2", .document_tensor_sha256 = source_digest[0..], .process_memory = processMemory(a, init.io) });
@@ -398,7 +425,7 @@ pub fn main(init: std.process.Init) !void {
     cold.deinit();
     const retained = models.currentAdmissionAmounts();
     monitor.reset();
-    context = .{ .a = a, .io = init.io, .label = "cancel_after_prefill", .oracle = &oracle.?, .query_reference = query_value, .cancel_after_prefill = true };
+    context = .{ .a = a, .io = init.io, .manager = &models, .decoder_path = paths.decoder.path, .label = "cancel_after_prefill", .oracle = &oracle.?, .query_reference = query_value, .cancel_after_prefill = true };
     var cancelled = false;
     if (service.generateWithOptions(a, init.io, &models, profile, paths, opts.question, &documents, &identity, steps, limits, control, options)) |value| {
         var unexpected = value;
@@ -413,7 +440,7 @@ pub fn main(init: std.process.Init) !void {
     for ([_][]const u8{ "warm_a_after_cancel", "warm_b_64_documents_128_tokens", "warm_a_after_b" }) |label| {
         monitor.reset();
         const is_b = std.mem.eql(u8, label, "warm_b_64_documents_128_tokens");
-        context = .{ .a = a, .io = init.io, .label = label, .oracle = &oracle.?, .query_reference = query_value, .validate = !is_b, .config = if (is_b) config else null };
+        context = .{ .a = a, .io = init.io, .manager = &models, .decoder_path = paths.decoder.path, .label = label, .oracle = &oracle.?, .query_reference = query_value, .validate = !is_b, .config = if (is_b) config else null };
         const input_rows: []const []const f32 = if (is_b) &max_documents else &documents;
         var run_options = options;
         if (is_b) {
@@ -431,6 +458,20 @@ pub fn main(init: std.process.Init) !void {
         passed = passed and numerical_pass and isolated and refunded and generation_bound_exercised;
         try emit(a, init.io, .{ .event = "case", .run = label, .documents = input_rows.len, .max_new_tokens = request_steps, .generated_tokens = generated_tokens, .generation_bound_exercised = generation_bound_exercised, .passed = numerical_pass and isolated and refunded and generation_bound_exercised, .compared_to_oracle = !is_b, .bitwise_a_isolated = isolated, .admission_refunded = refunded, .input_embeddings = context.embeddings, .memory_tokens = context.memory_tokens, .logits = context.logits, .admission_peak = monitor.peaks(), .process_memory = processMemory(a, init.io) });
     }
-    try emit(a, init.io, .{ .event = "complete", .passed = passed, .scope = "actual-managed-service-conditional-native-query-oracle", .oracle_tensor_sha256 = oracle.?.tensor_sha256[0..], .retained = models.currentAdmissionAmounts(), .encoder_execution_identity = identity[0..], .decoder_execution_identity = decoder_identity[0..], .frozen_logit_atol = 0.001, .frozen_logit_rtol = 0.001, .frozen_embedding_atol = 5e-5, .frozen_embedding_rtol = 1e-5 });
+    const decoder_runtime = blk: {
+        var pinned = try models.acquireFromDirWithControl(paths.decoder.path, paths.decoder.bind(control));
+        defer pinned.release();
+        const id = pinned.get().runtime_id;
+        const protected = models.unloadRuntime(id) == .in_use;
+        try emit(a, init.io, .{ .event = "reader_cache_pin", .protected = protected });
+        passed = passed and protected;
+        break :blk id;
+    };
+    const unloaded = models.unloadRuntime(decoder_runtime) == .unloaded;
+    const remaining = models.currentAdmissionAmounts();
+    const reader_refunded = remaining.backend_weight_bytes == qualified.encoder_weight_bytes;
+    passed = passed and unloaded and reader_refunded;
+    try emit(a, init.io, .{ .event = "reader_cache_eviction", .decoder_unloaded = unloaded, .reader_admission_refunded = reader_refunded, .retained = remaining });
+    try emit(a, init.io, .{ .event = "complete", .passed = passed, .scope = "actual-managed-service-conditional-native-query-oracle", .oracle_tensor_sha256 = oracle.?.tensor_sha256[0..], .retained = remaining, .encoder_execution_identity = identity[0..], .decoder_execution_identity = decoder_identity[0..], .frozen_logit_atol = 0.001, .frozen_logit_rtol = 0.001, .frozen_embedding_atol = 5e-5, .frozen_embedding_rtol = 1e-5 });
     if (!passed) return error.ComposedMemorillaQualificationFailed;
 }

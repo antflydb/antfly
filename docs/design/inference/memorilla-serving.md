@@ -36,6 +36,24 @@ need separate numerical qualification. The recorded F16-KV gate failed; it
 must not inherit the F32 profile's status. Numerical agreement does not establish
 answer quality on a production corpus; evaluate that workload before rollout.
 
+The [latent operational QA comparison](history/memorilla/2026-11-09-latent-operational-qualification.md)
+reproduces the released reader's factual failures in Python CUDA and native
+CUDA with identical output IDs. Exact unseen names and codes remain an explicit
+quality gate; source-verified hybrid qualification does not satisfy that gate.
+The [published-data diagnostic](history/memorilla/2026-11-09-latent-published-qa.md)
+records 20/32 Python BF16 TriviaQA exact matches, distinguishing those operational
+failures from a claim that all latent-only QA fails. The original vLLM engine
+was not executed.
+The subsequent [official vLLM engine check](history/memorilla/2026-11-09-vllm-engine-qualification.md)
+executes the pinned vLLM 0.9.1 path: QA scores match the independent BF16 control,
+and fresh warm latency is 0.819 s native F32 versus 0.823 s vLLM BF16 on GB10.
+The small median difference does not establish a general speed advantage.
+The [reader residency performance report](history/memorilla/2026-11-09-native-performance.md)
+records the subsequent native latency improvement and cache lifecycle checks.
+The [native/Python latency comparison](history/memorilla/2026-11-09-native-python-latency.md)
+records tokenizer and metadata reuse, strict FP32 projection optimization, and
+the resulting narrow observed median win over both Python controls.
+
 ## Install and configure
 
 Install the immutable managed base-model variants using the normal model pull
@@ -112,8 +130,21 @@ leases. The ordinary request-count gate bounds that queue. Normal model
 execution lanes still serialize their own mutable backend state. Cancellation
 and deadlines flow through queueing, model load, encoding, reading and decoding;
 physical request allocations retire before their admission credit is returned.
-The first implementation constructs the reader per request; it has no persistent
-reader or document-projection cache.
+Each loaded decoder retains at most one reader and its complete resource lease.
+Cold acquisition performs the full bundle hash and released-checkpoint checks.
+Warm requests check the canonical bundle paths and file generations before and
+after use; detected changes reject the request with retryable
+`MODEL_ARTIFACTS_CHANGING` and retire the reader after request work drains.
+Switching reader profiles replaces the retained reader. Decoder eviction frees
+the reader before refunding its resource lease, and an active decoder handle
+prevents eviction during use. Request tensors and KV are reclaimed separately;
+document projections are recomputed for each question.
+
+Warm preflight can borrow the loaded model's tokenizer, template and manifest
+through a model handle after verifying the current artifact generation. Cold
+preflight retains independent metadata validation and admission, and rejects
+over-limit inputs before loading GPU models. These borrows pin model lifetime;
+they do not retain request KV or change operator ceilings.
 
 ## Produce and submit compatible features
 
@@ -192,6 +223,12 @@ final completion tokens. Underlying model work is still counted in
 source-answer or abstention selection; it is false for `memory_verified`, even
 though independent source-answer work was performed and counted in total usage.
 
+The source policy preserves factual claims alongside response commands in the
+same document. A demand about what the assistant should answer cannot revoke a
+dated factual correction. The decoder still makes a model judgment: independent
+critic controls exposed false approvals, so an isolated support label cannot
+authorize the memory candidate.
+
 At most one memory candidate, one independent source answer and one verification
 call run. Answer candidates each obey `max_new_tokens`; the verifier is capped
 at eight tokens and narrowed by profile and operator ceilings. All calls share
@@ -250,7 +287,13 @@ capacity and load for its actual workload. The 64-document/128-token composed
 resource test establishes lifecycle behavior for that fixture, not corpus
 quality or sustained throughput. The initial
 [raw-document quality diagnostic](history/memorilla/2026-11-08-answer-quality.md)
-completed native execution but answered none of 22 factual cases correctly;
-keep factual QA rollout disabled while investigating that result. See the
+completed native execution but answered none of 22 factual cases correctly in
+latent-only mode. The
+[resumed F32 qualification](history/memorilla/2026-11-08-resumed-qualification.md)
+passed 45 supervised source-verified development cases, 48 unseen held-out cases,
+24 repeated sanity cases, and 30 HTTP contract/recovery requests. Cold asset
+drift failed closed and recovered after restoration. These bounded diagnostics
+support the opt-in source-verified path; latent-only factual QA remains
+unqualified. The route remains disabled by default. See the
 [implementation plan](../../plans/memorilla-native-memory.md) for the later
 database and Gemma training work.

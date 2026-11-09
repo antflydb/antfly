@@ -1076,6 +1076,22 @@ pub fn build(b: *std.Build) void {
     );
     metal_prefill_bucket_bench_step.dependOn(&run_metal_prefill_bucket_bench.step);
 
+    const memorilla_load_bench = b.addExecutable(.{
+        .name = "antfly-memorilla-load-bench",
+        .max_rss = 8 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/memorilla_load_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    memorilla_load_bench.root_module.addImport("build_options", build_options_mod);
+    memorilla_load_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(memorilla_load_bench.root_module);
+    memorilla_load_bench.root_module.link_libc = true;
+    b.step("build-memorilla-load-bench", "Build bounded offline reader load-phase profiler")
+        .dependOn(&b.addInstallArtifact(memorilla_load_bench, .{}).step);
+
     const memorilla_verify = b.addExecutable(.{
         .name = "antfly-memorilla-verify",
         .max_rss = 8 * 1024 * 1024 * 1024,

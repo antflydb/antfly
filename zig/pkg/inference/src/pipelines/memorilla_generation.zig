@@ -76,6 +76,8 @@ pub const PreparedPlainText = struct {
 pub const PlainMode = enum { plain, bounded_thinking };
 pub const think_open_id: i32 = 151667;
 pub const think_close_id: i32 = 151668;
+/// Internal diagnostics only. Public plain generation retains its 128-token cap.
+pub const thinking_max_new_tokens: usize = 2048;
 pub const ThinkingMetadata = struct {
     raw_tokens: usize = 0,
     reasoning_body_tokens: usize = 0,
@@ -90,10 +92,11 @@ pub const ThinkingMetadata = struct {
 /// closure. The only token this policy can select instead of argmax is </think>.
 pub const ThinkingState = struct {
     metadata: ThinkingMetadata = .{},
+    body_token_cap: usize = 64,
 
     pub fn select(self: *ThinkingState, predicted: i64, control: Control) !i64 {
         try control.check();
-        if (self.metadata.still_open and self.metadata.reasoning_body_tokens >= 64) {
+        if (self.metadata.still_open and self.metadata.reasoning_body_tokens >= self.body_token_cap) {
             if (predicted != think_close_id) self.metadata.forced_format_tokens += 1;
             return think_close_id;
         }
@@ -122,6 +125,12 @@ fn plainLimits(limits: Limits) Limits {
     bounded.max_prompt_tokens = @min(bounded.max_prompt_tokens, 1024);
     bounded.max_new_tokens = @min(bounded.max_new_tokens, 128);
     return bounded;
+}
+
+fn plainModeLimits(limits: Limits, mode: PlainMode) Limits {
+    var caps = plainLimits(limits);
+    if (mode == .bounded_thinking) caps.max_new_tokens = @min(limits.max_new_tokens, thinking_max_new_tokens);
+    return caps;
 }
 
 pub fn preparePlainText(a: A, tokenizer: tok.Tokenizer, template: *const generation.ChatTemplate, config: gpt_model.Config, system: []const u8, user: []const u8, limits: Limits, control: Control) !PreparedPlainText {
@@ -260,7 +269,11 @@ pub const ResourcePlan = struct {
     }
 
     pub fn createPlain(config: gpt_model.Config, backend: runtime.kv.pool.BackendKind, prompt_tokens: usize, prompt_bytes: usize, max_new_tokens: usize, limits: Limits) !ResourcePlan {
-        return createInternal(config, backend, prompt_tokens, prompt_bytes, 0, max_new_tokens, plainLimits(limits), .plain);
+        return createPlainWithMode(config, backend, prompt_tokens, prompt_bytes, max_new_tokens, limits, .plain);
+    }
+
+    pub fn createPlainWithMode(config: gpt_model.Config, backend: runtime.kv.pool.BackendKind, prompt_tokens: usize, prompt_bytes: usize, max_new_tokens: usize, limits: Limits, mode: PlainMode) !ResourcePlan {
+        return createInternal(config, backend, prompt_tokens, prompt_bytes, 0, max_new_tokens, plainModeLimits(limits, mode), .plain);
     }
 
     fn createInternal(config: gpt_model.Config, backend: runtime.kv.pool.BackendKind, prompt_tokens: usize, prompt_bytes: usize, memory_rows: usize, max_new_tokens: usize, limits: Limits, mode: @FieldType(ResourcePlan, "mode")) !ResourcePlan {
@@ -360,6 +373,7 @@ pub const Request = struct {
     trace: ?Trace = null,
     mode: PlainMode = .plain,
     thinking_metadata: ?*ThinkingMetadata = null,
+    reasoning_body_token_cap: usize = 64,
 };
 pub const Decoder = struct {
     backend: *const CB,
@@ -449,7 +463,7 @@ pub fn generate(a: A, decoder: Decoder, text: *const PreparedText, rows: MemoryR
 }
 
 pub fn generatePlain(a: A, decoder: Decoder, text: *const PreparedPlainText, request: Request, reservation: *Reservation, limits: Limits, control: Control) !generation.GenerationResult {
-    return generateInternal(a, decoder, .{ .plain = text }, request, reservation, plainLimits(limits), control);
+    return generateInternal(a, decoder, .{ .plain = text }, request, reservation, plainModeLimits(limits, request.mode), control);
 }
 
 const Prompt = union(enum) {
@@ -498,7 +512,8 @@ fn generateInternal(a: A, decoder: Decoder, prompt: Prompt, request: Request, re
         },
         .plain => |text| {
             if (text.mode != request.mode) return error.InvalidMemorillaReservation;
-            if (request.mode == .bounded_thinking and (request.teacher_forced_ids != null or request.ignore_eos or request.max_new_tokens > 128))
+            if (request.mode == .bounded_thinking and (request.teacher_forced_ids != null or request.ignore_eos or request.max_new_tokens > thinking_max_new_tokens or
+                request.reasoning_body_token_cap == 0 or request.reasoning_body_token_cap > thinking_max_new_tokens))
                 return error.InvalidMemorillaForcedTokens;
             for (input_ids) |id| if (id < 0 or id >= decoder.config.vocab_size or id >= decoder.tokenizer.vocabSize())
                 return error.InvalidMemorillaPromptRecipe;
@@ -614,7 +629,7 @@ fn run(a: A, decoder: Decoder, cb: *const CB, prompt: Prompt, request: Request, 
     defer generated.deinit(a);
     try generated.ensureTotalCapacity(a, request.max_new_tokens);
     var reason: []const u8 = "length";
-    var thinking: ThinkingState = .{};
+    var thinking: ThinkingState = .{ .body_token_cap = request.reasoning_body_token_cap };
     defer {
         if (request.thinking_metadata) |out| out.* = thinking.metadata;
     }
@@ -818,4 +833,22 @@ test "memorilla bounded thinking natural close at budget is not a forced token" 
     var state: ThinkingState = .{ .metadata = .{ .still_open = true, .reasoning_body_tokens = 64 } };
     try std.testing.expectEqual(@as(i64, think_close_id), try state.select(think_close_id, .{}));
     try std.testing.expectEqual(@as(usize, 0), state.metadata.forced_format_tokens);
+}
+
+test "memorilla diagnostic thinking budget reserves longer KV without widening plain generation" {
+    const config = gpt_model.Config{ .family = .qwen3, .hidden_size = 32, .intermediate_size = 64, .num_hidden_layers = 2, .num_attention_heads = 4, .num_key_value_heads = 2, .attention_head_dim = 8, .vocab_size = 80, .max_position_embeddings = 4096, .norm_type = .rms_norm, .position_encoding = .rope, .activation = .silu };
+    const limits = Limits{ .max_new_tokens = thinking_max_new_tokens };
+    try std.testing.expectError(error.MemorillaPromptBudgetExceeded, ResourcePlan.createPlain(config, .cuda, 12, 64, 129, limits));
+    const short = try ResourcePlan.createPlain(config, .cuda, 12, 64, 128, limits);
+    const long = try ResourcePlan.createPlainWithMode(config, .cuda, 12, 64, 2048, limits, .bounded_thinking);
+    try std.testing.expect(long.decoder.kv_bytes > short.decoder.kv_bytes);
+    try std.testing.expectError(error.MemorillaPromptBudgetExceeded, ResourcePlan.createPlainWithMode(config, .cuda, 12, 64, 2049, .{ .max_new_tokens = 4096 }, .bounded_thinking));
+    try std.testing.expectError(error.MemorillaPromptBudgetExceeded, ResourcePlan.createPlainWithMode(config, .cuda, 12, 64, 256, .{ .max_new_tokens = 128 }, .bounded_thinking));
+    var state: ThinkingState = .{ .body_token_cap = 512 };
+    state.observe(think_open_id, false);
+    for (0..512) |_| {
+        try std.testing.expectEqual(@as(i64, 42), try state.select(42, .{}));
+        state.observe(42, false);
+    }
+    try std.testing.expectEqual(@as(i64, think_close_id), try state.select(42, .{}));
 }

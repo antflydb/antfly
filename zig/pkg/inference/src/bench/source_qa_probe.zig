@@ -29,6 +29,8 @@ const Job = struct {
     max_new_tokens: usize = 48,
     cases: []const Case,
     mode: decode.PlainMode = .plain,
+    raw_max_new_tokens: usize = 128,
+    reasoning_body_token_cap: usize = 64,
 };
 const Args = struct { decoder: []const u8 = "", input: []const u8 = "", budget_gib: usize = 96 };
 fn parse(args: []const []const u8) !Args {
@@ -55,7 +57,7 @@ fn emit(a: A, io: std.Io, value: anytype) !void {
 
 const Sampling = struct {
     const Step = struct { position: usize, argmax_id: i64, chosen_id: i64, forced_format: bool };
-    steps: [128]Step = undefined,
+    steps: [decode.thinking_max_new_tokens]Step = undefined,
     count: usize = 0,
     allocator: A,
     input_ids: []const i64 = &.{},
@@ -92,8 +94,9 @@ fn thinkingCase(a: A, io: std.Io, models: *inference.server.model_manager.ModelM
     defer a.free(user);
     var sampling: Sampling = .{ .allocator = a };
     defer sampling.deinit();
-    var result = try service.generateWithOptions(a, io, models, selected, system, user, 128, limits, .{}, control, .{
+    var result = try service.generateWithOptions(a, io, models, selected, system, user, job.raw_max_new_tokens, limits, .{}, control, .{
         .mode = .bounded_thinking,
+        .reasoning_body_token_cap = job.reasoning_body_token_cap,
         .final_token_cap = if (judge) 8 else @min(job.max_new_tokens, 48),
         .context = &sampling,
         .prepared_text = Sampling.prepared,
@@ -115,6 +118,8 @@ fn thinkingCase(a: A, io: std.Io, models: *inference.server.model_manager.ModelM
         .physical_resources = sampling.physical,
         .raw = .{ .text = result.generation.text, .token_ids = result.generation.token_ids, .finish_reason = result.generation.finish_reason, .prompt_tokens = result.generation.prompt_tokens, .completion_tokens = result.generation.tokens_used },
         .thinking = result.thinking,
+        .raw_max_new_tokens = job.raw_max_new_tokens,
+        .reasoning_body_token_cap = job.reasoning_body_token_cap,
         .final_span_valid = result.final_span != null,
         .final_text = if (result.final_span) |span| span.text else null,
         .final_suffix_token_ids = result.finalTokenIds(),
@@ -152,6 +157,8 @@ pub fn main(init: std.process.Init) !void {
     const parsed = try std.json.parseFromSlice(Job, a, bytes, .{});
     defer parsed.deinit();
     const job = parsed.value;
+    if (job.raw_max_new_tokens == 0 or job.raw_max_new_tokens > decode.thinking_max_new_tokens or
+        job.reasoning_body_token_cap == 0 or job.reasoning_body_token_cap > decode.thinking_max_new_tokens) return error.InvalidArguments;
     if (!std.mem.eql(u8, job.schema, "antfly.memorilla.source-qa-probe.v1") or !std.mem.eql(u8, job.scope, "development-only") or
         job.cases.len == 0 or job.cases.len > 128 or job.max_new_tokens == 0 or job.max_new_tokens > 128 or
         job.answer_system.len > 16 * 1024 or job.verification_system.len > 16 * 1024) return error.InvalidArguments;

@@ -59,7 +59,13 @@ def select_features(
 
 
 def prepare_prompt(
-    tokenizer, embedding_lookup, memory_tokens, *, system_prompt: str, question: str
+    tokenizer,
+    embedding_lookup,
+    memory_tokens,
+    *,
+    system_prompt: str,
+    question: str,
+    device=None,
 ):
     if (
         memory_tokens.ndim != 2
@@ -89,6 +95,8 @@ def prepare_prompt(
     ids = tokenizer(rendered, return_tensors="pt", add_special_tokens=False)[
         "input_ids"
     ][0]
+    if device is not None:
+        ids = ids.to(device)
     positions = (ids == memory_id).nonzero(as_tuple=False).flatten()
     if positions.numel() != memory_tokens.shape[0]:
         raise ValueError("chat template did not preserve exactly the memory slot count")

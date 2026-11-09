@@ -31,6 +31,7 @@ pub const Options = struct {
     ignore_eos: bool = false,
     mode: decode.PlainMode = .plain,
     final_token_cap: usize = 48,
+    reasoning_body_token_cap: usize = 64,
 };
 
 /// Text is decoded from this exact raw-token suffix; IDs are never synthesized.
@@ -56,8 +57,12 @@ pub const OwnedResult = struct {
 };
 
 pub fn validateInputs(system: []const u8, user: []const u8, max_new_tokens: usize, request_limits: RequestLimits) !void {
+    return validateInputsWithMode(system, user, max_new_tokens, request_limits, .plain);
+}
+
+fn validateInputsWithMode(system: []const u8, user: []const u8, max_new_tokens: usize, request_limits: RequestLimits, mode: decode.PlainMode) !void {
     try common.validateRequestLimits(request_limits, 1, max_new_tokens);
-    if (max_new_tokens == 0 or max_new_tokens > 128) return error.MemorillaGenerationLimitExceeded;
+    if (max_new_tokens == 0 or max_new_tokens > modeLimits(mode).max_new_tokens) return error.MemorillaGenerationLimitExceeded;
     const bytes = std.math.add(usize, system.len, user.len) catch return error.MemorillaResourceOverflow;
     if (user.len == 0 or bytes > 128 * 1024) return error.MemorillaPromptBudgetExceeded;
     _ = std.unicode.Utf8View.init(system) catch return error.InvalidMemorillaPromptRecipe;
@@ -67,9 +72,12 @@ pub fn validateInputs(system: []const u8, user: []const u8, max_new_tokens: usiz
 }
 
 const bounded = decode.Limits{ .max_new_tokens = 128 };
+fn modeLimits(mode: decode.PlainMode) decode.Limits {
+    return if (mode == .bounded_thinking) .{ .max_new_tokens = decode.thinking_max_new_tokens } else bounded;
+}
 const PreparedRequest = struct {
     config: gpt_model.Config,
-    assets: manager_mod.ModelManager.TokenizerAssets,
+    assets: common.GenerationAssets,
     text: decode.PreparedPlainText,
     fn deinit(self: *PreparedRequest) void {
         self.text.deinit();
@@ -79,26 +87,14 @@ const PreparedRequest = struct {
 
 fn prepareRequest(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: selection.ResolvedModel, system: []const u8, user: []const u8, max_new_tokens: usize, request_limits: RequestLimits, bound_control: Control, mode: decode.PlainMode) !PreparedRequest {
     try bound_control.check();
-    try validateInputs(system, user, max_new_tokens, request_limits);
+    try validateInputsWithMode(system, user, max_new_tokens, request_limits, mode);
     if (selected.publication == null) return error.MemorillaManagedProducerRequired;
     try selected.verify(a, io);
     const backing = platform.allocator.reclaimingScratch(a);
-    var manifest = try manifest_mod.loadFromDir(backing, selected.path);
-    defer manifest.deinit();
-    try qualified.requireRecipe(.qwen3_decoder_f32_kv_f32_v1, manifest);
-    try qualified.verifySelectedPaths(backing, io, selected.path, manifest);
-    if (!std.meta.eql(manifest.managed_publication, selected.publication)) return error.ModelArtifactsChanging;
-    const config_bytes = try file.readFileMax(backing, manifest.config_path orelse return error.UnsupportedMemorillaArtifact, 4096);
-    defer backing.free(config_bytes);
-    var config = try gpt_model.parseConfig(backing, config_bytes);
-    const generation_path = try std.fs.path.join(backing, &.{ selected.path, "generation_config.json" });
-    defer backing.free(generation_path);
-    const generation_bytes = try file.readFileMax(backing, generation_path, 4096);
-    defer backing.free(generation_bytes);
-    try gpt_model.applyGenerationConfigJson(backing, &config, generation_bytes);
-    var assets = try manager.loadGenerationTokenizerAssets(selected.path, &manifest);
+    var assets = try common.acquireGenerationAssets(backing, io, manager, selected, .qwen3_decoder_f32_kv_f32_v1, bound_control);
     errdefer assets.deinit();
-    var text = try decode.preparePlainTextWithMode(backing, assets.tokenizer(), assets.chat_tmpl orelse return error.MemorillaChatTemplateRequired, config, system, user, bounded, bound_control, mode);
+    const config = try assets.decoderConfig(backing, selected.path);
+    var text = try decode.preparePlainTextWithMode(backing, assets.tokenizer(), assets.chatTemplate() orelse return error.MemorillaChatTemplateRequired, config, system, user, bounded, bound_control, mode);
     errdefer text.deinit();
     try common.validateInputTokenLimit(request_limits, text.input_ids.len);
     try selected.verify(a, io);
@@ -134,8 +130,9 @@ pub fn generateWithOptions(a: A, io: std.Io, manager: *manager_mod.ModelManager,
 
 fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: selection.ResolvedModel, system: []const u8, user: []const u8, max_new_tokens: usize, limits: memory.Limits, request_limits: RequestLimits, control: Control, options: Options) !OwnedResult {
     try control.check();
-    try validateInputs(system, user, max_new_tokens, request_limits);
-    if (options.mode == .bounded_thinking and (options.final_token_cap == 0 or options.final_token_cap > 48 or options.teacher_forced_ids != null or options.ignore_eos))
+    try validateInputsWithMode(system, user, max_new_tokens, request_limits, options.mode);
+    if (options.mode == .bounded_thinking and (options.final_token_cap == 0 or options.final_token_cap > 48 or options.teacher_forced_ids != null or options.ignore_eos or
+        options.reasoning_body_token_cap == 0 or options.reasoning_body_token_cap > decode.thinking_max_new_tokens))
         return error.InvalidMemorillaForcedTokens;
     if (limits.host_limit_bytes == 0 or limits.backend_limit_bytes == 0 or limits.combined_limit_bytes == 0 or
         limits.kv_limit_bytes == 0 or limits.scratch_limit_bytes == 0) return error.MemorillaFiniteBudgetRequired;
@@ -153,7 +150,8 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: 
     const config = prepared.config;
     const text = &prepared.text;
     if (options.prepared_text) |callback| try callback(options.context, text);
-    const plan = try decode.ResourcePlan.createPlain(config, .cuda, text.input_ids.len, text.rendered.len, max_new_tokens, bounded);
+    const caps = modeLimits(options.mode);
+    const plan = try decode.ResourcePlan.createPlainWithMode(config, .cuda, text.input_ids.len, text.rendered.len, max_new_tokens, caps, options.mode);
     const request_amounts = try memory.AdmissionAmounts.fromEstimate(plan.decoder).merge(.fromEstimate(plan.host));
     var request_lease = try manager.acquireRunResourceAmounts(.gpu, limits, request_amounts);
     defer request_lease.release();
@@ -162,7 +160,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: 
     defer reservation.deinit();
     try control.check();
     try selected.verify(a, io);
-    var handle = try manager.acquireFromDirWithControl(selected.path, bound_control);
+    var handle = try common.acquireResidentModel(manager, selected.path, bound_control);
     defer handle.release();
     const model = handle.get();
     try model.verifyMemorillaIdentityWithControl(bound_control);
@@ -180,7 +178,8 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: 
         .ignore_eos = options.ignore_eos,
         .mode = options.mode,
         .thinking_metadata = if (options.mode == .bounded_thinking) &thinking else null,
-    }, &reservation, bounded, bound_control);
+        .reasoning_body_token_cap = options.reasoning_body_token_cap,
+    }, &reservation, caps, bound_control);
     errdefer result.deinit();
     try model.verifyMemorillaIdentityWithControl(bound_control);
     try selected.verify(a, io);
@@ -198,7 +197,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: 
 fn parseThinkingFinal(a: A, tokenizer: tokenizer_mod.Tokenizer, config: gpt_model.Config, raw: generation.GenerationResult, final_cap: usize, control: Control) !?FinalSpan {
     try control.check();
     const ids = raw.token_ids orelse return null;
-    if (!std.mem.eql(u8, raw.finish_reason, "stop") or ids.len == 0 or ids.len > 128 or raw.tokens_used != ids.len or final_cap == 0 or ids[ids.len - 1] < 0 or
+    if (!std.mem.eql(u8, raw.finish_reason, "stop") or ids.len == 0 or ids.len > decode.thinking_max_new_tokens or raw.tokens_used != ids.len or final_cap == 0 or ids[ids.len - 1] < 0 or
         !config.isEosToken(@intCast(ids[ids.len - 1]))) return null;
     const specials = try tokenizer.allSpecialTokenIds(a);
     defer a.free(specials);
@@ -247,6 +246,9 @@ test "Memorilla source decoder rejects invalid prompts and operator ceilings" {
     try validateInputs("system", "user", 8, .{ .max_output_tokens_per_item = 8 });
     try std.testing.expectError(error.InferenceOutputTokensExceeded, validateInputs("s", "u", 8, .{ .max_output_tokens_per_item = 7 }));
     try std.testing.expectError(error.MemorillaGenerationLimitExceeded, validateInputs("s", "u", 129, .{}));
+    try validateInputsWithMode("s", "u", decode.thinking_max_new_tokens, .{}, .bounded_thinking);
+    try std.testing.expectError(error.MemorillaGenerationLimitExceeded, validateInputsWithMode("s", "u", decode.thinking_max_new_tokens + 1, .{}, .bounded_thinking));
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, validateInputsWithMode("s", "u", 256, .{ .max_output_tokens_per_item = 128 }, .bounded_thinking));
     try std.testing.expectError(error.MemorillaPromptBudgetExceeded, validateInputs("s", "", 8, .{}));
     try std.testing.expectError(error.InvalidMemorillaPromptRecipe, validateInputs("s", "\xff", 8, .{}));
     try std.testing.expectError(error.InvalidMemorillaPromptRecipe, validateInputs("s", "u\x00", 8, .{}));

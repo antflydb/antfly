@@ -1,8 +1,8 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Request-owned, leased reader weights. No synthetic modules, CPU fallback,
-//! persistent device cache or implicit enlargement of operator budgets.
+//! Leased reader weights with explicit owner lifetime. No synthetic modules,
+//! CPU fallback or implicit enlargement of operator budgets.
 const std = @import("std");
 const build_options = @import("build_options");
 const module = @import("memorilla.zig");
@@ -21,12 +21,17 @@ pub fn weightPlan() memory.AdmissionAmounts {
     };
 }
 
-pub fn requireAdmission(admission: *const memory.AdmissionLease, limits: memory.Limits) !void {
+pub fn requireLimits(limits: memory.Limits) !void {
     const plan = weightPlan();
     if (limits.host_limit_bytes == 0 or limits.backend_limit_bytes == 0 or limits.combined_limit_bytes == 0)
         return error.MemorillaFiniteBudgetRequired;
     if (plan.hostTotalBytes() > limits.host_limit_bytes or plan.backendTotalBytes() > limits.backend_limit_bytes or
         (try std.math.add(usize, plan.hostTotalBytes(), plan.backendTotalBytes())) > limits.combined_limit_bytes) return error.ResourceLimitExceeded;
+}
+
+pub fn requireAdmission(admission: *const memory.AdmissionLease, limits: memory.Limits) !void {
+    try requireLimits(limits);
+    const plan = weightPlan();
     if (admission.controller == null or admission.retain_backend_class != .gpu or
         admission.amounts.host_weight_bytes < plan.host_weight_bytes or
         admission.amounts.backend_weight_bytes < plan.backend_weight_bytes or

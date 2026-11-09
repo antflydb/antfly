@@ -2110,6 +2110,9 @@ fn createCudaSessionWithRequiredProfile(
     // The qualified managed path owns fresh KV and eager request state. The
     // generic SM121 capture defaults are for other serving profiles.
     if (model_manifest.memorilla_profile != null) cuda_compute.capture_gates = .{};
+    if (model_manifest.memorilla_profile == .qwen3_decoder_f32_kv_f32_v1) {
+        if (cuda_compute.cublaslt) |*blas| blas.memorilla_f32_prefill = true;
+    }
     cuda_compute.qualified_span_fp32 = model_manifest.gliner_specialty_profile != null;
     if (model_manifest.gliner_specialty_profile) |profile| {
         std.log.info("gliner_specialty_cuda_policy profile={s} weights=f32 attention=f32 diagnostic_overrides=ignored", .{@tagName(profile)});
