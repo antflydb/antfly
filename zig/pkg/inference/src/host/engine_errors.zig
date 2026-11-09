@@ -125,6 +125,7 @@ const names = [_][*:0]const u8{
     "AdvLenMismatch",
     "AdvancedExtractionSchemaRequiresVersion2",
     "AfliteImportRequiresReplace",
+    "AgentContextBudgetExceeded",
     "AlgebraicAggregateOverflow",
     "AlgebraicAggregateTypeMismatch",
     "AlgebraicHllContributionLimitExceeded",
@@ -900,11 +901,14 @@ const names = [_][*:0]const u8{
     "ContentOversize",
     "ContentPartTypeMustBeString",
     "ContentPartTypeRequired",
+    "ContextCompactionBatchLimitExceeded",
     "ContextCompactionRunnerRequired",
     "ContextManagementTextOnly",
     "ContextMemoryRequiresUserMessage",
     "ContextMessageLimitExceeded",
+    "ContextOutputReservationTooSmall",
     "ContextRequired",
+    "ContextSummaryMissingCitation",
     "ContextSummaryTooLarge",
     "ContextSummaryTruncated",
     "ContextTooLarge",
@@ -2803,6 +2807,7 @@ const names = [_][*:0]const u8{
     "InstructionRequiredForEmbeddingTask",
     "InstructionRequiresQueryTask",
     "InstructionsTooLarge",
+    "InsufficientContextReduction",
     "InsufficientData",
     "InsufficientEntropy",
     "InsufficientFragmentedCoverage",
@@ -9655,6 +9660,7 @@ const names = [_][*:0]const u8{
     "UnsupportedConstrainedSchema",
     "UnsupportedContainer",
     "UnsupportedContentPartType",
+    "UnsupportedContextMedia",
     "UnsupportedContextRole",
     "UnsupportedConversion",
     "UnsupportedCooperativeFit",
@@ -10640,6 +10646,7 @@ const values = [_]anyerror{
     error.AdvLenMismatch,
     error.AdvancedExtractionSchemaRequiresVersion2,
     error.AfliteImportRequiresReplace,
+    error.AgentContextBudgetExceeded,
     error.AlgebraicAggregateOverflow,
     error.AlgebraicAggregateTypeMismatch,
     error.AlgebraicHllContributionLimitExceeded,
@@ -11415,11 +11422,14 @@ const values = [_]anyerror{
     error.ContentOversize,
     error.ContentPartTypeMustBeString,
     error.ContentPartTypeRequired,
+    error.ContextCompactionBatchLimitExceeded,
     error.ContextCompactionRunnerRequired,
     error.ContextManagementTextOnly,
     error.ContextMemoryRequiresUserMessage,
     error.ContextMessageLimitExceeded,
+    error.ContextOutputReservationTooSmall,
     error.ContextRequired,
+    error.ContextSummaryMissingCitation,
     error.ContextSummaryTooLarge,
     error.ContextSummaryTruncated,
     error.ContextTooLarge,
@@ -13318,6 +13328,7 @@ const values = [_]anyerror{
     error.InstructionRequiredForEmbeddingTask,
     error.InstructionRequiresQueryTask,
     error.InstructionsTooLarge,
+    error.InsufficientContextReduction,
     error.InsufficientData,
     error.InsufficientEntropy,
     error.InsufficientFragmentedCoverage,
@@ -20170,6 +20181,7 @@ const values = [_]anyerror{
     error.UnsupportedConstrainedSchema,
     error.UnsupportedContainer,
     error.UnsupportedContentPartType,
+    error.UnsupportedContextMedia,
     error.UnsupportedContextRole,
     error.UnsupportedConversion,
     error.UnsupportedCooperativeFit,
@@ -21069,6 +21081,11 @@ test "engine errors retain every generated identity" {
 }
 test "engine errors preserve model-aware chunk failure identities" {
     for ([_]anyerror{ error.StaleChunkContinuation, error.IncompleteChunkCoverage, error.InvalidChunkCoordinates, error.ChunkOutputTooLarge, error.SourceVersionChanged, error.EmbeddingIdentityMismatch, error.InvalidChunkReplay }) |err| {
+        try std.testing.expectEqual(err, fromName(@errorName(err)));
+    }
+}
+test "engine errors preserve context management failure identities" {
+    for ([_]anyerror{ error.AgentContextBudgetExceeded, error.ContextCompactionBatchLimitExceeded, error.ContextOutputReservationTooSmall, error.InsufficientContextReduction, error.UnsupportedContextMedia, error.ContextSummaryMissingCitation }) |err| {
         try std.testing.expectEqual(err, fromName(@errorName(err)));
     }
 }

@@ -15411,9 +15411,7 @@ pub const Node = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.control.check();
             var preflight = try directGeneratePreflightForMessages(messages);
-            const schema = try std.json.parseFromSlice(std.json.Value, allocator,
-                \\{"type":"object","additionalProperties":false,"required":["conversation","tool_evidence","unresolved_tool_calls"],"properties":{"conversation":{"type":"string"},"tool_evidence":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["tool_call_id","tool_name","facts"],"properties":{"tool_call_id":{"type":"string"},"tool_name":{"type":"string"},"facts":{"type":"string"}}}},"unresolved_tool_calls":{"type":"array","maxItems":0,"items":{"type":"object","additionalProperties":false,"required":["tool_call_id","tool_name"],"properties":{"tool_call_id":{"type":"string"},"tool_name":{"type":"string"}}}}}}
-            , .{});
+            const schema = try std.json.parseFromSlice(std.json.Value, allocator, @import("antfly_generating").context_management.summary_schema, .{});
             defer schema.deinit();
             const grammar = try grammar_mod.buildJsonSchemaGrammarWithOptions(allocator, schema.value, .{ .bounded_whitespace = true });
             defer allocator.free(grammar);
@@ -27710,6 +27708,7 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
 }
 
 test {
+    _ = context_management;
     _ = @import("../documents/executor.zig");
     _ = @import("../documents/artifacts.zig");
     _ = @import("../documents/service.zig");
