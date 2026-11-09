@@ -166,7 +166,11 @@ pub const Stage = enum(u8) {
     // no foreground commit comes along to carry it. This is the expected,
     // amortized cost of ride-along's staleness bound, not an avoidable
     // per-write sync; distinguishing it from a genuinely unattributed
-    // `.other` background sync is the point of this tag.
+    // `.other` background sync is the point of this tag. The write-
+    // amplification harness additionally hard-gates how many times this
+    // can fire over one measured run (`ceil(elapsed_ns / idle_window) + 1`)
+    // rather than tolerating it unbounded -- see
+    // `write_amplification_bench_test.zig`'s `idleFlushDrains`.
     ride_along_flush,
     other,
 };

@@ -7445,6 +7445,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.column_scan_plan.",
             "storage.db.column_source.",
             "storage.db.db.",
+            "storage.db.artifact_catalog_proposal.",
             "storage.db.artifact_graph_completion.",
             "storage.db.artifact_input_test.",
             "storage.db.entity_alias_curation.",
@@ -7622,6 +7623,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db_split_vopr.",
             "storage.derived_log_test_root.",
             "storage.docstore.",
+            "storage.embedded_graph_catalog.",
             "storage.enrichment.",
             "storage.engine.",
             "storage.logical_source.",
@@ -7678,7 +7680,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.vopr_durable_job_lane.",
             "storage.wal.",
             "storage.wal_vopr.",
-            "storage.write_amplification_trace.",
         },
     };
     const unit_storage_db_core_shard_index = 3;

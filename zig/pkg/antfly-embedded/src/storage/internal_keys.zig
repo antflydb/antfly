@@ -132,7 +132,15 @@ pub const extraction_generation_directory_kind: u8 = 0x51;
 /// reservation. Zig rejects duplicate enum values at compile time.
 pub const GlobalReplayKind = enum(u8) {
     replay_init = 0x01,
-    next_sequence = 0x02,
+    // Journal sharing: moved from 0x02 to sit immediately next to
+    // `outcome_receipt`/`journal_format_version`/`journal_credit_ledger`
+    // below (0x55-0x57) rather than at the head of the family. Those four
+    // keys are now written in the same append transaction on every single
+    // commit (head sequence, receipt, ledger); consecutive ordinals put
+    // them on the same B-tree leaf regardless of which other, far less
+    // frequently written, replay-metadata families this store happens to
+    // have populated in between.
+    next_sequence = 0x58,
     latest_sequence = 0x03,
     replication_applied = 0x04,
     ordered_document_applied = 0x05,

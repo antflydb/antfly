@@ -80,6 +80,8 @@ pub const OpenOptions = struct {
     /// Optional caller-owned runtime for the complete native-single-file
     /// lifecycle. Bridge mode rejects it because that engine is native-only.
     io: ?std.Io = null,
+    /// See `docstore.Store.ride_along_idle_ns`'s own doc comment.
+    ride_along_idle_ns: ?u64 = null,
 };
 
 pub const CreateOptions = struct {
@@ -90,6 +92,8 @@ pub const CreateOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     writer_lock_marker: []const u8 = "",
     io: ?std.Io = null,
+    /// See `docstore.Store.ride_along_idle_ns`'s own doc comment.
+    ride_along_idle_ns: ?u64 = null,
 };
 
 pub fn isAflitePath(path: []const u8) bool {
@@ -772,6 +776,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
         .io = opts.io,
+        .ride_along_idle_ns = opts.ride_along_idle_ns,
     });
     return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
 }
@@ -797,6 +802,7 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
         .resource_manager = resource_manager,
         .writer_lock_marker = opts.writer_lock_marker,
         .io = opts.io,
+        .ride_along_idle_ns = opts.ride_along_idle_ns,
     });
     return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
 }

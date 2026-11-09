@@ -3144,6 +3144,10 @@ pub const LiteResolvedOpenOptions = struct {
     profile: lite_backend.Profile = .native,
     map_size: ?usize = null,
     no_sync: bool = false,
+    /// See `storage/lite/docstore.zig`'s `Store.ride_along_idle_ns` doc
+    /// comment. Threaded through for tests of the idle-flush barrier
+    /// itself; never meant to tune write-amplification numbers.
+    ride_along_idle_ns: ?u64 = null,
     ttl_cleanup: ?db_mod.ttl_runtime.Config = null,
     inference: lite_backend.InferenceOpenOptions = .{},
     generated_enrichment_replay: bool = false,
@@ -3334,6 +3338,8 @@ pub const HostLiteOpenOptions = struct {
     read_only: bool = false,
     hosted: bool = true,
     no_sync: bool = false,
+    /// See `LiteResolvedOpenOptions.ride_along_idle_ns`.
+    ride_along_idle_ns: ?u64 = null,
 };
 
 pub fn openLiteHandleWithRuntime(
@@ -3347,6 +3353,7 @@ pub fn openLiteHandleWithRuntime(
         .open_mode = if (options.read_only) .query_readonly else .writer,
         .profile = if (options.hosted) .hosted else .native,
         .no_sync = options.no_sync,
+        .ride_along_idle_ns = options.ride_along_idle_ns,
     }, options.create, io, backend_runtime));
 }
 
@@ -3391,6 +3398,7 @@ pub fn openLiteHandleAllocWithSharedInference(
             .exclusive = true,
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
+            .ride_along_idle_ns = resolved.ride_along_idle_ns,
         })
     else
         try lite_backend.Handle.open(alloc, path, .{
@@ -3398,6 +3406,7 @@ pub fn openLiteHandleAllocWithSharedInference(
             .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
+            .ride_along_idle_ns = resolved.ride_along_idle_ns,
         });
     errdefer if (!handle_owns_resources) backend.deinit();
     if (resolved.allocator_verification_owner) |verified| {
@@ -5573,6 +5582,27 @@ pub fn antfly_db_set_schema_json(
     const handle = guard.handle;
     @import("sql_ddl.zig").invalidate(handle);
     handle.database().*.setSchemaJson(handle.alloc, schema_json.bytes()) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+/// Test/internal support only -- deliberately not in `exports.zig`'s
+/// publish list, so it is not part of the public C ABI. Forces the
+/// underlying native store's durability barrier (`backend_erased.Store.
+/// sync(true)`, which for Lite reaches `docstore.Store.sync()`:
+/// `forceDrainDurable()` then `syncIndexContents()`), draining and
+/// fsyncing any ride-along work still pending -- the same barrier a
+/// cross-process path-lease handoff or `Store.close()` already relies
+/// on, just reachable directly for a test that wants to flush without
+/// closing the handle.
+pub fn antfly_db_force_sync_for_test(handle_ptr: ?*anyopaque) callconv(.c) capi.ErrorCode {
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return capi.ensureError(code, @src().fn_name);
+    }
+    defer guard.leave();
+    guard.handle.database().core.store.sync(true) catch |err| return capi.mapError(err);
     return .ok;
 }
 
