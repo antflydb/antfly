@@ -2132,7 +2132,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .owner_readiness => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget = .{
                         .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
                         .cancellation = ownerQueryCancellation(&request.control),
@@ -2141,7 +2141,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .owner_readiness_transitions => |input| {
-                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget = .{
                         .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
                         .cancellation = ownerQueryCancellation(&request.control),

@@ -6011,3 +6011,8 @@ the certified graph descriptor domains; callback ABI 11 remains the graph stride
 fence. Authenticated three-metadata/three-data qualification passed all 77 Cypher
 checks: three warm reads each used one 114-byte routing token and no routing
 snapshot; a catalog revision change fetched a new snapshot before warm reuse.
+
+Compiled readiness projections validate their nested control header against the
+shared query ABI, independently of the enclosing storage projection ABI. A real
+owner regression exercises both readiness operations with valid query controls
+and rejects substituted storage-version controls before executing owner reads.
