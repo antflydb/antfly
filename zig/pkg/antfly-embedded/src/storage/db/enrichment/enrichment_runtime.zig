@@ -6454,7 +6454,16 @@ fn mutateMediaPassOnce(runtime: *EnrichmentRuntime, cursor_key: []const u8, expe
         for (deletes) |key| try lease.guard_key(lease.ptr, key);
     }
     const fence = try requiredRuntimeStoreWriteFence(runtime);
-    var txn = try live.beginWrite();
+    // Ride-along, not a standalone commit+sync (lite-single-commit-write-path.md
+    // §3.2a): the media-pass cursor/page records are private worker
+    // preparation, never chunk artifacts, and are read back and resumed from
+    // on restart (see `media_pass.zig`'s doc comment) -- losing one in a
+    // crash just means a restart re-derives a bounded amount of recompute
+    // from the last durable cursor, exactly like the rebuild-from-progress
+    // ride-along work this design already covers. The next foreground
+    // group's fsync (or the idle-flush timer) makes this durable; it must
+    // never force its own sync.
+    var txn = try live.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
     const current = txn.get(cursor_key) catch |err| if (err == error.NotFound) null else return err;
@@ -6476,7 +6485,6 @@ fn mutateMediaPassOnce(runtime: *EnrichmentRuntime, cursor_key: []const u8, expe
     for (deletes) |key| txn.delete(key) catch |err| if (err != error.NotFound) return err;
     try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
     try txn.commit();
-    try live.sync(false);
 }
 
 fn retireMediaPassForDenseRequest(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
