@@ -3572,9 +3572,9 @@ pub const Index = struct {
         if (self.bulk_dirty_path_promotion_dictionaries.count() > 0) {
             var storage_accounting = self.storageAccountingScope();
             defer storage_accounting.deinit();
-            var txn = try store.beginWriteTxn();
+            var txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
             errdefer txn.abort();
-            var accounting = try storage_accounting.txn(&txn);
+            var accounting = try storage_accounting.txn(txn.asTxn());
             defer accounting.deinit();
             try self.flushBulkSessionPathPromotionDictionariesTxn(&accounting);
             try accounting.finish();
@@ -4012,9 +4012,9 @@ pub const Index = struct {
         defer self.alloc.free(expr_id);
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
-        var raw_txn = try store.beginWriteTxn();
+        var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer raw_txn.abort();
-        var txn = try storage_accounting.txn(&raw_txn);
+        var txn = try storage_accounting.txn(raw_txn.asTxn());
         defer txn.deinit();
         const axis_id = try self.ensureSymbol(&txn, axes_canonical);
         self.alloc.free(axis_id);
@@ -4034,12 +4034,16 @@ pub const Index = struct {
                 else => return err,
             };
             try txn.finish();
+            const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+            defer wal_trace_scope.end();
             try raw_txn.commit();
             return;
         };
         defer self.alloc.free(encoded);
         try txn.put(key, encoded);
         try txn.finish();
+        const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+        defer wal_trace_scope.end();
         try raw_txn.commit();
     }
 
@@ -4194,9 +4198,9 @@ pub const Index = struct {
 
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
-        var raw_txn = try store.beginWriteTxn();
+        var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer raw_txn.abort();
-        var txn = try storage_accounting.txn(&raw_txn);
+        var txn = try storage_accounting.txn(raw_txn.asTxn());
         defer txn.deinit();
 
         var keys = std.ArrayListUnmanaged([]u8).empty;
@@ -4252,6 +4256,8 @@ pub const Index = struct {
         }
 
         try txn.finish();
+        const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+        defer wal_trace_scope.end();
         try raw_txn.commit();
         return written;
     }
@@ -10589,9 +10595,9 @@ pub const Index = struct {
             const decision = if (should_start_backfill) "schemaless_path_backfill_started" else base_decision;
             var storage_accounting = self.storageAccountingScope();
             defer storage_accounting.deinit();
-            var raw_txn = try store.beginWriteTxn();
+            var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
             errdefer raw_txn.abort();
-            var txn = try storage_accounting.txn(&raw_txn);
+            var txn = try storage_accounting.txn(raw_txn.asTxn());
             defer txn.deinit();
             try self.persistPathProfileHistoryTxn(&txn, recommendation);
             const prior_state_payload = txn.get(state_key) catch |err| switch (err) {
@@ -10648,6 +10654,8 @@ pub const Index = struct {
                 try txn.put(progress_key, progress_payload);
             }
             try txn.finish();
+            const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+            defer wal_trace_scope.end();
             try raw_txn.commit();
         }
         return changed;
@@ -13499,9 +13507,9 @@ pub const Index = struct {
 
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
-        var raw_txn = try store.beginWriteTxn();
+        var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer raw_txn.abort();
-        var txn = try storage_accounting.txn(&raw_txn);
+        var txn = try storage_accounting.txn(raw_txn.asTxn());
         defer txn.deinit();
         const state = try self.encodePersistedMaterializationStateAlloc(recommendation, lifecycle, existing_state.observation_count);
         defer self.alloc.free(state);
@@ -13519,6 +13527,8 @@ pub const Index = struct {
             try txn.put(update.key, encoded);
         }
         try txn.finish();
+        const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+        defer wal_trace_scope.end();
         try raw_txn.commit();
         self.invalidateAdaptiveReadySpecCache();
     }
@@ -13561,9 +13571,9 @@ pub const Index = struct {
 
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
-        var raw_txn = try store.beginWriteTxn();
+        var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer raw_txn.abort();
-        var txn = try storage_accounting.txn(&raw_txn);
+        var txn = try storage_accounting.txn(raw_txn.asTxn());
         defer txn.deinit();
         const existing = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
@@ -13586,6 +13596,8 @@ pub const Index = struct {
             try txn.put(state_key, state);
         }
         try txn.finish();
+        const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+        defer wal_trace_scope.end();
         try raw_txn.commit();
         self.invalidateAdaptiveReadySpecCache();
     }
@@ -13607,9 +13619,9 @@ pub const Index = struct {
         defer self.alloc.free(state_key);
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
-        var raw_txn = try store.beginWriteTxn();
+        var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer raw_txn.abort();
-        var txn = try storage_accounting.txn(&raw_txn);
+        var txn = try storage_accounting.txn(raw_txn.asTxn());
         defer txn.deinit();
         try txn.put(key, encoded);
         if (txn.get(state_key)) |existing| {
@@ -13625,6 +13637,8 @@ pub const Index = struct {
             else => return err,
         }
         try txn.finish();
+        const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+        defer wal_trace_scope.end();
         try raw_txn.commit();
     }
 
@@ -13791,9 +13805,9 @@ pub const Index = struct {
         defer self.alloc.free(key);
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
-        var raw_txn = try store.beginWriteTxn();
+        var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer raw_txn.abort();
-        var txn = try storage_accounting.txn(&raw_txn);
+        var txn = try storage_accounting.txn(raw_txn.asTxn());
         defer txn.deinit();
         var prior_candidate: ?PersistedAdaptiveCandidate = null;
         const prior_payload = txn.get(key) catch |err| switch (err) {
@@ -13814,6 +13828,8 @@ pub const Index = struct {
         try txn.put(key, payload);
         try txn.put(history_key, history_payload);
         try txn.finish();
+        const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+        defer wal_trace_scope.end();
         try raw_txn.commit();
     }
 
@@ -13835,12 +13851,14 @@ pub const Index = struct {
         defer self.alloc.free(payload);
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
-        var raw_txn = try store.beginWriteTxn();
+        var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer raw_txn.abort();
-        var txn = try storage_accounting.txn(&raw_txn);
+        var txn = try storage_accounting.txn(raw_txn.asTxn());
         defer txn.deinit();
         try txn.put(key, payload);
         try txn.finish();
+        const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+        defer wal_trace_scope.end();
         try raw_txn.commit();
         self.invalidateAdaptiveReadySpecCache();
     }
@@ -13922,12 +13940,14 @@ pub const Index = struct {
             if (progress.lifecycle == .rebuild_required) continue;
             var storage_accounting = self.storageAccountingScope();
             defer storage_accounting.deinit();
-            var raw_txn = try store.beginWriteTxn();
+            var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
             errdefer raw_txn.abort();
-            var txn = try storage_accounting.txn(&raw_txn);
+            var txn = try storage_accounting.txn(raw_txn.asTxn());
             defer txn.deinit();
             try self.markAdaptiveMaterializationRebuildRequiredTxn(&txn, progress);
             try txn.finish();
+            const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+            defer wal_trace_scope.end();
             try raw_txn.commit();
             changed += 1;
         }
@@ -14316,9 +14336,9 @@ pub const Index = struct {
 
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
-        var raw_txn = try store.beginWriteTxn();
+        var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer raw_txn.abort();
-        var txn = try storage_accounting.txn(&raw_txn);
+        var txn = try storage_accounting.txn(raw_txn.asTxn());
         defer txn.deinit();
         for (payloads.items) |item| {
             var facts = fact_mod.decodeListAlloc(self.alloc, item.payload) catch |err| switch (err) {
@@ -14346,6 +14366,8 @@ pub const Index = struct {
             cursor_key,
         );
         try txn.finish();
+        const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+        defer wal_trace_scope.end();
         try raw_txn.commit();
         if (reached_end and next_cursor_key.len > 0) {
             self.alloc.free(next_cursor_key);
@@ -14471,9 +14493,9 @@ pub const Index = struct {
         const total_processed = progress.rows_processed + processed;
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
-        var raw_txn = try store.beginWriteTxn();
+        var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer raw_txn.abort();
-        var txn = try storage_accounting.txn(&raw_txn);
+        var txn = try storage_accounting.txn(raw_txn.asTxn());
         defer txn.deinit();
         const owns_dictionary = try self.putPathPromotionDictionaryRegistryTxn(&txn, spec, if (reached_end) "ready" else "building");
         for (items.items) |item| {
@@ -14536,6 +14558,8 @@ pub const Index = struct {
             cursor_key,
         );
         try txn.finish();
+        const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+        defer wal_trace_scope.end();
         try raw_txn.commit();
         if (reached_end and next_cursor_key.len > 0) {
             self.alloc.free(next_cursor_key);
@@ -14652,9 +14676,9 @@ pub const Index = struct {
 
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
-        var raw_txn = try store.beginWriteTxn();
+        var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer raw_txn.abort();
-        var txn = try storage_accounting.txn(&raw_txn);
+        var txn = try storage_accounting.txn(raw_txn.asTxn());
         defer txn.deinit();
         for (payloads.items) |item| {
             var changed_fact = ProjectedFact.decode(self.alloc, item.payload) catch |err| switch (err) {
@@ -14682,6 +14706,8 @@ pub const Index = struct {
             cursor_key,
         );
         try txn.finish();
+        const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+        defer wal_trace_scope.end();
         try raw_txn.commit();
         if (reached_end and next_cursor_key.len > 0) {
             self.alloc.free(next_cursor_key);
@@ -14755,9 +14781,9 @@ pub const Index = struct {
 
         var storage_accounting = self.storageAccountingScope();
         defer storage_accounting.deinit();
-        var raw_txn = try store.beginWriteTxn();
+        var raw_txn = try store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer raw_txn.abort();
-        var txn = try storage_accounting.txn(&raw_txn);
+        var txn = try storage_accounting.txn(raw_txn.asTxn());
         defer txn.deinit();
         for (keys.items) |key| txn.delete(key) catch |err| switch (err) {
             error.NotFound => {},
@@ -14773,6 +14799,8 @@ pub const Index = struct {
         };
         try self.deleteAdaptiveDictionaryIfOwnedTxn(&txn, recommendation, materialization_id);
         try txn.finish();
+        const wal_trace_scope = wal_trace.scope(.algebraic_adaptive);
+        defer wal_trace_scope.end();
         try raw_txn.commit();
     }
 
