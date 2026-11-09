@@ -223,6 +223,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db retryable asset producer batches do not block independent dense publication",
         "storage.db.db.test.db asset consumes another asset artifact and re-derives on upstream change",
         "storage.db.db.test.db asset consuming asset validates upstream references at admission",
+        "generic scalar chunks reject stale upstream and fence publication",
         "asset preparation is lazy and byte bounded across retryable provider batches",
         "asset planning groups interleaved providers",
         "asset producer neighbor context samples local graph adjacency into the input and skip state",

@@ -18411,6 +18411,8 @@ export interface components {
              * @default false
              */
             external?: boolean;
+            /** @description Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model. */
+            external_vector_space?: string;
             /**
              * @description When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
              * @default false
@@ -19775,6 +19777,7 @@ export interface components {
             coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
             /** @default false */
             external?: boolean;
+            external_vector_space?: string;
             /** @default false */
             sparse?: boolean;
             dimension?: number;

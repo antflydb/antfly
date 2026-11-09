@@ -107,6 +107,9 @@ func (s *Service) verifiedMediaDigest(ctx context.Context, source Source, connec
 func sourceMediaBinding(source Source) string {
 	source.Alias = ""
 	source.Streams = nil // Producer/search bindings do not revoke original bytes.
+	source.SearchVersion = 0
+	source.Artifacts = nil
+	source.Processing = nil
 	source.PermissionTTLSeconds = 0
 	raw, _ := json.Marshal(source)
 	sum := sha256.Sum256(raw)
