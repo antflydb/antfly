@@ -451,8 +451,11 @@ class RuntimeCacheTest(unittest.TestCase):
         output = self.build(*targets)
         self.assert_compile(output, "local_query", "success")
         self.assert_compile(output, "enrichment_compute", "cached")
+        # The tiny storage probe does not read its physical ABI. Check a real
+        # consumed input instead: dispatch must fail without its opaque ABI.
+        query.unlink()
         self.assertIn(
-            "FileNotFound", self.build("runtime-unit-storage_kernel", succeeds=False)
+            "FileNotFound", self.build("runtime-unit-local_query", succeeds=False)
         )
 
     def test_control_consumers_ignore_physical_db_implementation(self):
