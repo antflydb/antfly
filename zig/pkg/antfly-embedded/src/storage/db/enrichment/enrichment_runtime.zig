@@ -16251,9 +16251,7 @@ fn processAsset(
         if (producer_cfg.type == .document_extraction) {
             try deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window);
         } else {
-            const receipt_key = try @import("../artifact_local_publication.zig").key(runtime.alloc, key);
-            defer runtime.alloc.free(receipt_key);
-            try storePutBatchGuardedWithRetry(runtime, &.{}, &.{ key, state_key, receipt_key }, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_absent = consumes_upstream });
+            try retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_absent = consumes_upstream });
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         }
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
@@ -41576,6 +41574,32 @@ test "generic contextual asset publication keeps raw upstream identity" {
     const retired_receipt = try storeGetOptionalAllocWithRetry(&runtime, output_receipt);
     defer if (retired_receipt) |value| alloc.free(value);
     try std.testing.expect(retired_output == null and retired_receipt == null);
+    // A delayed no-input request from an older recipe must not retire a newer
+    // producer's output, receipt or skip state, nor publish skipped coverage.
+    const current_receipt = local.encode(local.recipe(upstream), parent, raw_upstream);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = upstream_key, .value = raw_upstream }, .{ .key = receipt_key, .value = &current_receipt } }, &.{});
+    try runOnce(&runtime, request, &prepared_sources, &window);
+    const output_state = try assetStateKeyAlloc(alloc, doc_key, request.artifact_name);
+    defer alloc.free(output_state);
+    const protected_keys = [_][]const u8{ output_key, output_receipt, output_state };
+    var previous: [3][]u8 = undefined;
+    for (protected_keys, 0..) |protected, i| previous[i] = (try storeGetOptionalAllocWithRetry(&runtime, protected)).?;
+    defer for (previous) |value| alloc.free(value);
+    const window_items = window.itemCount();
+    const coverage_items = window.coverage_transitions.items.len;
+    for ([_]bool{ false, true }) |root_selector| {
+        var obsolete = request;
+        obsolete.upstream_artifact_name = if (root_selector) "" else "retired_upstream";
+        obsolete.source_field = if (root_selector) "retired_field" else "";
+        try std.testing.expectError(error.EnrichmentSourceChanged, runOnce(&runtime, obsolete, &prepared_sources, &window));
+        for (protected_keys, previous) |protected, expected| {
+            const current = (try storeGetOptionalAllocWithRetry(&runtime, protected)).?;
+            defer alloc.free(current);
+            try std.testing.expectEqualSlices(u8, expected, current);
+        }
+        try std.testing.expectEqual(window_items, window.itemCount());
+        try std.testing.expectEqual(coverage_items, window.coverage_transitions.items.len);
+    }
 }
 
 test "asset producer neighbor context samples local graph adjacency into the input and skip state" {
@@ -42652,6 +42676,21 @@ test "source semantic media input preserves typed bytes instead of embedding URI
     try std.testing.expectEqual(@as(usize, 1), text.parts.len);
     try std.testing.expect(text.parts[0] == .text);
     try std.testing.expectEqualStrings("data:image/png;base64,AQID", text.parts[0].text);
+    // Native field selectors are literal root keys. PDF locator templates must
+    // select the nested source and preserve signed URI bytes without escaping.
+    const signed = "https://example.com/file.pdf?token=a&part=b";
+    const pdf_raw = "{\"content\":{\"resource\":{\"uri\":\"https://example.com/file.pdf?token=a&part=b\"}}}";
+    request.embedding_input = .pdf_page_images;
+    request.source_template = "";
+    request.source_field = "content.resource.uri";
+    const dotted = try extractSourceText(a, .{}, pdf_raw, request);
+    defer if (dotted) |value| a.free(value);
+    try std.testing.expect(dotted == null);
+    request.source_field = "";
+    request.source_template = "{{{content.resource.uri}}}";
+    const nested = (try extractSourceText(a, .{}, pdf_raw, request)).?;
+    defer a.free(nested);
+    try std.testing.expectEqualStrings(signed, nested);
 }
 
 test "extractSourceText with template skips _embeddings field" {

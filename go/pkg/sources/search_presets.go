@@ -16,6 +16,7 @@
 package sources
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"github.com/antflydb/antfly/go/pkg/sources/management"
@@ -167,7 +168,9 @@ func WithExternalVector(parent map[string]any, index string, space VectorSpace, 
 		return nil, err
 	}
 	var out map[string]any
-	if err = json.Unmarshal(raw, &out); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err = decoder.Decode(&out); err != nil {
 		return nil, err
 	}
 	source, ok := out["source"].(map[string]any)

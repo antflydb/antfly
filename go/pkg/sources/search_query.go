@@ -16,6 +16,7 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -259,28 +260,33 @@ func (p *Publisher) Search(ctx context.Context, binding Binding, request SearchR
 	if request.RequireSnapshot && consistency != "retained_snapshot" {
 		return nil, fmt.Errorf("operation requires a retained snapshot; native runtime returned %s", consistency)
 	}
-	var envelope map[string]any
+	// Keep native hits opaque. Decoding arbitrary evidence into interface values
+	// both rounds JSON numbers and allocates a second object tree for the result.
+	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(response, &envelope); err != nil {
 		return nil, err
 	}
 	result := envelope
-	if responses, ok := envelope["responses"].([]any); ok {
+	if raw, ok := envelope["responses"]; ok {
+		var responses []map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &responses); err != nil {
+			return nil, err
+		}
 		if len(responses) != 1 {
 			return nil, fmt.Errorf("unexpected search response count")
 		}
-		var valid bool
-		result, valid = responses[0].(map[string]any)
-		if !valid {
-			return nil, fmt.Errorf("invalid native search response")
-		}
+		result = responses[0]
 	}
-	if _, ok := result["hits"].(map[string]any); !ok {
+	hits := bytes.TrimSpace(result["hits"])
+	if len(hits) == 0 || hits[0] != '{' {
 		return nil, fmt.Errorf("native search hits unavailable")
 	}
-	// Preserve native hits and scores while identifying the selected binding and
-	// its actual consistency. Unretained relevance results cannot be continued
-	// as a snapshot and cannot prove authoritative absence.
-	envelope["source_search"] = map[string]any{"source_id": binding.ID, "stream": selected.Name, "index": indexName, "mode": request.Mode, "purpose": selected.Purpose, "generated": selected.Generated, "consistency": consistency}
+	// Unretained relevance results cannot prove authoritative absence.
+	metadata, err := json.Marshal(map[string]any{"source_id": binding.ID, "stream": selected.Name, "index": indexName, "mode": request.Mode, "purpose": selected.Purpose, "generated": selected.Generated, "consistency": consistency})
+	if err != nil {
+		return nil, err
+	}
+	envelope["source_search"] = metadata
 	return json.Marshal(envelope)
 }
 

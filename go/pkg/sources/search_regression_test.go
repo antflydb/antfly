@@ -131,7 +131,8 @@ func TestSemanticMediaInputModesAndModalities(t *testing.T) {
 		{name: "typed_audio", template: "{{remoteMedia url=content.resource.uri}}", modality: "audio", valid: true},
 		{name: "typed_multimodal", template: "{{media url=content.resource.uri}}", modality: "multimodal", valid: true},
 		{name: "media_cannot_claim_text", template: "{{media url=content.resource.uri}}", modality: "text"},
-		{name: "pdf_pages", field: "content.resource.uri", input: "pdf_page_images", modality: "image", valid: true},
+		{name: "pdf_literal_dotted_field_is_not_nested", field: "content.resource.uri", input: "pdf_page_images", modality: "image"},
+		{name: "pdf_escaped_uri_template", template: "{{content.resource.uri}}", input: "pdf_page_images", modality: "image"},
 		{name: "pdf_uri_template", template: "{{{content.resource.uri}}}", input: "pdf_page_images", modality: "image", valid: true},
 		{name: "pdf_wrong_modality", field: "content.resource.uri", input: "pdf_page_images", modality: "audio"},
 		{name: "pdf_wrong_field", field: "other.uri", input: "pdf_page_images", modality: "image"},
@@ -151,6 +152,36 @@ func TestSemanticMediaInputModesAndModalities(t *testing.T) {
 				require.NoError(t, err)
 			} else {
 				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestNativeTextLineageUsesLiteralFieldsAndNestedTemplates(t *testing.T) {
+	for _, tc := range []struct {
+		name, field, template, representation string
+		valid                                 bool
+	}{
+		{name: "literal_root", field: "body", representation: "body", valid: true},
+		{name: "literal_dotted_is_not_nested", field: "content.text", representation: "content.text"},
+		{name: "raw_nested", template: "{{{content.text}}}", representation: "content.text", valid: true},
+		{name: "conflicting_field_and_template", field: "body", template: "{{{content.text}}}", representation: "content.text"},
+		{name: "wrong_nested", template: "{{{other.text}}}", representation: "content.text"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := testMediaStream()
+			stream.ResourceField = ""
+			stream.Field = tc.representation
+			stream.Retrieval.Semantic.MemberField = tc.representation
+			stream.Retrieval.Semantic.VectorSpace.DocumentModality = "text"
+			index, err := decodeSearchIndex(testNativeIndex(stream, true))
+			require.NoError(t, err)
+			e := nativeEnrichments(index.Config)["image_dense"]
+			e["field"], e["template"] = tc.field, tc.template
+			if tc.valid {
+				require.NoError(t, checkNativeStream(stream, index, true))
+			} else {
+				require.Error(t, checkNativeStream(stream, index, true))
 			}
 		})
 	}

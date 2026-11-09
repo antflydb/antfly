@@ -77,8 +77,11 @@ Managed original-media bindings require a direct typed native input such as
 `template: "{{media url=content.resource.uri}}"`, matching a non-text document
 modality. A URI field or plain `{{content.resource.uri}}` interpolation embeds
 text and cannot certify media readiness. Native `embedding_input: pdf_page_images`
-may instead consume the resource URI as a field or pure interpolation, with
-`document_modality: image`. Unknown input modes, text-producing helper options,
+consumes the nested resource URI through raw interpolation such as
+`template: "{{{content.resource.uri}}}"`, with `document_modality: image`.
+Native `field` selectors address literal root keys, so a dotted native field
+cannot prove a nested representation dependency. Escaped interpolation is also
+rejected for URI inputs because it can alter signed query parameters. Unknown input modes, text-producing helper options,
 composed prompts and unproven artifact/media transitions report an unsupported
 binding; they never become ready based only on a matching URI dependency.
 
@@ -366,3 +369,11 @@ remain inputs to provider execution and skip-state identity; they never replace
 the raw upstream identity checked in the publication transaction. Empty-input
 retirement removes the output, skip state and local publication receipt under
 the same source and producer fences.
+
+Missing-input retirement uses the same current-producer recipe fence as output
+publication. Obsolete work cannot delete the output, skip state or receipt of a
+replacement producer, or publish skipped coverage for it. The ranked search
+wrapper keeps native hits and extension fields as opaque JSON while attaching
+binding metadata; external-vector helpers preserve parent JSON numbers during
+deep copying. Large identifiers and high-precision numeric evidence are never
+coerced through floating-point values by these adapters.

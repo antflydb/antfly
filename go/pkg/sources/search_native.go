@@ -144,17 +144,9 @@ func nativeLineage(enrichments map[string]map[string]any, member string, stream 
 		if input != "" && input != "text" {
 			return false
 		}
-		field, _ := e["field"].(string)
-		template, _ := e["template"].(string)
-		if template != "" {
-			var valid bool
-			if field != "" {
-				return false
-			}
-			field, valid = pureFieldTemplate(template)
-			if !valid {
-				return false
-			}
+		field, valid := nativeTextSelector(e, false)
+		if !valid {
+			return false
 		}
 		switch e["kind"] {
 		case "embedding":
@@ -198,15 +190,10 @@ func nativeMediaLineage(e map[string]any, stream SearchStream) bool {
 		if binding.VectorSpace.DocumentModality != "image" {
 			return false
 		}
-		if template != "" {
-			if field != "" {
-				return false
-			}
-			var valid bool
-			field, valid = pureFieldTemplate(template)
-			if !valid {
-				return false
-			}
+		var valid bool
+		field, valid = nativeTextSelector(e, true)
+		if !valid {
+			return false
 		}
 	} else {
 		if (input != "" && input != "text") || field != "" {
@@ -648,6 +635,21 @@ func pureFieldTemplate(template string) (string, bool) {
 		}
 	}
 	return field, true
+}
+
+// Native field selectors name literal root keys. Portable bindings use logical
+// dotted paths, so only a template can prove a nested dependency. URI consumers
+// additionally require raw interpolation to preserve signed query parameters.
+func nativeTextSelector(e map[string]any, rawOnly bool) (string, bool) {
+	field, _ := e["field"].(string)
+	template, _ := e["template"].(string)
+	if template == "" {
+		return field, field != "" && !strings.Contains(field, ".")
+	}
+	if field != "" || rawOnly && !strings.HasPrefix(template, "{{{") {
+		return "", false
+	}
+	return pureFieldTemplate(template)
 }
 
 // Admit only a single typed media input from the declared resource. Ordinary
