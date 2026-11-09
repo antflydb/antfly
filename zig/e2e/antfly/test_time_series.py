@@ -1329,3 +1329,47 @@ def test_ordered_series_repeated_first_pages_keep_their_captured_rows(stateful_a
         )
         retained = payload.get("responses", [payload])[0]
         assert retained["hits"]["hits"][0]["_id"] == "b", payload
+
+
+@pytest.mark.parametrize("shards", [1, 2])
+@pytest.mark.parametrize("min_doc_count", [0, 1])
+@pytest.mark.parametrize("endpoint", ["table", "global"])
+def test_numeric_histogram_extremes_return_error_and_preserve_server(
+    stateful_api, shards, min_doc_count, endpoint
+):
+    api = stateful_api
+    name = f"numeric_extent_{time.time_ns()}"
+    finish_create_table(
+        api, name, api._request("POST", f"/tables/{name}", {"num_shards": shards})
+    )
+    api.batch_write(
+        name,
+        inserts={"lo": {"ts": -(2**127)}, "hi": {"ts": 2**127 - 1}},
+        sync_level="full_index",
+    )
+    query = {
+        "limit": 0,
+        "aggregations": {
+            "points": {
+                "type": "date_histogram",
+                "field": "ts",
+                "fixed_interval": "1ns",
+                "min_doc_count": min_doc_count,
+            }
+        },
+    }
+    if endpoint == "global":
+        query["table"] = name
+    response = api._request(
+        "POST", "/query" if endpoint == "global" else f"/tables/{name}/query", query
+    )
+    if response.status_code == 200:
+        payload = response.json()
+        result = payload.get("responses", [payload])[0]
+        assert result.get("status", 200) == 400, payload
+    else:
+        if response.status_code != 400:
+            print(api.debug_logs())
+        assert response.status_code == 400, response.text
+    payload = api.query_table(name, {"limit": 1})
+    assert payload.get("responses", [payload])[0].get("status", 200) == 200, payload

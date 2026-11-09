@@ -149865,7 +149865,7 @@ test "time series pinned Cypher uses signed source for visibility and revision f
     }
 }
 
-test "time series graph TTL reconstructs revision lifetimes and validates before mutation" {
+test "time series graph TTL reconstructs admitted lifetimes and validates before mutation" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("series-graph-ttl-source");
     defer directory.cleanup();
@@ -150003,4 +150003,76 @@ test "time series staged restore preserves timestamp presence sources and delete
     try target.batch(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } } });
     try target.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "deleted", .value = "{}" }} });
     try std.testing.expectEqual(@as(u64, 10_002), try target.getTimestamp(a, "deleted"));
+}
+
+test "time series graph repair requires authoritative lifetimes across clock rollback" {
+    const a = std.testing.allocator;
+    const documents = [_][]const u8{ "{\"ref\":\"b\"}", "{\"ref\":\"b\",\"at\":\"1969-12-31T23:59:59Z\"}", "{\"ref\":\"b\",\"at\":\"1970-01-01T00:00:00Z\"}" };
+    for (0..6) |profile| {
+        const json = documents[profile % documents.len];
+        const mixed = profile >= documents.len;
+        var directory = try TestDirectory.init("series-graph-lifetime-authority");
+        defer directory.cleanup();
+        const options: OpenOptions = .{ .start_index_workers = false, .start_optional_runtimes = false };
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        if (profile % documents.len != 0) try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+        const admitted = currentTimeNs();
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = admitted + 10 * std.time.ns_per_hour, .writes = &.{.{ .key = "b", .value = "{}" }} });
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = admitted, .writes = &.{.{ .key = "a", .value = json }} });
+        try std.testing.expect(try db.getTimestamp(a, "a") > admitted + 10 * std.time.ns_per_hour);
+        if (mixed) try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = if (mixed)
+            "{\"ttl\":{\"duration\":\"1h\"},\"sources\":[{\"artifact\":\"relations_v1\"}],\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}]}"
+        else
+            "{\"ttl\":{\"duration\":\"1h\"},\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}]}" });
+        // Neither a logical revision nor an event timestamp is an admission
+        // clock. Repair cannot invent the missing historical edge lifetime.
+        try std.testing.expectError(error.GraphEdgeTtlMigrationRequired, projectGraphFieldContributionsForRepair(db.async_context, "g", "a"));
+        // Re-admitting the field document through the normal mutation path
+        // creates a durable, replicated edge artifact and lifetime record.
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = admitted, .writes = &.{.{ .key = "a", .value = json }} });
+        try db.runUntilIdle();
+        const graph = db.core.index_manager.graphIndex("g").?;
+        const artifact_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(a, "a", "g", "link", "b", "a");
+        defer a.free(artifact_key);
+        const state_key = try internal_keys.graphDirectStateKeyAlloc(a, "a", "g");
+        defer a.free(state_key);
+        const lifetime_key = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(a, artifact_key, "g", graph.config.coverage_generation, state_key);
+        defer a.free(lifetime_key);
+        const artifact = try db.core.store.get(a, artifact_key);
+        defer a.free(artifact);
+        var edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(a, artifact);
+        defer edge.deinit(a);
+        try std.testing.expectEqual(admitted, edge.ttl_created_ns);
+        if (mixed) {
+            const lifetime = try db.core.store.get(a, lifetime_key);
+            defer a.free(lifetime);
+            try std.testing.expectEqual(admitted, std.mem.readInt(u64, lifetime[0..8], .big));
+        }
+        db.close();
+        db = try DB.open(a, directory.path(), options);
+        _ = try projectGraphFieldContributionsForRepair(db.async_context, "g", "a");
+        const reopened_graph = db.core.index_manager.graphIndex("g").?;
+        var live = try reopened_graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, admitted + std.time.ns_per_hour - 1);
+        defer live.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), live.edges.len);
+        var expired = try reopened_graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, admitted + 2 * std.time.ns_per_hour);
+        defer expired.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), expired.edges.len);
+        // A missing artifact can be reconstructed only when a contributor
+        // lifetime survives. Direct-only edges require explicit re-admission.
+        try db.core.store.delete(artifact_key);
+        if (!mixed) {
+            try std.testing.expectError(error.GraphEdgeTtlMigrationRequired, projectGraphFieldContributionsForRepair(db.async_context, "g", "a"));
+            continue;
+        }
+        _ = try projectGraphFieldContributionsForRepair(db.async_context, "g", "a");
+        var recovered = try reopened_graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, admitted + 2 * std.time.ns_per_hour);
+        defer recovered.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), recovered.edges.len);
+        // Corrupt lifetime authority is rejected before applying field edges.
+        try db.core.store.put(lifetime_key, "invalid");
+        try std.testing.expectError(error.InvalidGraphEdgeTtlLifetime, projectGraphFieldContributionsForRepair(db.async_context, "g", "a"));
+    }
 }

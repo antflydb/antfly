@@ -6207,7 +6207,7 @@ pub const HttpHandler = struct {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         const guard = http_types.RequestGuard{ .context = request };
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
-        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (err) {
+        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (normalizePublicAggregationError(err)) {
             error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
@@ -10439,13 +10439,7 @@ fn queryOperationalFailureResponse(alloc: Allocator, err: anyerror) !?HttpRespon
 /// well-formed capability this deployment cannot execute. Stateful and
 /// serverless query surfaces share this normalization so callers receive the
 /// same 400/422 contract independent of the serving architecture.
-fn normalizePublicAggregationError(err: anyerror) anyerror {
-    return switch (err) {
-        error.InvalidQueryRequest, error.InvalidAggregation => error.InvalidQueryRequest,
-        error.UnsupportedQueryRequest, error.UnsupportedAggregation => error.UnsupportedQueryRequest,
-        else => err,
-    };
-}
+const normalizePublicAggregationError = public_table_http.normalizePublicAggregationError;
 
 const UnsupportedArtifactIndexSourcesError = struct {
     @"error": []const u8 = "unsupported_index_capability",

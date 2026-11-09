@@ -16143,14 +16143,32 @@ fn fillDateHistogramBucketKeys(
     last_key: i128,
     interval: search_agg_mod.DateInterval,
 ) ![]i128 {
+    if (last_key < first_key) return alloc.alloc(i128, 0);
+    const dt = @import("../../datetime.zig");
+    if (!dt.isSupportedDateTimeNs(first_key) or !dt.isSupportedDateTimeNs(last_key)) return error.InvalidAggregation;
     var keys: std.ArrayList(i128) = .empty;
     errdefer keys.deinit(alloc);
+
+    if (interval == .fixed) {
+        const every = interval.fixed.every_ns;
+        if (every == 0) return error.InvalidAggregation;
+        const span = std.math.sub(i128, last_key, first_key) catch return error.QueryCandidateBudgetExceeded;
+        const steps = @divFloor(span, every);
+        if (steps >= 10000) return error.QueryCandidateBudgetExceeded;
+        try keys.ensureTotalCapacity(alloc, @intCast(steps + 1));
+    }
 
     var current = first_key;
     while (current <= last_key) {
         if (keys.items.len >= 10000) return error.QueryCandidateBudgetExceeded;
         try keys.append(alloc, current);
-        if (current == last_key or (interval == .fixed and last_key - current < interval.fixed.every_ns)) break;
+        if (current == last_key) break;
+        if (interval == .fixed) {
+            const next = std.math.add(i128, current, interval.fixed.every_ns) catch return error.InvalidAggregation;
+            if (next > last_key) break;
+            current = next;
+            continue;
+        }
         const next = try nextDateHistogramBucketKey(current, interval);
         if (next <= current) break;
         current = next;
@@ -16904,12 +16922,16 @@ test "time series grouped materializations merge globally and reduce extra dimen
             if (children.pipeline.len > 0) try std.testing.expectEqual(@as(usize, 2), answer.buckets.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, LegacyAllocation.run, .{ &left, &left_store, legacy_histogram });
+    // Debug allocator remap success can depend on address reuse. Disable resize
+    // in the backing allocator so every fault-injection run has the same alloc
+    // count, while retaining leak accounting and the full OOM sweep.
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), LegacyAllocation.run, .{ &left, &left_store, legacy_histogram });
     var legacy_filled = legacy_histogram;
     legacy_filled.min_doc_count = 0;
     legacy_filled.date_bounds_start = "2026-11-06T11:50:00Z";
     legacy_filled.date_bounds_end = "2026-11-06T12:20:00Z";
-    try std.testing.checkAllAllocationFailures(a, LegacyAllocation.run, .{ &left, &left_store, legacy_filled });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), LegacyAllocation.run, .{ &left, &left_store, legacy_filled });
     const legacy_pipeline_children = [_]SearchAggregationRequest{
         legacy_histogram.aggregations[0],
         .{ .name = "selected", .type = "bucket_sort", .field = "", .bucket_path = "_count", .sort_order = "desc", .size = 2 },
@@ -16918,7 +16940,7 @@ test "time series grouped materializations merge globally and reduce extra dimen
     var legacy_pipeline = legacy_histogram;
     legacy_pipeline.min_doc_count = 0;
     legacy_pipeline.aggregations = &legacy_pipeline_children;
-    try std.testing.checkAllAllocationFailures(a, LegacyAllocation.run, .{ &left, &left_store, legacy_pipeline });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), LegacyAllocation.run, .{ &left, &left_store, legacy_pipeline });
     const limited_config = try std.fmt.allocPrint(a, "{{\"max_result_buckets\":1,{s}", .{config[1..]});
     defer a.free(limited_config);
     var limited = try algebraic_mod.index.Index.open(a, "limited", limited_config);
@@ -17059,4 +17081,39 @@ test "time series populated histogram output budget is shared across roots and g
         const grouped: SearchAggregationRequest = .{ .name = "series", .type = "terms", .field = "device", .aggregations = &.{request} };
         try std.testing.expectError(error.QueryCandidateBudgetExceeded, computeSearchAggregations(a, &.{grouped}, .{ .alloc = a, .hits = @constCast(&hits), .total_hits = 2 }, .{ .histogram_output_budget = &budget }));
     }
+}
+
+test "time series numeric histogram extremes reject safely before extent allocation" {
+    const a = std.testing.allocator;
+    const hits = [_]types.SearchHit{
+        .{ .id = @constCast("lo"), .stored_data = @constCast("{\"ts\":-170141183460469231731687303715884105728}") },
+        .{ .id = @constCast("hi"), .stored_data = @constCast("{\"ts\":170141183460469231731687303715884105727}") },
+    };
+    for ([_]i64{ 0, 1 }) |minimum| {
+        const request: SearchAggregationRequest = .{ .name = "points", .type = "date_histogram", .field = "ts", .fixed_interval = "1ns", .min_doc_count = minimum };
+        try std.testing.expectError(error.InvalidAggregation, computeSearchAggregations(a, &.{request}, .{ .alloc = a, .hits = @constCast(&hits), .total_hits = 2 }, .{}));
+    }
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const interval: search_agg_mod.DateInterval = .{ .fixed = .{ .every_ns = 1 } };
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, fillDateHistogramBucketKeys(failing.allocator(), -5000, 5000, interval));
+    try std.testing.expectError(error.InvalidAggregation, fillDateHistogramBucketKeys(failing.allocator(), std.math.minInt(i128), std.math.maxInt(i128), interval));
+    const keys = try fillDateHistogramBucketKeys(a, -5000, 4999, interval);
+    defer a.free(keys);
+    try std.testing.expectEqual(@as(usize, 10000), keys.len);
+    try std.testing.expectEqual(@as(i128, -5000), keys[0]);
+    try std.testing.expectEqual(@as(i128, 4999), keys[keys.len - 1]);
+}
+
+test "time series numeric histogram calendar domain includes UTC endpoints" {
+    const a = std.testing.allocator;
+    const hits = [_]types.SearchHit{
+        .{ .id = @constCast("lo"), .stored_data = @constCast("{\"ts\":-62167219200000000000}") },
+        .{ .id = @constCast("hi"), .stored_data = @constCast("{\"ts\":253402300799999999999}") },
+    };
+    const request: SearchAggregationRequest = .{ .name = "points", .type = "date_histogram", .field = "ts", .fixed_interval = "1ns", .min_doc_count = 1 };
+    const result = try computeSearchAggregations(a, &.{request}, .{ .alloc = a, .hits = @constCast(&hits), .total_hits = 2 }, .{});
+    defer deinitResults(a, result);
+    try std.testing.expectEqual(@as(usize, 2), result[0].buckets.len);
+    try std.testing.expectEqualStrings("\"0000-01-01T00:00:00Z\"", result[0].buckets[0].key_json);
+    try std.testing.expectEqualStrings("\"9999-12-31T23:59:59.999999999Z\"", result[0].buckets[1].key_json);
 }

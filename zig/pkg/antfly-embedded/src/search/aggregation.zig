@@ -68,17 +68,22 @@ fn DateHistogram(comptime Timestamp: type) type {
 
 pub fn truncateSignedToInterval(ns: i128, interval: DateInterval) !i128 {
     const datetime = @import("../datetime.zig");
-    if (interval == .fixed) return datetime.binSigned(ns, interval.fixed.every_ns, interval.fixed.origin_ns) orelse error.InvalidDateTime;
-    return datetime.truncateSigned(ns, switch (interval) {
-        .minute => .minute,
-        .hour => .hour,
-        .day => .day,
-        .week => .week,
-        .month => .month,
-        .quarter => .quarter,
-        .year => .year,
-        .fixed => unreachable,
-    }) orelse error.InvalidDateTime;
+    if (!datetime.isSupportedDateTimeNs(ns)) return error.InvalidAggregation;
+    const start = if (interval == .fixed)
+        datetime.binSigned(ns, interval.fixed.every_ns, interval.fixed.origin_ns) orelse return error.InvalidAggregation
+    else
+        datetime.truncateSigned(ns, switch (interval) {
+            .minute => .minute,
+            .hour => .hour,
+            .day => .day,
+            .week => .week,
+            .month => .month,
+            .quarter => .quarter,
+            .year => .year,
+            .fixed => unreachable,
+        }) orelse return error.InvalidAggregation;
+    if (!datetime.isSupportedDateTimeNs(start)) return error.InvalidAggregation;
+    return start;
 }
 
 // ============================================================================

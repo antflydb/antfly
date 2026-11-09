@@ -294,6 +294,13 @@ retention from the restored write version. These pages require revision-capable
 replicas before proposal. Graph edge TTL continues to use its own unsigned
 admission lifetime, independently of the document's signed event time.
 
+Repair preserves persisted edge lifetimes; it never derives them from logical
+revisions or event timestamps. A legacy field-only edge without an authoritative
+lifetime requires explicit re-admission of its document through the normal write
+path (use a version-conditional upsert to avoid overwriting a concurrent edit).
+This creates durable lifetime metadata. Known expired lifetimes remain expired
+during repair.
+
 Table TTL expires raw observations and removes their contributions from exact
 aggregate indexes. These indexes are rebuildable accelerators over retained raw
 data. They do **not** preserve historical summaries after source expiration.
@@ -307,6 +314,10 @@ fields, range, and interval; inspect charts or bucket data and copy SQL/JSON.
 Refresh polling is opt-in, cancels obsolete requests, and uses a fixed selected
 range. It is not a live subscription or an automatically advancing window.
 
+Numeric histogram timestamps must be renderable as UTC years 0000 through 9999.
+Out-of-domain timestamps return a query error. Fixed-interval extents are checked
+against the bucket budget before allocation. This rendering restriction does not
+narrow signed document-retention timestamps.
 
 Bounded empty histograms accept metric children only and share a request-wide
 output budget of 100,000 cells (bucket plus metrics), shared across groups and

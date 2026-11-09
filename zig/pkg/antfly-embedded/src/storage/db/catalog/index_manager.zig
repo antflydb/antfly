@@ -29226,6 +29226,7 @@ pub const IndexManager = struct {
                     parsed.doc_key,
                     parsed.edge_id,
                     if (parsed.edge_id.len > 0 and parsed.logical_source.len > 0) parsed.doc_key else "",
+                    0,
                     &snapshots,
                 );
                 try state.entry.index.replaceContributionSnapshots(snapshots.items);
@@ -29358,7 +29359,7 @@ pub const IndexManager = struct {
             const primary = self.primary_store orelse return error.MissingPrimaryStore;
             var field_cache: GraphFieldSnapshotCache = .{};
             for (batch_writes.items) |write| {
-                try self.appendGraphContributionSnapshot(arena, &field_cache, primary, entry, write.source, write.edge_type, write.target, write.owner, write.edge_id, write.owner_document, &snapshots);
+                try self.appendGraphContributionSnapshot(arena, &field_cache, primary, entry, write.source, write.edge_type, write.target, write.owner, write.edge_id, write.owner_document, write.ttl_created_ns, &snapshots);
             }
             for (batch_deletes.items) |delete| {
                 if (snapshot_mode == .retire_owner) {
@@ -29372,7 +29373,7 @@ pub const IndexManager = struct {
                         .contributions = &.{},
                     });
                 } else {
-                    try self.appendGraphContributionSnapshot(arena, &field_cache, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, delete.edge_id, delete.owner_document, &snapshots);
+                    try self.appendGraphContributionSnapshot(arena, &field_cache, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, delete.edge_id, delete.owner_document, 0, &snapshots);
                 }
             }
         }
@@ -29382,7 +29383,6 @@ pub const IndexManager = struct {
 
     const GraphFieldSnapshot = struct {
         targets: std.StringHashMapUnmanaged(void) = .empty,
-        ttl_created_ns: u64 = 0,
     };
     const GraphFieldSnapshotCache = std.StringHashMapUnmanaged(GraphFieldSnapshot);
 
@@ -29423,11 +29423,9 @@ pub const IndexManager = struct {
             const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, source);
             const timestamp = primary.get(alloc, timestamp_key) catch |err| if (err == error.NotFound) return error.GraphEdgeTtlMigrationRequired else return err;
             const metadata = @import("../../ttl.zig").decodeTimestamp(timestamp) orelse return error.GraphEdgeTtlMigrationRequired;
-            // Edge TTL is an unsigned admission lifetime, independent of the
-            // document's possibly negative event-time TTL source. Field-only
-            // legacy rows have no edge artifact, so retain their revision seed.
+            // Validate the document fence, but never interpret it as a clock.
+            // Event time and logical revisions are both independent of edge TTL.
             if (metadata.version == 0) return error.GraphEdgeTtlMigrationRequired;
-            result.value_ptr.ttl_created_ns = metadata.version;
         }
         return result.value_ptr;
     }
@@ -29444,6 +29442,7 @@ pub const IndexManager = struct {
         owner: []const u8,
         edge_id: []const u8,
         owner_document: []const u8,
+        admitted_lifetime_ns: u64,
         snapshots: *std.ArrayListUnmanaged(graph_mod.ContributionSnapshot),
     ) !void {
         const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (owner_document.len > 0) owner_document else if (owner.len > 0) owner else source, entry.config.name, edge_type, target, source, edge_id);
@@ -29495,7 +29494,27 @@ pub const IndexManager = struct {
             const field = try self.graphFieldSnapshot(alloc, field_cache, primary, entry, source, edge_type);
             if (field.targets.contains(target)) {
                 const field_state = try internal_keys.graphDirectStateKeyAlloc(alloc, source, entry.config.name);
-                try contributors.append(alloc, .{ .state_key = field_state, .source_priority = std.math.maxInt(u64), .weight = 1, .created_at = 0, .updated_at = 0, .ttl_created_ns = field.ttl_created_ns, .metadata_json = "" });
+                const lifetime = if (entry.ttl_duration_ns != 0) blk: {
+                    // The primary lifetime survives artifact expiration and is
+                    // specific to this edge/contributor, not the whole document.
+                    const key = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(alloc, artifact_key, entry.config.name, entry.config.coverage_generation, field_state);
+                    const raw_lifetime = primary.get(alloc, key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (raw_lifetime) |bytes| {
+                        if (bytes.len != 8) return error.InvalidGraphEdgeTtlLifetime;
+                        const timestamp = std.mem.readInt(u64, bytes[0..8], .big);
+                        if (timestamp == 0) return error.InvalidGraphEdgeTtlLifetime;
+                        break :blk timestamp;
+                    }
+                    // An ordered producer may already carry its admitted edge
+                    // clock. A field-only repair has no such authority: require
+                    // explicit re-admission through the normal write path.
+                    if (admitted_lifetime_ns == 0) return error.GraphEdgeTtlMigrationRequired;
+                    break :blk admitted_lifetime_ns;
+                } else 0;
+                try contributors.append(alloc, .{ .state_key = field_state, .source_priority = std.math.maxInt(u64), .weight = 1, .created_at = 0, .updated_at = 0, .ttl_created_ns = lifetime, .metadata_json = "" });
             }
         }
         try snapshots.append(alloc, .{

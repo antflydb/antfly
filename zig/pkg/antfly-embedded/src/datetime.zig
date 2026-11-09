@@ -112,8 +112,15 @@ pub fn formatDateTimeNsAlloc(alloc: Allocator, ns: u64) ![]u8 {
     return formatDateTimeSignedNsAlloc(alloc, ns);
 }
 
+/// Calendar values and rendered bucket labels share the four-digit UTC domain.
+/// TTL source metadata is intentionally wider and does not use this restriction.
+pub fn isSupportedDateTimeNs(ns: i128) bool {
+    return ns >= @as(i128, daysFromCivil(0, 1, 1)) * std.time.ns_per_day and
+        ns < @as(i128, daysFromCivil(10000, 1, 1)) * std.time.ns_per_day;
+}
+
 pub fn formatDateTimeSignedNsAlloc(alloc: Allocator, ns: i128) ![]u8 {
-    if (ns < @as(i128, daysFromCivil(0, 1, 1)) * std.time.ns_per_day or ns >= @as(i128, daysFromCivil(10000, 1, 1)) * std.time.ns_per_day) return error.InvalidDateTime;
+    if (!isSupportedDateTimeNs(ns)) return error.InvalidDateTime;
     const seconds = @divFloor(ns, std.time.ns_per_s);
     const nanos: u64 = @intCast(@mod(ns, std.time.ns_per_s));
     const days: i64 = @intCast(@divFloor(seconds, 86_400));

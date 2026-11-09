@@ -478,8 +478,16 @@ fn fail(
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
     std.log.debug("local query rejected operation={s} err={s}", .{ @tagName(operation), @errorName(err) });
+    // Query-level identities must be established before the generic runtime
+    // callback ABI. Dedicated aggregation failures are not callback details;
+    // query consumers already transport these canonical query classes.
+    const query_error = switch (err) {
+        error.InvalidAggregation => error.InvalidQueryRequest,
+        error.UnsupportedAggregation => error.UnsupportedQueryRequest,
+        else => err,
+    };
     out_failure.* = error_identity.failureFromError(
-        err,
+        query_error,
         .local_query,
         abi.abi_version,
         @backingInt(operation),

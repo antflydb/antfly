@@ -4799,3 +4799,55 @@ test "opaque storage pipeline metrics snapshot versions and ownership" {
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_context_pipeline_metrics_json(context.handle, 2, &rejected));
     try std.testing.expect(rejected.ptr == null);
 }
+
+test "time series owner query preserves invalid histogram class before runtime callbacks" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var owner = try client.Owner.open(.{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7013,
+        .has_identity_namespace = 1,
+        .identity_table_id = 7,
+        .identity_shard_id = 7013,
+        .identity_range_id = 7013,
+    });
+    defer owner.deinit();
+    var batch = try owner.batchJson("docs",
+        \\{"inserts":{"lo":{"ts":-170141183460469231731687303715884105728},"hi":{"ts":170141183460469231731687303715884105727}},"sync_level":"full_index"}
+    );
+    defer batch.deinit();
+    const runtime_error = @import("antfly_runtime_abi").error_abi;
+    for ([_][]const u8{
+        \\{"query":{"match_all":{}},"limit":0,"aggregations":{"points":{"type":"date_histogram","field":"ts","fixed_interval":"1ns","min_doc_count":0}}}
+        ,
+        \\{"query":{"match_all":{}},"limit":0,"aggregations":{"points":{"type":"date_histogram","field":"ts","fixed_interval":"1ns","min_doc_count":1}}}
+        ,
+    }) |query| {
+        var response: abi.QueryOwnedResponse = .{};
+        defer abi.antfly_storage_owner_buffer_destroy(&response.buffer);
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_query_json(owner.handle, &.{ .control = .{
+            .table_name = .fromSlice("docs"),
+            .request_json = .fromSlice(query),
+        } }, &response, &failure);
+        try std.testing.expectEqual(abi.Status.invalid_query, status);
+        try std.testing.expectEqual(status, failure.status);
+        try std.testing.expectEqual(abi.FailureBoundary.local_query, failure.boundary);
+        try std.testing.expectEqual(abi.query_abi_version, failure.boundary_version);
+        try std.testing.expectEqual(@backingInt(abi.LocalQueryOperation.execute_internal_query), failure.operation);
+        try std.testing.expectEqualStrings("InvalidQueryRequest", failure.errorName());
+        const received = blk: {
+            client.statusToError(status) catch |err| break :blk err;
+            return error.ExpectedInvalidHistogram;
+        };
+        const transported = runtime_error.statusFromError(received);
+        try std.testing.expectEqual(@backingInt(runtime_error.Code.invalid_argument), transported.code);
+        try std.testing.expectEqual(error.InvalidQueryRequest, runtime_error.errorFromStatus(transported));
+    }
+    var healthy = try owner.queryJson("docs", "{\"query\":{\"match_all\":{}},\"limit\":1}");
+    defer healthy.deinit();
+}
