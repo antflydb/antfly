@@ -3,6 +3,8 @@
 
 import Foundation
 
+public enum ConnectionMode: String, Codable, Sendable { case managed, external }
+
 public enum TranscriberRoute: String, Codable, Sendable { case gateway, runtime }
 
 public enum DictationError: Error, LocalizedError {
@@ -33,6 +35,7 @@ public struct Preset: Codable, Identifiable, Equatable, Sendable {
   public var mode: DictationMode?
   public var processing: ProcessingStrategy?
   public var livePreview: Bool
+  public var automaticallySelectLocalTranscriber: Bool? = true
   public var transcriberRoute: TranscriberRoute?
   public init(id: String, name: String, style: String = "clean", context: String = "") {
     self.id = id
@@ -62,6 +65,7 @@ extension Preset {
       ? catalog.filter { $0.task == "generate" && $0.id.hasPrefix("generators/") } : []
   }
   public mutating func selectTranscriber(_ selection: DiscoveredModel) {
+    automaticallySelectLocalTranscriber = false
     model = selection.id
     transcriberRoute =
       selection.dictation?.text_cleanup == true || model.hasPrefix("transcribers/")
@@ -74,6 +78,11 @@ extension Preset {
 public struct Configuration: Codable, Equatable, Sendable {
   public static let maxEncodedBytes = 1_048_576
   public var version = 1
+  /// Missing in older settings: preserve the user’s existing external server.
+  public var connectionMode: ConnectionMode? = .managed
+  public var usesManagedRuntime: Bool { connectionMode == .managed }
+  public static let managedServerOrigin = "http://127.0.0.1:47831"
+  public var effectiveServer: String { usesManagedRuntime ? Self.managedServerOrigin : server }
   public var server = "http://localhost:8080"
   public var table = "dictation"
   public var profile = "default"
@@ -105,24 +114,26 @@ public struct Configuration: Codable, Equatable, Sendable {
   public func validated() throws -> Configuration {
     guard version == 1 else { throw DictationError.invalid("Unsupported settings version.") }
     let origin = server.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !origin.isEmpty else {
-      throw DictationError.invalid("Enter a server address, such as http://localhost:8080.")
-    }
-    guard let url = URL(string: origin), ["http", "https"].contains(url.scheme),
-      let host = url.host, !host.isEmpty
-    else {
-      throw DictationError.invalid(
-        "Server address must start with http:// or https:// and include a hostname.")
-    }
-    guard url.user == nil, url.password == nil else {
-      throw DictationError.invalid(
-        "Remove credentials from the server address. Use the Bearer token field for authentication."
-      )
-    }
-    guard url.query == nil, url.fragment == nil, url.path.isEmpty || url.path == "/" else {
-      throw DictationError.invalid(
-        "Use only the server origin, such as http://localhost:8080, without a path, query, or fragment."
-      )
+    if !usesManagedRuntime {
+      guard !origin.isEmpty else {
+        throw DictationError.invalid("Enter a server address, such as http://localhost:8080.")
+      }
+      guard let url = URL(string: origin), ["http", "https"].contains(url.scheme),
+        let host = url.host, !host.isEmpty
+      else {
+        throw DictationError.invalid(
+          "Server address must start with http:// or https:// and include a hostname.")
+      }
+      guard url.user == nil, url.password == nil else {
+        throw DictationError.invalid(
+          "Remove credentials from the server address. Use the Bearer token field for authentication."
+        )
+      }
+      guard url.query == nil, url.fragment == nil, url.path.isEmpty || url.path == "/" else {
+        throw DictationError.invalid(
+          "Use only the server origin, such as http://localhost:8080, without a path, query, or fragment."
+        )
+      }
     }
     guard (1...2).contains(concurrentRequests ?? 1) else {
       throw DictationError.invalid("Inference concurrency must be one or two.")
@@ -180,6 +191,30 @@ public struct Configuration: Codable, Equatable, Sendable {
     }
     return normalized
   }
+  /// Only automatic local defaults follow readiness; explicit/custom selections survive discovery.
+  @discardableResult public mutating func selectAvailableManagedTranscriber(
+    from catalog: ModelCatalog, supportsApple: Bool
+  ) -> Bool {
+    guard usesManagedRuntime else { return false }
+    let apple = catalog.transcriber("transcribers/apple-speech")
+    let available =
+      supportsApple && apple?.dictation != nil
+      && apple?.dictation?.readiness_error == nil
+    let selected = available ? "transcribers/apple-speech" : "transcribers/whisper"
+    var changed = false
+    for index in presets.indices {
+      guard presets[index].automaticallySelectLocalTranscriber != false,
+        ["transcribers/whisper", "transcribers/apple-speech"].contains(presets[index].model)
+      else { continue }
+      if presets[index].model != selected || presets[index].transcriberRoute != .gateway {
+        presets[index].model = selected
+        presets[index].transcriberRoute = .gateway
+        changed = true
+      }
+    }
+    return changed
+  }
+
   public static func decode(_ data: Data) throws -> Configuration {
     guard data.count <= maxEncodedBytes else {
       throw DictationError.invalid("Settings file exceeds 1 MiB.")

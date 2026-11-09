@@ -184,6 +184,7 @@ jobs:
       - name: Upload qualified archives
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 14
           name: qualification-${{ matrix.artifact_name }}
           path: dist/release-archives/*.tar.gz
           if-no-files-found: error
@@ -192,6 +193,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 14
           name: qualification-diagnostics-${{ matrix.artifact_name }}
           path: |
             ${{ runner.temp }}/antfly-zig-release-*/*attempt*.log

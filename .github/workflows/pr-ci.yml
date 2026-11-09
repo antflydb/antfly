@@ -145,6 +145,12 @@ jobs:
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
   vopr:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     needs: approve
     if: contains(fromJSON(needs.approve.outputs.suites), 'vopr') || contains(fromJSON(needs.approve.outputs.suites), 'soak')
     uses: ./.github/workflows/zig-vopr-pr.yml

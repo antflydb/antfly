@@ -109,7 +109,13 @@ pub fn build(b: *std.Build) void {
                     b.step("cache-vopr-tests", "Exercise actual simulation test imports").dependOn(&b.addRunArtifact(artifact).step);
                     vopr_test_found = true;
                 }
-                if (std.mem.endsWith(u8, path.sub_path, "/template_test_root.zig")) template = artifact;
+                // The same source also has independently linked test objects.
+                // Only a complete test artifact is executable here; pointer-map
+                // iteration must never select an object file as the runner.
+                if (artifact.kind == .@"test" and std.mem.endsWith(u8, path.sub_path, "/template_test_root.zig")) {
+                    if (template != null) @panic("ambiguous runnable template suite");
+                    template = artifact;
+                }
             },
             else => {},
         };
@@ -156,6 +162,7 @@ pub fn build(b: *std.Build) void {
     template_tests.root_module.root_source_file = sources.add("template_test.zig",
         \\test "unit metadata is stable without a release object" {
         \\    try @import("std").testing.expectEqualStrings("test", @import("build_info").version());
+        \\    @import("std").debug.print("UNIT_METADATA_PROBE {s}\n", .{@import("build_info").version()});
         \\}
     );
     unit_tests.dependOn(&b.addRunArtifact(template_tests).step);

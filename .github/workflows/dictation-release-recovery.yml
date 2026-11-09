@@ -1,0 +1,58 @@
+name: Dictation release recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Exact dictation/vX.Y.Z[-beta.N] tag'
+        required: true
+        type: string
+      source_commit:
+        description: 'Original full source commit'
+        required: true
+        type: string
+      ledger_sha256:
+        description: 'Trusted SHA-256 of the sealed artifacts.json'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dictation-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+jobs:
+  recover:
+    if: ${{ github.ref_name == github.event.repository.default_branch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release-promotion
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ steps.toolchain.outputs.python_build }}
+      - name: Install locked release dependencies
+        run: python3 -m pip install --require-hashes -r scripts/release/requirements.lock
+      - name: Restore verified signed bytes and finish channel publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
+        run: |
+          python3 examples/dictation/release/release.py recover --tag "$RELEASE_TAG" --commit "$SOURCE_COMMIT" --ledger-sha256 "$LEDGER_SHA256" --out-dir dist/recovered --identity-output dist/identity.json
+          python3 examples/dictation/release/release.py publish dist/identity.json dist/recovered

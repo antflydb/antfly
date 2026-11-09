@@ -251,6 +251,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 14
           name: compile-costs-${{ inputs.step }}-${{ inputs.optimize }}-${{ inputs.target }}-strip-${{ inputs.strip }}-${{ inputs.cli_optimize }}-shared-pdf-${{ inputs.shared_pdf_templates }}-retained-${{ inputs.shared_pdf_sessions }}
           path: .benchmark-results/compile-costs/
           if-no-files-found: error

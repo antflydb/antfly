@@ -19,6 +19,7 @@ on:
         type: string
         default: ''
   workflow_dispatch:
+
   push:
     branches: [main]
     paths:
@@ -26,12 +27,22 @@ on:
       - 'examples/dictation/Tests/**'
       - 'examples/dictation/Assets/**'
       - 'examples/dictation/presets/**'
+      - 'examples/dictation/release/**'
+      - 'scripts/release/objectstore_channel.py'
+      - 'scripts/release/publish_objectstorage.py'
+      - 'scripts/release/download_objectstorage.py'
+      - 'scripts/release/verify_release_ledger.py'
+      - 'scripts/release/create_github_release.py'
+      - 'scripts/release/release_channels.py'
+      - 'scripts/release/release_lines.py'
+      - 'scripts/release/requirements.lock'
       - 'examples/dictation/*.swift'
       - 'examples/dictation/*.sh'
       - 'examples/dictation/Package.resolved'
       - 'examples/dictation/Info.plist'
       - 'examples/dictation/antfly.yaml'
       - '.github/workflows/dictation-example.yml'
+      - '.github/workflows/dictation-release*.yml'
 
 permissions:
   contents: read
@@ -68,7 +79,14 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
+      - name: Test release policy
+        run: |
+          bash examples/dictation/release/fetch-tools.sh
+          python3 -m unittest discover -s examples/dictation/release -p 'test_*.py'
+
       - name: Test configuration, streaming, and persistence clients
         run: examples/dictation/test.sh
       - name: Build signed application bundle
-        run: examples/dictation/build-app.sh
+        run: |
+          examples/dictation/build-app.sh
+          DICTATION_TEST_APP="$PWD/examples/dictation/dist/Antfly Dictation.app/Contents/MacOS/AntflyDictation" python3 -m unittest discover -s examples/dictation/release -p 'test_runtime.py'
