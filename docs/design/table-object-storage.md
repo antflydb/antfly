@@ -211,12 +211,35 @@ remain readable without bundles; a new publication/rebuild is needed to gain
 publication-level opening bundles. Metadata capability 85 fences older readers
 from new lake catalog writes.
 
+Cold demand reads also use bounded byte read-ahead. A touched native text pack
+can be fetched and authenticated once (at most 1 MiB, at most 16 times its
+requested block). Parquet data reads can reuse aligned 1 MiB windows across
+headers and payloads, including stitching up to three windows for a bounded
+request. Every source GET still enforces the admitted version/ETag. Footer and
+page-index interpretations keep their exact ranges. Existing exact disk entries
+are checked first, so upgrading does not discard their restart benefit.
+
+Text and source windows share one atomic 8 MiB reservation allowance across all
+composed leaves and refills; failed admissions also consume it. Each widened
+read additionally obtains conservative node-wide I/O memory admission. Small
+caches, exhausted allowances and saturated nodes retain the exact-range path.
+No archive-wide segment traversal or arbitrary neighbouring file fetch is
+introduced. A failed optional whole-pack checksum falls back to independently
+authenticated required ranges. Parquet page-index discovery runs inside admitted
+header workers instead of serially opening every column before its pipeline.
+Serving header probes can use the existing 64 KiB workspace to combine header
+and payload discovery; single-window shared leases avoid another payload copy.
+
 Request-owned atomic I/O profiles record immutable RAM/disk hits, provider read
 count/bytes/errors, overlapping provider elapsed time, peak active loads, and
 bundle-opening time. They attach to the prepared reader's lifetime, not a leaf's
 scratch arena, and survive only through the request's bounded diagnostic
 snapshot. Process counters continue to cover all provider traffic; these request
-profiles specifically attribute immutable index/cache reads. Slow-request health
+profiles separately attribute immutable index/cache reads and planned Parquet
+source loads. Source counters include footer/index/data range payloads, not all
+authentication, metadata probes, wire attempts or billing operations. The
+read-ahead byte counter reports conservative reservations, not extra wire bytes.
+Slow-request health
 metrics expose both individual leaves and accumulated composed-request I/O
 without table names, object paths, or credentials. Refill calls contribute only
 their new work, and serial leaf peaks combine by maximum rather than sum.

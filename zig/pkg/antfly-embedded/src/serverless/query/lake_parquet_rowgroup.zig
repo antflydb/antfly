@@ -11139,7 +11139,7 @@ test "external lake Parquet page phases leave CPU admission free during delayed 
     }
 }
 
-test "external lake Parquet physical payload phases overlap at default quotas cancel and preserve saturated inline work" {
+test "external lake Parquet read ahead and index discovery overlap physical payload phases at default quotas cancel and preserve saturated inline work" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const Scheduler = @import("../../sql/parallel_scheduler.zig");
@@ -11187,13 +11187,20 @@ test "external lake Parquet physical payload phases overlap at default quotas ca
         data_end: usize,
         entered: std.Io.Event = .unset,
         gate: std.Io.Event = .unset,
+        indexes: std.atomic.Value(usize) = .init(0),
+        index_entered: std.Io.Event = .unset,
+        index_gate: std.Io.Event = .unset,
         calls: std.atomic.Value(usize) = .init(0),
         bodies: std.atomic.Value(usize) = .init(0),
         body_entered: std.Io.Event = .unset,
         body_gate: std.Io.Event = .unset,
         fn read(raw: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, offset: u64, len: usize) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (offset >= self.data_end) return allocator.dupe(u8, self.bytes[@intCast(offset)..][0..len]);
+            if (offset >= self.data_end) {
+                if (self.indexes.fetchAdd(1, .acq_rel) + 1 == 2) self.index_entered.set(std.testing.io);
+                try self.index_gate.wait(std.testing.io);
+                return allocator.dupe(u8, self.bytes[@intCast(offset)..][0..len]);
+            }
             if (len > 512) {
                 if (self.bodies.fetchAdd(1, .acq_rel) + 1 == 2) self.body_entered.set(std.testing.io);
                 try self.body_gate.wait(std.testing.io);
@@ -11229,6 +11236,9 @@ test "external lake Parquet physical payload phases overlap at default quotas ca
             for ([_]bool{ false, true }) |cancel| {
                 for ([_]usize{ 0, 2 }) |lanes| {
                     scheduler.max_io_workers = lanes;
+                    delayed.indexes.store(0, .release);
+                    delayed.index_entered.reset();
+                    delayed.index_gate.reset();
                     delayed.entered.reset();
                     delayed.gate.reset();
                     delayed.calls.store(0, .release);
@@ -11236,6 +11246,7 @@ test "external lake Parquet physical payload phases overlap at default quotas ca
                     delayed.body_entered.reset();
                     delayed.body_gate.reset();
                     if (lanes == 0) {
+                        delayed.index_gate.set(io);
                         delayed.gate.set(io);
                         delayed.body_gate.set(io);
                     }
@@ -11255,6 +11266,8 @@ test "external lake Parquet physical payload phases overlap at default quotas ca
                         _ = future.cancel(io) catch {};
                     };
                     if (lanes != 0) {
+                        if (indexed) try delayed.index_entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } });
+                        delayed.index_gate.set(io);
                         if (!indexed) try delayed.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } });
                         delayed.gate.set(io);
                         try delayed.body_entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } });

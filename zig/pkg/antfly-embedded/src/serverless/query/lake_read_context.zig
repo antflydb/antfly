@@ -19,6 +19,22 @@ const std = @import("std");
 const storage = @import("../../storage/object_storage.zig");
 const Allocator = std.mem.Allocator;
 
+/// Reservations include failures and concurrent workers. Retrying cannot turn
+/// a selective query into an unbounded speculative scan.
+pub const ReadAheadBudget = struct {
+    used: std.atomic.Value(u64) = .init(0),
+    pub fn reserve(self: *ReadAheadBudget, bytes: u64) bool {
+        const maximum = 8 * 1024 * 1024;
+        var used = self.used.load(.monotonic);
+        while (bytes <= maximum - used) {
+            if (self.used.cmpxchgWeak(used, used + bytes, .monotonic, .monotonic)) |observed| {
+                used = observed;
+            } else return true;
+        }
+        return false;
+    }
+};
+
 /// Request-owned, bounded diagnostics. Workers share atomics, never a request
 /// arena or a callback retained by a cache. Elapsed I/O sums may overlap.
 pub const IoTrace = struct {
@@ -31,6 +47,11 @@ pub const IoTrace = struct {
         provider_nanoseconds: u64 = 0,
         peak_inflight: u64 = 0,
         opening_nanoseconds: u64 = 0,
+        read_ahead_bytes: u64 = 0,
+        source_provider_reads: u64 = 0,
+        source_provider_bytes: u64 = 0,
+        source_provider_nanoseconds: u64 = 0,
+        source_provider_errors: u64 = 0,
         pub fn add(self: *Snapshot, other: Snapshot) void {
             inline for (@typeInfo(Snapshot).@"struct".field_names) |field| {
                 if (comptime std.mem.eql(u8, field, "peak_inflight")) @field(self, field) = @max(@field(self, field), @field(other, field)) else @field(self, field) +|= @field(other, field);
@@ -45,6 +66,15 @@ pub const IoTrace = struct {
     const fields = @typeInfo(Snapshot).@"struct".field_names.len;
     values: [fields]std.atomic.Value(u64) = @splat(.init(0)),
     active: std.atomic.Value(u64) = .init(0),
+    read_ahead_budget: ReadAheadBudget = .{},
+    /// Composed leaves/refills share their outer request's one allowance.
+    read_ahead_shared: ?*ReadAheadBudget = null,
+    pub fn reserveReadAhead(self: *IoTrace, bytes: u64) bool {
+        const budget = self.read_ahead_shared orelse &self.read_ahead_budget;
+        if (!budget.reserve(bytes)) return false;
+        self.add("read_ahead_bytes", bytes);
+        return true;
+    }
     pub fn add(self: *IoTrace, comptime field: []const u8, value: u64) void {
         inline for (@typeInfo(Snapshot).@"struct".field_names, 0..) |name, i| if (comptime std.mem.eql(u8, field, name)) {
             _ = self.values[i].fetchAdd(value, .monotonic);
@@ -258,4 +288,23 @@ test "external lake opening I/O traces separate request traffic and overlapping 
     merged.add(before);
     merged.add(delta);
     try std.testing.expectEqual(@as(u64, 2), merged.peak_inflight);
+}
+
+test "external lake read ahead reservations are bounded across retries and readers" {
+    var trace: IoTrace = .{};
+    for (0..8) |_| try std.testing.expect(trace.reserveReadAhead(1024 * 1024));
+    try std.testing.expect(!trace.reserveReadAhead(1));
+    try std.testing.expect(!trace.reserveReadAhead(std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), trace.snapshot().read_ahead_bytes);
+    var fresh: IoTrace = .{};
+    try std.testing.expect(fresh.reserveReadAhead(1));
+    var shared: ReadAheadBudget = .{};
+    {
+        trace.read_ahead_shared = &shared;
+        fresh.read_ahead_shared = &shared;
+        try std.testing.expect(trace.reserveReadAhead(7 * 1024 * 1024));
+        try std.testing.expect(fresh.reserveReadAhead(1024 * 1024));
+        try std.testing.expect(!trace.reserveReadAhead(1));
+        try std.testing.expect(!fresh.reserveReadAhead(1));
+    }
 }

@@ -104,6 +104,7 @@ pub fn reconcileRecent(a: A, server: *server_api.ApiHttpServer, table: local.com
 /// One bounded owner per composed request. Tables remain authorized and bound
 /// by the HTTP runner on every leaf; only immutable, cut-bound readers are shared.
 pub const Scope = struct {
+    read_ahead_budget: local.serverless_query_lake_read_context.ReadAheadBudget = .{},
     io: local.serverless_query_lake_read_context.IoTrace.Snapshot = .{},
     budget: local.sql_memory_budget,
     entries: [16]*Prepared = undefined,
@@ -611,6 +612,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     }
     const cache = shared != null and reused == null and shared.?.len < shared.?.entries.len;
     const prepared = reused orelse (try prepare(if (cache) shared.?.budget.allocator() else a, server, current_table, req, request, &request_profile, &is_lake, !build_recent) orelse return null);
+    if (scope) |owner| prepared.io_trace.read_ahead_shared = &owner.read_ahead_budget;
     trace_owner = prepared;
     if (cache) {
         prepared.local_id = shared.?.len;

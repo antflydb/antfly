@@ -983,7 +983,7 @@ pub const Reader = struct {
             const envelopes = try ranges.coalescePhysicalReadsAlloc(work.arena.allocator(), missing[0..count], .{ .max_range_bytes = 2 * 1024 * 1024 });
             for (envelopes) |envelope| {
                 const owner = try std.heap.page_allocator.create(Cache.Envelope);
-                const bytes = worker.base.parquetReader().readPlannedAlloc(std.heap.page_allocator, envelope) catch |err| {
+                const bytes = worker.readSource(std.heap.page_allocator, envelope) catch |err| {
                     std.heap.page_allocator.destroy(owner);
                     return err;
                 };
@@ -1119,7 +1119,108 @@ pub const Reader = struct {
             },
         }
     }
+    fn readSource(self: *Reader, alloc: Allocator, read: ranges.RangeRead) ![]u8 {
+        const started = @import("antfly_platform").time.monotonicNs();
+        var failed = true;
+        defer if (self.context.trace) |trace| {
+            trace.add("source_provider_reads", 1);
+            trace.add("source_provider_bytes", if (failed) 0 else read.range.len);
+            trace.add("source_provider_errors", @intFromBool(failed));
+            trace.add("source_provider_nanoseconds", @import("antfly_platform").time.monotonicNs() -| started);
+        };
+        const bytes = try self.base.parquetReader().readPlannedAlloc(alloc, read);
+        failed = false;
+        return bytes;
+    }
+    fn lookupRangeLease(self: *Reader, alloc: Allocator, read: ranges.RangeRead, key: []const u8) !?ranges.RangeLease {
+        if (self.cache.pin(key)) |lease| {
+            errdefer lease.release();
+            try self.context.ensureActive();
+            return lease;
+        }
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.cache.persistentCache()) |disk| if (try disk.readAlloc(alloc, key, @intCast(read.range.len))) |bytes| {
+            errdefer alloc.free(bytes);
+            try self.context.ensureActive();
+            self.cache.recordRead(true, bytes.len);
+            self.cache.store(key, bytes) catch {};
+            if (self.cache.pin(key)) |lease| {
+                alloc.free(bytes);
+                return lease;
+            }
+            return .{ .bytes = bytes, .owner = .{ .allocation = alloc } };
+        };
+        return null;
+    }
+    /// Reuse version-qualified byte windows across header and payload reads.
+    /// Only demanded column data participates; footer/index semantics and exact
+    /// range fallback are preserved. Text and Parquet share the outer budget.
+    fn readAheadLease(self: *Reader, alloc: Allocator, read: ranges.RangeRead) !?ranges.RangeLease {
+        const trace = self.context.trace orelse return null;
+        const window = 1024 * 1024;
+        if (read.purpose != .parquet_column_chunk or read.range.len == 0 or read.range.len > 2 * window or self.cache.max_bytes < 8 * window) return null;
+        const begin = read.range.offset / window * window;
+        const end = @min(read.object.byte_len, ((read.range.end() - 1) / window * window) +| window);
+        const span = end - begin;
+        // Never read beyond the authenticated object length. Every widened
+        // GET still enforces the exact version/ETag from this plan.
+        if (span > read.range.len *| 16 or (begin == read.range.offset and span == read.range.len)) return null;
+        const admission = self.scheduler.reserveIo(@intCast(2 * span + read.range.len)) orelse return null;
+        defer admission.release();
+        var held: [3]?ranges.RangeLease = @splat(null);
+        defer for (held) |lease| if (lease) |value| value.release();
+        var offset = begin;
+        var count: usize = 0;
+        while (offset < end) : (count += 1) {
+            var widened = read;
+            widened.range = .{ .offset = offset, .len = @min(window, end - offset) };
+            const key = try self.rangeKey(alloc, widened);
+            defer alloc.free(key);
+            if (try self.lookupRangeLease(alloc, widened, key)) |lease| {
+                held[count] = lease;
+            } else {
+                if (!trace.reserveReadAhead(widened.range.len)) return null;
+                held[count] = readExactLease(self, alloc, widened) catch |err| switch (err) {
+                    error.OutOfMemory => return null,
+                    else => return err,
+                };
+            }
+            offset += widened.range.len;
+        }
+        try self.context.ensureActive();
+        if (count == 1 and held[0].?.owner == .shared) {
+            var lease = held[0].?;
+            const start: usize = @intCast(read.range.offset - begin);
+            lease.bytes = lease.bytes[start..][0..@intCast(read.range.len)];
+            held[0] = null;
+            return lease;
+        }
+        const bytes = try alloc.alloc(u8, @intCast(read.range.len));
+        errdefer alloc.free(bytes);
+        var copied: usize = 0;
+        for (held[0..count], 0..) |lease, i| {
+            const start = begin + i * window;
+            const from = @max(start, read.range.offset);
+            const to = @min(start + lease.?.bytes.len, read.range.end());
+            const length: usize = @intCast(to - from);
+            @memcpy(bytes[copied..][0..length], lease.?.bytes[@intCast(from - start)..][0..length]);
+            copied += length;
+        }
+        std.debug.assert(copied == bytes.len);
+        return .{ .bytes = bytes, .owner = .{ .allocation = alloc } };
+    }
     fn readLease(raw: *anyopaque, alloc: Allocator, read: ranges.RangeRead) !ranges.RangeLease {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        try self.context.ensureActive();
+        try read.validate();
+        const key = try self.rangeKey(alloc, read);
+        defer alloc.free(key);
+        // Prefer an existing exact disk entry before widening. Upgrades and
+        // range-only requests must retain their restart cache benefit.
+        if (try self.lookupRangeLease(alloc, read, key)) |lease| return lease;
+        if (try self.readAheadLease(alloc, read)) |lease| return lease;
+        return readExactLease(raw, alloc, read);
+    }
+    fn readExactLease(raw: *anyopaque, alloc: Allocator, read: ranges.RangeRead) !ranges.RangeLease {
         const self: *Reader = @ptrCast(@alignCast(raw));
         try self.context.ensureActive();
         try read.validate();
@@ -1163,7 +1264,7 @@ pub const Reader = struct {
         // Disk corruption/missing entries are misses inside the persistent
         // cache; an allocation failure still belongs to this request.
         const disk_bytes = if (comptime @import("builtin").os.tag == .freestanding) null else if (self.cache.persistentCache()) |disk| try disk.readAlloc(alloc, key, std.math.cast(usize, read.range.len) orelse return error.LakeRowsScanBudgetExceeded) else null;
-        const bytes = disk_bytes orelse try self.base.parquetReader().readPlannedAlloc(alloc, read);
+        const bytes = disk_bytes orelse try self.readSource(alloc, read);
         self.cache.recordRead(disk_bytes != null, bytes.len);
         errdefer alloc.free(bytes);
         try self.context.ensureActive();
@@ -2197,4 +2298,137 @@ test "external lake shared envelope charges once across alias eviction and pinne
     try cache.storeOwned("again", owner.bytes[0..4], owner);
     try std.testing.expectEqual(@as(usize, 8), cache.snapshot().stored_bytes);
     try std.testing.expectEqual(@as(usize, 1), owner.residents);
+}
+
+test "external lake source read ahead reuses pinned windows and fences versions budgets and admission" {
+    const a = std.testing.allocator;
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    const bytes = try a.alloc(u8, 3 * 1024 * 1024);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / 1024);
+    var put = try client.putObject("bucket", "data", bytes, .{});
+    defer put.deinit(a);
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    var trace: @import("lake_read_context.zig").IoTrace = .{};
+    var scheduler: Reader.Scheduling.Scheduler = .{};
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(client), .scope = @splat(6), .context = .{ .trace = &trace }, .scheduler = &scheduler };
+    var read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "data", .byte_len = bytes.len, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 1024, .len = 64 * 1024 }, .purpose = .parquet_column_chunk };
+    {
+        const lease = try reader.reader().readPlannedLease(a, read);
+        defer lease.release();
+        try std.testing.expectEqualSlices(u8, bytes[1024..][0 .. 64 * 1024], lease.bytes);
+    }
+    read.range = .{ .offset = 128 * 1024, .len = 256 * 1024 };
+    {
+        const lease = try reader.reader().readPlannedLease(a, read);
+        defer lease.release();
+        try std.testing.expectEqualSlices(u8, bytes[128 * 1024 ..][0 .. 256 * 1024], lease.bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 1), trace.snapshot().source_provider_reads);
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), trace.snapshot().source_provider_bytes);
+    // Cross-window payloads stitch verified ranges in order, reusing the first.
+    read.range = .{ .offset = 960 * 1024, .len = 128 * 1024 };
+    {
+        const lease = try reader.reader().readPlannedLease(a, read);
+        defer lease.release();
+        try std.testing.expectEqualSlices(u8, bytes[960 * 1024 ..][0 .. 128 * 1024], lease.bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 2), trace.snapshot().source_provider_reads);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+    // Even a resident byte window cannot authorize a different ETag.
+    read.object.version.etag = "wrong-etag";
+    try std.testing.expectError(error.PreconditionFailed, reader.reader().readPlannedLease(a, read));
+    read.object.version.etag = put.etag.?;
+    // Exhausted outer budgets and node admission decline read-ahead and
+    // preserve the exact physical read rather than raising a query limit.
+    var exhausted: @import("lake_read_context.zig").IoTrace = .{};
+    try std.testing.expect(exhausted.reserveReadAhead(8 * 1024 * 1024));
+    reader.context.trace = &exhausted;
+    read.range = .{ .offset = 2 * 1024 * 1024, .len = 64 * 1024 };
+    const exact = try reader.reader().readPlannedLease(a, read);
+    exact.release();
+    try std.testing.expectEqual(@as(u64, 64 * 1024), exhausted.snapshot().source_provider_bytes);
+    reader.context.trace = &trace;
+    scheduler.max_io_bytes = 0;
+    read.range.offset += 64 * 1024;
+    const denied = try reader.reader().readPlannedLease(a, read);
+    denied.release();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    reader.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, reader.reader().readPlannedLease(a, read));
+}
+
+test "external lake source read ahead restores exact legacy and widened disk entries without provider reads" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/read-ahead", .{tmp.sub_path});
+    defer a.free(root);
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    const bytes = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / 1024);
+    var put = try client.putObject("bucket", "data", bytes, .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        fail: bool = false,
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.ProviderUnavailable;
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+    provider.vtable.get_object = Provider.get;
+    const base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+    var read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "data", .byte_len = bytes.len, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 1024, .len = 64 * 1024 }, .purpose = .parquet_column_chunk };
+    {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(1), .context = .{ .io = io } };
+        const legacy = try reader.reader().readPlannedLease(a, read);
+        legacy.release();
+        var trace: @import("lake_read_context.zig").IoTrace = .{};
+        reader.context.trace = &trace;
+        var other = read;
+        other.range.offset = 256 * 1024;
+        const widened = try reader.reader().readPlannedLease(a, other);
+        widened.release();
+    }
+    provider.fail = true;
+    {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        var trace: @import("lake_read_context.zig").IoTrace = .{};
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(1), .context = .{ .io = io, .trace = &trace } };
+        const legacy = try reader.reader().readPlannedLease(a, read);
+        legacy.release();
+        read.range = .{ .offset = 128 * 1024, .len = 256 * 1024 };
+        const widened = try reader.reader().readPlannedLease(a, read);
+        defer widened.release();
+        try std.testing.expectEqualSlices(u8, bytes[128 * 1024 ..][0 .. 256 * 1024], widened.bytes);
+        try std.testing.expectEqual(@as(u64, 0), trace.snapshot().source_provider_reads);
+        try std.testing.expectEqual(@as(u64, 0), trace.snapshot().read_ahead_bytes);
+        reader.scope = @splat(2);
+        try std.testing.expectError(error.ProviderUnavailable, reader.reader().readPlannedLease(a, read));
+    }
 }

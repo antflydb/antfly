@@ -920,8 +920,8 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                         for name, value in profile_after.items()
                         if name.startswith(
                             (
-                                "antfly_lake_query_slowest_lake_io_",
-                                "antfly_lake_query_slowest_composed_io_",
+                                "antfly_lake_query_slowest_lake_",
+                                "antfly_lake_query_slowest_composed_",
                             )
                         )
                         or name
@@ -1013,8 +1013,8 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                         for name, value in metrics().items()
                         if name.startswith(
                             (
-                                "antfly_lake_query_slowest_lake_io_",
-                                "antfly_lake_query_slowest_composed_io_",
+                                "antfly_lake_query_slowest_lake_",
+                                "antfly_lake_query_slowest_composed_",
                             )
                         )
                         or name

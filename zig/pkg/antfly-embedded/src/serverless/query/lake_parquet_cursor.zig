@@ -630,7 +630,11 @@ pub const Cursor = struct {
             if (len != entry.len or parsed.header.value_count != entry.rows) return error.InvalidParquetMetadata;
             return .{ .parsed = parsed, .lease = lease };
         }
-        var probe_size: usize = @intCast(@min(end - column.offset, @min(self.limits.max_input_bytes, 512)));
+        // A serving request with bounded byte read-ahead can amortize its
+        // first header and following payload. Tiny probes force another GET
+        // even when the entire projected chunk fits in the admitted buffer.
+        const probe_limit: usize = if (self.shared_reader) |reader| if (reader.context.trace != null and reader.cache.max_bytes >= 8 * 1024 * 1024) 64 * 1024 else 512 else 512;
+        var probe_size: usize = @intCast(@min(end - column.offset, @min(self.limits.max_input_bytes, probe_limit)));
         while (true) {
             const probe_lease = try self.read(column.offset, probe_size);
             errdefer probe_lease.release();
@@ -818,12 +822,10 @@ pub const Cursor = struct {
         for (self.columns) |*column| {
             if ((!required_only or column.required) and column.first + column.count <= self.position) self.retire(column);
         }
-        // Required directory discovery retains its established caller path.
-        // Speculative discovery runs in the admitted I/O phase, using the
-        // heap-owned admission's locked backing allocator for retained state.
-        for (self.columns) |*column| {
-            if (!self.speculative and (!required_only or column.required)) try self.loadIndex(column);
-        }
+        // Header workers discover independent page indexes under the same
+        // admitted I/O phase as page headers. Loading every index here first
+        // serialized cold columns before the parallel pipeline could start.
+        // The inline advance path still loads its own index when saturated.
         const io = if (self.shared_reader) |reader| reader.context.io else null;
         if (io == null or (self.columns.len < 2 and !self.speculative)) {
             for (self.columns) |*column| {

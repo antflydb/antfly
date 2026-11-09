@@ -891,6 +891,36 @@ fn readPieceLease(a: A, store: stores.ArtifactStore, piece: Piece, cancellation:
     if (cached) |cache| if (cache.capture) |capture| try capture.record(capture.ptr, piece.ref.artifact_id, try stores.sha256DigestFromChecksum(piece.ref.checksum), lease.bytes());
     return lease;
 }
+/// A demanded posting/source block is the only trigger. Small immutable packs
+/// amortize serial range latency, bounded by 16x amplification, one MiB per
+/// pack, one eighth of cache capacity and eight MiB per request. Archive-wide
+/// segments are never enumerated or prefetched. Cache hits spend no allowance.
+fn readAheadPiece(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: artifacts.CachedRead) !?ServingCache.VerifiedLease {
+    const pack = piece.pack orelse return null;
+    if (pack.byte_len > pack_bytes or pack.byte_len > piece.ref.byte_len *| 16 or pack.byte_len > cached.cache.max_bytes / 8 or cached.capture != null) return null;
+    if (piece.pack_offset > pack.byte_len or piece.ref.byte_len > pack.byte_len - piece.pack_offset) return error.InvalidNativeLakeTextCorpus;
+    const digest = try stores.sha256DigestFromChecksum(pack.checksum);
+    var admission: ?local.sql_parallel_scheduler.Scheduler.IoLease = null;
+    defer if (admission) |lease| lease.release();
+    var held = (try cached.cache.lookupImmutableBlockLease(a, cached.scope, pack.artifact_id, @intCast(pack.byte_len), digest, cached.context)) orelse cold: {
+        const trace = cached.context.trace orelse return null;
+        admission = local.sql_parallel_scheduler.global().reserveIo(@intCast(pack.byte_len * 2)) orelse return null;
+        if (!trace.reserveReadAhead(pack.byte_len)) return null;
+        break :cold artifacts.readArtifactLease(a, store, pack, cancellation, cached) catch |err| switch (err) {
+            // Optional read-ahead must not make unrelated damaged bytes or
+            // memory pressure poison an independently authenticated range.
+            error.ArtifactIntegrityMismatch, error.OutOfMemory => return null,
+            else => return err,
+        };
+    };
+    defer held.deinit();
+    const bytes = try a.dupe(u8, held.bytes()[@intCast(piece.pack_offset)..][0..@intCast(piece.ref.byte_len)]);
+    errdefer a.free(bytes);
+    const verified = try ServingCache.VerifiedBytes.authenticate(bytes, try stores.sha256DigestFromChecksum(piece.ref.checksum));
+    try cached.context.ensureActive();
+    try cancellation.check();
+    return .{ .value = verified, .owner = .{ .bytes = bytes, .owner = .{ .allocation = a } } };
+}
 fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead, coalesced: ?*CoalescedRead, publication: bool) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
     if (piece.pack == null) {
         if (publication) return .{ .heap = .{ .alloc = a, .bytes = try artifacts.readPublicationArtifact(a, store, piece.ref, cancellation) } };
@@ -927,6 +957,7 @@ fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, canc
         const length: usize = @intCast(piece.ref.byte_len);
         const digest = try stores.sha256DigestFromChecksum(piece.ref.checksum);
         if (try cache.cache.lookupImmutableBlockLease(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context)) |lease| return lease;
+        if (!publication) if (try readAheadPiece(a, store, piece, cancellation, cache)) |verified| return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, verified);
         const verified = if (coalesced) |group| try group.verifiedLease(a, piece, cache) else direct: {
             const bytes = try artifacts.readPhysicalRange(a, store, piece.pack.?.artifact_id, piece.pack_offset, length, cancellation, cache);
             errdefer a.free(bytes);
@@ -2829,4 +2860,72 @@ test "external lake content block reuse survives shifted offsets restart and int
     defer identical.deinit();
     _ = try publishSourceReusing(a, out, &store, .{ .contiguous = changed }, .none, null, identical);
     try std.testing.expectEqual(@as(u64, 0), identical.uploaded_bytes);
+}
+
+test "external lake demanded pack read ahead reuses distant blocks and respects request limits" {
+    const a = std.testing.allocator;
+    const Fs = @import("../serverless/artifacts/fs_store.zig").FsStore;
+    var directory = try local.common_test_directory.TestDirectory.init("demanded-pack");
+    defer directory.cleanup();
+    var fs = try Fs.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const bytes = try a.alloc(u8, pack_bytes);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / block_bytes);
+    const ref = try publish(a, a, &store, bytes, .none);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    const data = try load(a, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, ref);
+    var source = data.native;
+    defer source.close();
+    const owner: *Owner = @ptrCast(@alignCast(source.ranges.ptr));
+    var cache = ServingCache.init(a);
+    defer cache.deinit();
+    var trace: local.serverless_query_lake_read_context.IoTrace = .{};
+    const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(42), .context = .{ .trace = &trace } };
+    for ([_]usize{ 0, 15, 7 }) |index| {
+        var piece = try readPieceLeaseCoalesced(a, store, owner.directory.blocks[index], .none, cached, null, false);
+        defer piece.deinit();
+        try std.testing.expectEqualSlices(u8, bytes[index * block_bytes ..][0..block_bytes], piece.bytes());
+    }
+    try std.testing.expectEqual(@as(u64, 1), trace.snapshot().provider_reads);
+    try std.testing.expectEqual(@as(u64, pack_bytes), trace.snapshot().provider_bytes);
+    try std.testing.expectEqual(@as(u64, pack_bytes), trace.snapshot().read_ahead_bytes);
+    // Cache authority cannot cross credential scopes; an exhausted request
+    // reads just the independent demanded unit in the new scope.
+    var exhausted: local.serverless_query_lake_read_context.IoTrace = .{};
+    try std.testing.expect(exhausted.reserveReadAhead(8 * pack_bytes));
+    var restricted = cached;
+    restricted.scope = @splat(43);
+    restricted.context.trace = &exhausted;
+    var sparse = try readPieceLeaseCoalesced(a, store, owner.directory.blocks[15], .none, restricted, null, false);
+    defer sparse.deinit();
+    try std.testing.expectEqual(@as(u64, block_bytes), exhausted.snapshot().provider_bytes);
+    // A tiny cache and capture/publication paths keep exact range behavior.
+    cache.max_bytes = block_bytes;
+    try std.testing.expectEqual(@as(?ServingCache.VerifiedLease, null), try readAheadPiece(a, store, owner.directory.blocks[0], .none, cached));
+    // A damaged optional whole-pack fetch must not poison a valid independent
+    // requested range, including when the damage is in an unrelated sibling.
+    cache.max_bytes = 64 * pack_bytes;
+    var fresh: local.serverless_query_lake_read_context.IoTrace = .{};
+    var fallback = cached;
+    fallback.scope = @splat(44);
+    fallback.context.trace = &fresh;
+    const Corrupt = struct {
+        fn get(_: *anyopaque, _: A, _: []const u8, _: usize, _: Cancellation) anyerror![]u8 {
+            return error.ArtifactIntegrityMismatch;
+        }
+    };
+    var damaged_vtable = store.vtable.*;
+    damaged_vtable.get_bounded_alloc_with_cancellation = Corrupt.get;
+    var damaged = store;
+    damaged.vtable = &damaged_vtable;
+    var surviving = try readPieceLeaseCoalesced(a, damaged, owner.directory.blocks[15], .none, fallback, null, false);
+    defer surviving.deinit();
+    try std.testing.expectEqualSlices(u8, bytes[15 * block_bytes ..][0..block_bytes], surviving.bytes());
+    try std.testing.expectEqual(@as(u64, 1), fresh.snapshot().provider_errors);
+    var expired = cached;
+    expired.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, readPieceLeaseCoalesced(a, store, owner.directory.blocks[0], .none, expired, null, false));
 }
