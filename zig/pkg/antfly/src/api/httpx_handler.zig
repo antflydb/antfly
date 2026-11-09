@@ -876,8 +876,13 @@ const AgentGenerationRunner = struct {
     fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
         return .{
             .ptr = runner,
-            .vtable = &.{ .execute_chain = executeChain },
+            .vtable = &.{ .execute_chain = executeChain, .check = check },
         };
+    }
+
+    fn check(raw: *anyopaque) !void {
+        const runner: *@This() = @ptrCast(@alignCast(raw));
+        try runner.request_context.check();
     }
 
     fn executeChain(
@@ -7694,6 +7699,9 @@ pub const AntflyApiHandler = struct {
     }
 
     fn respondGenerationOutputError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
+        if (@import("agent_context.zig").failure(err)) |detail| {
+            return try ctx.status(detail.status).json(.{ .code = @errorName(err), .message = detail.message, .retryable = false });
+        }
         var response = (try http_server_mod.generationOutputErrorResponse(ctx.allocator, err)) orelse return null;
         return try respondOwnedContextualResponse(ctx, &response, ctx.allocator);
     }

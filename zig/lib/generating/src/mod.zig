@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const context_management = @import("context_management.zig");
 pub const anthropic_api = @import("anthropic_api");
 pub const cloudflare = @import("antfly_cloudflare_config");
 pub const localGenerationStatusError = @import("local_failure.zig").localGenerationStatusError;
@@ -1623,4 +1624,5 @@ pub const dictation = @import("dictation.zig");
 
 test {
     _ = dictation;
+    _ = context_management;
 }

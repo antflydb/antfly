@@ -12449,6 +12449,83 @@ export interface components {
              */
             eval?: components["schemas"]["EvalConfig"];
         };
+        AgentContextEvent: {
+            counting_method: string;
+            /** Format: int64 */
+            latency_ms: number;
+            summary_provider?: string;
+            summary_model?: string;
+            diagnostics: components["schemas"]["AgentContextDiagnostics"];
+        };
+        /** @description Summary usage is separate from destination generation usage; retries are always zero. */
+        AgentContextDiagnostics: {
+            /** Format: int64 */
+            contract_version?: number;
+            /** Format: int64 */
+            original_input_tokens?: number;
+            /** Format: int64 */
+            effective_input_tokens?: number;
+            /** Format: int64 */
+            retained_messages?: number;
+            /** Format: int64 */
+            compacted_messages?: number;
+            /** Format: int64 */
+            batches?: number;
+            /** Format: int64 */
+            retries?: number;
+            /** Format: int64 */
+            summary_input_tokens?: number;
+            /** Format: int64 */
+            summary_output_tokens?: number;
+        };
+        /**
+         * @description Opt-in conversation/evidence preparation before agent model calls. The
+         *     summarizer uses the same GeneratorConfig, secrets and provider dispatch
+         *     as generation; omitted summarizer inherits the effective generator
+         *     (the first link when a chain is configured). Summary calls have no
+         *     fallback or retries and consume the agent's model-call budget.
+         *     A remote summarizer receives the selected conversation and tool evidence.
+         *     Input accounting conservatively charges serialized UTF-8 bytes plus
+         *     framing and tool schemas. Configure windows supported by both models.
+         *     Failure returns a typed error without replacing authoritative history.
+         *     Derived memory is request-local; continuations supply authoritative
+         *     history/research_state and are prepared again. This does not alter KV caches.
+         */
+        AgentContextManagement: {
+            /**
+             * @description Inspect only reports; reject fails oversized prompts; window drops eligible exchanges; compact summarizes them.
+             * @default compact
+             * @enum {string}
+             */
+            mode?: "inspect" | "reject" | "window" | "compact";
+            /** @description Destination model capacity including reserved generation output. */
+            context_window_tokens: number;
+            /** @description Compaction threshold and final input ceiling; defaults to context_window_tokens minus reserved_output_tokens. */
+            target_input_tokens?: number;
+            /**
+             * @description Must cover every destination generator's configured output limit.
+             * @default 4000
+             */
+            reserved_output_tokens?: number;
+            /**
+             * @description Prior completed user turns retained verbatim. Current question, most recent exchange and open tool transactions are always retained.
+             * @default 2
+             */
+            keep_recent_turns?: number;
+            summarizer?: components["schemas"]["GeneratorConfig"];
+            /**
+             * @description Independent summary capacity, including instructions, schema, prior memory, one complete exchange and summary output.
+             * @default 8192
+             */
+            summarizer_context_window_tokens?: number;
+            /** @default 1024 */
+            summary_output_tokens?: number;
+            /**
+             * @description Maximum summary calls per preparation. No automatic retries or provider fallback.
+             * @default 8
+             */
+            max_summary_batches?: number;
+        };
         /**
          * @description Request for the retrieval agent. Queries define which tables and indexes
          *     to search, each as an ordinary QueryRequest. Optional tree or graph exploration
@@ -12468,6 +12545,7 @@ export interface components {
          *     traversal. They cannot be replaced or weakened by model tool arguments.
          */
         RetrievalAgentRequest: {
+            context_management?: components["schemas"]["AgentContextManagement"];
             /**
              * @description User's natural language query
              * @example How do I configure OAuth?
@@ -12590,6 +12668,8 @@ export interface components {
         };
         /** @description Result from the retrieval agent */
         RetrievalAgentResult: {
+            /** @description Per-model-call preparation diagnostics, also emitted as context_management SSE events. */
+            context_management?: components["schemas"]["AgentContextEvent"][];
             /**
              * @description Unique response ID for logging and tracing
              * @example ragr_cr3ig20h5tbs73e3ahrg
@@ -13004,6 +13084,7 @@ export interface components {
          *     widen tables, filters, tools or budgets.
          */
         ResearchAgentRequest: {
+            context_management?: components["schemas"]["AgentContextManagement"];
             /**
              * @description The research question.
              * @example How do Antfly's hybrid search and reranking interact, and what are the tuning trade-offs?
@@ -13052,6 +13133,8 @@ export interface components {
         };
         /** @description Result from the research agent. */
         ResearchAgentResult: {
+            /** @description Per-model-call preparation diagnostics, also emitted as context_management SSE events. */
+            context_management?: components["schemas"]["AgentContextEvent"][];
             /**
              * @description Unique response ID.
              * @example resr_cr3ig20h5tbs73e3ahrg
