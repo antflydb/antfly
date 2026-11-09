@@ -3231,13 +3231,48 @@ const IndexEditor = struct {
     fn load(self: *IndexEditor, link: *Link) !*Node {
         if (link.node) |node| return node;
         try self.prepareRead(link.page);
-        const payload = try self.file.readPagePayloadByKindAllocForCheckpoint(self.file.allocator, link.page, .document_index, self.checkpoint);
-        defer self.file.allocator.free(payload);
         const node = try self.newNode(.leaf);
         const alloc = self.nodeAllocator(node);
         // Decoded buffers belong to the editor arena; transfer key slices
         // directly instead of allocating another copy of every inline key.
-        const decoded = try decodeDocumentIndexNode(alloc, payload);
+        const decoded = blk: {
+            // Fast path: this page's bytes are already resident (this writer
+            // read or wrote them in an earlier commit on this same
+            // `NativeFile` and nothing since has reused/rewritten/rolled
+            // back that page -- `page_cache`'s existing eviction already
+            // guarantees that: `PageAllocator.allocate`'s reuse path and
+            // `evictCacheForPagesReusedSince`'s rollback path both call
+            // `page_cache.remove`/`removeLinks` the moment a page's content
+            // actually changes, so a surviving cache entry here is
+            // guaranteed current). `acquirePayload` validates the CRC once
+            // on promotion into a `RawView` and skips it on every
+            // subsequent acquire of the same still-resident view -- the
+            // same cache-hit-skips-CRC property "lite warm value ranges
+            // borrow pages without copies or allocations" already proves
+            // for the value/record path; this reuses that exact mechanism
+            // instead of inventing a parallel one. A `null` return (cold
+            // cache, a concurrent `IndexView` promoted on the same page, or
+            // this writer's own page size mismatch, none of which should
+            // happen in practice for a document-index page) falls back to
+            // the always-correct disk-read-and-decode path below, which
+            // re-seeds the cache for next time via `readPhysicalPageAlloc`.
+            if (self.file.page_cache_enabled.load(.monotonic) and self.file.page_cache_bypass.load(.monotonic) == 0) {
+                const physical = physicalPage(link.page);
+                if (physical != 0 and physical < self.checkpoint.page_count) {
+                    if (try self.file.page_cache.acquirePayload(self.file.allocator, physical, @intCast(self.file.header.page_size))) |view| {
+                        defer self.file.page_cache.releaseRaw(self.file.allocator, view);
+                        if (view.validation.?.kind != .document_index) return error.UnexpectedNativePageKind;
+                        const payload = view.bytes[page_header_size..][0..view.validation.?.payload_len];
+                        if (builtin.is_test) _ = PageDecodeMetrics.index_editor_cache_hits.fetchAdd(1, .monotonic);
+                        break :blk try decodeDocumentIndexNode(alloc, payload);
+                    }
+                }
+            }
+            if (builtin.is_test) _ = PageDecodeMetrics.index_editor_cache_misses.fetchAdd(1, .monotonic);
+            const payload = try self.file.readPagePayloadByKindAllocForCheckpoint(self.file.allocator, link.page, .document_index, self.checkpoint);
+            defer self.file.allocator.free(payload);
+            break :blk try decodeDocumentIndexNode(alloc, payload);
+        };
         node.kind = decoded.kind;
         node.page = link.page;
         node.original_page = link.page;
@@ -4333,6 +4368,10 @@ const PageDecodeMetrics = struct {
     var crc_calls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
     var crc_bytes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
     var extent_decodes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
+    // Diagnostic-only counters for IndexEditor.load's cache-hit fast path
+    // (debugging the item-2 write-amplification fix), not load-bearing.
+    var index_editor_cache_hits: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
+    var index_editor_cache_misses: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
 };
 
 /// In-memory cache of encoded pages, keyed by page id.
@@ -22415,6 +22454,54 @@ test "lite warm value ranges borrow pages without copies or allocations" {
     const bytes = file.test_value_cache_borrowed_bytes.load(.monotonic) - borrowed;
     try std.testing.expect(bytes > 100 * 16);
     std.debug.print("LITE_VALUE_LEASE ranges=100 returned_bytes=1600 borrowed_page_bytes={d} all_cache_copied_bytes=0 crc_calls=0 crc_bytes=0 extent_decodes=0 release_locks=0 backing_reads=0 allocations=0\n", .{bytes});
+}
+
+// Regression gate for `IndexEditor.load`'s cache-hit fast path: a steady
+// write workload that keeps revisiting the same small set of document-index
+// pages (the write-amplification harness's own shape -- few distinct keys,
+// many updates) must not pay a fresh CRC verification on every single
+// commit's `IndexEditor.load` of those same pages. Asserts directly on the
+// fast path's own hit/miss counters rather than on the aggregate
+// `PageDecodeMetrics.crc_calls` delta: a write commit also CRC-verifies the
+// free-map/allocator/manifest pages every time regardless of this fix (out
+// of scope here -- see items 3/4), so that aggregate is not this fix's
+// signal and asserting on it either passes for the wrong reason or (as
+// first written) fails for the wrong reason.
+test "lite index editor reuses verified document-index pages across commits" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "index-editor-cache-reuse.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    // Seed enough distinct keys that the document index has more than one
+    // leaf, so the updates below actually revisit shared pages rather than
+    // always landing on a lone root leaf.
+    for (0..64) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+        try file.putDocument(key, "seed");
+    }
+    const hits_before = PageDecodeMetrics.index_editor_cache_hits.load(.monotonic);
+    const misses_before = PageDecodeMetrics.index_editor_cache_misses.load(.monotonic);
+    const rounds = 64;
+    const keys_per_round = 8;
+    for (0..rounds) |_| {
+        for (0..keys_per_round) |i| {
+            var key_buf: [16]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+            try file.putDocument(key, "updated");
+        }
+    }
+    const hits = PageDecodeMetrics.index_editor_cache_hits.load(.monotonic) - hits_before;
+    const misses = PageDecodeMetrics.index_editor_cache_misses.load(.monotonic) - misses_before;
+    std.debug.print("LITE_INDEX_EDITOR_CACHE fast_path_hits={d} fast_path_misses={d} rounds={d} keys_per_round={d}\n", .{ hits, misses, rounds, keys_per_round });
+    // Every one of these updates revisits a document-index page this same
+    // writer wrote in the immediately preceding commit; the fast path must
+    // take every one of them (zero misses) once the cache is warm.
+    try std.testing.expectEqual(@as(u64, 0), misses);
+    try std.testing.expect(hits > 0);
 }
 
 test "lite value cursor initialization errors release borrowed pages" {
