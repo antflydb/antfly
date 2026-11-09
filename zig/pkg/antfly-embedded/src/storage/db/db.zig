@@ -50170,6 +50170,7 @@ fn renderDocumentPdfPagePngAlloc(
             max_decoded_stream_bytes,
             max_working_set_bytes,
             render_timeout_ms,
+            .auto,
             out_failure,
         );
         return rendered.png;

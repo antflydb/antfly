@@ -147,27 +147,13 @@ pub const Pipeline = struct {
         );
         defer encoded_query.deinit();
 
-        var prepared_images = std.ArrayListUnmanaged(qwen2vl.PreparedImage).empty;
-        defer {
-            for (prepared_images.items) |*image| image.deinit();
-            prepared_images.deinit(self.allocator);
+        const counts = try self.allocator.alloc(usize, images.len);
+        defer self.allocator.free(counts);
+        for (images, counts) |encoded, *count| {
+            if (self.execution_control) |control| try control.check();
+            count.* = (try qwen2vl.imageGeometryForEncoded(encoded, self.prep_cfg)).image_token_count;
         }
-        for (images) |image| {
-            try prepared_images.append(
-                self.allocator,
-                try qwen2vl.prepareImage(self.allocator, image, self.prep_cfg),
-            );
-        }
-        var prepared_document = try prepareDocumentPrompt(
-            self.allocator,
-            self.tok,
-            self.config.prompt,
-            self.gpt_cfg,
-            prepared_images.items,
-            document_text,
-            self.max_length,
-            self.add_bos_token,
-        );
+        var prepared_document = try prepareDocumentPromptForCounts(self.allocator, self.tok, self.config.prompt, self.gpt_cfg, counts, document_text, self.max_length, self.add_bos_token);
         defer prepared_document.deinit();
 
         return @max(
@@ -326,12 +312,15 @@ pub fn prepareDocumentPrompt(
     max_length: usize,
     add_bos_token: bool,
 ) !qwen2vl.PreparedTextInput {
-    const prompt = try buildDocumentPromptString(allocator, prompt_cfg, prepared_images.len, document_text);
-    defer allocator.free(prompt);
-
     const counts = try allocator.alloc(usize, prepared_images.len);
     defer allocator.free(counts);
     for (prepared_images, 0..) |prepared, idx| counts[idx] = prepared.image_token_count;
+    return prepareDocumentPromptForCounts(allocator, tok, prompt_cfg, config, counts, document_text, max_length, add_bos_token);
+}
+
+fn prepareDocumentPromptForCounts(allocator: std.mem.Allocator, tok: Tokenizer, prompt_cfg: PromptConfig, config: gpt_mod.Config, counts: []const usize, document_text: []const u8, max_length: usize, add_bos_token: bool) !qwen2vl.PreparedTextInput {
+    const prompt = try buildDocumentPromptString(allocator, prompt_cfg, counts.len, document_text);
+    defer allocator.free(prompt);
     return encodeDocumentPromptWithImageExpansion(allocator, tok, prompt, config, counts, max_length, add_bos_token);
 }
 

@@ -17796,6 +17796,17 @@ export interface components {
         /** @description How PDF pages are rasterized for OCR. */
         DocumentExtractionRenderConfig: {
             /**
+             * @description PDF image sampling, separate from model resizing and normalization.
+             *     `auto` smooths continuous-tone images while preserving one-bit scan
+             *     coverage during minification. `pdf` honors the PDF's interpolation
+             *     declarations. `smooth` uses bilinear sampling even for one-bit images
+             *     (except stencil masks), which can soften fine lines. Effective policy,
+             *     version, resolution, DPI and geometry are recorded in unit provenance.
+             * @default auto
+             * @enum {string}
+             */
+            sampling?: "auto" | "pdf" | "smooth";
+            /**
              * @description Render resolution in dots per inch.
              * @default 150
              */
