@@ -1525,8 +1525,8 @@ pub const Index = struct {
             // Out of budget: rank the rest by estimate rather than return
             // fewer than k results.
             stats.budget_exhausted = true;
-            for (pool.items[from..]) |p| {
-                if (self.isDeleted(p.id)) continue;
+            for (pool.items[from..], from..) |p, position| {
+                if (self.isDeleted(p.id) or (position < i and self.upper_vectors.contains(p.id))) continue;
                 const c = Cand{ .dist = p.est, .id = p.id };
                 if (top.len() < k) {
                     try top.push(alloc, c);
@@ -3564,7 +3564,20 @@ test "leann: a closed recompute gate ranks the rest by estimate, an error cancel
         try testing.expect(resp.stats.batches <= 1);
         // bounds mode still fills k from estimates; ratio mode returns what it has.
         if (quantizer == .rabitq) try testing.expectEqual(@as(usize, 10), resp.results.len);
+        for (resp.results, 0..) |result, i| {
+            for (resp.results[0..i]) |previous| try testing.expect(result.id != previous.id);
+        }
         for (resp.results[1..], resp.results[0 .. resp.results.len - 1]) |r, prev| try testing.expect(prev.distance <= r.distance);
+
+        if (quantizer == .rabitq) {
+            var closed = Budget{ .batches = 0 };
+            var estimated = try index.search(alloc, src.source(), fx.query(0), .{ .k = 10, .batch_size = 4, .gate = .{ .ctx = &closed, .check_fn = Budget.check } });
+            defer estimated.deinit(alloc);
+            try testing.expectEqual(@as(usize, 10), estimated.results.len);
+            for (estimated.results, 0..) |result, i| {
+                for (estimated.results[0..i]) |previous| try testing.expect(result.id != previous.id);
+            }
+        }
 
         const dummy: u8 = 0;
         try testing.expectError(error.Cancelled, index.search(alloc, src.source(), fx.query(0), .{ .k = 10, .gate = .{ .ctx = &dummy, .check_fn = Budget.cancel } }));

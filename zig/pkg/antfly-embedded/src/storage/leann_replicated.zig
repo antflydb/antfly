@@ -698,7 +698,7 @@ pub const ReplicatedState = struct {
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         const loader = self.loader orelse return error.MissingVectorLoader;
         var ctx = KeyLoader{ .state = @constCast(self), .loader = loader };
-        const gate = SearchGate.init(req, self.opts.reembed_budget_ms);
+        const gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
         var want: u32 = @intCast(@max(req.k, 1));
         // Id, key and prefix filters go into the graph walk; only distance
         // bounds are applied afterwards, over an enlarged result set.

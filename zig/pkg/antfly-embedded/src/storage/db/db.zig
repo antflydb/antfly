@@ -134041,6 +134041,27 @@ test "db native snapshot pins a local leann graph file" {
     const manifest_raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), manifest_path, alloc, .limited(16 * 1024 * 1024));
     defer alloc.free(manifest_raw);
     try std.testing.expect(std.mem.indexOf(u8, manifest_raw, "indexes/leann_idx/leann.store") != null);
+
+    // Mutation after capture must not alter the graph pinned by the snapshot.
+    try db.batch(.{ .deletes = &.{keys[123]}, .sync_level = .full_index });
+    try db.syncIndexes(true);
+    var restore_tmp = try TestDirectory.init("db-leann-restore");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
+    defer cleanupTempDir(restore_path);
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/leann", .{std.mem.span(path)});
+    defer alloc.free(snapshot_root);
+    try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{});
+    var restored = try DB.open(alloc, std.mem.span(restore_path), .{ .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
+    defer restored.close();
+    const entry = restored.core.index_manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
+    const query = [_]f32{ 3, 4.23, 1, 4 };
+    var results = try entry.index.searchWithRequest(.{ .query = &query, .k = 1 });
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 1), results.items.items.len);
+    const doc = (try restored.core.index_manager.lookupDenseDocKey(restored.core.store, "leann_idx", results.items.items[0].vector_id)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(doc);
+    try std.testing.expectEqualStrings(keys[123], doc);
 }
 
 test "db native snapshot rejects storage without atomic host generation publication" {

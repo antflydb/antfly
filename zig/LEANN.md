@@ -138,6 +138,11 @@ guaranteed from the entry point, so a walk that runs dry restarts there,
 then falls back to scoring the remaining unvisited allowed nodes from their
 codes (no embeddings). `LeannStore` and the replicated state pass id, key
 and prefix filters this way; only distance bounds still over-fetch.
+When fewer than `ef` live nodes pass a filter, this fallback can inspect all
+`node_count` nodes, so its worst-case CPU time is linear in the index size even
+when the result contains only one node. It does not re-embed rejected nodes.
+Size `search_ef` with this tradeoff in mind; benchmarks on representative
+large collections are needed before relying on selective-filter latency.
 
 ### Differences from the paper
 

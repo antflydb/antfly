@@ -626,7 +626,6 @@ pub const LeannStore = struct {
     }
 
     fn searchLocalLocked(self: *LeannStore, alloc: Allocator, req: search_types.SearchRequest) !search_results.SearchResults {
-
         var out = search_results.SearchResults.init(alloc, req.k);
         errdefer out.deinit();
         if (req.k == 0) return out;
@@ -662,7 +661,7 @@ pub const LeannStore = struct {
         var want: usize = if (filter.distanceActive()) @max(req.k * 4, req.k + 64) else req.k;
         var ctx = SourceCtx{ .store = self, .far_from = req.query };
         const node_filter = NodeFilter{ .store = self, .filter = &filter };
-        const gate = SearchGate.init(req, self.opts.reembed_budget_ms);
+        const gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
         while (true) {
             want = @min(want, live);
             var resp = try index.search(alloc, ctx.source(), req.query, .{
@@ -979,21 +978,24 @@ const NodeFilter = struct {
 /// edited document (new digest) or a recreated index never sees a stale
 /// vector. Evicts the least recently used entries. Thread-safe.
 pub const ReembedCache = struct {
-    const Entry = struct { vector: []f32, stamp: u64 };
+    const Entry = struct { key: []u8, vector: []f32, prev: ?*Entry = null, next: ?*Entry = null };
 
     limit_bytes: usize,
     mutex: std.atomic.Mutex = .unlocked,
-    map: std.StringHashMapUnmanaged(Entry) = .empty,
+    map: std.StringHashMapUnmanaged(*Entry) = .empty,
+    oldest: ?*Entry = null,
+    newest: ?*Entry = null,
     bytes: usize = 0,
-    clock: u64 = 0,
     hits: u64 = 0,
     misses: u64 = 0,
 
     pub fn deinit(self: *ReembedCache, alloc: Allocator) void {
-        var it = self.map.iterator();
-        while (it.next()) |e| {
-            alloc.free(e.key_ptr.*);
-            alloc.free(e.value_ptr.vector);
+        var it = self.map.valueIterator();
+        while (it.next()) |value| {
+            const entry = value.*;
+            alloc.free(entry.key);
+            alloc.free(entry.vector);
+            alloc.destroy(entry);
         }
         self.map.deinit(alloc);
         self.* = .{ .limit_bytes = self.limit_bytes };
@@ -1018,14 +1020,13 @@ pub const ReembedCache = struct {
         const key = keyInto(&buf, incarnation, doc_key, digest) orelse return false;
         self.lock();
         defer self.mutex.unlock();
-        const entry = self.map.getPtr(key) orelse {
+        const entry = self.map.get(key) orelse {
             self.misses += 1;
             return false;
         };
         if (entry.vector.len != out.len) return false;
         @memcpy(out, entry.vector);
-        self.clock += 1;
-        entry.stamp = self.clock;
+        self.touch(entry);
         self.hits += 1;
         return true;
     }
@@ -1043,27 +1044,41 @@ pub const ReembedCache = struct {
         errdefer alloc.free(owned_key);
         const owned_vector = try alloc.dupe(f32, vector);
         errdefer alloc.free(owned_vector);
-        self.clock += 1;
-        try self.map.put(alloc, owned_key, .{ .vector = owned_vector, .stamp = self.clock });
+        const entry = try alloc.create(Entry);
+        errdefer alloc.destroy(entry);
+        entry.* = .{ .key = owned_key, .vector = owned_vector };
+        try self.map.put(alloc, owned_key, entry);
+        self.linkNewest(entry);
         self.bytes += size;
     }
 
+    fn unlink(self: *ReembedCache, entry: *Entry) void {
+        if (entry.prev) |prev| prev.next = entry.next else self.oldest = entry.next;
+        if (entry.next) |next| next.prev = entry.prev else self.newest = entry.prev;
+        entry.prev = null;
+        entry.next = null;
+    }
+
+    fn linkNewest(self: *ReembedCache, entry: *Entry) void {
+        entry.prev = self.newest;
+        if (self.newest) |last| last.next = entry else self.oldest = entry;
+        self.newest = entry;
+    }
+
+    fn touch(self: *ReembedCache, entry: *Entry) void {
+        if (self.newest == entry) return;
+        self.unlink(entry);
+        self.linkNewest(entry);
+    }
+
     fn evictOldest(self: *ReembedCache, alloc: Allocator) void {
-        var oldest: ?[]const u8 = null;
-        var oldest_stamp: u64 = std.math.maxInt(u64);
-        var it = self.map.iterator();
-        while (it.next()) |e| if (e.value_ptr.stamp < oldest_stamp) {
-            oldest_stamp = e.value_ptr.stamp;
-            oldest = e.key_ptr.*;
-        };
-        const victim = oldest orelse {
-            self.bytes = 0;
-            return;
-        };
-        const kv = self.map.fetchRemove(victim).?;
-        self.bytes -= kv.key.len + kv.value.vector.len * @sizeOf(f32);
-        alloc.free(kv.key);
-        alloc.free(kv.value.vector);
+        const victim = self.oldest orelse return;
+        self.unlink(victim);
+        _ = self.map.remove(victim.key);
+        self.bytes -= victim.key.len + victim.vector.len * @sizeOf(f32);
+        alloc.free(victim.key);
+        alloc.free(victim.vector);
+        alloc.destroy(victim);
     }
 };
 
