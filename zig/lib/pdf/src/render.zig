@@ -1246,10 +1246,10 @@ fn drawImageRunCancelable(
     const y0 = floorToCanvas(margin_f + max_y - bounds.max_y, canvas_h);
     const y1 = ceilToCanvas(margin_f + max_y - bounds.min_y, canvas_h);
     const has_clip = run.clip_box != null or run.clip_points != null;
-    // PDF interpolation is opt-in. In particular, preserve hard sample
-    // boundaries for bilevel scans and line art when /Interpolate is absent
-    // or false, even when the image is minified.
-    const filtered = run.interpolate;
+    // Exact PDF interpolation is opt-in. The OCR preparation pass may
+    // separately smooth continuous-tone samples without changing /Interpolate.
+    // Bilevel scans retain their coverage-preserving OCR path below.
+    const filtered = run.interpolate or run.ocr_interpolate;
     const projected_width = @sqrt(run.a * run.a + run.b * run.b);
     const projected_height = @sqrt(run.c * run.c + run.d * run.d);
     const coverage_minify = run.ocr_coverage_minify and run.bilevel and
@@ -4284,6 +4284,45 @@ test "image minification honors explicit interpolation policy" {
     try std.testing.expectEqual(@as(u8, 0xff), filtered[3]);
 }
 
+test "OCR continuous-tone sampling smooths magnification and minification without changing PDF policy" {
+    var rgba = [_]u8{ 255, 0, 0, 255, 0, 0, 255, 255 };
+    for ([_]usize{ 1, 4 }) |width| {
+        const base: reader.ImageRun = .{
+            .rgba = &rgba,
+            .width = 2,
+            .height = 1,
+            .a = @floatFromInt(width),
+            .b = 0,
+            .c = 0,
+            .d = 1,
+            .e = 0,
+            .f = 0,
+            .x = 0,
+            .y = 0,
+            .draw_width = @floatFromInt(width),
+            .draw_height = 1,
+        };
+        var prepared = [_]reader.ImageRun{base};
+        try reader.prepareOcrRenderRunsAlloc(std.testing.allocator, &prepared, &.{}, .{});
+        try std.testing.expect(!prepared[0].interpolate);
+        try std.testing.expect(prepared[0].ocr_interpolate);
+
+        var exact: [16]u8 = @splat(255);
+        var ocr: [16]u8 = @splat(255);
+        drawImageRun(exact[0 .. width * 4], width, 1, 0, 0, 1, base);
+        drawImageRun(ocr[0 .. width * 4], width, 1, 0, 0, 1, prepared[0]);
+        var mixed_pixels: usize = 0;
+        for (0..width) |x| {
+            try std.testing.expect(exact[x * 4] == 0 or exact[x * 4] == 255);
+            try std.testing.expect(exact[x * 4 + 2] == 0 or exact[x * 4 + 2] == 255);
+            if (ocr[x * 4] > 0 and ocr[x * 4 + 2] > 0) mixed_pixels += 1;
+            try std.testing.expectEqual(@as(u8, 255), ocr[x * 4 + 3]);
+        }
+        try std.testing.expect(mixed_pixels > 0);
+    }
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255, 0, 0, 255, 255 }, &rgba);
+}
+
 test "image mask stencil paints decoded coverage with its occurrence color" {
     var rgba = [_]u8{ 0, 0, 0, 0xff };
     const run: reader.ImageRun = .{
@@ -4419,6 +4458,24 @@ test "OCR bilevel area filter retains thin rules beyond four-to-one minification
     try std.testing.expectEqual(canvas[0], canvas[1]);
     try std.testing.expectEqual(canvas[0], canvas[2]);
     try std.testing.expectEqual(@as(u8, 0xff), canvas[3]);
+}
+
+test "OCR sampling override can trade one-bit coverage for smoothing and reset to PDF semantics" {
+    const a = std.testing.allocator;
+    var pixels: [32]u8 = @splat(255);
+    pixels[0..3].* = .{ 0, 0, 0 };
+    var runs = [_]reader.ImageRun{.{ .rgba = &pixels, .width = 8, .height = 1, .bilevel = true, .a = 1, .b = 0, .c = 0, .d = 1, .e = 0, .f = 0, .x = 0, .y = 0, .draw_width = 1, .draw_height = 1 }};
+    try reader.prepareRenderRunsAlloc(a, &runs, &.{}, .ocr, .{});
+    var automatic: [4]u8 = @splat(255);
+    drawImageRun(&automatic, 1, 1, 0, 0, 1, runs[0]);
+    try std.testing.expect(automatic[0] >= 222 and automatic[0] <= 224);
+    try reader.prepareRenderRunsAlloc(a, &runs, &.{}, .smooth, .{});
+    try std.testing.expect(runs[0].ocr_interpolate and !runs[0].ocr_coverage_minify);
+    var smooth: [4]u8 = @splat(255);
+    drawImageRun(&smooth, 1, 1, 0, 0, 1, runs[0]);
+    try std.testing.expectEqual(@as(u8, 255), smooth[0]);
+    try reader.prepareRenderRunsAlloc(a, &runs, &.{}, .exact, .{});
+    try std.testing.expect(!runs[0].interpolate and !runs[0].ocr_interpolate and !runs[0].ocr_coverage_minify);
 }
 
 test "OCR bilevel exact integration uses cached full-source summary when unaffordable" {

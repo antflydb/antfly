@@ -47,6 +47,8 @@ pub const Resample = enum(u32) {
     pillow_bicubic = 4,
     /// Torchvision uint8 antialiased bicubic, with adaptive int16 coefficients.
     torchvision_bicubic = 5,
+    /// Pillow antialiased, quantized two-pass BILINEAR.
+    pillow_bilinear = 6,
 };
 
 pub const PixelFormat = enum(u8) {

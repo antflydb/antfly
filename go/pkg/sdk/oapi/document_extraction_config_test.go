@@ -26,6 +26,9 @@ import (
 func TestDocumentExtractionConfigPreservesOptionPresence(t *testing.T) {
 	for _, tc := range []struct{ name, payload string }{
 		{"unset", `{}`},
+		{"automatic PDF sampling", `{"ocr":{"reader":{"provider":"antfly","model":"test-reader"},"render":{"sampling":"auto"}}}`},
+		{"exact PDF sampling", `{"ocr":{"reader":{"provider":"antfly","model":"test-reader"},"render":{"sampling":"pdf"}}}`},
+		{"smooth PDF sampling", `{"ocr":{"reader":{"provider":"antfly","model":"test-reader"},"render":{"sampling":"smooth"}}}`},
 		{"native text without OCR", `{"native_text":{"policy":"visible","quality":{"min_chars":0,"max_replacement_ratio":0}}}`},
 		{"independent text quality", `{"native_text":{"quality":{"min_chars":1}},"ocr":{"reader":{"provider":"antfly","model":"test-reader"},"quality":{"min_chars":100}}}`},
 		{"html tags retained", `{"html_strip_tags":false}`},

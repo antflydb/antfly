@@ -4522,6 +4522,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .ocr_used = unit.ocr_used,
                 .ocr_attempted = unit.ocr_attempted,
                 .ocr_render_dpi = unit.ocr_render_dpi,
+                .ocr_render_policy = chunk_artifact_mod.RenderPolicyProvenance.from(unit.ocr_render_policy),
                 .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
                 .ocr_rendered_width = unit.ocr_rendered_width,
                 .ocr_rendered_height = unit.ocr_rendered_height,
@@ -4537,6 +4538,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .transcript_confidence = unit.transcript_confidence,
                 .extraction_warning = unit.extraction_warning,
             });
+            try chunk_artifact_mod.appendTranscriptSpans(alloc, &obj, unit.transcript_spans, chunk);
             return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
         }
 
@@ -5109,6 +5111,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const privacy_prefix = try @import("../../privacy/local_publication.zig").key(alloc, document_prefix);
             defer alloc.free(privacy_prefix);
             try collectDeleteKeysForPrefix(alloc, store, privacy_prefix, delete_keys, owned_delete_keys, null);
+            const local_asset_prefix = try @import("artifact_local_publication.zig").key(alloc, document_prefix);
+            defer alloc.free(local_asset_prefix);
+            try collectDeleteKeysForPrefix(alloc, store, local_asset_prefix, delete_keys, owned_delete_keys, null);
             const retry_prefix = try @import("../../privacy/retry.zig").key(alloc, document_prefix);
             defer alloc.free(retry_prefix);
             try collectDeleteKeysForPrefix(alloc, store, retry_prefix, delete_keys, owned_delete_keys, null);
@@ -8019,6 +8024,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .ocr_used = try storedUnitRequiredBool(provenance, "ocr_used"),
                 .ocr_attempted = try storedUnitRequiredBool(object, "ocr_attempted"),
                 .ocr_render_dpi = try storedUnitOptionalInteger(u16, object, "ocr_render_dpi"),
+                .ocr_render_policy = if (object.get("ocr_render_policy")) |value| if (value == .null) null else std.json.parseFromValueLeaky(document_extraction_mod.RenderPolicy, scratch, value, .{}) catch return error.InvalidDocumentExtractionState else null,
                 .ocr_effective_render_dpi = try storedUnitOptionalInteger(u16, object, "ocr_effective_render_dpi"),
                 .ocr_rendered_width = try storedUnitOptionalInteger(u32, object, "ocr_rendered_width"),
                 .ocr_rendered_height = try storedUnitOptionalInteger(u32, object, "ocr_rendered_height"),
@@ -8198,6 +8204,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .native_text_diagnostics = unit.native_text_diagnostics,
                 .ocr_attempted = unit.ocr_attempted,
                 .ocr_render_dpi = unit.ocr_render_dpi,
+                .ocr_render_policy = unit.ocr_render_policy,
                 .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
                 .ocr_rendered_width = unit.ocr_rendered_width,
                 .ocr_rendered_height = unit.ocr_rendered_height,
@@ -8225,6 +8232,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .ocr_used = unit.ocr_used,
                     .ocr_attempted = unit.ocr_attempted,
                     .ocr_render_dpi = unit.ocr_render_dpi,
+                    .ocr_render_policy = unit.ocr_render_policy,
                     .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
                     .ocr_rendered_width = unit.ocr_rendered_width,
                     .ocr_rendered_height = unit.ocr_rendered_height,
@@ -8264,6 +8272,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .ocr_used = unit.ocr_used,
                         .ocr_attempted = unit.ocr_attempted,
                         .ocr_render_dpi = unit.ocr_render_dpi,
+                        .ocr_render_policy = unit.ocr_render_policy,
                         .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
                         .ocr_rendered_width = unit.ocr_rendered_width,
                         .ocr_rendered_height = unit.ocr_rendered_height,

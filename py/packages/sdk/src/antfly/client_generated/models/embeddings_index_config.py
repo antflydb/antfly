@@ -46,6 +46,10 @@ class EmbeddingsIndexConfig:
                 completeness.
             external (bool | Unset): When true, embeddings are supplied externally via _embeddings and the index does not
                 derive prompts from a field or template. Default: False.
+            external_vector_space (str | Unset): Optional immutable compatibility declaration for an external dense index.
+                Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName]
+                with this exact identity; dimensions and finite values are checked independently. This is an assertion by the
+                writer, not proof of the generating model.
             sparse (bool | Unset): When true, creates a sparse (SPLADE) inverted index. When false (default), creates a
                 dense HBC vector index. Default: False.
             dimension (int | Unset): Vector dimension for dense indexes. Required for external dense indexes. Can be omitted
@@ -107,6 +111,7 @@ class EmbeddingsIndexConfig:
     publication_policy: IndexPublicationPolicy | Unset = UNSET
     coverage_policy: DerivedCoveragePolicy | Unset = UNSET
     external: bool | Unset = False
+    external_vector_space: str | Unset = UNSET
     sparse: bool | Unset = False
     dimension: int | Unset = UNSET
     field: str | Unset = UNSET
@@ -158,6 +163,8 @@ class EmbeddingsIndexConfig:
             coverage_policy = self.coverage_policy.value
 
         external = self.external
+
+        external_vector_space = self.external_vector_space
 
         sparse = self.sparse
 
@@ -243,6 +250,8 @@ class EmbeddingsIndexConfig:
             field_dict["coverage_policy"] = coverage_policy
         if external is not UNSET:
             field_dict["external"] = external
+        if external_vector_space is not UNSET:
+            field_dict["external_vector_space"] = external_vector_space
         if sparse is not UNSET:
             field_dict["sparse"] = sparse
         if dimension is not UNSET:
@@ -316,6 +325,8 @@ class EmbeddingsIndexConfig:
             coverage_policy = DerivedCoveragePolicy(_coverage_policy)
 
         external = d.pop("external", UNSET)
+
+        external_vector_space = d.pop("external_vector_space", UNSET)
 
         sparse = d.pop("sparse", UNSET)
 
@@ -482,6 +493,7 @@ class EmbeddingsIndexConfig:
             publication_policy=publication_policy,
             coverage_policy=coverage_policy,
             external=external,
+            external_vector_space=external_vector_space,
             sparse=sparse,
             dimension=dimension,
             field=field,

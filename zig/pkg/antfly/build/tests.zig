@@ -2600,6 +2600,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const root_test_step = b.step("root-test", "Run root-module contracts and HTTP runtime regressions");
     root_test_step.dependOn(&run_lib_unit_tests.step);
+    // Rendering policy contracts do not need the broad API/metadata anchors.
+    // Keep this inexpensive owner available for schema/provenance changes.
+    const render_policy_tests = b.addTest(.{
+        .name = "document-render-policy-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{"OCR sampling"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-render-policy-test", "Run focused OCR rendering configuration, identity and provenance contracts")
+        .dependOn(&addFilteredTestRunArtifact(b, render_policy_tests).step);
+
+    // Keep the real ordered apply/child-publication migration check separate
+    // from the inexpensive policy/codec owner above.
+    const unit_upgrade_tests = b.addTest(.{
+        .name = "document-unit-upgrade-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{"ordered artifact inventory unit chunk callback reconstructs publishes and retires accepted inputs"},
+        // Measured safe native compilation peaked at 8.64 GB. Keep this
+        // explicit integration owner bounded without inflating the codec gate.
+        .max_rss = 10 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-unit-upgrade-test", "Verify persisted v5 child publication and subsequent v6 replacement through ordered apply")
+        .dependOn(&addFilteredTestRunArtifact(b, unit_upgrade_tests).step);
 
     const graph_capability_filters = selectTestFilters(b, &.{
         "unsupported graph diagnostics identify the rejected operation feature",
@@ -7669,6 +7694,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("relational-index-catalog-test", "Verify native ordered catalog allocation, recovery and private reservation contracts")
         .dependOn(&addFilteredTestRunArtifact(b, native_index_catalog_tests).step);
+    const source_vector_contract_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "external vector compatibility declaration", "scalar text asset chunks", "generic scalar chunks reject stale upstream and fence publication", "generic contextual asset publication", "asset producer neighbor context samples", "source semantic media input", "transcript chunk public provenance", "transcript timing stamps", "diarized phrases carry", "transcript spans locate", "grouped artifact text filters use parent ordinals" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("source-vector-contract-test", "Verify authored source vector compatibility and text-asset chunk lifecycle")
+        .dependOn(&addFilteredTestRunArtifact(b, source_vector_contract_tests).step);
+
     const lite_external_dimension_tests = b.addTest(.{
         .root_module = db_test_mod,
         .max_rss = 12 * 1024 * 1024 * 1024,

@@ -18131,6 +18131,17 @@ export interface components {
         /** @description How PDF pages are rasterized for OCR. */
         DocumentExtractionRenderConfig: {
             /**
+             * @description PDF image sampling, separate from model resizing and normalization.
+             *     `auto` smooths continuous-tone images while preserving one-bit scan
+             *     coverage during minification. `pdf` honors the PDF's interpolation
+             *     declarations. `smooth` uses bilinear sampling even for one-bit images
+             *     (except stencil masks), which can soften fine lines. Effective policy,
+             *     version, resolution, DPI and geometry are recorded in unit provenance.
+             * @default auto
+             * @enum {string}
+             */
+            sampling?: "auto" | "pdf" | "smooth";
+            /**
              * @description Render resolution in dots per inch.
              * @default 150
              */
@@ -18735,6 +18746,8 @@ export interface components {
              * @default false
              */
             external?: boolean;
+            /** @description Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model. */
+            external_vector_space?: string;
             /**
              * @description When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
              * @default false
@@ -20287,6 +20300,7 @@ export interface components {
             coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
             /** @default false */
             external?: boolean;
+            external_vector_space?: string;
             /** @default false */
             sparse?: boolean;
             dimension?: number;
