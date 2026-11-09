@@ -41,6 +41,10 @@ jobs:
       suite: ${{ inputs.full_soak && 'soak' || 'vopr' }}
 
   qualification:
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     needs: admission
     if: >-
       ${{ !cancelled() && success() &&

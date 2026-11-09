@@ -35,6 +35,7 @@ class CreatedEmbeddingsIndexConfig:
             coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
                 completeness.
             external (bool | Unset):  Default: False.
+            external_vector_space (str | Unset):
             sparse (bool | Unset):  Default: False.
             dimension (int | Unset):
             field (str | Unset):
@@ -69,6 +70,7 @@ class CreatedEmbeddingsIndexConfig:
     publication_policy: IndexPublicationPolicy | Unset = UNSET
     coverage_policy: DerivedCoveragePolicy | Unset = UNSET
     external: bool | Unset = False
+    external_vector_space: str | Unset = UNSET
     sparse: bool | Unset = False
     dimension: int | Unset = UNSET
     field: str | Unset = UNSET
@@ -98,6 +100,8 @@ class CreatedEmbeddingsIndexConfig:
             coverage_policy = self.coverage_policy.value
 
         external = self.external
+
+        external_vector_space = self.external_vector_space
 
         sparse = self.sparse
 
@@ -159,6 +163,8 @@ class CreatedEmbeddingsIndexConfig:
             field_dict["coverage_policy"] = coverage_policy
         if external is not UNSET:
             field_dict["external"] = external
+        if external_vector_space is not UNSET:
+            field_dict["external_vector_space"] = external_vector_space
         if sparse is not UNSET:
             field_dict["sparse"] = sparse
         if dimension is not UNSET:
@@ -220,6 +226,8 @@ class CreatedEmbeddingsIndexConfig:
             coverage_policy = DerivedCoveragePolicy(_coverage_policy)
 
         external = d.pop("external", UNSET)
+
+        external_vector_space = d.pop("external_vector_space", UNSET)
 
         sparse = d.pop("sparse", UNSET)
 
@@ -296,6 +304,7 @@ class CreatedEmbeddingsIndexConfig:
             publication_policy=publication_policy,
             coverage_policy=coverage_policy,
             external=external,
+            external_vector_space=external_vector_space,
             sparse=sparse,
             dimension=dimension,
             field=field,

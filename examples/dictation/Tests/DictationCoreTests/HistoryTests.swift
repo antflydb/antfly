@@ -203,6 +203,7 @@ final class StoreProtocol: URLProtocol, @unchecked Sendable {
       clientFactory: { try AntflyClient(configuration: $0, session: session) },
       credentialReader: { _ in "" }, credentialWriter: { _, _ in })
     store.config.retainHistory = true
+    store.config.connectionMode = .external
     store.config.server = "https://original.example"
     await store.recordHistory(historyEntry(), snapshot: store.config)
     let id = store.history[0].id
@@ -367,6 +368,7 @@ func manualHistoryRetryDoesNotRetargetOldTranscriptsAfterConnectionChanges() asy
     directory: directory, registerHotkey: false,
     historyUpload: { await probe.upload($0, to: $1) })
   store.config.retainHistory = true
+  store.config.connectionMode = .external
   store.config.server = "https://original.example"
   store.config.table = "original"
   await store.recordHistory(historyEntry(), snapshot: store.config)

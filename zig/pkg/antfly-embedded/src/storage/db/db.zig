@@ -45015,7 +45015,12 @@ pub const DB = struct {
                 }
             }
         }
-        const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution;
+        // Grouped artifacts share their primary row's ordinal, but never its
+        // index-local document number. Resolve parent predicates to ordinals
+        // before scoring the member postings; this also preserves exact paging.
+        const grouped_artifact_filter = req.return_mode != .member and req.return_mode != .chunk and
+            try self.core.textIndexIsChunkBacked(alloc, req.index_name);
+        const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution or grouped_artifact_filter;
         var algebraic_filter = if (needs_algebraic_doc_filter)
             try self.searchRequestWithAlgebraicDocFilterAlloc(req)
         else
@@ -48686,7 +48691,7 @@ pub const DB = struct {
         if (policy != null and policy.?.prepared.policy.mode != .monitor) {
             if (internal_keys.isInternalUserKey(key)) {
                 const safe = try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, &txn);
-                return try alloc.dupe(u8, safe);
+                return if (scalarSearchAsset(self, store_key)) try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = safe }, .{}) else try alloc.dupe(u8, safe);
             }
             const safe = privacy.project(privacy_arena.allocator(), policy.?, key, raw, &txn) catch |err| {
                 if (privacy.pending(err)) return null;
@@ -48695,7 +48700,7 @@ pub const DB = struct {
             return try alloc.dupe(u8, safe);
         }
         if (internal_keys.mediaWindowIndex(store_key)) |index| return try @import("../../chunking/chunk.zig").mediaWindowPayloadAlloc(alloc, raw, index);
-        return try self.core.index_manager.materializeStoredValueAlloc(alloc, store_key, raw);
+        return try materializeSearchStoredValue(self, alloc, store_key, raw);
     }
 
     fn loadProjectedSearchDocumentMany(
@@ -49008,6 +49013,22 @@ const assetPayloadJsonValue = read_projection.assetPayloadJsonValue;
 
 const assetContentTypeIsJson = document_collectors.assetContentTypeIsJson;
 
+// Preserve the declared scalar type at the storage/query boundary. JSON-shaped
+// plaintext must never be inferred to be a structured artifact by a serializer.
+fn scalarSearchAsset(self: *DB, key: []const u8) bool {
+    if (!internal_keys.isAssetArtifactKey(key)) return false;
+    const name = (internal_keys.artifactNameView(key) catch return false) orelse return false;
+    self.core.index_manager.catalog_mutex.lockShared();
+    defer self.core.index_manager.catalog_mutex.unlockShared();
+    const entry = self.core.index_manager.getEnrichment(.asset, name) orelse return false;
+    return entry.content_type.len == 0 or std.mem.eql(u8, entry.content_type, "text/plain");
+}
+
+fn materializeSearchStoredValue(self: *DB, alloc: Allocator, key: []const u8, raw: []const u8) ![]u8 {
+    if (scalarSearchAsset(self, key)) return try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = raw }, .{});
+    return try self.core.index_manager.materializeStoredValueAlloc(alloc, key, raw);
+}
+
 fn projectLookupStoredBytes(self: *DB, alloc: Allocator, doc_key: []const u8, raw: []const u8, opts: types.LookupOptions) ![]u8 {
     return try db_query_projection.projectLookupStoredBytes(alloc, doc_key, raw, opts, .{
         .ctx = self,
@@ -49315,7 +49336,9 @@ fn loadStoredSearchDocumentsMany(
             };
             // Authenticate the complete document, then retain only the selected
             // output. Unselected bodies and validation DOMs expire per row.
-            loaded[item.original_index] = if (direct_fields) |fields|
+            loaded[item.original_index] = if (scalarSearchAsset(self, item.store_key))
+                try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = safe }, .{})
+            else if (direct_fields) |fields|
                 try db_query_projection.projectLookupStoredBytesWithOutput(row, alloc, id, safe, .{ .fields = fields, .include_all_fields = false }, .{
                     .ctx = self,
                     .load_chunks = loadChunkFieldValueCallback,
@@ -49328,11 +49351,10 @@ fn loadStoredSearchDocumentsMany(
                 try alloc.dupe(u8, safe);
             continue;
         }
-        loaded[item.original_index] = try schema_plans.materialize(
-            item.store_key,
-            value,
-            values_authenticated,
-        );
+        loaded[item.original_index] = if (scalarSearchAsset(self, item.store_key))
+            try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = value }, .{})
+        else
+            try schema_plans.materialize(item.store_key, value, values_authenticated);
     }
     if (bench_profile) dupe_ns = platform_time.monotonicNs() - materialize_start_ns;
     if (bench_profile) {
@@ -50172,6 +50194,7 @@ fn renderDocumentPdfPagePngAlloc(
             max_decoded_stream_bytes,
             max_working_set_bytes,
             render_timeout_ms,
+            .auto,
             out_failure,
         );
         return rendered.png;
@@ -79630,6 +79653,53 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
     const after_delete = try db.getEdges(alloc, "selected_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, after_delete);
     try std.testing.expectEqual(@as(usize, 0), after_delete.len);
+}
+
+test "db grouped artifact text filters use parent ordinals across indexes" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.close();
+    try db.addIndex(.{ .name = "parents", .kind = .full_text, .config_json = "{}" });
+    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addEnrichment(.{ .name = "passages", .kind = .chunk, .source_artifact_name = "units", .field = "text", .chunk_size = 8, .chunk_overlap = 0 });
+    try db.addIndex(.{ .name = "passage_text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"passages\",\"field\":\"text\"}]}" });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:drop", .value = "{\"body\":\"alpha alpha alpha alpha alpha alpha\",\"source_id\":\"other\"}" },
+        .{ .key = "doc:keep", .value = "{\"body\":\"alpha launch alpha launch alpha launch\",\"source_id\":\"wanted\"}" },
+    }, .sync_level = .full_index });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    {
+        var all = try db.search(alloc, .{ .index_name = "passage_text", .full_text = .{ .match = .{ .field = "text", .text = "alpha" } } });
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 2), all.hits.len);
+    }
+    // The first parent's many members deliberately separate the member and
+    // parent document-number spaces. Both direct and composed dispatch must
+    // filter before selecting their one-result page, including exclusions.
+    for ([_]bool{ false, true }) |composed| {
+        for ([_]bool{ false, true }) |exclude| {
+            var req: types.SearchRequest = .{
+                .index_name = "passage_text",
+                .primary_text_index_name = "parents",
+                .full_text = .{ .match = .{ .field = "text", .text = "alpha" } },
+                .limit = 1,
+                .return_mode = .parent,
+            };
+            if (exclude) req.exclusion_query_json = "{\"term\":{\"source_id\":\"other\"}}" else req.filter_query_json = "{\"term\":{\"source_id\":\"wanted\"}}";
+            const named = [_]types.NamedFullTextQuery{.{ .name = "passages", .index_name = "passage_text", .query = req.full_text.? }};
+            if (composed) {
+                req.full_text = null;
+                req.index_name = null;
+                req.full_text_queries = &named;
+            }
+            var result = try db.search(alloc, req);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+            try std.testing.expectEqualStrings("doc:keep", result.hits[0].id);
+        }
+    }
 }
 
 test "db member-mode chunk hits filter through the parent row on the full-text arm" {
@@ -149530,4 +149600,245 @@ test "privacy protected hit hydration bounds row scratch and retains only select
         }
         std.debug.print("\nPrivacy projected hydration rows={d} peak_bytes={d}\n", .{ count, budget.peak_live_bytes });
     }
+}
+
+test "external vector compatibility declaration rejects missing and mismatched writer identity" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(path);
+    var db = try DB.open(alloc, path, .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "external_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"external_vector_space\":\"recipe-v1\"}",
+    });
+    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+        .writes = &.{.{ .key = "missing", .value = "{\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+        .sync_level = .full_index,
+    }));
+    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+        .writes = &.{.{ .key = "wrong", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"other\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+        .sync_level = .full_index,
+    }));
+    try db.batch(.{
+        .writes = &.{.{ .key = "matched", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+        .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}}}" }},
+        .sync_level = .full_index,
+    }));
+    // Withdrawing the receipt permits an acquisition update to retain hidden
+    // vector bytes; source search independently requires the exact receipt.
+    try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
+}
+
+test "scalar text asset chunks track parent updates and retirement" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-scalar-chunks");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addEnrichment(.{ .name = "summary_chunks", .kind = .chunk, .source_artifact_name = "summary", .field = "text", .chunk_size = 512, .chunk_overlap = 32 });
+    try db.addIndex(.{ .name = "summary_text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"summary_chunks\",\"field\":\"text\"}]}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"silver submarine\"}" }}, .sync_level = .full_index });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    {
+        const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "summary");
+        defer a.free(key);
+        const value = try db.core.store.get(a, key);
+        defer a.free(value);
+        try std.testing.expectEqualStrings("silver submarine", value);
+        const chunk = try internal_keys.chunkArtifactKeyAlloc(a, "doc", "summary_chunks", 0);
+        defer a.free(chunk);
+        const member = try db.core.store.get(a, chunk);
+        defer a.free(member);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, member, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("silver submarine", parsed.value.object.get("text").?.string);
+    }
+    {
+        var result = try db.search(a, .{ .index_name = "summary_text", .full_text = .{ .match = .{ .field = "text", .text = "silver" } }, .limit = 10 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"gold submarine\"}" }}, .sync_level = .full_index });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    {
+        var old = try db.search(a, .{ .index_name = "summary_text", .full_text = .{ .match = .{ .field = "text", .text = "silver" } }, .limit = 10 });
+        defer old.deinit();
+        try std.testing.expectEqual(@as(usize, 0), old.hits.len);
+        var current = try db.search(a, .{ .index_name = "summary_text", .full_text = .{ .match = .{ .field = "text", .text = "gold" } }, .limit = 10 });
+        defer current.deinit();
+        try std.testing.expectEqual(@as(usize, 1), current.hits.len);
+    }
+    try db.batch(.{ .deletes = &.{"doc"}, .sync_level = .full_index });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    var retired = try db.search(a, .{ .index_name = "summary_text", .full_text = .{ .match = .{ .field = "text", .text = "gold" } }, .limit = 10 });
+    defer retired.deinit();
+    try std.testing.expectEqual(@as(usize, 0), retired.hits.len);
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "summary");
+    defer a.free(asset_key);
+    const receipt_key = try @import("artifact_local_publication.zig").key(a, asset_key);
+    defer a.free(receipt_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, receipt_key));
+}
+
+test "scalar text asset chunks asynchronous mixed parents settle publication" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-async-publication");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "content_units", .kind = .asset, .template = "{{content.text}}", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addEnrichment(.{ .name = "content_chunks", .kind = .chunk, .source_artifact_name = "content_units", .field = "text", .chunk_size = 512, .chunk_overlap = 64 });
+    try db.addIndex(.{ .name = "units_text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"content_units\",\"field\":\"text\"}]}" });
+    try db.addIndex(.{ .name = "chunks_text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"content_chunks\",\"field\":\"text\"}]}" });
+    try db.batch(.{ .writes = &.{ .{ .key = "text", .value = "{\"content\":{\"text\":\"launch at 04:12\"}}" }, .{ .key = "image", .value = "{\"content\":{\"resource\":{\"uri\":\"image\"}}}" } }, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    for ([_][]const u8{ "units_text", "chunks_text" }) |index| {
+        var status = types.DBIndexStats{ .name = try a.dupe(u8, index), .kind = .full_text };
+        defer types.freeDBIndexStatsItem(a, status);
+        try db.populateIndexSourceReplayStats(a, index, 0, 0, &status);
+        try std.testing.expectEqual(@as(usize, 1), status.source_replay.len);
+        try std.testing.expect(status.source_replay[0].producer_complete);
+    }
+}
+
+test "source semantic media input PDF URI template registration survives reopen and admits repair" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-pdf-template");
+    defer directory.cleanup();
+    const options = OpenOptions{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } };
+    var db = try DB.open(a, directory.path(), options);
+    {
+        defer db.close();
+        const config = types.EnrichmentConfig{ .name = "pages", .kind = .embedding, .template = "{{{content.resource.uri}}}", .embedding_input = .pdf_page_images, .expected_dims = 3 };
+        try db.addEnrichment(config);
+        try std.testing.expectEqual(index_manager_mod.IndexManager.EnrichmentUpsertResult.unchanged, try db.upsertEnrichment(config));
+        var invalid = config;
+        invalid.name = "invalid_pages";
+        invalid.chunk_size = 128;
+        try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(invalid));
+        invalid.chunk_size = 0;
+        invalid.chunker_json = "{}";
+        try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(invalid));
+        invalid.chunker_json = "";
+        invalid.kind = .chunk;
+        try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(invalid));
+    }
+    db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    var config = (try db.getEnrichment(a, .embedding, "pages")).?;
+    defer config.deinit(a);
+    try std.testing.expectEqualStrings("{{{content.resource.uri}}}", config.template);
+    try std.testing.expectEqual(@TypeOf(config.embedding_input).pdf_page_images, config.embedding_input);
+    var repaired = try db.reprocessDocumentArtifactRange(a, "pages", .{ .limit = 1 });
+    defer repaired.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), repaired.scanned);
+}
+
+test "source semantic media input repair distinguishes supported producer kinds" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-repair-kinds");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "content", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "text", .source_artifact_name = "content", .chunk_size = 128 });
+    try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .field = "text" } });
+    try db.addEnrichment(.{ .name = "dense", .kind = .embedding, .field = "body", .expected_dims = 3 });
+    for ([_][]const u8{ "content", "dense" }) |name| {
+        var repaired = try db.reprocessDocumentArtifactRange(a, name, .{ .limit = 1 });
+        defer repaired.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), repaired.scanned);
+    }
+    for ([_][]const u8{ "chunks", "turns" }) |name|
+        try std.testing.expectError(error.NotFound, db.reprocessDocumentArtifactRange(a, name, .{ .limit = 1 }));
+}
+
+test "source semantic media input rejects PDF ancestry on nonempty sources and preserves text pipelines" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-pdf-ancestry");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"https://example.org/source.pdf\"}" }}, .sync_level = .write });
+    try db.addEnrichment(.{ .name = "links", .kind = .chunk, .field = "body", .chunk_size = 512 });
+    try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .field = "text" } });
+    var config = types.EnrichmentConfig{ .name = "pages", .kind = .embedding, .field = "text", .source_artifact_name = "links", .embedding_input = .pdf_page_images, .expected_dims = 3 };
+    for ([_][]const u8{ "links", "turns", "missing" }) |upstream| {
+        config.source_artifact_name = upstream;
+        try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(config));
+        try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(config));
+        try std.testing.expect((try db.getEnrichment(a, .embedding, "pages")) == null);
+    }
+    config.source_artifact_name = "links";
+    config.embedding_input = .text;
+    try db.addEnrichment(config);
+    try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"_unused\",\"dims\":3,\"embedding_name\":\"pages\",\"metric\":\"l2_squared\"}" });
+    config.embedding_input = .pdf_page_images;
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(config));
+    var retained = (try db.getEnrichment(a, .embedding, "pages")).?;
+    defer retained.deinit(a);
+    try std.testing.expectEqual(@TypeOf(retained.embedding_input).text, retained.embedding_input);
+    const requests = try db.core.index_manager.planGeneratedEnrichments(a, "doc", "{\"body\":\"https://example.org/source.pdf\"}", &.{}, &.{});
+    defer @import("enrichment/enrichment_types.zig").deinitGeneratedRequests(a, requests);
+    var dense_requests: usize = 0;
+    for (requests) |request| if (request.kind == .dense_embedding) {
+        dense_requests += 1;
+        try std.testing.expectEqual(@TypeOf(request.embedding_input).text, request.embedding_input);
+        try std.testing.expectEqual(@TypeOf(request.input_kind).materialized_chunks, request.input_kind);
+    };
+    try std.testing.expectEqual(@as(usize, 1), dense_requests);
+}
+
+test "source semantic media input PDF producers cannot be bound to sparse consumers" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-pdf-sparse");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    var config = types.EnrichmentConfig{ .name = "pages", .kind = .embedding, .field = "uri", .embedding_input = .pdf_page_images };
+    try db.addEnrichment(config);
+    try std.testing.expectError(error.InvalidIndexConfig, db.addIndex(.{ .name = "sparse_single", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse_embedding\",\"embedding_name\":\"pages\"}" }));
+    try std.testing.expectError(error.InvalidIndexConfig, db.addIndex(.{ .name = "sparse_sources", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse_embedding\",\"sources\":[{\"artifact\":\"pages\"}]}" }));
+    config.embedding_input = .text;
+    _ = try db.upsertEnrichment(config);
+    try db.addIndex(.{ .name = "sparse_text", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse_embedding\",\"embedding_name\":\"pages\"}" });
+    config.embedding_input = .pdf_page_images;
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(config));
+    var retained = (try db.getEnrichment(a, .embedding, "pages")).?;
+    defer retained.deinit(a);
+    try std.testing.expectEqual(@TypeOf(retained.embedding_input).text, retained.embedding_input);
+}
+
+test "source semantic media input PDF page output cannot bind unrelated chunk definitions" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-pdf-output-name");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.close();
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addIndex(.{ .name = "invalid_pdf_chunks", .kind = .dense_vector, .config_json = "{\"field\":\"_unused\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"uri\",\"artifact_name\":\"bad_pages\",\"embedding_name\":\"bad_visual\",\"input\":\"pdf_page_images\",\"chunk_size\":128}}" }));
+    try std.testing.expect((try db.getEnrichment(a, .embedding, "bad_visual")) == null);
+    try std.testing.expect((try db.getEnrichment(a, .chunk, "bad_pages")) == null);
+    try db.addEnrichment(.{ .name = "pages", .kind = .chunk, .field = "body", .chunk_size = 512 });
+    try db.addIndex(.{ .name = "pdf_vectors", .kind = .dense_vector, .config_json = "{\"field\":\"_unused\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"uri\",\"artifact_name\":\"pages\",\"embedding_name\":\"visual\",\"input\":\"pdf_page_images\"}}" });
+    const source = "{\"body\":\"unrelated text\",\"uri\":\"https://example.org/original.pdf\"}";
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = source }}, .sync_level = .write });
+    const requests = try db.core.index_manager.planGeneratedEnrichments(a, "doc", source, &.{}, &.{});
+    defer @import("enrichment/enrichment_types.zig").deinitGeneratedRequests(a, requests);
+    try std.testing.expectEqual(@as(usize, 1), requests.len);
+    const request = requests[0];
+    try std.testing.expectEqual(@TypeOf(request.kind).dense_embedding, request.kind);
+    try std.testing.expectEqual(@TypeOf(request.embedding_input).pdf_page_images, request.embedding_input);
+    try std.testing.expectEqual(@TypeOf(request.input_kind).document, request.input_kind);
+    try std.testing.expectEqualStrings("uri", request.source_field);
+    try std.testing.expectEqual(@as(u32, 0), request.chunk_size);
+    try @import("enrichment/enrichment_types.zig").validateGeneratedEmbeddingInput(request);
 }

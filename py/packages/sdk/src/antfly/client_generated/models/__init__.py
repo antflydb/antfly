@@ -250,6 +250,7 @@ from .created_embeddings_index import CreatedEmbeddingsIndex
 from .created_embeddings_index_config import CreatedEmbeddingsIndexConfig
 from .created_embeddings_index_type import CreatedEmbeddingsIndexType
 from .created_enrichment_config import CreatedEnrichmentConfig
+from .created_enrichment_config_embedding_input import CreatedEnrichmentConfigEmbeddingInput
 from .created_full_text_index import CreatedFullTextIndex
 from .created_full_text_index_config import CreatedFullTextIndexConfig
 from .created_full_text_index_type import CreatedFullTextIndexType
@@ -374,6 +375,7 @@ from .document_extraction_reader_config_provider import DocumentExtractionReader
 from .document_extraction_reader_config_recognition_level import DocumentExtractionReaderConfigRecognitionLevel
 from .document_extraction_render_config import DocumentExtractionRenderConfig
 from .document_extraction_render_config_resolution import DocumentExtractionRenderConfigResolution
+from .document_extraction_render_config_sampling import DocumentExtractionRenderConfigSampling
 from .document_extraction_route import DocumentExtractionRoute
 from .document_extraction_route_extractor import DocumentExtractionRouteExtractor
 from .document_extraction_route_extractor_type import DocumentExtractionRouteExtractorType
@@ -436,6 +438,7 @@ from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
+from .enrichment_config_embedding_input import EnrichmentConfigEmbeddingInput
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
@@ -2916,6 +2919,7 @@ __all__ = (
     "CreatedEmbeddingsIndexConfig",
     "CreatedEmbeddingsIndexType",
     "CreatedEnrichmentConfig",
+    "CreatedEnrichmentConfigEmbeddingInput",
     "CreatedFullTextIndex",
     "CreatedFullTextIndexConfig",
     "CreatedFullTextIndexType",
@@ -3057,6 +3061,7 @@ __all__ = (
     "DocumentExtractionReaderConfigRecognitionLevel",
     "DocumentExtractionRenderConfig",
     "DocumentExtractionRenderConfigResolution",
+    "DocumentExtractionRenderConfigSampling",
     "DocumentExtractionRoute",
     "DocumentExtractionRouteExtractor",
     "DocumentExtractionRouteExtractorType",
@@ -3119,6 +3124,7 @@ __all__ = (
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
+    "EnrichmentConfigEmbeddingInput",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",

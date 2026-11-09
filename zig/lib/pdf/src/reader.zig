@@ -2509,12 +2509,18 @@ fn prepareOcrImageRunsWithSummariesAlloc(
     alloc: Allocator,
     image_runs: []ImageRun,
     summaries: *std.AutoHashMapUnmanaged(usize, [4]u8),
+    profile: @import("pdf_values").RenderProfile,
     cancellation: CancellationProbe,
 ) !void {
     for (image_runs, 0..) |*run, index| {
         if (index & 255 == 0) try cancellation.check();
-        run.ocr_coverage_minify = run.bilevel;
-        if (!run.bilevel or run.rgba.len == 0) continue;
+        // OCR consumes a resampled image rather than an exact PDF painting.
+        // Smooth continuous-tone samples before the vision encoder resizes the
+        // page again; nearest-neighbour magnification aliases small lettering.
+        // One-bit scans retain their separate coverage-preserving policy.
+        run.ocr_interpolate = profile != .exact and (profile == .smooth or !run.bilevel) and run.stencil_color == null;
+        run.ocr_coverage_minify = profile == .ocr and run.bilevel;
+        if (!run.ocr_coverage_minify or run.rgba.len == 0) continue;
         const key = @intFromPtr(run.rgba.ptr);
         const entry = try summaries.getOrPut(alloc, key);
         if (!entry.found_existing) {
@@ -2531,6 +2537,7 @@ fn prepareOcrPatternRunsWithSummariesAlloc(
     alloc: Allocator,
     pattern_runs: []PatternRun,
     summaries: *std.AutoHashMapUnmanaged(usize, [4]u8),
+    profile: @import("pdf_values").RenderProfile,
     cancellation: CancellationProbe,
     depth: u8,
 ) !void {
@@ -2541,14 +2548,14 @@ fn prepareOcrPatternRunsWithSummariesAlloc(
     for (pattern_runs, 0..) |*pattern, index| {
         if (index & 63 == 0) try cancellation.check();
         if (pattern.stencil_mask) |*mask|
-            try prepareOcrImageRunsWithSummariesAlloc(alloc, @as(*[1]ImageRun, @ptrCast(mask))[0..], summaries, cancellation);
-        try prepareOcrImageRunsWithSummariesAlloc(alloc, pattern.tile_image_runs, summaries, cancellation);
-        try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern.tile_pattern_runs, summaries, cancellation, depth + 1);
+            try prepareOcrImageRunsWithSummariesAlloc(alloc, @as(*[1]ImageRun, @ptrCast(mask))[0..], summaries, profile, cancellation);
+        try prepareOcrImageRunsWithSummariesAlloc(alloc, pattern.tile_image_runs, summaries, profile, cancellation);
+        try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern.tile_pattern_runs, summaries, profile, cancellation, depth + 1);
     }
 }
 
-/// Prepare every bilevel resource reachable by OCR rendering, including
-/// pattern-cell images and image masks retained as Pattern paint targets.
+/// Prepare OCR sampling for every reachable image: continuous-tone smoothing
+/// and bilevel coverage, including pattern-cell images and retained masks.
 /// Shared decoded XObjects use one summary regardless of how many occurrences
 /// reference them.
 pub fn prepareOcrRenderRunsAlloc(
@@ -2557,10 +2564,20 @@ pub fn prepareOcrRenderRunsAlloc(
     pattern_runs: []PatternRun,
     cancellation: CancellationProbe,
 ) !void {
+    return prepareRenderRunsAlloc(alloc, image_runs, pattern_runs, .ocr, cancellation);
+}
+
+pub fn prepareRenderRunsAlloc(
+    alloc: Allocator,
+    image_runs: []ImageRun,
+    pattern_runs: []PatternRun,
+    profile: @import("pdf_values").RenderProfile,
+    cancellation: CancellationProbe,
+) !void {
     var summaries = std.AutoHashMapUnmanaged(usize, [4]u8).empty;
     defer summaries.deinit(alloc);
-    try prepareOcrImageRunsWithSummariesAlloc(alloc, image_runs, &summaries, cancellation);
-    try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern_runs, &summaries, cancellation, 0);
+    try prepareOcrImageRunsWithSummariesAlloc(alloc, image_runs, &summaries, profile, cancellation);
+    try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern_runs, &summaries, profile, cancellation, 0);
 }
 
 /// Compatibility helper for callers that render only standalone images.
@@ -5999,7 +6016,14 @@ pub const Reader = struct {
             var annotation = try self.annotationValue(raw);
             defer annotation.deinit(self.alloc);
             if (!try self.annotationIsVisible(&annotation.value)) continue;
-            var appearance = (try self.staticAppearance(&annotation.value, true)) orelse return true;
+            // An invalid appearance prevents trustworthy rendering, but must not
+            // discard otherwise valid native page text during metadata analysis.
+            // Rendering still sees the unsupported-annotation flag and refuses
+            // incomplete painting. Resource/cancellation errors remain fatal.
+            var appearance = (self.staticAppearance(&annotation.value, true) catch |err| switch (err) {
+                error.InvalidPdfAnnotations => return true,
+                else => return err,
+            }) orelse return true;
             appearance.deinit(self.alloc);
         }
         return false;
@@ -18466,9 +18490,10 @@ fn applyShapeOperator(
         const closed = current_path_closed.* or std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*");
         if ((std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*")) and current_subpath_closed.items.len > 0)
             current_subpath_closed.items[current_subpath_closed.items.len - 1] = true;
-        if (current_path.items.len >= 3) {
+        if (current_path.items.len >= 2) {
             const order = paint_order.*;
-            if (try solidShapePaintAvailable(state.fill_color_space.kind)) {
+            // A two-point path has no fill area but still has a valid stroke.
+            if (current_path.items.len >= 3 and try solidShapePaintAvailable(state.fill_color_space.kind)) {
                 try emitPolygonShapeRun(
                     alloc,
                     out,
@@ -23251,6 +23276,8 @@ test "OCR bilevel summaries are prepared lazily and reused by decoded buffer" {
     try std.testing.expectEqual(runs[0].bilevel_fallback, runs[1].bilevel_fallback);
     try std.testing.expect(runs[0].ocr_coverage_minify);
     try std.testing.expect(runs[1].ocr_coverage_minify);
+    try std.testing.expect(!runs[0].ocr_interpolate);
+    try std.testing.expect(!runs[1].ocr_interpolate);
 }
 
 test "OCR preparation reaches retained pattern stencils and tile images" {
@@ -39454,4 +39481,61 @@ test "reader color frontiers preserve nested spaces default aliases ICC metadata
     const lookup = try cache.table(&reader, resources.get("ColorSpace").?.*);
     try std.testing.expectEqual(@as(usize, 3), lookup.scans);
     try std.testing.expect(lookup.dependency_requests == null);
+}
+
+test "invalid annotation appearance preserves native text but remains unrendered" {
+    const a = std.testing.allocator;
+    const content = "BT /F1 12 Tf 10 50 Td (Preserve native text) Tj ET\n";
+    const stream = try std.fmt.allocPrint(a, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
+    defer a.free(stream);
+    for ([_][]const u8{ "0 0 0 20", "20 0 0 20" }) |bounds| {
+        const appearance = try std.fmt.allocPrint(a, "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [{s}] /Length 0 >>\nstream\nendstream\nendobj\n", .{bounds});
+        defer a.free(appearance);
+        const bytes = try buildImageDecodeTestPdfAlloc(a, &.{
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R /Annots [6 0 R] >>\nendobj\n",
+            stream,
+            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n",
+            "6 0 obj\n<< /Subtype /Stamp /Rect [0 0 20 20] /AP << /N 7 0 R >> >>\nendobj\n",
+            appearance,
+        });
+        defer a.free(bytes);
+        var parsed = try Reader.init(a, bytes);
+        defer parsed.deinit();
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expect(std.mem.indexOf(u8, analysis.text, "Preserve native text") != null);
+        try std.testing.expect(analysis.has_unrendered_annotations);
+        try std.testing.expectError(error.InvalidPdfAnnotations, parsed.extractPageRenderRunsAlloc(1));
+    }
+}
+
+test "fill stroke operators retain two point rule strokes" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "B", "B*", "b", "b*" }) |op| {
+        const content = try std.fmt.allocPrint(a, "1 0 0 RG\n10 10 m\n90 10 l\n{s}\n", .{op});
+        defer a.free(content);
+        const stream = try std.fmt.allocPrint(a, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
+        defer a.free(stream);
+        const bytes = try buildImageDecodeTestPdfAlloc(a, &.{
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>\nendobj\n",
+            stream,
+        });
+        defer a.free(bytes);
+        var parsed = try Reader.init(a, bytes);
+        defer parsed.deinit();
+        const shapes = try parsed.extractPageShapeRunsAlloc(1);
+        defer {
+            for (shapes) |*shape| shape.deinit(a);
+            a.free(shapes);
+        }
+        try std.testing.expectEqual(@as(usize, 1), shapes.len);
+        try std.testing.expect(shapes[0].kind == .stroke);
+        try std.testing.expectEqual(@as(usize, 2), shapes[0].points.len);
+        try std.testing.expectApproxEqAbs(@as(f64, 10), shapes[0].points[0][0], 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f64, 90), shapes[0].points[1][0], 0.0001);
+    }
 }

@@ -5,16 +5,42 @@ import AppKit
 import DictationCore
 import SwiftUI
 
-@main struct DictationApp: App {
+@main enum DictationLauncher {
+  static func main() {
+    if CommandLine.arguments.dropFirst().first == "--managed-runtime-child" {
+      executeManagedRuntimeChild(arguments: CommandLine.arguments)
+    }
+    if ["--managed-runtime", "--managed-runtime-pull"].contains(
+      CommandLine.arguments.dropFirst().first ?? "")
+    {
+      exit(superviseManagedRuntime(arguments: CommandLine.arguments))
+    }
+    DictationApp.main()
+  }
+}
+
+struct DictationApp: App {
   @NSApplicationDelegateAdaptor(DictationLifecycle.self) private var lifecycle
   @StateObject private var store = Store()
+  @StateObject private var updates = AppUpdates()
   var body: some Scene {
     WindowGroup("Antfly Dictation", id: "settings") {
-      SettingsView(store: store).frame(minWidth: 760, minHeight: 640)
-        .onAppear { lifecycle.store = store }
+      SettingsView(store: store, updates: updates).frame(minWidth: 760, minHeight: 640)
+        .onAppear {
+          lifecycle.store = store
+          updates.start(store: store)
+        }
+    }
+    .commands {
+      CommandGroup(after: .appInfo) {
+        Button("Check for Updates…") { updates.check() }.disabled(!updates.canCheck)
+      }
     }
     MenuBarExtra {
-      MenuContent(store: store).onAppear { lifecycle.store = store }
+      MenuContent(store: store, updates: updates).onAppear {
+        lifecycle.store = store
+        updates.start(store: store)
+      }
     } label: {
       Image(
         systemName: store.state == .recording
@@ -41,12 +67,14 @@ import SwiftUI
 
 struct MenuContent: View {
   @ObservedObject var store: Store
+  @ObservedObject var updates: AppUpdates
   @Environment(\.openWindow) var openWindow
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
       Text("Antfly Dictation").font(.headline)
       Text(store.phase.label).font(.headline)
       Text(store.message).font(.caption).textSelection(.enabled)
+      if store.config.usesManagedRuntime { RuntimeSummary(runtime: store.runtime) }
       if !store.processingWarning.isEmpty {
         Text(store.processingWarning).font(.caption).foregroundStyle(.secondary)
       }
@@ -54,8 +82,10 @@ struct MenuContent: View {
       HStack {
         Button(store.state == .recording ? "Finish" : "Record") {
           if store.state == .recording { store.finish() } else { store.start() }
-        }.disabled(store.state == .processing)
-        Button("Cancel") { store.cancel() }.disabled(store.state == .idle)
+        }.disabled(store.state == .processing || store.working)
+        Button("Cancel") {
+          if store.settingUpModel { store.cancelModelSetup() } else { store.cancel() }
+        }.disabled(store.state == .idle && !store.settingUpModel)
         Button("Copy") { store.copy(store.result.isEmpty ? store.preview : store.result) }.disabled(
           store.result.isEmpty && store.preview.isEmpty)
       }
@@ -69,6 +99,7 @@ struct MenuContent: View {
         openWindow(id: "settings")
         NSApp.activate(ignoringOtherApps: true)
       }
+      Button("Check for Updates…") { updates.check() }.disabled(!updates.canCheck)
       Button("Quit") {
         store.cancel()
         NSApp.terminate(nil)
@@ -79,6 +110,7 @@ struct MenuContent: View {
 
 struct SettingsView: View {
   @ObservedObject var store: Store
+  @ObservedObject var updates: AppUpdates
   var body: some View {
     VStack(alignment: .leading) {
       HStack {
@@ -110,7 +142,9 @@ struct SettingsView: View {
           store.state != .idle || store.working || store.capturingShortcut)
         Button("Export JSON…") { store.exportSettings() }
         Spacer()
-        Button("Cancel recording / request") { store.cancel() }.disabled(store.state == .idle)
+        Button(store.settingUpModel ? "Cancel model setup" : "Cancel recording / request") {
+          if store.settingUpModel { store.cancelModelSetup() } else { store.cancel() }
+        }.disabled(store.state == .idle && !store.settingUpModel)
       }
     }.padding(20)
   }
@@ -118,10 +152,25 @@ struct SettingsView: View {
     ScrollView {
       Form {
         Section("Connection — audio is processed on this server") {
-          TextField("Server origin", text: $store.config.server).onChange(of: store.config.server) {
-            _, _ in store.connectionChanged()
+          Picker(
+            "Processing location",
+            selection: Binding(
+              get: { store.config.connectionMode ?? .external },
+              set: { store.config.connectionMode = $0 })
+          ) {
+            Text("On this Mac (bundled Antfly)").tag(ConnectionMode.managed)
+            Text("External Antfly server").tag(ConnectionMode.external)
+          }.disabled(store.state != .idle || store.working || store.historyWorking)
+            .onChange(of: store.config.connectionMode) { _, _ in store.runtimeModeChanged() }
+          if store.config.usesManagedRuntime {
+            RuntimeControls(store: store, runtime: store.runtime)
+          } else {
+            TextField("Server origin", text: $store.config.server).onChange(of: store.config.server)
+            {
+              _, _ in store.connectionChanged()
+            }
+            SecureField("Bearer token (Keychain only)", text: $store.token)
           }
-          SecureField("Bearer token (Keychain only)", text: $store.token)
           HStack {
             Button("Discover models") { store.discover() }
             Button("Create storage table") { store.setup() }
@@ -156,6 +205,7 @@ struct SettingsView: View {
           Toggle("Press to toggle recording instead of hold to talk", isOn: $store.config.toggle)
           Toggle("Paste into the original focused text field", isOn: $store.config.autoPaste)
         }
+        UpdateSettings(updates: updates)
         Section("Retention") {
           Toggle("Save transcript history locally and in Antfly", isOn: $store.config.retainHistory)
           Toggle("Keep last audio recording locally", isOn: $store.config.retainAudio)
@@ -226,7 +276,7 @@ struct SettingsView: View {
                 ForEach(ProcessingStrategy.allCases, id: \.self) { Text($0.label).tag($0) }
               }
               Text(
-                "Automatic uses only advertised capabilities. Incremental requires final recognition segments; Rewrite needs the complete utterance. The selected engine never changes automatically."
+                "Automatic processing uses advertised capabilities. Incremental requires final recognition segments; Rewrite needs the complete utterance. Explicit transcriber selections are preserved."
               ).font(.caption)
               TextField(
                 "Transcriber model or alias",
@@ -234,9 +284,17 @@ struct SettingsView: View {
                   get: { preset.model },
                   set: {
                     preset.model = $0
+                    preset.automaticallySelectLocalTranscriber = false
                     preset.transcriberRoute = nil
                   }))
               Menu("Choose discovered transcriber") {
+                if store.config.usesManagedRuntime {
+                  Button("Automatic (Apple when ready, otherwise Whisper)") {
+                    preset.automaticallySelectLocalTranscriber = true
+                    preset.model = "transcribers/whisper"
+                    store.refreshModels()
+                  }
+                }
                 ForEach(store.models.filter { $0.task == "transcribe" }) { model in
                   Button("\(model.id) · \(model.executorName)") {
                     preset.selectTranscriber(model)
@@ -358,4 +416,29 @@ struct SettingsView: View {
       !$0.isEmpty
     }
   }
+}
+
+private struct RuntimeControls: View {
+  @ObservedObject var store: Store
+  @ObservedObject var runtime: ManagedRuntime
+  var body: some View {
+    Text(runtime.status).font(.callout)
+    HStack {
+      Button("Start / retry local engine") { runtime.start() }.disabled(
+        runtime.busy || runtime.ready)
+      Button("Download Whisper Tiny…") { store.installLocalWhisper() }.disabled(
+        !runtime.ready || runtime.busy)
+      Button("Use Apple speech") { store.useLocalApple() }.disabled(
+        !runtime.ready || runtime.busy || !runtime.supportsAppleSpeech)
+      Button("Open engine log") { NSWorkspace.shared.open(runtime.logURL) }
+    }
+    Text(
+      "Apple speech is selected automatically when available. Otherwise, download Whisper Tiny. Apple speech requires macOS 26+ and installed language assets. No cleanup model is selected automatically."
+    ).font(.caption)
+  }
+}
+
+private struct RuntimeSummary: View {
+  @ObservedObject var runtime: ManagedRuntime
+  var body: some View { Text(runtime.status).font(.caption).foregroundStyle(.secondary) }
 }

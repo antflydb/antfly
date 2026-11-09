@@ -2030,6 +2030,17 @@ pub fn resolveStructuredTextDocNumFilterForComposedAlloc(
     if (req.resolved_doc_filter != null) return null;
     if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return null;
 
+    // Document numbers belong to one physical text index. Composed searches
+    // may use a primary-row index for predicates and artifact indexes for
+    // retrieval; only shared parent ordinals can cross that boundary.
+    const filter_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+    const retrieval_entry = try executor.text_index_entry(executor.ctx, req.index_name) orelse return null;
+    if (filter_entry != retrieval_entry) return null;
+    for (req.full_text_queries) |named| {
+        const entry = try executor.text_index_entry(executor.ctx, named.index_name) orelse return null;
+        if (entry != filter_entry) return null;
+    }
+
     var active_executor = executor;
     if (active_executor.identity_read_generation == null) active_executor.identity_read_generation = req.identity_read_generation;
     const all_visible = if (active_executor.all_docs_visible) |visible|
