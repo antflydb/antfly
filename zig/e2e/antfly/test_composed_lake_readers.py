@@ -1005,12 +1005,13 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             # request. Preserve that bounded diagnostic profile, not
             # a full process metrics dump or another timing series.
             time.sleep(6)
+            cold_metrics = metrics()
             record_property(
                 "slowest_immutable_io_after_cold",
                 json.dumps(
                     {
                         name: value
-                        for name, value in metrics().items()
+                        for name, value in cold_metrics.items()
                         if name.startswith(
                             (
                                 "antfly_lake_query_slowest_lake_",
@@ -1022,6 +1023,32 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                             "antfly_lake_query_slowest_lake_total_nanoseconds",
                             "antfly_lake_query_slowest_composed_total_nanoseconds",
                         }
+                    }
+                ),
+            )
+            # Fresh-process aggregates fill gaps in the retained request
+            # profile, particularly hydration. Startup/background work can
+            # contribute, so these are not request-attributed durations.
+            record_property(
+                "cold_process_phase_totals",
+                json.dumps(
+                    {
+                        name: cold_metrics[name]
+                        for phase in (
+                            "index",
+                            "hydration",
+                            "hydration_source",
+                            "hydration_native",
+                            "highlight",
+                            "text_directory",
+                            "text_inventory",
+                            "text_opening",
+                            "text_term_plan",
+                            "text_navigation",
+                            "text_postings",
+                        )
+                        if (name := f"antfly_lake_query_{phase}_nanoseconds_total")
+                        in cold_metrics
                     }
                 ),
             )
