@@ -1925,8 +1925,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             const cleanup_contract = @import("../graph_cleanup_contract.zig");
-            var graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
-                (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null))
+            // derived_changed_flags defaults to true for every write (it is
+            // only cleared for proven semantic no-ops), so "some write's
+            // content changed" is true for almost every ordinary commit.
+            // Advancing the lifecycle generation only matters for fencing
+            // stale graph retirement stamps against fresh graph artifacts;
+            // without any graph index there is nothing to fence, so a store
+            // with no graph indexes configured no longer pays a
+            // document_index write for this on every primary-only update.
+            var graph_lifecycle_generation: u64 = if (S.ownerField(self, "core").*.index_manager.hasGraphIndexes() and
+                (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
+                    (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null)))
                 try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &write_buffers.store_writes, &write_buffers.owned_store_values)
             else
                 0;
@@ -2655,6 +2664,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &owned_child_range_outbox_values,
             );
             const build_derived_start_ns = monotonicTimeNs();
+            // Journal suppression (below, after inline-publication prepare)
+            // reuses this in-memory record -- when available and still in
+            // sync with `replay_payload` -- to encode the suppressed local
+            // journal payload exactly once, instead of decoding the bytes
+            // `encodeRecord` just produced only to re-encode them. Only the
+            // `else blk:` branch below (the non-thin, non-group-source-
+            // command path) ever builds one; inline publication requires
+            // `materialized_derived_batch != null`, which only that branch
+            // sets, so suppression never has anything to do on the other
+            // two paths anyway. `record_matches_replay_payload` goes false
+            // if the `transferred_group_changed`/`deleted` merge below
+            // re-encodes `replay_payload` from a decoded copy instead of
+            // this struct, so a later reuse attempt never reads a stale
+            // hint/key set for what was actually journaled.
+            var maybe_record: ?change_journal_mod.Record = null;
+            defer if (maybe_record) |*r| change_journal_mod.deinitRecord(S.ownerField(self, "alloc").*, r);
+            var record_matches_replay_payload = true;
             var replay_payload = if (opts.group_source_command != null)
                 try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, .{ .sequence = sequence, .changed_doc_keys = try group_staged.replayDocuments(group_alloc), .deleted_doc_keys = group_staged.deleted, .changed_artifact_keys = changed_graph_artifact_keys.items, .target_hints = &.{ .enrichment, .graph, .dense_vector, .sparse_vector } })
             else if (use_thin_replay_fast_path)
@@ -2690,8 +2716,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 materialized_derived_batch.?.generated_enrichment_refs = precomputed_generated.generated_enrichment_refs;
                 precomputed_generated.generated_enrichment_refs = &.{};
                 materialized_derived_batch.?.sequence = sequence;
-                var record = try prepareDirectChangeRecord(&self.batchContext(), materialized_derived_batch.?, sequence, effective_req, S.ownerField(self, "local_execution").*.row_policy_table_name);
-                defer change_journal_mod.deinitRecord(S.ownerField(self, "alloc").*, &record);
+                const record = try prepareDirectChangeRecord(&self.batchContext(), materialized_derived_batch.?, sequence, effective_req, S.ownerField(self, "local_execution").*.row_policy_table_name);
+                // Ownership moves to the outer `maybe_record`/its top-level
+                // `defer` immediately -- on any error after this point
+                // (including from the rest of this block), that `defer`
+                // still runs and frees it exactly once.
+                maybe_record = record;
                 const payload = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, record);
                 errdefer S.ownerField(self, "alloc").*.free(payload);
                 if (preparation.write_plan == null or preparation.write_plan.?.plan().has_text_consumers or splitShadowRequiresMaterializedDerivedBatch(self))
@@ -2725,6 +2755,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const encoded = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, record);
                 S.ownerField(self, "alloc").*.free(replay_payload);
                 replay_payload = encoded;
+                // `replay_payload` now reflects `decoded.record` (this
+                // transfer merge's own group_alloc-backed copy), not
+                // `maybe_record` (still the pre-merge, alloc-owned
+                // original) -- never reuse it for the suppressed re-encode
+                // below; fall back to its own decode of these new bytes
+                // instead, same as before this change.
+                record_matches_replay_payload = false;
             }
             const append_derived_replay = !opts.suppress_derived_replay_append and
                 !elide_semantic_noop_replay;
@@ -3861,26 +3898,62 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     suppress_algebraic = inline_algebraic_publication_count != 0 and algebraic_remaining == 0;
                 }
                 if (suppress_full_text or suppress_graph or suppress_sparse or suppress_dense or suppress_algebraic) {
-                    var decoded = try change_journal_mod.decodeRecord(group_alloc, entry.payload);
-                    defer decoded.deinit();
-                    var kept_hints: std.ArrayListUnmanaged(change_journal_mod.TargetHint) = .empty;
-                    for (decoded.record.target_hints) |hint| {
-                        const drop = switch (hint) {
-                            .full_text => suppress_full_text,
-                            .graph => suppress_graph,
-                            .sparse_vector => suppress_sparse,
-                            .dense_vector => suppress_dense,
-                            .algebraic => suppress_algebraic,
-                            .enrichment, .resolution, .promotion => false,
-                        };
-                        if (!drop) try kept_hints.append(group_alloc, hint);
-                    }
-                    if (kept_hints.items.len != decoded.record.target_hints.len) {
-                        var suppressed_record = decoded.record;
-                        suppressed_record.target_hints = kept_hints.items;
-                        const encoded = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, suppressed_record);
-                        suppressed_replay_payload = encoded;
-                        replay_append = .{ .sequence = entry.sequence, .payload = encoded };
+                    const Dropper = struct {
+                        fn drop(hint: change_journal_mod.TargetHint, ft: bool, g: bool, sp: bool, d: bool, alg: bool) bool {
+                            return switch (hint) {
+                                .full_text => ft,
+                                .graph => g,
+                                .sparse_vector => sp,
+                                .dense_vector => d,
+                                .algebraic => alg,
+                                .enrichment, .resolution, .promotion => false,
+                            };
+                        }
+                    };
+                    // Common case: the in-memory record `encodeRecord`
+                    // already consumed to produce `entry.payload` is still
+                    // right here and still matches those exact bytes --
+                    // reuse it directly (just swapping `target_hints`,
+                    // every other field borrowed as-is) instead of
+                    // decoding the bytes it just encoded only to re-encode
+                    // them. Falls back to decode/filter/re-encode only for
+                    // the rare paths with no such record available (the
+                    // thin-replay/group-source-command payload shapes,
+                    // neither of which materializes a batch inline
+                    // publication could ever have serviced anyway, or the
+                    // transferred-group merge just above, which already
+                    // repointed `replay_payload` at its own decoded copy).
+                    if (maybe_record != null and record_matches_replay_payload) {
+                        const record = maybe_record.?;
+                        var kept_hints_buf: [8]change_journal_mod.TargetHint = undefined;
+                        var kept_len: usize = 0;
+                        for (record.target_hints) |hint| {
+                            if (!Dropper.drop(hint, suppress_full_text, suppress_graph, suppress_sparse, suppress_dense, suppress_algebraic)) {
+                                kept_hints_buf[kept_len] = hint;
+                                kept_len += 1;
+                            }
+                        }
+                        if (kept_len != record.target_hints.len) {
+                            var suppressed_record = record;
+                            suppressed_record.target_hints = kept_hints_buf[0..kept_len];
+                            const encoded = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, suppressed_record);
+                            suppressed_replay_payload = encoded;
+                            replay_append = .{ .sequence = entry.sequence, .payload = encoded };
+                        }
+                    } else {
+                        var decoded = try change_journal_mod.decodeRecord(group_alloc, entry.payload);
+                        defer decoded.deinit();
+                        var kept_hints: std.ArrayListUnmanaged(change_journal_mod.TargetHint) = .empty;
+                        for (decoded.record.target_hints) |hint| {
+                            if (!Dropper.drop(hint, suppress_full_text, suppress_graph, suppress_sparse, suppress_dense, suppress_algebraic)) try kept_hints.append(group_alloc, hint);
+                        }
+                        if (kept_hints.items.len != decoded.record.target_hints.len) {
+                            var suppressed_record = decoded.record;
+                            suppressed_record.target_hints = kept_hints.items;
+                            const encoded = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, suppressed_record);
+                            suppressed_replay_payload = encoded;
+                            replay_append = .{ .sequence = entry.sequence, .payload = encoded };
+                        }
                     }
                 }
             }

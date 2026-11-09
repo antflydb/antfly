@@ -317,7 +317,6 @@ test "logical value stored ranges bind revisions preserve arrays and reject corr
     const internal = @import("internal_keys.zig");
     const physical = try internal.documentKeyAlloc(temp, "doc");
     const rev_key = revision.keyForPhysical(physical).?;
-    const content_key = revision.contentKey(rev_key);
     const directory_key = projection.keyForRevision(rev_key);
     const ignored = try temp.alloc(u8, 32 * 1024);
     @memset(ignored, 'x');
@@ -325,21 +324,15 @@ test "logical value stored ranges bind revisions preserve arrays and reject corr
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
     const directory = (try projection.build(temp, body, internal.primary_kind, digest)).?;
-    var content: [49]u8 = undefined;
-    std.mem.writeInt(u64, content[0..8], 7, .little);
-    std.mem.writeInt(u64, content[8..16], body.len, .little);
-    content[16] = internal.primary_kind;
-    @memcpy(content[17..49], &digest);
-    var mutation: [8]u8 = undefined;
-    std.mem.writeInt(u64, &mutation, 7, .little);
+    // Revision and content authority share one combined on-disk record.
+    var combined_buf: [revision.encoded_len_with_content]u8 = undefined;
+    const combined = revision.encodeCombined(&combined_buf, .{ .revision = 7, .content = .{ .revision = 7, .bytes = body.len, .kind = internal.primary_kind, .digest = digest } });
     const Mock = struct {
         physical: []const u8,
         body: []const u8,
         rev_key: []const u8,
-        content_key: []const u8,
         directory_key: []const u8,
-        content: []const u8,
-        mutation: []const u8,
+        combined: []const u8,
         directory: ?[]const u8,
         full_reads: usize = 0,
         range_bytes: usize = 0,
@@ -350,7 +343,7 @@ test "logical value stored ranges bind revisions preserve arrays and reject corr
                 out.* = if (std.mem.eql(u8, key, self.physical)) full: {
                     self.full_reads += 1;
                     break :full self.body;
-                } else if (std.mem.eql(u8, key, self.rev_key)) self.mutation else if (std.mem.eql(u8, key, self.content_key)) self.content else if (std.mem.eql(u8, key, self.directory_key)) self.directory else null;
+                } else if (std.mem.eql(u8, key, self.rev_key)) self.combined else if (std.mem.eql(u8, key, self.directory_key)) self.directory else null;
             }
         }
         pub fn getRangesMany(self: *@This(), requests: []const ranges_mod.Request) !void {
@@ -363,7 +356,7 @@ test "logical value stored ranges bind revisions preserve arrays and reject corr
             }
         }
     };
-    var mock: Mock = .{ .physical = physical, .body = body, .rev_key = &rev_key, .content_key = &content_key, .directory_key = &directory_key, .content = &content, .mutation = &mutation, .directory = directory };
+    var mock: Mock = .{ .physical = physical, .body = body, .rev_key = &rev_key, .directory_key = &directory_key, .combined = combined, .directory = directory };
     const wanted = &[_][]const u8{"nested"};
     var profile: ReadProfile = .{};
     const rows = try loadProfiled(temp, temp, &mock, &.{ physical, physical }, &.{ "doc", "doc" }, wanted, true, &profile);
@@ -414,13 +407,15 @@ test "logical value stored ranges bind revisions preserve arrays and reject corr
     mock.corrupt = true;
     try std.testing.expectError(error.InvalidDocumentContentAuthority, load(temp, temp, &mock, &.{physical}, &.{"doc"}, wanted, true));
     mock.corrupt = false;
-    // Older writers update mutation revision without replacing the directory.
-    std.mem.writeInt(u64, &mutation, 8, .little);
+    // Older writers update mutation revision without replacing the directory:
+    // bump only the outer revision, leaving the embedded content proof's own
+    // revision stale so the combined record's self-check rejects it.
+    std.mem.writeInt(u64, combined_buf[0..8], 8, .little);
     const stale = try load(temp, temp, &mock, &.{physical}, &.{"doc"}, wanted, true);
     try std.testing.expect(!stale[0].projected);
     try std.testing.expect(stale[0].repair_authority);
     try std.testing.expectEqualStrings(body, stale[0].bytes.?);
-    std.mem.writeInt(u64, &mutation, 7, .little);
+    std.mem.writeInt(u64, combined_buf[0..8], 7, .little);
     mock.directory = null;
     const legacy = try load(temp, temp, &mock, &.{physical}, &.{"doc"}, wanted, true);
     try std.testing.expect(!legacy[0].projected);

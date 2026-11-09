@@ -3359,6 +3359,7 @@ const IndexEditor = struct {
         const alloc = self.nodeAllocator(node);
         const index = try self.bound(node, key, node.kind == .internal);
         if (node.kind == .leaf) {
+            if (builtin.is_test) DocumentIndexKeyLog.record("insert", node.original_page, key);
             const replacement = index < node.keys.items.len and std.mem.eql(u8, try self.resolve(node, &node.keys.items[index]), key);
             if (replacement) {
                 if (self.accounting_pages) |pages| if (node.links.items[index].page != page) try pages.retire(node.links.items[index].page, .record);
@@ -3450,6 +3451,7 @@ const IndexEditor = struct {
         if (depth > 64) return error.InvalidDocumentIndex;
         const index = try self.bound(node, key, node.kind == .internal);
         if (node.kind == .leaf) {
+            if (builtin.is_test) DocumentIndexKeyLog.record("erase", node.original_page, key);
             if (index == node.keys.items.len or !std.mem.eql(u8, try self.resolve(node, &node.keys.items[index]), key)) return .{ .removed = false };
             if (self.accounting_pages) |pages| try pages.retire(node.links.items[index].page, .record);
             _ = node.keys.orderedRemove(index);
@@ -3983,6 +3985,14 @@ const TransactionWrites = struct {
     // reclaimed; they stay allocated-but-unreferenced until the next vacuum.
     undo: std.ArrayListUnmanaged(UndoEntry) = .empty,
     undo_depth: usize = 0,
+    // Every key/value `stageMutation` stages (and every undo-log snapshot of
+    // one it replaces) dies at the exact same moment: this instance's own
+    // `clear`/`deinit`, called once per flush window. Individually
+    // `allocator.free`-ing each of them bought nothing but 2-4 extra
+    // allocator calls per staged write; one arena reclaims all of them in a
+    // single `deinit`. `self.pages`/`self.undo`/`self.maps`/`self.appends`
+    // are unrelated containers with their own, unchanged lifecycles.
+    value_arena: std.heap.ArenaAllocator,
 
     const UndoEntry = struct {
         root: usize,
@@ -3998,23 +4008,10 @@ const TransactionWrites = struct {
             map.* = .empty;
         }
         self.append_count = 0;
-        for (self.undo.items) |item| {
-            if (item.previous) |previous| {
-                allocator.free(previous.key);
-                allocator.free(previous.value);
-            }
-            allocator.free(item.key);
-        }
+        self.value_arena.deinit();
         self.undo.clearRetainingCapacity();
         self.undo_depth = 0;
-        for (&self.maps) |*map| {
-            var it = map.valueIterator();
-            while (it.next()) |mutation| {
-                allocator.free(mutation.key);
-                allocator.free(mutation.value);
-            }
-            map.clearRetainingCapacity();
-        }
+        for (&self.maps) |*map| map.clearRetainingCapacity();
         self.bytes = 0;
         self.count = 0;
     }
@@ -4444,6 +4441,36 @@ pub const PageWriteMetrics = struct {
             bucket.calls.store(0, .monotonic);
             bucket.bytes.store(0, .monotonic);
         }
+    }
+};
+
+/// Diagnostic-only (perf/lwa-cpu, document-index write-count investigation):
+/// when armed, logs every key `IndexEditor.insert`/`erase` touches at the
+/// leaf level -- the leaf's original (pre-commit) on-disk page id, so
+/// multiple keys landing in the *same* leaf are visibly grouped, and the
+/// key bytes themselves -- to answer "how many distinct leaves does one
+/// commit's document-index writes actually touch, and why". Not armed by
+/// default; armed only by the dedicated attribution test in
+/// `write_amplification_cpu_bench_test.zig`.
+pub const DocumentIndexKeyLog = struct {
+    var armed: if (builtin.is_test) std.atomic.Value(bool) else void = if (builtin.is_test) .init(false) else {};
+
+    pub fn arm(on: bool) void {
+        if (!builtin.is_test) return;
+        armed.store(on, .monotonic);
+    }
+
+    fn record(comptime op: []const u8, leaf_original_page: u64, key: []const u8) void {
+        if (!builtin.is_test) return;
+        if (!armed.load(.monotonic)) return;
+        var hex_buf: [256]u8 = undefined;
+        var pos: usize = 0;
+        for (key) |byte| {
+            if (pos + 2 > hex_buf.len) break;
+            _ = std.fmt.bufPrint(hex_buf[pos..][0..2], "{x:0>2}", .{byte}) catch break;
+            pos += 2;
+        }
+        std.debug.print("DOCIDX_KEY op={s} leaf_original_page={d} key_len={d} key_hex={s}\n", .{ op, leaf_original_page, key.len, hex_buf[0..pos] });
     }
 };
 
@@ -5157,6 +5184,19 @@ pub const VacuumImage = struct {
 };
 
 pub const ReaderCoordinator = @import("reader_coordinator.zig").Coordinator;
+
+/// Off by default. Crash/durability investigations (regression B: an
+/// acknowledged full_index write surviving to a stale checkpoint after a
+/// ride-along merge/retirement) flip this on for the duration of their own
+/// run to log every recovery candidate's slot index/commit_sequence/verify
+/// result, and every ride-along (non-durable) commit's resulting
+/// commit_sequence and whether durable_header moved.
+pub var recovery_debug_log: bool = false;
+
+fn recoveryDebugLog(comptime fmt: []const u8, args: anytype) void {
+    if (!recovery_debug_log) return;
+    std.debug.print("[native-recovery] " ++ fmt ++ "\n", args);
+}
 
 var test_header_fingerprint_hashes: std.atomic.Value(u64) = .init(0);
 
@@ -6415,10 +6455,24 @@ pub const NativeFile = struct {
 
     fn ledgerRead(context: *anyopaque, a: Allocator, page: u64) ![]u8 {
         const file: *NativeFile = @ptrCast(@alignCast(context));
+        const expected_kind: PageKind = if (page == file.activeCheckpoint().free_map_root_page) .free_map else .allocator;
+        // A cache hit already holds a CRC-validated page; borrow its payload
+        // directly instead of duplicating the whole page just to decode and
+        // immediately discard the full-page copy. allocator_v4's ledger load
+        // calls this once per ledger page per commit, so this was the single
+        // largest allocation site in the write path.
+        const use_cache = file.page_cache_enabled.load(.monotonic) and file.page_cache_bypass.load(.monotonic) == 0;
+        if (use_cache) {
+            const physical = physicalPage(page);
+            if (try file.page_cache.acquirePayload(file.allocator, physical, @intCast(file.header.page_size))) |view| {
+                defer file.page_cache.releaseRaw(file.allocator, view);
+                if (view.validation.?.kind != expected_kind) return error.UnexpectedNativePageKind;
+                return try a.dupe(u8, view.bytes[page_header_size..][0..view.validation.?.payload_len]);
+            }
+        }
         const raw = try file.readPageAlloc(a, page);
         defer a.free(raw);
-        const kind: PageKind = if (page == file.activeCheckpoint().free_map_root_page) .free_map else .allocator;
-        return try a.dupe(u8, try decodePagePayload(raw, kind));
+        return try a.dupe(u8, try decodePagePayload(raw, expected_kind));
     }
     fn ledgerReadOnlyAllocate(_: *anyopaque) !u64 {
         return error.ReadOnly;
@@ -7923,7 +7977,9 @@ pub const NativeFile = struct {
         const ref = try state.finish();
         const mutation = writes.maps[@backingInt(root)].getPtr(key).?;
         writes.bytes -= mutation.value.len;
-        self.allocator.free(mutation.value);
+        // `mutation.value` came from `writes.value_arena` (stageMutation),
+        // reclaimed in one shot with everything else at `writes.clear` --
+        // not individually freed here.
         mutation.value = &.{};
         mutation.external_value_root_page = ref.page;
         mutation.external_value_len = state.len;
@@ -11264,6 +11320,24 @@ pub const NativeFile = struct {
         kind: PageKind,
         checkpoint: CheckpointSlot,
     ) ![]u8 {
+        // Mirrors ledgerRead's fix: a cache hit already holds a
+        // CRC-validated page, so borrow its payload instead of duplicating
+        // the whole page just to decode and immediately discard the copy.
+        // A packed record reference names one record inside a shared
+        // record_bundle page, not the page's own payload -- unpackRecordPage
+        // (inside readPageAllocForCheckpoint) does that extraction, so those
+        // references must keep going through the slow path below.
+        if (page_id & packed_record_flag == 0 and page_id != 0 and page_id < checkpoint.page_count) {
+            const physical = physicalPage(page_id);
+            const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
+            if (use_cache) {
+                if (try self.page_cache.acquirePayload(allocator, physical, @intCast(self.header.page_size))) |view| {
+                    defer self.page_cache.releaseRaw(allocator, view);
+                    if (view.validation.?.kind != kind) return error.UnexpectedNativePageKind;
+                    return try allocator.dupe(u8, view.bytes[page_header_size..][0..view.validation.?.payload_len]);
+                }
+            }
+        }
         const page = try self.readPageAllocForCheckpoint(allocator, page_id, checkpoint);
         defer allocator.free(page);
         return try decodePagePayloadAlloc(allocator, page, kind);
@@ -12564,7 +12638,7 @@ pub const NativeFile = struct {
         if (self.transaction_writes) |writes| return writes;
         const writes = try self.allocator.create(TransactionWrites);
         errdefer self.allocator.destroy(writes);
-        writes.* = .{ .pages = try self.pageAllocatorFromFreeMap(self.activeCheckpoint()) };
+        writes.* = .{ .pages = try self.pageAllocatorFromFreeMap(self.activeCheckpoint()), .value_arena = std.heap.ArenaAllocator.init(self.allocator) };
         self.transaction_writes = writes;
         self.transaction_writes_generation +%= 1;
         return writes;
@@ -12581,28 +12655,40 @@ pub const NativeFile = struct {
             return error.InvalidArtifactLeaseMutation;
         // Acquire ownership before a spill: callers may be appending/renaming
         // an entry borrowed from the write set that the spill will release.
-        var owned = mutation;
-        owned.key = try self.allocator.dupe(u8, mutation.key);
-        errdefer self.allocator.free(owned.key);
         const inline_value = !mutation.is_delete and mutation.external_value_root_page == 0 and
             (if (root == .documents) self.documentEntryFitsInline(mutation.key, mutation.value) else self.catalogEntryFitsInline(mutation.key, mutation.value));
-        owned.value = try self.allocator.dupe(u8, if (inline_value) mutation.value else "");
-        errdefer self.allocator.free(owned.value);
-        const spill_copy = if (!mutation.is_delete and !inline_value and mutation.external_value_root_page == 0 and mutation.value.len <= self.maxPagePayloadBytes()) try self.allocator.dupe(u8, mutation.value) else null;
-        defer if (spill_copy) |bytes| self.allocator.free(bytes);
-        const source_value = spill_copy orelse mutation.value;
+        // The eventual owned value is either the real inline bytes or "" (an
+        // out-of-line value is written below and tracked only by its page
+        // reference) -- compute its length now, before any allocation, so
+        // the capacity check and a possible flush-and-replace of `writes`
+        // (and its arena) can happen before anything is staged into it.
+        const owned_value_len: usize = if (inline_value) mutation.value.len else 0;
         var writes = try self.transactionWrites();
-        const replaced = writes.maps[@backingInt(root)].get(owned.key);
+        const replaced = writes.maps[@backingInt(root)].get(mutation.key);
         const replaced_bytes = if (replaced) |old| old.key.len + old.value.len else 0;
-        if ((replaced == null and writes.count >= TransactionWrites.max_keys) or writes.bytes - replaced_bytes + owned.key.len + owned.value.len > TransactionWrites.max_bytes) {
+        if ((replaced == null and writes.count >= TransactionWrites.max_keys) or writes.bytes - replaced_bytes + mutation.key.len + owned_value_len > TransactionWrites.max_bytes) {
             try self.flushTransactionWrites();
             writes = try self.transactionWrites();
         }
+        // Acquire ownership from this transaction's own arena: every entry
+        // staged here (and every undo-log snapshot of one it replaces) dies
+        // together at `writes.clear`/`deinit` (one per flush window), so
+        // there is nothing to free individually and no failure-path
+        // `errdefer` to register -- an arena allocation that is never
+        // stored anywhere just becomes unreferenced garbage, reclaimed at
+        // the same point a successful one would have been anyway. Writing
+        // `mutation.value` into pages below (not duping it first: those
+        // writers only read it synchronously within this call) no longer
+        // needs its own temporary copy either.
+        const arena = writes.value_arena.allocator();
+        var owned = mutation;
+        owned.key = try arena.dupe(u8, mutation.key);
+        owned.value = try arena.dupe(u8, if (inline_value) mutation.value else "");
         if (!mutation.is_delete and mutation.external_value_root_page == 0 and !inline_value) {
             owned.external_value_root_page = if (root == .documents)
-                try self.writeDocumentValue(&writes.pages, source_value)
+                try self.writeDocumentValue(&writes.pages, mutation.value)
             else
-                try self.writeCatalogValue(&writes.pages, source_value, options);
+                try self.writeCatalogValue(&writes.pages, mutation.value, options);
             owned.external_value_len = mutation.value.len;
             try self.flushTransactionPayloads();
         }
@@ -12613,38 +12699,25 @@ pub const NativeFile = struct {
             const old = slot.value_ptr.*;
             writes.bytes -= old.key.len + old.value.len;
             if (recording) {
-                // Transfer ownership of the replaced entry into the undo log
-                // instead of freeing it, so a savepoint rollback can restore
-                // it verbatim.
-                const undo_key = try self.allocator.dupe(u8, owned.key);
-                // If `append` below fails (e.g. the allocator-v4 injected
-                // failure test), `undo_key` has no other owner yet -- nothing
-                // reachable from `writes.undo` or the map references it, so
-                // without this it leaks on every such failure.
-                errdefer self.allocator.free(undo_key);
+                // Transfer the replaced entry into the undo log instead of
+                // dropping it, so a savepoint rollback can restore it
+                // verbatim. Both live in the same arena either way.
+                const undo_key = try arena.dupe(u8, owned.key);
                 try writes.undo.append(self.allocator, .{ .root = @backingInt(root), .key = undo_key, .previous = old });
-            } else {
-                self.allocator.free(old.key);
-                self.allocator.free(old.value);
             }
         } else {
             // `getOrPut` already wrote `owned.key` into `slot.key_ptr` for a
             // new entry (its own contract: "if (!found_existing) gop.key_ptr.*
             // = key"), but `slot.value_ptr` is still whatever garbage backed
             // that slot -- this function doesn't fill it in until the very
-            // end. If the undo-log append below fails, unwind through the
-            // two `errdefer`s above frees `owned.key`/`owned.value`, which
-            // would otherwise leave this half-initialized slot in the map
-            // with a dangling key and an uninitialized value. Remove it
-            // before that happens; `owned.key` is still valid here since
-            // `errdefer`s run in reverse registration order.
+            // end. If the undo-log append below fails, remove the
+            // half-initialized slot before that happens so a dangling key
+            // never lingers in the map; `owned.key` itself needs no cleanup
+            // (arena memory).
             errdefer _ = map.remove(owned.key);
             writes.count += 1;
             if (recording) {
-                const undo_key = try self.allocator.dupe(u8, owned.key);
-                // Same leak as the `found_existing` branch above: `append`
-                // failing here must not strand this dupe.
-                errdefer self.allocator.free(undo_key);
+                const undo_key = try arena.dupe(u8, owned.key);
                 try writes.undo.append(self.allocator, .{ .root = @backingInt(root), .key = undo_key, .previous = null });
             }
         }
@@ -12899,16 +12972,10 @@ pub const NativeFile = struct {
         if (self.transaction_writes_generation != sp.writes_generation) return; // a flush already retired sp's undo log.
         std.debug.assert(writes.undo_depth > 0);
         writes.undo_depth -= 1;
-        var i = writes.undo.items.len;
-        while (i > sp.undo_mark) {
-            i -= 1;
-            const item = writes.undo.items[i];
-            if (item.previous) |previous| {
-                self.allocator.free(previous.key);
-                self.allocator.free(previous.value);
-            }
-            self.allocator.free(item.key);
-        }
+        // The discarded entries' key/previous.key/previous.value all came
+        // from `writes.value_arena` (stageMutation); it reclaims them with
+        // everything else at `writes.clear`, so there is nothing to free
+        // here now -- just stop tracking them for rollback.
         writes.undo.shrinkRetainingCapacity(sp.undo_mark);
     }
 
@@ -12971,27 +13038,23 @@ pub const NativeFile = struct {
         if (self.transaction_writes_generation != sp.writes_generation) return; // already superseded by the checkpoint restore above.
         std.debug.assert(writes.undo_depth > 0);
         writes.undo_depth -= 1;
+        // Every key/value touched below (the popped undo entry's own key,
+        // whatever `current`/`previous` it restores or discards) came from
+        // `writes.value_arena` (stageMutation); it reclaims all of them
+        // together at `writes.clear`, so none of them are freed here --
+        // only the map/undo-log bookkeeping changes.
         while (writes.undo.items.len > sp.undo_mark) {
             const item = writes.undo.pop().?;
-            defer self.allocator.free(item.key);
             const map = &writes.maps[item.root];
             if (item.previous) |previous| {
                 if (map.getPtr(item.key)) |current| {
                     writes.bytes -= current.key.len + current.value.len;
-                    self.allocator.free(current.key);
-                    self.allocator.free(current.value);
                     current.* = previous;
                     writes.bytes += previous.key.len + previous.value.len;
-                } else {
-                    // The key was removed by a later undo entry already;
-                    // the replaced value still needs freeing.
-                    self.allocator.free(previous.key);
-                    self.allocator.free(previous.value);
                 }
+                // else: the key was removed by a later undo entry already.
             } else if (map.fetchRemove(item.key)) |kv| {
                 writes.bytes -= kv.value.key.len + kv.value.value.len;
-                self.allocator.free(kv.value.key);
-                self.allocator.free(kv.value.value);
                 writes.count -= 1;
             }
         }
@@ -13163,12 +13226,19 @@ pub const NativeFile = struct {
             // durability barrier. Readers on this handle see the new roots;
             // reopening after a crash sees the previous complete checkpoint.
             if (changed) {
+                const was_durable_header_null = self.durable_header == null;
                 if (self.durable_header == null) self.durable_header = previous;
                 self.header.checkpoints[self.header.active_checkpoint] = next;
+                recoveryDebugLog("ride-along commit (non-durable) commit_sequence={d} captured_durable_header={} durable_header_commit_sequence={d}", .{
+                    next.commit_sequence,
+                    was_durable_header_null,
+                    self.durable_header.?.checkpoints[self.durable_header.?.active_checkpoint].commit_sequence,
+                });
             }
             return;
         }
         if (changed) {
+            recoveryDebugLog("durable commit commit_sequence={d} durable_header_was_set={}", .{ next.commit_sequence, self.durable_header != null });
             const manifest_prepared = if (manifest_commits_enabled) try self.tryBuildCommitManifest(&next) else false;
             if (!manifest_prepared) try self.syncIfRequired(hooks);
             try self.publishCheckpoint(next, manifest_prepared, hooks);
@@ -14762,12 +14832,25 @@ fn recoverActiveCheckpoint(
         candidates += 1;
     }
     if (candidates == 0) return error.InvalidNativeCheckpoint;
+    if (recovery_debug_log) for (order[0..candidates], 0..) |index, rank| {
+        const slot = header.checkpoints[index];
+        recoveryDebugLog("candidate rank={d} slot_index={d} commit_sequence={d} presynced={} manifest_page={d} manifest_page_count={d}", .{ rank, index, slot.commit_sequence, slot.presynced, slot.manifest_page, slot.manifest_page_count });
+    };
     for (order[0..candidates], 0..) |index, rank| {
         const slot = header.checkpoints[index];
-        if (!verifyManifest(file, io, slot, header.page_size)) continue;
-        if (rank == 0) return .{ .index = index };
-        if (!allow_truncate) return .{ .index = index };
+        const verified = verifyManifest(file, io, slot, header.page_size);
+        recoveryDebugLog("verify slot_index={d} commit_sequence={d} verified={}", .{ index, slot.commit_sequence, verified });
+        if (!verified) continue;
+        if (rank == 0) {
+            recoveryDebugLog("chosen slot_index={d} commit_sequence={d} (top candidate, no fallback)", .{ index, slot.commit_sequence });
+            return .{ .index = index };
+        }
+        if (!allow_truncate) {
+            recoveryDebugLog("chosen slot_index={d} commit_sequence={d} (fallback rank={d}, read-only, no truncate)", .{ index, slot.commit_sequence, rank });
+            return .{ .index = index };
+        }
         const truncated_size = try checkpointPrefixSize(slot, header.page_size);
+        recoveryDebugLog("chosen slot_index={d} commit_sequence={d} (fallback rank={d}, truncating to {d} bytes)", .{ index, slot.commit_sequence, rank, truncated_size });
         try file.setLength(io, truncated_size);
         return .{ .index = index, .truncated_to = truncated_size };
     }

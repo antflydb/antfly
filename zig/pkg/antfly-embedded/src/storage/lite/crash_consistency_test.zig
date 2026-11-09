@@ -249,7 +249,7 @@ pub fn runCrashSweep(allocator: Allocator, scenario: Scenario, opts: SweepOption
                 report.runs += 1;
                 runOneCrash(allocator, scenario, barrier_seq, when, power_loss, &report) catch |err| {
                     const placeholder = Barrier{ .sequence = barrier_seq, .kind = .file_sync, .path = "" };
-                    try report.fail(placeholder, when, power_loss, "harness error: {s}", .{@errorName(err)});
+                    try report.fail(placeholder, when, power_loss, "scenario={s} harness error: {s}", .{ scenario.name, @errorName(err) });
                 };
             }
         }
@@ -289,7 +289,7 @@ fn runOneCrash(allocator: Allocator, scenario: Scenario, barrier_seq: u64, when:
         if (power_loss == .drop_unsynced) {
             sim.applyPowerLoss() catch |pl_err| {
                 const barrier = sim.crash_barrier orelse Barrier{ .sequence = barrier_seq, .kind = .file_sync, .path = "" };
-                try report.fail(barrier, when, power_loss, "applyPowerLoss failed: {s}", .{@errorName(pl_err)});
+                try report.fail(barrier, when, power_loss, "scenario={s} barrier_thread={d} applyPowerLoss failed: {s}", .{ scenario.name, barrier.thread_id, @errorName(pl_err) });
                 return;
             };
         }
@@ -323,11 +323,11 @@ fn checkInvariants(
         };
     } else if (scenario.via_db) {
         checkCheckpointsViaDb(allocator, path, outcome, checkpoints, scenario.search_index, scenario.search_field, scenario.retirement) catch |err| {
-            try report.fail(placeholder, when, power_loss, "db invariant check failed: {s}{s}", .{ @errorName(err), crash_note });
+            try report.fail(placeholder, when, power_loss, "scenario={s} barrier_thread={d} db invariant check failed: {s}{s}", .{ scenario.name, placeholder.thread_id, @errorName(err), crash_note });
         };
     } else {
         checkCheckpointsViaNative(allocator, path, outcome, checkpoints) catch |err| {
-            try report.fail(placeholder, when, power_loss, "native invariant check failed: {s}{s}", .{ @errorName(err), crash_note });
+            try report.fail(placeholder, when, power_loss, "scenario={s} barrier_thread={d} native invariant check failed: {s}{s}", .{ scenario.name, placeholder.thread_id, @errorName(err), crash_note });
         };
     }
 }
@@ -547,6 +547,7 @@ pub fn checkCheckpointsViaDb(
     var required = try finalAcknowledgedState(allocator, split.durable_acknowledged);
     defer required.deinit(allocator);
 
+    if (native.recovery_debug_log) std.debug.print("[native-recovery] >>> checkCheckpointsViaDb verification open path={s} crashed={}\n", .{ path, outcome != null });
     var handle = openDbWithIo(allocator, path, std.testing.io, false) catch |err| {
         if (required.count() != 0) return err;
         return;
@@ -2506,15 +2507,35 @@ test "crash sweep: commit failing after staging under a persistent io fault does
     const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
     const platform_time = @import("antfly_platform").time;
     const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    var hang_detected = false;
     while (!closer.done.load(.acquire)) {
-        if (platform_time.monotonicNs() >= deadline_ns) {
-            thread.detach();
-            return error.ShutdownHangDetected;
+        if (!hang_detected and platform_time.monotonicNs() >= deadline_ns) {
+            // `close()` is taking far longer than it should under a
+            // persistent fault -- that is the regression this test exists
+            // to catch, and it is reported below. But this thread still
+            // holds a reference to this function's own stack locals
+            // (`handle`, `sim`, `tmp`'s backing directory, `path`), all of
+            // which this function's own `defer`s would tear down the
+            // moment it returns. Previously this detached the thread and
+            // returned immediately, which let it keep running against a
+            // freed `SimIo` (and a deleted temp directory) for an
+            // unbounded time -- exactly the cross-scenario background-task
+            // leak `registerSelf` now fails loudly on in every *later*
+            // scenario's `SimIo.init`, not this one. Clear the fault
+            // instead: the retry loop(s) `close()` is stuck behind back
+            // off and retry every `retry_ms`, so clearing it lets the very
+            // next attempt succeed, and this loop keeps waiting
+            // (unboundedly, but only after the actual cause is gone) so
+            // this function never returns while `thread` can still touch
+            // its locals.
+            hang_detected = true;
+            sim.setIoFaultPlan(null);
         }
         std.Thread.yield() catch {};
     }
     thread.join();
     handle_open = false;
+    if (hang_detected) return error.ShutdownHangDetected;
 }
 
 pub fn reportFailures(report: *const SweepReport) !void {
@@ -3012,8 +3033,10 @@ const ride_along_steps: [ride_along_key_count * ride_along_round_count]RideAlong
 };
 
 fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    if (native.recovery_debug_log) std.debug.print("[native-recovery] === subrun start path={s} ===\n", .{path});
     var handle = try openDbWithIo(allocator, path, io, true);
     defer handle.close();
+    defer if (native.recovery_debug_log) std.debug.print("[native-recovery] === subrun end path={s} ===\n", .{path});
 
     // Reaches the same merge/retirement machinery the production repro
     // needed ~7,500 writes for in a handful of writes instead -- see the
@@ -3032,6 +3055,14 @@ fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const 
             .expectations = &.{.{ .key = step.key, .before = step.before, .after = step.after, .searchable_after = step.after }},
         });
         try handle.db.batch(.{ .writes = &.{.{ .key = step.key, .value = json }}, .sync_level = .full_index });
+        if (native.recovery_debug_log) if (handle.backend.native_docstore) |store| {
+            std.debug.print("[native-recovery] acked key={s} value={s} commit_sequence={d} durable_header_set={}\n", .{
+                step.key,
+                step.after,
+                store.file.activeCheckpoint().commit_sequence,
+                store.file.durable_header != null,
+            });
+        };
 
         // Mirrors production: a WS5 retirement turn driven explicitly here
         // (this harness bypasses the Owner/pool layer that normally drives
@@ -3043,6 +3074,16 @@ fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const 
 }
 
 test "crash sweep: sustained full_index writes survive a crash during ride-along merge and retirement" {
+    // Regression B investigation (AcknowledgedWriteLost under ride-along
+    // merge/retirement): scope native.zig's recovery instrumentation to
+    // just this scenario, so a failing run's checkpoint-candidate/verify
+    // trace and every ride-along-vs-durable commit's resulting sequence
+    // are directly in the test log instead of needing a separate
+    // instrumented rebuild.
+    const prior_recovery_log = native.recovery_debug_log;
+    native.recovery_debug_log = true;
+    defer native.recovery_debug_log = prior_recovery_log;
+
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "sustained-full-index-ride-along",
         .run = runSustainedFullIndexRideAlongUnderCrash,
