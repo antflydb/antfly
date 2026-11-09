@@ -23108,30 +23108,39 @@ fn implementationTests() type {
             }
         }
 
-        test "lsm manifest credits retain one descriptor when the complete long-key partition fits" {
+        test "lsm manifest credits remain additive across interleaved long-key cohorts" {
             const a = std.testing.allocator;
-            var state: State = .{};
-            defer state.deinit(a);
+            var prior: State = .{};
+            defer prior.deinit(a);
+            var incoming: State = .{};
+            defer incoming.deinit(a);
+            var combined: State = .{};
+            defer combined.deinit(a);
+            const value = try a.alloc(u8, 250 * 1024);
+            defer a.free(value);
+            @memset(value, 'v');
+            for ([_][]const u8{ "b", "h" }) |key| {
+                try prior.upsert(a, .{}, key, value, false);
+                try combined.upsert(a, .{}, key, value, false);
+            }
             var key: [16 * 1024]u8 = @splat('k');
-            for (0..6) |i| {
-                key[key.len - 1] = @intCast(i);
-                try state.upsert(a, .{}, &key, "value", false);
+            for ("acegik") |first| {
+                key[0] = first;
+                try incoming.upsert(a, .{}, &key, "value", false);
+                try combined.upsert(a, .{}, &key, "value", false);
             }
             var storage = storage_io.MemoryStorage.init(a);
             defer storage.deinit();
-            var backend = try Backend.open(a, "/manifest-credit-long-keys", .{
+            var backend = try Backend.open(a, "/manifest-credit-cohorts", .{
                 .storage = storage.storage(),
-                .max_run_file_bytes = 1024 * 1024,
+                .max_run_file_bytes = 512 * 1024,
                 .max_run_file_physical_bytes = 1024 * 1024,
             });
             defer backend.close();
-            const credit = try backend.prepareManifestCredit(&state, &@as(State, .{}));
-            // The conservative physical bound exceeds half the output cap,
-            // but the complete partition still fits one physical/logical run.
-            try std.testing.expectEqual(@as(u64, 128 + 192 + "/manifest-credit-long-keys".len + 2 * key.len), credit);
-            var outputs = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, &backend, &state, 0);
+            const credit = try backend.prepareManifestCredit(&prior, &@as(State, .{})) + try backend.prepareManifestCredit(&incoming, &@as(State, .{}));
+            var outputs = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, &backend, &combined, 0);
             defer compaction_mod.discardOutputRuns(Backend, &backend, &outputs);
-            try std.testing.expectEqual(@as(usize, 1), outputs.items.len);
+            try std.testing.expect(outputs.items.len > 1);
             const encoded = try repository_mod.encodeManifestAlloc(a, backend.next_run_id, outputs.items, &.{});
             defer a.free(encoded);
             try std.testing.expect(encoded.len <= credit);
