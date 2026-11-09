@@ -5883,7 +5883,7 @@ selected owners' full ranges then requires no catalog-sized allocation or scan;
 only the selected range bounds are copied into owner plans. The generation stays
 retained until initial capture completes.
 
-This changes private coordinator descriptors (kernel ABI 88 / runtime ABI 88).
+This changes private coordinator descriptors (kernel ABI 90 / runtime ABI 88).
 Native callback ABI 11 independently fences the graph table descriptor stride
 behind `Statement.tables`; older callbacks are rejected before payload access.
 The public JSON contract and shard query protocol are unchanged. Privacy-policy
@@ -6004,3 +6004,10 @@ rejection/withdrawal and the existing large relational sparse-predicate fixture.
 Internal routing-budget exhaustion retains temporary graph/SQL availability
 semantics (HTTP 503 and SQLSTATE 53300); it is never classified as malformed query
 syntax. Explicit execution deadlines and cancellation keep their own outcomes.
+
+The latest-main merge retains the equivalent upstream prepared-row receipt fix.
+Kernel ABI 90 combines main's aggregation-budget and checked-borrow changes with
+the certified graph descriptor domains; callback ABI 11 remains the graph stride
+fence. Authenticated three-metadata/three-data qualification passed all 77 Cypher
+checks: three warm reads each used one 114-byte routing token and no routing
+snapshot; a catalog revision change fetched a new snapshot before warm reuse.
