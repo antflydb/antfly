@@ -288,6 +288,7 @@ pub fn build(b: *std.Build) void {
             return std.mem.lessThan(u8, config.stringSlice(a.sub_path), config.stringSlice(c.sub_path));
         }
     }.lessThan);
+    profiles.retainCacheTargets(b, "cache-probe");
 }
 
 fn inferenceIdentityPath(b: *std.Build, module: *std.Build.Module, seen: *std.AutoHashMap(*std.Build.Module, void), path: []const u8) ?[]const u8 {

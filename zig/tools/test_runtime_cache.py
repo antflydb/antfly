@@ -607,6 +607,33 @@ class RuntimeCacheTest(unittest.TestCase):
                             self.build(target), rf"compile {artifact} debug \S+ cached"
                         )
 
+    def test_graph_audit_precedes_fixture_target_pruning(self):
+        help_output = self.build("--help")
+        for target in (
+            "cache-probe",
+            "lib-hash-test",
+            "sql-grammar-generated-check",
+            "regen-sql-grammar",
+            "check-snowball",
+            "regen-snowball",
+        ):
+            self.assertIn(target, help_output)
+        self.assertNotIn("lib-image-webp-bench", help_output)
+        # The WebP product target is absent from serialized fixture roots, but
+        # its entire graph must still be audited before it is discarded.
+        support = self.own("zig/lib/image/build_support.zig")
+        source = support.read_text()
+        original = "createWorkControlModule(b, root, target, .fast)"
+        self.assertEqual(source.count(original), 1)
+        support.write_text(
+            source.replace(original, "createWorkControlModule(b, root, target, .debug)")
+        )
+        failure = self.build("--help", succeeds=False)
+        self.assertIn(
+            "lib-image-webp-bench: runtime dependency uses debug, expected fast",
+            failure,
+        )
+
     def test_native_artifact_profiles(self):
         for source in ("zig/lib/audio/src/mod.zig", "zig/lib/linalg/src/mod.zig"):
             path = self.own(source)
