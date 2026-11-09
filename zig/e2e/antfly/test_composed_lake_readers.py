@@ -911,7 +911,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             time.sleep(6)
             profile_after = metrics()
             record_property(
-                "restart_immutable_io",
+                "slowest_lake_io_after_restart",
                 json.dumps(
                     {
                         name: value
@@ -991,16 +991,19 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 "cold_cache_startup_and_query_ms",
                 (time.monotonic() - cold_started) * 1000,
             )
-            # Preserve only the bounded request-owned diagnostic profile, not
+            # This is the slowest retained leaf profile since process start;
+            # its total identifies whether it corresponds to the measured cold
+            # request. Preserve that bounded diagnostic profile, not
             # a full process metrics dump or another timing series.
             time.sleep(6)
             record_property(
-                "cold_immutable_io",
+                "slowest_lake_io_after_cold",
                 json.dumps(
                     {
                         name: value
                         for name, value in metrics().items()
                         if name.startswith("antfly_lake_query_slowest_lake_io_")
+                        or name == "antfly_lake_query_slowest_lake_total_nanoseconds"
                     }
                 ),
             )
