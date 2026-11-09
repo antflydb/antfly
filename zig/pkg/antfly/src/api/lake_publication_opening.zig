@@ -257,6 +257,7 @@ const Worker = struct {
         // A seed worker always reads and hashes the entire optional bundle;
         // it never uses certificate shortcuts or needs another provider clock.
         try store.bindGenerationMap(self.publication.cloud_generations, token);
+        if (store.cloud_binding) |binding| try binding.reader.bindPublicationLocators(self.publication.opening_bundles);
         const bundle = self.bundle orelse {
             // Overlap map-root navigation with direct seed GETs. Otherwise
             // skipping the map here merely moves its cold miss into ranking.
@@ -294,8 +295,14 @@ const Loader = struct {
         const has_hint = for (self.publication.opening_bundles) |bundle| {
             if (bundle.provider_generation != null) break true;
         } else false;
+        const has_locators = for (self.publication.opening_bundles) |bundle| {
+            if (bundle.provider_locators.len != 0) break true;
+        } else false;
         const root_cost = 8 * 1024 * 1024;
-        if (has_hint and self.publication.cloud_generations != null) if (self.cached.context.io) |io| {
+        // Current bundles supply authenticated direct locators. Speculating on
+        // their entire map adds contention and an unnecessary joined teardown.
+        // Missing locators retain the normal authoritative demand fallback.
+        if (has_hint and !has_locators and self.publication.cloud_generations != null) if (self.cached.context.io) |io| {
             root_task = local.sql_parallel_scheduler.global().submitIo(io, root_cost, Worker.run, .{&root_work});
         };
         const wave_budget = parallel_budget - @as(usize, if (root_task != null) root_cost else 0);

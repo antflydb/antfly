@@ -233,11 +233,14 @@ headers, overlapping independent norms and postings through the existing bounded
 source queue. Native hydration sorts identity validation into physical order,
 plans 64-winner tiles and at most four column cursors per tile, then scatters
 values to ranked output positions. Selected Parquet hydration warms up to eight
-file footers and can split selected files into four disjoint cursor lanes. The
-page gatherer submits all admitted lanes before inline fallback, joins each wave
+file footers and can split selected files, or selected row groups within one
+file, into four disjoint cursor lanes. Point coordinates and bitmap blocks share
+group boundaries; a two-pass merge over sorted selections uses O(lanes) memory
+and never materializes the archive's group ordinals. The page gatherer submits all admitted lanes before inline fallback, joins each wave
 before result assembly, and cancels/joins outstanding work on failure. Returned
 column leases retain a stable synchronized allocator owner through final release.
-Single-file selections retain their column pipeline and serial cursor fallback.
+Single-group selections and declined worker admission retain the column pipeline
+and serial cursor fallback.
 
 Explicitly planned native spans avoid unrelated whole-pack expansion. Their
 speculative jobs share the request's eight-MiB conservative reservation allowance;
@@ -249,14 +252,15 @@ hits. Timers can overlap and are not an HTTP-attempt or billing count.
 Opening bundle descriptors can also carry the exact provider generation captured
 by the publication writer. That descriptor is authenticated with the publication
 and bound to its cloud-map identity. A private seed reader can fetch that one
-bundle without first walking the generation map; every other artifact still
-resolves through its normal map. Missing selectors retain the ordinary path.
+bundle without first walking the generation map; authenticated publication
+locators also resolve their exact artifacts directly. Missing selectors retain
+the ordinary map path.
 Absent selectors are omitted from serialization, preserving existing bundle and
 certificate wire shapes. The seed worker always reads and hashes the full bundle
 and does not repeat the parent's provider-clock/certificate admission.
 
-To avoid moving the skipped cold map lookup into ranking, bounded map-root warming
-runs alongside direct bundle fetches, using the same credential-scoped immutable
+For legacy bundles without publication locators, bounded map-root warming runs
+alongside direct bundle fetches, using the same credential-scoped immutable
 navigation pool. Its conservative 8 MiB admission reduces the bundle wave's
 allowance, keeping their combined cap at 32 MiB. It is optional and is canceled
 and joined when the required seed wave is ready. Independent stop flags interrupt
@@ -345,6 +349,31 @@ workers may host the same object table and contend through that protocol.
 
 Local worker affinity is a scheduling/cache optimization. Durable objects and
 fences determine correctness. Object tables have no data shard voters or leaders.
+
+
+Cold-query attribution retains at most 16 serial composed leaf calls, including
+failed calls and refills. Each records a numeric source slot, source kind,
+preparation count, binding/preparation/dispatch/ranking/hydration durations, and
+request-owned I/O deltas. No table names, paths, credentials, or reader owners
+escape into metrics. Elapsed phases overlap; peak-inflight I/O values are
+cumulative high-water marks rather than subtractable counters. Overflow is
+counted without growing diagnostic storage.
+
+Before first-page decoding, projected Parquet OffsetIndex ranges enter one
+bounded prefetch wave. Contiguous page indexes publish exact member cache
+aliases, as data-page envelopes do, so consumers do not reread each index.
+Unindexed selected-row hydration may probe a complete projected chunk up to
+256 KiB, subject to input and worker admission. Larger chunks and ordinary
+scans retain 64 KiB discovery; every encoded page remains independently
+validated. This policy bounds transfer amplification without assuming that a
+footer reveals the number of data pages.
+
+Opening-bundle workers bind the same publication-authenticated provider locators
+as demand readers. Publications carrying locators skip speculative map-root
+warming; a missing locator still uses authoritative map lookup. Legacy bundles
+retain map warming. These changes do not establish a sub-second cold-query
+result; candidate qualification must measure them separately from the earlier
+roughly five-second fixture.
 
 ## Storage binding and incarnation isolation
 

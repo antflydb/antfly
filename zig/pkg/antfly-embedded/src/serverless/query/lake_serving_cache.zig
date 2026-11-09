@@ -869,8 +869,10 @@ pub const Reader = struct {
                 members[length] = read;
                 length += 1;
             };
-            // Header/footer discovery retains its original interpretation.
-            const shared = length > 1 and envelope.purpose == .parquet_column_chunk;
+            // Page locations are opaque versioned ranges just like data.
+            // Publish member aliases, or demand would fetch every index again
+            // after the coalesced envelope completed.
+            const shared = length > 1 and (envelope.purpose == .parquet_column_chunk or envelope.purpose == .parquet_page_index);
             try self.prefetchImpl(&.{envelope}, null, 0, if (shared) members[0..length] else &.{});
         }
     }
@@ -2201,7 +2203,7 @@ test "external lake verified slice admission retains denied ownership and copies
     try std.testing.expectError(error.ArtifactIntegrityMismatch, Cache.VerifiedBytes.authenticate("corrupt", digest));
 }
 
-test "external lake prefetch coalesces adjacent pages with shared bounded lease slices" {
+test "external lake bounded window profiles prefetch coalesces adjacent pages and locations with shared bounded lease slices" {
     const storage = @import("../../storage/object_storage.zig");
     const a = std.testing.allocator;
     var memory = storage.MemoryObjectStorage.init(a);
@@ -2224,39 +2226,42 @@ test "external lake prefetch coalesces adjacent pages with shared bounded lease 
     };
     var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
     provider.vtable.get_object = Provider.get;
-    var cache = Cache.initWithMemoryLimit(a, 64);
-    defer cache.deinit();
-    var scheduler: Reader.Scheduling.Scheduler = .{ .max_io_workers = 8, .max_bytes = 128 };
-    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io }, .scheduler = &scheduler };
-    defer reader.drain(true);
-    const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "pages", .byte_len = 16, .version = .{ .etag = put.etag.? } };
-    const reads = [_]ranges.RangeRead{
-        .{ .object = object, .range = .{ .offset = 0, .len = 4 }, .purpose = .parquet_column_chunk },
-        .{ .object = object, .range = .{ .offset = 4, .len = 4 }, .purpose = .parquet_column_chunk },
-        // The gap is never fetched speculatively.
-        .{ .object = object, .range = .{ .offset = 12, .len = 4 }, .purpose = .parquet_column_chunk },
-    };
-    try reader.prefetch(&reads);
-    // Required reads wait on member flights, then borrow their exact slices.
-    const first = try Reader.readLease(&reader, a, reads[0]);
-    defer first.release();
-    const second = try Reader.readLease(&reader, a, reads[1]);
-    defer second.release();
-    reader.drain(false);
-    try std.testing.expectEqual(@as(usize, 2), provider.calls.load(.acquire));
-    try std.testing.expectEqualStrings("abcd", first.bytes);
-    try std.testing.expectEqualStrings("efgh", second.bytes);
-    try std.testing.expectEqual(@intFromPtr(first.bytes.ptr) + 4, @intFromPtr(second.bytes.ptr));
-    try std.testing.expect(cache.snapshot().stored_bytes <= cache.max_bytes);
-    // A hot envelope is not fetched again, and pinned slices survive pressure.
-    try reader.prefetch(&reads);
-    reader.drain(false);
-    cache.max_bytes = 16;
-    try cache.store("pressure", "0123456789abcdef");
-    try std.testing.expectEqualStrings("efgh", second.bytes);
-    try std.testing.expectEqual(@as(usize, 2), provider.calls.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), cache.flights.count());
-    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    for ([_]ranges.RangePurpose{ .parquet_column_chunk, .parquet_page_index }) |purpose| {
+        provider.calls.store(0, .release);
+        var cache = Cache.initWithMemoryLimit(a, 64);
+        defer cache.deinit();
+        var scheduler: Reader.Scheduling.Scheduler = .{ .max_io_workers = 8, .max_bytes = 128 };
+        var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io }, .scheduler = &scheduler };
+        defer reader.drain(true);
+        const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "pages", .byte_len = 16, .version = .{ .etag = put.etag.? } };
+        const reads = [_]ranges.RangeRead{
+            .{ .object = object, .range = .{ .offset = 0, .len = 4 }, .purpose = purpose },
+            .{ .object = object, .range = .{ .offset = 4, .len = 4 }, .purpose = purpose },
+            // The gap is never fetched speculatively.
+            .{ .object = object, .range = .{ .offset = 12, .len = 4 }, .purpose = purpose },
+        };
+        try reader.prefetch(&reads);
+        // Required reads wait on member flights, then borrow their exact slices.
+        const first = try Reader.readLease(&reader, a, reads[0]);
+        defer first.release();
+        const second = try Reader.readLease(&reader, a, reads[1]);
+        defer second.release();
+        reader.drain(false);
+        try std.testing.expectEqual(@as(usize, 2), provider.calls.load(.acquire));
+        try std.testing.expectEqualStrings("abcd", first.bytes);
+        try std.testing.expectEqualStrings("efgh", second.bytes);
+        try std.testing.expectEqual(@intFromPtr(first.bytes.ptr) + 4, @intFromPtr(second.bytes.ptr));
+        try std.testing.expect(cache.snapshot().stored_bytes <= cache.max_bytes);
+        // A hot envelope is not fetched again, and pinned slices survive pressure.
+        try reader.prefetch(&reads);
+        reader.drain(false);
+        cache.max_bytes = 16;
+        try cache.store("pressure", "0123456789abcdef");
+        try std.testing.expectEqualStrings("efgh", second.bytes);
+        try std.testing.expectEqual(@as(usize, 2), provider.calls.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), cache.flights.count());
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    }
 }
 
 test "external lake coalesced prefetch reuses persisted page entries after restart" {

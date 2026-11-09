@@ -43,6 +43,10 @@ pub const Cursor = struct {
     shared_reader: ?*@import("lake_serving_cache.zig").Reader = null,
     scheduler: ?*@import("../../sql/parallel_scheduler.zig").Scheduler = null,
     speculative: bool = false,
+    /// Explicit winning-row hydration may amortize a small unindexed chunk's
+    /// first header with its payload. Ordinary scans keep conservative probes.
+    selected_hydration: bool = false,
+    navigation_prefetched: bool = false,
     dictionary_decodes: usize = 0,
     pages_decoded: usize = 0,
     output: std.heap.ArenaAllocator,
@@ -611,6 +615,36 @@ pub const Cursor = struct {
         _ = try parquet.admitColumnMaterialization(count, 1, admission);
         return lease;
     }
+    fn probeLimit(self: *const Cursor, column: *const Column) usize {
+        const lanes = @max(@as(usize, 1), @min(4, self.columns.len));
+        const budget = @max(@as(usize, 1), self.limits.max_input_bytes / lanes);
+        const reader = self.shared_reader orelse return 512;
+        if (reader.context.trace == null or reader.cache.max_bytes < 8 * 1024 * 1024) return 512;
+        // A footer supplies this length; cap amplification and transient input
+        // before scheduling. Large/multi-page chunks retain normal discovery.
+        const limit: usize = if (self.selected_hydration and column.chunk.compressed_len <= 256 * 1024) 256 * 1024 else 64 * 1024;
+        return @min(limit, budget);
+    }
+    fn prefetchNavigation(self: *Cursor) !void {
+        if (self.navigation_prefetched) return;
+        self.navigation_prefetched = true;
+        const reader = self.shared_reader orelse return;
+        var reads: [8]ranges.RangeRead = undefined;
+        var count: usize = 0;
+        const budget = self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len);
+        for (self.columns) |column| {
+            if (count == reads.len) break;
+            if (self.filter != null and !column.required) continue;
+            const offset = column.chunk.offset_index_offset orelse continue;
+            const length = column.chunk.offset_index_length orelse continue;
+            if (length > budget) continue;
+            reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = length }, .purpose = .parquet_page_index };
+            count += 1;
+        }
+        // Batch all projected page locations before column workers discover
+        // their first survivor. Demand still validates every offset and header.
+        try reader.prefetch(reads[0..count]);
+    }
     fn headerRead(self: *Cursor, column: *const Column) !HeaderRead {
         if (self.limits.max_input_bytes == 0) return error.ParquetPageTooLarge;
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
@@ -633,9 +667,7 @@ pub const Cursor = struct {
         // A serving request with bounded byte read-ahead can amortize its
         // first header and following payload. Tiny probes force another GET
         // even when the entire projected chunk fits in the admitted buffer.
-        const lanes = @max(@as(usize, 1), @min(4, self.columns.len));
-        const probe_budget = @max(@as(usize, 1), self.limits.max_input_bytes / lanes);
-        const probe_limit: usize = if (self.shared_reader) |reader| if (reader.context.trace != null and reader.cache.max_bytes >= 8 * 1024 * 1024) @min(64 * 1024, probe_budget) else 512 else 512;
+        const probe_limit = self.probeLimit(column);
         var probe_size: usize = @intCast(@min(end - column.offset, @min(self.limits.max_input_bytes, probe_limit)));
         while (true) {
             const probe_lease = try self.read(column.offset, probe_size);
@@ -643,7 +675,7 @@ pub const Cursor = struct {
             const probe = probe_lease.bytes;
             const parsed = page.parsePageHeader(probe) catch |err| {
                 const next_size = @min(end - column.offset, @min(probe_size * 2, @min(self.limits.max_input_bytes, 64 * 1024)));
-                if (next_size == probe_size) return err;
+                if (next_size <= probe_size) return err;
                 probe_lease.release();
                 probe_size = @intCast(next_size);
                 continue;
@@ -749,9 +781,10 @@ pub const Cursor = struct {
     }
     fn headerWorkspace(self: *Cursor, column: *const Column) usize {
         // Discovery performs no payload I/O for OffsetIndex ranges. Other
-        // headers probe at most 64 KiB; every larger payload is admitted later.
+        // Ordinary headers probe at most 64 KiB; selected small chunks can
+        // consume 256 KiB. Charge the actual policy before dispatch.
         const end = column.chunk.file_offset +| column.chunk.compressed_len;
-        const probe: usize = @intCast(@min(end -| column.offset, @min(self.limits.max_input_bytes, 64 * 1024)));
+        const probe: usize = @intCast(@min(end -| column.offset, @min(self.limits.max_input_bytes, @max(64 * 1024, self.probeLimit(column)))));
         const index: usize = if (column.index_loaded) 0 else @min(
             @as(usize, column.chunk.offset_index_length orelse 0) +| (column.chunk.column_index_length orelse 0),
             self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len),
@@ -1042,6 +1075,9 @@ pub const Cursor = struct {
         return .{ .snapshot = binding.snapshot(), .external_span = .{ .first = first.external, .count = count }, .columns = vectors.items };
     }
     pub fn next(self: *Cursor) !?types.ColumnBatch {
+        self.prefetchNavigation() catch {
+            if (self.shared_reader) |reader| try reader.context.ensureActive();
+        };
         const end = @min(self.group.row_count, self.row_end orelse self.group.row_count);
         while (self.position < end) {
             _ = self.output.reset(.free_all);

@@ -80,6 +80,40 @@ pub const Navigation = struct {
 pub const ComposedProfile = struct {
     nanoseconds: [count]u64 = @splat(0),
     io: local.serverless_query_lake_read_context.IoTrace.Snapshot = .{},
+    leaves: [16]Leaf = @splat(.{}),
+    leaf_count: usize = 0,
+    leaf_overflow: u64 = 0,
+    pub const Leaf = struct {
+        source: u64 = 0, // Request-local hash only; never exported.
+        source_slot: usize = 0,
+        repeated: bool = false,
+        kind: enum { unknown, native, object, read_only_lake, writable_lake } = .unknown,
+        total_ns: u64 = 0,
+        binding_ns: u64 = 0,
+        dispatch_ns: u64 = 0,
+        preparation_ns: u64 = 0,
+        preparations: u64 = 0,
+        ranking_ns: u64 = 0,
+        hydration_ns: u64 = 0,
+        io: local.serverless_query_lake_read_context.IoTrace.Snapshot = .{},
+    };
+    pub fn beginLeaf(self: *ComposedProfile, name: []const u8) ?*Leaf {
+        if (self.leaf_count == self.leaves.len) {
+            self.leaf_overflow +|= 1;
+            return null;
+        }
+        const hash = std.hash.Wyhash.hash(0, name);
+        var value: Leaf = .{ .source = hash, .source_slot = self.leaf_count };
+        for (self.leaves[0..self.leaf_count]) |prior| if (prior.source == hash) {
+            value.source_slot = prior.source_slot;
+            value.repeated = true;
+            break;
+        };
+        const result = &self.leaves[self.leaf_count];
+        result.* = value;
+        self.leaf_count += 1;
+        return result;
+    }
     pub fn record(self: *ComposedProfile, metrics: *Metrics, phase: Phase, start: u64) void {
         self.add(metrics, phase, @import("antfly_platform").time.monotonicNs() -| start);
     }
@@ -317,6 +351,21 @@ pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: any
         inline for (.{ "total", "definition", "leaf", "native_leaf", "cursor" }) |phase| {
             try prom.appendPromMetric(writer, "antfly_lake_query_slowest_composed_" ++ phase ++ "_nanoseconds", "gauge", "Request-local phase of the slowest composed request above 750 ms since startup; nested phases overlap", profile.duration(@field(Phase, "composed_" ++ phase)));
         }
+        try prom.appendPromMetric(writer, "antfly_lake_query_slowest_composed_leaf_overflow", "gauge", "Leaf calls exceeding the bounded request-local diagnostic slots", profile.leaf_overflow);
+        for (profile.leaves[0..profile.leaf_count], 0..) |leaf, i| {
+            var name_buffer: [192]u8 = undefined;
+            inline for (.{ "total_ns", "binding_ns", "dispatch_ns", "preparation_ns", "preparations", "ranking_ns", "hydration_ns", "source_slot", "repeated" }) |field| {
+                const metric = try std.fmt.bufPrint(&name_buffer, "antfly_lake_query_slowest_composed_call_{d}_{s}", .{ i, field });
+                const value: u64 = if (comptime std.mem.eql(u8, field, "repeated")) @intFromBool(leaf.repeated) else @intCast(@field(leaf, field));
+                try prom.appendPromMetric(writer, metric, "gauge", "Bounded request-local leaf call; source slots contain no names", value);
+            }
+            const kind_metric = try std.fmt.bufPrint(&name_buffer, "antfly_lake_query_slowest_composed_call_{d}_kind_{s}", .{ i, @tagName(leaf.kind) });
+            try prom.appendPromMetric(writer, kind_metric, "gauge", "Bounded leaf source kind", 1);
+            inline for (@typeInfo(local.serverless_query_lake_read_context.IoTrace.Snapshot).@"struct".field_names) |field| {
+                const metric = try std.fmt.bufPrint(&name_buffer, "antfly_lake_query_slowest_composed_call_{d}_io_{s}", .{ i, field });
+                try prom.appendPromMetric(writer, metric, "gauge", "Leaf-owned lake I/O; parallel elapsed sums overlap", @field(leaf.io, field));
+            }
+        }
         try prom.appendPromMetric(writer, "antfly_lake_query_slowest_composed_composition_nanoseconds", "gauge", "Slowest composed request remainder after definition, leaves and cursor; native overlaps leaves", profile.composition());
     }
 }
@@ -494,4 +543,30 @@ test "external lake metrics expose fallback and disk write reasons without paths
         try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_composed_" ++ phase ++ "_calls_total 1") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_composed_" ++ phase ++ "_nanoseconds_total ") != null);
     }
+}
+
+test "external lake bounded window profiles retain each refill without cross-request attribution" {
+    var profile: ComposedProfile = .{};
+    var other: ComposedProfile = .{};
+    const first = profile.beginLeaf("archive").?;
+    first.total_ns = 123;
+    _ = profile.beginLeaf("recent");
+    const refill = profile.beginLeaf("archive").?;
+    refill.dispatch_ns = 456;
+    try std.testing.expect(refill.repeated);
+    try std.testing.expectEqual(@as(usize, 0), refill.source_slot);
+    try std.testing.expect(!other.beginLeaf("archive").?.repeated);
+    while (profile.leaf_count < profile.leaves.len) _ = profile.beginLeaf("recent");
+    try std.testing.expect(profile.beginLeaf("overflow") == null);
+    try std.testing.expectEqual(@as(u64, 1), profile.leaf_overflow);
+    try std.testing.expectEqual(@as(u64, 123), profile.leaves[0].total_ns);
+    try std.testing.expectEqual(@as(u64, 456), profile.leaves[2].dispatch_ns);
+    var metrics: Metrics = .{};
+    profile.add(&metrics, .composed_total, std.time.ns_per_s);
+    metrics.retainSlow(profile);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try append(&output.writer, local.serverless_query_lake_serving_cache.Cache.Stats{}, @as(?local.serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats, null), metrics.snapshot());
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "composed_call_2_repeated 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "archive") == null);
 }

@@ -23297,6 +23297,14 @@ pub const ApiHttpServer = struct {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
                     const leaf_started = @import("antfly_platform").time.monotonicNs();
                     defer runner.profile.record(&runner.server.lake_query_metrics, .composed_leaf, leaf_started);
+                    const leaf_profile = runner.profile.beginLeaf(name);
+                    runner.lake_scope.active_leaf = leaf_profile;
+                    defer runner.lake_scope.active_leaf = null;
+                    const io_before = runner.lake_scope.ioSnapshot();
+                    defer if (leaf_profile) |leaf| {
+                        leaf.total_ns = @import("antfly_platform").time.monotonicNs() -| leaf_started;
+                        leaf.io = runner.lake_scope.ioSnapshot().since(io_before);
+                    };
                     if (!admittedTablePermissionAllowed(runner.identity, name, .read)) return contextual_operations.jsonErrorAlloc(a, 403, "forbidden");
                     var arena = std.heap.ArenaAllocator.init(a);
                     defer arena.deinit();
@@ -23312,7 +23320,13 @@ pub const ApiHttpServer = struct {
                     defer if (identity) |*owned| owned.deinit(a);
                     var resolver = CatalogQueryResolver{ .arena = scratch, .lake_scope = &runner.lake_scope };
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = runner.deadline, .cancellation = if (runner.cancellation) |cancel| cancel.token() else .none };
-                    var binding = runner.server.bindCatalogQuery(a, context, name, leaf_query, &identity, &resolver) catch |err| return runner.server.publicQueryOperationErrorResponse(name, leaf_query, err);
+                    var binding = binding: {
+                        const started = @import("antfly_platform").time.monotonicNs();
+                        defer if (leaf_profile) |leaf| {
+                            leaf.binding_ns = @import("antfly_platform").time.monotonicNs() -| started;
+                        };
+                        break :binding runner.server.bindCatalogQuery(a, context, name, leaf_query, &identity, &resolver) catch |err| return runner.server.publicQueryOperationErrorResponse(name, leaf_query, err);
+                    };
                     defer binding.deinit();
                     var before = (try runner.server.source.linearizableSnapshot(context)) orelse return error.UnsupportedQueryRequest;
                     defer runner.server.source.freeAdminSnapshot(&before);
@@ -23322,6 +23336,7 @@ pub const ApiHttpServer = struct {
                     if (runner.overlay and policy != null) return error.UnsupportedQueryRequest;
                     var native_query = binding.bound_body orelse leaf_query;
                     const external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(scratch, bound.schema_json);
+                    if (leaf_profile) |leaf| leaf.kind = if (bound.storage.engine == .object) .object else if (external) |source| if (source.binding.write_policy == .read_only) .read_only_lake else .writable_lake else .native;
                     if (bound.storage.engine != .object and external == null) {
                         var request = try std.json.parseFromSliceLeaky(std.json.Value, scratch, native_query, .{ .parse_numbers = false });
                         if (!request.object.contains("remote_snapshot")) {
@@ -23336,6 +23351,9 @@ pub const ApiHttpServer = struct {
                     }
                     var response = response: {
                         const native_started = @import("antfly_platform").time.monotonicNs();
+                        defer if (leaf_profile) |leaf| {
+                            leaf.dispatch_ns = @import("antfly_platform").time.monotonicNs() -| native_started;
+                        };
                         defer if (bound.storage.engine != .object and external == null)
                             runner.profile.record(&runner.server.lake_query_metrics, .composed_native_leaf, native_started);
                         break :response try runner.server.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, native_query, null, identity, runner.cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);

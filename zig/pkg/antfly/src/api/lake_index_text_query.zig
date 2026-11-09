@@ -104,6 +104,9 @@ pub fn reconcileRecent(a: A, server: *server_api.ApiHttpServer, table: local.com
 /// One bounded owner per composed request. Tables remain authorized and bound
 /// by the HTTP runner on every leaf; only immutable, cut-bound readers are shared.
 pub const Scope = struct {
+    // Borrowed only during a serial composed leaf callback; never retained by
+    // prepared readers, jobs, caches or returned pages.
+    active_leaf: ?*@import("lake_query_metrics.zig").ComposedProfile.Leaf = null,
     read_ahead_budget: local.serverless_query_lake_read_context.ReadAheadBudget = .{},
     io: local.serverless_query_lake_read_context.IoTrace.Snapshot = .{},
     budget: local.sql_memory_budget,
@@ -596,7 +599,10 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     var trace_owner: ?*const Prepared = null;
     defer if (is_lake) {
         request_profile.record(&server.lake_query_metrics, .total, total_started);
-        if (scope) |owner| owner.recordIo(trace_owner, request_profile.io);
+        if (scope) |owner| {
+            owner.recordIo(trace_owner, request_profile.io);
+            if (owner.active_leaf) |leaf| leaf.ranking_ns +|= request_profile.nanoseconds[@backingInt(@import("lake_query_metrics.zig").Phase.ranking)];
+        }
         server.lake_query_metrics.retainSlowLake(request_profile);
     };
     // The public full_text_index selector normalizes one text query into a
@@ -611,7 +617,16 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         if (req.full_text != null and req.query != .match_all) return error.UnsupportedQueryRequest;
     }
     const cache = shared != null and reused == null and shared.?.len < shared.?.entries.len;
-    const prepared = reused orelse (try prepare(if (cache) shared.?.budget.allocator() else a, server, current_table, req, request, &request_profile, &is_lake, !build_recent) orelse return null);
+    const prepared = reused orelse prepared: {
+        const started = @import("antfly_platform").time.monotonicNs();
+        defer if (is_lake) {
+            if (scope) |owner| if (owner.active_leaf) |leaf| {
+                leaf.preparation_ns +|= @import("antfly_platform").time.monotonicNs() -| started;
+                leaf.preparations +|= 1;
+            };
+        };
+        break :prepared try prepare(if (cache) shared.?.budget.allocator() else a, server, current_table, req, request, &request_profile, &is_lake, !build_recent) orelse return null;
+    };
     if (scope) |owner| prepared.io_trace.read_ahead_shared = &owner.read_ahead_budget;
     trace_owner = prepared;
     if (cache) {
@@ -676,6 +691,9 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     // the shared reader after this leaf returns.
     var execution_overlay = prepared.overlay;
     var owner: Execution = .{ .prepared_reader = if (shared != null) prepared else null, .server = server, .table = sql_table, .source = source, .store = store, .domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.table_id, store.identity, selected.publication().namespace), .declarations = selected.publication().declarations, .context = context, .request = normalized, .schema_json = table.schema_json, .arena = ca, .result_allocator = a, .overlay = if (execution_overlay != null) &execution_overlay.? else null, .wal_cut = if (prepared.wal_cut != null) &prepared.wal_cut.? else null };
+    defer if (scope) |request_scope| if (request_scope.active_leaf) |leaf| {
+        leaf.hydration_ns +|= owner.hydration_ns;
+    };
     defer owner.deinit();
     var proof: @import("lake_index_row_source.zig").Provider = .{ .source = source, .context = context, .expected_delete_objects = selected.delete_objects };
     if (selected.publication().source_navigation) |ref| {
