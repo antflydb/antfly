@@ -15,13 +15,19 @@ order: 8
 ## Install the macOS example
 
 [Download Antfly Dictation v0.1.0-beta.1 for Apple Silicon](https://releases.antfly.io/antfly-dictation/releases/0.1.0-beta.1/Antfly-Dictation-0.1.0-beta.1-arm64.zip)
-when the signed beta release is published. Unzip it, move **Antfly Dictation.app**
+is available now. Unzip it, move **Antfly Dictation.app**
 to Applications, and open it. Allow microphone and Accessibility access for the
 Fn/Globe shortcut and automatic paste. **On this Mac** uses the included Antfly
 runtime; ready Apple Speech is selected automatically, with Whisper Tiny available
 as a download. Use **Check for Updates…** for subsequent app releases.
 
 See the [example setup and configuration](https://github.com/antflydb/antfly/tree/main/examples/dictation).
+
+The desktop example handles “new line” and “new paragraph” locally, including
+without a cleanup generator. Settings → Voice formatting controls spoken breaks
+and spaces between separate insertions. A trailing “press enter” command is a
+separate opt-in: it can submit a message and requires a confirmed paste into the
+original field. See the example README for supported commands and limitations.
 
 ## The Result
 

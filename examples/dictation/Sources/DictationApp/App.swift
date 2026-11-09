@@ -205,6 +205,30 @@ struct SettingsView: View {
           Toggle("Press to toggle recording instead of hold to talk", isOn: $store.config.toggle)
           Toggle("Paste into the original focused text field", isOn: $store.config.autoPaste)
         }
+        Section("Voice formatting") {
+          Toggle(
+            "Spoken line and paragraph breaks",
+            isOn: Binding(
+              get: { store.config.usesVoiceFormatting }, set: { store.config.voiceFormatting = $0 })
+          )
+          Text(
+            "Say new line, next line, line break, skip a line, or new paragraph. Works without a cleanup model. Quote a phrase to keep it literal, or turn this off for literal dictation."
+          )
+          .font(.caption).foregroundStyle(.secondary)
+          Toggle(
+            "Add spaces around inserted dictation",
+            isOn: Binding(
+              get: { store.config.usesSmartSpacing }, set: { store.config.smartSpacing = $0 }))
+          Toggle(
+            "Allow a trailing ‘press enter’ voice command",
+            isOn: Binding(
+              get: { store.config.usesPressEnterCommand },
+              set: { store.config.pressEnterCommand = $0 }))
+          Text(
+            "Off by default. Ending dictation with press enter can send a message or submit a prompt. Enter is sent only after insertion is confirmed in the original text field."
+          )
+          .font(.caption).foregroundStyle(.secondary)
+        }
         UpdateSettings(updates: updates)
         Section("Retention") {
           Toggle("Save transcript history locally and in Antfly", isOn: $store.config.retainHistory)

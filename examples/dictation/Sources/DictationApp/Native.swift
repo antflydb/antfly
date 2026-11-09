@@ -421,10 +421,67 @@ final class CaptureConverter: @unchecked Sendable {
   static func finishPendingPaste() async {
     await DesktopClipboard.shared.finishRestoration()
   }
-  func paste(_ text: String, validate: @MainActor () throws -> Void = {}) async throws {
+  private func selectedRange() -> CFRange? {
+    guard let element else { return nil }
+    var value: CFTypeRef?
+    guard
+      AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value)
+        == .success,
+      let value, CFGetTypeID(value) == AXValueGetTypeID()
+    else { return nil }
+    let rangeValue = unsafeDowncast(value, to: AXValue.self)
+    var range = CFRange()
+    guard AXValueGetType(rangeValue) == .cfRange, AXValueGetValue(rangeValue, .cfRange, &range),
+      range.location >= 0, range.length >= 0, range.location <= Int.max - range.length
+    else { return nil }
+    return range
+  }
+  private func text(in range: CFRange) -> String? {
+    guard let element, range.location >= 0, range.length > 0 else { return nil }
+    var range = range
+    guard let parameter = AXValueCreate(.cfRange, &range) else { return nil }
+    var result: CFTypeRef?
+    if AXUIElementCopyParameterizedAttributeValue(
+      element, kAXStringForRangeParameterizedAttribute as CFString,
+      parameter, &result) == .success, let text = result as? String
+    {
+      return text
+    }
+    // Some web fields expose AXValue but not AXStringForRange. Avoid reading
+    // large documents just to determine spacing or to confirm a paste.
+    var count: CFTypeRef?
+    guard
+      AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &count)
+        == .success,
+      let length = count as? Int, length <= 65536,
+      range.location <= length, range.length <= length - range.location
+    else { return nil }
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success,
+      let value = value as? String
+    else { return nil }
+    let string = value as NSString
+    guard range.location <= string.length, range.length <= string.length - range.location else {
+      return nil
+    }
+    return string.substring(with: NSRange(location: range.location, length: range.length))
+  }
+  func paste(
+    _ text: String, smartSpacing: Bool = false, pressEnter: Bool = false,
+    validate: @MainActor () throws -> Void = {}
+  ) async throws {
     try validate()
     try validatePasteTarget()
-    try await DesktopClipboard.shared.paste(text) {
+    let selection = selectedRange()
+    var inserted = text
+    if smartSpacing, let selection, selection.length == 0 {
+      let before =
+        selection.location > 0
+        ? self.text(in: CFRange(location: selection.location - 1, length: 1)) ?? "" : ""
+      let after = self.text(in: CFRange(location: selection.location, length: 1)) ?? ""
+      inserted = VoiceFormatting.spaced(text, before: before, after: after)
+    }
+    try await DesktopClipboard.shared.paste(inserted) {
       try validate()
       try validatePasteTarget()
       guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
@@ -434,6 +491,36 @@ final class CaptureConverter: @unchecked Sendable {
       up.flags = .maskCommand
       down.post(tap: .cghidEventTap)
       up.post(tap: .cghidEventTap)
+    }
+    if pressEnter {
+      guard let selection else {
+        throw DictationError.invalid(
+          "Paste sent; Enter was not sent because the target cannot confirm insertion.")
+      }
+      let length = inserted.utf16.count
+      guard selection.location <= Int.max - length else {
+        throw DictationError.invalid("Invalid insertion range.")
+      }
+      try await PasteConfirmation.wait(
+        validate: {
+          try validate()
+          try validatePasteTarget()
+        },
+        confirmed: {
+          guard let current = selectedRange(), current.length == 0,
+            current.location == selection.location + length
+          else { return false }
+          return self.text(in: CFRange(location: selection.location, length: length)) == inserted
+        })
+      try validate()
+      try validatePasteTarget()
+      guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true),
+        let up = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: false)
+      else { throw DictationError.invalid("Paste sent; cannot generate Enter event.") }
+      down.flags = []
+      up.flags = []
+      down.postToPid(pid)
+      up.postToPid(pid)
     }
   }
 }

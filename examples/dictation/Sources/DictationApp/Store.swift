@@ -703,6 +703,12 @@ import SwiftUI
         output.timing?.afterRelease = ProcessInfo.processInfo.systemUptime - released
         try Task.checkCancellation()
         guard generation == run else { return }
+        // Only recognition can request a key action; generated text cannot.
+        let formatted = VoiceFormatting.finalize(
+          raw: output.raw, text: output.text,
+          commands: snapshot.usesVoiceFormatting, pressEnter: snapshot.usesPressEnterCommand)
+        output.text = formatted.text
+        let pressEnter = formatted.pressEnter
         result = output.text
         preview = output.raw
         draft = ""
@@ -710,14 +716,23 @@ import SwiftUI
         canRecoverRaw = false
         var status = "ready"
         if snapshot.autoPaste
-          && !output.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          && !output.text.isEmpty
         {
           if let destination {
             do {
-              try await destination.paste(output.text)
+              try await destination.paste(
+                output.text, smartSpacing: snapshot.usesSmartSpacing,
+                pressEnter: pressEnter,
+                validate: {
+                  try Task.checkCancellation()
+                  guard self.generation == run else { throw CancellationError() }
+                })
               guard generation == run, !Task.isCancelled else { return }
-              status = "paste_sent"
-              message = "Paste sent. Transcript remains available to copy."
+              status = pressEnter ? "enter_sent" : "paste_sent"
+              message =
+                pressEnter
+                ? "Paste confirmed; Enter sent. Transcript remains available to copy."
+                : "Paste sent. Transcript remains available to copy."
             } catch {
               guard generation == run, !Task.isCancelled else { return }
               status = "insertion_failed"
@@ -745,7 +760,9 @@ import SwiftUI
         phase =
           output.raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .noSpeech : .ready
         if phase == .noSpeech { message = phase.label }
-        if status == "paste_sent" || phase == .noSpeech { dismissOverlayLater() }
+        if status == "paste_sent" || status == "enter_sent" || phase == .noSpeech {
+          dismissOverlayLater()
+        }
       } catch {
         guard generation == run else { return }
         state = .idle

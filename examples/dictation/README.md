@@ -18,7 +18,6 @@ Official releases are Apple Silicon ZIPs containing a signed, notarized app and
 its pinned Antfly runtime.
 
 [Download v0.1.0-beta.1 for Apple Silicon](https://releases.antfly.io/antfly-dictation/releases/0.1.0-beta.1/Antfly-Dictation-0.1.0-beta.1-arm64.zip).
-The download becomes available when the signed beta release completes.
 
 After downloading:
 
@@ -35,6 +34,38 @@ updates. App updates include the bundled engine and preserve settings, models,
 history, and Keychain credentials. The public Dictation download channels require
 the first signed app release; publishing an Antfly engine release alone does not
 publish the app. See [release activation and installation](UPDATES.md).
+
+## Voice formatting and insertion
+
+Voice formatting runs locally and does not require a cleanup generator. In
+Settings → Voice formatting, spoken breaks and insertion spacing default on:
+
+| Say | Inserted text |
+| --- | --- |
+| new line, next line, line break, skip a line | One line break |
+| new paragraph, start a new paragraph | A blank line between paragraphs |
+
+Commands can be spoken alone. Quoted phrases are preserved as literal text; turn
+spoken formatting off when dictating text that discusses these commands. This is
+a deterministic English command vocabulary, so unquoted occurrences are treated
+as commands. It does not reproduce every Wispr Flow editing or formatting feature.
+Recognition/cleanup supplies punctuation; insertion adds boundary spaces when
+Accessibility exposes the surrounding text. Existing spaces, newlines, punctuation,
+selected-text replacements, and CJK boundaries are preserved. It reads small Accessibility ranges, with a bounded fallback for small text fields.
+Surrounding text is never stored; unsupported fields keep the transcript unchanged.
+
+**Allow a trailing ‘press enter’ voice command** is off by default. Enabling it
+allows a terminal **press enter** in recognized speech to send Return after the
+text is pasted. This can send a message or submit a prompt. Mid-sentence and quoted
+occurrences stay literal; generated text cannot trigger it. A command-only
+“press enter” does not send a key without a nonempty insertion. The app verifies
+the original app and text field, observes the expected text and cursor after the
+paste, and rechecks focus and cancellation before sending Return. If verification
+is unavailable or times out, text remains pasted and Enter is not sent. Copy,
+history, and original-transcript recovery never replay key actions.
+
+These features implement the common spacing/break/Enter workflow in Wispr Flow;
+they do not add recognition vocabulary bias or dictionary replacement rules.
 
 ## Build and run
 
