@@ -667,6 +667,8 @@ pub const Replica = struct {
         batch_size: u32 = 0,
         filter: ?KeyFilter = null,
         candidate_ids: ?[]const u32 = null,
+        filter_visit_limit: u32 = 0,
+        filter_truncated: ?*bool = null,
         /// Cancellation and re-embedding budget (see `leann.RecomputeGate`).
         gate: ?leann.RecomputeGate = null,
     };
@@ -706,9 +708,11 @@ pub const Replica = struct {
                 .batch_size = tuning.batch_size,
                 .filter = if (node_filter) |*nf| leann.Filter{ .ctx = nf, .allows_fn = NodeKeyFilter.allows } else null,
                 .candidate_ids = tuning.candidate_ids,
+                .filter_visit_limit = tuning.filter_visit_limit,
                 .gate = tuning.gate,
             });
             defer resp.deinit(alloc);
+            if (tuning.filter_truncated) |truncated| truncated.* = resp.stats.filter_truncated;
             for (resp.results) |r| try hits.append(alloc, .{ .key = self.keys.items[r.id], .distance = r.distance });
         }
         std.mem.sortUnstable(Hit, hits.items, {}, struct {

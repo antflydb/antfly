@@ -689,7 +689,7 @@ pub const LeannStore = struct {
         // can only be checked afterwards, so they over-fetch, widening until
         // k results pass or the whole graph has been considered.
         var want: usize = if (filter.distanceActive()) @max(req.k * 4, req.k + 64) else req.k;
-        var gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
+        var gate = SearchGate.init(req, if (self.opts.transient and !search_types.requiresExhaustiveCoverage(req)) self.opts.reembed_budget_ms else 0);
         var ctx = SourceCtx{ .store = self, .far_from = req.query, .reembed_ns = &gate.reembed_ns };
         const node_filter = NodeFilter{ .store = self, .filter = &filter };
         var candidate_ids = std.ArrayListUnmanaged(u32).empty;
@@ -702,11 +702,12 @@ pub const LeannStore = struct {
             want = @min(want, live);
             var resp = try index.search(alloc, ctx.source(), req.query, .{
                 .k = @intCast(want),
-                .ef = if (self.opts.search_ef > 0) @max(self.opts.search_ef, @as(u32, @intCast(want))) else 0,
+                .ef = if (filter.nodeActive() and search_types.requiresExhaustiveCoverage(req)) @intCast(live) else if (self.opts.search_ef > 0) @max(self.opts.search_ef, @as(u32, @intCast(want))) else 0,
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
                 .filter = if (filter.nodeActive()) .{ .ctx = &node_filter, .allows_fn = NodeFilter.allows } else null,
                 .candidate_ids = if (filter.has_allowed) candidate_ids.items else null,
+                .filter_visit_limit = if (filter.nodeActive() and !search_types.requiresExhaustiveCoverage(req)) @max(65536, @as(u32, @intCast(@min(req.k *| 16, std.math.maxInt(u32))))) else 0,
                 .gate = gate.recomputeGate(),
             });
             defer resp.deinit(alloc);
@@ -717,7 +718,9 @@ pub const LeannStore = struct {
                 if (!filter.distanceAllowed(r.distance)) continue;
                 passed += 1;
             }
-            if (passed >= req.k or want >= live or !filter.distanceActive()) {
+            if (passed >= req.k or want >= live or !filter.distanceActive() or resp.stats.filter_truncated or
+                (filter.has_allowed and want >= filter.allowed.count()))
+            {
                 for (resp.results) |r| {
                     const node = self.nodes.items[r.id];
                     if (!try filter.allows(node.vector_id, node.metadata)) continue;

@@ -467,8 +467,9 @@ and rescores leaf members near the admission cutoff with extended codes
   to an over-fetched candidate list. Exact distances come from HBC's
   external vector loader (the stored embedding artifact, or the document
   field for direct-field indexes). Explicit ID filters map directly to graph
-  nodes; arbitrary predicates may still require scanning the graph when few
-  nodes match. Deleted or missing candidates are pushed to the far end of
+  nodes. Best-effort searches bound work for arbitrary predicates, so a very
+  selective filter can return fewer than `k`; search effort `1.0` instead
+  exhausts the graph for complete coverage. Deleted or missing candidates are pushed to the far end of
   the metric rather than failing a search. If the source document no longer
   reproduces an elided vector's digest, re-embedding fails with
   `ReembedRevisionMismatch` rather than scoring a different revision.

@@ -223,6 +223,9 @@ pub const SearchOptions = struct {
     filter: ?Filter = null,
     /// Known graph node IDs to score directly; callers must provide unique IDs.
     candidate_ids: ?[]const u32 = null,
+    /// Maximum graph candidates and fallback positions inspected for an
+    /// opaque filter. Zero leaves the search exhaustive.
+    filter_visit_limit: u32 = 0,
     gate: ?RecomputeGate = null,
     /// Beam width, raised to `k` when smaller. Zero picks a default per
     /// rerank mode: 64 for `ratio`, where every beam slot costs
@@ -261,6 +264,8 @@ pub const SearchStats = struct {
     /// The gate closed before recomputation finished; some results are
     /// ranked by estimate.
     budget_exhausted: bool = false,
+    /// The opaque-filter work limit ended the walk or fallback scan.
+    filter_truncated: bool = false,
 };
 
 pub const Result = struct { id: u32, distance: f32 };
@@ -746,7 +751,7 @@ pub const Index = struct {
         const start = if (eff.candidate_ids != null) self.entry else if (eff.exact_descent and eff.filter == null)
             try self.greedyDescentRecompute(alloc, source, q, self.entry, self.max_level, &stats)
         else
-            try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats);
+            try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats, if (eff.filter != null and eff.filter_visit_limit > 0) @max(eff.filter_visit_limit / 4, 1) else 0, eff.gate);
 
         var found = std.ArrayListUnmanaged(Cand).empty;
         defer found.deinit(alloc);
@@ -770,6 +775,32 @@ pub const Index = struct {
         return .{ .results = try out.toOwnedSlice(alloc), .stats = stats };
     }
 
+    /// Sparse tracking keeps bounded predicate walks independent of index size;
+    /// exhaustive walks use a compact bitmap.
+    const FilterVisited = struct {
+        alloc: Allocator,
+        bits: ?std.DynamicBitSetUnmanaged = null,
+        sparse: std.AutoHashMapUnmanaged(u32, void) = .empty,
+
+        fn init(alloc: Allocator, count: u32, bounded: bool) !FilterVisited {
+            return .{ .alloc = alloc, .bits = if (bounded) null else try std.DynamicBitSetUnmanaged.initEmpty(alloc, count) };
+        }
+
+        fn deinit(self: *FilterVisited) void {
+            if (self.bits) |*bits| bits.deinit(self.alloc);
+            self.sparse.deinit(self.alloc);
+        }
+
+        fn isSet(self: *const FilterVisited, id: u32) bool {
+            if (self.bits) |bits| return bits.isSet(id);
+            return self.sparse.contains(id);
+        }
+
+        fn set(self: *FilterVisited, id: u32) !void {
+            if (self.bits) |*bits| bits.set(id) else try self.sparse.put(self.alloc, id, {});
+        }
+    };
+
     /// Filtered-search fallback: adds every unvisited, live, allowed node to
     /// the recompute pool by its estimate.
     fn scoreUnvisitedAllowed(
@@ -777,27 +808,30 @@ pub const Index = struct {
         alloc: Allocator,
         approx: *Approx,
         filter: Filter,
-        visited: *std.DynamicBitSetUnmanaged,
+        visited: *FilterVisited,
         scale: f32,
         pool: anytype,
         stats: *SearchStats,
         gate: ?RecomputeGate,
+        scan_limit: u32,
     ) !void {
         var chunk = std.ArrayListUnmanaged(u32).empty;
         defer chunk.deinit(alloc);
         var next: u32 = 0;
-        while (next < self.node_count) {
+        const end = if (scan_limit == 0) self.node_count else @min(self.node_count, scan_limit);
+        while (next < end) {
             chunk.clearRetainingCapacity();
-            while (next < self.node_count and chunk.items.len < 1024) : (next += 1) {
+            while (next < end and chunk.items.len < 1024) : (next += 1) {
                 if (next % 256 == 0) try RecomputeGate.checkCancellation(gate);
                 if (visited.isSet(next) or self.isDeleted(next)) continue;
-                visited.set(next);
+                try visited.set(next);
                 if (try filter.allows(next)) try chunk.append(alloc, next);
             }
             const ests = try approx.score(chunk.items);
             stats.approx_evaluated += @intCast(chunk.items.len);
             for (chunk.items, ests) |id, e| try pool.append(alloc, .{ .id = id, .lower = if (self.rabitq == null and !self.upper_vectors.contains(id)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
         }
+        if (end < self.node_count) stats.filter_truncated = true;
     }
 
     /// Two-level fallback: queues every unvisited, live, allowed node by its
@@ -901,7 +935,7 @@ pub const Index = struct {
         if (self.config.store_upper and level > 0) delta.upper_vector = try self.toDecodeSpace(alloc, v);
 
         var stats = SearchStats{};
-        var ep = try self.greedyDescentApprox(&approx, self.entry, self.max_level, level, &stats);
+        var ep = try self.greedyDescentApprox(&approx, self.entry, self.max_level, level, &stats, 0, null);
         var found = std.ArrayListUnmanaged(Cand).empty;
         defer found.deinit(alloc);
         var picked = std.ArrayListUnmanaged(u32).empty;
@@ -1263,7 +1297,7 @@ pub const Index = struct {
 
     /// Greedy descent with approximate distances from layer `from` down to
     /// layer `to + 1`. Costs no recomputation.
-    fn greedyDescentApprox(self: *const Index, approx: *Approx, start: u32, from: u8, to: u8, stats: *SearchStats) !u32 {
+    fn greedyDescentApprox(self: *const Index, approx: *Approx, start: u32, from: u8, to: u8, stats: *SearchStats, limit: u32, gate: ?RecomputeGate) !u32 {
         if (from <= to) return start;
         var cur = start;
         var cur_d = (try approx.scoreOne(cur)).dist;
@@ -1271,8 +1305,11 @@ pub const Index = struct {
         while (layer > to) : (layer -= 1) {
             var improved = true;
             while (improved) {
+                try RecomputeGate.checkCancellation(gate);
+                if (limit != 0 and stats.approx_evaluated >= limit) return cur;
                 improved = false;
-                const nbs = self.upper.items[cur][layer - 1].items;
+                const all_nbs = self.upper.items[cur][layer - 1].items;
+                const nbs = if (limit == 0) all_nbs else all_nbs[0..@min(all_nbs.len, limit - stats.approx_evaluated)];
                 const ests = try approx.score(nbs);
                 stats.approx_evaluated += @intCast(nbs.len);
                 for (nbs, ests) |nb, e| {
@@ -1420,8 +1457,8 @@ pub const Index = struct {
                 try pool.append(alloc, .{ .id = id, .lower = if (self.rabitq == null and !self.upper_vectors.contains(id)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
             }
         } else {
-            var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.node_count);
-            defer visited.deinit(alloc);
+            var visited = try FilterVisited.init(alloc, self.node_count, opts.filter != null and opts.filter_visit_limit != 0);
+            defer visited.deinit();
             var candidates = Heap(false){};
             defer candidates.deinit(alloc);
             var beam = Heap(true){};
@@ -1433,7 +1470,7 @@ pub const Index = struct {
             // Rejected nodes are still expanded while they could lead to better
             // allowed ones, but never enter the beam or the recompute pool.
             const first = try approx.scoreOne(start);
-            visited.set(start);
+            try visited.set(start);
             if (try allowedNode(opts.filter, start)) {
                 try pool.append(alloc, .{ .id = start, .lower = if (self.rabitq == null and !self.upper_vectors.contains(start)) -std.math.inf(f32) else first.dist - scale * first.bound, .est = first.dist });
                 try beam.push(alloc, .{ .dist = first.dist, .id = start });
@@ -1446,13 +1483,17 @@ pub const Index = struct {
             // scores what is still unvisited (codes only, no embeddings).
             var reseeded = false;
             walk: while (true) {
+                if (opts.filter != null and opts.filter_visit_limit != 0 and stats.approx_evaluated >= opts.filter_visit_limit) {
+                    stats.filter_truncated = true;
+                    break :walk;
+                }
                 if (stats.expanded % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
                 if (candidates.len() == 0) {
                     if (opts.filter == null or beam.len() >= ef) break :walk;
                     if (!reseeded) {
                         reseeded = true;
                         if (!visited.isSet(self.entry)) {
-                            visited.set(self.entry);
+                            try visited.set(self.entry);
                             const e = try approx.scoreOne(self.entry);
                             stats.approx_evaluated += 1;
                             if (try allowedNode(opts.filter, self.entry)) {
@@ -1463,7 +1504,12 @@ pub const Index = struct {
                             continue :walk;
                         }
                     }
-                    try self.scoreUnvisitedAllowed(alloc, approx, opts.filter.?, &visited, scale, &pool, stats, opts.gate);
+                    const remaining = if (opts.filter_visit_limit == 0) 0 else opts.filter_visit_limit -| stats.approx_evaluated;
+                    if (opts.filter_visit_limit != 0 and remaining == 0) {
+                        stats.filter_truncated = true;
+                        break :walk;
+                    }
+                    try self.scoreUnvisitedAllowed(alloc, approx, opts.filter.?, &visited, scale, &pool, stats, opts.gate, remaining);
                     break :walk;
                 }
                 const c = candidates.pop();
@@ -1471,8 +1517,10 @@ pub const Index = struct {
                 stats.expanded += 1;
                 fresh.clearRetainingCapacity();
                 for (self.adjacency.items[c.id].items) |nb| {
+                    if (opts.filter != null and opts.filter_visit_limit != 0 and
+                        @as(usize, stats.approx_evaluated) + fresh.items.len >= opts.filter_visit_limit) break;
                     if (visited.isSet(nb)) continue;
-                    visited.set(nb);
+                    try visited.set(nb);
                     try fresh.append(alloc, nb);
                 }
                 const ests = try approx.score(fresh.items);
@@ -3591,6 +3639,36 @@ test "leann: explicit candidates avoid the graph walk" {
     try testing.expectEqual(@as(usize, 3), result.results.len);
     try testing.expectEqual(@as(u32, 3), result.stats.approx_evaluated);
     try testing.expectEqual(@as(u32, 0), result.stats.expanded);
+}
+
+test "leann: opaque filter work is bounded unless exhaustive" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2000, 1, 16, 16, 49);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 16 };
+    var index = try Index.build(alloc, .{ .dims = 16, .quantizer = .rabitq, .max_degree = 16 }, fx.data);
+    defer index.deinit();
+    const Predicate = struct {
+        calls: usize = 0,
+        target: u32,
+        fn allows(raw: *const anyopaque, id: u32) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return id == self.target;
+        }
+    };
+    var predicate = Predicate{ .target = 1999 };
+    const filter = Filter{ .ctx = &predicate, .allows_fn = Predicate.allows };
+    var bounded = try index.search(alloc, src.source(), fx.query(0), .{ .k = 1, .filter = filter, .filter_visit_limit = 32 });
+    defer bounded.deinit(alloc);
+    try testing.expect(bounded.stats.filter_truncated);
+    try testing.expect(predicate.calls <= 32);
+    predicate.calls = 0;
+    var exhaustive = try index.search(alloc, src.source(), fx.query(0), .{ .k = 1, .ef = 2000, .filter = filter });
+    defer exhaustive.deinit(alloc);
+    try testing.expect(!exhaustive.stats.filter_truncated);
+    try testing.expectEqual(@as(usize, 1), exhaustive.results.len);
+    try testing.expectEqual(@as(u32, 1999), exhaustive.results[0].id);
 }
 
 test "leann: cancellation interrupts an empty filtered walk" {

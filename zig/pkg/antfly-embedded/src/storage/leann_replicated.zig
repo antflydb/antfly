@@ -706,7 +706,7 @@ pub const ReplicatedState = struct {
         if (req.k == 0) return out;
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         const loader = self.loader orelse return error.MissingVectorLoader;
-        var gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
+        var gate = SearchGate.init(req, if (self.opts.transient and !search_types.requiresExhaustiveCoverage(req)) self.opts.reembed_budget_ms else 0);
         var ctx = KeyLoader{ .state = @constCast(self), .loader = loader, .reembed_ns = &gate.reembed_ns };
         var want: u32 = @intCast(@max(req.k, 1));
         // Id, key and prefix filters go into the graph walk; only distance
@@ -728,12 +728,15 @@ pub const ReplicatedState = struct {
         }
         while (true) {
             want = @min(want, live);
+            var filter_truncated = false;
             const hits = try self.replica.search(alloc, req.query, want, .{
-                .ef = self.opts.search_ef,
+                .ef = if (search_types.requiresExhaustiveCoverage(req)) live else self.opts.search_ef,
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
                 .filter = if (key_filtered) .{ .ctx = &key_filter, .allows_fn = KeyRequestFilter.allows } else null,
                 .candidate_ids = if (filter.has_allowed) candidate_ids.items else null,
+                .filter_visit_limit = if (!search_types.requiresExhaustiveCoverage(req)) @max(65536, @as(u32, @intCast(@min(req.k *| 16, std.math.maxInt(u32))))) else 0,
+                .filter_truncated = &filter_truncated,
                 .gate = gate.recomputeGate(),
             }, ctx.keyLoader());
             defer alloc.free(hits);
@@ -743,7 +746,9 @@ pub const ReplicatedState = struct {
                 if (!try filter.allows(vector_id, h.key) or !filter.distanceAllowed(h.distance)) continue;
                 passed += 1;
             }
-            if (passed >= req.k or want >= live or !filtered) {
+            if (passed >= req.k or want >= live or !filtered or filter_truncated or
+                (filter.has_allowed and want >= filter.allowed.count()))
+            {
                 for (hits) |h| {
                     const vector_id = self.bindings.get(h.key) orelse continue;
                     if (!try filter.allows(vector_id, h.key) or !filter.distanceAllowed(h.distance)) continue;
