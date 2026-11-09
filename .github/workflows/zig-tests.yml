@@ -770,6 +770,11 @@ jobs:
           tools/test_sync_generated.py
           pkg/inference/build/test_prepare_wasm64_zig_lib.py
 
+      - name: Test linked read-session provider finalization and archive limits
+        run: |
+          zig build --build-file zig/build_read_session_graph_test.zig -Dtarget=x86_64-linux-musl --summary all
+          python3 -m unittest discover -s scripts/packaging -p test_native_archives.py
+
       - name: Test benchmark orchestration and fixture setup
         run: |
           python3 -m unittest discover -s scripts/ci -p test_eval_extract.py
@@ -1323,6 +1328,11 @@ jobs:
           tools/test_test_runner.py
           tools/test_local_test_partitions.py
           tools/test_sync_generated.py
+
+      - name: Test linked read-session provider finalization and archive limits
+        run: |
+          zig build --build-file zig/build_read_session_graph_test.zig -Dtarget=x86_64-linux-musl --summary all
+          python3 -m unittest discover -s scripts/packaging -p test_native_archives.py
 
       - name: Test benchmark orchestration and fixture setup
         run: |
