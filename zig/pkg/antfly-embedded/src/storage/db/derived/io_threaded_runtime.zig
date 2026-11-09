@@ -119,6 +119,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         can_advance_to_target_fn: ?CanAdvanceToTargetFn,
         applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
         resource_manager: ?*resource_manager_mod.ResourceManager,
+        persist_batch_fn: ?runtime_types.PersistBatchFn,
     ) @This() {
         _ = alloc;
         _ = replay_source;
@@ -131,6 +132,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         _ = can_advance_to_target_fn;
         _ = applied_sequence_advanced_fn;
         _ = resource_manager;
+        _ = persist_batch_fn;
         return .{};
     }
 
@@ -259,6 +261,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     ctx: *anyopaque,
     apply_fn: ApplyFn,
     persist_fn: PersistFn,
+    persist_batch_fn: ?runtime_types.PersistBatchFn = null,
     truncate_fn: TruncateFn,
     begin_catch_up_fn: ?BeginCatchUpFn,
     finish_catch_up_fn: ?FinishCatchUpFn,
@@ -293,6 +296,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         can_advance_to_target_fn: ?CanAdvanceToTargetFn,
         applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
         resource_manager: ?*resource_manager_mod.ResourceManager,
+        persist_batch_fn: ?runtime_types.PersistBatchFn,
     ) !DerivedRuntime {
         const threaded = try alloc.create(Io.Threaded);
         errdefer alloc.destroy(threaded);
@@ -313,6 +317,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             can_advance_to_target_fn,
             applied_sequence_advanced_fn,
             resource_manager,
+            persist_batch_fn,
         );
     }
 
@@ -329,6 +334,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         can_advance_to_target_fn: ?CanAdvanceToTargetFn,
         applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
         resource_manager: ?*resource_manager_mod.ResourceManager,
+        persist_batch_fn: ?runtime_types.PersistBatchFn,
     ) DerivedRuntime {
         return initWithIo(
             alloc,
@@ -344,6 +350,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             can_advance_to_target_fn,
             applied_sequence_advanced_fn,
             resource_manager,
+            persist_batch_fn,
         );
     }
 
@@ -361,6 +368,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         can_advance_to_target_fn: ?CanAdvanceToTargetFn,
         applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
         resource_manager: ?*resource_manager_mod.ResourceManager,
+        persist_batch_fn: ?runtime_types.PersistBatchFn,
     ) DerivedRuntime {
         return .{
             .alloc = alloc,
@@ -370,6 +378,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             .ctx = ctx,
             .apply_fn = apply_fn,
             .persist_fn = persist_fn,
+            .persist_batch_fn = persist_batch_fn,
             .truncate_fn = truncate_fn,
             .begin_catch_up_fn = begin_catch_up_fn,
             .finish_catch_up_fn = finish_catch_up_fn,
@@ -787,6 +796,69 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return try self.waitForAllWithVisibilityWait(sequence, .{});
     }
 
+    /// Forced-persist step shared by `waitForAllWithVisibilityWait`/
+    /// `waitForIndexesWithVisibilityWait`: every consumer whose worker has
+    /// already caught up to `sequence` needs its progress durably visible
+    /// before either of those can return. `self.persist_batch_fn`, when
+    /// set, notes every consumer in `persist_snapshots` before flushing
+    /// once (see `runtime_types.PersistBatchFn`'s doc comment) instead of
+    /// this falling back to one `persist_fn` call -- and one possible
+    /// native commit -- per consumer. Called with `self.mutex` unlocked
+    /// (matching `persist_fn`'s own calling convention: a persist call may
+    /// do real I/O); returns with `self.mutex` locked only when it returns
+    /// an error (mirroring the per-consumer fallback's own `catch` below,
+    /// so a caller with `defer self.mutex.unlock(io)` higher up stays
+    /// correct either way), unlocked on every success path.
+    fn persistSnapshots(self: *DerivedRuntime, io: Io, persist_snapshots: []const PersistSnapshot, all_persisted: *bool) !void {
+        if (self.persist_batch_fn) |batch_fn| {
+            var stack_args: [16]runtime_types.PersistSnapshotArg = undefined;
+            const heap_args: ?[]runtime_types.PersistSnapshotArg = if (persist_snapshots.len > stack_args.len)
+                try self.alloc.alloc(runtime_types.PersistSnapshotArg, persist_snapshots.len)
+            else
+                null;
+            defer if (heap_args) |heap| self.alloc.free(heap);
+            const args = heap_args orelse stack_args[0..persist_snapshots.len];
+            for (persist_snapshots, args[0..persist_snapshots.len]) |snapshot, *out| out.* = .{ .index_name = snapshot.name, .sequence = snapshot.sequence };
+            const persisted = batch_fn(self.ctx, args[0..persist_snapshots.len], true) catch |err| {
+                self.mutex.lockUncancelable(io);
+                return err;
+            };
+            self.mutex.lockUncancelable(io);
+            if (persisted) {
+                for (persist_snapshots) |snapshot| {
+                    for (self.workers.items) |worker| {
+                        if (std.mem.eql(u8, worker.name, snapshot.name)) {
+                            worker.persisted_sequence = @max(worker.persisted_sequence, snapshot.sequence);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                all_persisted.* = false;
+            }
+            self.mutex.unlock(io);
+            return;
+        }
+        for (persist_snapshots) |snapshot| {
+            const persisted = self.persist_fn(self.ctx, snapshot.name, snapshot.sequence, true) catch |err| {
+                self.mutex.lockUncancelable(io);
+                return err;
+            };
+            self.mutex.lockUncancelable(io);
+            if (persisted) {
+                for (self.workers.items) |worker| {
+                    if (std.mem.eql(u8, worker.name, snapshot.name)) {
+                        worker.persisted_sequence = @max(worker.persisted_sequence, snapshot.sequence);
+                        break;
+                    }
+                }
+            } else {
+                all_persisted.* = false;
+            }
+            self.mutex.unlock(io);
+        }
+    }
+
     pub fn waitForAllWithVisibilityWait(
         self: *DerivedRuntime,
         sequence: u64,
@@ -829,24 +901,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 snapshots = .empty;
                 defer freePersistSnapshots(self.alloc, persist_snapshots);
                 self.mutex.unlock(io);
-                for (persist_snapshots) |snapshot| {
-                    const persisted = self.persist_fn(self.ctx, snapshot.name, snapshot.sequence, true) catch |err| {
-                        self.mutex.lockUncancelable(io);
-                        return err;
-                    };
-                    self.mutex.lockUncancelable(io);
-                    if (persisted) {
-                        for (self.workers.items) |worker| {
-                            if (std.mem.eql(u8, worker.name, snapshot.name)) {
-                                worker.persisted_sequence = @max(worker.persisted_sequence, snapshot.sequence);
-                                break;
-                            }
-                        }
-                    } else {
-                        all_persisted = false;
-                    }
-                    self.mutex.unlock(io);
-                }
+                try self.persistSnapshots(io, persist_snapshots, &all_persisted);
                 self.mutex.lockUncancelable(io);
                 if (!all_persisted) {
                     self.mutex.unlock(io);
@@ -950,24 +1005,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 snapshots = .empty;
                 defer freePersistSnapshots(self.alloc, persist_snapshots);
                 self.mutex.unlock(io);
-                for (persist_snapshots) |snapshot| {
-                    const persisted = self.persist_fn(self.ctx, snapshot.name, snapshot.sequence, true) catch |err| {
-                        self.mutex.lockUncancelable(io);
-                        return err;
-                    };
-                    self.mutex.lockUncancelable(io);
-                    if (persisted) {
-                        for (self.workers.items) |worker| {
-                            if (std.mem.eql(u8, worker.name, snapshot.name)) {
-                                worker.persisted_sequence = @max(worker.persisted_sequence, snapshot.sequence);
-                                break;
-                            }
-                        }
-                    } else {
-                        all_persisted = false;
-                    }
-                    self.mutex.unlock(io);
-                }
+                try self.persistSnapshots(io, persist_snapshots, &all_persisted);
                 self.mutex.lockUncancelable(io);
                 if (!all_persisted) {
                     self.mutex.unlock(io);

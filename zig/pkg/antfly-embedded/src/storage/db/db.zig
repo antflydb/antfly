@@ -5482,6 +5482,7 @@ pub const DB = struct {
             notifyDerivedAppliedSequenceAdvanced,
             resource_manager,
             self.backend_runtime,
+            persistAppliedSequencesBatchAsync,
         );
     }
 
@@ -63385,6 +63386,40 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsSliceContext(ctx: *AsyncContext
     const next_key = state.resume_key;
     state.resume_key = null;
     return .{ .rebuilt = state.rebuilt, .resume_key = next_key };
+}
+
+/// Batched variant of `persistAppliedSequenceAsync`'s `force = true` path
+/// (see `runtime_types.PersistBatchFn`'s doc comment): notes every consumer
+/// in `snapshots` into the shared coalescer before flushing once, instead
+/// of `persistAppliedSequenceAsync` noting-and-flushing once per consumer.
+/// `waitForAllWithVisibilityWait`/`waitForIndexesWithVisibilityWait` are the
+/// only callers (`io_threaded_runtime.zig`'s `persistSnapshots`); both
+/// already collect every consumer that needs a forced flush before
+/// persisting any of them, which is exactly the shape this needs. Always
+/// called with `force = true`: there is no reason for a batched caller to
+/// want the opportunistic, best-effort semantics `persistAppliedSequenceAsync`'s
+/// `force = false` path has, so this does not implement it.
+fn persistAppliedSequencesBatchAsync(ctx_ptr: *anyopaque, snapshots: []const derived_executor_mod.PersistSnapshotArg, force: bool) !bool {
+    std.debug.assert(force);
+    const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
+    if (snapshots.len == 0) return true;
+    var lifecycle_completed = false;
+    const published = blk: {
+        var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
+        defer seq_lock.unlock();
+        _ = ctx.stats.applied_sequence.note_calls.fetchAdd(snapshots.len, .monotonic);
+        _ = ctx.stats.applied_sequence.forced_flush_calls.fetchAdd(1, .monotonic);
+        for (snapshots) |snapshot| try ctx.applied_sequence_coalescer.note(ctx.alloc, snapshot.index_name, snapshot.sequence);
+        break :blk try flushPendingAppliedSequencesLocked(ctx, true, &lifecycle_completed);
+    };
+    if (published) {
+        for (snapshots) |snapshot| {
+            if (ctx.index_manager.denseProjectionCheckpointMetadata(snapshot.index_name) == null) {
+                DB.notifyQueryVisibilityHook(ctx, .publish_consistent);
+            }
+        }
+    }
+    return published;
 }
 
 fn persistAppliedSequenceAsync(ctx_ptr: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {

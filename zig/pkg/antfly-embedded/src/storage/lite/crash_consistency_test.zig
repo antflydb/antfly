@@ -1514,15 +1514,28 @@ test "WS4-for-graph: a synchronous graph edge write lands in one native commit a
     // The inline publication itself still contributes no extra commit
     // beyond the primary write's own (its forward/reverse mutations and
     // progress ride inside the SAME native transaction via
-    // `commit_participant.View.putIndexCatalog`). See "WS4-for-dense"'s
-    // identical note for why the bound is wider than that single-digit
-    // claim: once ride-along commits wait for a driver instead of leading
-    // their own group, this write's own leadership turn can sweep in
-    // whatever unrelated ride-along backlog (graph forward/reverse store
-    // bookkeeping, maintenance ticks) happens to be queued at that moment,
-    // through `driveMutationCoordinator`'s drain-the-whole-queue loop. 16
-    // is comfortably above the observed 12-13 (two runs), not tight to it.
-    try std.testing.expect(commits_for_this_write <= 16);
+    // `commit_participant.View.putIndexCatalog`). The bound used to be much
+    // wider (16) to absorb two separate sources of inflation that were
+    // never this write's own cost, both fixed by perf/lwa-commit-eff2:
+    // (a) a redundant progress-v2 commit for a consumer whose inline
+    // publication had already written the identical durable record --
+    // `apply_state.contributeProgressTxn` now skips the write (and the
+    // whole commit, if every consumer in it turns out to be a no-op) when
+    // the durable record already covers the target; (b) the `.full_index`
+    // visibility wait's own forced-persist pass calling the persist
+    // callback once per consumer needing a flush instead of noting all of
+    // them and flushing once -- `io_threaded_runtime.zig`'s
+    // `persistSnapshots` now prefers a batched callback
+    // (`runtime_types.PersistBatchFn`, bound to `db.zig`'s
+    // `persistAppliedSequencesBatchAsync`) when one is registered. What is
+    // left (observed 7, stable across repeated runs, no longer "not fully
+    // deterministic") is this test harness's own extra managed index
+    // (`openDbWithIo` always also adds `body_text`) needing its own
+    // forced-visibility pass, plus whatever maintenance/catch-up activity
+    // is genuinely concurrent with this write -- not a per-write cost this
+    // single edge write pays on its own. 9 is comfortably above the
+    // observed 7, not tight to it.
+    try std.testing.expect(commits_for_this_write <= 9);
 
     {
         const edges = try handle.db.getEdges(allocator, "gr_idx", "edge-source", "links", .out);
@@ -1603,29 +1616,21 @@ test "WS4-for-dense: a synchronous dense vector write lands in one native commit
     // beyond the primary write's own (its HBC namespace mutations and the
     // durable doc_key<->vector_id mapping both ride inside the SAME native
     // transaction via `commit_participant.View.putIndexCatalog`/`.put`).
-    // The bound is wider than that single-digit claim because of a real
-    // mechanism, confirmed via write_amplification_trace's per-stage
-    // breakdown (mostly `hbc_checkpoint_commit`/`other`, both background):
-    // once ride-along commits wait for a driver instead of leading their
-    // own group (design doc §3.2a, perf/lwa-commit-eff2's stageRideAlong
-    // fix), `Store.driveMutationCoordinator`'s leader loop drains the
-    // WHOLE queue, not just its own batch -- so whatever ride-along
-    // backlog (HBC checkpoint saves, maintenance ticks, replication
-    // outbox staging) happens to be queued at the moment THIS write leads
-    // gets swept into one or more extra native commits, each bumping
-    // `commit_sequence`, all attributed to this write's own count even
-    // though none of it was caused by this write. This is a fairness/
-    // attribution property of the group-commit queue, not data loss or
-    // corruption (every commit is still real and correct) and not
-    // something `store.sync()` above can fully pre-empty, since some of
-    // this backlog is generated as a side effect of processing THIS write
-    // itself (e.g. its own HBC checkpoint save), not left over from
-    // setup. Restructuring the leader loop to bound how much unrelated
-    // backlog one foreground write's leadership turn can absorb is a
-    // real WS2/WS7 fix, not attempted here. 14 is comfortably above the
-    // observed 10-11 (two runs), not tight to it, since the exact amount
-    // of swept-in backlog is not fully deterministic.
-    try std.testing.expect(commits_for_this_write <= 14);
+    // The bound used to be much wider (14) to absorb two separate sources
+    // of inflation that were never this write's own cost, both fixed by
+    // perf/lwa-commit-eff2 -- see "WS4-for-graph"'s identical note for the
+    // full explanation: (a) `apply_state.contributeProgressTxn` no longer
+    // writes (or commits) a progress-v2 record that an inline publication
+    // already wrote identically; (b) the `.full_index` visibility wait's
+    // forced-persist pass now flushes every consumer needing it in one
+    // call (`persistAppliedSequencesBatchAsync`) instead of one call per
+    // consumer. What is left (observed 5, stable across repeated runs) is
+    // this test harness's own extra managed index (`body_text`, always
+    // added by `openDbWithIo`) needing its own forced-visibility pass,
+    // plus genuinely concurrent background activity -- not a per-write
+    // cost this single vector insert pays on its own. 7 is comfortably
+    // above the observed 5, not tight to it.
+    try std.testing.expect(commits_for_this_write <= 7);
 
     {
         var result = try handle.db.search(allocator, .{
