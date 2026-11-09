@@ -275,6 +275,7 @@ public enum RecordingState: Equatable, Sendable {
 }
 
 public struct DictationResult: Sendable {
+  public var formatting: VoiceFormatting.Output?
   public var raw: String
   public var text: String
   public var timing: DictationTiming?

@@ -45,13 +45,23 @@ Settings → Voice formatting, spoken breaks and insertion spacing default on:
 | new line, next line, line break, skip a line | One line break |
 | new paragraph, start a new paragraph | A blank line between paragraphs |
 
-Commands can be spoken alone. Quoted phrases are preserved as literal text; turn
-spoken formatting off when dictating text that discusses these commands. This is
+Commands can be spoken alone. Straight, curly, nested, escaped, and unclosed
+quoted phrases are preserved as literal text; apostrophes inside words are not
+quotation delimiters. Turn spoken formatting off when dictating text that discusses these commands. This is
 a deterministic English command vocabulary, so unquoted occurrences are treated
 as commands. It does not reproduce every Wispr Flow editing or formatting feature.
+
+Commands and quotations are parsed from recognition before cleanup. If cleanup
+is enabled, their contents are replaced by request-specific protected markers,
+without issuing a request per command. Markers must survive exactly once and in order; otherwise
+cleanup fails with the original transcript available for recovery. No generated
+text is interpreted as a new command. Internal and edge breaks are restored from
+the protected plan, rather than inferred from the model's output.
+
 Recognition/cleanup supplies punctuation; insertion adds boundary spaces when
 Accessibility exposes the surrounding text. Existing spaces, newlines, punctuation,
-selected-text replacements, and CJK boundaries are preserved. It reads small Accessibility ranges, with a bounded fallback for small text fields.
+selected-text replacements, and CJK boundaries are preserved. It reads small
+Accessibility ranges, with a bounded fallback for small text fields.
 Surrounding text is never stored; unsupported fields keep the transcript unchanged.
 
 **Allow a trailing ‘press enter’ voice command** is off by default. Enabling it
@@ -60,9 +70,23 @@ text is pasted. This can send a message or submit a prompt. Mid-sentence and quo
 occurrences stay literal; generated text cannot trigger it. A command-only
 “press enter” does not send a key without a nonempty insertion. The app verifies
 the original app and text field, observes the expected text and cursor after the
-paste, and rechecks focus and cancellation before sending Return. If verification
-is unavailable or times out, text remains pasted and Enter is not sent. Copy,
+paste, and rechecks focus, clipboard ownership, and cancellation before sending
+Return. Accessibility queries run on a serial worker with short per-object IPC
+timeouts. Confirmation has an eight-second monotonic deadline, including time
+spent reading the target. The clipboard lease remains owned until confirmation
+finishes, so a slow paste cannot consume the user's restored clipboard. New
+copies or overlapping insertions invalidate an older pending Enter action. If
+verification is unavailable or times out, Enter is not sent and the transcript
+remains available to copy. Copy,
 history, and original-transcript recovery never replay key actions.
+
+Stable-segment cleanup remains incremental. If a command or quoted span crosses
+a cleanup-batch boundary, the complete utterance is cleaned once more with a
+single protected plan before insertion. Enabling the trailing Enter command keeps
+recognition streaming but defers cleanup until release, because its terminal
+position cannot be established earlier. The processing note explains this choice.
+Recorded-audio cleanup likewise runs after recognition so commands can be
+protected first. These paths use the configured inference concurrency limit.
 
 These features implement the common spacing/break/Enter workflow in Wispr Flow;
 they do not add recognition vocabulary bias or dictionary replacement rules.

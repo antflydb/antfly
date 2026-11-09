@@ -76,9 +76,36 @@ public actor AntflyClient {
   }
   public func dictate(
     audio: Data, preset: Preset, dictionary: [String],
+    formatting: VoiceFormatting.Options? = nil,
     events: @Sendable @escaping (DictationProgress) async -> Void = { _ in },
     progress: @Sendable @escaping (String) async -> Void
   ) async throws -> DictationResult {
+    if let formatting, formatting.commands || formatting.pressEnter {
+      let began = ProcessInfo.processInfo.systemUptime
+      var recognition = preset
+      recognition.cleanupModel = ""
+      var raw = try await dictate(
+        audio: audio, preset: recognition, dictionary: dictionary,
+        events: events, progress: progress)
+      if !preset.runsCleanup {
+        let plan = VoiceFormatting.Plan(raw.raw, options: formatting)
+        let restored =
+          raw.text == raw.raw || plan.hasProtectedSpans || plan.pressEnter
+          ? plan.render() : try plan.restore(raw.text)
+        raw.text = restored.text
+        raw.formatting = restored
+        return raw
+      }
+      let cleanupBegan = ProcessInfo.processInfo.systemUptime
+      var result = try await cleanupText(
+        raw.raw, preset: preset, dictionary: dictionary,
+        formatting: formatting, events: events)
+      result.timing = DictationTiming(
+        recognition: raw.timing?.recognition ?? cleanupBegan - began,
+        cleanup: preset.runsCleanup ? ProcessInfo.processInfo.systemUptime - cleanupBegan : 0,
+        total: ProcessInfo.processInfo.systemUptime - began)
+      return result
+    }
     var body = dictationBody(preset: preset, dictionary: dictionary)
     body["audio"] = "attachment:0"
     var upload = request(
@@ -89,10 +116,40 @@ public actor AntflyClient {
   }
   public func cleanupText(
     _ text: String, preset: Preset, dictionary: [String],
+    formatting: VoiceFormatting.Options? = nil,
     events: @Sendable @escaping (DictationProgress) async -> Void = { _ in }
   ) async throws -> DictationResult {
     guard text.utf8.count <= 65536 else {
       throw DictationError.invalid("Transcript exceeds the cleanup limit.")
+    }
+    if let formatting {
+      let plan = VoiceFormatting.Plan(text, options: formatting)
+      var result: DictationResult
+      if !preset.runsCleanup || !plan.hasCleanupText {
+        result = DictationResult(raw: text, text: plan.render().text)
+        result.formatting = plan.render()
+        return result
+      }
+      do {
+        var protectedPreset = preset
+        if !plan.instructions.isEmpty {
+          protectedPreset.instructions =
+            (preset.outputMode == .rewrite ? preset.instructions + "\n" : "") + plan.instructions
+          protectedPreset.mode = .rewrite
+        }
+        result = try await cleanupText(
+          plan.input, preset: protectedPreset, dictionary: dictionary,
+          events: { event in
+            await events(DictationProgress(phase: event.phase, raw: text))
+          })
+        let restored = try plan.restore(result.text)
+        result.raw = text
+        result.text = restored.text
+        result.formatting = restored
+        return result
+      } catch is CancellationError { throw CancellationError() } catch {
+        throw DictationError.cleanupFailed(raw: text, message: error.localizedDescription)
+      }
     }
     if !preset.runsCleanup || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       return DictationResult(raw: text, text: text)

@@ -488,8 +488,13 @@ import SwiftUI
       let run = generation
       target = InsertionTarget.capture()
       let preset = snapshot.preset(for: target?.bundleID)
-      let effective = try ProcessingPlan(
+      var effective = try ProcessingPlan(
         preset: preset, model: ModelCatalog(data: models).transcriber(preset.model))
+      if snapshot.usesPressEnterCommand && effective.incrementalCleanup {
+        effective.incrementalCleanup = false
+        effective.explanation =
+          "Recognition runs while you speak. Cleanup waits for release to identify a terminal press enter command."
+      }
       plan = effective
       processingNote = effective.explanation
       processingWarning = ""
@@ -529,7 +534,8 @@ import SwiftUI
           do {
             let pipeline = try await LiveDictation.open(
               client: connection, preset: preset,
-              dictionary: snapshot.dictionary, plan: effective
+              dictionary: snapshot.dictionary, plan: effective,
+              formatting: VoiceFormatting.Options(snapshot)
             ) { [weak self] event in
               await self?.receive(event, run: run)
             }
@@ -662,6 +668,7 @@ import SwiftUI
         guard generation == run else { throw CancellationError() }
         return try await client(snapshot).dictate(
           audio: audio!, preset: preset, dictionary: snapshot.dictionary,
+          formatting: VoiceFormatting.Options(snapshot),
           events: { [weak self] in await self?.receive($0, run: run) }, progress: { _ in })
       }
     } catch {
@@ -680,6 +687,7 @@ import SwiftUI
       let connection = try self.client(snapshot)
       return try await connection.dictate(
         audio: audio, preset: preset, dictionary: snapshot.dictionary,
+        formatting: VoiceFormatting.Options(snapshot),
         events: { [weak self] in await self?.receive($0, run: run) }, progress: { _ in })
     }
   }
@@ -704,9 +712,13 @@ import SwiftUI
         try Task.checkCancellation()
         guard generation == run else { return }
         // Only recognition can request a key action; generated text cannot.
-        let formatted = VoiceFormatting.finalize(
-          raw: output.raw, text: output.text,
-          commands: snapshot.usesVoiceFormatting, pressEnter: snapshot.usesPressEnterCommand)
+        let formatted: VoiceFormatting.Output
+        if let processed = output.formatting {
+          formatted = processed
+        } else {
+          let plan = VoiceFormatting.Plan(output.raw, options: VoiceFormatting.Options(snapshot))
+          formatted = try plan.restore(output.text)
+        }
         output.text = formatted.text
         let pressEnter = formatted.pressEnter
         result = output.text
@@ -861,6 +873,7 @@ import SwiftUI
       runSubmission(preset: preset, snapshot: snapshot, destination: nil) { [self] in
         try await self.client(snapshot).cleanupText(
           original, preset: preset, dictionary: snapshot.dictionary,
+          formatting: VoiceFormatting.Options(snapshot),
           events: { [weak self] in await self?.receive($0, run: run) })
       }
       phase = .cleaning
@@ -1081,6 +1094,7 @@ import SwiftUI
         guard generation == run else { throw CancellationError() }
         return try await client(settings).dictate(
           audio: audio, preset: preset, dictionary: settings.dictionary,
+          formatting: VoiceFormatting.Options(settings),
           events: { [weak self] in await self?.receive($0, run: run) }, progress: { _ in })
       }
     } catch { message = error.localizedDescription }

@@ -270,3 +270,93 @@ private func fixtureBody(_ request: URLRequest) throws -> Data {
     body.append(contentsOf: buffer.prefix(count))
   }
 }
+
+private func formattingEvents(raw: String, text: String) throws -> String {
+  let transcript = try JSONSerialization.data(withJSONObject: [
+    "type": "dictation.transcript", "transcript": ["text": raw],
+  ])
+  let complete = try JSONSerialization.data(withJSONObject: [
+    "type": "dictation.completed", "text": text,
+  ])
+  return "data: " + String(decoding: transcript, as: UTF8.self) + "\n\ndata: "
+    + String(decoding: complete, as: UTF8.self) + "\n\ndata: [DONE]\n\n"
+}
+
+extension ClientTests {
+  @Test func protectedCleanupRestoresInternalBreaksAndLiteralQuotes() async throws {
+    let raw = "First new paragraph second ‘new line’ please"
+    FixtureProtocol.reply = { request in
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      let encoded = body["transcript_text"] as! String
+      #expect(!encoded.contains("new paragraph") && !encoded.contains("new line"))
+      #expect((body["instructions"] as? String)?.contains("Preserve every token") == true)
+      return (
+        200, "text/event-stream",
+        try formattingEvents(
+          raw: encoded, text: encoded.replacingOccurrences(of: "First", with: "First."))
+      )
+    }
+    var preset = Configuration().presets[0]
+    preset.cleanupModel = "generators/cleanup"
+    let result = try await client().cleanupText(
+      raw, preset: preset, dictionary: [], formatting: .init())
+    #expect(result.raw == raw && result.text == "First.\n\nsecond ‘new line’ please")
+  }
+  @Test func malformedCleanupCannotEraseProtectedCommandsOrInventAnEnterPayload() async throws {
+    FixtureProtocol.reply = { request in
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      return (
+        200, "text/event-stream",
+        try formattingEvents(raw: body["transcript_text"] as! String, text: "First second.")
+      )
+    }
+    var preset = Configuration().presets[0]
+    preset.cleanupModel = "generators/cleanup"
+    do {
+      _ = try await client().cleanupText(
+        "First new paragraph second", preset: preset, dictionary: [], formatting: .init())
+      Issue.record("Accepted missing protected tokens")
+    } catch let error as DictationError {
+      #expect(error.rawTranscript == "First new paragraph second")
+    }
+    FixtureProtocol.reply = { _ in
+      Issue.record("Command-only speech invoked cleanup")
+      return (500, "application/json", "{}")
+    }
+    let result = try await client().cleanupText(
+      "press enter", preset: preset, dictionary: [], formatting: .init(pressEnter: true))
+    #expect(result.text.isEmpty && result.formatting?.pressEnter == false)
+  }
+  @Test func recordedAudioRecognizesBeforeProtectedCleanup() async throws {
+    let raw = "First new paragraph second press enter"
+    FixtureProtocol.reply = { request in
+      let data = try fixtureBody(request)
+      if data.prefix(8) == Data("AFATT001".utf8) {
+        let size = data.withUnsafeBytes {
+          $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
+        }
+        let metadata =
+          try JSONSerialization.jsonObject(with: data.subdata(in: 40..<(40 + Int(size))))
+          as! [String: Any]
+        #expect(metadata["cleanup_model"] == nil)
+        return (200, "text/event-stream", try formattingEvents(raw: raw, text: raw))
+      }
+      let body = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+      let encoded = body["transcript_text"] as! String
+      #expect(!encoded.contains("press enter") && !encoded.contains("new paragraph"))
+      return (
+        200, "text/event-stream",
+        try formattingEvents(
+          raw: encoded, text: encoded.replacingOccurrences(of: "First", with: "First."))
+      )
+    }
+    var preset = Configuration().presets[0]
+    preset.cleanupModel = "generators/cleanup"
+    let result = try await client().dictate(
+      audio: Data([0, 1]), preset: preset, dictionary: [], formatting: .init(pressEnter: true),
+      progress: { _ in })
+    #expect(
+      result.raw == raw && result.text == "First.\n\nsecond"
+        && result.formatting?.pressEnter == true)
+  }
+}

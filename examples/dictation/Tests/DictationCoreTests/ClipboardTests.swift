@@ -173,3 +173,105 @@ private actor ReadFailure {
   #expect(board.text == "user copy" && board.restores == 0)
   await clock.advance()
 }
+
+@Test @MainActor func confirmedPasteKeepsClipboardUntilDelayedAcknowledgement() async throws {
+  let board = FakeClipboard()
+  let clock = ClipboardClock()
+  let coordinator = ClipboardCoordinator(
+    read: { await board.snapshot() }, count: { board.count },
+    writeText: { board.write($0) }, restore: { board.restore($0) }, sleep: { await clock.sleep() })
+  var sent = false
+  let operation = Task { @MainActor in
+    try await coordinator.withPaste("dictation", restoreAfterOperation: true) { ownership in
+      sent = true
+      await clock.sleep()  // Simulates a target consuming paste after the old 750 ms lease.
+      try ownership()
+      #expect(board.text == "dictation" && board.restores == 0)
+    }
+  }
+  while await clock.pending() == 0 { await Task.yield() }
+  #expect(sent)
+  #expect(board.text == "dictation" && board.restores == 0)
+  var drained = false
+  let shutdown = Task {
+    await coordinator.finishRestoration()
+    drained = true
+  }
+  await Task.yield()
+  #expect(!drained)
+  await clock.advance()
+  try await operation.value
+  await shutdown.value
+  #expect(board.text == "original" && board.restores == 1 && drained)
+}
+@Test @MainActor func changedClipboardInvalidatesPendingConfirmedAction() async throws {
+  let board = FakeClipboard()
+  let clock = ClipboardClock()
+  let coordinator = ClipboardCoordinator(
+    read: { await board.snapshot() }, count: { board.count },
+    writeText: { board.write($0) }, restore: { board.restore($0) })
+  var sent = false
+  var entered = false
+  let operation = Task { @MainActor in
+    try await coordinator.withPaste("dictation", restoreAfterOperation: true) { ownership in
+      sent = true
+      await clock.sleep()
+      try ownership()
+      entered = true
+    }
+  }
+  while await clock.pending() == 0 { await Task.yield() }
+  #expect(sent)
+  _ = board.write("user copied this")
+  await clock.advance()
+  do {
+    try await operation.value
+    Issue.record("Lost lease accepted")
+  } catch {}
+  #expect(!entered && board.text == "user copied this" && board.restores == 0)
+}
+
+@Test @MainActor func newerPasteInvalidatesOlderConfirmationWithoutLosingItsRestore() async throws {
+  let board = FakeClipboard()
+  let clock = ClipboardClock()
+  let coordinator = ClipboardCoordinator(
+    read: { await board.snapshot() }, count: { board.count },
+    writeText: { board.write($0) }, restore: { board.restore($0) }, sleep: { await clock.sleep() })
+  var entered = false
+  let first = Task { @MainActor in
+    try await coordinator.withPaste("first", restoreAfterOperation: true) { ownership in
+      await clock.sleep()
+      try ownership()
+      entered = true
+    }
+  }
+  while await clock.pending() < 1 { await Task.yield() }
+  try await coordinator.paste("second") {}
+  while await clock.pending() < 2 { await Task.yield() }
+  await clock.advanceFirst()
+  do {
+    try await first.value
+    Issue.record("Older action retained ownership")
+  } catch {}
+  #expect(!entered && board.text == "second" && board.restores == 0)
+  await clock.advance()
+  await coordinator.finishRestoration()
+  #expect(board.text == "original" && board.restores == 1)
+}
+@Test @MainActor func preparationCannotOverwriteAnExternalClipboardChange() async throws {
+  let board = FakeClipboard()
+  let coordinator = ClipboardCoordinator(
+    read: { await board.snapshot() }, count: { board.count },
+    writeText: { board.write($0) }, restore: { board.restore($0) })
+  do {
+    try await coordinator.withPaste(
+      "dictation",
+      prepare: { text in
+        _ = board.write("external")
+        return text
+      }
+    ) { _ in Issue.record("Paste sent after clipboard changed") }
+    Issue.record("Preparation accepted a changed clipboard")
+  } catch {}
+  #expect(board.text == "external" && board.restores == 0)
+}

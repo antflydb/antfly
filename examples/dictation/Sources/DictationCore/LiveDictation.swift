@@ -20,6 +20,9 @@ public actor LiveDictation {
   private let clean: Clean
   private let close: @Sendable () async -> Void
   private let observe: Observe
+  private let formatting: VoiceFormatting.Options?
+  private var cleanupBoundaries: [Int] = []
+  private var cleanedRawUTF16 = 0
   private let incremental: Bool
   private let needsCleanup: Bool
   private var segments: [Segment] = []
@@ -42,11 +45,13 @@ public actor LiveDictation {
   private var cleanupSeconds: TimeInterval = 0
 
   public init(
-    incremental: Bool, needsCleanup: Bool, recognize: @escaping Recognize,
+    incremental: Bool, needsCleanup: Bool, formatting: VoiceFormatting.Options? = nil,
+    recognize: @escaping Recognize,
     clean: @escaping Clean, close: @escaping @Sendable () async -> Void = {},
     observe: @escaping Observe = { _ in }
   ) {
-    self.incremental = incremental
+    self.formatting = formatting
+    self.incremental = incremental && formatting?.pressEnter != true
     self.needsCleanup = needsCleanup
     self.recognize = recognize
     self.clean = clean
@@ -55,7 +60,7 @@ public actor LiveDictation {
   }
   public static func open(
     client: AntflyClient, preset: Preset, dictionary: [String],
-    plan: ProcessingPlan, observe: @escaping Observe
+    plan: ProcessingPlan, formatting: VoiceFormatting.Options? = nil, observe: @escaping Observe
   ) async throws -> LiveDictation {
     let id = try await client.createSession(preset: preset, dictionary: dictionary)
     if Task.isCancelled {
@@ -64,15 +69,23 @@ public actor LiveDictation {
     }
     return LiveDictation(
       incremental: plan.incrementalCleanup, needsCleanup: preset.runsCleanup,
+      formatting: formatting,
       recognize: {
         try await client.appendSessionEvents(id, audio: $0, sampleRate: 16000, commit: $1)
       },
-      clean: { try await client.cleanupText($0, preset: preset, dictionary: dictionary) },
+      clean: {
+        try await client.cleanupText(
+          $0, preset: preset, dictionary: dictionary, formatting: formatting)
+      },
       close: { await client.closeSession(id) }, observe: observe)
   }
   private var raw: String { segments.map(\.raw).joined(separator: " ") }
   private var draft: String {
-    segments.compactMap(\.cleaned).filter { !$0.isEmpty }.joined(separator: " ")
+    segments.compactMap(\.cleaned).filter { !$0.isEmpty }.reduce("") { joined, next in
+      joined
+        + (joined.isEmpty || joined.last?.isNewline == true || next.first?.isNewline == true
+          ? "" : " ") + next
+    }
   }
   public func append(_ audio: Data, commit: Bool = false) async throws {
     guard !stopped, !committed, !appending else {
@@ -146,10 +159,13 @@ public actor LiveDictation {
         try Task.checkCancellation()
         guard !stopped else { return }
         guard output.raw == input,
-          !output.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          !(formatting == nil
+            ? output.text.trimmingCharacters(in: .whitespacesAndNewlines) : output.text).isEmpty
         else {
           throw DictationError.invalid("Cleanup returned empty text for speech.")
         }
+        cleanedRawUTF16 += (index == 0 ? 0 : 1) + input.utf16.count
+        cleanupBoundaries.append(cleanedRawUTF16)
         segments[index].cleaned = output.text
         if index + 1 < end { for offset in (index + 1)..<end { segments[offset].cleaned = "" } }
         await observe(
@@ -173,7 +189,10 @@ public actor LiveDictation {
       if !original.isEmpty && needsCleanup {
         await observe(DictationProgress(phase: .cleaning, raw: original, draft: draft))
         if let failure { throw DictationError.cleanupFailed(raw: original, message: failure) }
-        if incremental {
+        let crosses =
+          formatting.map { VoiceFormatting.Plan(original, options: $0).crosses(cleanupBoundaries) }
+          ?? false
+        if incremental && !crosses {
           guard segments.allSatisfy({ $0.cleaned != nil }) else {
             throw DictationError.cleanupFailed(
               raw: original, message: "Cleanup did not finish every final segment.")
@@ -187,7 +206,12 @@ public actor LiveDictation {
             throw DictationError.cleanupFailed(raw: original, message: error.localizedDescription)
           }
           cleanupSeconds += ProcessInfo.processInfo.systemUptime - began
-          guard !final.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+          guard
+            !(formatting == nil ? final.trimmingCharacters(in: .whitespacesAndNewlines) : final)
+              .isEmpty
+              || formatting.map({ !VoiceFormatting.Plan(original, options: $0).hasCleanupText })
+                == true
+          else {
             throw DictationError.cleanupFailed(
               raw: original, message: "Cleanup returned empty text for speech.")
           }
@@ -197,11 +221,18 @@ public actor LiveDictation {
       guard !stopped else { throw CancellationError() }
       stopped = true
       dispose()
-      return DictationResult(
+      var result = DictationResult(
         raw: original, text: final,
         timing: DictationTiming(
           recognition: recognitionSeconds, cleanup: cleanupSeconds,
           total: ProcessInfo.processInfo.systemUptime - started))
+      if let formatting {
+        let plan = VoiceFormatting.Plan(original, options: formatting)
+        if !needsCleanup { result.text = plan.render().text }
+        result.formatting = VoiceFormatting.Output(
+          text: result.text, pressEnter: plan.render().pressEnter && !result.text.isEmpty)
+      }
+      return result
     } catch {
       stopped = true
       worker?.cancel()
