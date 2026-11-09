@@ -67,6 +67,15 @@ export type { ResolveAssetReference } from "./prompt.js";
 export { type AntflyProvider, type AntflyProviderOptions, createAntfly } from "./provider.js";
 export { AntflyRerankingModel, type AntflyRerankingModelOptions } from "./reranking-model.js";
 export { type AntflyGraphToolOptions, createGraphTool } from "./tools/graph.js";
-export { type AntflyMemoryToolsOptions, createMemoryTools } from "./tools/memory.js";
+export {
+  type AntflyMemorySessionOptions,
+  type AntflyMemoryToolsOptions,
+  createMemorySession,
+  createMemoryTools,
+  type MemoryAccessOptions,
+  type MemoryBriefLoadOptions,
+  type MemoryTaskOutcome,
+  type MemoryToolJSON,
+} from "./tools/memory.js";
 export { type AntflySearchToolOptions, createSearchTool } from "./tools/search.js";
 export { type AntflySqlToolOptions, createSqlTool } from "./tools/sql.js";

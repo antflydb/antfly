@@ -10,6 +10,8 @@ order: 4
 - How do I ask what an agent believed at an earlier date?
 - How do I trace a memory back to the source that supports it?
 - Can the same memory run embedded and on a server?
+- What should an agent load at the start of every session?
+- How do I find duplicate, disputed or harmful memories?
 </Questions>
 
 ## The Result
@@ -153,6 +155,96 @@ curl -X POST http://127.0.0.1:8080/memory/v1/spaces/agent/outcomes \
 {"action": "outcome", "phase": "succeeded", "revision": 7}
 ```
 
+Outcomes feed back into ranking only where you ask for it. Recall with `"utility_weight": 0.5` (0 to 1) adds that weight times the memory's outcome utility, `(successes - failures) / (successes + failures + 2)`, to its score. The default of 0 leaves ranking unchanged. Utility counts only retained outcomes the caller is allowed to read, in the selected branch. Forgetting any memory used by an outcome immediately excludes that outcome from every utility score. Historical recall excludes outcomes recorded after `known_at`.
+
+### 6. Load a Session Brief
+
+Memory works in layers: evidence is the transcript, claims are the agent's notes, and the brief is the small slice injected at the start of every session. Anything loaded every session costs tokens and spreads any error it contains, so the brief stays small and points to deeper recall instead of repeating it.
+
+```bash
+curl -s 'http://127.0.0.1:8080/memory/v1/spaces/agent/brief?limit=8&token_budget=1024'
+```
+
+```json
+{
+  "items": [
+    {"id": "deploy-terraform", "statement": "Production deploys with Terraform.",
+     "kind": "semantic", "subject": "production", "predicate": "deploys_with",
+     "stability": "settled", "pinned": false, "score": 2.67,
+     "utility": {"successes": 1, "failures": 0, "score": 0.33, "complete": true}}
+  ],
+  "subjects": [{"subject": "production", "memories": 1}],
+  "guidance": "These are the memories most worth knowing at the start of a session. ...",
+  "complete": true,
+  "token_upper_bound": 512
+}
+```
+
+The brief holds current, active claims only. Disputed claims stay out unless pinned. Provisional claims stay out unless pinned or you pass `include_provisional`. Constraints and preferences rank first, then procedures and lessons, then decisions and plain facts. Settled claims and claims with good outcomes rank higher, and restated duplicates collapse to one item. `subjects` lists what else the space knows about, so the agent can recall it on demand. `scope`, `task` and `environment` narrow the brief to one context. The whole rendered response, not just the items, fits within `token_budget` bytes.
+
+Pin a memory to prioritize it ahead of unpinned memories, within the brief’s item and byte limits:
+
+```bash
+curl -X POST http://127.0.0.1:8080/memory/v1/spaces/agent/pins   -H 'Content-Type: application/json'   -H 'Idempotency-Key: pin-terraform'   -d '{"id": "deploy-terraform", "reason": "Every deploy task needs this"}'
+```
+
+Send `"pinned": false` to unpin, including after the evidence expires. Pins belong to the selected branch and are not inherited by forks. Pinning a team-visible memory changes every principal's brief, so it requires curator access.
+
+### 7. Review Memory Health
+
+Memory degrades without upkeep. Notes can be wrong when written, facts go stale, and duplicates pile up. A consolidation review reads the space and reports what needs attention, without changing anything:
+
+```bash
+curl -X POST http://127.0.0.1:8080/memory/v1/spaces/agent/consolidation   -H 'Content-Type: application/json' -d '{"limit": 32, "stale_after_ms": 2592000000}'
+```
+
+```json
+{
+  "findings": [
+    {"kind": "unverified", "memory_ids": ["owner-guess"], "entity_id": null, "target_id": null,
+     "reason": "provisional or inferred claim; check it against its evidence and settle or retract it",
+     "suggested_action": "verify"}
+  ],
+  "stats": {"memories": 2, "by_kind": [{"name": "semantic", "memories": 2}], "pinned": 0, "entities": 0},
+  "complete": true
+}
+```
+
+Follow `next_cursor` until `complete` is true, including pages with no findings. Keep `stale_after_ms` unchanged across pages and sum each page's statistics; writes invalidate the cursor.
+
+```python
+cursor = None
+while True:
+    page = client.memory.consolidate("agent", cursor=cursor, limit=32)
+    for finding in page["findings"]:
+        print(finding["kind"], finding["memory_ids"])
+    if page["complete"]:
+        break
+    cursor = page["next_cursor"]
+```
+
+A curator can create reviewable work with `memory.prepare_consolidation("agent", idempotency_key="review-2026-01")`. The receipt contains `proposal_ids` for the supersession verdict flow and `review_cursor` for the next preparation request. Preparation returns only open proposals whose pins match current authorized views, and refreshes stale work while retaining its audit history. Continue `review_cursor` even when a page returns no proposal IDs. Proposal creation leaves beliefs unchanged. Verifying a claim with `correct` to active/settled records `last_verified_at` and resets staleness.
+
+After consuming recall or brief results, call `memory.access("agent", ["deploy-helm"], idempotency_key="session-42-recall-1")`. Reuse the key on retries. `memory.usage("agent", "deploy-helm")` returns your branch-local count, last access, verification time and utility. Reads themselves do not create access events. Inspection includes paged `statistics` for retained space growth; continue with `memory.execute("agent", "inspect", body={"cursor": next_cursor})` and sum counts.
+
+Retrieval evaluation cases compare `policy.retrieval="recall"`, `"brief"` or `"none"`. Brief cases accept session-brief filters and budgets; no-memory cases use zero context tokens.
+
+Each finding carries a `suggested_action` that maps to an existing reviewed write:
+
+| Finding | Meaning | Suggested action |
+|---|---|---|
+| `duplicate` | Active claims with the same subject, predicate, applicability and value | `propose_supersession` with a `restates` verdict |
+| `dispute` | Conflicting current claims | `review_supersession` |
+| `unordered` | Single-valued claim without `valid_from` | `add_valid_from` |
+| `unverified` | Provisional, inferred or hypothesized claim | `verify`, then `correct` to settle or retract |
+| `stale` | Single-valued or provisional claim not verified within `stale_after_ms` | `verify` |
+| `harmful` | Used mostly in failed tasks | `correct` |
+| `dangling_link` | Links to a memory that was retired | `fix_link` |
+| `orphan_entity` | Entity no current claim mentions | `curate_entity` |
+| `promote` | Settled durable or repeatedly useful claim | `pin` |
+
+Run the review on a schedule, or after a burst of writes, and act on findings through a person or a judge model. Similarity never changes a memory by itself. `stats` counts memories by kind, lifecycle, stability and producer. A sharp rise in claims from one producer usually means an agent is logging everything instead of what matters.
+
 ### Run It Embedded
 
 The same actions run in-process on a `.aflite` file through the [embedded bindings](/docs/guides/lite), with the action name in the request:
@@ -170,9 +262,25 @@ with antfly_embedded.create("agent.aflite") as db:
     print(memory("recall", {"subject": "production", "token_budget": 4096}))
 ```
 
-Against a server, the Python SDK uses the same action names: `AntflyClient(url).memory.execute("agent", "recall", body={...})`. MCP clients reach these actions as tools at `/memory/v1/mcp`. The full contract, covering evidence and temporal policy, identity and supersession judging, provenance, and recorded explanations, is in [MEMORY.md](https://github.com/antflydb/antfly/blob/main/zig/MEMORY.md).
+Against a server, the Python SDK uses the same action names: `AntflyClient(url).memory.execute("agent", "recall", body={...})`, plus helpers such as `memory.brief("agent")` and `memory.recall("agent", query=...)` that generate idempotency keys for you.
+
+For Vercel AI SDK agents, `@antfly/ai-sdk` exports `createMemorySession`. Give it
+the authenticated client, fixed space/catalog scope, a globally unique host
+`runId`, and brief/recall budget ceilings. `loadBrief()` returns fresh bounded
+context; `tools` opts into the native eight-tool agent profile. After consuming
+memory, the host calls `recordAccess(ids, {eventId})` and reports its actual task
+result with `recordOutcome(...)`. Stable run, tool-call and event IDs deduplicate
+retries across restarts. The existing `createMemoryTools` default keeps its three
+tools; pass `profile: "agent"` to opt in. Consolidation and curator review remain
+explicit application/operator calls, and transcript ingestion is never implicit.
+
+### Connect an Agent over MCP
+
+Point an agent at `/memory/v1/mcp/agent`. It lists a small toolset: `memory_brief`, `memory_recall`, `memory_observe`, `memory_correct`, `memory_forget`, `memory_outcome`, `memory_get` and `memory_explain`. The tool descriptions say what memory is for rather than prescribing rules. Writes on this endpoint don't need an `idempotency_key`: when one is omitted, Antfly derives it from the tool arguments, so an identical retry replays the first result. Operators and curators use `/memory/v1/mcp`, which lists every action, including proposals, lineage, evaluation, pins and consolidation. The full contract, covering evidence and temporal policy, identity and supersession judging, provenance, and recorded explanations, is in [MEMORY.md](https://github.com/antflydb/antfly/blob/main/zig/MEMORY.md).
 
 ## Tradeoffs
+
+Keep the brief small. If an agent needs more than a screen of context every session, pin less and let it recall the rest. Consolidation reports are suggestions: an inferred claim may be right, and a duplicate may be an intended restatement in a different scope.
 
 The decision you own is which claims are facts with one current value. Declare a predicate with `cardinality: "one"` only when a newer claim should replace the old one; without it, both values stay `active` and recall returns both. Give every claim a real `valid_from`. A claim with no validity time can't be ordered against the others, so ingestion order never decides which is current.
 

@@ -38,6 +38,7 @@ comptime {
     exportInternal(&enrichment_compute_exports.pdfSessionClose, "antfly_enrichment_pdf_session_close");
     exportInternal(&enrichment_compute_exports.pdfBackend, "antfly_enrichment_pdf_backend");
     exportInternal(&enrichment_compute_exports.bufferDestroy, "antfly_enrichment_buffer_destroy");
+    exportInternal(&enrichment_compute_exports.pipelineMetricsJson, "antfly_enrichment_pipeline_metrics_json");
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

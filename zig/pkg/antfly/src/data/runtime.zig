@@ -2800,6 +2800,16 @@ pub const HealthSource = struct {
         try writeAsyncIndexingMetrics(writer, async_indexing_stats, replay_not_visible_skipped_by_index);
         try antfly.db.query_metrics.writePrometheus(writer);
         try antfly.db.enrichment_utf8_text.writePrometheus(writer);
+        const pipeline_metrics = @import("antfly_platform").document_pipeline_metrics;
+        var pipeline_snapshot = pipeline_metrics.snapshot();
+        if (comptime linked_storage) if (self.data_server.kernel_owner_source) |owner| {
+            var response = try owner.context.pipelineMetricsJson();
+            defer response.deinit();
+            const parsed = try std.json.parseFromSlice(pipeline_metrics.Snapshot, self.data_server.alloc, response.bytes(), .{});
+            defer parsed.deinit();
+            try pipeline_snapshot.merge(parsed.value);
+        };
+        try pipeline_snapshot.writePrometheus(writer);
     }
 
     fn writeHotStandbyMetrics(self: *HealthSource, writer: *std.Io.Writer) !void {
