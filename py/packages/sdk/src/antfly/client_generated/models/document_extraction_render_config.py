@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.document_extraction_render_config_resolution import DocumentExtractionRenderConfigResolution
+from ..models.document_extraction_render_config_sampling import DocumentExtractionRenderConfigSampling
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="DocumentExtractionRenderConfig")
@@ -17,6 +18,14 @@ class DocumentExtractionRenderConfig:
     """How PDF pages are rasterized for OCR.
 
     Attributes:
+        sampling (DocumentExtractionRenderConfigSampling | Unset): PDF image sampling, separate from model resizing and
+            normalization.
+            `auto` smooths continuous-tone images while preserving one-bit scan
+            coverage during minification. `pdf` honors the PDF's interpolation
+            declarations. `smooth` uses bilinear sampling even for one-bit images
+            (except stencil masks), which can soften fine lines. Effective policy,
+            version, resolution, DPI and geometry are recorded in unit provenance. Default:
+            DocumentExtractionRenderConfigSampling.AUTO.
         dpi (int | Unset): Render resolution in dots per inch. Default: 150.
         resolution (DocumentExtractionRenderConfigResolution | Unset): `requested_dpi` renders at `dpi` within the caps.
             `model_input` renders near the model's preferred input size. Default:
@@ -25,6 +34,7 @@ class DocumentExtractionRenderConfig:
         max_dimension (int | Unset): Maximum width or height of a rendered page. Default: 4096.
     """
 
+    sampling: DocumentExtractionRenderConfigSampling | Unset = DocumentExtractionRenderConfigSampling.AUTO
     dpi: int | Unset = 150
     resolution: DocumentExtractionRenderConfigResolution | Unset = (
         DocumentExtractionRenderConfigResolution.REQUESTED_DPI
@@ -34,6 +44,10 @@ class DocumentExtractionRenderConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        sampling: str | Unset = UNSET
+        if not isinstance(self.sampling, Unset):
+            sampling = self.sampling.value
+
         dpi = self.dpi
 
         resolution: str | Unset = UNSET
@@ -47,6 +61,8 @@ class DocumentExtractionRenderConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if sampling is not UNSET:
+            field_dict["sampling"] = sampling
         if dpi is not UNSET:
             field_dict["dpi"] = dpi
         if resolution is not UNSET:
@@ -61,6 +77,13 @@ class DocumentExtractionRenderConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        _sampling = d.pop("sampling", UNSET)
+        sampling: DocumentExtractionRenderConfigSampling | Unset
+        if isinstance(_sampling, Unset):
+            sampling = UNSET
+        else:
+            sampling = DocumentExtractionRenderConfigSampling(_sampling)
+
         dpi = d.pop("dpi", UNSET)
 
         _resolution = d.pop("resolution", UNSET)
@@ -75,6 +98,7 @@ class DocumentExtractionRenderConfig:
         max_dimension = d.pop("max_dimension", UNSET)
 
         document_extraction_render_config = cls(
+            sampling=sampling,
             dpi=dpi,
             resolution=resolution,
             max_pixels=max_pixels,

@@ -26,7 +26,7 @@ const MediaField = struct { field: []const u8, mode: ?enum { identity } = null, 
 const MediaSelection = struct { fields: []const MediaField };
 const Seen = std.AutoHashMap([32]u8, void);
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
-pub const Table = struct { fields: ?record_view.Fields = null, streams: []const record_view.Stream = &.{}, selected_stream: ?record_view.Stream = null, published_revision: ?[]const u8 = null, table: ?[]const u8 = null, source_id: ?[]const u8 = null, source_filter: ?std.json.Value = null, valid_until: ?i64 = null, access_id: ?[]const u8 = null, status: ?[]const u8 = null, name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
+pub const Table = struct { search_version: u32 = 1, artifacts: []const std.json.Value = &.{}, fields: ?record_view.Fields = null, streams: []const record_view.Stream = &.{}, selected_stream: ?record_view.Stream = null, published_revision: ?[]const u8 = null, table: ?[]const u8 = null, source_id: ?[]const u8 = null, source_filter: ?std.json.Value = null, valid_until: ?i64 = null, access_id: ?[]const u8 = null, status: ?[]const u8 = null, name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
 pub const ValueVerification = struct {
     allow_scan: bool = true,
     max_documents: u64 = 100_000,
@@ -67,6 +67,10 @@ pub fn run(search: anytype) !void {
         if (!std.ascii.eqlIgnoreCase(tables.scheme, inference.scheme) or !std.ascii.eqlIgnoreCase(table_host.percent_encoded, inference_host.percent_encoded) or table_port != inference_port) return error.ConflictingMediaOptions;
     }
     for (config.tables, 0..) |table, i| {
+        if (table.search_version > 2) return error.UnsupportedSearchVersion;
+        if (table.search_version < 2) for (table.streams) |stream| {
+            if (stream.retrieval != null or stream.resource_field != null) return error.UnsupportedSearchVersion;
+        };
         if (table.fields) |fields| try record_view.validate(fields, table.streams);
         if (table.fields == null and table.streams.len > 0) return error.InvalidSourceFields;
         if (table.name.len == 0 or (table.fields == null and table.document_field.len == 0) or std.mem.eql(u8, table.name, ".") or std.mem.eql(u8, table.name, "..") or std.mem.indexOfScalar(u8, table.name, 0) != null) return error.InvalidTableConfig;
@@ -105,7 +109,11 @@ pub fn run(search: anytype) !void {
         if (!selected) continue;
         if (table.fields != null and !metadataListing(search.options)) {
             var selected_count: usize = 0;
-            for (table.streams) |stream| {
+            for (table.streams) |declared| {
+                const stream = record_view.exact(declared) orelse {
+                    if (search.options.artifacts.items.len > 0 and record_view.selected(declared, search.options.artifacts.items, search.options.all_artifacts)) try search.reportError(table.alias orelse table.name, error.RepresentationDoesNotSupportExactSearch);
+                    continue;
+                };
                 if (!record_view.selected(stream, search.options.artifacts.items, search.options.all_artifacts)) continue;
                 selected_count += 1;
                 var bound = table;
@@ -326,6 +334,16 @@ fn streamReadiness(search: anytype, http: *httpx.Client, config: Config, table: 
         const field = document.field(binding, "field") orelse document.field(index_config, "field");
         if (field) |value| {
             if (value == .string and std.mem.eql(u8, value.string, stream.field)) matching_field = true;
+            if (value == .string and std.mem.eql(u8, value.string, "text") and std.mem.eql(u8, stream.field, "$")) {
+                if (document.field(index_config, "enrichments")) |enrichments| if (enrichments == .array) {
+                    for (enrichments.array.items) |enrichment| {
+                        const name = document.string(enrichment, "name") catch continue;
+                        const kind = document.string(enrichment, "kind") catch continue;
+                        const mime = document.string(enrichment, "content_type") catch continue;
+                        if (std.mem.eql(u8, name, stream.artifact.?) and std.mem.eql(u8, kind, "asset") and std.mem.eql(u8, mime, "text/plain")) matching_field = true;
+                    }
+                };
+            }
             if (value == .null and std.mem.eql(u8, stream.field, "$")) matching_field = true;
         } else if (std.mem.eql(u8, stream.field, "$")) matching_field = true;
     }

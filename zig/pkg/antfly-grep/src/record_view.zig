@@ -25,7 +25,14 @@ pub const Fields = struct {
     permissions: []const u8 = "permissions",
     metadata: []const u8 = "metadata",
 };
+pub const Retrieval = struct {
+    exact: ?struct { default: bool = false } = null,
+    full_text: ?struct { index: []const u8, default: bool = false } = null,
+    semantic: ?std.json.Value = null,
+};
 pub const Stream = struct {
+    resource_field: ?[]const u8 = null,
+    retrieval: ?Retrieval = null,
     name: []const u8,
     artifact: ?[]const u8 = null,
     index: ?[]const u8 = null,
@@ -41,7 +48,20 @@ pub fn validate(fields: Fields, streams: []const Stream) !void {
         if (field.len == 0 or std.mem.indexOfAny(u8, field, "\x00\r\n") != null) return error.InvalidSourceFields;
     }
     if (streams.len > 64) return error.TooManyArtifactStreams;
-    for (streams, 0..) |stream, i| {
+    for (streams, 0..) |declared, i| {
+        if (declared.name.len == 0 or std.mem.indexOfAny(u8, declared.name, "\x00\r\n") != null) return error.InvalidArtifactStream;
+        for ([_]?[]const u8{ declared.artifact, declared.index, declared.purpose, declared.location_field, declared.resource_field }) |field| {
+            if (field) |value| if (value.len == 0 or std.mem.indexOfAny(u8, value, "\x00\r\n") != null) return error.InvalidArtifactStream;
+        }
+
+        if (declared.retrieval) |retrieval| {
+            if (retrieval.exact == null and retrieval.full_text == null and retrieval.semantic == null) return error.InvalidArtifactStream;
+            if (declared.name.len == 0) return error.InvalidArtifactStream;
+            if (declared.resource_field == null and declared.artifact == null and declared.field.len == 0) return error.InvalidArtifactStream;
+            for (streams[0..i]) |prior| if (std.mem.eql(u8, prior.name, declared.name)) return error.DuplicateArtifactStream;
+            if (exact(declared) == null) continue;
+        }
+        const stream = exact(declared) orelse return error.InvalidArtifactStream;
         if (stream.name.len == 0 or stream.field.len == 0 or std.mem.indexOfAny(u8, stream.name, "\x00\r\n") != null or std.mem.indexOfAny(u8, stream.field, "\x00\r\n") != null) return error.InvalidArtifactStream;
         for ([_]?[]const u8{ stream.artifact, stream.index, stream.purpose, stream.location_field }) |field| {
             if (field) |value| if (std.mem.indexOfAny(u8, value, "\x00\r\n") != null) return error.InvalidArtifactStream;
@@ -51,6 +71,18 @@ pub fn validate(fields: Fields, streams: []const Stream) !void {
         if (stream.boundary) |boundary| if (!std.mem.eql(u8, boundary, "record") and !std.mem.eql(u8, boundary, "unit")) return error.UnsupportedArtifactBoundary;
         for (streams[0..i]) |prior| if (std.mem.eql(u8, prior.name, stream.name)) return error.DuplicateArtifactStream;
     }
+}
+
+/// Adapt only explicitly exact-enabled representations. Semantic media is never
+/// substituted with captions or silently treated as empty canonical text.
+pub fn exact(stream: Stream) ?Stream {
+    const retrieval = stream.retrieval orelse return stream;
+    const binding = retrieval.exact orelse return null;
+    var out = stream;
+    out.default = binding.default;
+    if (stream.artifact != null) out.index = if (retrieval.full_text) |text_binding| text_binding.index else return null;
+    out.retrieval = null;
+    return out;
 }
 
 pub fn parentFields(a: A, fields: Fields) ![]const []const u8 {
@@ -85,4 +117,20 @@ pub fn selected(stream: Stream, requested: []const []const u8, all: bool) bool {
         if (stream.artifact) |artifact| if (std.mem.eql(u8, name, artifact)) return true;
     }
     return false;
+}
+
+test "versioned stream adapters preserve exact text and exclude semantic media" {
+    const text_stream: Stream = .{ .name = "source", .field = "content.text", .retrieval = .{ .exact = .{ .default = true } } };
+    try std.testing.expect(exact(text_stream).?.default);
+    const media_stream: Stream = .{ .name = "image", .resource_field = "content.resource", .retrieval = .{ .semantic = .null } };
+    try std.testing.expect(exact(media_stream) == null);
+    try validate(.{}, &.{ text_stream, media_stream });
+}
+
+test "raw text asset projections use the native scalar envelope" {
+    var object = std.json.ObjectMap.empty;
+    defer object.deinit(std.testing.allocator);
+    try object.put(std.testing.allocator, "$", .{ .string = "asset text" });
+    try std.testing.expectEqualStrings("asset text", try text(.{ .object = object }, "$"));
+    try std.testing.expectError(error.MissingArtifactText, text(.{ .object = object }, "private"));
 }

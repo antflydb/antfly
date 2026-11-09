@@ -432,6 +432,17 @@ components:
       type: object
       description: How PDF pages are rasterized for OCR.
       properties:
+        sampling:
+          type: string
+          enum: [auto, pdf, smooth]
+          default: auto
+          description: |-
+            PDF image sampling, separate from model resizing and normalization.
+            `auto` smooths continuous-tone images while preserving one-bit scan
+            coverage during minification. `pdf` honors the PDF's interpolation
+            declarations. `smooth` uses bilinear sampling even for one-bit images
+            (except stencil masks), which can soften fine lines. Effective policy,
+            version, resolution, DPI and geometry are recorded in unit provenance.
         dpi:
           type: integer
           minimum: 72
@@ -1068,6 +1079,10 @@ components:
         template: { type: string }
         source_artifact_name: { type: string }
         expected_dims: { type: integer, minimum: 0 }
+        embedding_input:
+          type: string
+          enum: [text, pdf_page_images]
+          description: Effective embedding input mode; PDF pages are rasterized before embedding.
         vector_space:
           type: string
           minLength: 1
@@ -1090,6 +1105,7 @@ components:
         publication_policy: { $ref: "#/components/schemas/IndexPublicationPolicy" }
         coverage_policy: { $ref: "#/components/schemas/DerivedCoveragePolicy" }
         external: { type: boolean, default: false }
+        external_vector_space: { type: string }
         sparse: { type: boolean, default: false }
         dimension: { type: integer, minimum: 1 }
         field: { type: string }
@@ -1305,6 +1321,11 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor)."
+        embedding_input:
+          type: string
+          enum: [text, pdf_page_images]
+          default: text
+          description: pdf_page_images requires kind=embedding and a dense index. It consumes an original PDF URI selected by field or template and embeds its rendered pages. Upstream artifacts (source_artifact_name) and text chunking are not supported. Native field selectors address literal root keys; use a raw template for nested resource URIs.
         expected_dims:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -2233,6 +2254,11 @@ components:
           type: boolean
           default: false
           description: "When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template."
+        external_vector_space:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: "Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model."
         sparse:
           x-go-type-skip-optional-pointer: true
           type: boolean

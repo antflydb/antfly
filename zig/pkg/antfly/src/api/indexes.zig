@@ -505,6 +505,11 @@ fn validateArtifactIndexReferences(
 
         if (std.mem.eql(u8, index_type, "embeddings")) {
             const external = if (object.get("external")) |value| value == .bool and value.bool else false;
+            if (object.get("external_vector_space")) |space| {
+                if (!external or space != .string or space.string.len == 0 or space.string.len > 4096)
+                    return error.InvalidEnrichmentConfig;
+                if (object.get("sparse")) |sparse| if (sparse == .bool and sparse.bool) return error.InvalidEnrichmentConfig;
+            }
             if (!external) {
                 try validateEmbeddingArtifactReferences(alloc, object, configs);
             }
@@ -665,7 +670,7 @@ fn validateEmbeddingArtifactShape(
     dims: u32,
 ) !void {
     if (sparse) {
-        if (cfg.expected_dims != 0) return error.InvalidEnrichmentConfig;
+        if (cfg.expected_dims != 0 or cfg.embedding_input != .text) return error.InvalidEnrichmentConfig;
     } else if (dims > 0 and cfg.expected_dims > 0 and cfg.expected_dims != dims) {
         return error.InvalidEnrichmentConfig;
     }
