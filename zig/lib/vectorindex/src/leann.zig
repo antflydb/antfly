@@ -226,6 +226,10 @@ pub const SearchOptions = struct {
     /// Maximum graph candidates and fallback positions inspected for an
     /// opaque filter. Zero leaves the search exhaustive.
     filter_visit_limit: u32 = 0,
+    /// Score every eligible candidate instead of pruning by estimates.
+    exhaustive: bool = false,
+    /// Load upper-layer candidates to verify their backing vector is available.
+    verify_source: bool = false,
     gate: ?RecomputeGate = null,
     /// Beam width, raised to `k` when smaller. Zero picks a default per
     /// rerank mode: 64 for `ratio`, where every beam slot costs
@@ -1379,7 +1383,7 @@ pub const Index = struct {
         for (out, 0..) |*o, i| {
             const row = buf.items[i * d ..][0..d];
             if (self.config.metric == .cosine) normalize(row);
-            o.* = distance(self.config.metric, q, row);
+            o.* = if (std.math.isNan(row[0])) std.math.inf(f32) else distance(self.config.metric, q, row);
         }
     }
 
@@ -1558,6 +1562,9 @@ pub const Index = struct {
                 return a.lower < b.lower;
             }
         };
+        if (opts.exhaustive) {
+            for (pool.items) |*item| item.lower = -std.math.inf(f32);
+        }
         std.mem.sortUnstable(Pooled, pool.items, {}, ByLower.lessThan);
 
         var top = Heap(true){};
@@ -1579,14 +1586,9 @@ pub const Index = struct {
                 const p = pool.items[i];
                 if (p.lower >= tau) break;
                 if (self.isDeleted(p.id)) continue;
-                if (self.upper_vectors.contains(p.id)) {
-                    // Stored exactly (bound 0): no recomputation needed.
+                if (!opts.verify_source and !opts.exhaustive and self.upper_vectors.contains(p.id)) {
                     const c = Cand{ .dist = p.lower, .id = p.id };
-                    if (top.len() < k) {
-                        try top.push(alloc, c);
-                    } else if (c.dist < top.top().dist) {
-                        top.replaceTop(c);
-                    }
+                    if (top.len() < k) try top.push(alloc, c) else if (c.dist < top.top().dist) top.replaceTop(c);
                     continue;
                 }
                 try ids.append(alloc, p.id);
@@ -1602,6 +1604,7 @@ pub const Index = struct {
             try dists.resize(alloc, ids.items.len);
             try self.recomputeDistances(alloc, source, q, ids.items, &buf, dists.items, stats);
             for (ids.items, dists.items) |id, dist| {
+                if (!std.math.isFinite(dist)) continue;
                 const c = Cand{ .dist = dist, .id = id };
                 if (top.len() < k) {
                     try top.push(alloc, c);
@@ -1615,7 +1618,7 @@ pub const Index = struct {
             // fewer than k results.
             stats.budget_exhausted = true;
             for (pool.items[from..], from..) |p, position| {
-                if (self.isDeleted(p.id) or (position < i and self.upper_vectors.contains(p.id))) continue;
+                if (self.isDeleted(p.id) or (!opts.verify_source and !opts.exhaustive and position < i and self.upper_vectors.contains(p.id))) continue;
                 const c = Cand{ .dist = p.est, .id = p.id };
                 if (top.len() < k) {
                     try top.push(alloc, c);
@@ -1691,6 +1694,11 @@ pub const Index = struct {
                 try ds.resize(a, ids.items.len);
                 try index.recomputeDistances(a, src, query, ids.items, vectors, ds.items, st);
                 for (ids.items, ds.items) |id, dist| {
+                    if (!std.math.isFinite(dist)) {
+                        // Missing nodes still connect the graph; do not return them.
+                        try eq.push(a, .{ .dist = std.math.inf(f32), .id = id });
+                        continue;
+                    }
                     const c = Cand{ .dist = dist, .id = id };
                     const full = res.len() >= limit;
                     if (full and c.dist >= res.top().dist) continue;
@@ -3669,6 +3677,28 @@ test "leann: opaque filter work is bounded unless exhaustive" {
     try testing.expect(!exhaustive.stats.filter_truncated);
     try testing.expectEqual(@as(usize, 1), exhaustive.results.len);
     try testing.expectEqual(@as(u32, 1999), exhaustive.results[0].id);
+}
+
+test "leann: missing vectors are not returned even for zero queries" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 128, 1, 16, 16, 49);
+    defer fx.deinit(alloc);
+    const Source = struct {
+        vectors: []const f32,
+        fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (ids, 0..) |id, i| {
+                if (id == 3) @memset(out[i * 16 ..][0..16], std.math.nan(f32)) else @memcpy(out[i * 16 ..][0..16], self.vectors[@as(usize, id) * 16 ..][0..16]);
+            }
+        }
+    };
+    var src = Source{ .vectors = fx.data };
+    var index = try Index.build(alloc, .{ .dims = 16, .quantizer = .rabitq, .max_degree = 16 }, fx.data);
+    defer index.deinit();
+    var result = try index.search(alloc, .{ .ctx = &src, .recompute_fn = Source.recompute }, &@as([16]f32, @splat(0)), .{ .k = 2, .candidate_ids = &.{ 3, 7 }, .exhaustive = true });
+    defer result.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), result.results.len);
+    try testing.expectEqual(@as(u32, 7), result.results[0].id);
 }
 
 test "leann: cancellation interrupts an empty filtered walk" {

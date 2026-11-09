@@ -669,6 +669,8 @@ pub const Replica = struct {
         candidate_ids: ?[]const u32 = null,
         filter_visit_limit: u32 = 0,
         filter_truncated: ?*bool = null,
+        budget_exhausted: ?*bool = null,
+        exhaustive: bool = false,
         /// Cancellation and re-embedding budget (see `leann.RecomputeGate`).
         gate: ?leann.RecomputeGate = null,
     };
@@ -699,7 +701,7 @@ pub const Replica = struct {
             try hits.append(alloc, .{ .key = key, .distance = leann.distance(metric, q, tmp) });
         }
         if (self.index) |*index| {
-            var ctx = SearchSource{ .replica = self, .loader = loader, .far_from = query };
+            var ctx = SearchSource{ .replica = self, .loader = loader, .far_from = query, .strict = tuning.exhaustive };
             const node_filter: ?NodeKeyFilter = if (tuning.filter) |f| .{ .replica = self, .filter = f } else null;
             var resp = try index.search(alloc, ctx.source(), query, .{
                 .k = k,
@@ -709,10 +711,13 @@ pub const Replica = struct {
                 .filter = if (node_filter) |*nf| leann.Filter{ .ctx = nf, .allows_fn = NodeKeyFilter.allows } else null,
                 .candidate_ids = tuning.candidate_ids,
                 .filter_visit_limit = tuning.filter_visit_limit,
+                .exhaustive = tuning.exhaustive,
+                .verify_source = true,
                 .gate = tuning.gate,
             });
             defer resp.deinit(alloc);
             if (tuning.filter_truncated) |truncated| truncated.* = resp.stats.filter_truncated;
+            if (tuning.budget_exhausted) |exhausted| exhausted.* = resp.stats.budget_exhausted;
             for (resp.results) |r| try hits.append(alloc, .{ .key = self.keys.items[r.id], .distance = r.distance });
         }
         std.mem.sortUnstable(Hit, hits.items, {}, struct {
@@ -820,6 +825,7 @@ pub const Replica = struct {
         replica: *const Replica,
         loader: VectorLoader,
         far_from: []const f32,
+        strict: bool = false,
 
         fn source(self: *PlanSource) leann.EmbeddingSource {
             return .{ .ctx = self, .recompute_fn = recompute };
@@ -827,14 +833,15 @@ pub const Replica = struct {
 
         fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) anyerror!void {
             const self: *PlanSource = @ptrCast(@alignCast(raw));
-            return recomputeByKey(self.replica, self.loader, self.far_from, ids, out);
+            return recomputeByKey(self.replica, self.loader, self.far_from, ids, out, self.strict);
         }
     };
 
     const SearchSource = PlanSource;
 };
 
-fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: []const f32, ids: []const u32, out: []f32) !void {
+fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: []const f32, ids: []const u32, out: []f32, strict: bool) !void {
+    _ = far_from;
     const d: usize = replica.opts.config.dims;
     if (loader.load_batch) |load_batch| {
         const keys = try replica.alloc.alloc([]const u8, ids.len);
@@ -845,8 +852,9 @@ fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: []con
         for (ids, keys) |id, *k| k.* = if (replica.index.?.isDeleted(id)) "" else replica.keys.items[id];
         @memset(found, false);
         try load_batch(loader.ctx, replica.alloc, keys, out[0 .. ids.len * d], found);
-        for (found, 0..) |ok, i| if (!ok) for (out[i * d ..][0..d], far_from) |*o, x| {
-            o.* = -1000 * x;
+        for (found, 0..) |ok, i| if (!ok) {
+            if (strict and keys[i].len != 0) return error.IncompletePublishedSnapshot;
+            @memset(out[i * d ..][0..d], std.math.nan(f32));
         };
         return;
     }
@@ -864,7 +872,8 @@ fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: []con
             if (v.len != d) return error.DimensionMismatch;
             @memcpy(row, v);
         } else {
-            for (row, far_from) |*o, x| o.* = -1000 * x;
+            if (strict and !replica.index.?.isDeleted(id)) return error.IncompletePublishedSnapshot;
+            @memset(row, std.math.nan(f32));
         }
     }
 }

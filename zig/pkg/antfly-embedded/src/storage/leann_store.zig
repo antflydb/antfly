@@ -689,8 +689,8 @@ pub const LeannStore = struct {
         // can only be checked afterwards, so they over-fetch, widening until
         // k results pass or the whole graph has been considered.
         var want: usize = if (filter.distanceActive()) @max(req.k * 4, req.k + 64) else req.k;
-        var gate = SearchGate.init(req, if (self.opts.transient and !search_types.requiresExhaustiveCoverage(req)) self.opts.reembed_budget_ms else 0);
-        var ctx = SourceCtx{ .store = self, .far_from = req.query, .reembed_ns = &gate.reembed_ns };
+        var gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
+        var ctx = SourceCtx{ .store = self, .far_from = req.query, .reembed_ns = &gate.reembed_ns, .strict = search_types.requiresExhaustiveCoverage(req) };
         const node_filter = NodeFilter{ .store = self, .filter = &filter };
         var candidate_ids = std.ArrayListUnmanaged(u32).empty;
         defer candidate_ids.deinit(alloc);
@@ -702,15 +702,18 @@ pub const LeannStore = struct {
             want = @min(want, live);
             var resp = try index.search(alloc, ctx.source(), req.query, .{
                 .k = @intCast(want),
-                .ef = if (filter.nodeActive() and search_types.requiresExhaustiveCoverage(req)) @intCast(live) else if (self.opts.search_ef > 0) @max(self.opts.search_ef, @as(u32, @intCast(want))) else 0,
+                .ef = if (search_types.requiresExhaustiveCoverage(req)) @intCast(live) else if (self.opts.search_ef > 0) @max(self.opts.search_ef, @as(u32, @intCast(want))) else 0,
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
-                .filter = if (filter.nodeActive()) .{ .ctx = &node_filter, .allows_fn = NodeFilter.allows } else null,
+                .filter = if (filter.nodeActive() or search_types.requiresExhaustiveCoverage(req)) .{ .ctx = &node_filter, .allows_fn = NodeFilter.allows } else null,
                 .candidate_ids = if (filter.has_allowed) candidate_ids.items else null,
+                .exhaustive = search_types.requiresExhaustiveCoverage(req),
+                .verify_source = true,
                 .filter_visit_limit = if (filter.nodeActive() and !search_types.requiresExhaustiveCoverage(req)) @max(65536, @as(u32, @intCast(@min(req.k *| 16, std.math.maxInt(u32))))) else 0,
                 .gate = gate.recomputeGate(),
             });
             defer resp.deinit(alloc);
+            if (resp.stats.budget_exhausted and search_types.requiresExhaustiveCoverage(req)) return error.IncompletePublishedSnapshot;
             var passed: usize = 0;
             for (resp.results) |r| {
                 const node = self.nodes.items[r.id];
@@ -781,6 +784,7 @@ pub const LeannStore = struct {
         store: *LeannStore,
         far_from: []const f32,
         reembed_ns: ?*u64 = null,
+        strict: bool = false,
 
         fn source(self: *SourceCtx) leann.EmbeddingSource {
             return .{ .ctx = self, .recompute_fn = recompute };
@@ -808,8 +812,9 @@ pub const LeannStore = struct {
                 if (loader.load_batch_timed) |timed| {
                     try timed(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found, self.reembed_ns orelse &ignored_ns);
                 } else try loader.load_batch.?(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found);
-                for (found, 0..) |ok, i| if (!ok) for (out[i * d ..][0..d], self.far_from) |*o, x| {
-                    o.* = -1000 * x;
+                for (found, 0..) |ok, i| if (!ok) {
+                    if (self.strict and metas[i].len != 0) return error.IncompletePublishedSnapshot;
+                    @memset(out[i * d ..][0..d], std.math.nan(f32));
                 };
                 return;
             }
@@ -828,7 +833,8 @@ pub const LeannStore = struct {
                     if (v.len != d) return error.DimensionMismatch;
                     @memcpy(row, v);
                 } else {
-                    for (row, self.far_from) |*o, x| o.* = -1000 * x;
+                    if (self.strict and node.metadata.len != 0 and !store.index.?.isDeleted(id)) return error.IncompletePublishedSnapshot;
+                    @memset(row, std.math.nan(f32));
                 }
             }
         }
@@ -1387,6 +1393,9 @@ test "leann search forwards reembedding time from batch loader" {
     defer result.deinit();
     try testing.expectEqual(@as(usize, 1), source.calls);
     try testing.expectEqual(@as(usize, 50), result.items.items.len);
+    source.calls = 0;
+    try testing.expectError(error.IncompletePublishedSnapshot, store.search(alloc, .{ .query = data[0..dims], .k = 50, .search_effort = 1 }));
+    try testing.expectEqual(@as(usize, 1), source.calls);
 }
 
 test "leann reembed cache: hits by digest, misses on a new digest, evicts least recent" {

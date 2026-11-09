@@ -1808,12 +1808,28 @@ pub fn reembedDenseDocuments(
     defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
     var source_cache = ReembedChunkSourceCache{};
     defer source_cache.deinit(runtime.alloc);
-    for (requests, 0..) |request, i| {
+    const generation = try dense_embedder.captureTextGeneration(alloc, requestEmbeddingName(requests[0]));
+    const pinned_embedder = dense_embedder.withTextGeneration(generation);
+    for (requests, 0..) |base_request, i| {
+        var request = base_request;
+        const parent_key = if (internal_keys.isInternalUserKey(request.doc_key))
+            (try internal_keys.decodeDocumentComponentAlloc(runtime.alloc, request.doc_key)) orelse return error.ReembedProvenanceUnavailable
+        else
+            try runtime.alloc.dupe(u8, request.doc_key);
+        defer runtime.alloc.free(parent_key);
+        request.reprocess_generation = try embeddingReprocessGeneration(runtime, parent_key, requestEmbeddingName(request), request.producer_json);
         // Page-image inputs embed rendered pages, not the document source;
         // such indexes must keep their vectors.
         if (request.embedding_input == .pdf_page_images) return error.ReembedUnsupportedInput;
         if (request.input_kind != .document) {
             const text = (try reembedChunkTextAlloc(runtime, request, &chunk_cache, &source_cache)) orelse continue;
+            if (request.expected_source_hash) |expected| {
+                const actual = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
+                if (actual != expected) {
+                    runtime.alloc.free(text);
+                    return error.ReembedRevisionMismatch;
+                }
+            }
             texts.append(alloc, text) catch |err| {
                 runtime.alloc.free(text);
                 return err;
@@ -1830,14 +1846,24 @@ pub fn reembedDenseDocuments(
         switch (prepared) {
             .empty => continue,
             .parts => |parts| {
-                const vector = try embedDensePartsTracked(runtime, &index_names, alloc, dense_embedder, requestEmbeddingName(request), parts, dims);
+                if (request.expected_source_hash) |expected| {
+                    const actual = (try densePartsSourceHash(alloc, request, parts, generation.revision)) orelse return error.ReembedProvenanceUnavailable;
+                    if (actual != expected) return error.ReembedRevisionMismatch;
+                }
+                const vector = try embedDensePartsTracked(runtime, &index_names, alloc, pinned_embedder, requestEmbeddingName(request), parts, dims);
                 defer alloc.free(vector);
+                try dense_embedder.requireTextGeneration(alloc, requestEmbeddingName(request), generation);
                 if (vector.len != dims) return error.InvalidVectorDimensions;
                 @memcpy(out[i * dims ..][0..dims], vector);
                 found[i] = true;
                 continue;
             },
             .text => |text| {
+                if (request.expected_source_hash) |expected| {
+                    const actual = retainedTextEmbeddingHashAtRevision(request, text, generation.revision);
+                    const legacy = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
+                    if (actual != expected and legacy != expected) return error.ReembedRevisionMismatch;
+                }
                 try texts.append(alloc, text);
                 prepared = .empty; // The text list owns it now.
             },
@@ -1845,8 +1871,9 @@ pub fn reembedDenseDocuments(
         try slots.append(alloc, i);
     }
     if (texts.items.len == 0) return;
-    const vectors = try embedDenseBatchTracked(runtime, &index_names, alloc, dense_embedder, requestEmbeddingName(requests[0]), texts.items, dims);
+    const vectors = try embedDenseBatchTracked(runtime, &index_names, alloc, pinned_embedder, requestEmbeddingName(requests[0]), texts.items, dims);
     defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+    try dense_embedder.requireTextGeneration(alloc, requestEmbeddingName(requests[0]), generation);
     for (slots.items, vectors) |slot, vector| {
         if (vector.len != dims) return error.InvalidVectorDimensions;
         @memcpy(out[slot * dims ..][0..dims], vector);
@@ -6111,6 +6138,7 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
     defer alloc.free(missing_key);
     var requests = [_]enrichment_types.GeneratedEnrichmentRequest{ document_request, document_request };
     requests[0].doc_key = wanted.key;
+    requests[0].expected_source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(wanted.text, requests[0].producer_json, 0);
     requests[1].doc_key = missing_key;
     var out: [4]f32 = undefined;
     var found = [_]bool{ false, false };
@@ -6121,6 +6149,9 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
     try std.testing.expect(!found[1]);
     try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
     try std.testing.expectEqual(@as(usize, 1), probe.texts.items.len);
+    requests[0].expected_source_hash = requests[0].expected_source_hash.? ^ 1;
+    try std.testing.expectError(error.ReembedRevisionMismatch, reembedDenseDocuments(&runtime, alloc, &requests, 2, &out, &found));
+    requests[0].expected_source_hash = requests[0].expected_source_hash.? ^ 1;
     try std.testing.expectEqualStrings(wanted.text, probe.texts.items[0]);
     try std.testing.expectEqual(@as(f32, @floatFromInt(wanted.text.len)), out[0]);
 

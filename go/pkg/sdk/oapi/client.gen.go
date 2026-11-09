@@ -70735,7 +70735,7 @@ func (c *Client) DropGraph(ctx context.Context, graphName string, reqEditors ...
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphCatalogRequest(c.Client, req)
 }
 
 // GetGraph Get graph
@@ -70769,7 +70769,7 @@ func (c *Client) CreateGraphWithBody(ctx context.Context, graphName string, cont
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphCatalogRequest(c.Client, req)
 }
 
 // CreateGraph Create graph
@@ -70788,7 +70788,7 @@ func (c *Client) CreateGraph(ctx context.Context, graphName string, body CreateG
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphCatalogRequest(c.Client, req)
 }
 
 // UpdateGraphWithBody Update graph definition
@@ -70807,7 +70807,7 @@ func (c *Client) UpdateGraphWithBody(ctx context.Context, graphName string, cont
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphCatalogRequest(c.Client, req)
 }
 
 // UpdateGraph Update graph definition
@@ -70826,7 +70826,7 @@ func (c *Client) UpdateGraph(ctx context.Context, graphName string, body UpdateG
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphCatalogRequest(c.Client, req)
 }
 
 // ExecuteGraphQueryWithBody Execute Cypher against a named graph
@@ -70845,7 +70845,7 @@ func (c *Client) ExecuteGraphQueryWithBody(ctx context.Context, graphName string
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphRequest(c.Client, req)
 }
 
 // ExecuteGraphQuery Execute Cypher against a named graph
@@ -70864,7 +70864,7 @@ func (c *Client) ExecuteGraphQuery(ctx context.Context, graphName string, body E
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphRequest(c.Client, req)
 }
 
 // GlobalQueryWithBody Perform a global query
@@ -71381,7 +71381,7 @@ func (c *Client) ExecuteSQLWithBody(ctx context.Context, contentType string, bod
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // ExecuteSQL Execute a SQL statement
@@ -71408,7 +71408,7 @@ func (c *Client) ExecuteSQL(ctx context.Context, body ExecuteSQLJSONRequestBody,
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // OpenSQLConnectionWithBody Open a durable idle HTTP SQL connection
@@ -71482,7 +71482,7 @@ func (c *Client) PrepareSQLWithBody(ctx context.Context, contentType string, bod
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // PrepareSQL Create a durable prepared SQL resource
@@ -71501,7 +71501,7 @@ func (c *Client) PrepareSQL(ctx context.Context, body PrepareSQLJSONRequestBody,
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // ClosePreparedSQL Release a durable prepared SQL resource
@@ -71516,7 +71516,7 @@ func (c *Client) ClosePreparedSQL(ctx context.Context, preparedId string, params
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // ExecutePreparedSQLWithBody Execute a durable prepared SQL resource
@@ -71535,7 +71535,7 @@ func (c *Client) ExecutePreparedSQLWithBody(ctx context.Context, preparedId stri
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // ExecutePreparedSQL Execute a durable prepared SQL resource
@@ -71554,7 +71554,7 @@ func (c *Client) ExecutePreparedSQL(ctx context.Context, preparedId string, body
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // GetStatus Get cluster status
@@ -84928,7 +84928,7 @@ func NewGetGraphRequest(server string, graphName string) (*http.Request, error) 
 // NewCreateGraphRequest calls the generic CreateGraph builder with application/json body
 func NewCreateGraphRequest(server string, graphName string, body CreateGraphJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+	buf, err := marshalGraphCatalogRequest(body)
 	if err != nil {
 		return nil, err
 	}
@@ -84975,7 +84975,7 @@ func NewCreateGraphRequestWithBody(server string, graphName string, contentType 
 // NewUpdateGraphRequest calls the generic UpdateGraph builder with application/json body
 func NewUpdateGraphRequest(server string, graphName string, body UpdateGraphJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+	buf, err := marshalGraphCatalogRequest(body)
 	if err != nil {
 		return nil, err
 	}
@@ -85022,7 +85022,7 @@ func NewUpdateGraphRequestWithBody(server string, graphName string, contentType 
 // NewExecuteGraphQueryRequest calls the generic ExecuteGraphQuery builder with application/json body
 func NewExecuteGraphQueryRequest(server string, graphName string, body ExecuteGraphQueryJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+	buf, err := marshalGraphRequest(body)
 	if err != nil {
 		return nil, err
 	}
@@ -85596,7 +85596,7 @@ func NewCreateQuerySourceRequestWithBody(server string, sourceName string, conte
 // NewExecuteSQLRequest calls the generic ExecuteSQL builder with application/json body
 func NewExecuteSQLRequest(server string, body ExecuteSQLJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+	buf, err := marshalSQLRequest(body)
 	if err != nil {
 		return nil, err
 	}
@@ -85710,7 +85710,7 @@ func NewCloseSQLConnectionRequest(server string, connectionId string) (*http.Req
 // NewPrepareSQLRequest calls the generic PrepareSQL builder with application/json body
 func NewPrepareSQLRequest(server string, body PrepareSQLJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+	buf, err := marshalSQLRequest(body)
 	if err != nil {
 		return nil, err
 	}
@@ -85797,7 +85797,7 @@ func NewClosePreparedSQLRequest(server string, preparedId string, params *CloseP
 // NewExecutePreparedSQLRequest calls the generic ExecutePreparedSQL builder with application/json body
 func NewExecutePreparedSQLRequest(server string, preparedId string, body ExecutePreparedSQLJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+	buf, err := marshalSQLRequest(body)
 	if err != nil {
 		return nil, err
 	}
@@ -148973,7 +148973,7 @@ func ParseListGraphsResponse(rsp *http.Response) (*ListGraphsResponse, error) {
 
 // ParseDropGraphResponse parses an HTTP response from a DropGraphWithResponse call
 func ParseDropGraphResponse(rsp *http.Response) (*DropGraphResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readGraphResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -149035,7 +149035,7 @@ func ParseGetGraphResponse(rsp *http.Response) (*GetGraphResponse, error) {
 
 // ParseCreateGraphResponse parses an HTTP response from a CreateGraphWithResponse call
 func ParseCreateGraphResponse(rsp *http.Response) (*CreateGraphResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readGraphResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -149078,7 +149078,7 @@ func ParseCreateGraphResponse(rsp *http.Response) (*CreateGraphResponse, error) 
 
 // ParseUpdateGraphResponse parses an HTTP response from a UpdateGraphWithResponse call
 func ParseUpdateGraphResponse(rsp *http.Response) (*UpdateGraphResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readGraphResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -149131,7 +149131,7 @@ func ParseUpdateGraphResponse(rsp *http.Response) (*UpdateGraphResponse, error) 
 
 // ParseExecuteGraphQueryResponse parses an HTTP response from a ExecuteGraphQueryWithResponse call
 func ParseExecuteGraphQueryResponse(rsp *http.Response) (*ExecuteGraphQueryResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readGraphResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -149855,7 +149855,7 @@ func ParseCreateQuerySourceResponse(rsp *http.Response) (*CreateQuerySourceRespo
 
 // ParseExecuteSQLResponse parses an HTTP response from a ExecuteSQLWithResponse call
 func ParseExecuteSQLResponse(rsp *http.Response) (*ExecuteSQLResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readSQLResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -150011,7 +150011,7 @@ func ParseCloseSQLConnectionResponse(rsp *http.Response) (*CloseSQLConnectionRes
 
 // ParsePrepareSQLResponse parses an HTTP response from a PrepareSQLWithResponse call
 func ParsePrepareSQLResponse(rsp *http.Response) (*PrepareSQLResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readSQLResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -150044,7 +150044,7 @@ func ParsePrepareSQLResponse(rsp *http.Response) (*PrepareSQLResponse, error) {
 
 // ParseClosePreparedSQLResponse parses an HTTP response from a ClosePreparedSQLWithResponse call
 func ParseClosePreparedSQLResponse(rsp *http.Response) (*ClosePreparedSQLResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readSQLResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -150077,7 +150077,7 @@ func ParseClosePreparedSQLResponse(rsp *http.Response) (*ClosePreparedSQLRespons
 
 // ParseExecutePreparedSQLResponse parses an HTTP response from a ExecutePreparedSQLWithResponse call
 func ParseExecutePreparedSQLResponse(rsp *http.Response) (*ExecutePreparedSQLResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readSQLResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err

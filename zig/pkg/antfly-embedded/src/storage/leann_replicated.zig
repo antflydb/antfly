@@ -706,7 +706,7 @@ pub const ReplicatedState = struct {
         if (req.k == 0) return out;
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         const loader = self.loader orelse return error.MissingVectorLoader;
-        var gate = SearchGate.init(req, if (self.opts.transient and !search_types.requiresExhaustiveCoverage(req)) self.opts.reembed_budget_ms else 0);
+        var gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
         var ctx = KeyLoader{ .state = @constCast(self), .loader = loader, .reembed_ns = &gate.reembed_ns };
         var want: u32 = @intCast(@max(req.k, 1));
         // Id, key and prefix filters go into the graph walk; only distance
@@ -729,6 +729,7 @@ pub const ReplicatedState = struct {
         while (true) {
             want = @min(want, live);
             var filter_truncated = false;
+            var budget_exhausted = false;
             const hits = try self.replica.search(alloc, req.query, want, .{
                 .ef = if (search_types.requiresExhaustiveCoverage(req)) live else self.opts.search_ef,
                 .bound_scale = self.opts.bound_scale,
@@ -737,9 +738,12 @@ pub const ReplicatedState = struct {
                 .candidate_ids = if (filter.has_allowed) candidate_ids.items else null,
                 .filter_visit_limit = if (!search_types.requiresExhaustiveCoverage(req)) @max(65536, @as(u32, @intCast(@min(req.k *| 16, std.math.maxInt(u32))))) else 0,
                 .filter_truncated = &filter_truncated,
+                .budget_exhausted = &budget_exhausted,
+                .exhaustive = search_types.requiresExhaustiveCoverage(req),
                 .gate = gate.recomputeGate(),
             }, ctx.keyLoader());
             defer alloc.free(hits);
+            if (budget_exhausted and search_types.requiresExhaustiveCoverage(req)) return error.IncompletePublishedSnapshot;
             var passed: usize = 0;
             for (hits) |h| {
                 const vector_id = self.bindings.get(h.key) orelse continue;

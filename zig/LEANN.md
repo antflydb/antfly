@@ -469,9 +469,9 @@ and rescores leaf members near the admission cutoff with extended codes
   field for direct-field indexes). Explicit ID filters map directly to graph
   nodes. Best-effort searches bound work for arbitrary predicates, so a very
   selective filter can return fewer than `k`; search effort `1.0` instead
-  exhausts the graph for complete coverage. Deleted or missing candidates are pushed to the far end of
-  the metric rather than failing a search. If the source document no longer
-  reproduces an elided vector's digest, re-embedding fails with
+  exhausts the graph for complete coverage. Missing candidates are omitted
+  from best-effort results; complete-coverage requests fail if a live vector
+  cannot be loaded. Source identity mismatches fail with
   `ReembedRevisionMismatch` rather than scoring a different revision.
 - **Persistence.** `sync` (called from `IndexManager.syncAll`, before the
   applied sequence is recorded) writes `leann.store` atomically with a CRC:
@@ -550,8 +550,9 @@ Three modes:
   batch loader, so one query makes one embedder call per recompute batch;
   candidates whose embedding is still stored are read instead. Chunks from
   the same parent reuse one indexed source set per batch. A recomputed vector
-  enters the LRU only if its digest matches the stub, preventing an edit made
-  ahead of enrichment from poisoning a previous revision's cache entry.
+  enters the LRU only after its source identity is checked against the stub,
+  preventing an edit made ahead of enrichment from poisoning a previous
+  revision's cache entry without requiring bit-identical floating-point output.
   Without an enrichment runtime, reads of stubs fail with `error.ReembedUnavailable`.
 - **Vector blocks.** LEANN indexes stay out of HBC's shared vector-block
   plane (`IndexManager.denseIndexUsesVectorBlocks`): it would otherwise keep
