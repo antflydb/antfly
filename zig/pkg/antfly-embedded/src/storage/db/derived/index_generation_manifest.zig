@@ -129,6 +129,14 @@ pub fn writeReadyForPhysicalFormatWithStorage(
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
+    // The Storage-backed branch above creates the generation directory before
+    // writing into it (`files.createDirPath`). A fresh shadow candidate's
+    // directory may not exist yet on this plain-filesystem path either -- a
+    // brand-new replica's first repair quantum reaches this manifest write
+    // before anything else has created `index_path`. Without this, createFile
+    // fails ENOENT every attempt and the durable repair intent can never
+    // leave the generation it just finished building.
+    try fs_paths.createDirPathPortable(io, index_path);
     {
         var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
         defer file.close(io);
@@ -357,6 +365,28 @@ test "index generation manifest is durable and fenced by identity" {
     try std.Io.Dir.cwd().deleteFile(std.testing.io, manifest_path);
     const missing = try certifyReady(alloc, path, 91, "dense_idx", 44);
     try std.testing.expectEqual(ReadyCertification.missing, std.meta.activeTag(missing));
+}
+
+test "index generation manifest write creates its own directory tree (regression)" {
+    // A fresh shadow candidate whose corpus produced no physical segment
+    // files yet (e.g. a replica catching up a nearly-empty full-text index)
+    // reaches this manifest write as the very first thing ever written into
+    // its generation directory. The plain-filesystem path (no Storage
+    // abstraction) must create that directory itself, exactly like the
+    // Storage-backed branch already does with `files.createDirPath`, or
+    // `createFile` fails ENOENT every single repair attempt and the durable
+    // repair intent can never leave `catching_up`.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        ".zig-cache/tmp/{s}/repair-shadow-1/indexes/full_text_idx",
+        .{tmp.sub_path},
+    );
+    try writeReadyForPhysicalFormat(alloc, path, 91, "full_text_idx", 44, 123, .legacy_lsm);
+    try std.testing.expectEqual(@as(u64, 123), try validateReady(alloc, path, 91, "full_text_idx", 44));
 }
 
 test "index generation manifest identifies native physical generations" {
