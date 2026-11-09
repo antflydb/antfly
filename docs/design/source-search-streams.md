@@ -62,6 +62,11 @@ pinned model and preprocessing recipes. Native embedding enrichments declare
 `vector_space: sources.VectorSpaceIdentity(recipe)`, binding the complete recipe
 into native producer identity. The shared observer verifies index type, dimension,
 metric, member lineage, native vector-space identity and the installed query model.
+Authentication settings (including secret references) do not participate in vector
+compatibility. Private processing configuration still requires content-addressed
+index names; reconciliation compares the public readback fields while those names
+bind write-only configuration. Retrieval instructions and other encoding settings
+remain part of compatibility and must match the installed native configuration.
 Original media uses `resource_field: content.resource` and may declare only
 semantic retrieval. Query input support is explicit: indexing media does not
 advertise an image-query HTTP route. This contract supports server-embedded text
@@ -168,7 +173,11 @@ query-time authorization or derive public access from producer credentials.
 ## Consistency and readiness
 
 Management `search_status` is read-only, bounded to five seconds and caches each
-native index lookup within the request. It is advisory, not a snapshot lease.
+native index lookup within the request. Distinct indexes are inspected by at most
+eight concurrent workers with a shared 32 MiB metadata admission budget. Timeout
+and metadata-budget failures report `unsupported` with
+`native_observation_timeout` or `native_metadata_budget_exceeded`, rather than
+claiming that the native index is building. It is advisory, not a snapshot lease.
 It never turns a successful acquisition into an inference completion receipt.
 
 Native query responses describe actual operation consistency through

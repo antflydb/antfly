@@ -64,12 +64,16 @@ func ValidateManagedVectorSpace(space VectorSpace, embedder map[string]any) erro
 	return nil
 }
 
-// Only transport location is excluded. Unknown execution settings participate in
+// Authentication and transport location do not change embedding coordinates.
+// Unknown execution settings participate in
 // the identity too, so future native options cannot silently alias an old recipe.
 // Empty/default configurations retain the original protocol identity.
 func nativePreprocessing(embedder map[string]any) (string, string, error) {
 	config := make(map[string]any)
 	for key, value := range embedder {
+		if processingCredentialField(key) {
+			continue
+		}
 		switch key {
 		case "provider", "model", "model_identity", "api_url":
 			continue

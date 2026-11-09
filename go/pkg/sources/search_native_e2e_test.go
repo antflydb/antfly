@@ -53,6 +53,15 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 	chunkIndex := management.NativeIndexDeclaration{Name: "chunk_text", Config: map[string]any{"type": "full_text", "sources": []any{map[string]any{"artifact": chunkArtifact, "field": "text"}}, "enrichments": []any{chunkConfig}}}
 	plan.Indexes = append(plan.Indexes, ext, chunkIndex)
 	require.NoError(t, ReconcileProcessing(ctx, p, table, &plan))
+	// A matching index-level field cannot turn artifact-only sources into
+	// canonical parent text. Verify against actual native normalized readback.
+	misboundConfig := map[string]any{"type": "full_text", "field": "content.text", "sources": []any{map[string]any{"artifact": units, "field": "text"}}}
+	require.NoError(t, p.CreateSearchIndex(ctx, table, "misbound_text", misboundConfig))
+	misboundRaw, err := p.InspectSearchIndex(ctx, table, "misbound_text")
+	require.NoError(t, err)
+	misboundIndex, err := decodeSearchIndex(misboundRaw)
+	require.NoError(t, err)
+	require.Error(t, checkNativeStream(SearchStream{Name: "parent", Field: "content.text"}, misboundIndex, false))
 	original := SearchStream{Name: "original", ResourceField: "content.resource", Retrieval: &RetrievalBindings{Semantic: &management.SemanticRetrieval{Index: ext.Name, External: true, VectorSpace: space, QueryInputs: []management.SemanticRetrievalQueryInputs{"vector"}}}}
 	parents := map[string]any{}
 	for _, item := range []struct {

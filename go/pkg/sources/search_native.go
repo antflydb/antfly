@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/antflydb/antfly/go/pkg/sources/management"
@@ -32,7 +34,8 @@ import (
 type ProcessingDeclaration = management.ProcessingDeclaration
 
 // SearchIndexClient uses ordinary native index APIs with runtime-owned
-// credentials. Implementations must bound responses and refuse redirects.
+// credentials. Implementations must be safe for concurrent inspections, honor
+// cancellation, bound responses and refuse redirects.
 type SearchIndexClient interface {
 	InspectSearchIndex(context.Context, string, string) ([]byte, error)
 	CreateSearchIndex(context.Context, string, string, map[string]any) error
@@ -134,10 +137,14 @@ func nativeLineage(enrichments map[string]map[string]any, member string, stream 
 		field, _ := e["field"].(string)
 		template, _ := e["template"].(string)
 		if template != "" {
-			if field != "" || !strings.HasPrefix(template, "{{") || !strings.HasSuffix(template, "}}") {
+			var valid bool
+			if field != "" {
 				return false
 			}
-			field = strings.TrimSuffix(strings.TrimPrefix(template, "{{"), "}}")
+			field, valid = pureFieldTemplate(template)
+			if !valid {
+				return false
+			}
 		}
 		switch e["kind"] {
 		case "embedding":
@@ -185,7 +192,7 @@ func checkNativeStream(stream SearchStream, index nativeSearchIndex, semantic bo
 			if !ok || field != stream.Field && !(field == "" && stream.Field == "$") && !scalarAlias {
 				return fmt.Errorf("text artifact projection mismatch")
 			}
-		} else if cfg["field"] != stream.Field {
+		} else if len(sources) != 0 || cfg["field"] != stream.Field {
 			return fmt.Errorf("text field mismatch")
 		}
 		return nil
@@ -297,7 +304,7 @@ func containsNativeConfig(actual, desired map[string]any) bool {
 	for key, want := range desired {
 		// Native readback redacts producer config. Recipe names are content-addressed
 		// and are never overwritten by source reconciliation.
-		if key == "producer" || key == "producer_json" || key == "transcriber" {
+		if key == "producer" || key == "producer_json" || key == "transcriber" || processingCredentialField(key) {
 			continue
 		}
 		got, ok := actual[key]
@@ -352,7 +359,7 @@ func hasWriteOnlyProducer(v any) bool {
 	switch value := v.(type) {
 	case map[string]any:
 		for k, v := range value {
-			if k == "producer" || k == "producer_json" || k == "transcriber" {
+			if k == "producer" || k == "producer_json" || k == "transcriber" || processingCredentialField(k) {
 				return true
 			}
 			if hasWriteOnlyProducer(v) {
@@ -400,34 +407,15 @@ func ObserveSearch(ctx context.Context, client SearchIndexClient, binding Bindin
 	ctx, stop := context.WithTimeout(ctx, 5*time.Second)
 	defer stop()
 	out := management.SearchStatus{Version: SearchVersion, ObservedAt: int(time.Now().Unix()), Consistency: "unknown", Streams: []management.RepresentationStatus{}, Artifacts: []management.RepresentationStatus{}}
-	cache := map[string]nativeSearchIndex{}
-	failures := map[string]error{}
-	metadataBytes := 0
+	cache, failures := observeSearchIndexes(ctx, client, binding)
 	inspect := func(name string) (nativeSearchIndex, error) {
-		if v, ok := cache[name]; ok {
-			return v, nil
+		if index, ok := cache[name]; ok {
+			return index, nil
 		}
 		if err, ok := failures[name]; ok {
 			return nativeSearchIndex{}, err
 		}
-		if metadataBytes >= 32<<20 {
-			return nativeSearchIndex{}, fmt.Errorf("native metadata budget exceeded")
-		}
-		raw, err := client.InspectSearchIndex(ctx, binding.Table, name)
-		metadataBytes += len(raw)
-		if metadataBytes > 32<<20 {
-			return nativeSearchIndex{}, fmt.Errorf("native metadata budget exceeded")
-		}
-		if err == nil {
-			var v nativeSearchIndex
-			v, err = decodeSearchIndex(raw)
-			if err == nil {
-				cache[name] = v
-				return v, nil
-			}
-		}
-		failures[name] = err
-		return nativeSearchIndex{}, err
+		return nativeSearchIndex{}, errSearchMetadataBudget
 	}
 	for _, stream := range binding.Streams {
 		status := management.RepresentationStatus{Name: stream.Name, State: "ready"}
@@ -459,6 +447,14 @@ func ObserveSearch(ctx context.Context, client SearchIndexClient, binding Bindin
 				if err != nil {
 					status.State = "building"
 					status.Reason = "native_index_unavailable"
+					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+						status.State, status.Reason = "unsupported", "native_observation_timeout"
+						break
+					}
+					if errors.Is(err, errSearchMetadataBudget) {
+						status.State, status.Reason = "unsupported", "native_metadata_budget_exceeded"
+						break
+					}
 					continue
 				}
 				if err = checkNativeStream(stream, index, check.semantic); err != nil {
@@ -531,8 +527,7 @@ func validateProcessingSecretsDepth(value any, depth int) error {
 	switch v := value.(type) {
 	case map[string]any:
 		for key, value := range v {
-			switch strings.ToLower(key) {
-			case "api_key", "token", "access_token", "client_secret", "private_key", "password", "secret_access_key", "access_key_id", "session_token", "authorization":
+			if processingCredentialField(key) {
 				if text, ok := value.(string); ok && text != "" && !strings.HasPrefix(text, "${secret:") {
 					return fmt.Errorf("processing credentials require native secret references")
 				}
@@ -570,4 +565,108 @@ func SourceTableConfig() map[string]any {
 			"type": "object", "additionalProperties": true, "x-antfly-dynamic-indexing": map[string]any{"mode": "infer_types"}, "properties": properties,
 		}}},
 	}}
+}
+
+// Pure interpolations prove a field dependency; helpers, blocks and composed
+// templates do not. Raw Handlebars interpolation preserves signed media URLs.
+func pureFieldTemplate(template string) (string, bool) {
+	open, close := "{{", "}}"
+	if strings.HasPrefix(template, "{{{") {
+		open, close = "{{{", "}}}"
+	}
+	if !strings.HasPrefix(template, open) || !strings.HasSuffix(template, close) {
+		return "", false
+	}
+	field := strings.TrimSpace(template[len(open) : len(template)-len(close)])
+	if field == "" {
+		return "", false
+	}
+	for _, c := range field {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-' || c == '.' || c == '$') {
+			return "", false
+		}
+	}
+	return field, true
+}
+
+// These are execution credentials, never encoder settings. Keep validation,
+// compatibility and public readback comparison on the same boundary. Opaque
+// producer documents are separately protected by content-addressed names.
+func processingCredentialField(key string) bool {
+	switch strings.ToLower(key) {
+	case "api_key", "token", "access_token", "client_secret", "private_key", "password", "secret_access_key", "access_key_id", "session_token", "authorization":
+		return true
+	}
+	return false
+}
+
+var errSearchMetadataBudget = errors.New("native metadata budget exceeded")
+
+// Eight workers bound in-flight HTTP/decoding work. Every distinct index is
+// inspected once; maps are owned by the collector and byte admission is atomic.
+// No worker can outlive this request: clients must honor context cancellation.
+func observeSearchIndexes(ctx context.Context, client SearchIndexClient, binding Binding) (map[string]nativeSearchIndex, map[string]error) {
+	names := map[string]bool{}
+	jobs := make(chan string, 128)
+	add := func(name string) {
+		if name != "" && !names[name] && len(names) < cap(jobs) {
+			names[name] = true
+			jobs <- name
+		}
+	}
+	for _, stream := range binding.Streams {
+		if r := stream.Retrieval; r != nil {
+			if r.FullText != nil {
+				add(r.FullText.Index)
+			}
+			if r.Semantic != nil {
+				add(r.Semantic.Index)
+			}
+		} else {
+			add(stream.Index)
+		}
+	}
+	close(jobs)
+	type observation struct {
+		name  string
+		index nativeSearchIndex
+		err   error
+	}
+	results := make(chan observation, 8)
+	var workers sync.WaitGroup
+	var bytes atomic.Int64
+	for i := 0; i < min(8, len(names)); i++ {
+		workers.Go(func() {
+			for name := range jobs {
+				result := observation{name: name}
+				switch {
+				case ctx.Err() != nil:
+					result.err = ctx.Err()
+				case bytes.Load() >= 32<<20:
+					result.err = errSearchMetadataBudget
+				default:
+					raw, err := client.InspectSearchIndex(ctx, binding.Table, name)
+					result.err = err
+					if bytes.Add(int64(len(raw))) > 32<<20 {
+						result.err = errSearchMetadataBudget
+					}
+					if result.err == nil {
+						result.index, result.err = decodeSearchIndex(raw)
+					}
+				}
+				results <- result
+			}
+		})
+	}
+	go func() { workers.Wait(); close(results) }()
+	cache := map[string]nativeSearchIndex{}
+	failures := map[string]error{}
+	for result := range results {
+		if result.err != nil {
+			failures[result.name] = result.err
+		} else {
+			cache[result.name] = result.index
+		}
+	}
+	return cache, failures
 }
