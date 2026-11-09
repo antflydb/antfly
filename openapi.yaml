@@ -33289,6 +33289,7 @@ components:
           default: 4000
           description: Must cover every destination generator's configured output limit.
         keep_recent_turns:
+          x-go-type-skip-optional-pointer: false
           type: integer
           minimum: 0
           maximum: 4096

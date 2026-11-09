@@ -2023,8 +2023,11 @@ const AgentGenerationBudget = struct {
     runner: GenerationRunner,
     used: i64 = 0,
     limit: i64,
+    reserved_destination_calls: i64 = 0,
 
     pub fn executeChain(self: *@This(), alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+        try self.runner.check();
+        if (self.used >= self.limit - self.reserved_destination_calls) return error.AgentToolLimitExceeded;
         return generate(self, alloc, chain, messages);
     }
 
@@ -2167,7 +2170,16 @@ fn executeModelTools(
         const chain = try agent_tools.withTools(arena, base_chain, try modelToolSchema(arena, executable, request, navigation, web_config != null, fetch_config != null));
         var effective_messages: []const generating.ChatMessage = history.messages.items;
         if (request.context_management) |config| {
-            const prepared = try agent_context.prepare(arena, &budget, config, chain, history.messages.items, context_state, budget.runner.control());
+            budget.reserved_destination_calls = 1;
+            const prepared = agent_context.prepare(arena, &budget, config, chain, history.messages.items, context_state, budget.runner.control()) catch |err| switch (err) {
+                error.AgentToolLimitExceeded => {
+                    outcome.rounds = budget.used;
+                    outcome.exhausted = true;
+                    return outcome;
+                },
+                else => return err,
+            };
+            budget.reserved_destination_calls = 0;
             try agent_context.requireHitIds(arena, config, hits.items, history.messages.items, prepared.messages);
             if ((prepared.event.diagnostics.compacted_messages orelse 0) > 0) {
                 // Reclaim the accumulated tool allowance only after validated
@@ -12931,7 +12943,10 @@ test "retrieval agent context compacts pipeline evidence through independent gen
                 ), .usage = .{ .input_tokens = 900, .output_tokens = 70 } };
             }
             self.generations += 1;
-            try std.testing.expectEqualStrings("main", chain[0].generator.model);
+            if (chain[0].generator.provider == .apple) {
+                const request_json = try generating.appleGenerationRequestAlloc(a, chain[0].generator, messages, false);
+                defer a.free(request_json);
+            } else try std.testing.expectEqualStrings("main", chain[0].generator.model);
             const encoded = try std.json.Stringify.valueAlloc(a, messages, .{});
             defer a.free(encoded);
             try std.testing.expect(std.mem.indexOf(u8, encoded, "doc:42") != null);
@@ -12940,21 +12955,25 @@ test "retrieval agent context compacts pipeline evidence through independent gen
             return .{ .allocator = a, .content = try a.dupe(u8, "doc:42 is due Friday") };
         }
     };
-    var fake = Fake{};
-    const body =
-        \\{"query":"deadline","queries":[{"table":"docs","full_text_search":{"match":"deadline"}}],"stream":false,"generator":{"provider":"antfly","model":"main","max_tokens":100},"steps":{"generation":{}},"context_management":{"context_window_tokens":4000,"target_input_tokens":2500,"reserved_output_tokens":1000,"summarizer_context_window_tokens":32000,"summarizer":{"provider":"anthropic","model":"summary"}}}
-    ;
-    const encoded = try executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
-    defer std.testing.allocator.free(encoded);
-    const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
-    try std.testing.expectEqual(@as(usize, 1), fake.generations);
-    try std.testing.expectEqual(@as(i64, 2), parsed.value.usage.?.llm_calls.?);
-    const event = parsed.value.context_management.?[0];
-    try std.testing.expectEqualStrings("anthropic", event.summary_provider.?);
-    try std.testing.expectEqual(@as(i64, 900), event.diagnostics.summary_input_tokens.?);
-    try std.testing.expect(event.diagnostics.effective_input_tokens.? <= 2500);
+    for ([_]bool{ false, true }) |apple| {
+        var fake = Fake{};
+        const original_body =
+            \\{"query":"deadline","queries":[{"table":"docs","full_text_search":{"match":"deadline"}}],"stream":false,"generator":{"provider":"antfly","model":"main","max_tokens":100},"steps":{"generation":{}},"context_management":{"context_window_tokens":4000,"target_input_tokens":2500,"reserved_output_tokens":1000,"summarizer_context_window_tokens":32000,"summarizer":{"provider":"anthropic","model":"summary"}}}
+        ;
+        const body = if (apple) try std.mem.replaceOwned(u8, std.testing.allocator, original_body, "\"provider\":\"antfly\",\"model\":\"main\"", "\"provider\":\"apple\"") else try std.testing.allocator.dupe(u8, original_body);
+        defer std.testing.allocator.free(body);
+        const encoded = try executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
+        defer std.testing.allocator.free(encoded);
+        const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+        try std.testing.expectEqual(@as(usize, 1), fake.generations);
+        try std.testing.expectEqual(@as(i64, 2), parsed.value.usage.?.llm_calls.?);
+        const event = parsed.value.context_management.?[0];
+        try std.testing.expectEqualStrings("anthropic", event.summary_provider.?);
+        try std.testing.expectEqual(@as(i64, 900), event.diagnostics.summary_input_tokens.?);
+        try std.testing.expect(event.diagnostics.effective_input_tokens.? <= 2500);
+    }
 }
 
 test "retrieval agent context absent and fitting policies avoid summarization" {
@@ -13020,16 +13039,27 @@ test "retrieval agent context compacts older tool exchanges before the next mode
             return .{ .allocator = a, .content = try a.dupe(u8, "doc:1 and doc:2 are due Friday") };
         }
     };
-    var fake = Fake{};
-    const body =
-        \\{"query":"deadline","queries":[{"table":"docs","full_text_search":{"match":"deadline"}}],"stream":false,"max_internal_iterations":6,"generator":{"provider":"antfly","model":"main","max_tokens":100},"steps":{"generation":{}},"context_management":{"context_window_tokens":32768,"target_input_tokens":20000,"reserved_output_tokens":1000,"summarizer_context_window_tokens":32768,"summarizer":{"provider":"openai","model":"summary"}}}
-    ;
-    const encoded = try executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
-    defer std.testing.allocator.free(encoded);
-    const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
-    try std.testing.expectEqual(@as(usize, 2), fake.searches);
-    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
-    try std.testing.expectEqual(@as(i64, 4), parsed.value.usage.?.llm_calls.?);
+    for ([_]usize{ 3, 4, 6 }) |round_limit| {
+        var fake = Fake{};
+        const template =
+            \\{"query":"deadline","queries":[{"table":"docs","full_text_search":{"match":"deadline"}}],"stream":false,"max_internal_iterations":0,"generator":{"provider":"antfly","model":"main","max_tokens":100},"steps":{"generation":{}},"context_management":{"context_window_tokens":32768,"target_input_tokens":20000,"reserved_output_tokens":1000,"summarizer_context_window_tokens":32768,"summarizer":{"provider":"openai","model":"summary"}}}
+        ;
+        const body = try std.mem.replaceOwned(u8, std.testing.allocator, template, "\"max_internal_iterations\":0", if (round_limit == 3) "\"max_internal_iterations\":3" else if (round_limit == 4) "\"max_internal_iterations\":4" else "\"max_internal_iterations\":6");
+        defer std.testing.allocator.free(body);
+        const encoded = try executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
+        defer std.testing.allocator.free(encoded);
+        const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
+        defer parsed.deinit();
+        if (round_limit == 3) {
+            try std.testing.expectEqual(AgentStatus.incomplete, parsed.value.status);
+            try std.testing.expectEqual(@as(usize, 0), fake.summaries);
+            try std.testing.expectEqual(@as(usize, 2), parsed.value.hits.len);
+            try std.testing.expectEqual(@as(i64, 2), parsed.value.usage.?.llm_calls.?);
+            continue;
+        }
+        try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
+        try std.testing.expectEqual(@as(usize, 2), fake.searches);
+        try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+        try std.testing.expectEqual(@as(i64, 4), parsed.value.usage.?.llm_calls.?);
+    }
 }
