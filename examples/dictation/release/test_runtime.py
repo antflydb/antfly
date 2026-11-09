@@ -16,6 +16,7 @@
 """Exercise the real app's headless supervisor without starting a real server."""
 
 import os
+import signal
 import socket
 import subprocess
 import tempfile
@@ -152,6 +153,9 @@ while true; do sleep 0.1; done
         began = time.monotonic()
         self.finish(process)
         self.assertGreaterEqual(time.monotonic() - began, 8)
+        # A negative code means the test cleanup killed a stalled supervisor;
+        # the supervisor must instead exit with its SIGKILLed child's status.
+        self.assertEqual(process.returncode, signal.SIGKILL)
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
