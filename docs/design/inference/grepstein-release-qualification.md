@@ -151,11 +151,23 @@ model's processor contract. `ocr.render.sampling` does not override them.
 Qwen2-VL honors supported nearest, bilinear or bicubic declarations. The native
 Qwen3.5/LightOn path implements Pillow-compatible antialiased bicubic and
 rejects conflicting declarations. Unknown/malformed filters fail closed.
-The corrected Qwen2/ColQwen image processor also versions its execution identity,
-so vectors produced by the earlier fixed filter cannot satisfy the new recipe.
-Existing derived units use the new `duf6` fingerprint format and are re-extracted
-when their older state marker is encountered; this does not require recreating
-a source table. Plan that regeneration with the same bounded job/admission limits.
+The shared image library owns an execution recipe. Model resolution revisions
+include it for declared image/video inputs and for undeclared modalities (whose
+embedding pipelines may accept images until loading resolves their executor).
+Explicit text-only and audio-only models retain their artifact-only revision.
+Qwen2/ColQwen additionally version their model-specific processor contract. This
+fences SigLIP/default-profile vectors as well as Qwen vectors without requiring
+model-name exceptions for every future image encoder.
+
+Current derived-unit writers emit `duf6`, and completed-state reuse still requires
+version 6. Readers can authenticate persisted `duf5` units using the original
+hashed field set, so child work does not have to wait for a parent re-extraction.
+Version-5 payloads cannot claim rendering-policy metadata, even as a null mirror;
+unknown versions and modified content are rejected. Their rendering policy stays
+unknown. When the parent later publishes version 6, the existing generation and
+acceptance fences invalidate the old children and replace them with children
+bound to the new fingerprint. No source-table recreation is required. Plan parent
+regeneration with the same bounded job/admission limits.
 
 LightOn's [4B model card](https://huggingface.co/lightonai/LightOnOCR-3-4B#rendering-and-preprocessing-tips)
 recommends rendering at 400 DPI, then resizing to a 2048-pixel longest edge with
@@ -233,10 +245,15 @@ The `auto` PNG hash remains
 `622c903d2c249c0924403cae961a7f2ca53f6f975887060f7c3db370b263aa72`.
 That material CPU/transport tradeoff must remain visible in rollout measurements.
 
-Persisted-state coverage verifies that a version-5 publication is re-extracted,
-replaced with an authenticated version-6 unit and reused on the next pass. Both
-metadata-based and downloaded-byte source fingerprints bind the resolved render
-recipe. Full scan/photo/text reader accuracy and deployed end-to-end throughput
+The state-gate test separately verifies that old markers cannot satisfy current
+completed-state reuse. The ordered apply integration test uses a complete unit
+captured from the previous version-5 encoder: it computes/publishes child chunks,
+then replaces them after a version-6 parent publication and retires them after
+parent removal. Run `zig build document-unit-upgrade-test -Doptimize=safe -j2`
+from `zig/` for that production callback/receiver path. Codec tests verify the
+captured fingerprint, tamper rejection, missing-policy semantics and allocation
+failure cleanup. Both metadata-based and downloaded-byte source fingerprints
+bind the resolved render recipe. Full scan/photo/text reader accuracy and deployed end-to-end throughput
 remain required before broad backfill; these local tests do not claim them.
 
 ## Large-page vLLM comparison

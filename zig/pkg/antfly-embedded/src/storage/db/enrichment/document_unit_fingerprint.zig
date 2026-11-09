@@ -26,6 +26,28 @@ pub const current_prefix = "duf6:";
 pub const current_state_version: u8 = 6;
 const current_domain = "antfly-document-unit-fingerprint-v6";
 
+/// Versions whose persisted units can still be authenticated. Only v6 is
+/// emitted by current writers or accepted as completed-state reuse evidence.
+pub const PersistedVersion = enum { v5, v6 };
+
+pub fn persistedVersion(fingerprint: []const u8) ?PersistedVersion {
+    inline for (.{ PersistedVersion.v5, PersistedVersion.v6 }) |version| {
+        const prefix = if (version == .v6) current_prefix else "duf5:";
+        if (fingerprint.len == prefix.len + Sha256.digest_length * 2 and std.mem.startsWith(u8, fingerprint, prefix) and isLowerHex(fingerprint[prefix.len..])) return version;
+    }
+    return null;
+}
+
+/// Read-side verification preserves the original hashed field set. A v5
+/// digest cannot authenticate newly introduced rendering-policy metadata.
+pub fn matchesPersistedFingerprint(alloc: Allocator, unit: document_extraction.Unit, fingerprint: []const u8) !bool {
+    const version = persistedVersion(fingerprint) orelse return false;
+    if (version == .v5 and unit.ocr_render_policy != null) return false;
+    const computed = try fingerprintForVersionAlloc(alloc, unit, version);
+    defer alloc.free(computed);
+    return std.mem.eql(u8, fingerprint, computed);
+}
+
 // Adding extraction metadata is a persisted-format change: update the encoder,
 // assign a new stable tag, and bump the fingerprint version deliberately.
 comptime {
@@ -80,8 +102,12 @@ const Field = enum(u8) {
 /// a fixed byte order. The result is therefore unambiguous and portable while
 /// retaining one allocation for the returned persisted value.
 pub fn fingerprintAlloc(alloc: Allocator, unit: document_extraction.Unit) ![]u8 {
+    return fingerprintForVersionAlloc(alloc, unit, .v6);
+}
+
+fn fingerprintForVersionAlloc(alloc: Allocator, unit: document_extraction.Unit, version: PersistedVersion) ![]u8 {
     var hasher = Sha256.init(.{});
-    hashLengthPrefixed(&hasher, current_domain);
+    hashLengthPrefixed(&hasher, if (version == .v6) current_domain else "antfly-document-unit-fingerprint-v5");
     hashTaggedBytes(&hasher, .unit_id, unit.unit_id);
     hashTaggedBytes(&hasher, .unit_type, unit.unit_type);
     hashTaggedBytes(&hasher, .text, unit.text);
@@ -95,12 +121,14 @@ pub fn fingerprintAlloc(alloc: Allocator, unit: document_extraction.Unit) ![]u8 
     hashTaggedBool(&hasher, .ocr_used, unit.ocr_used);
     hashTaggedBool(&hasher, .ocr_attempted, unit.ocr_attempted);
     hashTaggedOptionalU16(&hasher, .ocr_render_dpi, unit.ocr_render_dpi);
-    hashTaggedBool(&hasher, .ocr_render_policy, unit.ocr_render_policy != null);
-    if (unit.ocr_render_policy) |policy| {
-        hashTaggedOptionalU16(&hasher, .ocr_render_policy, policy.version);
-        hashTaggedBytes(&hasher, .ocr_render_policy, @tagName(policy.sampling));
-        hashTaggedOptionalBytes(&hasher, .ocr_render_policy, if (policy.resolved_profile) |profile| @tagName(profile) else null);
-        hashTaggedBytes(&hasher, .ocr_render_policy, @tagName(policy.resolution));
+    if (version == .v6) {
+        hashTaggedBool(&hasher, .ocr_render_policy, unit.ocr_render_policy != null);
+        if (unit.ocr_render_policy) |policy| {
+            hashTaggedOptionalU16(&hasher, .ocr_render_policy, policy.version);
+            hashTaggedBytes(&hasher, .ocr_render_policy, @tagName(policy.sampling));
+            hashTaggedOptionalBytes(&hasher, .ocr_render_policy, if (policy.resolved_profile) |profile| @tagName(profile) else null);
+            hashTaggedBytes(&hasher, .ocr_render_policy, @tagName(policy.resolution));
+        }
     }
     hashTaggedOptionalU16(&hasher, .ocr_effective_render_dpi, unit.ocr_effective_render_dpi);
     hashTaggedOptionalU32(&hasher, .ocr_rendered_width, unit.ocr_rendered_width);
@@ -130,7 +158,7 @@ pub fn fingerprintAlloc(alloc: Allocator, unit: document_extraction.Unit) ![]u8 
 
     var digest: [Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
-    return try prefixedLowerHexAlloc(alloc, current_prefix, &digest);
+    return try prefixedLowerHexAlloc(alloc, if (version == .v6) current_prefix else "duf5:", &digest);
 }
 
 /// Reproduces the unversioned fingerprint emitted before `duf2`. It is

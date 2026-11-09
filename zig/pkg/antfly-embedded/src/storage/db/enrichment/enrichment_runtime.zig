@@ -39466,7 +39466,9 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
     const unit: document_extraction_mod.Unit = .{ .unit_id = @constCast("page-1"), .unit_type = @constCast("page"), .text = @constCast("hello world"), .method = @constCast("text"), .page_number = 7, .char_start = 30, .char_end = 41 };
     const unit_fingerprint = try document_unit_fingerprint.fingerprintAlloc(alloc, unit);
     defer alloc.free(unit_fingerprint);
-    const payload = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, unit_fingerprint, "input", "text/plain", .{ .range_id = "units-0" });
+    // This authenticated v5 row was emitted by the pre-upgrade writer.
+    // Child computation must work before any v6 parent re-extraction.
+    const payload = try alloc.dupe(u8, @embedFile("testdata/unit_v5.json"));
     defer alloc.free(payload);
     try Harness.parent(&db, unit_key, payload, 4);
     try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
@@ -39514,6 +39516,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
         defer alloc.free(key);
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, try read.get(key), .{});
         defer parsed.deinit();
+        try std.testing.expectEqualStrings("duf5:acda8ad8765b4ad978ed1792837bb279b11ea01f7a3509605320b8b26d1c7122", parsed.value.object.get(hierarchy_navigation.unit_fingerprint_field).?.string);
         try std.testing.expectEqualStrings(unit_key, parsed.value.object.get("_parent_unit_key").?.string);
         try std.testing.expectEqualStrings("units-0", parsed.value.object.get("_artifact_range_id").?.string);
         try std.testing.expectEqualStrings("local_committed", parsed.value.object.get("_artifact_route_status").?.string);
@@ -39521,24 +39524,42 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
     }
     try publishOrderedUnitChunks(runtime, request, "chunks", unit_key);
     try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    // A later v6 parent publication invalidates the old child's source proof.
+    // The same callback replaces it and then idempotently reuses acceptance.
+    const migrated = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, unit_fingerprint, "input", "text/plain", .{ .range_id = "units-0" });
+    defer alloc.free(migrated);
+    try Harness.parent(&db, unit_key, migrated, 7);
+    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+    try harness.apply(&db, 8);
+    try publishOrderedUnitChunks(runtime, request, "chunks", unit_key);
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc", "chunks", "page-1", 0);
+        defer alloc.free(key);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, try read.get(key), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(unit_fingerprint, parsed.value.object.get(hierarchy_navigation.unit_fingerprint_field).?.string);
+    }
     const remote_unit = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, unit_fingerprint, "input", "text/plain", .{ .range_id = "units-0", .route_status = "remote_committed", .owner_group_id = 7002 });
     defer alloc.free(remote_unit);
-    try Harness.parent(&db, unit_key, remote_unit, 7);
+    try Harness.parent(&db, unit_key, remote_unit, 9);
     try std.testing.expectError(error.OnlineMergeArtifactTailsUnsupported, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
-    try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
     // Even an accepted fixture cannot bypass the typed unit contract. The
     // receiver will share this decoder; consumers must not propagate a stale
     // fingerprint or overwrite a previously accepted child set meanwhile.
     const corrupt_unit = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, "wrong-fingerprint", "input", "text/plain", .{ .range_id = "units-0" });
     defer alloc.free(corrupt_unit);
-    try Harness.parent(&db, unit_key, corrupt_unit, 8);
+    try Harness.parent(&db, unit_key, corrupt_unit, 10);
     try std.testing.expectError(error.InvalidDocumentExtractionManifest, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
-    try std.testing.expectEqual(@as(usize, 2), harness.calls);
-    try Harness.parent(&db, unit_key, null, 9);
-    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
-    try harness.apply(&db, 10);
-    try publishOrderedUnitChunks(runtime, request, "chunks", unit_key);
     try std.testing.expectEqual(@as(usize, 3), harness.calls);
+    try Harness.parent(&db, unit_key, null, 11);
+    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+    try harness.apply(&db, 12);
+    try publishOrderedUnitChunks(runtime, request, "chunks", unit_key);
+    try std.testing.expectEqual(@as(usize, 4), harness.calls);
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectEqual(@as(u32, 0), (try manifest.Manifest.decode(try read.get(manifest_key))).count);
@@ -46392,7 +46413,7 @@ test "document preparation copy admission failure discards optional state withou
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
 }
 
-test "OCR sampling upgrade replaces persisted duf5 units and reuses duf6 publication" {
+test "OCR sampling reuse gate requires current state before skipping extraction" {
     const a = std.testing.allocator;
     var backend = mem_backend.Backend.init(a, .{});
     defer backend.close();
@@ -46419,7 +46440,8 @@ test "OCR sampling upgrade replaces persisted duf5 units and reuses duf6 publica
     const old_marker = "duf5:0000000000000000000000000000000000000000000000000000000000000000";
     const old_state = try std.json.Stringify.valueAlloc(a, .{ .fingerprint = "source-version", .unit_keys = &.{key}, .unit_descriptors = &.{.{ .key = key, .fingerprint = old_marker }}, .chunk_keys = &.{}, .chunk_unit_fingerprint_version = 5 }, .{});
     defer a.free(old_state);
-    // Persist the old row/state before exercising the production reuse gate.
+    // This synthetic row is never decoded: this test isolates the state-version
+    // reuse gate. The ordered child-publication test uses authentic v5 bytes.
     try storePutWithRetry(&runtime, key, "{\"_artifact_unit_fingerprint\":\"" ++ old_marker ++ "\",\"text\":\"stale output\"}");
     try storePutWithRetry(&runtime, state_key, old_state);
     var extractions: usize = 0;

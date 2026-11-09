@@ -20,6 +20,18 @@ pub const Resample = @import("image_values").Resample;
 pub const PixelFormat = @import("image_values").PixelFormat;
 pub const ImageU8 = @import("image_values").ImageU8;
 
+/// Execution semantics are independent of checkpoint bytes. Every model
+/// accepting image/video input includes this recipe in its resolution revision.
+pub const execution_recipe = "antfly-image-processing-sampling-boundaries-v1";
+
+pub fn executionRevision(artifacts: [32]u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(execution_recipe);
+    hash.update(&.{0});
+    hash.update(&artifacts);
+    return hash.finalResult();
+}
+
 /// Convert a decoded RGB/RGBA image into normalized CHW f32 layout.
 pub fn preprocessDecoded(
     allocator: std.mem.Allocator,

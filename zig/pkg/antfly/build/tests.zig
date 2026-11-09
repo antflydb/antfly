@@ -2033,6 +2033,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("document-render-policy-test", "Run focused OCR rendering configuration, identity and provenance contracts")
         .dependOn(&addFilteredTestRunArtifact(b, render_policy_tests).step);
 
+    // Keep the real ordered apply/child-publication migration check separate
+    // from the inexpensive policy/codec owner above.
+    const unit_upgrade_tests = b.addTest(.{
+        .name = "document-unit-upgrade-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{"ordered artifact inventory unit chunk callback reconstructs publishes and retires accepted inputs"},
+        // Measured safe native compilation peaked at 8.64 GB. Keep this
+        // explicit integration owner bounded without inflating the codec gate.
+        .max_rss = 10 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-unit-upgrade-test", "Verify persisted v5 child publication and subsequent v6 replacement through ordered apply")
+        .dependOn(&addFilteredTestRunArtifact(b, unit_upgrade_tests).step);
+
     const graph_capability_filters = selectTestFilters(b, &.{
         "unsupported graph diagnostics identify the rejected operation feature",
         "graph capability diagnostic",
