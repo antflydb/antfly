@@ -36,8 +36,8 @@ fn retainedCancellation(context: *const Context) @import("antfly_cancellation").
             try self.ensureActive();
         }
         fn canceled(raw: *const anyopaque) bool {
-            check(raw) catch return true;
-            return false;
+            const self: *const Context = @ptrCast(@alignCast(raw));
+            return self.isCancelled();
         }
     };
     // Artifact checkpoints preserve the precise deadline error; cloud
@@ -1320,8 +1320,7 @@ const Execution = struct {
     }
     fn canceled(raw: *const anyopaque) bool {
         const self: *Execution = @ptrCast(@alignCast(@constCast(raw)));
-        self.context.ensureActive() catch return true;
-        return false;
+        return self.context.isCancelled();
     }
     fn publicDocNum(raw: ?*anyopaque, a: A, snapshot: *const local.index.IndexSnapshot, doc: u32) !?[]u8 {
         const self = from(raw);

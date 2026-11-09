@@ -113,6 +113,12 @@ pub const Context = struct {
     cancellation: ?storage.CancellationToken = null,
     checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
     additional_checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
+    /// Safe for transport polling, including a canceled child task. Lease
+    /// checkpoints may perform I/O and belong only on fallible read boundaries.
+    pub fn isCancelled(self: Context) bool {
+        if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return true;
+        return if (self.cancellation) |token| token.isCancelled() else false;
+    }
     pub fn ensureActive(self: Context) !void {
         // The scoped deadline remains precise when an in-flight transport
         // adapter reports that same expiration through a boolean callback.
@@ -139,8 +145,7 @@ pub const Store = struct {
     }
     fn canceled(raw: *const anyopaque) bool {
         const self: *const Store = @ptrCast(@alignCast(raw));
-        self.ensureActive() catch return true;
-        return false;
+        return self.context.isCancelled();
     }
     fn token(self: *Store) storage.CancellationToken {
         return .{ .ptr = self, .is_cancelled_fn = canceled };
@@ -176,9 +181,8 @@ pub const Store = struct {
             parent: ?storage.CancellationToken,
             fn canceled(raw_token: *const anyopaque) bool {
                 const value: *const @This() = @ptrCast(@alignCast(raw_token));
-                value.store.ensureActive() catch return true;
-                if (value.parent) |parent| parent.check() catch return true;
-                return false;
+                if (value.store.context.isCancelled()) return true;
+                return if (value.parent) |parent| parent.isCancelled() else false;
             }
         };
         const combined: Combined = .{ .store = self, .parent = options.cancellation };
@@ -307,4 +311,29 @@ test "external lake read ahead reservations are bounded across retries and reade
         try std.testing.expect(!trace.reserveReadAhead(1));
         try std.testing.expect(!fresh.reserveReadAhead(1));
     }
+}
+
+test "external lake read ahead transport polling never invokes fallible lease checkpoints" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var calls: usize = 0;
+    const Hook = struct {
+        fn check(raw: *anyopaque) !void {
+            const value: *usize = @ptrCast(@alignCast(raw));
+            value.* += 1;
+        }
+    };
+    const context: Context = .{ .checkpoint = .{ .ptr = &calls, .check = Hook.check } };
+    try std.testing.expect(!context.isCancelled());
+    var store: Store = .{ .base = memory.client(), .context = context, .extra_checkpoint = .{ .ptr = &calls, .check = Hook.check } };
+    try std.testing.expect(!Store.canceled(&store));
+    try std.testing.expectEqual(@as(usize, 0), calls);
+    try store.ensureActive();
+    try std.testing.expectEqual(@as(usize, 2), calls);
+    var expired = context;
+    expired.deadline_ns = 0;
+    try std.testing.expect(expired.isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, expired.ensureActive());
+    try std.testing.expectEqual(@as(usize, 2), calls);
 }

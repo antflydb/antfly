@@ -213,6 +213,9 @@ pub const Reader = struct {
     prefix: []const u8,
     root: ?Ref = null,
     complete: bool = false,
+    /// Borrowed from the admitted publication, for an optional opening seed
+    /// only. Both the record and this exact map binding must outlive the reader.
+    opening_hint: ?struct { root: Ref, record: Record } = null,
     alternatives: []const *Reader = &.{},
     cache_limit: usize = 8 * 1024 * 1024,
     cache_allocator: A = std.heap.page_allocator,
@@ -452,7 +455,17 @@ pub const Reader = struct {
         };
         return null;
     }
+    pub fn bindOpeningHint(self: *Reader, record: Record) !void {
+        try record.validate();
+        self.opening_hint = .{ .root = self.root orelse return error.InvalidCloudGenerationMap, .record = record };
+    }
     pub fn lookup(self: *Reader, a: A, id: []const u8, token: Token) !?Record {
+        try token.check();
+        if (self.opening_hint) |hint| if (self.root) |root| {
+            if (root.byte_len == hint.root.byte_len and root.retention_until_ms == hint.root.retention_until_ms and
+                std.mem.eql(u8, root.artifact_id, hint.root.artifact_id) and std.mem.eql(u8, root.checksum, hint.root.checksum) and
+                std.mem.eql(u8, root.generation, hint.root.generation) and std.mem.eql(u8, id, hint.record.id)) return try hint.record.clone(a);
+        };
         return self.lookupAt(a, id, self.root, token);
     }
     fn lookupAt(self: *Reader, a: A, id: []const u8, root: ?Ref, token: Token) anyerror!?Record {
@@ -1424,4 +1437,49 @@ test "external lake metadata navigation pool reclaims idle scopes before owner a
     try std.testing.expectEqual(@as(usize, 2), next.refs.load(.acquire));
     next.release();
     (try pool.acquire(@splat(3))).release();
+}
+
+test "external lake read ahead opening hints skip map I/O and fence map identity cancellation and unrelated records" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    const Probe = struct {
+        calls: usize = 0,
+        fn get(raw: *anyopaque, _: A, _: []const u8, _: []const u8, _: objectstore.GetOptions) !objectstore.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.TestMapRead;
+        }
+    };
+    var probe: Probe = .{};
+    var vtable = memory.client().vtable.*;
+    vtable.get_object = Probe.get;
+    const client: objectstore.Client = .{ .allocator = a, .ptr = &probe, .vtable = &vtable };
+    const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const id = "sha256:" ++ checksum;
+    const root: Ref = .{ .artifact_id = id, .checksum = checksum, .byte_len = 1, .generation = "map-v1" };
+    var reader: Reader = .{ .client = client, .bucket = "bucket", .prefix = "maps", .root = root };
+    defer reader.deinit();
+    try reader.bindOpeningHint(.{ .id = id, .bytes = 42, .generation = "object-v7" });
+    var selected = (try reader.lookup(a, id, .none)).?;
+    defer selected.deinit(a);
+    try std.testing.expectEqualStrings("object-v7", selected.generation);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    const unrelated = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    try std.testing.expectError(error.TestMapRead, reader.lookup(a, unrelated, .none));
+    reader.root.?.generation = "map-v2";
+    try std.testing.expectError(error.TestMapRead, reader.lookup(a, id, .none));
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    reader.root = null;
+    try std.testing.expect((try reader.lookup(a, id, .none)) == null);
+    reader.root = root;
+    const Stop = struct {
+        fn canceled(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    var stop: u8 = 0;
+    try std.testing.expectError(error.Canceled, reader.lookup(a, id, .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled }));
+    try std.testing.expectError(error.InvalidCloudGenerationMap, reader.bindOpeningHint(.{ .id = id, .bytes = 42, .generation = "" }));
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
 }

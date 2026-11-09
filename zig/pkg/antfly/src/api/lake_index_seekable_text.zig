@@ -105,6 +105,23 @@ pub fn warmBounded(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
 pub fn warmOpening(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
     return warmMode(a, read, ref, maximum_bytes, true);
 }
+/// Publication-only second pass, after every navigation root has priority.
+/// Tiny complete segments fit in the same opening bundle; large archive
+/// segments retain selective demand reads rather than arbitrary prefixes.
+pub fn warmSmall(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
+    if (ref.byte_len > maximum_bytes or ref.byte_len > 256 * 1024) return 0;
+    const directory = try loadDirectory(a, read, ref);
+    if (directory.bytes > 256 * 1024) return 0;
+    var spent: usize = @intCast(ref.byte_len);
+    for (directory.blocks) |piece| {
+        if (piece.ref.byte_len > maximum_bytes -| spent) break;
+        try read.check();
+        var held = try readPieceLease(a, read.store, piece, read.cancellation, read.cache);
+        spent += @intCast(piece.ref.byte_len);
+        held.deinit();
+    }
+    return spent;
+}
 fn warmMode(a: A, read: Read, ref: Ref, maximum_bytes: usize, opening_only: bool) !usize {
     if (ref.byte_len > maximum_bytes or ref.byte_len > 512 * 1024) return 0;
     try read.check();
@@ -924,7 +941,7 @@ fn readAheadPiece(a: A, store: stores.ArtifactStore, piece: Piece, cancellation:
     try cached.context.ensureActive();
     try cancellation.check();
     owns = false;
-    return (PhysicalWarm{ .lease = held }).retainValue(verified);
+    return try (PhysicalWarm{ .lease = held }).retainValue(verified);
 }
 fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead, coalesced: ?*CoalescedRead, publication: bool) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
     if (piece.pack == null) {
@@ -1083,9 +1100,9 @@ const Owner = struct {
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             if (self.cancelled.load(.acquire)) return true;
-            self.capability.check() catch return true;
-            if (self.capability.cache) |cache| cache.context.ensureActive() catch return true;
-            return false;
+            if (self.capability.context.isCancelled()) return true;
+            if (self.capability.cache) |cache| if (cache.context.isCancelled()) return true;
+            return if (self.capability.cancellation.ptr) |ptr| if (self.capability.cancellation.is_cancelled_fn) |check| check(ptr) else false else false;
         }
         const WorkerPin = struct {
             lease: local.serverless_query_lake_decoded_cache.Lease,
@@ -2934,4 +2951,45 @@ test "external lake demanded pack read ahead reuses distant blocks and respects 
     var expired = cached;
     expired.context.deadline_ns = 0;
     try std.testing.expectError(error.DeadlineExceeded, readPieceLeaseCoalesced(a, store, owner.directory.blocks[0], .none, expired, null, false));
+}
+
+test "external lake read ahead tiny publication seeding covers all blocks and declines archive segments" {
+    const a = std.testing.allocator;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const Fs = @import("../serverless/artifacts/fs_store.zig").FsStore;
+    var directory = try local.common_test_directory.TestDirectory.init("tiny-opening");
+    defer directory.cleanup();
+    var fs = try Fs.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(45), 1, std.testing.io);
+    const bytes = try sa.alloc(u8, 512 * 1024);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / block_bytes);
+    const tiny = try publish(a, sa, &store, bytes[0 .. 128 * 1024], .none);
+    const large = try publish(a, sa, &store, bytes, .none);
+    const root = try loadDirectory(sa, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, tiny);
+    const Sink = struct {
+        pieces: []const Piece,
+        seen: [64]bool = @splat(false),
+        total: usize = 0,
+        fn capture(raw: *anyopaque, id: []const u8, digest: [32]u8, data: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (self.pieces, 0..) |piece, i| if (std.mem.eql(u8, id, piece.ref.artifact_id)) {
+                _ = try ServingCache.VerifiedBytes.authenticate(data, digest);
+                if (!self.seen[i]) self.total += data.len;
+                self.seen[i] = true;
+            };
+        }
+    };
+    var sink: Sink = .{ .pieces = root.blocks };
+    try std.testing.expect(root.blocks.len <= sink.seen.len);
+    var cache = ServingCache.initWithMemoryLimit(a, 0);
+    defer cache.deinit();
+    const read: Read = .{ .store = store, .cache = .{ .cache = &cache, .scope = @splat(45), .context = .{}, .capture = .{ .ptr = &sink, .record = Sink.capture } }, .context = .{}, .cancellation = .none };
+    _ = try warmSmall(sa, read, tiny, 512 * 1024);
+    try std.testing.expectEqual(@as(usize, 128 * 1024), sink.total);
+    for (sink.seen[0..root.blocks.len]) |seen| try std.testing.expect(seen);
+    try std.testing.expectEqual(@as(usize, 0), try warmSmall(sa, read, large, 512 * 1024));
 }

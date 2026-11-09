@@ -211,6 +211,29 @@ remain readable without bundles; a new publication/rebuild is needed to gain
 publication-level opening bundles. Metadata capability 85 fences older readers
 from new lake catalog writes.
 
+Opening bundle descriptors can also carry the exact provider generation captured
+by the publication writer. That descriptor is authenticated with the publication
+and bound to its cloud-map identity. A private seed reader can fetch that one
+bundle without first walking the generation map; every other artifact still
+resolves through its normal map. Missing selectors retain the ordinary path.
+Absent selectors are omitted from serialization, preserving existing bundle and
+certificate wire shapes. The seed worker always reads and hashes the full bundle
+and does not repeat the parent's provider-clock/certificate admission.
+
+To avoid moving the skipped cold map lookup into ranking, bounded map-root warming
+runs alongside direct bundle fetches, using the same credential-scoped immutable
+navigation pool. Its conservative 8 MiB admission reduces the bundle wave's
+allowance, keeping their combined cap at 32 MiB. It is optional and is canceled
+and joined when the required seed wave is ready. Independent stop flags interrupt
+provider polling before any worker arena or selector binding can be destroyed.
+
+After all opening navigation has priority, a second publication pass may seed
+complete tiny text indexes whose authenticated total serving size is at most
+256 KiB and whose segment count is at most sixteen. Their complete bounded
+payload avoids separate dictionary/posting/source GETs for small current-data
+tables. Large archive indexes do not receive arbitrary payload prefixes; this
+pass shares the existing pack count, decoded-byte and capture-read limits.
+
 Cold demand reads also use bounded byte read-ahead. A touched native text pack
 can be fetched and authenticated once (at most 1 MiB, at most 16 times its
 requested block). Parquet data reads can reuse aligned 1 MiB windows across
@@ -243,6 +266,9 @@ profiles separately attribute immutable index/cache reads and planned Parquet
 source loads. Source counters include footer/index/data range payloads, not all
 authentication, metadata probes, wire attempts or billing operations. The
 read-ahead byte counter reports conservative reservations, not extra wire bytes.
+Transport cancellation polling checks deadlines and explicit cancellation only;
+fallible reader/lease checkpoints run before and after required operations, not
+inside provider polling callbacks where they could perform nested I/O.
 Slow-request health
 metrics expose both individual leaves and accumulated composed-request I/O
 without table names, object paths, or credentials. Refill calls contribute only

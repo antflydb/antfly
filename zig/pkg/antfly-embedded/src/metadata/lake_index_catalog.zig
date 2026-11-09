@@ -110,6 +110,13 @@ pub const CloudGenerations = struct {
 pub const OpeningBundle = struct {
     artifact: artifacts.ArtifactRef,
     decoded_bytes: u32,
+    /// Optional publication-authenticated bootstrap selector. It avoids a
+    /// dependent map-page read for this seed only, never other artifacts.
+    provider_generation: ?[]const u8 = null,
+    pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+        if (self.provider_generation) |generation| return stream.write(.{ .artifact = self.artifact, .decoded_bytes = self.decoded_bytes, .provider_generation = generation });
+        return stream.write(.{ .artifact = self.artifact, .decoded_bytes = self.decoded_bytes });
+    }
 };
 pub const Publication = struct {
     reader_protocol: u16 = native_reader_protocol,
@@ -165,6 +172,7 @@ pub const Publication = struct {
         try validateReaderProtocol(self.reader_protocol);
         if (self.opening_bundles.len > 4 or (self.opening_bundles.len != 0 and self.reader_protocol < 98)) return error.InvalidLakeIndexCatalog;
         for (self.opening_bundles) |bundle| {
+            if (bundle.provider_generation) |generation| if (generation.len == 0 or generation.len > 4096 or std.mem.eql(u8, generation, "null")) return error.InvalidLakeIndexCatalog;
             if (bundle.artifact.kind != .doc_values or bundle.artifact.metadata_version != 1 or bundle.artifact.byte_len > 5 * 1024 * 1024 or bundle.decoded_bytes < 5 or bundle.decoded_bytes > 4 * 1024 * 1024) return error.InvalidLakeIndexCatalog;
             try artifactValid(bundle.artifact);
         }
@@ -503,7 +511,22 @@ test "metadata.lake opening publication preserves ready roots and fences changed
     defer roundtrip.deinit();
     try roundtrip.value.validate();
     try std.testing.expectEqual(@as(usize, 1), roundtrip.value.opening_bundles.len);
+    try std.testing.expect(std.mem.indexOf(u8, accelerated_bytes, "provider_generation") == null);
+    var hinted_bundle = accelerated.opening_bundles[0];
+    hinted_bundle.provider_generation = "provider-version";
+    accelerated.opening_bundles = &.{hinted_bundle};
+    const hinted_bytes = try std.json.Stringify.valueAlloc(a, accelerated, .{});
+    defer a.free(hinted_bytes);
+    const hinted = try std.json.parseFromSlice(Publication, a, hinted_bytes, .{});
+    defer hinted.deinit();
+    try hinted.value.validate();
+    try std.testing.expectEqualStrings("provider-version", hinted.value.opening_bundles[0].provider_generation.?);
+    hinted_bundle.provider_generation = "";
+    accelerated.opening_bundles = &.{hinted_bundle};
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, accelerated.validate());
+    accelerated.opening_bundles = publication.opening_bundles;
     accelerated.reader_protocol = minimum_reader_protocol;
+    accelerated.opening_bundles = roundtrip.value.opening_bundles;
     try std.testing.expectError(error.InvalidLakeIndexCatalog, accelerated.validate());
     var paged = publication;
     paged.inventory.metadata_version = 1;

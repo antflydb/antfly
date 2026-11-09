@@ -827,8 +827,7 @@ pub const Reader = struct {
         fn canceled(raw: *const anyopaque) bool {
             const self: *const Warm = @ptrCast(@alignCast(raw));
             if (self.cancelled.load(.acquire)) return true;
-            self.reader.context.ensureActive() catch return true;
-            return false;
+            return self.reader.context.isCancelled();
         }
     };
     cache: *Cache,
