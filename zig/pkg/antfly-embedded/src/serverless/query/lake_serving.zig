@@ -1283,7 +1283,10 @@ pub const ServingSource = struct {
         errdefer self.alloc.destroy(reader);
         const scope = try cacheScope(self.alloc, self.store, binding);
         var read_context = self.protectContext(context);
-        read_context.parallel_object_io = self.provider_allocator != null and self.store.client.vtable.supports_concurrent_requests;
+        // Borrowed resolver clients may ignore our construction allocator.
+        // Only known owned provider instances establish that synchronization.
+        const owned_provider = self.store.gcs_client != null or self.store.s3_client != null;
+        read_context.parallel_object_io = self.provider_allocator != null and owned_provider and self.store.client.vtable.supports_concurrent_requests;
         reader.* = .{ .base = self.scanner.object_reader, .cache = cache, .scope = scope, .context = read_context };
         self.scanner.shared_reader = reader;
     }

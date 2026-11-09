@@ -457,7 +457,12 @@ pub const Reader = struct {
     }
     pub fn bindOpeningHint(self: *Reader, record: Record) !void {
         try record.validate();
-        self.opening_hint = .{ .root = self.root orelse return error.InvalidCloudGenerationMap, .record = record };
+        const root = self.root orelse return error.InvalidCloudGenerationMap;
+        try root.validate();
+        const map_scope = (try api.uploadScopeFromArtifactId(root.artifact_id)) orelse return error.InvalidCloudGenerationMap;
+        const payload_scope = (try api.uploadScopeFromArtifactId(record.id)) orelse return error.InvalidCloudGenerationMap;
+        if (!std.mem.eql(u8, &map_scope.domain, &payload_scope.domain)) return error.InvalidCloudGenerationMap;
+        self.opening_hint = .{ .root = root, .record = record };
     }
     pub fn lookup(self: *Reader, a: A, id: []const u8, token: Token) !?Record {
         try token.check();
@@ -1456,8 +1461,11 @@ test "external lake read ahead opening hints skip map I/O and fence map identity
     vtable.get_object = Probe.get;
     const client: objectstore.Client = .{ .allocator = a, .ptr = &probe, .vtable = &vtable };
     const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const id = "sha256:" ++ checksum;
-    const root: Ref = .{ .artifact_id = id, .checksum = checksum, .byte_len = 1, .generation = "map-v1" };
+    const scope = try api.UploadScope.forPublication(@splat(46), 1, std.testing.io);
+    const root_id = try scope.artifactId(checksum);
+    const object_id = try scope.artifactId("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    const id = &object_id;
+    const root: Ref = .{ .artifact_id = &root_id, .checksum = checksum, .byte_len = 1, .generation = "map-v1" };
     var reader: Reader = .{ .client = client, .bucket = "bucket", .prefix = "maps", .root = root };
     defer reader.deinit();
     try reader.bindOpeningHint(.{ .id = id, .bytes = 42, .generation = "object-v7" });
@@ -1465,8 +1473,8 @@ test "external lake read ahead opening hints skip map I/O and fence map identity
     defer selected.deinit(a);
     try std.testing.expectEqualStrings("object-v7", selected.generation);
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
-    const unrelated = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    try std.testing.expectError(error.TestMapRead, reader.lookup(a, unrelated, .none));
+    const unrelated = try scope.artifactId("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    try std.testing.expectError(error.TestMapRead, reader.lookup(a, &unrelated, .none));
     reader.root.?.generation = "map-v2";
     try std.testing.expectError(error.TestMapRead, reader.lookup(a, id, .none));
     try std.testing.expectEqual(@as(usize, 2), probe.calls);
@@ -1481,5 +1489,8 @@ test "external lake read ahead opening hints skip map I/O and fence map identity
     var stop: u8 = 0;
     try std.testing.expectError(error.Canceled, reader.lookup(a, id, .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled }));
     try std.testing.expectError(error.InvalidCloudGenerationMap, reader.bindOpeningHint(.{ .id = id, .bytes = 42, .generation = "" }));
+    const foreign_scope = try api.UploadScope.forPublication(@splat(47), 1, std.testing.io);
+    const foreign_id = try foreign_scope.artifactId(checksum);
+    try std.testing.expectError(error.InvalidCloudGenerationMap, reader.bindOpeningHint(.{ .id = &foreign_id, .bytes = 42, .generation = "foreign-v1" }));
     try std.testing.expectEqual(@as(usize, 2), probe.calls);
 }
