@@ -5816,7 +5816,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "10";
+const derived_catalog_index_version = "11";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -12167,6 +12167,59 @@ pub const RaftApplyStore = struct {
         return out;
     }
 
+    // Migration belongs to apply/startup/control work. A foreground query must
+    // never rebuild catalog history or interpret a missing index as no merges.
+    fn beginOwnerReadinessTxn(self: *RaftApplyStore, group_id: u64) !docstore.DocStore.Txn {
+        var txn = try self.store.beginReadTxn();
+        errdefer txn.abort();
+        requireDerivedCatalogIndexesTxn(&txn, group_id) catch |err| switch (err) {
+            error.InvalidDerivedCatalogIndex => return error.StorageReadTemporarilyUnavailable,
+            else => return err,
+        };
+        return txn;
+    }
+
+    /// Only selected active owners are read; terminal history stays in storage.
+    pub fn ownerReadinessTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../api.zig").OwnerReadinessRequest, budget: @import("../../api/table_catalog.zig").RoutingBudget) ![]@import("../api.zig").OwnerTransitionCheck {
+        try budget.checkpoint();
+        if (request.owners.len == 0 or request.owners.len > 1024) return error.InvalidArgument;
+        var txn = try self.beginOwnerReadinessTxn(group_id);
+        defer txn.abort();
+        var result: std.ArrayList(@import("../api.zig").OwnerTransitionCheck) = .empty;
+        errdefer result.deinit(alloc);
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer seen.deinit(alloc);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        for (request.owners) |owner| {
+            try budget.checkpoint();
+            var buf: [192]u8 = undefined;
+            const prefix = try ownerMergePrefix(&buf, group_id, owner.group_id);
+            var row = try cursor.seekAtOrAfter(prefix);
+            while (row) |kv| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+                try budget.checkpoint();
+                if (kv.value.len != 9 or kv.value[8] > 1) return error.InvalidDerivedCatalogIndex;
+                const id = std.mem.readInt(u64, kv.value[0..8], .little);
+                const slot = try seen.getOrPut(alloc, id);
+                if (!slot.found_existing) try result.append(alloc, .{ .id = id, .reassignment = kv.value[8] == 1 });
+            }
+        }
+        try budget.checkpoint();
+        return result.toOwnedSlice(alloc);
+    }
+
+    fn putOwnerMergeIndexTxn(txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.MergeTransitionRecord) !void {
+        var value: [9]u8 = undefined;
+        std.mem.writeInt(u64, value[0..8], record.transition_id, .little);
+        value[8] = @intFromBool(record.allow_doc_identity_reassignment);
+        for ([_]u64{ record.donor_group_id, record.receiver_group_id }) |owner| {
+            var buf: [192]u8 = undefined;
+            const key = try std.fmt.bufPrint(&buf, "\x00\x00__metadata_derived__:owner_merge:{d}:{d}:{d}", .{ group_id, owner, record.transition_id });
+            if (transitionPhaseTerminal(record.phase)) try txn.delete(key) else try txn.put(key, &value);
+        }
+    }
+
     /// Indexed report pages and placement prefixes for selected owners only.
     /// No administrative, extension, job, or unrelated range records are read.
     pub fn ownerReadiness(self: *RaftApplyStore, alloc: std.mem.Allocator, metadata_group_id: u64, request: @import("../api.zig").OwnerReadinessRequest, budget: @import("../../api/table_catalog.zig").RoutingBudget) !@import("../api.zig").OwnerReadiness {
@@ -12177,7 +12230,7 @@ pub const RaftApplyStore = struct {
         const a = arena.allocator();
         const groups = try a.alloc(u64, request.owners.len);
         for (request.owners, groups) |owner, *group| group.* = owner.group_id;
-        var txn = try self.beginIndexedReportRead(metadata_group_id);
+        var txn = try self.beginOwnerReadinessTxn(metadata_group_id);
         defer txn.abort();
         const stores = try self.readSelectedStoresTxn(a, metadata_group_id, groups, true, budget, &txn);
         var ranges: std.ArrayListUnmanaged(metadata.RangeRecord) = .empty;
@@ -17839,6 +17892,13 @@ pub const RaftApplyStore = struct {
             var member = try decodeExtensionMemberRecord(self.alloc, row.value);
             defer member.deinitOwned(self.alloc);
             try self.putExtensionTableOwnerIndexTxn(txn, group_id, member);
+        }
+        // Derived owner membership is rebuilt only on migration/restore.
+        try self.deleteDerivedPrefixTxn(txn, try std.fmt.allocPrint(listing_alloc, "\x00\x00__metadata_derived__:owner_merge:{d}:", .{group_id}));
+        var merge_buf: [160]u8 = undefined;
+        for (try docstore.DocStore.scanPrefixTxn(listing_alloc, txn, try mergeTransitionPrefixForGroup(&merge_buf, group_id))) |row| {
+            const record = try decodeMergeTransitionRecord(listing_alloc, row.value);
+            if (!transitionPhaseTerminal(record.phase)) try putOwnerMergeIndexTxn(txn, group_id, record);
         }
         try txn.put(version_key, derived_catalog_index_version);
         return true;
@@ -26207,6 +26267,7 @@ pub const RaftApplyStore = struct {
         const encoded = try encodeMergeTransitionRecord(self.alloc, replacement);
         defer self.alloc.free(encoded);
         try txn.put(key, encoded);
+        try putOwnerMergeIndexTxn(txn, group_id, replacement);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         self.notifyProjectionListeners(.{ .kind = .merge_transition, .metadata_group_id = group_id, .group_id = replacement.receiver_group_id });
         self.notifyCommittedTransition(.{ .upsert_merge = replacement });
@@ -26287,6 +26348,7 @@ pub const RaftApplyStore = struct {
         const value = try encodeMergeTransitionRecord(self.alloc, record);
         defer self.alloc.free(value);
         try txn.put(key, value);
+        try putOwnerMergeIndexTxn(txn, group_id, record);
         try self.updateTableTransitionFenceTxn(
             txn,
             group_id,
@@ -26319,6 +26381,7 @@ pub const RaftApplyStore = struct {
         defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, existing);
         if (!transitionPhaseTerminal(existing.phase)) return;
 
+        try putOwnerMergeIndexTxn(txn, group_id, existing);
         try txn.delete(key);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         self.notifyProjectionListeners(.{
@@ -33152,6 +33215,10 @@ fn extensionTableOwnerIndexKey(
 
 fn derivedCatalogIndexVersionKey(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:catalog_index_version:{d}", .{group_id});
+}
+
+fn ownerMergePrefix(buf: []u8, group_id: u64, owner: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:owner_merge:{d}:{d}:", .{ group_id, owner });
 }
 
 pub fn mergeTransitionPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
@@ -44886,4 +44953,73 @@ test "selected owner readiness reads indexed namespaces and ignores unrelated un
     request.owners = &.{.{ .group_id = 99, .shard_id = 99, .range_id = 99 }};
     try std.testing.expectEqual(.topology_changed, (try store.ownerReadiness(a, 21, request, .{})).status);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.ownerReadiness(a, 21, request, .{ .deadline_ns = 0 }));
+}
+
+test "selected owner readiness durable transition index rebuilds and retires active membership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/owner-transitions", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const request: @import("../api.zig").OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{ .{ .group_id = 3, .shard_id = 3, .range_id = 3 }, .{ .group_id = 4, .shard_id = 4, .range_id = 4 } } };
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, store.ownerReadinessTransitions(a, 21, request, .{}));
+    var active: metadata.MergeTransitionRecord = .{ .transition_id = 9, .donor_group_id = 3, .receiver_group_id = 4, .table_contract = test_merge_transition_table_contract, .allow_doc_identity_reassignment = true };
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        for (0..1000) |i| {
+            var key: [160]u8 = undefined;
+            const record: metadata.MergeTransitionRecord = .{ .transition_id = i + 100, .donor_group_id = 10, .receiver_group_id = 11, .table_contract = test_transition_table_contract, .phase = .finalized };
+            const encoded = try encodeMergeTransitionRecord(a, record);
+            defer a.free(encoded);
+            try txn.put(try mergeTransitionKeyForGroup(&key, 21, record.transition_id), encoded);
+        }
+        var key: [160]u8 = undefined;
+        const encoded = try encodeMergeTransitionRecord(a, active);
+        defer a.free(encoded);
+        try txn.put(try mergeTransitionKeyForGroup(&key, 21, active.transition_id), encoded);
+        // Upgrade a legacy marker and derive membership from primary records.
+        try txn.put(try derivedCatalogIndexVersionKey(&key, 21), "10");
+        try std.testing.expect(try store.ensureDerivedCatalogIndexesTxn(&txn, 21));
+        try txn.commit();
+    }
+    {
+        const checks = try store.ownerReadinessTransitions(a, 21, request, .{});
+        defer a.free(checks);
+        try std.testing.expectEqual(@as(usize, 1), checks.len);
+        try std.testing.expectEqual(@as(u64, 9), checks[0].id);
+        try std.testing.expect(checks[0].reassignment);
+    }
+    // Indexed reads must not decode even a poisoned unrelated history record.
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var key: [160]u8 = undefined;
+        try txn.put(try mergeTransitionKeyForGroup(&key, 21, 100), "unrelated history");
+        try txn.commit();
+    }
+    const selected = try store.ownerReadinessTransitions(a, 21, request, .{});
+    defer a.free(selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    var refusing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const empty = try store.ownerReadinessTransitions(refusing.allocator(), 21, .{ .table_id = 7, .owners = &.{.{ .group_id = 99, .shard_id = 99, .range_id = 99 }} }, .{});
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expectEqual(@as(usize, 0), refusing.allocations);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        active.phase = .finalized;
+        var key: [160]u8 = undefined;
+        const encoded = try encodeMergeTransitionRecord(a, active);
+        defer a.free(encoded);
+        try txn.put(try mergeTransitionKeyForGroup(&key, 21, active.transition_id), encoded);
+        try RaftApplyStore.putOwnerMergeIndexTxn(&txn, 21, active);
+        try txn.commit();
+    }
+    const retired = try store.ownerReadinessTransitions(a, 21, request, .{});
+    defer a.free(retired);
+    try std.testing.expectEqual(@as(usize, 0), retired.len);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.ownerReadinessTransitions(a, 21, request, .{ .deadline_ns = 0 }));
 }

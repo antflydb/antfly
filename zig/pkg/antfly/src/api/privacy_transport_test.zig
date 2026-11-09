@@ -466,7 +466,7 @@ test "privacy compact owner readiness transport bounds replies and preserves sel
             self.calls += 1;
             try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/catalog/owner-readiness"));
             try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
-            var parsed = try std.json.parseFromSlice(api.OwnerReadinessRequest, a, request.body.?, .{});
+            var parsed = try std.json.parseFromSlice(api.OwnerReadinessRequest, a, request.body, .{});
             defer parsed.deinit();
             try std.testing.expectEqual(@as(u64, 7), parsed.value.table_id);
             try std.testing.expectEqual(@as(usize, 2), parsed.value.owners.len);
@@ -499,4 +499,44 @@ test "privacy compact owner readiness transport bounds replies and preserves sel
     const calls = fake.calls;
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchOwnerReadiness("http://metadata", request, .{ .deadline_ns = 1 }));
     try std.testing.expectEqual(calls, fake.calls);
+}
+
+test "privacy compact owner readiness transport preserves preflight and dispatch cancellation" {
+    const api = @import("../metadata/api.zig");
+    const Fake = struct {
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, _: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.Cancelled;
+        }
+    };
+    var fake: Fake = .{};
+    var signal: http.RequestCancellation = .{};
+    signal.cancel();
+    var client = @import("../metadata/http_client.zig").MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    const request: api.OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{.{ .group_id = 1, .shard_id = 1, .range_id = 1 }} };
+    try std.testing.expectError(error.Canceled, client.fetchOwnerReadiness("http://metadata", request, .{ .deadline_ns = std.math.maxInt(u64), .cancellation = &signal }));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectError(error.Canceled, client.fetchOwnerReadiness("http://metadata", request, null));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "privacy compact owner readiness transport routing tokens fail closed on peer errors" {
+    const Fake = struct {
+        status: u16 = 503,
+        fn execute(raw: *anyopaque, a: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/routing-token"));
+            try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
+            return .{ .status = self.status, .body = try a.dupe(u8, "invalid peer JSON") };
+        }
+    };
+    var fake: Fake = .{};
+    var client = @import("../metadata/http_client.zig").MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchRoutingToken("http://metadata", null));
+    fake.status = 200;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchRoutingToken("http://metadata", null));
+    fake.status = 404;
+    try std.testing.expectError(error.UnsupportedOperation, client.fetchRoutingToken("http://metadata", null));
 }

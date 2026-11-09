@@ -691,7 +691,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                         effect.timestamp_value = try encodeTimestampValue(effects_alloc, write_timestamp_ns);
                                     }
                                 }
-                                try S.ownerField(self, "core").*.index_manager.validateExternalVectorSpacesParsed(row.extracted.dense_embeddings, row.parsedValue());
+                                // The pinned preparation plan already validated authored
+                                // vector receipts before releasing transient JSON. Its
+                                // generation is fenced above; commit needs only row effects.
                                 for (row.extracted.dense_embeddings) |*embedding| {
                                     if (embedding.artifact_key != null) continue;
                                     embedding.artifact_key = try appendEmbeddingArtifactWrite(

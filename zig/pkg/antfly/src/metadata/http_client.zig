@@ -470,11 +470,20 @@ pub const MetadataHttpClient = struct {
         return try self.fetchRoutingSnapshotAt(base_uri, .POST, path, body, budget);
     }
 
+    pub fn fetchRoutingToken(self: *MetadataHttpClient, base_uri: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.CatalogRoutingChangeToken) {
+        return self.fetchCatalogReadAt(metadata_api.CatalogRoutingChangeToken, base_uri, .POST, routes.Routes.internal_routing_token, "{}", budget) catch |err| switch (err) {
+            error.OutOfMemory, error.CatalogRoutingSnapshotTimeout, error.Canceled, error.DeadlineExceeded, error.UnsupportedOperation => return err,
+            error.Cancelled => return error.Canceled,
+            else => return error.StorageReadTemporarilyUnavailable,
+        };
+    }
+
     pub fn fetchOwnerReadiness(self: *MetadataHttpClient, base_uri: []const u8, request: metadata_api.OwnerReadinessRequest, budget: ?RequestBudget) !std.json.Parsed(metadata_api.OwnerReadiness) {
         const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
         defer self.alloc.free(body);
         return self.fetchCatalogReadAt(metadata_api.OwnerReadiness, base_uri, .POST, routes.Routes.internal_owner_readiness, body, budget) catch |err| switch (err) {
             error.OutOfMemory, error.CatalogRoutingSnapshotTimeout, error.Canceled, error.DeadlineExceeded, error.UnsupportedOperation => return err,
+            error.Cancelled => return error.Canceled,
             // Legacy/malformed readiness replies are a peer capability or
             // availability failure, never an invalid public graph query.
             else => return error.StorageReadTemporarilyUnavailable,
@@ -511,7 +520,7 @@ pub const MetadataHttpClient = struct {
             .method = method,
             .uri = uri,
             .timeout_ms = default_request_timeout_ms,
-            .max_response_bytes = if (Result == metadata_api.PrivacyPolicyBinding or Result == metadata_api.OwnerReadiness) 4096 else null,
+            .max_response_bytes = if (Result == metadata_api.CatalogRoutingChangeToken or Result == metadata_api.PrivacyPolicyBinding or Result == metadata_api.OwnerReadiness) 4096 else null,
         };
         if (method == .POST) {
             request.body = body orelse "{}";

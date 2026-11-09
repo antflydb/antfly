@@ -973,3 +973,21 @@ test "external lake Cypher execution hides pending privacy records in native poi
     }
     try std.testing.expectError(error.IndexRebuilding, db.getCypherPinnedDocuments(a, &cut, &.{"one"}, .{ .privacy_policy_version = @as([64]u8, @splat('a')), .fields = &.{}, .include_all_fields = false }));
 }
+
+test "external lake Cypher execution reads immutable native document and graph cuts preserve relational vector receipt validation" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("relational-external-vector-receipts");
+    defer directory.cleanup();
+    var db = try local.storage_db_db.DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"metadata":{"type":"object"},"revision":{"type":"string"},"embedding":{"type":"array","items":{"type":"number"}}},"additionalProperties":false}}}}
+    );
+    try db.addIndex(.{ .name = "external_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"external_vector_space\":\"recipe-v1\"}" });
+    // Relational ingress accepts schema fields; external vector envelopes are
+    // tested by the document-mode contract. A receipt without an authored
+    // vector must still be rejected before the parsed relational root expires.
+    try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r1\",\"metadata\":{}}" }} });
+    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}}}" }} }));
+    try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }} });
+}

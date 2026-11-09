@@ -1484,6 +1484,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (schema.ttl_duration_ns != 0) try prepared.requireLogicalField(schema.ttl_field);
             if (plan) |snapshot| {
+                if (snapshot.external_vector_spaces.count() != 0) try prepared.requireLogicalField("metadata");
                 if (snapshot.group_sources) |group_plan| for (group_plan.entries) |entry| {
                     if (entry.source.filter != .null) {
                         try prepared.requireLogicalRoot();
@@ -1809,6 +1810,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 },
                                 &prepared.extracted,
                             ) catch |err| {
+                                prepared.deinit(owner_alloc);
+                                ctx.fail(err);
+                                return;
+                            };
+                        }
+                        if (ctx.write_plan) |pinned_write_plan| {
+                            // Validate while the transient parsed root exists. The
+                            // commit phase fences this exact immutable plan generation.
+                            pinned_write_plan.validateExternalVectorSpacesParsed(scratch_arena.allocator(), prepared.extracted.dense_embeddings, prepared.parsedValue()) catch |err| {
                                 prepared.deinit(owner_alloc);
                                 ctx.fail(err);
                                 return;

@@ -596,6 +596,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         auth.addImport("antfly_platform", platform_mod);
         module.addImport("usermgr_storage", auth);
     }
+    const cypher_remote_routing_tests = b.addTest(.{
+        .root_module = data_consumer_module,
+        .filters = &.{"remote graph"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-remote-routing-test", "Verify compact routing generation fences and readiness cancellation")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_remote_routing_tests).step);
     const sql_expression_apply_tests = b.addTest(.{
         .root_module = data_implementation_module,
         .filters = &.{"SQL expression apply failures preserve exact semantic rejections"},

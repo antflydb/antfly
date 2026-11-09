@@ -5968,3 +5968,39 @@ and validating residual predicates. Excluded table domains cannot consume key
 hashing/materialization work needed by unrelated bounded inputs. Regression
 coverage includes 4,096 wide keys in separate and mixed staged graph relations,
 concurrent topology replacement during readiness, and wire disposition decoding.
+
+Warm distributed graph captures validate a retained routing generation using a
+constant-size linearizable authority/revision token. Equal tokens license reuse
+without downloading or copying any catalog tables/ranges. Changed tokens refresh
+through the existing authoritative snapshot path; refreshes are coalesced and
+unsupported or incomplete token replies cannot license cache reuse. Endpoint
+iteration is pinned across failover, independently of concurrent affinity updates.
+
+Selected-owner merge readiness uses a durable covering index of active transition
+IDs and reassignment flags. Accepted ordinary/online admission, update, terminal
+publication, and removal maintain membership in the same metadata transaction.
+Derived catalog index version 11 reconstructs it from primary records on migration
+and snapshot restore. Foreground readiness refuses an unavailable index rather
+than rebuilding catalog history or treating missing membership as ready; ordinary
+apply/startup/control index maintenance performs reconstruction. Queries only seek
+selected owner prefixes, deduplicate shared donor/receiver transitions, and inspect
+their live observations. Split publications never invalidate or rescan merge history.
+
+Readiness HTTP requests borrow the caller's cancellation signal through outer and
+per-endpoint budgets, including requests without an explicit deadline. Transport
+`Cancelled` is normalized to `Canceled` and cannot become a retryable availability
+failure; cancellation before dispatch or during a peer call stops further attempts.
+Regression gates cover warm/revision-changed/mixed-peer routing, affinity changes
+during failover, durable-index migration and retirement with unrelated terminal
+history, allocation-free misses, and preflight/in-flight cancellation.
+Readiness observation-lock waits honor the same cancellation/deadline budget, so
+an active transition's control work cannot turn cancellation into an unbounded
+mutex wait. Relational authored-vector receipt validation runs during preparation,
+while transient JSON is still alive, against the immutable write plan whose
+generation commit fences. Lazy intent projection hydrates only the metadata field
+when external vector receipts require it; commit consumes owned rows/effects and
+never revives a released JSON root. Native regressions verify both receipt
+rejection/withdrawal and the existing large relational sparse-predicate fixture.
+Internal routing-budget exhaustion retains temporary graph/SQL availability
+semantics (HTTP 503 and SQLSTATE 53300); it is never classified as malformed query
+syntax. Explicit execution deadlines and cancellation keep their own outcomes.

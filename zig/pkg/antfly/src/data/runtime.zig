@@ -27433,13 +27433,73 @@ const RemoteMetadataSource = struct {
         return entry.generation;
     }
 
+    fn cachedAuthoritativeRoutingGeneration(self: *RemoteMetadataSource, deadline: ?u64) !?*antfly.public_api.table_catalog.RoutingGeneration {
+        if (!self.lockBefore(&self.cache_mutex, deadline)) return error.CatalogRoutingSnapshotTimeout;
+        defer self.cache_mutex.unlock();
+        const generation = self.authoritative_routing_generation orelse return null;
+        generation.retain();
+        return generation;
+    }
+
+    /// A fresh read barrier licenses an exact immutable authority/revision.
+    /// Unsupported peers use the existing full-snapshot path, never cache age.
+    fn confirmRoutingGeneration(self: *RemoteMetadataSource, generation: *antfly.public_api.table_catalog.RoutingGeneration, deadline: ?u64) !bool {
+        const end = deadline orelse (self.awakeNs() +| remote_metadata_snapshot_timeout_ns);
+        const first_index = try self.metadataReadApiIndexForAttemptWithBudget(0, .{ .deadline_ns = end, .io = self.io });
+        var last_err: anyerror = error.MissingMetadataApi;
+        var unsupported = false;
+        for (0..self.base_uris.len) |attempt| {
+            const budget: antfly.metadata_http_client.RequestBudget = .{ .deadline_ns = catalogRoutingAttemptDeadline(self.awakeNs(), end, self.base_uris.len - attempt), .io = self.io };
+            const index = (first_index + attempt) % self.base_uris.len;
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var client = self.metadataClient(arena.allocator());
+            var parsed = client.fetchRoutingToken(self.base_uris[index], budget) catch |err| {
+                if (err == error.UnsupportedOperation) unsupported = true;
+                last_err = normalizeCatalogRoutingSnapshotError(err);
+                continue;
+            };
+            defer parsed.deinit();
+            const token = parsed.value;
+            // Default/legacy tokens cannot prove a coherent generation.
+            if (token.metadata_group_id == 0 or token.metadata_incarnation == null or token.revision == 0) return false;
+            self.acceptMetadataIdentityWithBudget(token.metadata_group_id, token.metadata_incarnation, budget) catch |err| {
+                last_err = err;
+                continue;
+            };
+            try ensureBudgetActive(budget);
+            self.noteMetadataReadSuccess(index);
+            return token.eql(generation.indexed.snapshot.value.change_token);
+        }
+        if (unsupported) return false;
+        return last_err;
+    }
+
     fn remoteAcquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         if (!authoritative) {
             if (try self.cachedRoutingGenerationFresh(deadline_ns)) |generation| return generation;
         }
-        // Preserve singleflight refresh, incarnation validation and read
-        // barriers in the existing capture path. Only cache misses copy data.
+        if (authoritative) {
+            if (try self.cachedAuthoritativeRoutingGeneration(deadline_ns)) |generation| {
+                errdefer generation.release();
+                if (try self.confirmRoutingGeneration(generation, deadline_ns)) return generation;
+                generation.release();
+            }
+        }
+        // Coalesce expensive refreshes. Warm readers need only the compact
+        // barrier above and never queue behind a catalog-sized download.
+        var refresh_locked = false;
+        defer if (refresh_locked) self.routing_refresh_mutex.unlock();
+        if (authoritative) {
+            if (!self.lockBefore(&self.routing_refresh_mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+            refresh_locked = true;
+            if (try self.cachedAuthoritativeRoutingGeneration(deadline_ns)) |generation| {
+                errdefer generation.release();
+                if (try self.confirmRoutingGeneration(generation, deadline_ns)) return generation;
+                generation.release();
+            }
+        }
         var snapshot = try self.remoteRoutingSnapshotWithMode(deadline_ns, authoritative);
         defer freeRoutingSnapshotOwned(self.alloc, &snapshot);
         if (!authoritative) {
@@ -27487,24 +27547,28 @@ const RemoteMetadataSource = struct {
     fn remoteOwnerReadiness(ptr: *anyopaque, input: antfly.metadata_api.OwnerReadinessRequest, routing_budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.OwnerReadiness {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         try routing_budget.checkpoint();
-        const deadline_ns = routing_budget.deadline_ns;
-        const outer_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| .{ .deadline_ns = deadline, .io = self.io } else null;
+        var signal = antfly.common.http.http_common.RequestCancellation.fromToken(routing_budget.cancellation);
+        const deadline_ns = routing_budget.deadline_ns orelse (self.awakeNs() +| remote_metadata_snapshot_timeout_ns);
+        const outer_budget: antfly.metadata_http_client.RequestBudget = .{ .deadline_ns = deadline_ns, .io = self.io, .cancellation = &signal };
+        const first_index = try self.metadataReadApiIndexForAttemptWithBudget(0, outer_budget);
         var last_err: anyerror = error.MissingMetadataApi;
         for (0..self.base_uris.len) |attempt| {
             try routing_budget.checkpoint();
-            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
-            const index = self.metadataReadApiIndexForAttempt(attempt);
-            const budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| .{ .deadline_ns = catalogRoutingAttemptDeadline(self.awakeNs(), deadline, self.base_uris.len - attempt), .io = self.io } else null;
+            ensureBudgetActive(outer_budget) catch |err| return if (err == error.Cancelled or err == error.Canceled) error.Canceled else error.CatalogRoutingSnapshotTimeout;
+            const index = (first_index + attempt) % self.base_uris.len;
+            const budget: antfly.metadata_http_client.RequestBudget = .{ .deadline_ns = catalogRoutingAttemptDeadline(self.awakeNs(), deadline_ns, self.base_uris.len - attempt), .io = self.io, .cancellation = &signal };
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             var client = self.metadataClient(arena.allocator());
             var parsed = client.fetchOwnerReadiness(self.base_uris[index], input, budget) catch |err| {
+                try routing_budget.checkpoint();
+                if (err == error.Cancelled or err == error.Canceled) return error.Canceled;
                 last_err = if (err == error.UnsupportedOperation) error.StorageReadTemporarilyUnavailable else normalizeCatalogRoutingSnapshotError(err);
                 continue;
             };
             defer parsed.deinit();
             try routing_budget.checkpoint();
-            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+            ensureBudgetActive(outer_budget) catch |err| return if (err == error.Cancelled or err == error.Canceled) error.Canceled else error.CatalogRoutingSnapshotTimeout;
             self.acceptMetadataIdentityWithBudget(parsed.value.metadata_group_id, parsed.value.metadata_incarnation, budget) catch |err| {
                 last_err = err;
                 continue;
@@ -27512,7 +27576,8 @@ const RemoteMetadataSource = struct {
             self.noteMetadataReadSuccess(index);
             return parsed.value;
         }
-        ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+        try routing_budget.checkpoint();
+        ensureBudgetActive(outer_budget) catch |err| return if (err == error.Cancelled or err == error.Canceled) error.Canceled else error.CatalogRoutingSnapshotTimeout;
         return last_err;
     }
 
@@ -46658,6 +46723,114 @@ fn consumerTests() type {
                 try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(expected)));
             }
             try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(&source.http_executors[0])));
+        }
+
+        test "remote graph routing reuses fenced generations and refreshes changed revisions" {
+            const a = std.testing.allocator;
+            const Stub = struct {
+                revision: u64 = 9,
+                tokens: usize = 0,
+                snapshots: usize = 0,
+                unsupported: bool = false,
+                malformed: bool = false,
+                affinity: ?*RemoteMetadataSource = null,
+                fn snapshot(self: *@This()) antfly.metadata_api.CatalogRoutingSnapshot {
+                    return .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = self.revision, .change_token = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .revision = self.revision }, .tables = &.{}, .ranges = &.{} };
+                }
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (std.mem.endsWith(u8, request.uri, "/routing-token")) {
+                        self.tokens += 1;
+                        if (std.mem.indexOf(u8, request.uri, "stalled.test") != null) {
+                            if (self.affinity) |source| {
+                                lockAtomic(&source.cache_mutex);
+                                source.preferred_read_uri_index = 1;
+                                source.cache_mutex.unlock();
+                            }
+                            return error.ConnectionRefused;
+                        }
+                        try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
+                        if (self.unsupported) return .{ .status = 404, .body = try alloc.dupe(u8, "unsupported") };
+                        return .{ .status = 200, .body = if (self.malformed) try alloc.dupe(u8, "{}") else try std.json.Stringify.valueAlloc(alloc, self.snapshot().change_token, .{}) };
+                    }
+                    if (std.mem.indexOf(u8, request.uri, "capabilities") != null) return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.MetadataCapabilities{}, .{}) };
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/linearizable-routing-snapshot"));
+                    self.snapshots += 1;
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, self.snapshot(), .{}) };
+                }
+            };
+            var stub: Stub = .{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://metadata.test"}, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, std.testing.io);
+            defer source.deinit();
+            const first = try RemoteMetadataSource.remoteAcquireRoutingGeneration(&source, null, true);
+            defer first.release();
+            for (0..3) |_| {
+                const next = try RemoteMetadataSource.remoteAcquireRoutingGeneration(&source, null, true);
+                defer next.release();
+                try std.testing.expectEqual(first, next);
+            }
+            try std.testing.expectEqual(@as(usize, 1), stub.snapshots);
+            try std.testing.expectEqual(@as(usize, 3), stub.tokens);
+            stub.revision = 10;
+            const changed = try RemoteMetadataSource.remoteAcquireRoutingGeneration(&source, null, true);
+            defer changed.release();
+            try std.testing.expect(changed != first);
+            try std.testing.expectEqual(@as(u64, 10), changed.indexed.snapshot.value.catalog_revision);
+            try std.testing.expectEqual(@as(usize, 2), stub.snapshots);
+            stub.unsupported = true;
+            const legacy = try RemoteMetadataSource.remoteAcquireRoutingGeneration(&source, null, true);
+            defer legacy.release();
+            try std.testing.expectEqual(@as(usize, 3), stub.snapshots);
+            stub.unsupported = false;
+            stub.malformed = true;
+            const unproved = try RemoteMetadataSource.remoteAcquireRoutingGeneration(&source, null, true);
+            defer unproved.release();
+            try std.testing.expectEqual(@as(usize, 4), stub.snapshots);
+            stub.malformed = false;
+            var failover = try RemoteMetadataSource.initWithRequestExecutors(a, &.{ "http://stalled.test", "http://metadata.test" }, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, std.testing.io);
+            defer failover.deinit();
+            stub.affinity = &failover;
+            const pinned = try RemoteMetadataSource.remoteAcquireRoutingGeneration(&failover, null, true);
+            defer pinned.release();
+            const before = stub.snapshots;
+            const confirmed = try RemoteMetadataSource.remoteAcquireRoutingGeneration(&failover, null, true);
+            defer confirmed.release();
+            try std.testing.expectEqual(pinned, confirmed);
+            try std.testing.expectEqual(before, stub.snapshots);
+        }
+
+        test "remote graph readiness forwards cancellation and stops endpoint retries" {
+            const a = std.testing.allocator;
+            const Cancel = struct {
+                cancelled: bool = false,
+                fn check(raw: *const anyopaque) bool {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                    return self.cancelled;
+                }
+            };
+            const Stub = struct {
+                token: *Cancel,
+                calls: usize = 0,
+                fn execute(raw: *anyopaque, _: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    const signal = request.cancellation orelse return error.TestUnexpectedResult;
+                    try std.testing.expect(!signal.isCancelled());
+                    self.token.cancelled = true;
+                    try std.testing.expect(signal.isCancelled());
+                    return error.Cancelled;
+                }
+            };
+            var cancellation: Cancel = .{};
+            var stub: Stub = .{ .token = &cancellation };
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{ "http://one.test", "http://two.test" }, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, std.testing.io);
+            defer source.deinit();
+            const request: antfly.metadata_api.OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{.{ .group_id = 1, .shard_id = 1, .range_id = 1 }} };
+            const budget: antfly.public_api.table_catalog.RoutingBudget = .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = Cancel.check } };
+            try std.testing.expectError(error.Canceled, RemoteMetadataSource.remoteOwnerReadiness(&source, request, budget));
+            try std.testing.expectEqual(@as(usize, 1), stub.calls);
+            try std.testing.expectError(error.Canceled, RemoteMetadataSource.remoteOwnerReadiness(&source, request, budget));
+            try std.testing.expectEqual(@as(usize, 1), stub.calls);
         }
 
         test "remote metadata source restore staging authority binds every owner read" {
