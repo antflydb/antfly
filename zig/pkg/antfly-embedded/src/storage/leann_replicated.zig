@@ -713,11 +713,19 @@ pub const ReplicatedState = struct {
         // bounds are applied afterwards, over an enlarged result set.
         var filter = try RequestFilter.init(alloc, req);
         defer filter.deinit(alloc);
-        const key_filtered = filter.nodeActive();
+        const key_filtered = true; // Unbound graph keys must never occupy result slots.
         const filtered = filter.distanceActive();
         if (filtered) want = @intCast(@max(req.k * 4, req.k + 64));
         const live: u32 = @intCast(@max(self.replica.liveCount(), 1));
         var key_filter = KeyRequestFilter{ .state = self, .filter = &filter };
+        var candidate_ids = std.ArrayListUnmanaged(u32).empty;
+        defer candidate_ids.deinit(alloc);
+        if (filter.has_allowed) {
+            var ids = filter.allowed.keyIterator();
+            while (ids.next()) |id| if (self.key_of.get(id.*)) |key| {
+                if (self.replica.node_of.get(key)) |node| try candidate_ids.append(alloc, node);
+            };
+        }
         while (true) {
             want = @min(want, live);
             const hits = try self.replica.search(alloc, req.query, want, .{
@@ -725,6 +733,7 @@ pub const ReplicatedState = struct {
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
                 .filter = if (key_filtered) .{ .ctx = &key_filter, .allows_fn = KeyRequestFilter.allows } else null,
+                .candidate_ids = if (filter.has_allowed) candidate_ids.items else null,
                 .gate = gate.recomputeGate(),
             }, ctx.keyLoader());
             defer alloc.free(hits);
@@ -971,6 +980,14 @@ test "leann replicated state: derived replay plus committed records converge" {
     defer filtered.deinit();
     try testing.expectEqual(@as(usize, 2), filtered.items.items.len);
     for (filtered.items.items) |item| try testing.expect(item.vector_id == 79 or item.vector_id == 80);
+
+    // A locally removed binding must not consume a graph result slot while
+    // its replicated delete is still pending.
+    try follower.noteWrites(&[_]TestItem{}, &.{1077});
+    var after_unbind = try follower.search(alloc, .{ .query = &vecs[77], .k = 3 });
+    defer after_unbind.deinit();
+    try testing.expectEqual(@as(usize, 3), after_unbind.items.items.len);
+    for (after_unbind.items.items) |item| try testing.expect(item.vector_id != 1077);
 
     // Deletes replicate too; persistence round-trips.
     try leader.noteWrites(&[_]TestItem{}, &.{ 10, 11 });

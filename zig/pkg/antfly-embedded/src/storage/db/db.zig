@@ -37115,10 +37115,23 @@ pub const DB = struct {
                 try state.updateOwnedKey(&state.last_matching_key, key);
 
                 const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(state.alloc, value) catch |err| blk: {
-                    if (err == error.VectorElided and artifact_ref.source == null) {
-                        // Transient LEANN stub: re-embed the document.
+                    if (err == error.VectorElided) {
+                        // Derived embeddings are keyed by their source chunk, not the parent document.
+                        const source_key = if (artifact_ref.source) |source| source_key: {
+                            var source_ref = types.ArtifactRef{
+                                .document_id = try state.alloc.dupe(u8, artifact_ref.document_id),
+                                .name = try state.alloc.dupe(u8, source.name),
+                                .kind = source.kind,
+                                .chunk_id = source.chunk_id,
+                                .window_index = source.window_index,
+                                .unit_id = if (source.unit_id) |unit_id| try state.alloc.dupe(u8, unit_id) else null,
+                            };
+                            defer source_ref.deinit(state.alloc);
+                            break :source_key try artifact_ids.internalKeyForArtifactRefAlloc(state.alloc, source_ref);
+                        } else try state.alloc.dupe(u8, artifact_ref.document_id);
+                        defer state.alloc.free(source_key);
                         const stub = (try enrichment_artifact_codec.elidedDenseEmbedding(value)).?;
-                        break :blk state.db.core.index_manager.reembedElidedDocument(state.alloc, artifact_ref.name, artifact_ref.document_id, stub.dims) catch |reembed_err| switch (reembed_err) {
+                        break :blk state.db.core.index_manager.reembedElidedDocument(state.alloc, artifact_ref.name, source_key, stub.dims) catch |reembed_err| switch (reembed_err) {
                             error.NotFound => return .@"continue",
                             else => return reembed_err,
                         };
@@ -104478,6 +104491,10 @@ fn runTransientLeannStubCase(alloc: Allocator, storage: []const u8, chunked: boo
         try std.testing.expect(entry.index.leann.?.index != null);
         try std.testing.expect(stubs >= 256);
         try std.testing.expect(!db.core.index_manager.localLeannElisionPending());
+        if (chunked and !workers and std.mem.eql(u8, storage, "auto")) {
+            // Rebuild must accept derived chunk stubs as well as document stubs.
+            try std.testing.expect((try db.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc)) > 0);
+        }
         // The shared vector-block plane neither mirrors nor waits on LEANN.
         try std.testing.expect(!db.core.index_manager.vectorBlockBaseMaintenanceNeeded());
         try std.testing.expect(!db.core.index_manager.vectorBlockProjectionPending());

@@ -666,6 +666,7 @@ pub const Replica = struct {
         bound_scale: f32 = 1.0,
         batch_size: u32 = 0,
         filter: ?KeyFilter = null,
+        candidate_ids: ?[]const u32 = null,
         /// Cancellation and re-embedding budget (see `leann.RecomputeGate`).
         gate: ?leann.RecomputeGate = null,
     };
@@ -704,6 +705,7 @@ pub const Replica = struct {
                 .bound_scale = tuning.bound_scale,
                 .batch_size = tuning.batch_size,
                 .filter = if (node_filter) |*nf| leann.Filter{ .ctx = nf, .allows_fn = NodeKeyFilter.allows } else null,
+                .candidate_ids = tuning.candidate_ids,
                 .gate = tuning.gate,
             });
             defer resp.deinit(alloc);

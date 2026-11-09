@@ -8958,7 +8958,7 @@ pub const IndexManager = struct {
             // instead. The header is replicated data, so every replica
             // decides alike.
             const media = !header.flags.text_input;
-            if (entry.leann_text_only and media and !entry.leann_media_int8) continue;
+            if (media and !entry.leann_media_int8) continue;
             const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(self.alloc, raw) catch continue;
             defer self.alloc.free(vector);
             if (vector.len != entry.dims or leann_store_mod.vectorDigest(vector) != e.digest) continue;
@@ -9012,8 +9012,9 @@ pub const IndexManager = struct {
     /// The artifact key names the embedding, which covers `sources`
     /// indexes reading several of them.
     fn elidedArtifactOwner(self: *IndexManager, entry: *const DenseIndex, artifact_key: []const u8, doc_key: []const u8) ?struct { embedding_name: []const u8, doc_key: []const u8 } {
-        if (internal_keys.parseEmbeddingArtifactKeyView(artifact_key) catch null) |parsed| {
-            if (self.transientLeannOwns(parsed.artifact_name)) return .{ .embedding_name = parsed.artifact_name, .doc_key = parsed.doc_key };
+        for (entry.embedding_names) |name| {
+            if (embeddingArtifactKeyMatchesAnySource(artifact_key, &.{name}) and self.transientLeannOwns(name))
+                return .{ .embedding_name = name, .doc_key = doc_key };
         }
         if (entry.embedding_name) |name| if (self.transientLeannOwns(name)) return .{ .embedding_name = name, .doc_key = doc_key };
         return null;
@@ -29970,6 +29971,10 @@ pub const IndexManager = struct {
                                 else => return err,
                             };
                             errdefer self.alloc.free(reembedded);
+                            const stub_raw = try store_txn.get(write.artifact_key.?);
+                            const stub_header = try enrichment_artifact_codec.decodeHeader(stub_raw);
+                            if (!stub_header.flags.int8_payload and leann_store_mod.vectorDigest(reembedded) != digest)
+                                return error.ReembedRevisionMismatch;
                             // Store the vector again: this index reads it
                             // from storage in every scoring path, and elision
                             // now skips embeddings it consumes.
@@ -33490,11 +33495,11 @@ pub const IndexManager = struct {
                                     continue;
                                 }
                             }
-                            const digest = try leannStubDigest(alloc, store, meta, embedding_name);
-                            if (digest) |dg| if (manager.leann_reembed_cache.get(incarnation, meta, dg, out[i * d ..][0..d])) {
+                            const digest = (try leannStubDigest(alloc, store, meta, embedding_name)) orelse return error.ReembedRevisionMismatch;
+                            if (manager.leann_reembed_cache.get(incarnation, meta, digest, out[i * d ..][0..d])) {
                                 found[i] = true;
                                 continue;
-                            };
+                            }
                             try elided_slots.append(alloc, i);
                             try elided_keys.append(alloc, meta);
                             try elided_digests.append(alloc, digest);
@@ -33528,11 +33533,12 @@ pub const IndexManager = struct {
         for (elided_slots.items, 0..) |slot, j| {
             if (!ok[j]) continue;
             const vector = vectors[j * d ..][0..d];
+            if (elided_digests.items[j]) |dg| {
+                if (leann_store_mod.vectorDigest(vector) != dg) return error.ReembedRevisionMismatch;
+                manager.leann_reembed_cache.put(manager.alloc, incarnation, elided_keys.items[j], dg, vector) catch {};
+            }
             @memcpy(out[slot * d ..][0..d], vector);
             found[slot] = true;
-            if (elided_digests.items[j]) |dg| if (leann_store_mod.vectorDigest(vector) == dg) {
-                manager.leann_reembed_cache.put(manager.alloc, incarnation, elided_keys.items[j], dg, vector) catch {};
-            };
         }
     }
 
@@ -33631,6 +33637,11 @@ pub const IndexManager = struct {
         const keys = [_][]const u8{doc_key};
         try self.reembedDenseDocuments(alloc, entry, &keys, out, &found);
         if (!found[0]) return error.NotFound;
+        if (self.primary_store) |store| if (entry.embedding_name) |name| {
+            if (try leannStubDigest(alloc, store, doc_key, name)) |digest| {
+                if (leann_store_mod.vectorDigest(out) != digest) return error.ReembedRevisionMismatch;
+            }
+        };
         return out;
     }
 
@@ -52787,6 +52798,9 @@ test "auto leann stubs text-derived vectors and keeps media-derived ones" {
     while (start < n) : (start += 100) try manager.applyDenseEmbeddingWritesByName(&store, "leann_idx", writes[start..@min(start + 100, n)]);
     try manager.syncAll(true);
     try std.testing.expect(manager.localLeannElisionPending());
+    try manager.elideLocalLeannVectors();
+    // The same safety rule applies if a transient index receives media.
+    entry.leann_text_only = false;
     while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
     try std.testing.expect(!manager.localLeannElisionPending());
 
@@ -53014,6 +53028,19 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
         const entry = manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
         try std.testing.expect(entry.leann_transient);
+        {
+            var sources = [_][]u8{@constCast("leann_idx")};
+            var consumer = entry.*;
+            consumer.embedding_name = null;
+            consumer.embedding_names = &sources;
+            const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc\x00binary", "chunks", 3);
+            defer alloc.free(chunk_key);
+            const artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "leann_idx");
+            defer alloc.free(artifact_key);
+            const owner = manager.elidedArtifactOwner(&consumer, artifact_key, chunk_key).?;
+            try std.testing.expectEqualStrings("leann_idx", owner.embedding_name);
+            try std.testing.expectEqualSlices(u8, chunk_key, owner.doc_key);
+        }
 
         var writes: [n]mapper.DenseEmbeddingWrite = undefined;
         for (&writes, 0..) |*w, i| w.* = .{ .index_name = @constCast("leann_idx"), .doc_key = keys[i], .vector = &.{}, .artifact_key = produced[i] };
@@ -53049,8 +53076,8 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
             var found = [_]bool{false};
             var elapsed: u64 = 0;
             embedder.wrong_key = 177;
-            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &ids, &metadata, &out, &found, &elapsed);
-            try std.testing.expect(found[0] and out[0] != vectors[177][0]);
+            try std.testing.expectError(error.ReembedRevisionMismatch, IndexManager.loadDenseVectorsForLeann(&loader, alloc, &ids, &metadata, &out, &found, &elapsed));
+            try std.testing.expect(!found[0]);
             const before = embedder.documents;
             embedder.wrong_key = null;
             try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &ids, &metadata, &out, &found, &elapsed);
@@ -53794,7 +53821,7 @@ fn seedProducedEmbeddings(alloc: Allocator, store: *docstore_mod.DocStore, embed
     for (doc_keys, 0..) |doc_key, i| {
         out[i] = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, embedding_name);
         made += 1;
-        const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 1, &vectors[i]);
+        const payload = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, 1, true, &vectors[i]);
         defer alloc.free(payload);
         try store.put(out[i], payload);
     }

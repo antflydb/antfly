@@ -221,6 +221,8 @@ pub const SearchOptions = struct {
     k: u32 = 10,
     /// Only nodes this allows are returned or recomputed during filtered search.
     filter: ?Filter = null,
+    /// Known graph node IDs to score directly; callers must provide unique IDs.
+    candidate_ids: ?[]const u32 = null,
     gate: ?RecomputeGate = null,
     /// Beam width, raised to `k` when smaller. Zero picks a default per
     /// rerank mode: 64 for `ratio`, where every beam slot costs
@@ -741,14 +743,16 @@ pub const Index = struct {
         defer approx.deinit();
 
         // A filtered search must not load rejected upper-layer vectors.
-        const start = if (eff.exact_descent and eff.filter == null)
+        const start = if (eff.candidate_ids != null) self.entry else if (eff.exact_descent and eff.filter == null)
             try self.greedyDescentRecompute(alloc, source, q, self.entry, self.max_level, &stats)
         else
             try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats);
 
         var found = std.ArrayListUnmanaged(Cand).empty;
         defer found.deinit(alloc);
-        switch (rerank) {
+        if (eff.candidate_ids != null) {
+            try self.boundedSearch(alloc, source, q, &approx, start, eff, &found, &stats);
+        } else switch (rerank) {
             .bounds => try self.boundedSearch(alloc, source, q, &approx, start, eff, &found, &stats),
             else => if (eff.filter != null)
                 try self.boundedSearch(alloc, source, q, &approx, start, eff, &found, &stats)
@@ -1407,75 +1411,85 @@ pub const Index = struct {
         const Pooled = struct { id: u32, lower: f32, est: f32 };
         var pool = std.ArrayListUnmanaged(Pooled).empty;
         defer pool.deinit(alloc);
-        var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.node_count);
-        defer visited.deinit(alloc);
-        var candidates = Heap(false){};
-        defer candidates.deinit(alloc);
-        var beam = Heap(true){};
-        defer beam.deinit(alloc);
-        var fresh = std.ArrayListUnmanaged(u32).empty;
-        defer fresh.deinit(alloc);
+        if (opts.candidate_ids) |ids| {
+            for (ids, 0..) |id, offset| {
+                if (offset % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+                if (id >= self.node_count or self.isDeleted(id) or !try allowedNode(opts.filter, id)) continue;
+                const e = try approx.scoreOne(id);
+                stats.approx_evaluated += 1;
+                try pool.append(alloc, .{ .id = id, .lower = if (self.rabitq == null and !self.upper_vectors.contains(id)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
+            }
+        } else {
+            var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.node_count);
+            defer visited.deinit(alloc);
+            var candidates = Heap(false){};
+            defer candidates.deinit(alloc);
+            var beam = Heap(true){};
+            defer beam.deinit(alloc);
+            var fresh = std.ArrayListUnmanaged(u32).empty;
+            defer fresh.deinit(alloc);
 
-        // `beam` holds the best `ef` allowed estimates; it bounds the walk.
-        // Rejected nodes are still expanded while they could lead to better
-        // allowed ones, but never enter the beam or the recompute pool.
-        const first = try approx.scoreOne(start);
-        visited.set(start);
-        if (try allowedNode(opts.filter, start)) {
-            try pool.append(alloc, .{ .id = start, .lower = if (self.rabitq == null and !self.upper_vectors.contains(start)) -std.math.inf(f32) else first.dist - scale * first.bound, .est = first.dist });
-            try beam.push(alloc, .{ .dist = first.dist, .id = start });
-        }
-        try candidates.push(alloc, .{ .dist = first.dist, .id = start });
-        stats.approx_evaluated += 1;
-        // Layer-0 edges are directed and only reachability from the entry
-        // point is guaranteed, so a filtered walk that runs dry before
-        // finding `ef` allowed nodes restarts from the entry point, then
-        // scores what is still unvisited (codes only, no embeddings).
-        var reseeded = false;
-        walk: while (true) {
-            if (stats.expanded % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
-            if (candidates.len() == 0) {
-                if (opts.filter == null or beam.len() >= ef) break :walk;
-                if (!reseeded) {
-                    reseeded = true;
-                    if (!visited.isSet(self.entry)) {
-                        visited.set(self.entry);
-                        const e = try approx.scoreOne(self.entry);
-                        stats.approx_evaluated += 1;
-                        if (try allowedNode(opts.filter, self.entry)) {
-                            try pool.append(alloc, .{ .id = self.entry, .lower = if (self.rabitq == null and !self.upper_vectors.contains(self.entry)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
-                            if (beam.len() < ef) try beam.push(alloc, .{ .dist = e.dist, .id = self.entry });
+            // `beam` holds the best `ef` allowed estimates; it bounds the walk.
+            // Rejected nodes are still expanded while they could lead to better
+            // allowed ones, but never enter the beam or the recompute pool.
+            const first = try approx.scoreOne(start);
+            visited.set(start);
+            if (try allowedNode(opts.filter, start)) {
+                try pool.append(alloc, .{ .id = start, .lower = if (self.rabitq == null and !self.upper_vectors.contains(start)) -std.math.inf(f32) else first.dist - scale * first.bound, .est = first.dist });
+                try beam.push(alloc, .{ .dist = first.dist, .id = start });
+            }
+            try candidates.push(alloc, .{ .dist = first.dist, .id = start });
+            stats.approx_evaluated += 1;
+            // Layer-0 edges are directed and only reachability from the entry
+            // point is guaranteed, so a filtered walk that runs dry before
+            // finding `ef` allowed nodes restarts from the entry point, then
+            // scores what is still unvisited (codes only, no embeddings).
+            var reseeded = false;
+            walk: while (true) {
+                if (stats.expanded % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+                if (candidates.len() == 0) {
+                    if (opts.filter == null or beam.len() >= ef) break :walk;
+                    if (!reseeded) {
+                        reseeded = true;
+                        if (!visited.isSet(self.entry)) {
+                            visited.set(self.entry);
+                            const e = try approx.scoreOne(self.entry);
+                            stats.approx_evaluated += 1;
+                            if (try allowedNode(opts.filter, self.entry)) {
+                                try pool.append(alloc, .{ .id = self.entry, .lower = if (self.rabitq == null and !self.upper_vectors.contains(self.entry)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
+                                if (beam.len() < ef) try beam.push(alloc, .{ .dist = e.dist, .id = self.entry });
+                            }
+                            try candidates.push(alloc, .{ .dist = e.dist, .id = self.entry });
+                            continue :walk;
                         }
-                        try candidates.push(alloc, .{ .dist = e.dist, .id = self.entry });
-                        continue :walk;
                     }
+                    try self.scoreUnvisitedAllowed(alloc, approx, opts.filter.?, &visited, scale, &pool, stats, opts.gate);
+                    break :walk;
                 }
-                try self.scoreUnvisitedAllowed(alloc, approx, opts.filter.?, &visited, scale, &pool, stats, opts.gate);
-                break :walk;
-            }
-            const c = candidates.pop();
-            if (beam.len() >= ef and c.dist > beam.top().dist) break;
-            stats.expanded += 1;
-            fresh.clearRetainingCapacity();
-            for (self.adjacency.items[c.id].items) |nb| {
-                if (visited.isSet(nb)) continue;
-                visited.set(nb);
-                try fresh.append(alloc, nb);
-            }
-            const ests = try approx.score(fresh.items);
-            stats.approx_evaluated += @intCast(fresh.items.len);
-            for (fresh.items, ests) |nb, e| {
-                const nc = Cand{ .dist = e.dist, .id = nb };
-                const allowed = try allowedNode(opts.filter, nb);
-                // Every allowed estimate joins the pool, as without a filter.
-                if (allowed) try pool.append(alloc, .{ .id = nb, .lower = if (self.rabitq == null and !self.upper_vectors.contains(nb)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
-                if (beam.len() >= ef and nc.dist >= beam.top().dist) continue;
-                if (allowed) {
-                    if (beam.len() < ef) {
-                        try beam.push(alloc, nc);
-                    } else beam.replaceTop(nc);
+                const c = candidates.pop();
+                if (beam.len() >= ef and c.dist > beam.top().dist) break;
+                stats.expanded += 1;
+                fresh.clearRetainingCapacity();
+                for (self.adjacency.items[c.id].items) |nb| {
+                    if (visited.isSet(nb)) continue;
+                    visited.set(nb);
+                    try fresh.append(alloc, nb);
                 }
-                try candidates.push(alloc, nc);
+                const ests = try approx.score(fresh.items);
+                stats.approx_evaluated += @intCast(fresh.items.len);
+                for (fresh.items, ests) |nb, e| {
+                    const nc = Cand{ .dist = e.dist, .id = nb };
+                    const allowed = try allowedNode(opts.filter, nb);
+                    // Every allowed estimate joins the pool, as without a filter.
+                    if (allowed) try pool.append(alloc, .{ .id = nb, .lower = if (self.rabitq == null and !self.upper_vectors.contains(nb)) -std.math.inf(f32) else e.dist - scale * e.bound, .est = e.dist });
+                    if (beam.len() >= ef and nc.dist >= beam.top().dist) continue;
+                    if (allowed) {
+                        if (beam.len() < ef) {
+                            try beam.push(alloc, nc);
+                        } else beam.replaceTop(nc);
+                    }
+                    try candidates.push(alloc, nc);
+                }
             }
         }
 
@@ -3563,6 +3577,20 @@ test "leann: filtered search walks past rejected nodes to fill k allowed results
             return err;
         };
     }
+}
+
+test "leann: explicit candidates avoid the graph walk" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2000, 1, 16, 16, 49);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 16 };
+    var index = try Index.build(alloc, .{ .dims = 16, .quantizer = .rabitq, .max_degree = 16 }, fx.data);
+    defer index.deinit();
+    var result = try index.search(alloc, src.source(), fx.query(0), .{ .k = 3, .candidate_ids = &.{ 10, 123, 500 } });
+    defer result.deinit(alloc);
+    try testing.expectEqual(@as(usize, 3), result.results.len);
+    try testing.expectEqual(@as(u32, 3), result.stats.approx_evaluated);
+    try testing.expectEqual(@as(u32, 0), result.stats.expanded);
 }
 
 test "leann: cancellation interrupts an empty filtered walk" {

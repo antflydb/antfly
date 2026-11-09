@@ -692,6 +692,12 @@ pub const LeannStore = struct {
         var gate = SearchGate.init(req, if (self.opts.transient) self.opts.reembed_budget_ms else 0);
         var ctx = SourceCtx{ .store = self, .far_from = req.query, .reembed_ns = &gate.reembed_ns };
         const node_filter = NodeFilter{ .store = self, .filter = &filter };
+        var candidate_ids = std.ArrayListUnmanaged(u32).empty;
+        defer candidate_ids.deinit(alloc);
+        if (filter.has_allowed) {
+            var ids = filter.allowed.keyIterator();
+            while (ids.next()) |id| if (self.node_of.get(id.*)) |node| try candidate_ids.append(alloc, node);
+        }
         while (true) {
             want = @min(want, live);
             var resp = try index.search(alloc, ctx.source(), req.query, .{
@@ -700,6 +706,7 @@ pub const LeannStore = struct {
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
                 .filter = if (filter.nodeActive()) .{ .ctx = &node_filter, .allows_fn = NodeFilter.allows } else null,
+                .candidate_ids = if (filter.has_allowed) candidate_ids.items else null,
                 .gate = gate.recomputeGate(),
             });
             defer resp.deinit(alloc);

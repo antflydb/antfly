@@ -466,8 +466,12 @@ and rescores leaf members near the admission cutoff with extended codes
   `exclude_ids`, the key predicate, the metadata prefix and distance limits
   to an over-fetched candidate list. Exact distances come from HBC's
   external vector loader (the stored embedding artifact, or the document
-  field for direct-field indexes). Deleted or missing candidates are pushed
-  to the far end of the metric rather than failing a search.
+  field for direct-field indexes). Explicit ID filters map directly to graph
+  nodes; arbitrary predicates may still require scanning the graph when few
+  nodes match. Deleted or missing candidates are pushed to the far end of
+  the metric rather than failing a search. If the source document no longer
+  reproduces an elided vector's digest, re-embedding fails with
+  `ReembedRevisionMismatch` rather than scoring a different revision.
 - **Persistence.** `sync` (called from `IndexManager.syncAll`, before the
   applied sequence is recorded) writes `leann.store` atomically with a CRC:
   the key map, the exact buffer, and the serialized graph. When at least
@@ -503,9 +507,11 @@ Three modes:
   and vectors written by older builds or copied by restore paths lack the
   flag and stay stored. Re-embedding therefore only ever renders text: no
   query fetches or decodes media.
-- `transient` stubs every covered embedding. It requires inputs that
+- `transient` stubs covered text embeddings. It requires inputs that
   re-embed from text: no media chunkers (`audio`, `policy`, `outputs`,
-  `embedding`, or a non-`fixed` model) and no stored chunk inputs.
+  `embedding`, or a non-`fixed` model) and no stored chunk inputs. If a
+  template nevertheless produces media, its vector is retained (or kept as
+  an int8 copy when configured), so it remains searchable.
 - `persistent` keeps every embedding. External vectors, indexes fed by other
   enrichments, and PQ (rebuilds need vectors) resolve to it; asking for
   `auto` or `transient` there is rejected. Configs written before the option
