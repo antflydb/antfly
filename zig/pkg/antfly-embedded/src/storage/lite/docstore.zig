@@ -5862,7 +5862,10 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
         if (ledger.bytes + upper_bound_charge > admissible) return error.JournalCreditCapacityExceeded;
     }
 
-    try txn.put(internal_keys.replay_meta_init_key[0..], "");
+    // The init marker's value never changes once set; rewriting the same
+    // empty string every commit cost this record its own document_index
+    // leaf for no reason after the first append ever made.
+    if (!already_initialized) try txn.put(internal_keys.replay_meta_init_key[0..], "");
     const next_raw = encodeReplaySequence(sequence + 1);
     try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
     const latest_raw = encodeReplaySequence(sequence);

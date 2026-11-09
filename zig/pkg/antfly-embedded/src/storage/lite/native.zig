@@ -4468,7 +4468,14 @@ pub const DocumentIndexKeyLog = struct {
     fn record(comptime op: []const u8, leaf_original_page: u64, key: []const u8) void {
         if (!builtin.is_test) return;
         if (!armed.load(.monotonic)) return;
-        std.debug.print("DOCIDX_KEY op={s} leaf_original_page={d} key_len={d} key={s}\n", .{ op, leaf_original_page, key.len, key });
+        var hex_buf: [256]u8 = undefined;
+        var pos: usize = 0;
+        for (key) |byte| {
+            if (pos + 2 > hex_buf.len) break;
+            _ = std.fmt.bufPrint(hex_buf[pos..][0..2], "{x:0>2}", .{byte}) catch break;
+            pos += 2;
+        }
+        std.debug.print("DOCIDX_KEY op={s} leaf_original_page={d} key_len={d} key_hex={s}\n", .{ op, leaf_original_page, key.len, hex_buf[0..pos] });
     }
 };
 
@@ -11316,6 +11323,24 @@ pub const NativeFile = struct {
         kind: PageKind,
         checkpoint: CheckpointSlot,
     ) ![]u8 {
+        // Mirrors ledgerRead's fix: a cache hit already holds a
+        // CRC-validated page, so borrow its payload instead of duplicating
+        // the whole page just to decode and immediately discard the copy.
+        // A packed record reference names one record inside a shared
+        // record_bundle page, not the page's own payload -- unpackRecordPage
+        // (inside readPageAllocForCheckpoint) does that extraction, so those
+        // references must keep going through the slow path below.
+        if (page_id & packed_record_flag == 0 and page_id != 0 and page_id < checkpoint.page_count) {
+            const physical = physicalPage(page_id);
+            const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
+            if (use_cache) {
+                if (try self.page_cache.acquirePayload(allocator, physical, @intCast(self.header.page_size))) |view| {
+                    defer self.page_cache.releaseRaw(allocator, view);
+                    if (view.validation.?.kind != kind) return error.UnexpectedNativePageKind;
+                    return try allocator.dupe(u8, view.bytes[page_header_size..][0..view.validation.?.payload_len]);
+                }
+            }
+        }
         const page = try self.readPageAllocForCheckpoint(allocator, page_id, checkpoint);
         defer allocator.free(page);
         return try decodePagePayloadAlloc(allocator, page, kind);
