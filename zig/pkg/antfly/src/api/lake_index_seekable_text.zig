@@ -929,7 +929,8 @@ fn readAheadPiece(a: A, store: stores.ArtifactStore, piece: Piece, cancellation:
         hash.update(&cached.scope);
         hash.update(pack.artifact_id);
         hash.update(&digest);
-        const failure_key = hash.finalResult();
+        var failure_key: [32]u8 = undefined;
+        hash.final(&failure_key);
         if (trace.readAheadFailed(failure_key)) return null;
         admission = local.sql_parallel_scheduler.global().reserveIo(@intCast(pack.byte_len * 2)) orelse return null;
         if (!trace.reserveReadAhead(pack.byte_len)) return null;
