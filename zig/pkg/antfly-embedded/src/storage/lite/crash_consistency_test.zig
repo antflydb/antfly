@@ -2538,6 +2538,108 @@ test "crash sweep: commit failing after staging under a persistent io fault does
     if (hang_detected) return error.ShutdownHangDetected;
 }
 
+// Regression for a `DB.close()` hang (perf/lwa-commit-eff2): a worker (the
+// derived executor's own catch-up thread, in production) can be blocked in
+// `Ticket.wait()` for a ride-along commit it staged -- e.g. via
+// `native_catalog_sink.Sink.submitDeferred`/`Store.stageRideAlong` -- with
+// nothing else driving the Lite store's group-commit queue to resolve it
+// (no foreground write arrives, and the idle-flush timer has not fired
+// yet). `deinitWrapperState` used to call `self.executor.beginShutdown()`/
+// `.deinit()` -- which joins that worker thread -- before ever reaching
+// `self.core.syncStore()`, so a worker stuck like this stranded close()
+// behind a wait nothing was left to resolve. Fixed by force-draining the
+// store (`self.core.syncStore(true)`, which reaches the Lite store's own
+// `sync()` -> `forceDrainDurable()`) immediately before `beginShutdown()`,
+// so every currently-queued ride-along ticket -- a worker's own included --
+// is already resolved by the time any worker is asked to shut down.
+//
+// This test stages its own ride-along ticket directly on the DB's
+// underlying `docstore.Store` (bypassing the real derived-worker machinery
+// for determinism, mirroring docstore.zig's own "closing a store with only
+// ride-along work" precedent) and waits on it from a second thread,
+// simulating a worker still blocked on its own queued ticket, then calls
+// `DB.close()` from a third. `ride_along_idle_ns` is set well beyond this
+// test's own deadline -- not just "deliberately long" -- so the idle-flush
+// timer firing in time can never be why this passes: only `DB.close()`
+// itself resolving the ticket (whether via the force-drain this change adds
+// before `beginShutdown()`, or any other barrier already inside it) can.
+// Both the close and the ticket wait are bounded by the same deadline,
+// mirroring this file's and docstore.zig's own convention, so a regression
+// fails loudly instead of wedging the suite.
+test "DB.close() does not hang on a ride-along ticket a worker is still waiting on" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+    var handle_open = true;
+    defer if (handle_open) handle.close();
+
+    const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+    store.ride_along_idle_ns = 120 * std.time.ns_per_s;
+
+    const RideAlongCtx = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putDocument("worker-ride-along", "rode along");
+        }
+    };
+    var ride_ctx: u8 = 0;
+    const ticket = try store.stageRideAlong(.{ .context = &ride_ctx, .apply = RideAlongCtx.apply });
+
+    // Simulates the derived worker: a thread blocked in `Ticket.wait()` for
+    // its own ride-along commit, with nothing else (no foreground write,
+    // no idle-timer fire within this test's deadline) yet driving the
+    // queue to resolve it.
+    const TicketWaiter = struct {
+        ticket: docstore.Store.Ticket,
+        done: std.atomic.Value(bool) = .init(false),
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            self.result = self.ticket.wait();
+            self.done.store(true, .release);
+        }
+    };
+    var ticket_waiter: TicketWaiter = .{ .ticket = ticket };
+    const ticket_thread = try std.Thread.spawn(.{}, TicketWaiter.run, .{&ticket_waiter});
+
+    const Closer = struct {
+        handle: *DbHandle,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.handle.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .handle = &handle };
+    const closer_thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+
+    const platform_time = @import("antfly_platform").time;
+    const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire) or !ticket_waiter.done.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            closer_thread.detach();
+            ticket_thread.detach();
+            return error.CloseHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    ticket_thread.join();
+    try ticket_waiter.result;
+    closer_thread.join();
+    handle_open = false;
+
+    // The ride-along write must have actually landed durably, not just
+    // resolved its ticket without a real commit behind it.
+    var reopened = try openDbWithIo(allocator, path, std.testing.io, false);
+    defer reopened.close();
+    const reopened_store = reopened.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+    const value = try reopened_store.file.getDocumentAlloc(allocator, "worker-ride-along");
+    defer if (value) |bytes| allocator.free(bytes);
+    try std.testing.expectEqualStrings("rode along", value orelse return error.TestExpectedEqual);
+}
+
 pub fn reportFailures(report: *const SweepReport) !void {
     if (report.ok()) return;
     for (report.failures.items) |f| {
