@@ -5956,7 +5956,9 @@ or `identity_unavailable`. Missing owners and changed routing namespaces trigger
 a fresh generation and a new whole-cohort capture attempt before any rows are
 exposed. Actual identity-health failures remain fail-closed. Exhausted topology
 retries and unavailable identity state return temporary graph-read availability
-errors, including through the private HTTP/native projection boundaries.
+errors, including through the private HTTP/native projection boundaries. SQL
+`GRAPH_TABLE` reports the same readiness failures as retryable SQLSTATE `53300`
+with HTTP 503; pgwire uses the shared diagnostic classification.
 
 SQL computes its physically prunable table set before domain analysis. Staged
 and ordinary SQL scans already require full key cohorts, so staged-only graph
