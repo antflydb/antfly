@@ -2558,8 +2558,9 @@ fn applyCommonSearchRequestOptions(
     if (request.count) |count| req.count_only = count;
     if (request.remote_snapshot) |snapshot| {
         const retained_lake = (std.mem.startsWith(u8, snapshot, "lake2:") or std.mem.startsWith(u8, snapshot, "native2:")) and snapshot.len > 64 and (snapshot.len <= 512 or @import("../serverless/manifest/artifact_ref.zig").retainedGenerationToken(snapshot));
-        if (snapshot.len != 64 and !retained_lake) return error.InvalidQueryRequest;
-        if (retained_lake) for (snapshot) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidQueryRequest;
+        const owned_lake = std.mem.startsWith(u8, snapshot, "lake3:") and snapshot.len > 64 and snapshot.len <= 16 * 1024;
+        if (snapshot.len != 64 and !retained_lake and !owned_lake) return error.InvalidQueryRequest;
+        if (retained_lake or owned_lake) for (snapshot) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidQueryRequest;
         req.remote_snapshot = try alloc.dupe(u8, snapshot);
     }
     const has_result_page_options =
@@ -5021,7 +5022,7 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
     if (hit.stored_data) |stored_data| {
         const match_projection_configured = !req.hierarchy_match_include_all_fields;
         const source = if (req.defer_stored_projection or match_projection_configured)
-            try projectPublicStoredSourceValue(alloc, stored_data, .{
+            try projectHierarchyMemberSource(alloc, stored_data, .{
                 .fields = if (match_projection_configured) req.hierarchy_match_fields else req.fields,
                 .include_all_fields = if (match_projection_configured) false else req.include_all_fields,
             })
@@ -5045,6 +5046,42 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
     }
 
     return .{ .object = obj };
+}
+
+// Copy/text assets retain raw UTF-8, whereas chunks and extraction units are
+// JSON objects. Apply the same explicit projection to a synthetic text field
+// instead of feeding raw bytes into the JSON-only document projector.
+fn projectHierarchyMemberSource(alloc: std.mem.Allocator, raw: []const u8, options: db_mod.types.LookupOptions) !std.json.Value {
+    var value = try parseStoredSourceValue(alloc, raw);
+    defer db_mod.types.deinitJsonValue(alloc, &value);
+    if (value != .object) {
+        var object = std.json.ObjectMap.empty;
+        var scalar_field: []const u8 = "$";
+        if (!options.include_all_fields) for (options.fields) |field| {
+            if (std.mem.eql(u8, field, "text")) scalar_field = "text";
+            if (std.mem.eql(u8, field, "$")) {
+                scalar_field = "$";
+                break;
+            }
+        };
+        try object.put(alloc, try alloc.dupe(u8, scalar_field), try db_mod.types.cloneJsonValue(alloc, value));
+        db_mod.types.deinitJsonValue(alloc, &value);
+        value = .{ .object = object };
+    }
+    return try document_query.projectLookupValue(alloc, value, options);
+}
+
+test "api query contract projects raw text asset evidence without exposing unrequested fields" {
+    const a = std.testing.allocator;
+    var projected = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"text"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &projected);
+    try std.testing.expectEqualStrings("launch at 04:12", projected.object.get("text").?.string);
+    var scalar = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"$"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &scalar);
+    try std.testing.expectEqualStrings("launch at 04:12", scalar.object.get("$").?.string);
+    var hidden = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"provenance"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &hidden);
+    try std.testing.expectEqual(@as(usize, 0), hidden.object.count());
 }
 
 fn hierarchyAncestorsJsonValue(
@@ -10626,9 +10663,7 @@ fn parseLegacyPatternSteps(
                 .edge_filter = edge_filter,
             } else .{ .types = edge_types },
         };
-        if (step.edge != null and (steps[i].edge.min_hops == 0 or
-            steps[i].edge.max_hops == 0 or
-            steps[i].edge.min_hops > steps[i].edge.max_hops or
+        if (step.edge != null and (steps[i].edge.min_hops > steps[i].edge.max_hops or
             steps[i].edge.max_hops > graph_pattern_mod.max_pattern_hops))
             return error.InvalidQueryRequest;
         initialized += 1;
@@ -11011,8 +11046,8 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
                 .types = types,
                 .edge_filter = edge_filter,
                 .direction = parseGraphDirection(edge.direction),
-                .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
-                .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
+                .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 0, graph_pattern_mod.max_pattern_hops),
+                .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 0, graph_pattern_mod.max_pattern_hops),
                 .min_weight = weight_bounds.min,
                 .max_weight = weight_bounds.max,
             },
@@ -20907,4 +20942,25 @@ test "native member traversal requires producer and private parent admission" {
     defer json.deinit();
     try json.value.object.put(json.arena.allocator(), "_hierarchy_parent_admitted", .{ .bool = true });
     try std.testing.expect(objectHasInternalShardField(json.value.object));
+}
+
+test "api query contract scalar evidence preserves JSON-shaped plaintext bytes" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "123", "true", "\"quoted\"", "{\"text\":\"launch\"}" }) |raw| {
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .@"$" = raw }, .{});
+        defer a.free(encoded);
+        var projected = try projectHierarchyMemberSource(a, encoded, .{ .fields = &.{"$"}, .include_all_fields = false });
+        defer db_mod.types.deinitJsonValue(a, &projected);
+        try std.testing.expectEqualStrings(raw, projected.object.get("$").?.string);
+    }
+}
+
+test "api query contract structured dollar projection never exposes internal fields" {
+    const a = std.testing.allocator;
+    var projected = try projectHierarchyMemberSource(a, "{\"text\":\"visible\",\"_artifact_unit_fingerprint\":\"private-proof\",\"_resolution_work\":{}}", .{ .fields = &.{"$"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &projected);
+    const wire = try std.json.Stringify.valueAlloc(a, projected, .{});
+    defer a.free(wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "private-proof") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "_resolution_work") == null);
 }

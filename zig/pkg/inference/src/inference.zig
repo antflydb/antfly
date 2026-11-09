@@ -27,6 +27,10 @@ extern fn unsetenv(name: [*:0]const u8) c_int;
 
 pub const backends = @import("backends/backends.zig");
 pub const platform = @import("antfly_platform");
+test {
+    _ = @import("pipelines/preprocessing_memory.zig");
+}
+
 pub const execution_control = @import("execution_control.zig");
 pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
 pub const HardCancellationWatchdog = @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog;

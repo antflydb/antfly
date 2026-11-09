@@ -1,0 +1,9 @@
+{
+  "note": "Keep the frozen v1 scorer byte-identical to the recorded causal-probe qualification. Its Apache inference package LICENSE applies.",
+  "frozen_helpers": {
+    "quality_cases.py": {
+      "sha256": "c3499c3645d5a42dacdf43c4131e6680a65fa22287016de18a5e5bc6b91cb80b",
+      "size_bytes": 18704
+    }
+  }
+}

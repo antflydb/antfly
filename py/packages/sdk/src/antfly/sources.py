@@ -1,6 +1,6 @@
 """Control the optional antfly-source companion at its own base URL."""
 
-from typing import Any
+from typing import Any, Self
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -46,7 +46,7 @@ class _SourceTransport:
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self) -> "SourcesClient":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: Any) -> None:
@@ -126,8 +126,18 @@ class SourcesClient(_SourceTransport):
     def source(self, source_id: str) -> dict[str, Any]:
         return self._request("GET", f"/sources/{quote(source_id, safe='')}")
 
+    def preview_processing(self, source_id: str, preset: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", f"/sources/{quote(source_id, safe='')}/processing-preview", preset)
+
+    def processing_job(self, source_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", f"/sources/{quote(source_id, safe='')}/processing-jobs", request)
+
     def put_source(self, source: dict[str, Any]) -> dict[str, Any]:
-        return self._request("PUT", f"/sources/{quote(source['id'], safe='')}", source)
+        return self._request(
+            "PUT",
+            f"/sources/{quote(source['id'], safe='')}",
+            {key: value for key, value in source.items() if key != "search_status"},
+        )
 
     def remove_source(self, source_id: str, *, purge: bool = False) -> dict[str, Any]:
         return self._request("DELETE", f"/sources/{quote(source_id, safe='')}?purge={str(purge).lower()}")

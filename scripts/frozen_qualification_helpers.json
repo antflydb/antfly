@@ -14,5 +14,9 @@
   "zig/pkg/inference/testdata/gliner25/reference_manifest.json": {
     "base": "zig/pkg/inference/scripts/gliner25",
     "key": "generators"
+  },
+  "zig/pkg/inference/scripts/memorilla/qualification_helpers.json": {
+    "base": "zig/pkg/inference/scripts/memorilla",
+    "key": "frozen_helpers"
   }
 }

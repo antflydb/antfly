@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Offline full-width Qwen3-Embedding-4B reference and native CLI comparison.
 
 This independently checks last-token pooling, L2 normalization, exact encoded
@@ -240,26 +253,36 @@ def validate_native_response(
         lock = lock_model("encoder")
         evidence = response["cuda_execution"]
         low_precision = (
-            "bf16_cublaslt_linear_calls", "bf16_cublaslt_qkv_calls",
-            "f16_cublaslt_linear_calls", "f16_cublaslt_qkv_calls",
+            "bf16_cublaslt_linear_calls",
+            "bf16_cublaslt_qkv_calls",
+            "f16_cublaslt_linear_calls",
+            "f16_cublaslt_qkv_calls",
         )
         if (
             backend != "cuda"
-            or response.get("arithmetic") != "BF16-source-weights-widened-F32; F32-activations"
+            or response.get("arithmetic")
+            != "BF16-source-weights-widened-F32; F32-activations"
             or response.get("model") != lock["model"]
             or response.get("revision") != lock["revision"]
-            or response.get("base_model_lock_sha256") != hashlib.sha256(
+            or response.get("base_model_lock_sha256")
+            != hashlib.sha256(
                 Path(__file__).with_name("base_models.json").read_bytes()
             ).hexdigest()
             or evidence.get("strict_f32_weights") is not True
             or type(evidence.get("resident_weights")) is not int
             or evidence["resident_weights"] <= 0
-            or any(type(evidence.get(key)) is not int or evidence[key] != 0 for key in (
-                "low_precision_activation_staging_calls", "low_precision_matmul_calls"
-            ))
+            or any(
+                type(evidence.get(key)) is not int or evidence[key] != 0
+                for key in (
+                    "low_precision_activation_staging_calls",
+                    "low_precision_matmul_calls",
+                )
+            )
             or any(evidence["counters"][key] != 0 for key in low_precision)
         ):
-            raise ValueError("invalid strict-F32 encoder provenance or precision evidence")
+            raise ValueError(
+                "invalid strict-F32 encoder provenance or precision evidence"
+            )
     if response.get("token_ids") != token_ids:
         raise ValueError("native encoder token IDs differ from the reference")
     if response.get("text_prefix") != "" or response.get("trailing_eos_id") != EOS:
@@ -305,7 +328,13 @@ def validate_cuda_execution(evidence: dict | None) -> None:
         "rope_host_fallbacks",
         "cross_backend_sync_fallbacks",
     )
-    names = ("kernel_launches", "attention_kernel_launches", "d2h_bytes", *linear, *fallback)
+    names = (
+        "kernel_launches",
+        "attention_kernel_launches",
+        "d2h_bytes",
+        *linear,
+        *fallback,
+    )
     if not isinstance(counters, dict) or any(
         type(counters.get(key)) is not int or counters[key] < 0 for key in names
     ):
@@ -315,9 +344,13 @@ def validate_cuda_execution(evidence: dict | None) -> None:
         or counters["attention_kernel_launches"] == 0
         or not any(counters[key] > 0 for key in linear)
     ):
-        raise ValueError("CUDA execution evidence lacks GPU kernel/linear/attention work")
+        raise ValueError(
+            "CUDA execution evidence lacks GPU kernel/linear/attention work"
+        )
     if any(counters[key] != 0 for key in fallback):
-        raise ValueError("CUDA execution evidence reports a host or synchronization fallback")
+        raise ValueError(
+            "CUDA execution evidence reports a host or synchronization fallback"
+        )
 
 
 def verify_memory_recipe(model_dir: Path) -> None:

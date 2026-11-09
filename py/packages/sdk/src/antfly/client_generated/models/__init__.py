@@ -250,6 +250,7 @@ from .created_embeddings_index import CreatedEmbeddingsIndex
 from .created_embeddings_index_config import CreatedEmbeddingsIndexConfig
 from .created_embeddings_index_type import CreatedEmbeddingsIndexType
 from .created_enrichment_config import CreatedEnrichmentConfig
+from .created_enrichment_config_embedding_input import CreatedEnrichmentConfigEmbeddingInput
 from .created_full_text_index import CreatedFullTextIndex
 from .created_full_text_index_config import CreatedFullTextIndexConfig
 from .created_full_text_index_type import CreatedFullTextIndexType
@@ -287,12 +288,23 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .database_catalog_record import DatabaseCatalogRecord
 from .date_range_string_query import DateRangeStringQuery
+from .decider_cascade import DeciderCascade
+from .decider_cascade_budget import DeciderCascadeBudget
+from .decider_cascade_stage import DeciderCascadeStage
+from .decider_cascade_stage_on_failure import DeciderCascadeStageOnFailure
+from .decider_cascade_stage_when import DeciderCascadeStageWhen
 from .decider_config import DeciderConfig
 from .decider_config_decision_method import DeciderConfigDecisionMethod
 from .decider_config_embedding_options import DeciderConfigEmbeddingOptions
 from .decider_config_embedding_options_task_type import DeciderConfigEmbeddingOptionsTaskType
 from .decider_config_provider import DeciderConfigProvider
 from .decision_batch_item import DecisionBatchItem
+from .decision_cascade_agreement_status import DecisionCascadeAgreementStatus
+from .decision_cascade_stage_trace import DecisionCascadeStageTrace
+from .decision_cascade_stage_trace_decision_method import DecisionCascadeStageTraceDecisionMethod
+from .decision_cascade_stage_trace_provenance import DecisionCascadeStageTraceProvenance
+from .decision_cascade_trace import DecisionCascadeTrace
+from .decision_cascade_upstream_agreement import DecisionCascadeUpstreamAgreement
 from .decision_choice import DecisionChoice
 from .decision_choice_probability import DecisionChoiceProbability
 from .decision_evidence_image import DecisionEvidenceImage
@@ -309,6 +321,8 @@ from .decision_evidence_text_type import DecisionEvidenceTextType
 from .decision_input import DecisionInput
 from .decision_level import DecisionLevel
 from .decision_level_probability import DecisionLevelProbability
+from .decision_revision_dependency import DecisionRevisionDependency
+from .decision_revision_dependency_kind import DecisionRevisionDependencyKind
 from .decision_similarity import DecisionSimilarity
 from .decision_table_source import DecisionTableSource
 from .decision_table_source_filter_query import DecisionTableSourceFilterQuery
@@ -350,6 +364,7 @@ from .document_artifact_table_reprocess_response_reprocess_status import (
     DocumentArtifactTableReprocessResponseReprocessStatus,
 )
 from .document_extraction_config import DocumentExtractionConfig
+from .document_extraction_config_checksum_algorithm import DocumentExtractionConfigChecksumAlgorithm
 from .document_extraction_config_route_preset import DocumentExtractionConfigRoutePreset
 from .document_extraction_native_text_config import DocumentExtractionNativeTextConfig
 from .document_extraction_native_text_config_policy import DocumentExtractionNativeTextConfigPolicy
@@ -360,6 +375,7 @@ from .document_extraction_reader_config_provider import DocumentExtractionReader
 from .document_extraction_reader_config_recognition_level import DocumentExtractionReaderConfigRecognitionLevel
 from .document_extraction_render_config import DocumentExtractionRenderConfig
 from .document_extraction_render_config_resolution import DocumentExtractionRenderConfigResolution
+from .document_extraction_render_config_sampling import DocumentExtractionRenderConfigSampling
 from .document_extraction_route import DocumentExtractionRoute
 from .document_extraction_route_extractor import DocumentExtractionRouteExtractor
 from .document_extraction_route_extractor_type import DocumentExtractionRouteExtractorType
@@ -422,6 +438,7 @@ from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
+from .enrichment_config_embedding_input import EnrichmentConfigEmbeddingInput
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
@@ -756,6 +773,9 @@ from .graph_bindings_result_kind import GraphBindingsResultKind
 from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
+from .graph_catalog_entry import GraphCatalogEntry
+from .graph_definition import GraphDefinition
+from .graph_definition_update import GraphDefinitionUpdate
 from .graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
 from .graph_distinct_budget_exceeded_error_dimension import GraphDistinctBudgetExceededErrorDimension
 from .graph_distinct_budget_exceeded_error_error import GraphDistinctBudgetExceededErrorError
@@ -800,6 +820,8 @@ from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 from .graph_k_shortest_paths import GraphKShortestPaths
 from .graph_k_shortest_paths_query import GraphKShortestPathsQuery
 from .graph_key_node_selector import GraphKeyNodeSelector
+from .graph_label_mapping import GraphLabelMapping
+from .graph_label_mapping_where import GraphLabelMappingWhere
 from .graph_match import GraphMatch
 from .graph_match_edge import GraphMatchEdge
 from .graph_match_node import GraphMatchNode
@@ -860,15 +882,23 @@ from .graph_path_weight_domain_error_violation import GraphPathWeightDomainError
 from .graph_paths_result import GraphPathsResult
 from .graph_paths_result_kind import GraphPathsResultKind
 from .graph_queries import GraphQueries
+from .graph_query_limits import GraphQueryLimits
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
+from .graph_query_request import GraphQueryRequest
+from .graph_query_request_parameters import GraphQueryRequestParameters
+from .graph_query_result import GraphQueryResult
+from .graph_query_result_plan_item import GraphQueryResultPlanItem
+from .graph_query_result_wire_version import GraphQueryResultWireVersion
 from .graph_query_results import GraphQueryResults
+from .graph_query_stats import GraphQueryStats
 from .graph_query_type import GraphQueryType
 from .graph_query_unsupported_error import GraphQueryUnsupportedError
 from .graph_query_unsupported_error_error import GraphQueryUnsupportedErrorError
 from .graph_query_unsupported_error_reason import GraphQueryUnsupportedErrorReason
 from .graph_query_unsupported_error_status import GraphQueryUnsupportedErrorStatus
 from .graph_relationship_filter import GraphRelationshipFilter
+from .graph_relationship_mapping import GraphRelationshipMapping
 from .graph_relationship_property_predicate import GraphRelationshipPropertyPredicate
 from .graph_relationship_property_predicate_op import GraphRelationshipPropertyPredicateOp
 from .graph_relationship_property_predicate_value_type import GraphRelationshipPropertyPredicateValueType
@@ -905,10 +935,15 @@ from .graph_ttl_config import GraphTtlConfig
 from .graph_where_and import GraphWhereAnd
 from .graph_where_not_equal import GraphWhereNotEqual
 from .graph_where_not_exists import GraphWhereNotExists
+from .graph_wire_value import GraphWireValue
+from .graph_wire_value_type import GraphWireValueType
 from .graph_work_budget_exceeded_error import GraphWorkBudgetExceededError
 from .graph_work_budget_exceeded_error_dimension import GraphWorkBudgetExceededErrorDimension
 from .graph_work_budget_exceeded_error_error import GraphWorkBudgetExceededErrorError
 from .graph_work_budget_exceeded_error_status import GraphWorkBudgetExceededErrorStatus
+from .graph_write_receipt import GraphWriteReceipt
+from .graph_write_receipt_outcome_type_0 import GraphWriteReceiptOutcomeType0
+from .graph_write_receipt_status import GraphWriteReceiptStatus
 from .ground_truth import GroundTruth
 from .grouped_artifact_source import GroupedArtifactSource
 from .grouped_artifact_source_filter import GroupedArtifactSourceFilter
@@ -1316,6 +1351,7 @@ from .memorilla_generate_response_verification_status import MemorillaGenerateRe
 from .memorilla_generate_usage import MemorillaGenerateUsage
 from .memorilla_profile_config import MemorillaProfileConfig
 from .memorilla_runtime_config import MemorillaRuntimeConfig
+from .memory_access import MemoryAccess
 from .memory_assertion import MemoryAssertion
 from .memory_assertion_embedding_model_type_0 import MemoryAssertionEmbeddingModelType0
 from .memory_assertion_evidence_item import MemoryAssertionEvidenceItem
@@ -1331,17 +1367,25 @@ from .memory_assertion_support_sets_item_evidence_item_span_type_0 import (
     MemoryAssertionSupportSetsItemEvidenceItemSpanType0,
 )
 from .memory_assertion_visibility import MemoryAssertionVisibility
+from .memory_brief import MemoryBrief
+from .memory_brief_item import MemoryBriefItem
+from .memory_brief_item_kind import MemoryBriefItemKind
+from .memory_brief_item_stability import MemoryBriefItemStability
+from .memory_brief_request import MemoryBriefRequest
 from .memory_change_page import MemoryChangePage
 from .memory_change_request import MemoryChangeRequest
 from .memory_change_request_start import MemoryChangeRequestStart
 from .memory_claim_pin import MemoryClaimPin
 from .memory_claim_view import MemoryClaimView
 from .memory_configure_request import MemoryConfigureRequest
+from .memory_consolidation import MemoryConsolidation
+from .memory_consolidation_request import MemoryConsolidationRequest
 from .memory_correction import MemoryCorrection
 from .memory_correction_evidence_item import MemoryCorrectionEvidenceItem
 from .memory_correction_evidence_item_span_type_0 import MemoryCorrectionEvidenceItemSpanType0
 from .memory_correction_lifecycle import MemoryCorrectionLifecycle
 from .memory_correction_stability import MemoryCorrectionStability
+from .memory_count import MemoryCount
 from .memory_create_space_request import MemoryCreateSpaceRequest
 from .memory_embedding_batch import MemoryEmbeddingBatch
 from .memory_embedding_batch_items_item import MemoryEmbeddingBatchItemsItem
@@ -1502,6 +1546,7 @@ from .memory_evaluation_judge_output import MemoryEvaluationJudgeOutput
 from .memory_evaluation_judge_output_label import MemoryEvaluationJudgeOutputLabel
 from .memory_evaluation_judge_task import MemoryEvaluationJudgeTask
 from .memory_evaluation_policy_input import MemoryEvaluationPolicyInput
+from .memory_evaluation_policy_input_retrieval import MemoryEvaluationPolicyInputRetrieval
 from .memory_evaluation_prediction import MemoryEvaluationPrediction
 from .memory_evaluation_prediction_label import MemoryEvaluationPredictionLabel
 from .memory_evaluation_report import MemoryEvaluationReport
@@ -1546,6 +1591,9 @@ from .memory_explanation_nodes_item_links_item_target_type_0_kind import (
 )
 from .memory_explanation_nodes_item_resource import MemoryExplanationNodesItemResource
 from .memory_explanation_nodes_item_resource_kind import MemoryExplanationNodesItemResourceKind
+from .memory_finding import MemoryFinding
+from .memory_finding_kind import MemoryFindingKind
+from .memory_finding_suggested_action import MemoryFindingSuggestedAction
 from .memory_forget_request import MemoryForgetRequest
 from .memory_inspection import MemoryInspection
 from .memory_inspection_capabilities import MemoryInspectionCapabilities
@@ -1670,6 +1718,7 @@ from .memory_observation_request_origin_type_0_trace_type_0_kind import (
 from .memory_operation import MemoryOperation
 from .memory_operation_phase import MemoryOperationPhase
 from .memory_outcome import MemoryOutcome
+from .memory_pin import MemoryPin
 from .memory_recall_request import MemoryRecallRequest
 from .memory_recall_request_embedding_model_type_0 import MemoryRecallRequestEmbeddingModelType0
 from .memory_recall_request_graph_type_0 import MemoryRecallRequestGraphType0
@@ -1914,6 +1963,7 @@ from .memory_relationship_proposal_views_type_0_item_dependencies_item_resource 
 from .memory_relationship_proposal_views_type_0_item_dependencies_item_resource_kind import (
     MemoryRelationshipProposalViewsType0ItemDependenciesItemResourceKind,
 )
+from .memory_resolved_entity import MemoryResolvedEntity
 from .memory_result import MemoryResult
 from .memory_space_change import MemorySpaceChange
 from .memory_space_change_kind import MemorySpaceChangeKind
@@ -1933,6 +1983,10 @@ from .memory_space_config_predicates_item_cardinality import MemorySpaceConfigPr
 from .memory_space_config_processing import MemorySpaceConfigProcessing
 from .memory_space_config_semantic_discovery import MemorySpaceConfigSemanticDiscovery
 from .memory_space_config_source_rules_item import MemorySpaceConfigSourceRulesItem
+from .memory_space_stats import MemorySpaceStats
+from .memory_statistics import MemoryStatistics
+from .memory_stored_evidence import MemoryStoredEvidence
+from .memory_subject_count import MemorySubjectCount
 from .memory_supersession_candidate import MemorySupersessionCandidate
 from .memory_supersession_candidate_page import MemorySupersessionCandidatePage
 from .memory_supersession_candidate_page_retrieval import MemorySupersessionCandidatePageRetrieval
@@ -1952,6 +2006,8 @@ from .memory_supersession_verdict_evidence_item import MemorySupersessionVerdict
 from .memory_supersession_verdict_evidence_item_span_type_0 import MemorySupersessionVerdictEvidenceItemSpanType0
 from .memory_supersession_verdict_model_type_0 import MemorySupersessionVerdictModelType0
 from .memory_supersession_verdict_verdict import MemorySupersessionVerdictVerdict
+from .memory_usage import MemoryUsage
+from .memory_utility import MemoryUtility
 from .merge_config import MergeConfig
 from .merge_config_weights import MergeConfigWeights
 from .merge_profile import MergeProfile
@@ -2886,6 +2942,7 @@ __all__ = (
     "CreatedEmbeddingsIndexConfig",
     "CreatedEmbeddingsIndexType",
     "CreatedEnrichmentConfig",
+    "CreatedEnrichmentConfigEmbeddingInput",
     "CreatedFullTextIndex",
     "CreatedFullTextIndexConfig",
     "CreatedFullTextIndexType",
@@ -2942,12 +2999,23 @@ __all__ = (
     "DataShapeDecl",
     "DataShapeKind",
     "DateRangeStringQuery",
+    "DeciderCascade",
+    "DeciderCascadeBudget",
+    "DeciderCascadeStage",
+    "DeciderCascadeStageOnFailure",
+    "DeciderCascadeStageWhen",
     "DeciderConfig",
     "DeciderConfigDecisionMethod",
     "DeciderConfigEmbeddingOptions",
     "DeciderConfigEmbeddingOptionsTaskType",
     "DeciderConfigProvider",
     "DecisionBatchItem",
+    "DecisionCascadeAgreementStatus",
+    "DecisionCascadeStageTrace",
+    "DecisionCascadeStageTraceDecisionMethod",
+    "DecisionCascadeStageTraceProvenance",
+    "DecisionCascadeTrace",
+    "DecisionCascadeUpstreamAgreement",
     "DecisionChoice",
     "DecisionChoiceProbability",
     "DecisionEvidenceImage",
@@ -2964,6 +3032,8 @@ __all__ = (
     "DecisionInput",
     "DecisionLevel",
     "DecisionLevelProbability",
+    "DecisionRevisionDependency",
+    "DecisionRevisionDependencyKind",
     "DecisionSimilarity",
     "DecisionTableSource",
     "DecisionTableSourceFilterQuery",
@@ -3003,6 +3073,7 @@ __all__ = (
     "DocumentArtifactTableReprocessResponseReprocess",
     "DocumentArtifactTableReprocessResponseReprocessStatus",
     "DocumentExtractionConfig",
+    "DocumentExtractionConfigChecksumAlgorithm",
     "DocumentExtractionConfigRoutePreset",
     "DocumentExtractionNativeTextConfig",
     "DocumentExtractionNativeTextConfigPolicy",
@@ -3013,6 +3084,7 @@ __all__ = (
     "DocumentExtractionReaderConfigRecognitionLevel",
     "DocumentExtractionRenderConfig",
     "DocumentExtractionRenderConfigResolution",
+    "DocumentExtractionRenderConfigSampling",
     "DocumentExtractionRoute",
     "DocumentExtractionRouteExtractor",
     "DocumentExtractionRouteExtractorType",
@@ -3075,6 +3147,7 @@ __all__ = (
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
+    "EnrichmentConfigEmbeddingInput",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",
@@ -3403,6 +3476,9 @@ __all__ = (
     "GraphBindingsReturn",
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
+    "GraphCatalogEntry",
+    "GraphDefinition",
+    "GraphDefinitionUpdate",
     "GraphDistinctBudgetExceededError",
     "GraphDistinctBudgetExceededErrorDimension",
     "GraphDistinctBudgetExceededErrorError",
@@ -3447,6 +3523,8 @@ __all__ = (
     "GraphKeyNodeSelector",
     "GraphKShortestPaths",
     "GraphKShortestPathsQuery",
+    "GraphLabelMapping",
+    "GraphLabelMappingWhere",
     "GraphMatch",
     "GraphMatchEdge",
     "GraphMatchNode",
@@ -3507,15 +3585,23 @@ __all__ = (
     "GraphPathWeightDomainErrorStatus",
     "GraphPathWeightDomainErrorViolation",
     "GraphQueries",
+    "GraphQueryLimits",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",
+    "GraphQueryRequest",
+    "GraphQueryRequestParameters",
+    "GraphQueryResult",
+    "GraphQueryResultPlanItem",
     "GraphQueryResults",
+    "GraphQueryResultWireVersion",
+    "GraphQueryStats",
     "GraphQueryType",
     "GraphQueryUnsupportedError",
     "GraphQueryUnsupportedErrorError",
     "GraphQueryUnsupportedErrorReason",
     "GraphQueryUnsupportedErrorStatus",
     "GraphRelationshipFilter",
+    "GraphRelationshipMapping",
     "GraphRelationshipPropertyPredicate",
     "GraphRelationshipPropertyPredicateOp",
     "GraphRelationshipPropertyPredicateValueType",
@@ -3552,10 +3638,15 @@ __all__ = (
     "GraphWhereAnd",
     "GraphWhereNotEqual",
     "GraphWhereNotExists",
+    "GraphWireValue",
+    "GraphWireValueType",
     "GraphWorkBudgetExceededError",
     "GraphWorkBudgetExceededErrorDimension",
     "GraphWorkBudgetExceededErrorError",
     "GraphWorkBudgetExceededErrorStatus",
+    "GraphWriteReceipt",
+    "GraphWriteReceiptOutcomeType0",
+    "GraphWriteReceiptStatus",
     "GroundTruth",
     "GroupedArtifactSource",
     "GroupedArtifactSourceFilter",
@@ -3961,6 +4052,7 @@ __all__ = (
     "MemorillaGenerateUsage",
     "MemorillaProfileConfig",
     "MemorillaRuntimeConfig",
+    "MemoryAccess",
     "MemoryAssertion",
     "MemoryAssertionEmbeddingModelType0",
     "MemoryAssertionEvidenceItem",
@@ -3974,17 +4066,25 @@ __all__ = (
     "MemoryAssertionSupportSetsItemEvidenceItem",
     "MemoryAssertionSupportSetsItemEvidenceItemSpanType0",
     "MemoryAssertionVisibility",
+    "MemoryBrief",
+    "MemoryBriefItem",
+    "MemoryBriefItemKind",
+    "MemoryBriefItemStability",
+    "MemoryBriefRequest",
     "MemoryChangePage",
     "MemoryChangeRequest",
     "MemoryChangeRequestStart",
     "MemoryClaimPin",
     "MemoryClaimView",
     "MemoryConfigureRequest",
+    "MemoryConsolidation",
+    "MemoryConsolidationRequest",
     "MemoryCorrection",
     "MemoryCorrectionEvidenceItem",
     "MemoryCorrectionEvidenceItemSpanType0",
     "MemoryCorrectionLifecycle",
     "MemoryCorrectionStability",
+    "MemoryCount",
     "MemoryCreateSpaceRequest",
     "MemoryEmbeddingBatch",
     "MemoryEmbeddingBatchItemsItem",
@@ -4103,6 +4203,7 @@ __all__ = (
     "MemoryEvaluationJudgeOutputLabel",
     "MemoryEvaluationJudgeTask",
     "MemoryEvaluationPolicyInput",
+    "MemoryEvaluationPolicyInputRetrieval",
     "MemoryEvaluationPrediction",
     "MemoryEvaluationPredictionLabel",
     "MemoryEvaluationReport",
@@ -4145,6 +4246,9 @@ __all__ = (
     "MemoryExplanationNodesItemLinksItemTargetType0Kind",
     "MemoryExplanationNodesItemResource",
     "MemoryExplanationNodesItemResourceKind",
+    "MemoryFinding",
+    "MemoryFindingKind",
+    "MemoryFindingSuggestedAction",
     "MemoryForgetRequest",
     "MemoryInspection",
     "MemoryInspectionCapabilities",
@@ -4221,6 +4325,7 @@ __all__ = (
     "MemoryOperation",
     "MemoryOperationPhase",
     "MemoryOutcome",
+    "MemoryPin",
     "MemoryRecallRequest",
     "MemoryRecallRequestEmbeddingModelType0",
     "MemoryRecallRequestGraphType0",
@@ -4349,6 +4454,7 @@ __all__ = (
     "MemoryRelationshipProposalViewsType0ItemDependenciesItemEvidenceItemSpanType0",
     "MemoryRelationshipProposalViewsType0ItemDependenciesItemResource",
     "MemoryRelationshipProposalViewsType0ItemDependenciesItemResourceKind",
+    "MemoryResolvedEntity",
     "MemoryResult",
     "MemorySpaceChange",
     "MemorySpaceChangeKind",
@@ -4368,6 +4474,10 @@ __all__ = (
     "MemorySpaceConfigProcessing",
     "MemorySpaceConfigSemanticDiscovery",
     "MemorySpaceConfigSourceRulesItem",
+    "MemorySpaceStats",
+    "MemoryStatistics",
+    "MemoryStoredEvidence",
+    "MemorySubjectCount",
     "MemorySupersessionCandidate",
     "MemorySupersessionCandidatePage",
     "MemorySupersessionCandidatePageRetrieval",
@@ -4387,6 +4497,8 @@ __all__ = (
     "MemorySupersessionVerdictEvidenceItemSpanType0",
     "MemorySupersessionVerdictModelType0",
     "MemorySupersessionVerdictVerdict",
+    "MemoryUsage",
+    "MemoryUtility",
     "MergeConfig",
     "MergeConfigWeights",
     "MergeProfile",

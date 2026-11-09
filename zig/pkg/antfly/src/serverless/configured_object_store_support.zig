@@ -60,15 +60,37 @@ pub fn openNativeArtifactObjectStoreAlloc(
     };
 }
 
+/// Native admission is installed only by an authenticated server adapter. Raw
+/// object-store callers cannot acknowledge writes to an owned source.
+pub const NativeSourceOwner = struct {
+    token: [16]u8,
+    ptr: *anyopaque,
+    table_id: u64,
+    object_generation: u64,
+    acknowledge: *const fn (*anyopaque, u64, u64, [16]u8, ?u64, lake_catalog.types.Context) anyerror!void,
+    pub fn committed(self: @This(), lsn: ?u64, context: lake_catalog.types.Context) !void {
+        // Remote durability has already succeeded. A native acknowledgement
+        // failure cannot be reported as a definite rejection or acceptance.
+        self.acknowledge(self.ptr, self.table_id, self.object_generation, self.token, lsn, context) catch return error.LakeCommitOutcomeUnknown;
+    }
+};
 pub const BindingObjectStoreOpenOptions = struct {
+    pub fn resolveOwner(self: @This(), a: Allocator, context: lake_catalog.types.Context) !@This() {
+        var result = self;
+        if (result.native_owner == null and result.catalog_table_id != 0) if (self.native_owner_resolver) |resolver| {
+            result.native_owner = try resolver.resolve(resolver.ptr, a, result.catalog_table_id, result.catalog_generation, context);
+        };
+        return result;
+    }
     /// Borrowed options must outlive synchronous lake source opening.
     pub fn lakeOptions(self: *const @This()) @import("antfly_local_sources").serverless_lake_host.OpenOptions {
-        return .{ .file_bucket = self.file_bucket, .resolver = .{ .ptr = self, .open_fn = openLake }, .catalog_resolver = .{ .ptr = self, .load_fn = loadLakeCatalog }, .snapshot_pin_resolver = .{ .ptr = self, .acquire = acquireSnapshotPin } };
+        return .{ .file_bucket = self.file_bucket, .resolver = .{ .ptr = self, .open_fn = openLake }, .catalog_resolver = .{ .ptr = self, .load_fn = loadLakeCatalog }, .snapshot_pin_resolver = .{ .ptr = self, .acquire = acquireSnapshotPin }, .retained_manifest = self.retained_manifest };
     }
     fn acquireSnapshotPin(raw: *const anyopaque, a: Allocator, source: catalog_binding.Binding, snapshot: []const u8, uuid: []const u8, context: lake_catalog.types.Context) anyerror!?@import("antfly_local_sources").serverless_lake_host.SnapshotPin {
         _ = a;
         const pin_alloc = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator);
         const self: *const @This() = @ptrCast(@alignCast(raw));
+        if (self.native_reader_protected) return null;
         if (source.catalog == null or self.node_config == null or self.node_config.?.storage.artifacts.connection == null or snapshot.len == 0) return null;
         const pins = @import("lake_snapshot_pins.zig");
         var opened = try openNativeArtifactObjectStoreAlloc(pin_alloc, self.node_config.?, self.secret_store, false);
@@ -88,6 +110,11 @@ pub const BindingObjectStoreOpenOptions = struct {
     }
     fn loadLakeCatalog(raw: *const anyopaque, alloc: Allocator, source: catalog_binding.Binding, context: lake_catalog.types.Context) anyerror!lake_catalog.types.Table {
         const self: *const @This() = @ptrCast(@alignCast(raw));
+        if (self.authoritative_metadata) {
+            const retained = self.retained_catalog_metadata orelse return error.InvalidQueryRequest;
+            try context.ensureActive();
+            return std.json.parseFromSliceLeaky(lake_catalog.types.Table, alloc, try std.json.Stringify.valueAlloc(alloc, retained, .{}), .{ .allocate = .alloc_always });
+        }
         var result = try executeLakeCatalogAlloc(alloc, source, self.*, context, .load);
         if (self.retained_catalog_metadata) |retained| {
             defer result.deinit(alloc);
@@ -105,6 +132,13 @@ pub const BindingObjectStoreOpenOptions = struct {
         }
         return result.table;
     }
+    native_owner: ?NativeSourceOwner = null,
+    native_owner_resolver: ?struct { ptr: *anyopaque, resolve: *const fn (*anyopaque, Allocator, u64, u64, lake_catalog.types.Context) anyerror!?NativeSourceOwner } = null,
+    /// Only an authenticated, retained native serving cut may bypass mutable
+    /// source discovery. Its generation reader protects source files in vacuum.
+    authoritative_metadata: bool = false,
+    native_reader_protected: bool = false,
+    retained_manifest: ?[]const u8 = null,
     /// Server-authenticated metadata; load still verifies external incarnation.
     retained_catalog_metadata: ?lake_catalog.types.Table = null,
     file_bucket: []const u8 = "antfly",
@@ -133,9 +167,10 @@ pub const CatalogResult = union(enum) {
     }
 };
 
-pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, options: BindingObjectStoreOpenOptions, context: lake_catalog.types.Context, operation: CatalogOperation) !CatalogResult {
+pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, unresolved_options: BindingObjectStoreOpenOptions, context: lake_catalog.types.Context, operation: CatalogOperation) !CatalogResult {
     try context.ensureActive();
     try binding.validateSupported();
+    const options = try unresolved_options.resolveOwner(a, context);
     const config = binding.catalog orelse return error.InvalidLakeCatalog;
     const mutation = operation == .create or operation == .commit or operation == .retire or operation == .references;
     if (mutation and binding.write_policy != .iceberg_writer) return error.ExternalLakeReadOnly;
@@ -145,8 +180,14 @@ pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, o
     defer opened.deinit();
     var catalog: lake_catalog.Catalog = undefined;
     if (config.type == .managed) {
-        catalog = .{ .managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri, .context = context } };
-        return executeCatalog(a, &catalog, operation);
+        catalog = .{ .managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null } };
+        const result = try executeCatalog(a, &catalog, operation);
+        errdefer {
+            var failed = result;
+            failed.deinit(a);
+        }
+        if ((mutation and operation != .references) or (operation == .resolve and result == .outcome and result.outcome == .committed)) if (options.native_owner) |owner| try owner.committed(null, context);
+        return result;
     }
     const node = options.node_config orelse return error.LakeCatalogConnectionRequired;
     const connection = node.connections.get(config.connection.?) orelse return error.LakeCatalogConnectionRequired;

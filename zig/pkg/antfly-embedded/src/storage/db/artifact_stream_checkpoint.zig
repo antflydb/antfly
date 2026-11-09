@@ -57,6 +57,7 @@ pub const State = struct {
     scan_cursor: []const u8 = "",
     logical_scan_cursor: []const u8 = "",
     enumerated: bool = false,
+    execution_revision: ?publication.Digest = null,
     members: u64 = 0,
     chain: publication.Digest = @splat(0),
 
@@ -67,10 +68,10 @@ pub const State = struct {
     pub fn encodeAlloc(self: State, alloc: std.mem.Allocator) ![]u8 {
         if (self.root_incarnation == 0 or self.cursor.len > max_cursor_bytes or self.scan_cursor.len > max_cursor_bytes or self.logical_scan_cursor.len > logical_position.max_encoded_bytes or
             (self.enumerated and (self.scan_cursor.len != 0 or self.logical_scan_cursor.len != 0)) or (self.members == 0) != (self.cursor.len == 0)) return error.InvalidBatchRequest;
-        const raw = try alloc.alloc(u8, 242 + self.cursor.len + self.scan_cursor.len + self.logical_scan_cursor.len);
+        const raw = try alloc.alloc(u8, 275 + self.cursor.len + self.scan_cursor.len + self.logical_scan_cursor.len);
         errdefer alloc.free(raw);
         @memset(raw, 0);
-        @memcpy(raw[0..4], "ASC4");
+        @memcpy(raw[0..4], "ASC5");
         @memcpy(raw[4..28], &self.observation.authority.namespace);
         std.mem.writeInt(u64, raw[28..36], self.observation.authority.epoch, .little);
         @memcpy(raw[36..68], &self.observation.authority.catalog_digest);
@@ -84,9 +85,11 @@ pub const State = struct {
         std.mem.writeInt(u128, raw[186..202], self.root_incarnation, .little);
         std.mem.writeInt(u32, raw[202..206], @intCast(self.scan_cursor.len), .little);
         std.mem.writeInt(u32, raw[206..210], @intCast(self.logical_scan_cursor.len), .little);
-        @memcpy(raw[210 .. 210 + self.cursor.len], self.cursor);
-        @memcpy(raw[210 + self.cursor.len .. 210 + self.cursor.len + self.scan_cursor.len], self.scan_cursor);
-        @memcpy(raw[210 + self.cursor.len + self.scan_cursor.len .. raw.len - 32], self.logical_scan_cursor);
+        raw[210] = @intFromBool(self.execution_revision != null);
+        if (self.execution_revision) |revision| @memcpy(raw[211..243], &revision);
+        @memcpy(raw[243 .. 243 + self.cursor.len], self.cursor);
+        @memcpy(raw[243 + self.cursor.len .. 243 + self.cursor.len + self.scan_cursor.len], self.scan_cursor);
+        @memcpy(raw[243 + self.cursor.len + self.scan_cursor.len .. raw.len - 32], self.logical_scan_cursor);
         std.crypto.hash.Blake3.hash(raw[0 .. raw.len - 32], raw[raw.len - 32 ..][0..32], .{});
         _ = try decode(raw);
         return raw;
@@ -116,11 +119,16 @@ pub fn appendMember(state: anytype, scope: []const u8, accepted_digest: publicat
 pub const Loaded = struct { state: State, digest: publication.Digest };
 
 pub fn decode(raw: []const u8) !Loaded {
-    if (raw.len < 242 or raw.len > 242 + 2 * max_cursor_bytes + logical_position.max_encoded_bytes or !std.mem.eql(u8, raw[0..4], "ASC4") or raw[141] > 3) return error.ArtifactCatalogCorrupt;
+    if (raw.len < 242 or raw.len > 275 + 2 * max_cursor_bytes + logical_position.max_encoded_bytes or raw[141] > 3) return error.ArtifactCatalogCorrupt;
+    const legacy = std.mem.eql(u8, raw[0..4], "ASC4");
+    if (!legacy and (!std.mem.eql(u8, raw[0..4], "ASC5") or raw.len < 275 or raw[210] > 1)) return error.ArtifactCatalogCorrupt;
+    const start: usize = if (legacy) 210 else 243;
+    const execution_revision: ?publication.Digest = if (!legacy and raw[210] == 1) raw[211..243].* else null;
+    if (!legacy and raw[210] == 0 and !std.mem.allEqual(u8, raw[211..243], 0)) return error.ArtifactCatalogCorrupt;
     const len = std.mem.readInt(u32, raw[182..186], .little);
     const scan_len = std.mem.readInt(u32, raw[202..206], .little);
     const logical_len = std.mem.readInt(u32, raw[206..210], .little);
-    if (len > max_cursor_bytes or scan_len > max_cursor_bytes or logical_len > logical_position.max_encoded_bytes or raw.len != 242 + @as(usize, len) + @as(usize, scan_len) + @as(usize, logical_len)) return error.ArtifactCatalogCorrupt;
+    if (len > max_cursor_bytes or scan_len > max_cursor_bytes or logical_len > logical_position.max_encoded_bytes or raw.len != start + 32 + @as(usize, len) + @as(usize, scan_len) + @as(usize, logical_len)) return error.ArtifactCatalogCorrupt;
     var digest: publication.Digest = undefined;
     std.crypto.hash.Blake3.hash(raw[0 .. raw.len - 32], &digest, .{});
     if (!std.mem.eql(u8, &digest, raw[raw.len - 32 ..])) return error.ArtifactCatalogCorrupt;
@@ -131,9 +139,10 @@ pub fn decode(raw: []const u8) !Loaded {
     const state: State = .{
         .root_incarnation = std.mem.readInt(u128, raw[186..202], .little),
         .observation = .{ .authority = authority, .document_digest = raw[68..100].*, .revision = revision, .validation_epoch = std.mem.readInt(u64, raw[133..141], .little), .foreign_inputs = raw[141] & 1 != 0 },
-        .cursor = raw[210 .. 210 + len],
-        .scan_cursor = raw[210 + len .. 210 + len + scan_len],
-        .logical_scan_cursor = raw[210 + len + scan_len .. raw.len - 32],
+        .execution_revision = execution_revision,
+        .cursor = raw[start .. start + len],
+        .scan_cursor = raw[start + len .. start + len + scan_len],
+        .logical_scan_cursor = raw[start + len + scan_len .. raw.len - 32],
         .enumerated = raw[141] & 2 != 0,
         .members = std.mem.readInt(u64, raw[142..150], .little),
         .chain = raw[150..182].*,
@@ -166,8 +175,8 @@ pub fn collectObsoletePage(alloc: std.mem.Allocator, store_handle: anytype, root
 }
 
 /// Must run with the runtime ownership fence in the same writer transaction.
-/// Old checkpoints may only be replaced after their input observation became
-/// stale. A concurrent scanner cannot overwrite a newer page or a ready scan.
+/// A changed input observation or execution revision starts a fresh scan.
+/// The expected digest still fences concurrent scanners and completed pages.
 pub const Staged = struct { changed: bool, digest: publication.Digest };
 /// Owned encoding prepared before acquiring the serialized writer. The state
 /// borrows only this buffer, never a cursor or a released read transaction.
@@ -212,7 +221,7 @@ pub fn stagePrepared(txn: anytype, selected: *const Key, expected: ?publication.
             };
             break :blk true;
         };
-        if (current) {
+        if (current and std.meta.eql(old.state.execution_revision, next.execution_revision)) {
             const physical_order = std.mem.order(u8, next.scan_cursor, old.state.scan_cursor);
             const logical_same = std.mem.eql(u8, next.logical_scan_cursor, old.state.logical_scan_cursor);
             const logical_advances = !logical_same and next.logical_scan_cursor.len != 0 and
@@ -280,4 +289,21 @@ test "ordered artifact inventory stream checkpoints encode bounded binary cursor
     try std.testing.expect(!std.mem.eql(u8, &first, &key(observation.authority, "doc\x00", identity)));
     state.root_incarnation = 0;
     try std.testing.expectError(error.InvalidBatchRequest, state.encodeAlloc(std.testing.allocator));
+}
+
+test "ordered artifact inventory checkpoints bind model revision and read legacy records" {
+    const a = std.testing.allocator;
+    const state: State = .{ .root_incarnation = 17, .observation = .{ .authority = .{ .namespace = @splat(1), .epoch = 3, .catalog_digest = @splat(2) }, .document_digest = @splat(4), .revision = .{ .raft = .{ .term = 2, .index = 7 } }, .validation_epoch = 12 }, .execution_revision = @splat(9) };
+    const raw = try state.encodeAlloc(a);
+    defer a.free(raw);
+    try std.testing.expectEqualDeep(state, (try decode(raw)).state);
+    const legacy = try a.alloc(u8, raw.len - 33);
+    defer a.free(legacy);
+    @memcpy(legacy[0..210], raw[0..210]);
+    @memcpy(legacy[0..4], "ASC4");
+    @memcpy(legacy[210..], raw[243..]);
+    std.crypto.hash.Blake3.hash(legacy[0 .. legacy.len - 32], legacy[legacy.len - 32 ..][0..32], .{});
+    const decoded = try decode(legacy);
+    try std.testing.expectEqual(@as(?publication.Digest, null), decoded.state.execution_revision);
+    try std.testing.expectEqualDeep(state.observation, decoded.state.observation);
 }

@@ -3,6 +3,16 @@ packages:
   - apps/*
   - examples/*
 
+# The Zod adapter imports zod/v4/core but does not declare it as a peer.
+# Bind it to each consumer's Zod instead of an unrelated hoisted minor version.
+packageExtensions:
+  '@hookform/resolvers@5.4.0':
+    peerDependencies:
+      zod: '^3.25.0 || ^4.0.0'
+    peerDependenciesMeta:
+      zod:
+        optional: true
+
 allowBuilds:
   '@parcel/watcher': true
   core-js: true

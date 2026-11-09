@@ -458,7 +458,8 @@ fn adjudicationProducer(handle: *h.Handle) !@import("../storage/db/enrichment/as
 fn adjudicate(ptr: *anyopaque, a: std.mem.Allocator, request: @import("antfly_resolver").adjudication.Request) anyerror![]u8 {
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     const io = handle.database().backend_runtime.io() orelse return error.MissingAdjudicator;
-    const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, request.timeout_ms) * std.time.ns_per_ms;
+    const now = @import("antfly_platform").time.monotonicNs();
+    const deadline = try request.deadline(now);
     const producer = try adjudicationProducer(handle);
     return producer.withInvocationContext(.{ .io = io, .deadline_ns = deadline }).produce(a, .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint });
 }
@@ -527,10 +528,13 @@ fn supportsCuration(_: *anyopaque) anyerror!bool {
     return true;
 }
 
-fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const callbacks.EntityUpsert) anyerror!void {
+pub fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const callbacks.EntityUpsert) anyerror!void {
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.ReadOnly;
     if (entries.len == 0) return;
+    // Detached computation never owns the live SQL coordinator journal.
+    // Publish the canonical merge and decision under the owner/path fence.
+    if (handle.maintenance_publication) |publication| return publication.publishPromotions(allocator, entries);
     const admission = if (handle.owned_lite_backend) |backend|
         if (backend.native_docstore) |store| store.writer_admission else null
     else
@@ -630,9 +634,7 @@ fn replaySequence(handle: *h.Handle) u128 {
 
 fn boundTable(ptr: *anyopaque, name: []const u8) anyerror!?[]const u8 {
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
-    _ = try tables.get(handle, name);
-    if (std.mem.eql(u8, name, "default")) return "embedded/tables/1";
-    return handle.embedded_tables.get(name).?.namespace;
+    return try tables.storageName(handle, name);
 }
 
 fn candidateGet(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, key: []const u8) anyerror!?[]u8 {

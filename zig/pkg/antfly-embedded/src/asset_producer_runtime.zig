@@ -447,12 +447,63 @@ test "asset producer runtime resolves a plan for a tiny local extractor request"
 /// recording is decoded and windowed; more only adds memory pressure.
 pub const default_local_transcriber_width: usize = 2;
 
+// Invocation-local only: shared Runtime handles never mutate identity state.
+// Mixed revisions (including a retry after a route change) are not reusable.
+const ModelExecutionIdentity = struct {
+    revision: ?[32]u8 = null,
+    invalid: bool = false,
+    expected: ?[32]u8 = null,
+    fn record(self: *@This(), revision: ?[32]u8) !void {
+        if (self.expected) |expected| {
+            const actual = revision orelse return error.ModelExecutionIdentityUnavailable;
+            if (!std.mem.eql(u8, &expected, &actual)) return error.ModelExecutionRevisionChanged;
+        }
+        const value = revision orelse {
+            self.invalid = true;
+            return;
+        };
+        if (self.revision) |prior| {
+            if (!std.mem.eql(u8, &prior, &value)) self.invalid = true;
+        } else self.revision = value;
+    }
+    fn result(self: @This()) ?[32]u8 {
+        return if (self.invalid) null else self.revision;
+    }
+};
+
+fn immutableAntflyModel(model: ?[]const u8) bool {
+    const raw = model orelse return false;
+    const name = if (std.mem.startsWith(u8, raw, "hf:")) raw[3..] else raw;
+    const separator = std.mem.lastIndexOfScalar(u8, name, '@') orelse return false;
+    const revision = name[separator + 1 ..];
+    if (revision.len != 40 and revision.len != 64) return false;
+    for (revision) |c| if (!std.ascii.isHex(c)) return false;
+    // Only registry references enforce the revision at model selection. A
+    // mutable directory or friendly alias named "model@<sha>" is not a pin.
+    const reference = name[0..separator];
+    const slash = std.mem.indexOfScalar(u8, reference, '/') orelse return false;
+    const owner = reference[0..slash];
+    const rest = reference[slash + 1 ..];
+    const model_end = std.mem.indexOfScalar(u8, rest, ':') orelse rest.len;
+    for ([_][]const u8{ owner, rest[0..model_end] }) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return false;
+        for (component) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.') return false;
+    }
+    if (model_end < rest.len) {
+        const variant = rest[model_end + 1 ..];
+        if (variant.len == 0) return false;
+        for (variant) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.' and c != ':') return false;
+    }
+    return true;
+}
+
 pub const Runtime = struct {
     alloc: Allocator,
     http: *httpx.Client,
     capability_cache: remote_capabilities.Cache,
     execution: execution_context.Context = .{},
     request_progress: ?execution_context.ProgressSink = null,
+    model_execution_identity: ?*ModelExecutionIdentity = null,
     owned_provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,
@@ -955,6 +1006,28 @@ pub const Runtime = struct {
                     const inputs = try a.alloc(@import("functions/decisions.zig").Request, requests.len);
                     for (requests, inputs) |request, *input| input.* = .{ .decider = "materialized", .questions = parsed.value.questions, .input = .{ .text = request.source_text } };
                     caller_workspace_bytes = try @import("functions/embedding_decisions.zig").workingBytes(a, cfg, embedder, inputs);
+                } else if (cfg.decision_method == .cascade) {
+                    var arena = std.heap.ArenaAllocator.init(alloc);
+                    defer arena.deinit();
+                    const scratch = arena.allocator();
+                    const d = @import("functions/decisions.zig");
+                    const definition = try d.cascade_contract.compile(scratch, cfg.cascade.?);
+                    remote = false;
+                    for (definition.stages) |stage| {
+                        var stage_cfg = try d.DeciderConfig.parseStage(scratch, stage.decider);
+                        var stage_remote = true;
+                        if (stage_cfg.decision_method == .generated) {
+                            try self.routeGeneratorConfig(scratch, &stage_cfg.generator.?);
+                            // Ownership follows the route, not a model lookup.
+                            // Discovery here would bypass cascade deadlines and
+                            // make an unused optional stage a hard dependency.
+                            stage_remote = stage_cfg.generator.?.provider != .antfly or stage_cfg.generator.?.url.len > 0 or !self.linkedGeneratorAvailable();
+                        } else if (stage_cfg.provider == .antfly and stage_cfg.url.len == 0 and self.antfly_provider != null) {
+                            stage_remote = self.antfly_provider.?.decide_json == null;
+                        }
+                        if (!stage_remote) allocator_owner = try localInvocationAllocatorOwner(self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable);
+                        remote = remote or stage_remote;
+                    }
                 } else if (cfg.decision_method == .generated) {
                     try self.routeGeneratorConfig(alloc, &parsed.value.decider.generator.?);
                     var engine = self.constrainedRuntime();
@@ -1362,7 +1435,14 @@ pub const Runtime = struct {
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
         try scoped.execution.check(platform.time.monotonicNs());
+        var identity: ModelExecutionIdentity = .{ .expected = context.expected_model_revision };
+        scoped.model_execution_identity = &identity;
         var batch = try produceBatchReported(&scoped, alloc, requests);
+        // General batches may contain compatibility work whose adapter cannot
+        // report identity. Only the singleton reader/generator invocation used
+        // for speculative OCR has one authoritative execution binding.
+        batch.executed_model_revision = if (requests.len == 1 and
+            (requests[0].producer_type == .reader or requests[0].producer_type == .generator)) identity.result() else null;
         errdefer batch.deinit(alloc);
         try scoped.execution.check(platform.time.monotonicNs());
         return batch;
@@ -1378,7 +1458,14 @@ pub const Runtime = struct {
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
         try scoped.execution.check(platform.time.monotonicNs());
+        var identity: ModelExecutionIdentity = .{ .expected = context.expected_model_revision };
+        scoped.model_execution_identity = &identity;
         var batch = try produceBorrowedRasterBatchReported(&scoped, alloc, requests, rasters);
+        // General batches may contain compatibility work whose adapter cannot
+        // report identity. Only the singleton reader/generator invocation used
+        // for speculative OCR has one authoritative execution binding.
+        batch.executed_model_revision = if (requests.len == 1 and
+            (requests[0].producer_type == .reader or requests[0].producer_type == .generator)) identity.result() else null;
         errdefer batch.deinit(alloc);
         try scoped.execution.check(platform.time.monotonicNs());
         return batch;
@@ -1444,7 +1531,14 @@ pub const Runtime = struct {
                 break :blk try self.readerCapabilities(alloc, cfg.value);
             },
             .decision => blk: {
-                var parsed = try @import("functions/materialization.zig").parse(alloc, requests[0].config_json);
+                const raw = requests[0].config_json;
+                if (std.mem.indexOf(u8, raw, "decision_revision_probe") != null or std.mem.indexOfScalar(u8, raw, '\\') != null) {
+                    const envelope = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+                    defer envelope.deinit();
+                    if (envelope.value == .object) if (envelope.value.object.get("decision_revision_probe")) |probe|
+                        break :blk try self.proxyDecisionRevisionCapabilities(alloc, probe);
+                }
+                var parsed = try @import("functions/materialization.zig").parse(alloc, raw);
                 defer parsed.deinit();
                 if (parsed.value.decider.decision_method != .generated) break :blk null;
                 try self.routeGeneratorConfig(alloc, &parsed.value.decider.generator.?);
@@ -1502,6 +1596,10 @@ pub const Runtime = struct {
                     var spec = try @import("functions/materialization.zig").parse(alloc, first.config_json);
                     defer spec.deinit();
                     if (spec.value.decider.embedder != null) break :blk .native;
+                    // A cascade can batch generated stages even when its typed
+                    // stages use serial provider calls. It has no single model
+                    // capability record, so advertise the composite explicitly.
+                    if (spec.value.decider.decision_method == .cascade) break :blk .serial_compatibility;
                 }
                 const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse break :blk .none;
                 break :blk capabilities.batch.mode;
@@ -1926,7 +2024,8 @@ pub const Runtime = struct {
         const materialization = @import("functions/materialization.zig");
         var parsed = try materialization.parse(alloc, requests[0].config_json);
         defer parsed.deinit();
-        if (parsed.value.decider.decision_method != .generated and parsed.value.decider.embedder == null) return error.BatchIncompatible;
+        // Cascades batch so that escalating items share each stage's call.
+        if (parsed.value.decider.decision_method != .generated and parsed.value.decider.decision_method != .cascade and parsed.value.decider.embedder == null) return error.BatchIncompatible;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1965,7 +2064,8 @@ pub const Runtime = struct {
         for (items, results.values, results.failures, requests) |*item, value, failure, request| {
             var response = value;
             if (response) |*answer| {
-                var info = try materialization.provenanceWithRevision(a, parsed.value, request.source_fingerprint, answer.object.get("model_revision"));
+                const definition = if (parsed.value.decider.decision_method == .cascade) &(try registry.getCascade("materialized")).definition else null;
+                var info = try materialization.provenanceWithDefinition(a, parsed.value, request.source_fingerprint, answer.object.get("model_revision"), definition);
                 try d.put(a, &info, "model", answer.object.get("model").?);
                 try d.put(a, answer, "provenance", info);
             }
@@ -2000,7 +2100,8 @@ pub const Runtime = struct {
         defer execution.deinit();
         const results = try execution.provider().evaluateBatch(arena.allocator(), &.{.{ .decider = "materialized", .questions = parsed.value.questions, .input = .{ .text = request.source_text } }});
         var response = results[0];
-        var info = try materialization.provenance(arena.allocator(), parsed.value, request.source_fingerprint);
+        const definition = if (parsed.value.decider.decision_method == .cascade) &(try registry.getCascade("materialized")).definition else null;
+        var info = try materialization.provenanceWithDefinition(arena.allocator(), parsed.value, request.source_fingerprint, response.object.get("model_revision"), definition);
         try d.put(arena.allocator(), &info, "model", response.object.get("model").?);
         try d.put(arena.allocator(), &response, "provenance", info);
         return std.json.Stringify.valueAlloc(alloc, response, .{});
@@ -2750,6 +2851,7 @@ pub const Runtime = struct {
             self.execution.waitContext(),
         );
         capabilities = capability_lease.capabilities orelse return error.InvalidInferenceCapabilities;
+        try self.recordLeaseExecution(capability_lease);
         if (capability_lease.routing_token) |*value| {
             header_storage[header_count] = .{ remote_capabilities.capability_token_header, value.slice() };
             header_count += 1;
@@ -2894,6 +2996,7 @@ pub const Runtime = struct {
             self.execution.waitContext(),
         );
         try replaceCapabilityLeaseFields(alloc, cfg, lease);
+        try self.recordLeaseExecution(lease);
         return lease.capabilities;
     }
 
@@ -3191,13 +3294,36 @@ pub const Runtime = struct {
         return try asset_producer.producedBatchFromOutputs(alloc, requests, out, reader_execution);
     }
 
+    fn proxyDecisionRevisionCapabilities(self: *Runtime, a: Allocator, raw: std.json.Value) !?inference_work.InferenceCapabilities {
+        const probe = try @import("antfly_resolver").adjudication.Config.parseRevisionRequest(a, raw);
+        // This native route exposes a single leaf revision. Composite routes
+        // require an authoritative host verifier of the complete dependency set.
+        if (probe.version != 1) return error.CapabilityDiscoveryUnavailable;
+        const original = try @import("functions/materialization.zig").parse(a, probe.specification);
+        defer original.deinit();
+        const cfg = original.value.decider;
+        if (cfg.provider != .antfly or cfg.decision_method != .typed or !std.mem.eql(u8, cfg.model, probe.model)) return error.CapabilityDiscoveryUnavailable;
+        // Match the Decisions executor's route, not generation availability.
+        // A local generator callback is not proof that Decisions ran locally.
+        if (cfg.url.len == 0) if (self.antfly_provider) |local| if (local.decide_json != null)
+            return self.linkedModelCapabilities(a, local, probe.model, .generate);
+        // Public gateway aliases and HTTP task routes do not expose an
+        // authoritative execution-revision contract here. A /generate lookup
+        // on the old leaf is not proof of the current Decisions route, even
+        // when unqualified alias and leaf names happen to be equal.
+        return error.CapabilityDiscoveryUnavailable;
+    }
+
     fn constrainedProducerCapabilities(self: *Runtime, a: Allocator, generator: *generating_runtime.GeneratorConfig, output: constrained.Output, probabilities: ?constrained.Probabilities, batch: constrained.Batch, task: inference_work.Task) !inference_work.InferenceCapabilities {
         var engine = self.constrainedRuntime();
         const resolved = try engine.capabilities(a, generator);
         _ = try resolved.select(output, probabilities);
         const revision: ?[32]u8 = if (resolved.model_revision) |value| blk: {
             var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+            // Execution reports this same 32-byte identity as lowercase hex.
+            // Decode it; hashing the hex would invalidate every unchanged receipt.
+            if (value.len != 64) return error.InvalidInferenceCapabilities;
+            _ = std.fmt.hexToBytes(&digest, value) catch return error.InvalidInferenceCapabilities;
             break :blk digest;
         } else null;
         return .{ .model_revision = revision, .task = task, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = if (task == .extract) .extraction else .generated_text, .batch = .{ .mode = if (batch.max_items_per_call > 1) .native else .serial_compatibility, .preferred_items = batch.max_items_per_call, .max_items = batch.max_items_per_call, .per_item_failures = true } };
@@ -3290,6 +3416,8 @@ pub const Runtime = struct {
             const local = self.antfly_provider.?;
             const capabilities = (try self.linkedModelCapabilities(alloc, local, cfg.model, .generate)) orelse
                 return error.InvalidInferenceCapabilities;
+            if (self.model_execution_identity) |identity|
+                try identity.record(if (immutableAntflyModel(cfg.model)) capabilities.model_revision else null);
             var encoded_bytes: usize = 0;
             var modalities = inference_work.Modalities{ .text = true };
             for (request.media) |media| {
@@ -3559,6 +3687,15 @@ pub const Runtime = struct {
         return try encodeReaderResults(alloc, request.content_type, results);
     }
 
+    fn recordLeaseExecution(self: *Runtime, lease: remote_capabilities.CapabilityLease) !void {
+        const identity = self.model_execution_identity orelse return;
+        const revision = if (lease.routing_token != null and lease.descriptor_revision != null)
+            if (lease.capabilities) |cap| cap.model_revision else null
+        else
+            null;
+        try identity.record(revision);
+    }
+
     fn appleReaderOptions(self: *Runtime) !readers.RemoteOptions {
         return .{
             .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
@@ -3611,6 +3748,7 @@ pub const Runtime = struct {
             );
             capability_lease_fields = CapabilityLeaseFields.init(lease);
             capability_lease_fields.apply(&execution_cfg);
+            try self.recordLeaseExecution(lease);
             break :blk lease.capabilities;
         } else try self.readerCapabilities(alloc, execution_cfg);
         if (discovered_capabilities) |capabilities| {
@@ -3638,6 +3776,8 @@ pub const Runtime = struct {
             return readers.readWithConfigReported(alloc, self.http, execution_cfg, request, try self.appleReaderOptions());
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
+            if (self.model_execution_identity) |identity|
+                try identity.record(if (immutableAntflyModel(execution_cfg.model)) if (discovered_capabilities) |cap| cap.model_revision else null else null);
             const items = if (local.read_images_with_context) |read_images|
                 try managed_embedder.AntflyProviderBoundary.call(
                     "read_images_with_context",
@@ -3747,6 +3887,7 @@ pub const Runtime = struct {
             );
             capability_lease_fields = CapabilityLeaseFields.init(lease);
             capability_lease_fields.apply(&execution_cfg);
+            try self.recordLeaseExecution(lease);
             break :blk lease.capabilities;
         } else try self.readerCapabilities(alloc, execution_cfg);
         var use_framed_transport = false;
@@ -3787,6 +3928,8 @@ pub const Runtime = struct {
             return readers.readEncodedWithConfigReported(alloc, self.http, execution_cfg, request, try self.appleReaderOptions());
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
+            if (self.model_execution_identity) |identity|
+                try identity.record(if (immutableAntflyModel(execution_cfg.model)) if (capabilities) |cap| cap.model_revision else null else null);
             if (local.read_encoded_images_reported_with_context) |read_reported|
                 return try managed_embedder.AntflyProviderBoundary.call(
                     "read_encoded_images_reported_with_context",
@@ -3909,6 +4052,8 @@ pub const Runtime = struct {
         if (execution_cfg.provider == .apple)
             return readers.readRasterWithConfigReported(alloc, execution_cfg, request, try self.appleReaderOptions());
         const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
+        if (self.model_execution_identity) |identity|
+            try identity.record(if (immutableAntflyModel(execution_cfg.model)) capabilities.model_revision else null);
         if (local.read_raster_images_reported == null and
             local.read_raster_images_reported_with_context == null)
             return error.BorrowedRasterUnsupported;
@@ -8859,6 +9004,97 @@ test "decision functions materialized enrichment records version model and sourc
     try std.testing.expect(provenance.get("specification_hash").?.string.len > 0);
 }
 
+test "decision functions cascade enrichments advertise batching and share generated escalation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fake = struct {
+        fast_calls: std.atomic.Value(usize) = .init(0),
+        strong_calls: usize = 0,
+        discoveries: usize = 0,
+        confident: bool = false,
+        fail_discovery: bool = false,
+        fn decide(ptr: *anyopaque, alloc: Allocator, _: []const u8, _: ?RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.fast_calls.fetchAdd(1, .monotonic);
+            if (self.confident) return alloc.dupe(u8,
+                \\{"model":"fast","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"same","probabilities":[{"value":"same","probability":0.99},{"value":"different","probability":0.01}]}],"usage":{"input_tokens":2,"output_tokens":0}}
+            );
+            return alloc.dupe(u8,
+                \\{"model":"fast","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"same","probabilities":[{"value":"same","probability":0.6},{"value":"different","probability":0.4}]}],"usage":{"input_tokens":2,"output_tokens":0}}
+            );
+        }
+        fn generate(ptr: *anyopaque, alloc: Allocator, bytes: []const u8, _: ?RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.strong_calls += 1;
+            const body = try std.json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{});
+            const messages = body.object.get("messages").?.array.items;
+            const prompt = try std.json.parseFromSliceLeaky(std.json.Value, alloc, messages[1].object.get("content").?.string, .{});
+            try std.testing.expectEqual(@as(usize, 2), prompt.object.get("items").?.array.items.len);
+            return alloc.dupe(u8,
+                \\{"choices":[{"message":{"content":"{\"items\":[{\"item\":0,\"value\":{\"same\":\"same\"}},{\"item\":1,\"value\":{\"same\":\"different\"}}]}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+            );
+        }
+        fn capabilities(ptr: *anyopaque, _: Allocator, _: []const u8, _: inference_work.Task) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.discoveries += 1;
+            if (self.fail_discovery) return error.CapabilityDiscoveryUnavailable;
+            return .{ .model_revision = @splat(1), .task = .generate, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true };
+        }
+    };
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.init(a, io_impl.io());
+    defer client.deinit();
+    var fake = Fake{};
+    var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = &fake, .owns_invocation_admission = true, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide, .generate_json = Fake.generate, .model_capabilities = Fake.capabilities } });
+    defer runtime.deinit();
+    const specification =
+        \\{"version":"v1","decider":{"decision_method":"cascade","cascade":{"stages":[
+        \\ {"name":"fast","decider":{"model":"fast"}},
+        \\ {"name":"strong","decider":{"decision_method":"generated","generator":{"provider":"antfly","model":"strong"},"probabilities":"verdict_only"},"when":{"question":"same","choice":"same","probability_between":[0.3,0.9]}}]}},
+        \\ "questions":[{"name":"same","type":"choice","instructions":"Same entity?","choices":[{"value":"same"},{"value":"different"}]}]}
+    ;
+    const requests = [_]asset_producer.Request{
+        .{ .producer_type = .decision, .config_json = specification, .source_text = "A B", .item_id = "a" },
+        .{ .producer_type = .decision, .config_json = specification, .source_text = "C D", .item_id = "b" },
+    };
+    const producer = runtime.producer();
+    try std.testing.expectEqual(inference_work.BatchMode.serial_compatibility, try producer.batchMode(a, &requests));
+    var result = try producer.produceBatchReported(a, &requests);
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), fake.fast_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), fake.strong_calls);
+    for (result.items) |item| {
+        const response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, item.result.value, .{});
+        const trace = response.object.get("cascade").?.object;
+        try std.testing.expectEqualStrings("strong", trace.get("answered_by").?.string);
+        try std.testing.expectEqual(@as(usize, 2), trace.get("stages").?.array.items.len);
+        try std.testing.expect(trace.get("stages").?.array.items[1].object.contains("model_revision"));
+        const usage = trace.get("stages").?.array.items[1].object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 5), usage.get("input_tokens").?.integer);
+        try std.testing.expect(usage.get("estimated").?.bool);
+        try std.testing.expect(response.object.get("usage").?.object.get("estimated").?.bool);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.discoveries);
+    fake.confident = true;
+    fake.fail_discovery = true;
+    var fast_only = try producer.produceBatchReported(a, &requests);
+    defer fast_only.deinit(a);
+    for (fast_only.items) |item| try std.testing.expect(item.result == .value);
+    const single = try producer.produce(a, requests[0]);
+    defer a.free(single);
+    try std.testing.expectEqual(@as(usize, 1), fake.discoveries);
+    try std.testing.expectEqual(@as(usize, 1), fake.strong_calls);
+    // An available local callback must not change the ownership of hosted stages.
+    const hosted =
+        \\{"version":"v1","decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"a","decider":{"provider":"jev"}},{"name":"b","decider":{"provider":"jev"},"when":{"probability_between":[0.3,0.9]}}]}},"questions":[{"name":"same","type":"predicate","instructions":"Same?"}]}
+    ;
+    const memory = try producer.invocationMemoryForRequests(a, &.{.{ .producer_type = .decision, .config_json = hosted, .source_text = "text" }});
+    try std.testing.expectEqual(inference_work.InvocationAllocatorOwner.caller, memory.allocator_owner);
+}
+
 test "decision functions Cloudflare extraction resolves secret references before transport" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -9587,4 +9823,97 @@ test "privacy structurally wide sources fit planning and execution budgets indep
     }
     const escaped = try std.json.Stringify.valueAlloc(scratch, .{ .body = "\\\"{[:,\\\"" }, .{});
     try std.testing.expectEqual(try privacy.jsonStructureBytes("{\"body\":\"short\"}"), try privacy.jsonStructureBytes(escaped));
+}
+
+test "decision provider revision discovery matches execution bytes and verifies only exact proxy routes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fixture = struct {
+        probes: usize = 0,
+        missing: bool = false,
+        logprobs: bool = true,
+        fn generate(_: *anyopaque, _: Allocator, _: []const u8, _: ?RequestContext) ![]u8 {
+            return error.UnexpectedInferenceDuringDiscovery;
+        }
+        fn capabilities(ptr: *anyopaque, _: Allocator, model: []const u8, task: inference_work.Task) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.probes += 1;
+            try std.testing.expectEqualStrings("native", model);
+            try std.testing.expectEqual(inference_work.Task.generate, task);
+            return .{ .model_revision = if (self.missing) null else @splat(0xaa), .task = .generate, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true, .generation_token_logprobs_v1 = self.logprobs };
+        }
+    };
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var fixture = Fixture{};
+    var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = &fixture, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fixture.generate, .decide_json = Fixture.generate, .model_capabilities = Fixture.capabilities } });
+    defer runtime.deinit();
+    const resolve = @import("functions/resolver_adjudication.zig").modelRevision;
+    const generated =
+        \\{"version":"v1","decider":{"decision_method":"generated","generator":{"provider":"antfly","model":"native"}},"questions":[{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]}]}
+    ;
+    const expected: [32]u8 = @splat(0xaa);
+    try std.testing.expectEqualSlices(u8, &expected, &(try resolve(scratch, runtime.producer(), .{ .io = std.testing.io }, generated, 10000)).?);
+    // Revision discovery must also work for verdict-only native generators.
+    fixture.logprobs = false;
+    const proxy =
+        \\{"version":"v1","decider":{"model":"native"},"questions":[{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]}]}
+    ;
+    const probe = try std.json.Stringify.valueAlloc(scratch, .{ .decision_revision_probe = .{ .version = 1, .specification = proxy, .model = "native" } }, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &(try resolve(scratch, runtime.producer(), .{ .io = std.testing.io }, probe, 10000)).?);
+    try std.testing.expectEqual(@as(usize, 2), fixture.probes);
+    fixture.missing = true;
+    try std.testing.expectError(error.CapabilityDiscoveryUnavailable, resolve(scratch, runtime.producer(), .{ .io = std.testing.io }, probe, 10000));
+    fixture.missing = false;
+    // A previously resolved leaf is not proof of an opaque alias's current
+    // execution identity. Do not query the old leaf and silently reuse it.
+    const alias = try std.mem.replaceOwned(u8, scratch, proxy, "\"model\":\"native\"", "\"model\":\"deciders/alias\"");
+    const alias_probe = try std.json.Stringify.valueAlloc(scratch, .{ .decision_revision_probe = .{ .version = 1, .specification = alias, .model = "native" } }, .{});
+    const probes = fixture.probes;
+    try std.testing.expectError(error.CapabilityDiscoveryUnavailable, resolve(scratch, runtime.producer(), .{ .io = std.testing.io }, alias_probe, 10000));
+    try std.testing.expectEqual(probes, fixture.probes);
+    // Generator availability must not change the route used to verify a
+    // Decisions response. Without decide_json, this route is HTTP, not linked.
+    var remote_only = Runtime.initWithOptions(a, &client, .{ .inference_api_url = "invalid-default-endpoint", .antfly_provider = .{ .ptr = &fixture, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fixture.generate, .model_capabilities = Fixture.capabilities } });
+    defer remote_only.deinit();
+    try std.testing.expectError(error.CapabilityDiscoveryUnavailable, resolve(scratch, remote_only.producer(), .{ .io = std.testing.io }, probe, 10000));
+    try std.testing.expectEqual(probes, fixture.probes);
+}
+
+test "index document checkpoint producer execution identity rejects missing fencing and mixed revisions across retries" {
+    var identity: ModelExecutionIdentity = .{};
+    try std.testing.expect(identity.result() == null);
+    try identity.record(@splat(1));
+    try std.testing.expectEqual(@as(?[32]u8, @splat(1)), identity.result());
+    try identity.record(@splat(2));
+    try identity.record(@splat(1));
+    try std.testing.expect(identity.result() == null);
+    identity = .{};
+    try identity.record(@splat(1));
+    try identity.record(null);
+    try std.testing.expect(identity.result() == null);
+    identity = .{ .expected = @splat(1) };
+    try std.testing.expectError(error.ModelExecutionIdentityUnavailable, identity.record(null));
+    try std.testing.expectError(error.ModelExecutionRevisionChanged, identity.record(@splat(2)));
+    try identity.record(@splat(1));
+    var runtime: Runtime = undefined;
+    runtime.model_execution_identity = &identity;
+    var lease: remote_capabilities.CapabilityLease = .{
+        .capabilities = .{ .model_revision = @splat(1), .model_revision_pinning = true, .task = .read, .input_modalities = .{ .image = true }, .input_granularity = .page, .output = .read_result },
+    };
+    // A catalog support bit without the actual enforced lease is insufficient.
+    try std.testing.expectError(error.ModelExecutionIdentityUnavailable, runtime.recordLeaseExecution(lease));
+    lease.routing_token = try remote_capabilities.RoutingToken.init("route");
+    lease.descriptor_revision = try remote_capabilities.CapabilityRevision.init("1111111111111111111111111111111111111111111111111111111111111111");
+    try runtime.recordLeaseExecution(lease);
+    lease.capabilities.?.model_revision = @splat(2);
+    try std.testing.expectError(error.ModelExecutionRevisionChanged, runtime.recordLeaseExecution(lease));
+    try std.testing.expect(!immutableAntflyModel("alias"));
+    try std.testing.expect(!immutableAntflyModel("model@main"));
+    try std.testing.expect(!immutableAntflyModel("model@1111111111111111111111111111111111111111"));
+    try std.testing.expect(!immutableAntflyModel("/tmp/model@1111111111111111111111111111111111111111"));
+    try std.testing.expect(!immutableAntflyModel("../model@1111111111111111111111111111111111111111"));
+    try std.testing.expect(immutableAntflyModel("owner/model@1111111111111111111111111111111111111111"));
 }

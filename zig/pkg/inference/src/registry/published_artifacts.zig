@@ -24,6 +24,8 @@ pub const Expected = struct { publication: ?[32]u8 };
 pub const VerificationCache = struct {
     pub const capacity = 4096;
     const Entry = struct { stamp: managed.ArtifactStamp, used: u64 };
+    /// Manager-owned caches outlive the allocators of borrowed acquisitions.
+    owner_allocator: ?std.mem.Allocator = null,
     mutex: std.atomic.Mutex = .unlocked,
     builders: [16]std.Io.Mutex = @splat(.init),
     entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
@@ -64,7 +66,7 @@ pub const VerificationCache = struct {
             };
             _ = self.entries.remove(oldest.?);
         }
-        try self.entries.put(a, key, .{ .stamp = stamp, .used = self.clock });
+        try self.entries.put(self.owner_allocator orelse a, key, .{ .stamp = stamp, .used = self.clock });
     }
     fn verify(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, initial: managed.ArtifactStamp) !managed.ArtifactStamp {
         const key = keyFor(publication, artifact);
@@ -81,8 +83,21 @@ pub const VerificationCache = struct {
         self.remember(a, key, verified) catch {}; // Cache pressure cannot deny a valid construction.
         return verified;
     }
+    fn verifyOpened(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, file: std.Io.File, initial: managed.ArtifactStamp) !managed.ArtifactStamp {
+        const key = keyFor(publication, artifact);
+        if (self.hit(key, initial)) return initial;
+        const builder = &self.builders[key[0] % self.builders.len];
+        try builder.lock(io);
+        defer builder.unlock(io);
+        const stamp = managed.ArtifactStamp.fromStat(try file.stat(io));
+        if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
+        if (self.hit(key, stamp)) return stamp;
+        const verified = try managed.verifyOpenedArtifactSha256AndStamp(io, file, artifact, artifact.sha256.?);
+        self.remember(a, key, verified) catch {};
+        return verified;
+    }
     pub fn deinit(self: *VerificationCache, a: std.mem.Allocator) void {
-        self.entries.deinit(a);
+        self.entries.deinit(self.owner_allocator orelse a);
     }
 };
 
@@ -92,6 +107,13 @@ pub const PublishedArtifacts = struct {
     root: []const u8,
     requested_root: []u8,
     storage_root: []u8,
+    physical_root: [:0]u8,
+    physical_root_inode: @FieldType(std.Io.File.Stat, "inode"),
+    physical_direct: ?[]u8 = null,
+    // A standalone GGUF may be constructed with a directory metadata snapshot.
+    // Keep that dependency scope separate from the direct file's own binding.
+    directory_scope: ?[:0]u8 = null,
+    directory_scope_inode: ?@FieldType(std.Io.File.Stat, "inode") = null,
     direct_path: ?[]u8 = null,
     direct_index: ?usize = null,
     verification_cache: ?*VerificationCache = null,
@@ -99,17 +121,36 @@ pub const PublishedArtifacts = struct {
     publication: ?[32]u8,
     verified_stamps: []?managed.ArtifactStamp = &.{},
     canonical_index: std.StringHashMapUnmanaged(usize) = .empty,
+    opened_files: std.AutoHashMapUnmanaged(usize, OpenedArtifact) = .empty,
+    handle_clock: u64 = 0,
+    /// Per-acquisition bound, independent of model file count. Active borrows
+    /// (e.g. the graph mmap during dependency inspection) are never evicted.
+    pub const onnx_handle_capacity = 8;
+    const OpenedArtifact = struct { file: std.Io.File, stamp: managed.ArtifactStamp, borrows: usize = 0, used: u64 = 0 };
+    const ExternalDataReader = @import("onnx_graph").tensor.ExternalDataReader;
 
     pub fn init(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected) !PublishedArtifacts {
-        const direct = std.mem.endsWith(u8, root, ".gguf");
-        const storage_root = try managed.publicationRootAlloc(a, io, root);
+        const direct = managed.isDirectModelPath(root);
+        const publication_root = try managed.publicationRootAlloc(a, io, root);
+        defer a.free(publication_root);
+        const standalone = direct and std.mem.eql(u8, publication_root, root);
+        // ONNX external-data locations are relative to the requested graph's
+        // directory, even when the graph itself points at a shared blob.
+        const storage_root = try a.dupe(u8, if (standalone and std.mem.endsWith(u8, root, ".onnx"))
+            std.fs.path.dirname(root) orelse "."
+        else
+            publication_root);
         errdefer a.free(storage_root);
         const requested_root = try absolutePath(a, io, storage_root);
         errdefer a.free(requested_root);
         const direct_path = if (direct) try absolutePath(a, io, root) else null;
         errdefer if (direct_path) |path| a.free(path);
-        const standalone = direct and std.mem.eql(u8, storage_root, root);
-        var receipt = if (standalone) null else try managed.loadValidated(a, io, storage_root);
+        const physical_root = try std.Io.Dir.cwd().realPathFileAlloc(io, storage_root, a);
+        errdefer a.free(physical_root);
+        const root_stat = try std.Io.Dir.cwd().statFile(io, physical_root, .{ .follow_symlinks = false });
+        const physical_direct = if (direct) try managed.resolveRegularFilePath(a, io, root) else null;
+        errdefer if (physical_direct) |path| a.free(path);
+        var receipt = if (standalone) null else try managed.loadValidated(a, io, physical_root);
         errdefer if (receipt) |*value| value.deinit();
         const publication = if (receipt) |value| value.publication_generation else null;
         if (expected) |value| if (!std.meta.eql(value.publication, publication)) return error.ModelArtifactsChanging;
@@ -130,25 +171,85 @@ pub const PublishedArtifacts = struct {
         } else null;
         const verified = try a.alloc(?managed.ArtifactStamp, if (receipt) |value| value.artifacts.len else 0);
         @memset(verified, null);
-        return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .storage_root = storage_root, .direct_path = direct_path, .direct_index = direct_index, .receipt = receipt, .publication = publication, .canonical_index = index, .verified_stamps = verified };
+        return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .storage_root = storage_root, .physical_root = physical_root, .physical_root_inode = root_stat.inode, .physical_direct = physical_direct, .direct_path = direct_path, .direct_index = direct_index, .receipt = receipt, .publication = publication, .canonical_index = index, .verified_stamps = verified };
     }
     pub fn deinit(self: *PublishedArtifacts) void {
+        var opened = self.opened_files.valueIterator();
+        while (opened.next()) |value| {
+            std.debug.assert(value.borrows == 0);
+            value.file.close(self.io);
+        }
+        self.opened_files.deinit(self.allocator);
         self.allocator.free(self.requested_root);
         self.allocator.free(self.storage_root);
+        self.allocator.free(self.physical_root);
+        if (self.physical_direct) |path| self.allocator.free(path);
+        if (self.directory_scope) |path| self.allocator.free(path);
         if (self.direct_path) |path| self.allocator.free(path);
         self.allocator.free(self.verified_stamps);
         self.canonical_index.deinit(self.allocator);
         if (self.receipt) |*receipt| receipt.deinit();
     }
+    fn constructionRoot(self: *const PublishedArtifacts) []const u8 {
+        return self.directory_scope orelse self.physical_root;
+    }
+
+    /// A supplied directory snapshot grants a standalone direct file its local
+    /// sidecar scope. It cannot change receipt authority or admit a foreign file.
+    pub fn bindDirectoryScope(self: *PublishedArtifacts, root: []const u8) !void {
+        if (self.direct_path == null) return;
+        const canonical = try std.Io.Dir.cwd().realPathFileAlloc(self.io, root, self.allocator);
+        errdefer self.allocator.free(canonical);
+        if (!std.mem.eql(u8, canonical, root)) return error.ModelArtifactsChanging;
+        const stat = try std.Io.Dir.cwd().statFile(self.io, canonical, .{});
+        if (stat.kind != .directory) return error.NotDir;
+        if (!managed.pathIsWithinRoot(canonical, self.physical_direct.?)) return error.ModelArtifactOutsideRoot;
+        if (self.receipt != null) {
+            if (!std.mem.eql(u8, self.physical_root, canonical) and !managed.pathIsWithinRoot(self.physical_root, canonical)) return error.ModelArtifactOutsideRoot;
+            self.allocator.free(canonical);
+            return;
+        }
+        if (self.directory_scope) |scope| {
+            if (!std.mem.eql(u8, scope, canonical) or self.directory_scope_inode.? != stat.inode) return error.ModelArtifactsChanging;
+            self.allocator.free(canonical);
+        } else {
+            self.directory_scope = canonical;
+            self.directory_scope_inode = stat.inode;
+        }
+    }
+
+    /// Default sidecars are optional only when absent from the captured catalog.
+    /// Explicit selections must use constructionPath and cannot silently vanish.
+    pub fn optionalConstructionPath(self: *const PublishedArtifacts, path: []const u8) !?[]u8 {
+        if (self.receipt != null) {
+            _ = self.indexForPath(path) catch |err| switch (err) {
+                error.InvalidManagedDownload => return null,
+                else => return err,
+            };
+        }
+        return self.constructionPath(path) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => null,
+            else => return err,
+        };
+    }
+
     pub fn resolve(self: *const PublishedArtifacts, relative: []const u8) !?[]u8 {
         if (self.receipt) |*receipt| {
             const artifact = receipt.find(relative) orelse return null;
             return try self.allocator.dupe(u8, artifact.canonical_path);
         }
-        return managed.resolveContainedArtifactPath(self.allocator, self.io, self.storage_root, relative) catch |err| switch (err) {
+        return managed.resolveContainedArtifactPath(self.allocator, self.io, self.constructionRoot(), relative) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => null,
             else => return err,
         };
+    }
+    /// Component discovery retains the selected filename and dependency base.
+    /// The cold constructor will pin the leaf target separately. Resolve first
+    /// to enforce receipt membership and containment before exposing this name.
+    pub fn resolveModel(self: *const PublishedArtifacts, relative: []const u8) !?[]u8 {
+        const canonical = (try self.resolve(relative)) orelse return null;
+        defer self.allocator.free(canonical);
+        return try std.fs.path.join(self.allocator, &.{ self.constructionRoot(), relative });
     }
     /// Verify bytes actually read/mapped, avoiding a hash-then-reopen race.
     pub fn verifyBytes(self: *const PublishedArtifacts, relative: []const u8, bytes: []const u8) !void {
@@ -179,9 +280,11 @@ pub const PublishedArtifacts = struct {
         defer self.allocator.free(absolute);
         if (self.canonical_index.get(absolute)) |index| return index;
         if (self.direct_path) |direct| if (std.mem.eql(u8, absolute, direct)) return self.direct_index orelse error.InvalidManagedDownload;
-        if (managed.pathIsWithinRoot(self.requested_root, absolute)) {
-            const offset = self.requested_root.len + @intFromBool(!std.fs.path.isSep(self.requested_root[self.requested_root.len - 1]));
-            if (self.receipt.?.path_index.get(absolute[offset..])) |index| return index;
+        for ([_][]const u8{ self.requested_root, self.physical_root }) |root| {
+            if (managed.pathIsWithinRoot(root, absolute)) {
+                const offset = root.len + @intFromBool(!std.fs.path.isSep(root[root.len - 1]));
+                if (self.receipt.?.path_index.get(absolute[offset..])) |index| return index;
+            }
         }
         return error.InvalidManagedDownload;
     }
@@ -192,13 +295,14 @@ pub const PublishedArtifacts = struct {
             const artifact = &receipt.artifacts[try self.indexForPath(path)];
             return self.readSelected(path, artifact, max_bytes);
         }
-        const canonical = try managed.resolveRegularFilePath(self.allocator, self.io, path);
-        defer self.allocator.free(canonical);
-        const root = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.storage_root, self.allocator);
-        defer self.allocator.free(root);
-        const standalone = self.direct_path != null and std.mem.eql(u8, self.root, self.storage_root);
-        if (!managed.pathIsWithinRoot(root, canonical) and !(standalone and std.mem.eql(u8, root, canonical))) return error.ModelArtifactOutsideRoot;
-        return self.readSelected(canonical, null, max_bytes);
+        // Share construction's namespace rebasing and containment. Resolving
+        // storage_root again could follow a different installation, and would
+        // discard a standalone file's validated directory sidecar scope.
+        const physical = try self.constructionPath(path);
+        defer self.allocator.free(physical);
+        const stat = try std.Io.Dir.cwd().statFile(self.io, physical, .{ .follow_symlinks = false });
+        if (stat.kind != .file) return error.InvalidModelArtifactKind;
+        return self.readSelected(physical, null, max_bytes);
     }
     fn readSelected(self: *const PublishedArtifacts, path: []const u8, artifact: ?*const managed.ValidatedArtifact, max_bytes: usize) ![]u8 {
         if (artifact) |member| {
@@ -255,14 +359,179 @@ pub const PublishedArtifacts = struct {
     /// importer can read it. Callers retain a shared publication lease through
     /// construction and call verify() before publishing the resulting session.
     pub fn verifyOnnx(self: *PublishedArtifacts, path: []const u8) !void {
+        return self.verifyOnnxWithBase(path, null);
+    }
+    pub fn verifyOnnxWithBase(self: *PublishedArtifacts, path: []const u8, external_base_dir: ?[]const u8) !void {
         if (self.receipt == null) return;
-        try self.verifyPath(path);
-        var graph = try @import("../backends/imported_onnx_session.zig").inspectArtifactSet(self.allocator, path);
+        // Each dependency is authenticated on its opened handle. Idle handles
+        // may be evicted; a reopen must match its captured proof before use.
+        var graph = try @import("../backends/imported_onnx_session.zig").inspectArtifactSetWithReader(self.allocator, path, external_base_dir, self.onnxReader());
         defer graph.deinit();
-        for (graph.external_paths) |external| try self.verifyPath(external);
+    }
+
+    /// Borrow only through synchronous construction. No reader or file handle
+    /// escapes into a resident session; decoded weights and shape templates do.
+    pub fn onnxReader(self: *PublishedArtifacts) ?ExternalDataReader {
+        if (self.receipt == null) return null;
+        return .{ .context = self, .open_fn = openOnnxArtifact };
+    }
+
+    fn openOnnxArtifact(raw: *anyopaque, path: []const u8) !ExternalDataReader.OpenedFile {
+        const self: *PublishedArtifacts = @ptrCast(@alignCast(raw));
+        const member = &self.receipt.?.artifacts[try self.indexForPath(path)];
+        const index = self.canonical_index.get(member.canonical_path).?;
+        self.handle_clock +|= 1;
+        if (self.opened_files.getPtr(index)) |opened| {
+            const stamp = managed.ArtifactStamp.fromStat(try opened.file.stat(self.io));
+            if (!std.meta.eql(opened.stamp, stamp)) return error.ModelArtifactsChanging;
+            opened.borrows += 1;
+            opened.used = self.handle_clock;
+            return self.borrowedOnnxFile(opened.*);
+        }
+        if (self.opened_files.count() == onnx_handle_capacity) {
+            var victim: ?usize = null;
+            var oldest: u64 = std.math.maxInt(u64);
+            var it = self.opened_files.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.borrows == 0 and entry.value_ptr.used <= oldest) {
+                    victim = entry.key_ptr.*;
+                    oldest = entry.value_ptr.used;
+                }
+            }
+            // Refuse unexpected nesting rather than invalidate a live borrow
+            // or grow the descriptor footprint beyond the acquisition budget.
+            const key = victim orelse return error.ResourceLimitExceeded;
+            self.opened_files.get(key).?.file.close(self.io);
+            _ = self.opened_files.remove(key);
+        }
+        try self.opened_files.ensureUnusedCapacity(self.allocator, 1);
+        const artifact = &self.receipt.?.artifacts[index];
+        const file = try std.Io.Dir.cwd().openFile(self.io, artifact.canonical_path, .{});
+        errdefer file.close(self.io);
+        const stamp = managed.ArtifactStamp.fromStat(try file.stat(self.io));
+        if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
+        const verified = if (self.verified_stamps[index]) |prior| blk: {
+            // Reopening must not adopt another inode/version mid-construction,
+            // even if it has the same declared digest or size.
+            if (!std.meta.eql(prior, stamp)) return error.ModelArtifactsChanging;
+            break :blk stamp;
+        } else try self.verifyOpened(artifact, file, stamp);
+        self.verified_stamps[index] = verified;
+        const opened = OpenedArtifact{ .file = file, .stamp = verified, .borrows = 1, .used = self.handle_clock };
+        self.opened_files.putAssumeCapacity(index, opened);
+        return self.borrowedOnnxFile(opened);
+    }
+
+    fn borrowedOnnxFile(self: *PublishedArtifacts, opened: OpenedArtifact) ExternalDataReader.OpenedFile {
+        return .{ .file = opened.file, .io = self.io, .size = opened.stamp.size, .context = self, .release_fn = releaseOnnxFile, .validate_fn = validateOnnxFile };
+    }
+
+    fn releaseOnnxFile(raw: *anyopaque, file: std.Io.File) void {
+        const self: *PublishedArtifacts = @ptrCast(@alignCast(raw));
+        var it = self.opened_files.valueIterator();
+        while (it.next()) |opened| if (opened.file.handle == file.handle) {
+            std.debug.assert(opened.borrows > 0);
+            opened.borrows -= 1;
+            return;
+        };
+        unreachable; // Active borrows cannot be evicted.
+    }
+
+    fn validateOnnxFile(raw: *anyopaque, file: std.Io.File) !void {
+        const self: *PublishedArtifacts = @ptrCast(@alignCast(raw));
+        var it = self.opened_files.valueIterator();
+        while (it.next()) |opened| if (opened.file.handle == file.handle) {
+            const stamp = managed.ArtifactStamp.fromStat(try file.stat(self.io));
+            if (!std.meta.eql(opened.stamp, stamp)) return error.ModelArtifactsChanging;
+            return;
+        };
+        unreachable;
+    }
+
+    fn verifyOpened(self: *PublishedArtifacts, artifact: *const managed.ValidatedArtifact, file: std.Io.File, stamp: managed.ArtifactStamp) !managed.ArtifactStamp {
+        const digest = artifact.sha256 orelse return stamp;
+        if (self.verification_cache) |cache| return cache.verifyOpened(self.allocator, self.io, self.publication.?, artifact, file, stamp);
+        return managed.verifyOpenedArtifactSha256AndStamp(self.io, file, artifact, digest);
+    }
+    /// Rebase metadata into the captured namespace without opening optional
+    /// artifacts or granting execution permission. A backend must still call
+    /// constructionPath/verifyPath for each dependency it actually consumes.
+    pub fn namespacePath(self: *const PublishedArtifacts, path: []const u8) ![]u8 {
+        const absolute = try absolutePath(self.allocator, self.io, path);
+        errdefer self.allocator.free(absolute);
+        if (std.mem.eql(u8, absolute, self.requested_root)) {
+            const captured = try self.allocator.dupe(u8, self.physical_root);
+            self.allocator.free(absolute);
+            return captured;
+        }
+        if (managed.pathIsWithinRoot(self.requested_root, absolute)) {
+            const offset = self.requested_root.len + @intFromBool(!std.fs.path.isSep(self.requested_root[self.requested_root.len - 1]));
+            const captured = try std.fs.path.join(self.allocator, &.{ self.physical_root, absolute[offset..] });
+            self.allocator.free(absolute);
+            return captured;
+        }
+        return absolute;
+    }
+
+    /// Capture the physical construction target once. Backends must never
+    /// reopen a mutable caller alias after authenticating a different target.
+    pub fn constructionPath(self: *const PublishedArtifacts, path: []const u8) ![]u8 {
+        const absolute = try absolutePath(self.allocator, self.io, path);
+        defer self.allocator.free(absolute);
+        if (self.direct_path) |direct| if (std.mem.eql(u8, absolute, direct))
+            return self.allocator.dupe(u8, self.physical_direct.?);
+        if (std.mem.eql(u8, absolute, self.physical_root)) return self.allocator.dupe(u8, self.physical_root);
+        if (std.mem.eql(u8, absolute, self.requested_root)) return self.allocator.dupe(u8, self.physical_root);
+        if (self.receipt) |receipt| {
+            if (self.indexForPath(path)) |index| {
+                return self.allocator.dupe(u8, receipt.artifacts[index].canonical_path);
+            } else |err| if (err != error.InvalidManagedDownload) return err;
+        }
+        const captured_path = if (managed.pathIsWithinRoot(self.requested_root, absolute)) blk: {
+            const offset = self.requested_root.len + @intFromBool(!std.fs.path.isSep(self.requested_root[self.requested_root.len - 1]));
+            break :blk try std.fs.path.join(self.allocator, &.{ self.physical_root, absolute[offset..] });
+        } else try self.allocator.dupe(u8, absolute);
+        defer self.allocator.free(captured_path);
+        const canonical = try std.Io.Dir.cwd().realPathFileAlloc(self.io, captured_path, self.allocator);
+        defer self.allocator.free(canonical);
+        const scope = self.constructionRoot();
+        if (!std.mem.eql(u8, scope, canonical) and !managed.pathIsWithinRoot(scope, canonical)) return error.ModelArtifactOutsideRoot;
+        // Directory importers verify their selected dependencies separately.
+        // A file must always be selected through the captured receipt above.
+        if (self.receipt != null and (try std.Io.Dir.cwd().statFile(self.io, canonical, .{})).kind != .directory) return error.InvalidManagedDownload;
+        return self.allocator.dupe(u8, canonical);
+    }
+
+    fn verifyBinding(self: *const PublishedArtifacts, path: []const u8, expected: []const u8) !void {
+        const current = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
+        defer self.allocator.free(current);
+        if (!std.mem.eql(u8, current, expected)) return error.ModelArtifactsChanging;
     }
     pub fn verify(self: *const PublishedArtifacts) !void {
+        try self.verifyBinding(self.storage_root, self.physical_root);
+        const root_stat = try std.Io.Dir.cwd().statFile(self.io, self.physical_root, .{ .follow_symlinks = false });
+        if (root_stat.inode != self.physical_root_inode) return error.ModelArtifactsChanging;
+        if (self.directory_scope) |root| {
+            try self.verifyBinding(root, root);
+            const stat = try std.Io.Dir.cwd().statFile(self.io, root, .{});
+            if (stat.kind != .directory or stat.inode != self.directory_scope_inode.?) return error.ModelArtifactsChanging;
+        }
+        if (self.direct_path) |path| try self.verifyBinding(path, self.physical_direct.?);
         if (!std.meta.eql(self.publication, try managed.publicationGeneration(self.allocator, self.io, self.root))) return error.ModelArtifactsChanging;
+        var opened = self.opened_files.valueIterator();
+        while (opened.next()) |value| {
+            const stamp = managed.ArtifactStamp.fromStat(try value.file.stat(self.io));
+            if (!std.meta.eql(stamp, value.stamp)) return error.ModelArtifactsChanging;
+        }
+        // Native directory importers also discover members by relative names.
+        // Keep every alias of a verified member bound to its captured target.
+        if (self.receipt) |receipt| for (receipt.artifacts) |artifact| {
+            const index = self.canonical_index.get(artifact.canonical_path).?;
+            if (self.verified_stamps[index] == null) continue;
+            const path = try std.fs.path.join(self.allocator, &.{ self.physical_root, artifact.path });
+            defer self.allocator.free(path);
+            try self.verifyBinding(path, artifact.canonical_path);
+        };
         // A path verified earlier must still name those bytes when construction
         // finishes. Do not reuse a digest across replacement or in-place writes.
         for (self.verified_stamps, 0..) |maybe_stamp, index| if (maybe_stamp) |expected| {
@@ -717,4 +986,449 @@ test "model selection proof cache allocation failure does not deny authenticated
     try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
     failing.fail_index = std.math.maxInt(usize);
     try artifacts.verify();
+}
+
+test "model selection construction keeps captured root and directory targets" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |managed_model| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        for ([_][]const u8{ "first", "second" }) |name| {
+            const nested = try std.fs.path.join(a, &.{ name, "encoder" });
+            defer a.free(nested);
+            try tmp.dir.createDirPath(io, nested);
+        }
+        try tmp.dir.writeFile(io, .{ .sub_path = "first/encoder/model.gguf", .data = "aaaa" });
+        if (managed_model) try tmp.dir.writeFile(io, .{ .sub_path = "first/.antfly-download-complete.json", .data = "{\"version\":2,\"artifacts\":[{\"path\":\"encoder/model.gguf\",\"size\":4}]}" });
+        try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const alias = try std.fs.path.join(a, &.{ root, "current" });
+        defer a.free(alias);
+        const component = try std.fs.path.join(a, &.{ alias, "encoder" });
+        defer a.free(component);
+        var artifacts = try PublishedArtifacts.init(a, io, alias, null);
+        defer artifacts.deinit();
+        try artifacts.verify();
+        try tmp.dir.deleteFile(io, "current");
+        try tmp.dir.symLink(io, "second", "current", .{ .is_directory = true });
+        const captured = try artifacts.constructionPath(component);
+        defer a.free(captured);
+        const first = try tmp.dir.realPathFileAlloc(io, "first/encoder", a);
+        defer a.free(first);
+        try std.testing.expectEqualStrings(first, captured);
+        try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+    }
+}
+
+test "model selection final verification detects member alias retargets" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "first.gguf", .data = "aaaa" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "second.gguf", .data = "bbbb" });
+    try tmp.dir.symLink(io, "first.gguf", "model.gguf", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = "{\"version\":2,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":4}]}" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var artifacts = try PublishedArtifacts.init(a, io, root, null);
+    defer artifacts.deinit();
+    try artifacts.verifyFile("model.gguf");
+    try artifacts.verify();
+    try tmp.dir.deleteFile(io, "model.gguf");
+    try tmp.dir.symLink(io, "second.gguf", "model.gguf", .{});
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+}
+
+test "model selection namespace rebasing does not inspect unused alternatives" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "first");
+    try tmp.dir.createDirPath(io, "second");
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const alias = try std.fs.path.join(a, &.{ root, "current" });
+    defer a.free(alias);
+    var artifacts = try PublishedArtifacts.init(a, io, alias, null);
+    defer artifacts.deinit();
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "second", "current", .{ .is_directory = true });
+    const optional = try std.fs.path.join(a, &.{ alias, "absent/missing.onnx" });
+    defer a.free(optional);
+    const rebased = try artifacts.namespacePath(optional);
+    defer a.free(rebased);
+    const expected = try std.fs.path.join(a, &.{ root, "first/absent/missing.onnx" });
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, rebased);
+    // Rebasing grants no execution permission and does not follow the new alias.
+    try std.testing.expectError(error.FileNotFound, artifacts.constructionPath(rebased));
+    const outside = try std.fs.path.join(a, &.{ root, "second" });
+    defer a.free(outside);
+    const unchanged = try artifacts.namespacePath(outside);
+    defer a.free(unchanged);
+    try std.testing.expectEqualStrings(outside, unchanged);
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.constructionPath(unchanged));
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+}
+
+fn directDirectoryScopeAllocationScenario(a: std.mem.Allocator, file: []const u8, root: []const u8) !void {
+    var artifacts = try PublishedArtifacts.init(a, std.testing.io, file, null);
+    defer artifacts.deinit();
+    try artifacts.bindDirectoryScope(root);
+    try artifacts.bindDirectoryScope(root);
+    const path = try std.fs.path.join(a, &.{ root, "config.json" });
+    defer a.free(path);
+    const config = try artifacts.constructionPath(path);
+    defer a.free(config);
+    const relative = try artifacts.read("config.json", 1024);
+    defer a.free(relative);
+    const direct = try artifacts.readPath(config, 1024);
+    defer a.free(direct);
+    try std.testing.expectEqualStrings("{}", relative);
+    try std.testing.expectEqualStrings(relative, direct);
+    try artifacts.verify();
+}
+
+test "model selection direct directory scopes contain sidecars and unwind allocation failures" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.createDirPath(io, "foreign");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.gguf", .data = "weights" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "foreign/config.json", .data = "{}" });
+    const root = try tmp.dir.realPathFileAlloc(io, "model", a);
+    defer a.free(root);
+    const file = try tmp.dir.realPathFileAlloc(io, "model/model.gguf", a);
+    defer a.free(file);
+    const foreign = try tmp.dir.realPathFileAlloc(io, "foreign", a);
+    defer a.free(foreign);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, directDirectoryScopeAllocationScenario, .{ file, root });
+    var artifacts = try PublishedArtifacts.init(a, io, file, null);
+    defer artifacts.deinit();
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.bindDirectoryScope(foreign));
+    try artifacts.bindDirectoryScope(root);
+    try std.testing.expectError(error.InvalidModelArtifactKind, artifacts.readPath(root, 1024));
+    const outside = try std.fs.path.join(a, &.{ foreign, "config.json" });
+    defer a.free(outside);
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.constructionPath(outside));
+    try tmp.dir.rename("model", tmp.dir, "previous", io);
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.gguf", .data = "weights" });
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+}
+
+test "model selection unmanaged metadata reads retain the captured root across alias switches" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "first", "second" }) |name| try tmp.dir.createDirPath(io, name);
+    try tmp.dir.writeFile(io, .{ .sub_path = "first/config.json", .data = "first" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "second/config.json", .data = "other" });
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const alias = try std.fs.path.join(a, &.{ root, "current" });
+    defer a.free(alias);
+    const logical = try std.fs.path.join(a, &.{ alias, "config.json" });
+    defer a.free(logical);
+    const original = try tmp.dir.realPathFileAlloc(io, "first/config.json", a);
+    defer a.free(original);
+    const foreign = try tmp.dir.realPathFileAlloc(io, "second/config.json", a);
+    defer a.free(foreign);
+    var artifacts = try PublishedArtifacts.init(a, io, alias, null);
+    defer artifacts.deinit();
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "second", "current", .{ .is_directory = true });
+    const relative = try artifacts.read("config.json", 1024);
+    defer a.free(relative);
+    try std.testing.expectEqualStrings("first", relative);
+    for ([_][]const u8{ logical, original }) |path| {
+        const bytes = try artifacts.readPath(path, 1024);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("first", bytes);
+    }
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.readPath(foreign, 1024));
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    try artifacts.verify();
+}
+
+test "model selection receipt discovery uses the captured root before opening metadata" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "first", "second" }) |name| {
+        try tmp.dir.createDirPath(io, name);
+        const receipt = try std.fs.path.join(a, &.{ name, managed.complete_filename });
+        defer a.free(receipt);
+        // Identical legacy receipts deliberately cannot distinguish the bytes.
+        try tmp.dir.writeFile(io, .{ .sub_path = receipt, .data = "{\"version\":2,\"artifacts\":[{\"path\":\"config.json\",\"size\":5},{\"path\":\"model.gguf\",\"size\":7}]}" });
+        const weights = try std.fs.path.join(a, &.{ name, "model.gguf" });
+        defer a.free(weights);
+        try tmp.dir.writeFile(io, .{ .sub_path = weights, .data = "weights" });
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "first/config.json", .data = "first" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "second/config.json", .data = "other" });
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const alias = try std.fs.path.join(a, &.{ root, "current" });
+    defer a.free(alias);
+    const Probe = struct {
+        dir: std.Io.Dir,
+        switched: bool = false,
+        var current: *@This() = undefined;
+        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (!current.switched and std.mem.endsWith(u8, path, managed.complete_filename)) {
+                current.switched = true;
+                current.dir.deleteFile(std.testing.io, "current") catch unreachable;
+                current.dir.symLink(std.testing.io, "second", "current", .{ .is_directory = true }) catch unreachable;
+            }
+            return original(raw, dir, path, options);
+        }
+    };
+    var probe = Probe{ .dir = tmp.dir };
+    var table = io.vtable.*;
+    Probe.current = &probe;
+    Probe.original = table.dirOpenFile;
+    table.dirOpenFile = Probe.open;
+    var artifacts = try PublishedArtifacts.init(a, .{ .userdata = io.userdata, .vtable = &table }, alias, null);
+    defer artifacts.deinit();
+    try std.testing.expect(probe.switched);
+    const bytes = try artifacts.read("config.json", 1024);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("first", bytes);
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    try artifacts.verify();
+}
+
+test "model selection standalone ONNX scopes unwind allocations and retain file binding" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/graph", .data = "weights" });
+    try tmp.dir.symLink(io, "graph", "model/model.onnx", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/config.json", .data = "{}" });
+    const root = try tmp.dir.realPathFileAlloc(io, "model", a);
+    defer a.free(root);
+    const file = try std.fs.path.join(a, &.{ root, "model.onnx" });
+    defer a.free(file);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, directDirectoryScopeAllocationScenario, .{ file, root });
+    var artifacts = try PublishedArtifacts.init(a, io, file, null);
+    defer artifacts.deinit();
+    const graph = try artifacts.constructionPath(file);
+    defer a.free(graph);
+    try std.testing.expect(std.mem.endsWith(u8, graph, "/model/graph"));
+    const base = try artifacts.constructionPath(root);
+    defer a.free(base);
+    try std.testing.expectEqualStrings(root, base);
+    const parent = std.fs.path.dirname(root).?;
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.constructionPath(parent));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/other", .data = "weights" });
+    try tmp.dir.deleteFile(io, "model/model.onnx");
+    try tmp.dir.symLink(io, "other", "model/model.onnx", .{});
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+}
+
+test "model selection direct ONNX receipt authority rejects unlisted and escaping aliases" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.onnx", .data = "weights" });
+    try tmp.dir.symLink(io, "model.onnx", "model/unlisted.onnx", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.onnx", .data = "weights" });
+    try tmp.dir.symLink(io, "../outside.onnx", "model/escape.onnx", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/.antfly-download-complete.json", .data = "{\"version\":2,\"artifacts\":[{\"path\":\"model.onnx\",\"size\":7}]}" });
+    const root = try tmp.dir.realPathFileAlloc(io, "model", a);
+    defer a.free(root);
+    for ([_][]const u8{ "unlisted.onnx", "escape.onnx" }) |name| {
+        const path = try std.fs.path.join(a, &.{ root, name });
+        defer a.free(path);
+        try std.testing.expectError(error.ModelArtifactNotPublished, PublishedArtifacts.init(a, io, path, null));
+    }
+    const path = try std.fs.path.join(a, &.{ root, "model.onnx" });
+    defer a.free(path);
+    var artifacts = try PublishedArtifacts.init(a, io, path, null);
+    defer artifacts.deinit();
+    try std.testing.expect(artifacts.publication != null);
+    try artifacts.verify();
+}
+
+fn retainedOnnxAllocationScenario(a: std.mem.Allocator, root: []const u8, path: []const u8, alias: []const u8) !void {
+    var artifacts = try PublishedArtifacts.init(a, std.testing.io, root, null);
+    defer artifacts.deinit();
+    const reader = artifacts.onnxReader().?;
+    const first = try reader.read(a, path, 0, -1, 1024);
+    defer a.free(first);
+    const second = try reader.read(a, alias, 1, 3, 1024);
+    defer a.free(second);
+    try std.testing.expectEqualStrings("weights", first);
+    try std.testing.expectEqualStrings("eig", second);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.opened_files.count());
+    try artifacts.verify();
+}
+
+test "model selection retained ONNX aliases share one handle and unwind every allocation failure" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = "weights" });
+    try tmp.dir.symLink(io, "model.onnx", "alias.onnx", .{});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("weights", &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const json = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .artifacts = .{ .{ .path = "model.onnx", .size = 7, .sha256 = hex }, .{ .path = "alias.onnx", .size = 7, .sha256 = hex } } }, .{});
+    defer a.free(json);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = json });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "model.onnx" });
+    defer a.free(path);
+    const alias = try std.fs.path.join(a, &.{ root, "alias.onnx" });
+    defer a.free(alias);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, retainedOnnxAllocationScenario, .{ root, path, alias });
+    var artifacts = try PublishedArtifacts.init(a, io, root, null);
+    defer artifacts.deinit();
+    const reader = artifacts.onnxReader().?;
+    const borrowed = try reader.open(path);
+    borrowed.deinit();
+    try std.testing.expectError(error.ExternalRegionOutOfBounds, reader.read(a, path, 8, 1, 100));
+    try std.testing.expectError(error.FileTooLarge, reader.read(a, path, 0, -1, 3));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = "changed" });
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+}
+
+test "model selection bounded ONNX cache pins active readers and authenticates evicted reopens" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const count = PublishedArtifacts.onnx_handle_capacity * 3;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Artifact = struct { path: []const u8, size: u64, sha256: []const u8 };
+    const members = try scratch.alloc(Artifact, count);
+    const paths = try scratch.alloc([]const u8, count);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("weights", &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", scratch);
+    for (members, paths, 0..) |*member, *path, i| {
+        const name = if (i == 0) "model.onnx" else try std.fmt.allocPrint(scratch, "{d}.data", .{i});
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "weights" });
+        member.* = .{ .path = name, .size = 7, .sha256 = &hex };
+        path.* = try std.fs.path.join(scratch, &.{ root, name });
+    }
+    const json = try std.json.Stringify.valueAlloc(scratch, .{ .version = @as(u32, 2), .artifacts = members }, .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = json });
+    // Acquisitions share checksum proofs, never mutable handle/borrow state.
+    // Exercise overlapping many-file loads under the same descriptor budget.
+    {
+        var cache = VerificationCache{};
+        defer cache.deinit(a);
+        const Worker = struct {
+            root: []const u8,
+            paths: []const []const u8,
+            cache: *VerificationCache,
+            start: *std.Io.Event,
+            failure: ?anyerror = null,
+            fn acquire(self: *@This()) !void {
+                var catalog = try PublishedArtifacts.init(std.testing.allocator, std.testing.io, self.root, null);
+                defer catalog.deinit();
+                catalog.verification_cache = self.cache;
+                try self.start.wait(std.testing.io);
+                const source = catalog.onnxReader().?;
+                const graph = try source.open(self.paths[0]);
+                defer graph.deinit();
+                for (0..2) |_| for (self.paths[1..]) |path| {
+                    const bytes = try source.read(std.testing.allocator, path, 0, -1, 1024);
+                    defer std.testing.allocator.free(bytes);
+                    try std.testing.expectEqualStrings("weights", bytes);
+                    try std.testing.expect(catalog.opened_files.count() <= PublishedArtifacts.onnx_handle_capacity);
+                };
+                try graph.validate();
+                try catalog.verify();
+            }
+            fn run(self: *@This()) void {
+                self.acquire() catch |err| {
+                    self.failure = err;
+                };
+            }
+        };
+        var start: std.Io.Event = .unset;
+        var workers: [3]Worker = undefined;
+        var tasks: [workers.len]std.Io.Future(void) = undefined;
+        var launched: usize = 0;
+        defer {
+            start.set(io);
+            for (tasks[0..launched]) |*task| task.await(io);
+        }
+        for (&workers, 0..) |*worker, i| {
+            worker.* = .{ .root = root, .paths = paths, .cache = &cache, .start = &start };
+            tasks[i] = try io.concurrent(Worker.run, .{worker});
+            launched += 1;
+        }
+        start.set(io);
+        for (&tasks) |*task| task.await(io);
+        for (workers) |worker| if (worker.failure) |err| return err;
+    }
+    var artifacts = try PublishedArtifacts.init(a, io, root, null);
+    defer artifacts.deinit();
+    const reader = artifacts.onnxReader().?;
+    {
+        const pinned = try reader.open(paths[0]);
+        defer pinned.deinit();
+        for (paths[1..]) |path| {
+            const bytes = try reader.read(a, path, 0, -1, 1024);
+            defer a.free(bytes);
+            try std.testing.expectEqualStrings("weights", bytes);
+            try std.testing.expect(artifacts.opened_files.count() <= PublishedArtifacts.onnx_handle_capacity);
+        }
+        try pinned.validate();
+        try std.testing.expect(artifacts.opened_files.contains(0));
+        try std.testing.expect(!artifacts.opened_files.contains(1));
+        // The evicted proof must not authorize a replacement, even of the same
+        // size and with the original pathname restored before the final fence.
+        try tmp.dir.rename("1.data", tmp.dir, "saved.data", io);
+        try tmp.dir.writeFile(io, .{ .sub_path = "1.data", .data = "foreign" });
+        try std.testing.expectError(error.ModelArtifactsChanging, reader.read(a, paths[1], 0, -1, 1024));
+        try tmp.dir.deleteFile(io, "1.data");
+        try tmp.dir.rename("saved.data", tmp.dir, "1.data", io);
+    }
+    // Active borrows cannot be evicted, including on an error path. Once a
+    // borrow is released the same acquisition can continue within its budget.
+    var pins: [PublishedArtifacts.onnx_handle_capacity]PublishedArtifacts.ExternalDataReader.OpenedFile = undefined;
+    var acquired: usize = 0;
+    defer for (pins[0..acquired]) |pin| pin.deinit();
+    for (&pins, paths[2 .. 2 + pins.len]) |*pin, path| {
+        pin.* = try reader.open(path);
+        acquired += 1;
+    }
+    try std.testing.expectError(error.ResourceLimitExceeded, reader.open(paths[count - 1]));
+    pins[acquired - 1].deinit();
+    acquired -= 1;
+    const last = try reader.open(paths[count - 1]);
+    defer last.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = members[count - 1].path, .data = "changed" });
+    try std.testing.expectError(error.ModelArtifactsChanging, last.validate());
 }

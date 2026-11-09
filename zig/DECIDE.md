@@ -54,6 +54,32 @@ admission remain shared with managed inference. Calibration binds the model,
 geometry, renderer, question prototypes and selection mode. Threshold quality
 still needs application-specific held-out evaluation.
 
+## Cascades
+
+`lib/decisions/cascade.zig` owns the cascade contract: compilation, canonical
+identity (`definition_sha256`, credentials excluded), band evaluation over
+public answers and per-input trace assembly. Stage execution is injected.
+
+The shared decision runtime (`pkg/antfly-embedded/src/functions/runtime.zig`)
+is the only executor, so the gateway's `deciders/<name>`, SQL `ai_*`
+functions, decision enrichments and resolver adjudication share it. The
+registry stores each stage as an ordinary decider under `<cascade>#<stage>`, so
+quotas, generator resolution and normalization are unchanged. Definitions and
+static capabilities compile once into registry-owned plans. Native model
+discovery runs only when the stage is reached, under the cascade deadline and
+failure policy. Stage entries
+are hidden from gateway resolution and the catalog, and configured names
+cannot contain `#`. `evaluateCore` dispatches cascades before admission;
+inputs sharing a cascade, routing scope and questions escalate together, and
+each stage re-enters `evaluateCore` as an ordinary batch.
+
+Cascade admission intersects the stages' configured static contracts; actual
+native model capabilities are checked when a stage is reached. Questions are
+limited to choice and predicate. Normalization validates each answer by its
+own decision method, because typed and generated stages can answer in one
+batch. Escalation reads successful answers only; whole-stage and per-input
+failures follow `on_failure` and never fall through to another stage.
+
 ## Batches and limits
 
 A single request uses `input` and returns `answers`. A batch uses
@@ -103,3 +129,54 @@ an accuracy evaluation.
 These checks qualify the API revision. Production quality and throughput claims
 need current workload evidence; earlier performance artifacts retain their
 original source provenance.
+
+Post-call limits use metered failed outcomes in partial execution. Typed
+windows drain and account all completed siblings before validating results or
+enforcing actual token usage. An overrun clears the stage invocation's answers,
+preserves per-item costs (zero for unsubmitted inputs), and prevents later
+windows from being sent. Reaching the allowance exactly preserves completed
+answers and rejects only unsubmitted inputs. Generated windows and repairs use
+the same allowance; each physical call's usage is apportioned only among its
+actual inputs, with estimates explicitly labelled. Strict callers
+still receive an error; cancellation, deadlines and allocation failures remain
+fatal. Direct generated enrichments also retain their physical execution report
+on a post-call limit failure, and an exhausted allowance prevents another call.
+
+### Cascade agreement
+
+Later stages may set `require_agreement: true`. The shared cascade executor
+compares the preceding and current normalized votes, scoped by `when.question`
+or across all questions. Choice strings must match; predicate probabilities
+must lie strictly on the same side of 0.5. Bounded stack scratch sorts at most
+64 question names, without allocating per-result plans or reparsing prompts.
+A disagreement stops that row; `keep_previous` on a guarded failed attempt
+records unverified agreement. Both states block scalar and predicate consumers
+while retaining raw answers and usage. `ai_decide` retains the complete trace.
+Trace validation recomputes the gate from the frozen definition and answers.
+Absent and explicit-false guards preserve existing canonical identities.
+Configuration boundaries omit disabled guard fields before forwarding or
+persisting definitions, preserving the epoch-30 wire shape. This normalization
+runs on caller-owned trees or configuration copies, outside per-result execution.
+Enabled guards require reader epoch 31 in persisted producers and resolver
+policies; unguarded cascades retain epoch 30.
+
+
+Confidence bands consume measured probabilities. A dynamically proxied
+verdict-only answer is rejected before its producing stage commits success if a
+later band needs that answer. Band validation checks every unscoped question,
+including questions after an earlier in-band answer. Valid upstream or local
+vetoes stop first, so terminal categorical votes remain valid evidence.
+
+Guarded stage receipts record sorted `agreement_questions` for each comparison
+that actually ran. Proxy consumers verify those selected votes without compiling
+the upstream policy. Historical full traces with ambiguous omitted scope abstain;
+metadata-only summaries retain their existing contract. Flat upstream dependency
+projections are stage provenance and cannot override a supplied public trace.
+
+Choice and predicate evidence validation is shared by local stages, upstream full
+traces, and resolver thresholds. Complete stage dependency projections carry
+`upstream_revisions_version: 2` and an explicit `upstream_revisions_complete`
+boolean. Uncertainty does not consume the 32 actual dependency slots. Version-1
+markers remain readable and older hashes can be recognized without authorizing
+identity verdict reuse. Cascade definitions are pinned independently of model
+revisions; validated historical vetoes can still abstain offline at the node limit.

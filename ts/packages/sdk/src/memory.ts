@@ -110,3 +110,76 @@ export function createMemoryClient(
   }
   return client as unknown as Client<MemoryPaths>;
 }
+
+/** Catalog scope for a memory call; omitted fields use the server defaults. */
+export interface MemoryScopeOptions {
+  /** `X-Antfly-Database` (server default `"default"`). */
+  database?: string;
+  /** `X-Antfly-Namespace` (server default `"public"`). */
+  namespace?: string;
+  /** `X-Antfly-Memory-Branch` (server default `""`, the main branch). */
+  branch?: string;
+}
+
+/** Scope plus the idempotency key for mutating memory calls. */
+export interface MemoryCallOptions extends MemoryScopeOptions {
+  /** Stable per-principal key (≤256 chars); a random UUID when omitted. Reuse it to retry safely. */
+  idempotencyKey?: string;
+}
+
+type MemoryGetQuery<P extends keyof MemoryPaths> = MemoryPaths[P] extends {
+  get: { parameters: { query?: infer Query } };
+}
+  ? NonNullable<Query>
+  : never;
+
+export type MemoryListQuery = MemoryGetQuery<"/memory/v1/spaces/{space}/memories">;
+export type MemoryHistoryQuery = MemoryGetQuery<"/memory/v1/spaces/{space}/memories/{id}/history">;
+export type MemoryPageQuery = MemoryGetQuery<"/memory/v1/spaces/{space}/entities">;
+export type MemoryEpisodeQuery = MemoryGetQuery<"/memory/v1/spaces/{space}/episodes">;
+
+type MemoryAssertionInput = Omit<MemorySchemas["MemoryAssertion"], "evidence"> &
+  Partial<Pick<MemorySchemas["MemoryAssertion"], "evidence">>;
+
+/** Input for `client.memory.remember`: one text evidence item plus optional observation fields. */
+export type MemoryRememberInput = Omit<
+  MemorySchemas["MemoryObservationRequest"],
+  "evidence" | "assertions"
+> & {
+  /** The text to remember. */
+  text: string;
+  /** Evidence id; a random UUID when omitted. */
+  id?: string;
+  /** Evidence `source_id`. */
+  sourceId?: string;
+  /** Extra evidence fields (author, event_time, thread_id, visibility, ...). */
+  evidence?: Partial<Omit<MemorySchemas["MemoryEvidence"], "id" | "text" | "source_id">>;
+  /** Assertions without `evidence` cite the remembered text. */
+  assertions?: MemoryAssertionInput[];
+};
+
+export type MemoryScopeHeaders = {
+  "X-Antfly-Database"?: string;
+  "X-Antfly-Namespace"?: string;
+  "X-Antfly-Memory-Branch"?: string;
+};
+
+/** Scope headers for the fields that were provided. */
+export function memoryScopeHeaders(options?: MemoryScopeOptions): MemoryScopeHeaders {
+  const headers: MemoryScopeHeaders = {};
+  if (options?.database !== undefined) headers["X-Antfly-Database"] = options.database;
+  if (options?.namespace !== undefined) headers["X-Antfly-Namespace"] = options.namespace;
+  if (options?.branch !== undefined) headers["X-Antfly-Memory-Branch"] = options.branch;
+  return headers;
+}
+
+/** Scope headers plus `Idempotency-Key`; a bare string is the key (legacy positional form). */
+export function memoryMutationHeaders(
+  options?: string | MemoryCallOptions
+): MemoryScopeHeaders & { "Idempotency-Key": string } {
+  const resolved = typeof options === "string" ? { idempotencyKey: options } : options;
+  return {
+    ...memoryScopeHeaders(resolved),
+    "Idempotency-Key": resolved?.idempotencyKey ?? globalThis.crypto.randomUUID(),
+  };
+}

@@ -39,6 +39,12 @@ type Backend interface {
 	CancelRun(context.Context, string, string) (Run, error)
 }
 
+// ProcessingBackend is optional for older runtimes implementing acquisition only.
+type ProcessingBackend interface {
+	PreviewProcessing(context.Context, string, ProcessingPreset) (ProcessingPreview, error)
+	ProcessingJob(context.Context, string, ProcessingJobRequest) (map[string]any, error)
+}
+
 type HTTPError struct {
 	Status int
 	Code   string
@@ -140,6 +146,23 @@ func Handler(b Backend) http.Handler {
 					result, err = b.RemoveSource(r.Context(), id, purge == "true")
 				default:
 					err = Failure(405, "method_not_allowed")
+				}
+			case len(parts) == 3 && (parts[2] == "processing-preview" || parts[2] == "processing-jobs") && r.Method == http.MethodPost:
+				backend, ok := b.(ProcessingBackend)
+				if !ok {
+					err = Failure(503, "processing_unavailable")
+					break
+				}
+				if parts[2] == "processing-preview" {
+					var input ProcessingPreset
+					if err = Decode(w, r, &input); err == nil {
+						result, err = backend.PreviewProcessing(r.Context(), id, input)
+					}
+				} else {
+					var input ProcessingJobRequest
+					if err = Decode(w, r, &input); err == nil {
+						result, err = backend.ProcessingJob(r.Context(), id, input)
+					}
 				}
 			case len(parts) == 3 && parts[2] == "runs":
 				switch r.Method {

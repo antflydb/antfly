@@ -101,7 +101,14 @@ def management_plan(project, image=None):
     }
 
 
-def native_plan(project, archive_auth, current_auth, archive_prefix="archive"):
+def native_plan(
+    project,
+    archive_auth,
+    current_auth,
+    archive_prefix="archive",
+    *,
+    owned_serving=False,
+):
     path = PurePosixPath(archive_prefix)
     if (
         str(path) != archive_prefix
@@ -111,6 +118,10 @@ def native_plan(project, archive_auth, current_auth, archive_prefix="archive"):
         or not re.fullmatch(r"[A-Za-z0-9_./-]+", archive_prefix)
     ):
         raise ValueError("Archive prefix must be a canonical path within archive/")
+    if owned_serving and not archive_prefix.endswith(".parquet-manifest.json"):
+        raise ValueError(
+            "Native owner serving requires a sealed .parquet-manifest.json archive"
+        )
     current = table_definition(
         SimpleNamespace(
             mode="managed",
@@ -124,6 +135,10 @@ def native_plan(project, archive_auth, current_auth, archive_prefix="archive"):
     archive["schema"]["base_source"] = {
         "kind": "external",
         "format": "parquet",
+        # HN exports use fresh object names. This promises immutable file
+        # contents, not immutable prefix membership, and avoids per-file HEAD
+        # revalidation when using the published index.
+        "object_mutability": "immutable",
         "table_id": "hn-archive",
         "uri": f"gs://{project}-hn-archive/{archive_prefix}",
         "credentials": {"ref": connection(archive_auth)},
@@ -133,7 +148,7 @@ def native_plan(project, archive_auth, current_auth, archive_prefix="archive"):
     for table, definition in (("hn_archive", archive), ("hn_current", current)):
         for index in definition["schema"]["relational_indexes"]:
             index["name"] = table + "_" + index["name"]
-    return {
+    result = {
         "archive-table.json": archive,
         "current-table.json": current,
         "hackernews-source.json": {
@@ -146,6 +161,12 @@ def native_plan(project, archive_auth, current_auth, archive_prefix="archive"):
             }
         },
     }
+
+    if owned_serving:
+        result["native-serving-config.json"] = {
+            "lake_indexes": {"serving_cuts": {"enabled": True}}
+        }
+    return result
 
 
 def main():
@@ -163,6 +184,11 @@ def main():
         default="archive",
         help="Frozen archive snapshot or private qualification prefix",
     )
+    native.add_argument(
+        "--owned-serving",
+        action="store_true",
+        help="Prepare candidate native owner configuration; requires a sealed archive and compatible engine release",
+    )
     native.add_argument("--archive-auth", required=True)
     native.add_argument("--current-auth", required=True)
     args = parser.parse_args()
@@ -171,7 +197,11 @@ def main():
             management_plan(args.project, args.image)
             if args.stage == "management"
             else native_plan(
-                args.project, args.archive_auth, args.current_auth, args.archive_prefix
+                args.project,
+                args.archive_auth,
+                args.current_auth,
+                args.archive_prefix,
+                owned_serving=args.owned_serving,
             )
         )
         # A plan is review evidence; do not silently overwrite earlier inputs.

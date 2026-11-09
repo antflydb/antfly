@@ -17,6 +17,10 @@ paths:
       responses:
         '200':
           description: Current profile; credentials are references only.
+          headers:
+            X-Antfly-Source-Preconditions:
+              description: Version of conditional source cutover support. Migration clients require this advertisement before copying.
+              schema: {type: string, enum: ['2']}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Profile'}
@@ -80,14 +84,27 @@ paths:
       - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
     put:
       operationId: putSource
-      description: Reconfiguration is serialized with sync. The body id must equal the path id.
+      description: Reconfiguration is serialized with sync. The body id must equal the path id. Migration cutover supplies If-Match to reject a changed or removed source with HTTP 412.
+      parameters:
+        - name: If-Match
+          in: header
+          description: Expected source revision for conditional migration cutover.
+          schema: {type: string}
+        - name: X-Antfly-Migration-Connections
+          in: header
+          description: JSON object mapping the two transfer connection names to their expected configuration digests; checked atomically with source mutation or sync admission. A mismatch returns HTTP 412.
+          schema: {type: string}
+        - name: X-Antfly-Local-Migration
+          in: header
+          description: JSON LocalMigrationReceipt committed atomically with cutover. Requires both conditional headers. Post-cutover retries must match the durable receipt exactly; mismatches return HTTP 412.
+          schema: {type: string, maxLength: 16384}
       requestBody:
         required: true
         content:
           application/json:
             schema: {$ref: '#/components/schemas/Source'}
       responses:
-        '200': {$ref: '#/components/responses/Mutation'}
+        '200': {$ref: '#/components/responses/PutSourceMutation'}
         default: {$ref: '#/components/responses/Error'}
     delete:
       operationId: removeSource
@@ -107,6 +124,15 @@ paths:
   /v1/sync:
     post:
       operationId: startSourceSync
+      parameters:
+        - name: If-Match
+          in: header
+          description: Expected revision of source_id at sync admission. A mismatch, missing source_id, or purge_only returns HTTP 412.
+          schema: {type: string}
+        - name: X-Antfly-Migration-Connections
+          in: header
+          description: JSON object mapping both transfer connection names to expected configuration digests. Checked atomically at sync admission; a mismatch returns HTTP 412.
+          schema: {type: string}
       description: >-
         Start one durable sync of the full profile, or of one source with
         source_id. Sync is serialized across the service, so another source's
@@ -218,6 +244,27 @@ components:
       content:
         application/json:
           schema: {$ref: '#/components/schemas/SyncJob'}
+    PutSourceMutation:
+      description: >-
+        Source configuration persisted. `rekeys` is true only when this source
+        had no namespace before this call and the call changed its connection
+        or config (including setting a namespace for the first time on a
+        populated source): the next sync re-keys every row of this source
+        exactly as it always did, because nothing before this field existed
+        separated identity from location. It is false whenever a namespace
+        was already set (identity already follows the namespace, not the
+        connection or config) and false for a source newly created in this
+        same call (it is assigned a namespace before any row exists, so
+        nothing is ever keyed before it has one).
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [version, state, rekeys]
+            properties:
+              version: {type: integer, enum: [1]}
+              state: {type: string}
+              rekeys: {type: boolean}
   schemas:
     Connection:
       type: object
@@ -249,6 +296,26 @@ components:
       properties:
         public: {type: boolean}
         readers: {type: array, items: {type: string}}
+    SourceIdentity:
+      type: object
+      additionalProperties: false
+      properties:
+        namespace:
+          type: string
+          description: >-
+            Opaque prefix that scopes this source's row keys, independent of
+            its connection or config. Record keys are
+            sha256(namespace + "/" + relative_key), where relative_key is a
+            connector-reported key relative to the source's root (the
+            provider's native ID for providers without a path-like key, such
+            as Drive or GitHub, for which moving across providers is not
+            meaningful). Assigned automatically at source creation and
+            immutable afterward: it is set once, never edited, so that a
+            later connection or provider change never changes row identity.
+            Left unset on sources created before this field existed; such a
+            source keeps today's key formula (sha256 of its provider ID)
+            until something explicitly sets a namespace, at which point any
+            row whose key would change is re-keyed once.
     Source:
       type: object
       additionalProperties: false
@@ -261,7 +328,18 @@ components:
         config: {type: object, additionalProperties: true}
         permissions: {$ref: '#/components/schemas/Permissions'}
         permission_ttl_seconds: {type: integer}
-        publication: {type: string, enum: [text, media], default: text}
+        publication: {type: string, enum: [native, text, media], default: native}
+        search_version: {type: integer, minimum: 1, maximum: 2}
+        streams:
+          type: array
+          maxItems: 64
+          items: {$ref: './management.yaml#/components/schemas/SearchStream'}
+        artifacts:
+          type: array
+          maxItems: 64
+          items: {$ref: './management.yaml#/components/schemas/ArtifactBinding'}
+        processing: {$ref: './management.yaml#/components/schemas/ProcessingDeclaration'}
+        identity: {$ref: '#/components/schemas/SourceIdentity'}
     Profile:
       type: object
       required: [version, endpoint, connections, sources]
@@ -273,6 +351,26 @@ components:
         principals: {type: array, items: {type: string}}
         connections: {type: object, additionalProperties: {$ref: '#/components/schemas/Connection'}}
         sources: {type: array, items: {$ref: '#/components/schemas/Source'}}
+        local_migrations:
+          type: object
+          readOnly: true
+          additionalProperties: {$ref: '#/components/schemas/LocalMigrationReceipt'}
+    LocalMigrationReceipt:
+      type: object
+      readOnly: true
+      required: [version, source_id, table, namespace, from_connection, from_prefix, from_binding, to_connection, to_bucket, to_prefix, to_binding]
+      properties:
+        version: {type: integer, enum: [1]}
+        source_id: {type: string}
+        table: {type: string}
+        namespace: {type: string}
+        from_connection: {type: string}
+        from_prefix: {type: string}
+        from_binding: {type: string}
+        to_connection: {type: string}
+        to_bucket: {type: string}
+        to_prefix: {type: string}
+        to_binding: {type: string}
     SyncJob:
       type: object
       required: [version, id, state, started_at]

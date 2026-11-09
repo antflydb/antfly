@@ -221,7 +221,18 @@ pub fn eligible(session: session_mod.Session, inputs: []const Tensor) bool {
     return true;
 }
 
-pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task: micro.Task, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: *std.atomic.Mutex, inputs: []const Tensor, control: ?Control, deadline: ?std.Io.Clock.Timestamp, wait_us: u64) ![]Tensor {
+fn collectionWaitUs(override: ?u64, backend_default: u64) u64 {
+    return override orelse @max(@as(u64, 200), backend_default);
+}
+
+test "tensor microbatch explicit collection override preserves zero and bounded caller policy" {
+    try std.testing.expectEqual(@as(u64, 5000), collectionWaitUs(null, 5000));
+    try std.testing.expectEqual(@as(u64, 200), collectionWaitUs(null, 0));
+    try std.testing.expectEqual(@as(u64, 0), collectionWaitUs(0, 5000));
+    try std.testing.expectEqual(@as(u64, 20), collectionWaitUs(20, 5000));
+}
+
+pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task: micro.Task, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: *std.atomic.Mutex, inputs: []const Tensor, control: ?Control, deadline: ?std.Io.Clock.Timestamp, wait_us: ?u64) ![]Tensor {
     if (control) |active| try active.check();
     if (!eligible(session, inputs)) return direct(allocator, .{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = 1 });
     const alloc = std.heap.smp_allocator;
@@ -252,9 +263,13 @@ pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task
         try std.json.Stringify.value(.{ .name = tensor.name, .dtype = tensor.dtype, .shape = if (broadcast) tensor.shape else tensor.shape[1..], .value = if (broadcast) tensor.data else &.{} }, .{}, &signature.writer);
     }
     const ticket = Ticket{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = @intCast(inputs[0].shape[0]) };
+    const policy = session.forwardBatchPolicy(inputs);
+    const max_items = @min(@as(usize, 8), policy.max_items);
+    const max_rows = @min(@as(usize, 64), policy.max_rows);
+    if (max_items == 0 or max_rows == 0) return error.InvalidMicrobatchLimits;
     // Requests already larger than the coalescing window keep their existing
     // native batch. Do not turn a valid caller batch into a broker size error.
-    if (ticket.rows > 64 or bytes > 64 * 1024 * 1024) return direct(allocator, ticket);
+    if (ticket.rows > max_rows or bytes > 64 * 1024 * 1024) return direct(allocator, ticket);
     if (permit) |borrowed| {
         if (!try borrowed.yieldExecution()) return direct(allocator, ticket);
     }
@@ -271,7 +286,7 @@ pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task
         .task = task,
         .schema = signature.written(),
         .resource_class = if (session.backend().usesGpuHostedSession()) .gpu else .cpu,
-    }, .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_tokens = 64, .max_bytes = 64 * 1024 * 1024, .max_wait_us = wait_us }, &.{.{ .bytes = bytes, .tokens = ticket.rows }}, &.{.{}}, deadline, if (control) |*active| .{ .ptr = active, .is_cancelled_fn = Probe.canceled } else .{}, &.{ticket}, broker, execute);
+    }, .{ .mode = .native, .preferred_items = max_items, .max_items = max_items, .max_tokens = max_rows, .max_bytes = 64 * 1024 * 1024, .max_wait_us = collectionWaitUs(wait_us, policy.collection_wait_us) }, &.{.{ .bytes = bytes, .tokens = ticket.rows }}, &.{.{}}, deadline, if (control) |*active| .{ .ptr = active, .is_cancelled_fn = Probe.canceled } else .{}, &.{ticket}, broker, execute);
     defer {
         for (results) |result| switch (result.result) {
             .value => |value| destroy(alloc, value),

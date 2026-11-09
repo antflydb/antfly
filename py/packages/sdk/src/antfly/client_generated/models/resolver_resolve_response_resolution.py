@@ -24,12 +24,15 @@ class ResolverResolveResponseResolution:
     Attributes:
         config_generation (int):
         entities (list[ResolverResolvedEntity]):
+        adjudication_execution_hash (str | Unset): Shared base policy and source binding for adjudication receipts,
+            independent of model revisions. Omitted by older writers.
         skipped_mentions (int | Unset):
         field_resolution_work (ResolverResolveResponseResolutionResolutionWork | Unset):
     """
 
     config_generation: int
     entities: list[ResolverResolvedEntity]
+    adjudication_execution_hash: str | Unset = UNSET
     skipped_mentions: int | Unset = UNSET
     field_resolution_work: ResolverResolveResponseResolutionResolutionWork | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -41,6 +44,8 @@ class ResolverResolveResponseResolution:
         for entities_item_data in self.entities:
             entities_item = entities_item_data.to_dict()
             entities.append(entities_item)
+
+        adjudication_execution_hash = self.adjudication_execution_hash
 
         skipped_mentions = self.skipped_mentions
 
@@ -56,6 +61,8 @@ class ResolverResolveResponseResolution:
                 "entities": entities,
             }
         )
+        if adjudication_execution_hash is not UNSET:
+            field_dict["adjudication_execution_hash"] = adjudication_execution_hash
         if skipped_mentions is not UNSET:
             field_dict["skipped_mentions"] = skipped_mentions
         if field_resolution_work is not UNSET:
@@ -80,6 +87,8 @@ class ResolverResolveResponseResolution:
 
             entities.append(entities_item)
 
+        adjudication_execution_hash = d.pop("adjudication_execution_hash", UNSET)
+
         skipped_mentions = d.pop("skipped_mentions", UNSET)
 
         _field_resolution_work = d.pop("_resolution_work", UNSET)
@@ -92,6 +101,7 @@ class ResolverResolveResponseResolution:
         resolver_resolve_response_resolution = cls(
             config_generation=config_generation,
             entities=entities,
+            adjudication_execution_hash=adjudication_execution_hash,
             skipped_mentions=skipped_mentions,
             field_resolution_work=field_resolution_work,
         )

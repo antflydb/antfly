@@ -15,7 +15,10 @@
 
 const std = @import("std");
 
+pub const ImageResample = enum(u8) { nearest = 0, bilinear = 2, bicubic = 3 };
+
 pub const PreprocessorConfig = struct {
+    resample: ImageResample = .bicubic,
     do_resize: bool = true,
     do_rescale: bool = true,
     do_normalize: bool = true,
@@ -42,3 +45,26 @@ pub const PreparedImage = struct {
         self.allocator.free(self.pixel_values);
     }
 };
+
+/// Version execution semantics separately from checkpoint bytes so corrected
+/// preprocessing cannot reuse embeddings produced by the earlier fixed filter.
+pub const preprocessing_recipe = "qwen2vl-declared-resample-scale-v2";
+
+pub fn preprocessingRevision(artifacts: [32]u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(preprocessing_recipe);
+    hash.update(&.{0});
+    hash.update(&artifacts);
+    var result: [32]u8 = undefined;
+    hash.final(&result);
+    return result;
+}
+
+test "model processor resampling execution identity versions preprocessing semantics" {
+    const artifacts: [32]u8 = @splat(1);
+    const revision = preprocessingRevision(artifacts);
+    try std.testing.expect(!std.mem.eql(u8, &artifacts, &revision));
+    try std.testing.expectEqual(revision, preprocessingRevision(artifacts));
+    const other = preprocessingRevision(@splat(2));
+    try std.testing.expect(!std.mem.eql(u8, &revision, &other));
+}

@@ -127,6 +127,8 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 pub const metrics_mod = @import("metrics.zig");
 const inference_admission_mod = @import("inference_admission.zig");
 const executor_microbatch = @import("executor_microbatch.zig");
+const gliner_microbatch = @import("gliner_microbatch.zig");
+const OutputOwner = @import("output_owner.zig").OutputOwner;
 pub const ExecutorCancellation = executor_microbatch.Cancellation;
 const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
@@ -1291,9 +1293,10 @@ pub const NodeConfig = struct {
     request_limits: RequestLimits = .{},
     generation_batching: GenerationBatchingConfig = .{},
     cooperative_execution: CooperativeExecutionConfig = .{},
-    /// Maximum queueing delay used only by resolved native executor batches.
-    /// Serial compatibility paths bypass the broker and never pay this delay.
-    executor_microbatch_max_wait_us: u64 = 200,
+    /// Optional collection-delay override, including zero. Otherwise each
+    /// backend stage uses its declared policy (200 us for generic cohorts).
+    /// Serial compatibility paths bypass collection entirely.
+    executor_microbatch_max_wait_us: ?u64 = null,
     kernel_jit: graph_mod.kernel_jit.Config = .{},
     prompt_cache: PromptCacheConfig = .{},
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
@@ -2846,13 +2849,12 @@ fn collectOnnxDependenciesForPath(
     allocator: std.mem.Allocator,
     dependencies: *OnnxDependencies,
     maybe_path: ?[]const u8,
+    primary: bool,
+    logical_path: ?[]const u8,
 ) !void {
     const path = maybe_path orelse return;
-    if (!std.mem.endsWith(u8, path, ".onnx")) return;
-    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSet(
-        allocator,
-        path,
-    ) catch |err| {
+    if (!primary and !std.mem.endsWith(u8, path, ".onnx")) return;
+    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSetWithBase(allocator, path, if (logical_path) |logical| std.fs.path.dirname(logical) else null) catch |err| {
         if (err == error.OutOfMemory) return err;
         dependencies.valid = false;
         return;
@@ -2877,7 +2879,7 @@ fn collectCompatibilityOnnxDependencies(
         man.visual_projection_path,
         man.audio_projection_path,
     };
-    for (paths) |path| try collectOnnxDependenciesForPath(allocator, &dependencies, path);
+    for (paths, 0..) |path, index| try collectOnnxDependenciesForPath(allocator, &dependencies, path, index == 0, if (index == 0) man.onnx_logical_path else null);
     return dependencies;
 }
 
@@ -2945,6 +2947,7 @@ fn addCompatibilityManifestFacts(
     const native_arch_hint: u8 = @backingInt(man.native_arch_hint);
     signature.update(&.{ model_type, model_type_origin, native_arch_hint });
     updateCompatibilitySignatureSlice(signature, man.config_model_arch);
+    updateCompatibilitySignatureSlice(signature, man.onnx_logical_path orelse "");
     updateCompatibilitySignatureSlice(signature, man.gliner_model_type);
     updateCompatibilitySignatureSlice(signature, man.inference_bundle_family);
     signature.update(&.{
@@ -2981,6 +2984,8 @@ fn computeCompatibilitySignatureWithDependencies(
     }
     try addArtifactIdentityToSignature(allocator, io, &signature, man.model_manifest_path, true);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.jina_adapter_config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.jina_adapter_weights_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.gguf_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.gguf_projector_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.safetensors_path, false);
@@ -6088,6 +6093,7 @@ pub const Node = struct {
         prompt_tokens: usize,
         completion_tokens: usize,
         truncated: bool,
+        naturally_completed: bool = false,
         /// Prompt tokens served from the model's prefix KV cache.
         cached_prompt_tokens: usize = 0,
         silent_audio: bool = false,
@@ -6370,6 +6376,8 @@ pub const Node = struct {
             .has_audio = preflight.has_audio,
             .has_video = preflight.video_count > 0,
         });
+        var media_budget_credit = try @import("../pipelines/preprocessing_memory.zig").BudgetCredit.reserve(&run_budget, generation.fallbackImagePreparationBytes(gpt_config, model.manifest.gguf_projector_path, prompt_estimate.media_admission));
+        defer media_budget_credit.deinit();
         const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
             .{
                 .backend = backend_kind,
@@ -6535,6 +6543,7 @@ pub const Node = struct {
             .cb = cb,
             .session = model.session,
             .media_run_budget = &run_budget,
+            .media_prepaid = .{ .process_bytes = prompt_estimate.media_admission.host_scratch_bytes, .budget_bytes = media_budget_credit.bytes },
             .explicit_scratch_limit = self.config.generation_budget_overrides.scratch_limit_bytes,
             .gpt_config = gpt_config,
             .kv_dtype = kv_dtype,
@@ -6632,6 +6641,7 @@ pub const Node = struct {
             .prompt_tokens = result.prompt_tokens,
             .completion_tokens = result.tokens_used,
             .truncated = std.mem.eql(u8, result.finish_reason, "length"),
+            .naturally_completed = std.mem.eql(u8, result.finish_reason, "stop"),
             .cached_prompt_tokens = result.cached_prompt_tokens,
         };
     }
@@ -7557,7 +7567,7 @@ pub const Node = struct {
         };
         const shared = std.heap.smp_allocator;
         const Output = if (scoring) []f32 else []gliner_mod.Entity;
-        const results = try self.executorMicrobatchBroker().submitBatchControlled(GlinerTicket, Output, io, shared, .{ .model = dispatch.model, .generation = dispatch.generation, .task = .extract, .schema = schema, .transform = if (scoring) "gliner-label-scores" else "gliner-encoder", .resource_class = executorMicrobatchResourceClass(pipeline.session.backend()) }, .{ .mode = .native, .preferred_items = @min(@as(usize, 8), contract.batch.max_items), .max_items = contract.batch.max_items, .max_bytes = requestMediaMaxBytes(self), .max_wait_us = self.config.executor_microbatch_max_wait_us }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, if (scoring) executeGlinerScores else executeGlinerBatch);
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(GlinerTicket, Output, io, shared, .{ .model = dispatch.model, .generation = dispatch.generation, .task = .extract, .schema = schema, .transform = if (scoring) "gliner-label-scores" else "gliner-encoder", .resource_class = executorMicrobatchResourceClass(pipeline.session.backend()) }, .{ .mode = .native, .preferred_items = @min(@as(usize, 8), contract.batch.max_items), .max_items = contract.batch.max_items, .max_bytes = requestMediaMaxBytes(self), .max_wait_us = self.config.executor_microbatch_max_wait_us orelse 200 }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, if (scoring) executeGlinerScores else executeGlinerBatch);
         return executor_microbatch.collectOwned(Output, allocator, shared, results, if (scoring) cloneDenseRow else cloneGlinerRow, if (scoring) freeDenseRow else freeGlinerRow);
     }
 
@@ -7730,7 +7740,7 @@ pub const Node = struct {
             .max_items = rows,
             .max_bytes = requestMediaMaxBytes(self),
             .max_tokens = if (read_text) @min(model.session.executionCapabilities().text_batch_padded_tokens, if (contract.batch.max_input_tokens_per_item) |limit| limit *| rows else std.math.maxInt(usize)) else if (contract.batch.max_input_tokens_per_item) |limit| limit *| rows else std.math.maxInt(usize),
-            .max_wait_us = self.config.executor_microbatch_max_wait_us,
+            .max_wait_us = self.config.executor_microbatch_max_wait_us orelse 200,
         }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, if (sparse) executeSparseTextEmbedMicrobatch else executeTextEmbedMicrobatch);
         return try executor_microbatch.collectOwned(Output, allocator, shared, results, if (sparse) cloneSparseRow else cloneDenseRow, if (sparse) freeSparseRow else freeDenseRow);
     }
@@ -7805,11 +7815,9 @@ pub const Node = struct {
         }
     }
 
-    const read_pool_microbatch = @import("read_pool_microbatch.zig");
-    const DecideOutputOwner = read_pool_microbatch.OutputOwner;
-    const DecideRows = read_pool_microbatch.Rows;
-    const cloneDecideRows = read_pool_microbatch.clone;
-    const freeDecideRows = read_pool_microbatch.destroy;
+    const DecideRows = gliner_microbatch.ClassificationRows;
+    const cloneDecideRows = gliner_microbatch.cloneClassificationRows;
+    const freeDecideRows = gliner_microbatch.destroyClassificationRows;
 
     const DecideClassifyTicket = struct {
         model: *model_manager_mod.LoadedModel,
@@ -7852,7 +7860,7 @@ pub const Node = struct {
             }
         };
         const shared = std.heap.smp_allocator;
-        const results = try self.executorMicrobatchBroker().submitBatchControlled(DecideClassifyTicket, DecideRows, io, shared, .{ .model = model.model_dir, .generation = @intFromPtr(model), .task = .extract, .schema = key, .transform = "read-decide-classification", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_tokens = 8 * 512, .max_bytes = 8 * 512 * @sizeOf(i64), .max_wait_us = self.config.executor_microbatch_max_wait_us }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, executeDecideClassificationMicrobatch);
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(DecideClassifyTicket, DecideRows, io, shared, .{ .model = model.model_dir, .generation = @intFromPtr(model), .task = .extract, .schema = key, .transform = "gliner-classification", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_tokens = 8 * 512, .max_bytes = 8 * 512 * @sizeOf(i64), .max_wait_us = self.config.executor_microbatch_max_wait_us orelse 200 }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, executeDecideClassificationMicrobatch);
         const rows = try executor_microbatch.collectOwned(DecideRows, a, shared, results, cloneDecideRows, freeDecideRows);
         defer {
             for (rows) |row| freeDecideRows(a, row);
@@ -7878,12 +7886,12 @@ pub const Node = struct {
         const rows = self.forwardDecideClassificationMicrobatch(items) catch |err| {
             // Capacity subdivision happens before any forward. Never replay a
             // failed GPU operation or let one oversized cohort reject fit rows.
-            if (err == error.ReadMicrobatchCapacity and items.len > 1) {
+            if (err == error.ClassificationMicrobatchCapacity and items.len > 1) {
                 const half = items.len / 2;
                 try self.runDecideClassificationMicrobatch(items[0..half]);
                 return self.runDecideClassificationMicrobatch(items[half..]);
             }
-            return if (err == error.ReadMicrobatchCapacity) error.MemoryBudgetExceeded else err;
+            return if (err == error.ClassificationMicrobatchCapacity) error.MemoryBudgetExceeded else err;
         };
         const a = std.heap.smp_allocator;
         defer a.free(rows);
@@ -7905,8 +7913,8 @@ pub const Node = struct {
         const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group, .check_fn = executor_microbatch.ExecutionControl.check });
         var longest: usize = 0;
         for (items) |item| longest = @max(longest, item.payloadAs(DecideClassifyTicket).sample.input_ids.len);
-        var budget = read_pool_microbatch.classificationBudget(first.limits, first.config, longest, items.len) catch |err| {
-            if (err == error.MemoryBudgetExceeded) return error.ReadMicrobatchCapacity;
+        var budget = gliner_microbatch.classificationBudget(first.limits, first.config, longest, items.len) catch |err| {
+            if (err == error.MemoryBudgetExceeded) return error.ClassificationMicrobatchCapacity;
             return err;
         };
         const device_bytes = budget.backend_scratch_bytes;
@@ -7916,7 +7924,7 @@ pub const Node = struct {
         try control.lock(&first.model.gliner_boundary_admission_lock);
         defer first.model.gliner_boundary_admission_lock.unlock();
         var lease = self.model_manager.acquireRunResourceAmounts(.gpu, first.limits, .{ .backend_scratch_bytes = device_bytes, .host_scratch_bytes = host_bytes }) catch |err| {
-            if (err == error.MemoryBudgetExceeded) return error.ReadMicrobatchCapacity;
+            if (err == error.MemoryBudgetExceeded) return error.ClassificationMicrobatchCapacity;
             return err;
         };
         var lease_transferred = false;
@@ -7942,9 +7950,9 @@ pub const Node = struct {
         };
         const output = try a.alloc(DecideRows, items.len);
         errdefer a.free(output);
-        const owner = try a.create(DecideOutputOwner);
+        const owner = try a.create(OutputOwner);
         errdefer a.destroy(owner);
-        var retained: usize = @sizeOf(DecideOutputOwner) + output.len * @sizeOf(DecideRows);
+        var retained: usize = @sizeOf(OutputOwner) + output.len * @sizeOf(DecideRows);
         for (raw_rows) |rows| {
             retained += rows.len * @sizeOf([]f64);
             for (rows) |row| retained += row.len * @sizeOf(f64);
@@ -7985,7 +7993,7 @@ pub const Node = struct {
             }
         };
         const shared = std.heap.smp_allocator;
-        const results = try self.executorMicrobatchBroker().submitBatchControlled(AudioEmbedTicket, []f32, io, shared, .{ .model = model.model_dir, .generation = @intFromPtr(model), .task = .embed, .transform = "audio-encoded", .resource_limit_bytes = working_bytes, .resource_class = executorMicrobatchResourceClass(model.session.backend()) }, .{ .mode = .native, .preferred_items = contract.batch.preferred_items, .max_items = contract.batch.max_items, .max_bytes = requestMediaMaxBytes(self), .max_wait_us = self.config.executor_microbatch_max_wait_us }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, executeAudioEmbedMicrobatch);
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(AudioEmbedTicket, []f32, io, shared, .{ .model = model.model_dir, .generation = @intFromPtr(model), .task = .embed, .transform = "audio-encoded", .resource_limit_bytes = working_bytes, .resource_class = executorMicrobatchResourceClass(model.session.backend()) }, .{ .mode = .native, .preferred_items = contract.batch.preferred_items, .max_items = contract.batch.max_items, .max_bytes = requestMediaMaxBytes(self), .max_wait_us = self.config.executor_microbatch_max_wait_us orelse 200 }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, executeAudioEmbedMicrobatch);
         return executor_microbatch.collectOwned([]f32, allocator, shared, results, cloneDenseRow, freeDenseRow);
     }
 
@@ -8140,7 +8148,7 @@ pub const Node = struct {
             io,
             shared,
             .{ .model = model.model_dir, .generation = @intFromPtr(model), .task = .embed, .schema = instruction orelse "", .option_key = @as(u64, @backingInt(task_type)) * 2 + @intFromBool(instruction != null), .transform = if (raw) "rgba8" else "encoded-image", .resource_class = executorMicrobatchResourceClass(model.session.backend()) },
-            .{ .mode = .native, .preferred_items = contract.batch.preferred_items, .max_items = contract.batch.max_items, .max_bytes = if (raw) std.math.maxInt(usize) else contract.batch.max_encoded_media_bytes, .max_pixels = contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), .max_wait_us = self.config.executor_microbatch_max_wait_us },
+            .{ .mode = .native, .preferred_items = contract.batch.preferred_items, .max_items = contract.batch.max_items, .max_bytes = if (raw) std.math.maxInt(usize) else contract.batch.max_encoded_media_bytes, .max_pixels = contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), .max_wait_us = self.config.executor_microbatch_max_wait_us orelse 200 },
             shapes,
             identities,
             try directExecutorDeadline(io, control.deadline_ns),
@@ -9646,7 +9654,7 @@ pub const Node = struct {
             io,
             owner,
             .{ .model = model_path, .generation = @intFromPtr(model), .task = .read, .prompt = prompt, .option_key = @intCast(max_tokens), .resource_class = .gpu },
-            .{ .mode = .native, .preferred_items = window, .max_items = window, .max_bytes = @min(readInlineSourceByteCap(self), contract.batch.max_encoded_media_bytes), .max_pixels = contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), .max_tokens = std.math.mul(usize, window, @intCast(max_tokens)) catch std.math.maxInt(usize), .max_wait_us = @max(self.config.executor_microbatch_max_wait_us, @min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_WAIT_US") orelse 5000, 20000)) },
+            .{ .mode = .native, .preferred_items = window, .max_items = window, .max_bytes = @min(readInlineSourceByteCap(self), contract.batch.max_encoded_media_bytes), .max_pixels = contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), .max_tokens = std.math.mul(usize, window, @intCast(max_tokens)) catch std.math.maxInt(usize), .max_wait_us = self.config.executor_microbatch_max_wait_us orelse @min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_WAIT_US") orelse 5000, 20000) },
             shapes,
             identities,
             try directExecutorDeadline(io, control.deadline_ns),
@@ -12041,7 +12049,9 @@ pub const Node = struct {
         });
         defer validators.deinit();
         observer.emit(.{ .phase = .parsing });
-        var request = try extraction_v2.parseJson(scratch, request_json, .{ .failure = failure, .compiler = validators.compilerOptions(.{
+        var parse_limits = extraction_v2.Limits{};
+        if (self.config.request_limits.max_items_per_request) |limit| parse_limits.max_inputs = @min(parse_limits.max_inputs, limit);
+        var request = try extraction_v2.parseJson(scratch, request_json, .{ .limits = parse_limits, .failure = failure, .compiler = validators.compilerOptions(.{
             .allow_legacy_classification_threshold_endpoints = classification_compatibility != .none,
         }) });
         defer request.deinit();
@@ -12070,7 +12080,10 @@ pub const Node = struct {
             try self.resolveRequestModelSelection(scratch, io, request.model, "extractors");
         const model_path = model_path_selection.path;
         const model_path_selection_control: ?InferenceExecutionControl = model_path_selection.bind(self.bindExecutionControl(null, control orelse .{}));
+        // Preserve model-selection validity in direct and brokered execution.
+        execution_options.control = model_path_selection_control;
         defer scratch.free(model_path);
+        execution_options.control = model_path_selection_control;
         // Only architecture/configuration and capability are needed here.
         // Full tokenizer JSON materialization belongs to the admitted managed
         // loader; repeating it per request can exceed the request heap before
@@ -12122,7 +12135,6 @@ pub const Node = struct {
         const loaded = handle.get();
         const backend = loaded.session.backend();
         if (backend != .native and backend != .metal and backend != .cuda) return error.UnsupportedExtractionBackend;
-        const config = try session_factory.getGlinerBoundaryConfig(loaded.session);
         execution_options.identity = try session_factory.getGlinerBoundaryIdentity(loaded.session);
         if (backend == .metal and session_factory.isGlinerBoundaryResidentReady(loaded.session))
             execution_options.metal_execution_policy = .optimized_v2;
@@ -12135,6 +12147,181 @@ pub const Node = struct {
                 else => .native,
             }, &request, execution_options.pipeline, model_path_selection_control);
         }
+        if (!test_qualification) {
+            if (try self.tryBoundaryRequestMicrobatch(scratch, io, loaded, &request, request_json, execution_options, working_bytes, budget)) |json| return json;
+        }
+        return self.executeBoundaryLoaded(scratch, loaded, &request, execution_options, budget, working_bytes, test_qualification);
+    }
+
+    const BoundaryRequestTicket = struct {
+        model: *model_manager_mod.LoadedModel,
+        request: *const extraction_v2.Request,
+        options: boundary_executor.Options,
+        working_bytes: usize,
+    };
+    const BoundaryReply = gliner_microbatch.BoundaryReply;
+
+    fn tryBoundaryRequestMicrobatch(self: *Node, a: std.mem.Allocator, io: std.Io, loaded: *model_manager_mod.LoadedModel, request: *const extraction_v2.Request, request_json: []const u8, options: boundary_executor.Options, working_bytes: usize, budget: *runtime.tier.memory.RunBudget) !?[]u8 {
+        const caps = loaded.session.executionCapabilities();
+        if (caps.boundary_batch_rows <= 1 or caps.boundary_batch_tokens == 0 or request.items.len != 1 or request.items[0].options.long_document.mode == .window) return null;
+        const max_items = @min(@as(usize, 8), caps.boundary_batch_rows);
+        const qualification = @import("../extractors/gliner_boundary_qualification.zig");
+        // Regex compilers retain caller controls. They remain exclusive until
+        // their validation contexts can be owned by the physical invocation.
+        if ((try qualification.requiredFeaturesResolved(request, options.pipeline, options.control)).contains(.regex_validation)) return null;
+        const schema = (try gliner_microbatch.boundaryKey(a, request_json, options.pipeline.classification_multi_label_fallback)) orelse return null;
+        defer a.free(schema);
+        const config = try session_factory.getGlinerBoundaryConfig(loaded.session);
+        var prepared = try boundary_executor.prepareQualifiedShortRow(.cuda, a, &config, loaded.getTokenizer(), request, options);
+        defer prepared.deinit();
+        var prepared_options = options;
+        prepared_options.prepared_samples = prepared.samples;
+        if (options.failure) |failure| failure.* = .{ .stage = "model" };
+        if (options.observer) |observer| observer.emit(.{ .phase = .model });
+        const tokens = prepared.input_ids.len;
+        // Oversized rows keep their serial geometry and reuse the same
+        // immutable preparation instead of tokenizing again on fallback.
+        if (tokens > caps.boundary_batch_tokens)
+            return try self.executeBoundaryLoaded(a, loaded, request, prepared_options, budget, working_bytes, false);
+        const bucket = @import("../pipelines/batch_execution.zig").maskedSequenceBucket(loaded.session, tokens, caps.boundary_batch_tokens);
+        const control = self.bindExecutionControl(io, options.control orelse .{});
+        const hard = control.hard_cancellation;
+        const key = try std.json.Stringify.valueAlloc(a, .{
+            .schema = schema,
+            .request_model = request.model,
+            .working_bytes = working_bytes,
+            .response_bytes = options.max_response_bytes,
+            .hard_owner = if (hard) |owner| @intFromPtr(owner.ptr) else @as(usize, 0),
+            .hard_arm = if (hard) |owner| @intFromPtr(owner.arm_fn) else @as(usize, 0),
+            .hard_disarm = if (hard) |owner| @intFromPtr(owner.disarm_fn) else @as(usize, 0),
+        }, .{});
+        defer a.free(key);
+        const Probe = struct {
+            fn canceled(raw: *const anyopaque) bool {
+                const active: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+                active.check() catch return true;
+                return false;
+            }
+        };
+        const shared = std.heap.smp_allocator;
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(BoundaryRequestTicket, BoundaryReply, io, shared, .{ .model = loaded.model_dir, .generation = @intFromPtr(loaded), .task = .extract, .schema = key, .transform = "gliner-boundary-short", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = max_items, .max_items = max_items, .max_tokens = caps.boundary_batch_padded_tokens, .max_bytes = requestMediaMaxBytes(self), .max_wait_us = self.config.executor_microbatch_max_wait_us orelse caps.boundary_batch_collection_wait_us }, &.{.{ .tokens = bucket, .geometry_key = bucket, .bytes = request_json.len }}, &.{.{}}, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, &.{.{ .model = loaded, .request = request, .options = prepared_options, .working_bytes = working_bytes }}, self, executeBoundaryRequestMicrobatch);
+        defer {
+            for (results) |result| switch (result.result) {
+                .value => |value| gliner_microbatch.destroyBoundaryReply(shared, value),
+                .item_error => {},
+            };
+            shared.free(results);
+        }
+        try control.check();
+        if (try gliner_microbatch.boundaryResult(a, results[0])) |json| return json;
+        return try self.executeBoundaryLoaded(a, loaded, request, prepared_options, budget, working_bytes, false);
+    }
+
+    fn executeBoundaryRequestMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        self.runBoundaryRequestMicrobatch(items) catch |err| {
+            for (items) |item| if (!item.slot.completed) item.slot.fail(err);
+        };
+    }
+
+    fn runBoundaryRequestMicrobatch(self: *Node, items: []const executor_microbatch.ExecuteItem) anyerror!void {
+        if (items.len == 0) return;
+        self.forwardBoundaryRequestMicrobatch(items) catch |err| {
+            if (err == error.BoundaryMicrobatchCapacity and items.len > 1) {
+                const half = items.len / 2;
+                try self.runBoundaryRequestMicrobatch(items[0..half]);
+                return self.runBoundaryRequestMicrobatch(items[half..]);
+            }
+            // A singleton that cannot admit the additional broker heap/output
+            // rejoins its caller and uses that caller's existing serial budget.
+            // Only this pre-forward capacity refusal permits a retry.
+            return err;
+        };
+    }
+
+    fn forwardBoundaryRequestMicrobatch(self: *Node, items: []const executor_microbatch.ExecuteItem) !void {
+        const first = items[0].payloadAs(BoundaryRequestTicket);
+        var group = executor_microbatch.ExecutionControl{ .items = items };
+        const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group, .check_fn = executor_microbatch.ExecutionControl.check, .hard_cancellation = if (first.options.control) |active| active.hard_cancellation else null });
+        try control.check();
+        const shared = std.heap.smp_allocator;
+        const limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.cpu));
+        // Original callers own their parse heaps until the broker rejoins.
+        // The physical cohort owns a separate admitted, reclaiming heap and
+        // exactly one device reservation; it borrows no caller's budget.
+        var lease = self.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = first.working_bytes }) catch |err| {
+            if (err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable) return error.BoundaryMicrobatchCapacity;
+            return err;
+        };
+        defer lease.release();
+        var bounded = BoundedRequestAllocator{ .backing = platform.allocator.processAllocator(shared), .limit = first.working_bytes };
+        defer std.debug.assert(bounded.live == 0);
+        const a = bounded.allocator();
+        var request_items: [8]extraction_v2.Item = undefined;
+        var evidence: [8]boundary_executor.ItemExecution = undefined;
+        var prepared_samples: [8]@import("../pipelines/gliner_boundary_processor.zig").Sample = undefined;
+        for (items, request_items[0..items.len]) |item, *row| row.* = item.payloadAs(BoundaryRequestTicket).request.items[0];
+        const request = extraction_v2.Request{ .arena = undefined, .model = first.request.model, .items = request_items[0..items.len] };
+        var failure = extraction_v2.FailureContext{};
+        var options = first.options;
+        options.preparations = null;
+        options.failure = &failure;
+        options.control = control;
+        options.item_executions = evidence[0..items.len];
+        options.brokered_request = true;
+        // Published bytes can outlive this callback's heap and execution
+        // reservation. Give them a separate owner retained by every result,
+        // including results discarded by expired or disconnected callers.
+        const output_limit = try std.math.mul(usize, first.options.max_response_bytes, items.len);
+        var output_lease = self.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = try std.math.add(usize, output_limit, @sizeOf(OutputOwner)) }) catch |err| {
+            if (err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable) return error.BoundaryMicrobatchCapacity;
+            return err;
+        };
+        const output_owner = shared.create(OutputOwner) catch |err| {
+            output_lease.release();
+            return err;
+        };
+        output_owner.* = .{ .lease = output_lease, .remaining = .init(1) };
+        defer output_owner.release();
+        var consumers: [8]gliner_microbatch.BoundaryConsumer = undefined;
+        for (items, consumers[0..items.len], prepared_samples[0..items.len]) |item, *consumer, *sample| {
+            const ticket = item.payloadAs(BoundaryRequestTicket);
+            sample.* = ticket.options.prepared_samples.?[0];
+            consumer.* = .{ .model = ticket.request.model, .slot = item.slot, .control = item.control, .observer = ticket.options.observer, .failure = ticket.options.failure, .max_output_values = ticket.options.pipeline.max_output_values, .max_response_bytes = ticket.options.max_response_bytes };
+        }
+        options.prepared_samples = prepared_samples[0..items.len];
+        var cohort = gliner_microbatch.BoundaryCohort{ .consumers = consumers[0..items.len], .evidence = evidence[0..items.len], .failure = &failure, .owner = output_owner, .output_limit = output_limit, .group_key = @intFromPtr(items.ptr) };
+        options.observer = .{ .context = &cohort, .emit_fn = gliner_microbatch.BoundaryCohort.observe };
+        options.row_sink = .{ .context = &cohort, .emit_fn = gliner_microbatch.BoundaryCohort.publish, .fail_fn = gliner_microbatch.BoundaryCohort.fail, .check_fn = gliner_microbatch.BoundaryCohort.checkRow };
+        var budget = runtime.tier.memory.RunBudget.init(limits);
+        try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = first.working_bytes, .scratch_tier = .host });
+        const json = self.executeBoundaryLoaded(a, first.model, &request, options, &budget, first.working_bytes, false) catch |err| {
+            // Planning can update the wire failure context without emitting a
+            // phase. Preserve it for each still-pending caller on failure too.
+            if (metrics_mod.extraction.observation.Stage.fromFailure(failure.stage)) |phase|
+                gliner_microbatch.BoundaryCohort.observe(&cohort, .{ .phase = phase });
+            return err;
+        };
+        defer a.free(json);
+        // Shrinking can retain the conservative reservation on any refusal;
+        // ownership remains valid until the final consumer releases it.
+        output_owner.lease.retain(.{ .host_scratch_bytes = cohort.output_bytes + @sizeOf(OutputOwner) }) catch {};
+    }
+
+    fn executeBoundaryLoaded(self: *Node, scratch: std.mem.Allocator, loaded: *model_manager_mod.LoadedModel, request: *const extraction_v2.Request, supplied_options: boundary_executor.Options, budget: *runtime.tier.memory.RunBudget, working_bytes: usize, test_qualification: bool) ![]u8 {
+        var started = false;
+        return self.executeBoundaryLoadedImpl(scratch, loaded, request, supplied_options, budget, working_bytes, test_qualification, &started) catch |err| {
+            return gliner_microbatch.boundaryExecutionError(err, supplied_options.brokered_request, started);
+        };
+    }
+
+    fn executeBoundaryLoadedImpl(self: *Node, scratch: std.mem.Allocator, loaded: *model_manager_mod.LoadedModel, request: *const extraction_v2.Request, supplied_options: boundary_executor.Options, budget: *runtime.tier.memory.RunBudget, working_bytes: usize, test_qualification: bool, started: *bool) ![]u8 {
+        var execution_options = supplied_options;
+        const backend = loaded.session.backend();
+        const config = try session_factory.getGlinerBoundaryConfig(loaded.session);
+        const control = execution_options.control;
+        const failure = execution_options.failure orelse return error.InvalidExtractionRequest;
+        const observer = execution_options.observer;
         // This pass uses the held immutable tokenizer and exact prepared items
         // and windows under the existing request heap. Observe its real CPU
         // phase while keeping decoded-item and window counters quiet. No CB or
@@ -12144,31 +12331,31 @@ pub const Node = struct {
         execution_options.preparations = &boundary_preparations;
         const workspace_tokens = if (execution_options.metal_execution_policy == .optimized_v2) tokens: {
             failure.* = .{ .stage = "tokenizing" };
-            observer.emit(.{ .phase = .tokenizing });
-            const count = try boundary_executor.workspaceGeometry(scratch, &config, loaded.getTokenizer(), &request, execution_options);
+            if (observer) |active| active.emit(.{ .phase = .tokenizing });
+            const count = try boundary_executor.workspaceGeometry(scratch, &config, loaded.getTokenizer(), request, execution_options);
             // Later cancellation or admission failure belongs to the model
             // queue, rather than the last item visited by the quiet planner.
             failure.* = .{ .stage = "model" };
-            observer.emit(.{ .phase = .model });
+            if (observer) |active| active.emit(.{ .phase = .model });
             break :tokens count;
         } else 0;
         // The reference device path has no resident workspace to size from
         // tokens, so plan its encoder bytes from the exact prepared request.
         const reference_encoder_bytes: ?usize = if ((backend == .metal or backend == .cuda) and execution_options.metal_execution_policy != .optimized_v2) bytes: {
             failure.* = .{ .stage = "tokenizing" };
-            const planned = try boundary_executor.referenceEncoderDeviceBytes(if (backend == .cuda) .cuda else .metal, scratch, &config, loaded.getTokenizer(), &request, execution_options);
+            const planned = try boundary_executor.referenceEncoderDeviceBytes(if (backend == .cuda) .cuda else .metal, scratch, &config, loaded.getTokenizer(), request, execution_options);
             failure.* = .{ .stage = "model" };
             break :bytes planned;
         } else null;
         const execution_mutex = loaded.targetInferenceExecutionMutex();
-        const effective = model_path_selection_control orelse InferenceExecutionControl{};
+        const effective = control orelse InferenceExecutionControl{};
         // A waiting GPU boundary request cannot use the session workspace
         // yet. Admit its device ceiling only when it reaches the front of the
         // model queue; otherwise concurrent waiters reserve duplicate device
         // capacity and fail before the already-serialized execution can drain.
         // This is distinct from the execution/provider lock: admission may
         // evict other models and must remain outside those locks.
-        const gliner_turn = if (backend == .cuda or backend == .metal) try loaded.gliner_execution_lane.acquire(model_path_selection_control orelse .{}) else null;
+        const gliner_turn = if (backend == .cuda or backend == .metal) try loaded.gliner_execution_lane.acquire(control orelse .{}) else null;
         defer if (gliner_turn) |turn| turn.release();
         const admission_mutex = if (backend == .cuda or backend == .metal) &loaded.gliner_boundary_admission_lock else null;
         if (admission_mutex) |mutex| try effective.lock(mutex);
@@ -12226,24 +12413,28 @@ pub const Node = struct {
                 if (workspace_plan) |plan| if (plan.replacement_amounts) |amounts| {
                     workspace_permit = try self.model_manager.acquireRunResourceAmounts(.gpu, device_limits, amounts);
                 };
-                device_lease = try self.model_manager.acquireRunResourceAmounts(.gpu, device_limits, .{ .backend_scratch_bytes = request_device_bytes });
+                device_lease = self.model_manager.acquireRunResourceAmounts(.gpu, device_limits, .{ .backend_scratch_bytes = request_device_bytes }) catch |err| {
+                    if (execution_options.brokered_request and (err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable)) return error.BoundaryMicrobatchCapacity;
+                    return err;
+                };
             }
             // Keep the existing model lock through CB and workspace-view
             // cleanup. Every retry first unlocks and releases both permits.
             if (execution_mutex) |mutex| try effective.lock(mutex);
             defer if (execution_mutex) |mutex| mutex.unlock();
             var managed = if (workspace_plan) |plan|
-                session_factory.getManagedGlinerBoundaryComputeBackend(loaded.session, scratch, budget, model_path_selection_control, plan, if (workspace_permit) |*permit| permit else null) catch |err| {
+                session_factory.getManagedGlinerBoundaryComputeBackend(loaded.session, scratch, budget, control, plan, if (workspace_permit) |*permit| permit else null) catch |err| {
                     if (err == error.GlinerBoundaryWorkspacePlanChanged) continue;
                     return err;
                 }
             else
-                try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, model_path_selection_control);
+                try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, control);
             defer managed.deinit();
+            started.* = true;
             const json = if (test_qualification)
-                try boundary_executor.execute(&managed.backend, scratch, &config, loaded.getTokenizer(), &request, request_options)
+                try boundary_executor.execute(&managed.backend, scratch, &config, loaded.getTokenizer(), request, request_options)
             else
-                try boundary_executor.executeQualified(&managed.backend, scratch, &config, loaded.getTokenizer(), &request, request_options);
+                try boundary_executor.executeQualified(&managed.backend, scratch, &config, loaded.getTokenizer(), request, request_options);
             errdefer scratch.free(json);
             try effective.check();
             return json;
@@ -15107,10 +15298,29 @@ pub const Node = struct {
         const prep_cfg = multimodal_qwen_adapter.loadPreprocessorConfig(ctx.allocator, model_path) catch
             return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "model preprocessor configuration is unsupported" });
 
+        // Admit geometry-dependent decoder, tensor, coefficient and row-window
+        // ownership before any image preprocessing. Documents execute serially.
+        var image_working_bytes: usize = 0;
+        for (parsed_docs.items) |doc| {
+            model_path_selection_control.check() catch |err| return inferenceFailureResponse(ctx, err);
+            image_working_bytes = @max(image_working_bytes, multimodal_qwen_adapter.imageWorkingBytes(doc.images, prep_cfg) catch |err|
+                return inferenceFailureResponse(ctx, err));
+        }
+        const image_units = admissionUnitsFor(std.math.add(usize, media_admission.resident_byte_cap, image_working_bytes) catch return inferenceFailureResponse(ctx, error.ResourceLimitExceeded), read_admission_bytes_per_unit);
+        if (image_units > reserved_units) {
+            if (try self.growSlotUnits(ctx, reserved_units, image_units)) |response| return response;
+            reserved_units = image_units;
+        }
+        var image_permit = model.session.admitHostPreprocess(image_working_bytes) catch |err| return inferenceFailureResponse(ctx, err);
+        defer image_permit.deinit();
+        var image_memory = @import("../pipelines/preprocessing_memory.zig").Scope.init(ctx.allocator, model.session, .{ .process_bytes = image_working_bytes }, null);
+        defer image_memory.deinit();
+        const image_allocator = try image_memory.allocator();
+
         // The compute backend and resident slots below share the loaded
         // model's stateful GPU runtime. Hold the target-model lane for their
-        // complete lifetime; request parsing and image preparation remain
-        // outside it.
+        // complete lifetime. Request media parsing and geometry admission
+        // above do not touch that stateful runtime.
         const execution_mutex = model.targetInferenceExecutionMutex();
         if (execution_mutex) |mutex| model_path_selection_control.lock(mutex) catch |err|
             return inferenceFailureResponse(ctx, err);
@@ -15121,7 +15331,7 @@ pub const Node = struct {
         defer compute.deinit();
 
         var mm_pipeline = multimodal_reranker.Pipeline.init(
-            ctx.allocator,
+            image_allocator,
             &compute.backend,
             vision_session,
             model.getTokenizer(),
@@ -15140,7 +15350,7 @@ pub const Node = struct {
                 break :tokens text_pipeline.maxInputTokensPerItem(query, &.{doc.text}) catch |err|
                     return inferenceFailureResponse(ctx, err);
             } else mm_pipeline.maxInputTokensPerItem(query, doc.text, doc.images) catch |err|
-                return inferenceFailureResponse(ctx, err);
+                return inferenceFailureResponse(ctx, image_memory.failure(err));
             input_tokens_for_limit = @max(input_tokens_for_limit, item_tokens);
         }
         validateInferenceExecutorInvocation(executor_contract, .{
@@ -15156,7 +15366,7 @@ pub const Node = struct {
         }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
         var query_encoded = mm_pipeline.encodeQueryText(query) catch |err|
-            return inferenceFailureResponse(ctx, err);
+            return inferenceFailureResponse(ctx, image_memory.failure(err));
         defer query_encoded.deinit();
 
         const scores = try ctx.allocator.alloc(f32, parsed_docs.items.len);
@@ -15182,7 +15392,7 @@ pub const Node = struct {
             ) catch |err| switch (err) {
                 error.InvalidImageDataUri, error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
                 error.ImageTokenLengthMismatch, error.ImageProjectionSizeMismatch, error.UnexpectedOutputShape => return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) }),
-                else => return inferenceFailureResponse(ctx, err),
+                else => return inferenceFailureResponse(ctx, image_memory.failure(err)),
             };
         }
 
@@ -16902,6 +17112,11 @@ pub const Node = struct {
             }
         }
 
+        var media_budget_credit = @import("../pipelines/preprocessing_memory.zig").BudgetCredit.reserve(&run_budget, generation.fallbackImagePreparationBytes(gpt_config, model.manifest.gguf_projector_path, prompt_estimate.?.media_admission)) catch |err| {
+            if (err == error.MemoryBudgetExceeded) return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
+            return contextRequestFailure(ctx, err);
+        };
+        defer media_budget_credit.deinit();
         var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
         budget_components[0] = .{
             .backend = backend_kind,
@@ -17377,6 +17592,7 @@ pub const Node = struct {
             .cb = cb,
             .session = model.session,
             .media_run_budget = &run_budget,
+            .media_prepaid = .{ .process_bytes = prompt_estimate.?.media_admission.host_scratch_bytes, .budget_bytes = media_budget_credit.bytes },
             .explicit_scratch_limit = self.config.generation_budget_overrides.scratch_limit_bytes,
             .gpt_config = gpt_config,
             .kv_dtype = kv_dtype,
@@ -22240,11 +22456,21 @@ pub const Node = struct {
     }
 
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        if (requestUsesAttachmentEnvelope(ctx)) {
-            var envelope = parseRequestAttachmentEnvelope(ctx, .{ .max_metadata_bytes = ctx.max_request_body_size, .max_attachment_bytes = requestMediaMaxBytes(self), .max_total_attachment_bytes = requestMediaMaxBytes(self) }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{ .@"error" = attachmentEnvelopeErrorCode(err), .message = attachmentEnvelopeErrorMessage(err) });
-            defer envelope.deinit();
+        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        if (uses_attachment_envelope) {
+            // The transport body is single-pass. Retain the admitted payload
+            // until either audio or image dispatch has finished using it.
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{ .max_metadata_bytes = ctx.max_request_body_size, .max_attachment_bytes = requestMediaMaxBytes(self), .max_total_attachment_bytes = requestMediaMaxBytes(self) }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{ .@"error" = attachmentEnvelopeErrorCode(err), .message = attachmentEnvelopeErrorMessage(err) });
+            const envelope = attachment_envelope.?;
             var metadata = std.json.parseFromSlice(std.json.Value, ctx.allocator, envelope.metadata, .{ .duplicate_field_behavior = .@"error" }) catch return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST" });
             defer metadata.deinit();
+            if (metadata.value == .object) {
+                const object = metadata.value.object;
+                const forms = @as(usize, @intFromBool(object.contains("images"))) + @intFromBool(object.contains("documents")) + @intFromBool(object.contains("audio"));
+                if (forms != 1) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "read requires exactly one input form" });
+            }
             if (metadata.value == .object) if (metadata.value.object.get("audio")) |audio| {
                 if (audio != .string or envelope.attachments.len != 1 or !std.mem.eql(u8, audio.string, "attachment:0")) return ctx.status(400).json(.{ .@"error" = "InvalidAudioAttachment" });
                 const attachment = envelope.attachments[0];
@@ -22254,8 +22480,7 @@ pub const Node = struct {
                 try ctx.setHeader("content-type", "application/json");
                 return ctx.response.build();
             };
-        }
-        if (try ctx.body()) |raw| {
+        } else if (try ctx.body()) |raw| {
             const envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw, .{}) catch null;
             if (envelope) |parsed_document| {
                 defer parsed_document.deinit();
@@ -22282,25 +22507,15 @@ pub const Node = struct {
             }
         }
         var execution_control = httpInferenceExecutionControl(self, ctx);
-        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
-        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
-        defer if (attachment_envelope) |*envelope| envelope.deinit();
-        var parsed = if (uses_attachment_envelope) blk: {
-            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
-                .max_metadata_bytes = ctx.max_request_body_size,
-                .max_attachment_bytes = requestMediaMaxBytes(self),
-                .max_total_attachment_bytes = requestMediaMaxBytes(self),
-            }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
-                .@"error" = attachmentEnvelopeErrorCode(err),
-                .message = attachmentEnvelopeErrorMessage(err),
-            });
-            break :blk std.json.parseFromSlice(api.ReadRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
+        var parsed = if (attachment_envelope) |envelope|
+            std.json.parseFromSlice(api.ReadRequest, ctx.allocator, envelope.metadata, .{}) catch
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
                     .message = "attachment envelope metadata must be a valid read request",
-                });
-        } else (try ctx.parseJson(api.ReadRequest)) orelse
-            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+                })
+        else
+            (try ctx.parseJson(api.ReadRequest)) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
         if ((body.images orelse @as([]const api.ImageURL, &.{})).len == 0) {
@@ -23110,6 +23325,10 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
+        if (body.transcript_text != null) return ctx.status(400).json(.{
+            .@"error" = "UNSUPPORTED_FEATURE",
+            .message = "text cleanup requires a named transcriber advertising text_cleanup",
+        });
         const model_name = std.mem.trim(u8, body.model, " \t\r\n");
         if (model_name.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
@@ -23374,7 +23593,11 @@ pub const Node = struct {
                 writer.close() catch {};
                 return ctx.response.build();
             }
-            const cleaned = try dictation_mod.normalizeOutput(ctx.allocator, generated.text);
+            const cleaned = normalizeDirectDictationOutput(ctx.allocator, generated) catch |err| {
+                writeGenerationStreamError(&writer, err);
+                writer.close() catch {};
+                return ctx.response.build();
+            };
             defer ctx.allocator.free(cleaned);
             writeDictationEvent(&writer, &payload, .{
                 .type = "dictation.completed",
@@ -23410,7 +23633,7 @@ pub const Node = struct {
             execution_control,
         ) catch |err| return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(generated.text);
-        const cleaned = try dictation_mod.normalizeOutput(ctx.allocator, generated.text);
+        const cleaned = normalizeDirectDictationOutput(ctx.allocator, generated) catch |err| return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(cleaned);
         return ctx.json(api.DictateResponse{
             .object = "dictation",
@@ -23421,6 +23644,14 @@ pub const Node = struct {
             .transcript = api_transcript,
             .text = cleaned,
             .usage = tokenUsageWithCachedPrompt(generated.prompt_tokens, generated.completion_tokens, generated.cached_prompt_tokens),
+        });
+    }
+
+    fn normalizeDirectDictationOutput(allocator: std.mem.Allocator, generated: DirectGenerateOutput) ![]u8 {
+        return @import("antfly_generating").dictation.normalizeCleanupOutput(allocator, .{
+            .finish_reason = @as(?api.FinishReason, if (generated.naturally_completed) .stop else .length),
+            .tool_calls = @as([]const u8, &.{}),
+            .content = generated.text,
         });
     }
 
@@ -25187,7 +25418,7 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*value| value.deinit();
         const io = self.inferenceIo(out, control.io, &owned_io);
-        return @import("../pipelines/gemma4_image_broker.zig").submit(self.executorMicrobatchBroker(), out, io, model.model_dir, @intFromPtr(model), model.session, model.getTokenizer(), model.embeddingExecutionLock(), control, groups, options, self.config.executor_microbatch_max_wait_us, contract.batch.max_encoded_media_bytes, contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), contract.batch.max_items);
+        return @import("../pipelines/gemma4_image_broker.zig").submit(self.executorMicrobatchBroker(), out, io, model.model_dir, @intFromPtr(model), model.session, model.getTokenizer(), model.embeddingExecutionLock(), control, groups, options, self.config.executor_microbatch_max_wait_us orelse 200, contract.batch.max_encoded_media_bytes, contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), contract.batch.max_items);
     }
 
     fn embedGroupsFromPath(self: *Node, out: std.mem.Allocator, io: std.Io, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, input: std.json.Value, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl, admission: GroupedEmbeddingAdmission) ![][]f32 {
@@ -27604,6 +27835,50 @@ test {
     _ = @import("gliner_specialty_artifact_test.zig");
     _ = @import("gliner_boundary_queued_cancellation_test.zig");
     _ = @import("embed_direct_vs_http_bench_test.zig");
+}
+
+test "gliner boundary microbatch capacity rejoins the caller with its original budget intact" {
+    const a = std.testing.allocator;
+    var request = try extraction_v2.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"entities":["person"]},"inputs":[{"content":"Ada"}]}
+    , .{});
+    defer request.deinit();
+    // Default limits admit both heaps but refuse the output reservation; a
+    // smaller explicit limit refuses the second heap itself. Neither case
+    // reaches a model, and neither may turn a valid serial request into 507.
+    for ([_]usize{ 0, 256 * 1024 * 1024 }) |scratch_limit| {
+        var node = try Node.init(a, .{
+            .generation_budget_overrides = .{ .scratch_limit_bytes = scratch_limit },
+        });
+        defer node.deinit();
+        const limits = node.config.generation_budget_overrides.apply(node.defaultGenerationLimits(.cpu));
+        const working_bytes = @min(512 * 1024 * 1024, @min(limits.host_limit_bytes, limits.scratch_limit_bytes));
+        var caller = try node.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = working_bytes });
+        defer caller.release();
+        const before = node.model_manager.currentAdmissionAmounts();
+        // The capacity refusal must precede any access to the model.
+        const ticket = Node.BoundaryRequestTicket{ .model = undefined, .request = &request, .options = .{}, .working_bytes = working_bytes };
+        var output: Node.BoundaryReply = undefined;
+        var slot = executor_microbatch.ResultSlot{ .output = &output };
+        Node.executeBoundaryRequestMicrobatch(&node, &.{.{ .allocator = a, .identity = .{}, .payload = &ticket, .slot = &slot }});
+        try std.testing.expect(slot.completed);
+        try std.testing.expectEqual(error.BoundaryMicrobatchCapacity, slot.err.?);
+        try std.testing.expectEqualDeep(before, node.model_manager.currentAdmissionAmounts());
+        try std.testing.expectEqual(@as(?[]u8, null), try gliner_microbatch.boundaryResult(a, .{
+            .identity = .{},
+            .execution = slot.execution,
+            .result = .{ .item_error = .{ .cause = slot.err.? } },
+        }));
+        // Serial execution can use the still-admitted caller heap after all
+        // physical-invocation reservations have drained.
+        var bounded = BoundedRequestAllocator{ .backing = a, .limit = working_bytes };
+        const bytes = try bounded.allocator().alloc(u8, 1024);
+        bounded.allocator().free(bytes);
+        try std.testing.expectEqual(@as(usize, 0), bounded.live);
+        try std.testing.expectEqualDeep(before, node.model_manager.currentAdmissionAmounts());
+        caller.release();
+        try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, node.model_manager.currentAdmissionAmounts());
+    }
 }
 
 test "gliner boundary v2 allocation attribution distinguishes recovery and model backing OOM" {
@@ -30244,9 +30519,10 @@ fn lightOnContinuousWorkerCount(images: usize, window: usize) usize {
 /// Give concurrent OCR pages time to reach the same cohort before acquiring
 /// the serialized provider. A short generic tensor window underfills readers
 /// on a busy CPU; retain that window for unqualified backends and explicit 0.
-fn nativeReadCollectionWaitUs(configured: u64, backend: backends_mod.BackendType) u64 {
+fn nativeReadCollectionWaitUs(configured: ?u64, backend: backends_mod.BackendType) u64 {
+    if (configured) |override| return override;
     const qualified_metal = backend == .metal and @import("../backends/metal_runtime.zig").appleSimdgroupDeviceDefault();
-    return nativeReadCollectionWaitPolicy(configured, backend, qualified_metal, platform.env.getenvUsize("ANTFLY_FLORENCE2_BATCH_WAIT_US"));
+    return nativeReadCollectionWaitPolicy(200, backend, qualified_metal, platform.env.getenvUsize("ANTFLY_FLORENCE2_BATCH_WAIT_US"));
 }
 
 fn nativeReadCollectionWaitPolicy(configured: u64, backend: backends_mod.BackendType, qualified_metal: bool, requested: ?usize) u64 {
@@ -32932,6 +33208,13 @@ test "direct generate preflight counts video without treating it as audio" {
     try std.testing.expectEqual(@as(usize, 0), preflight.image_count);
     try std.testing.expect(!preflight.has_audio);
     try std.testing.expectEqual(@as(usize, 4), preflight.decoded_media_bytes);
+}
+
+test "generation says what to do when no route can decode HEVC" {
+    const failure = generationRequestFailure(error.HevcDecoderUnavailable).?;
+    try std.testing.expectEqual(@as(u16, 400), failure.status);
+    try std.testing.expectEqualStrings("VIDEO_CODEC_UNAVAILABLE", failure.code);
+    try std.testing.expect(std.mem.indexOf(u8, failure.message, "transcode") != null);
 }
 
 test "generation maps undecodable images to a client error" {
@@ -37529,6 +37812,7 @@ test "download remote content accepts data uri" {
     const node = Node{
         .config = .{},
         .allocator = undefined,
+        .host_caches = undefined,
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
@@ -37778,6 +38062,7 @@ test "download remote content blocks private ip urls when configured" {
             .block_private_ips = true,
         } },
         .allocator = undefined,
+        .host_caches = undefined,
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
@@ -37797,6 +38082,7 @@ test "download remote content blocks hosts outside allowlist" {
     const node = Node{
         .config = .{ .content_security = .{ .allowed_hosts = &allowed_hosts } },
         .allocator = undefined,
+        .host_caches = undefined,
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
@@ -38932,6 +39218,66 @@ fn parseAttachmentUrl(url: []const u8) !?usize {
     return std.fmt.parseUnsigned(usize, digits, 10) catch error.InvalidAttachmentReference;
 }
 
+test "framed read consumes streaming image envelopes exactly once" {
+    const allocator = std.testing.allocator;
+    const Source = struct {
+        bytes: []const u8,
+        offset: usize = 0,
+        reads_after_end: usize = 0,
+        fn readAll(_: ?*anyopaque) !?[]const u8 {
+            return error.UnexpectedWholeBodyRead;
+        }
+        fn read(raw: ?*anyopaque, out: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.offset == self.bytes.len) self.reads_after_end += 1;
+            const n = @min(@min(out.len, 7), self.bytes.len - self.offset);
+            @memcpy(out[0..n], self.bytes[self.offset..][0..n]);
+            self.offset += n;
+            return n;
+        }
+    };
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+    const cases = [_]struct { metadata: []const u8, status: u16, message: []const u8 }{
+        .{ .metadata = "{\"model\":\"missing/model\",\"images\":[{\"url\":\"attachment:1\"}]}", .status = 400, .message = "every framed attachment must be referenced exactly once" },
+        // Valid image framing must reach model resolution without a GPU.
+        .{ .metadata = "{\"model\":\"missing/model\",\"images\":[{\"url\":\"attachment:0\"}]}", .status = 404, .message = "MODEL_NOT_FOUND" },
+        .{ .metadata = "{\"model\":\"missing/model\",\"audio\":\"attachment:1\"}", .status = 400, .message = "InvalidAudioAttachment" },
+        .{ .metadata = "{\"model\":\"missing/model\",\"audio\":\"attachment:0\",\"images\":[{\"url\":\"attachment:0\"}]}", .status = 400, .message = "read requires exactly one input form" },
+    };
+    for (cases) |case| {
+        const encoded = try httpx.attachment_envelope.encodeAlloc(allocator, case.metadata, &.{.{ .mime_type = "image/png", .data = "image bytes" }});
+        defer allocator.free(encoded);
+        for ([_]bool{ false, true }) |streaming| {
+            for ([_]bool{ false, true }) |budgeted| {
+                var budget = httpx.SharedBodyBudget.init(encoded.len);
+                var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
+                defer request.deinit();
+                if (budgeted) request.body_budget = &budget;
+                try request.headers.set("Content-Type", httpx.attachment_envelope.content_type);
+                var source = Source{ .bytes = encoded };
+                if (!streaming) request.body = encoded;
+                var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+                defer ctx.deinit();
+                if (streaming) ctx.body_delegate = .{ .ptr = &source, .read_all = Source.readAll, .read = Source.read, .streaming = true };
+                var response = try node.readImages(&ctx);
+                defer response.deinit();
+                try std.testing.expectEqual(case.status, response.status.code);
+                try std.testing.expect(std.mem.indexOf(u8, response.body.?, case.message) != null);
+                try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+                try std.testing.expectEqual(@as(usize, 0), request.body_budget_reserved);
+                if (streaming) {
+                    try std.testing.expectEqual(encoded.len, source.offset);
+                    // One EOF check from parseReaderAlloc, no second parse or readAll.
+                    try std.testing.expectEqual(@as(usize, 1), source.reads_after_end);
+                    try std.testing.expect(request.body == null);
+                    if (budgeted) try std.testing.expectEqual(case.metadata.len + "image/png".len + "image bytes".len, budget.stats().peak_in_use);
+                }
+            }
+        }
+    }
+}
+
 test "framed read attachment URLs are canonical and bounded integers" {
     try std.testing.expect((try parseAttachmentUrl("https://example.com/page.png")) == null);
     try std.testing.expectEqual(@as(?usize, 0), try parseAttachmentUrl("attachment:0"));
@@ -39948,6 +40294,7 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
             .message = "expanded embedding input exceeds the model context limit",
         },
         error.InvalidVideoInput => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported or corrupt video; expected progressive SDR H.264 MP4" },
+        error.HevcDecoderUnavailable => .{ .status = 400, .code = "VIDEO_CODEC_UNAVAILABLE", .message = "this host cannot decode this HEVC video; transcode it to H.264 or AV1, or use a host with hardware HEVC decoding, such as a Mac or an NVIDIA GPU" },
         error.VideoDurationExceeded, error.VideoInputTooLarge => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds the 60-second or 256-MiB limit" },
         error.UnsupportedVideoBackend => .{ .status = 400, .code = "UNSUPPORTED_VIDEO_BACKEND", .message = "video embeddings require the Linux CUDA backend with NVDEC" },
         error.NvdecUnavailable => .{ .status = 503, .code = "VIDEO_BACKEND_UNAVAILABLE", .message = "the CUDA video decoder is unavailable on this server" },
@@ -42928,7 +43275,8 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         error.MalformedAnnexB,
         error.MissingVideoParameterSet,
         => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported, empty, or corrupt video", .retryable = false },
-        error.VideoDurationExceeded, error.VideoInputTooLarge => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
+        error.HevcDecoderUnavailable => .{ .status = 400, .code = "VIDEO_CODEC_UNAVAILABLE", .message = "this host cannot decode this HEVC video; transcode it to H.264 or AV1, or use a host with hardware HEVC decoding, such as a Mac or an NVIDIA GPU", .retryable = false },
+        error.VideoDurationExceeded, error.VideoInputTooLarge, error.SharedAdmissionExceeded => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
         error.NvdecUnavailable => .{ .status = 503, .code = "VIDEO_BACKEND_UNAVAILABLE", .message = "the CUDA video decoder is unavailable on this server", .retryable = true },
         error.Timeout => .{
             .status = 504,
@@ -51889,4 +52237,80 @@ test "model selection VAD admission failures retain retry semantics" {
     var budget_response = try Node.sileroModelFailureResponse(&ctx, .load, error.MemoryBudgetExceeded);
     defer budget_response.deinit();
     try std.testing.expectEqual(@as(u16, 507), budget_response.status.code);
+}
+
+test "model selection compatibility signature preserves aliased ONNX context" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const ml = @import("ml");
+    const onnx = @import("onnx_graph");
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const weight = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(weight);
+    const values = [_]f32{ 1, 2, 3, 4 };
+    var exported = try onnx.exportGraphWithExternalData(a, &graph, .{ .parameter_initializers = &.{.{ .name = "weight", .shape = ml.graph.Shape.init(.f32, &.{4}), .data = .{ .raw_bytes = std.mem.asBytes(&values) } }} }, "weights.data");
+    defer exported.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "blobs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/graph", .data = exported.model_bytes });
+    try tmp.dir.symLink(io, "blobs/graph", "model.onnx", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.data", .data = exported.external_data.?.bytes });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var manifest = try manifest_mod.loadFromDir(a, root);
+    defer manifest.deinit();
+    var dependencies = try collectCompatibilityOnnxDependencies(a, &manifest);
+    defer dependencies.deinit(a);
+    try std.testing.expect(dependencies.valid);
+    try std.testing.expectEqual(@as(usize, 1), dependencies.paths.items.len);
+    const before = try computeCompatibilitySignatureWithDependencies(a, io, root, &manifest, dependencies.paths.items, true);
+    const changed = [_]f32{ 5, 6, 7, 8 };
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.data", .data = std.mem.asBytes(&changed) });
+    const after = try computeCompatibilitySignatureWithDependencies(a, io, root, &manifest, dependencies.paths.items, true);
+    try std.testing.expect(!std.mem.eql(u8, &before, &after));
+    const new_logical = try std.fs.path.join(a, &.{ root, "text_model.onnx" });
+    a.free(manifest.onnx_logical_path.?);
+    manifest.onnx_logical_path = new_logical;
+    const renamed = try computeCompatibilitySignatureWithDependencies(a, io, root, &manifest, dependencies.paths.items, true);
+    try std.testing.expect(!std.mem.eql(u8, &after, &renamed));
+}
+
+test "model selection compatibility signature tracks selected Jina adapter files" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "adapters/retrieval");
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"jina_embeddings_v5\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "base" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_config.json", .data = "{\"r\":1}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_model.safetensors", .data = "aaaa" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadListingFromDir(a, root);
+    defer man.deinit();
+    try std.testing.expect((try man.jinaRetrievalAdapter()) != null);
+    const before = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_config.json", .data = "{\"r\":2}" });
+    const config_changed = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
+    try std.testing.expect(!std.mem.eql(u8, &before, &config_changed));
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_model.safetensors", .data = "bbbbb" });
+    const weights_changed = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
+    try std.testing.expect(!std.mem.eql(u8, &config_changed, &weights_changed));
+}
+
+test "direct dictation cleanup rejects unfinished and normalized empty text" {
+    const a = std.testing.allocator;
+    const output = Node.DirectGenerateOutput{ .text = @constCast("Hello."), .prompt_tokens = 1, .completion_tokens = 1, .truncated = false };
+    try std.testing.expectError(error.InferenceOutputIncomplete, Node.normalizeDirectDictationOutput(a, output));
+    var complete = output;
+    complete.naturally_completed = true;
+    const text = try Node.normalizeDirectDictationOutput(a, complete);
+    defer a.free(text);
+    try std.testing.expectEqualStrings("Hello.", text);
+    complete.text = @constCast("\"\"");
+    try std.testing.expectError(error.InferenceOutputIncomplete, Node.normalizeDirectDictationOutput(a, complete));
 }

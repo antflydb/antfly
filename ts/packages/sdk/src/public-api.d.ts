@@ -660,6 +660,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/transactions/{transaction_id}/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Inspect your transaction receipt
+         * @description Returns outcome and lease metadata for a transaction bound to the
+         *     authenticated principal. This endpoint never returns staged documents,
+         *     table names, keys, read snapshots, or execution plans. The creator can
+         *     inspect the outcome after table permissions are revoked or a table is
+         *     dropped. A missing, expired, or other principal's receipt returns 404;
+         *     absence does not establish that a mutation aborted or permit replay.
+         */
+        get: operations["getTransactionStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/transactions/{transaction_id}/stage": {
         parameters: {
             query?: never;
@@ -2649,6 +2674,73 @@ export interface paths {
         post: operations["createQuerySource"];
         /** Drop saved query source */
         delete: operations["dropQuerySource"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/graphs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List graphs */
+        get: operations["listGraphs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/graphs/{graphName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        /** Get graph */
+        get: operations["getGraph"];
+        /**
+         * Update graph definition
+         * @description Atomically replaces mappings when expected_revision matches. Requires graph administration and read permission on every new input table. The graph incarnation is preserved and the definition revision advances; stale prepared plans must be prepared again.
+         */
+        put: operations["updateGraph"];
+        /**
+         * Create graph
+         * @description Creates a graph mapping over existing tables and graph indexes. Reads require permission on the graph and every input table. Definition updates use conditional revisions; existing cursors retain their captured definition.
+         */
+        post: operations["createGraph"];
+        /** Drop graph */
+        delete: operations["dropGraph"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/graphs/{graphName}/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute Cypher against a named graph
+         * @description Executes an authenticated statement under the graph definition and each underlying table's permissions and row policies. Resource budgets fail explicitly. EXPLAIN binds without reading rows. Results use the lossless version 1 graph wire format.
+         */
+        post: operations["executeGraphQuery"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -5456,6 +5548,28 @@ export interface paths {
          *     `dictionary` are applied. Clips longer than the 30 s Whisper window
          *     are transcribed in windows cut at the quietest pause near the boundary.
          *
+         *     Database nodes also accept named transcribers such as
+         *     `transcribers/apple-speech`. Apple uses the server's native SpeechAnalyzer
+         *     for recorded clips and requires an Apple-provider build, macOS 26+, and
+         *     installed locale assets. Select a named cleanup generator with its bare
+         *     name or `generators/name`; this shares cleanup with named Whisper
+         *     transcribers. The standalone runtime continues to accept local Whisper
+         *     and generator model names.
+         *
+         *     Named non-Whisper providers apply `dictionary` during cleanup; they reject
+         *     Whisper-only `transcript_prompt`, `vad`, and `audio_context` options.
+         *     Apple does not support live transcription sessions. For provider-backed
+         *     cleanup, a delta may contain the entire cleaned result; the raw transcript
+         *     is delivered before cleanup starts. Missing token usage remains absent.
+         *
+         *     Empty recognition is a successful empty result and does not run cleanup.
+         *     Cleanup must confirm a complete text response: token-limited, filtered,
+         *     tool-only, empty, and unconfirmed outputs fail rather than replacing the
+         *     transcript. In streaming mode the error follows `dictation.transcript`
+         *     and no `dictation.completed` event is emitted. Strict Apple cleanup runs
+         *     to natural completion within context, deadline, and bounded output bytes;
+         *     macOS 27+ also verifies measured output tokens against the token budget.
+         *
          *     Set `cleanup_model` to the generator that rewrites the transcript.
          *     Without it, or with `style: verbatim`, the response carries the raw
          *     transcript and no generation runs.
@@ -6367,12 +6481,28 @@ export interface paths {
             cookie?: never;
         };
         get: operations["getMemorySpace"];
-        put?: never;
+        put: operations["putMemorySpace"];
         post?: never;
         delete?: never;
         options?: never;
         head?: never;
         patch: operations["configureMemorySpace"];
+        trace?: never;
+    };
+    "/memory/v1/spaces/{space}/memories/{id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getMemoryUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/memory/v1/spaces/{space}/embeddings": {
@@ -6465,6 +6595,54 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["recordMemoryOutcome"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/memory/v1/spaces/{space}/pins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["pinMemory"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/memory/v1/spaces/{space}/accesses": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["recordMemoryAccess"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/memory/v1/spaces/{space}/consolidation-proposals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["prepareMemoryConsolidation"];
         delete?: never;
         options?: never;
         head?: never;
@@ -6961,6 +7139,38 @@ export interface paths {
         get: operations["listMemories"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/memory/v1/spaces/{space}/brief": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getMemoryBrief"];
+        put?: never;
+        post: operations["briefMemory"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/memory/v1/spaces/{space}/consolidation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["consolidateMemory"];
         delete?: never;
         options?: never;
         head?: never;
@@ -13898,6 +14108,100 @@ export interface components {
              */
             tombstone_field?: string;
         };
+        /** @description Version 1 graph value. INTEGER payloads are signed decimal strings. Map payloads contain typed values, keeping user keys distinct from type tags. Entity identities are opaque table-qualified handles. */
+        GraphWireValue: {
+            /** @enum {string} */
+            type: "null" | "boolean" | "integer" | "number" | "string" | "list" | "map" | "node" | "relationship" | "path";
+            /** @description Type-specific payload; nested collections and entity properties contain GraphWireValue values. */
+            value: unknown;
+        };
+        GraphQueryLimits: {
+            memory_bytes?: number;
+            scanned_anchors?: number;
+            explored_edges?: number;
+            intermediate_states?: number;
+            path_depth?: number;
+            recursion_depth?: number;
+        };
+        GraphQueryRequest: {
+            query: string;
+            /** @description Client-generated native transaction ID for write recovery after cancellation or a lost response. Reusing an admitted ID is rejected; inspect its transaction status instead of replaying the statement. */
+            write_request_id?: string;
+            /** @description Ordinary JSON parameters. Mutually exclusive with typed_parameters. */
+            parameters?: {
+                [key: string]: unknown;
+            };
+            /** @description A map GraphWireValue containing lossless data parameters; graph entity parameters are rejected. Mutually exclusive with parameters. */
+            typed_parameters?: components["schemas"]["GraphWireValue"];
+            limits?: components["schemas"]["GraphQueryLimits"];
+        };
+        GraphQueryResult: {
+            /** @enum {integer} */
+            wire_version: 1;
+            columns: string[];
+            rows: components["schemas"]["GraphWireValue"][][];
+            plan: {
+                [key: string]: unknown;
+            }[];
+            stats: components["schemas"]["GraphQueryStats"];
+            commit?: components["schemas"]["GraphWriteReceipt"];
+            /** @description Whether the compiled statement has no mutation clauses; EXPLAIN also reports the underlying statement capability. */
+            read_only?: boolean;
+            graph_incarnation: string;
+            graph_revision: string;
+            complete: boolean;
+        };
+        GraphQueryStats: {
+            scanned_anchors?: number;
+            explored_edges?: number;
+            intermediate_states?: number;
+            mutations?: number;
+            memory_bytes?: number;
+            search_calls?: number;
+            search_candidates?: number;
+            search_approximate?: boolean;
+        };
+        GraphWriteReceipt: {
+            /** @description Native durable transaction identity; never replay a statement after an ambiguous write response. */
+            transaction_id: string;
+            /** @enum {string} */
+            status: "committed" | "committed_pending" | "committed_repair_required" | "aborted" | "unknown";
+            outcome?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        GraphCatalogEntry: {
+            /** @description Opaque decimal catalog identity */
+            graph_id: string;
+            /** @description Lossless decimal definition revision used for conditional updates */
+            revision: string;
+            name: string;
+            definition: components["schemas"]["GraphDefinition"];
+        };
+        GraphDefinitionUpdate: {
+            expected_revision: string;
+            definition: components["schemas"]["GraphDefinition"];
+        };
+        GraphDefinition: {
+            labels: components["schemas"]["GraphLabelMapping"][];
+            relationships?: components["schemas"]["GraphRelationshipMapping"][];
+        };
+        GraphLabelMapping: {
+            name: string;
+            /** @description A literal default.public table name or an explicitly scoped table target. Bindings retain the physical table incarnation through renames. */
+            table: string | components["schemas"]["CatalogTableTarget"];
+            /** @description Equality predicates defining this label over stored document properties. */
+            where?: {
+                [key: string]: unknown;
+            };
+        };
+        GraphRelationshipMapping: {
+            name: string;
+            index: string;
+            source_label: string;
+            target_label: string;
+            stored_type: string;
+        };
         SavedQuerySource: {
             /** Format: uint64 */
             source_id: number;
@@ -15456,7 +15760,7 @@ export interface components {
          * @example table
          * @enum {string}
          */
-        ResourceType: "table" | "database" | "namespace" | "tablespace" | "user" | "inference" | "*";
+        ResourceType: "table" | "database" | "namespace" | "tablespace" | "graph" | "user" | "inference" | "*";
         /**
          * @description Type of permission.
          * @example read
@@ -17409,7 +17713,7 @@ export interface components {
             content_type_field?: string;
             /** @description Row field holding the source ETag. */
             etag_field?: string;
-            /** @description Row field holding the source checksum. */
+            /** @description Row field holding the source checksum. May name a dotted path (e.g. `metadata.sha256`) to reach a value nested under another row field. */
             checksum_field?: string;
             /** @description Row field holding the source version. */
             version_field?: string;
@@ -17526,6 +17830,17 @@ export interface components {
         };
         /** @description How PDF pages are rasterized for OCR. */
         DocumentExtractionRenderConfig: {
+            /**
+             * @description PDF image sampling, separate from model resizing and normalization.
+             *     `auto` smooths continuous-tone images while preserving one-bit scan
+             *     coverage during minification. `pdf` honors the PDF's interpolation
+             *     declarations. `smooth` uses bilinear sampling even for one-bit images
+             *     (except stencil masks), which can soften fine lines. Effective policy,
+             *     version, resolution, DPI and geometry are recorded in unit provenance.
+             * @default auto
+             * @enum {string}
+             */
+            sampling?: "auto" | "pdf" | "smooth";
             /**
              * @description Render resolution in dots per inch.
              * @default 150
@@ -17770,6 +18085,11 @@ export interface components {
             etag?: string;
             /** @description Static checksum recorded as source version metadata. */
             checksum?: string;
+            /**
+             * @description Declares that `checksum` (or the row value named by `source.checksum_field`) is a digest of the original bytes, computed with this algorithm. When set and the row carries a well-formed digest, extraction identifies the row by that digest instead of by its location (URL, ETag, version, last-modified), so copying, re-hosting, or renaming a source does not force re-extraction as long as the bytes are unchanged. The downloaded bytes are verified against the declared digest; a mismatch fails extraction instead of keeping stale output alive. A present but malformed digest is also an error, never a silent fall back to location-based identity. Leaving this unset preserves prior behavior byte for byte, including for rows that only set `checksum_field`.
+             * @enum {string}
+             */
+            checksum_algorithm?: "sha256";
             /** @description Static source version. Together with the other metadata it lets extraction skip unchanged sources. */
             version?: string;
             /** @description Static last-modified timestamp recorded as source version metadata. */
@@ -17909,6 +18229,12 @@ export interface components {
             template?: string;
             /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor). */
             source_artifact_name?: string;
+            /**
+             * @description pdf_page_images requires kind=embedding, consumes a PDF URI, and embeds its rendered pages. Native field selectors address literal root keys; use a raw template for nested resource URIs.
+             * @default text
+             * @enum {string}
+             */
+            embedding_input?: "text" | "pdf_page_images";
             /** @description Expected embedding dimension for embedding enrichments. */
             expected_dims?: number;
             /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently. */
@@ -18126,6 +18452,8 @@ export interface components {
              * @default false
              */
             external?: boolean;
+            /** @description Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model. */
+            external_vector_space?: string;
             /**
              * @description When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
              * @default false
@@ -18352,15 +18680,49 @@ export interface components {
                 review?: number;
             };
         };
+        DeciderCascadeStage: {
+            /** @description Unique within the cascade; reported in traces. */
+            name: string;
+            /** @description Inline typed or generated decider. Cascades and embedding_similarity deciders cannot be stages. */
+            decider: components["schemas"]["DeciderConfig"];
+            /** @description Required on every stage except the first, which must omit it. Inclusive band on the previous stage's answer. */
+            when?: {
+                /** @description Measure this question only. Omitted, any question in the band escalates. */
+                question?: string;
+                /** @description For choice questions, measure this value's probability. Omitted, the selected value's probability. */
+                choice?: string;
+                /** @description Lower and upper bound, lower strictly below upper. Inputs must have measured probabilities. The previous stage must not be verdict_only; a dynamically returned proxy verdict fails its producing stage under on_failure instead of driving the band. */
+                probability_between: number[];
+            };
+            /** @description Require this stage to agree with the preceding stage on the band question, or every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and abstains; a keep_previous failure leaves agreement unverified and also abstains. */
+            require_agreement?: boolean;
+            /**
+             * @description Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
+             * @default fail
+             * @enum {string}
+             */
+            on_failure?: "fail" | "keep_previous";
+        };
+        /** @description Required with decision_method=cascade, which allows no transport, model or rate-limit fields of its own. The first stage answers every input. Each later stage runs only for inputs whose previous answer falls inside its probability band, and all escalating inputs share one call. The final answer is the last answering stage's. Escalation applies to successful answers only; it is not failover. Probabilities are not calibrated across models, so set bands per model on labelled data. */
+        DeciderCascade: {
+            stages: components["schemas"]["DeciderCascadeStage"][];
+            budget?: {
+                /** @description Stage invocations allowed per request. Defaults to the stage count and cannot be lower. */
+                max_model_calls?: number;
+                /** @description Narrows the caller's deadline for the whole cascade. Checked before each stage and enforced by stage transports. */
+                deadline_ms?: number;
+            };
+        };
         DeciderConfig: {
             /** @enum {string} */
             provider?: "antfly" | "jev" | "openai" | "cloudflare";
             /**
-             * @description Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
+             * @description Execution contract. With provider antfly, typed invokes the Decisions endpoint; remote named deciders may return validated typed or generated answers, including upstream cascade outcomes. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate questions only.
              * @default typed
              * @enum {string}
              */
-            decision_method?: "typed" | "embedding_similarity" | "generated";
+            decision_method?: "typed" | "embedding_similarity" | "generated" | "cascade";
+            cascade?: components["schemas"]["DeciderCascade"];
             /** @description Required with decision_method=generated. Provider configuration belongs here rather than in the outer typed-decider fields. */
             generator?: components["schemas"]["GeneratorConfig"];
             instructions?: string;
@@ -18442,7 +18804,7 @@ export interface components {
         };
         /** @description Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges. */
         GraphResolverAdjudicationConfig: {
-            /** @description Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one. */
+            /** @description Frozen typed, generated or cascade decider configuration. Standalone generated verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds to probabilistic stages and require categorical zero-or-one terminal verdicts. A cascade answer is validated against the stage that produced it, and the receipt keeps the response's stage trace. */
             decider: components["schemas"]["DeciderConfig"];
             /** @description Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions. */
             template: string;
@@ -19368,6 +19730,11 @@ export interface components {
             template?: string;
             source_artifact_name?: string;
             expected_dims?: number;
+            /**
+             * @description Effective embedding input mode; PDF pages are rasterized before embedding.
+             * @enum {string}
+             */
+            embedding_input?: "text" | "pdf_page_images";
             /** @description Optional stable model/token-space identifier asserted for this embedding artifact. */
             vector_space?: string;
             chunk_size?: number;
@@ -19456,6 +19823,7 @@ export interface components {
             coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
             /** @default false */
             external?: boolean;
+            external_vector_space?: string;
             /** @default false */
             sparse?: boolean;
             dimension?: number;
@@ -22518,7 +22886,7 @@ export interface components {
             /** Format: double */
             max?: number;
         };
-        /** @description Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
+        /** @description Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses Cypher relationship-simple trails: nodes may repeat, but the same physical relationship cannot be reused anywhere within one MATCH group. Each optional group has its own relationship scope. Parallel relationship IDs remain distinct. A zero-hop path binds both endpoints to the same node identity without reading an edge. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
         GraphMatchEdge: {
             edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             from: components["schemas"]["GraphIdentifier"];
@@ -23461,6 +23829,8 @@ export interface components {
             resolution: {
                 /** Format: uint64 */
                 config_generation: number;
+                /** @description Shared base policy and source binding for adjudication receipts, independent of model revisions. Omitted by older writers. */
+                adjudication_execution_hash?: string;
                 skipped_mentions?: number;
                 entities: components["schemas"]["ResolverResolvedEntity"][];
                 _resolution_work?: {
@@ -24467,6 +24837,13 @@ export interface components {
              */
             audio: string;
             /**
+             * @description Clean an already finalized recognition segment without running recognition
+             *     again. Supported by named transcribers advertising text_cleanup. Set
+             *     audio to the empty string and omit attachments and recognition hints.
+             *     Partial hypotheses must never be submitted as finalized segments.
+             */
+            transcript_text?: string;
+            /**
              * @description Force the transcript language (ISO 639-1). Omit for automatic detection.
              * @example en
              */
@@ -24786,6 +25163,7 @@ export interface components {
             answers?: components["schemas"]["InferenceDecideAnswer"][];
             data?: components["schemas"]["DecisionBatchItem"][];
             usage: components["schemas"]["DecisionUsage"];
+            cascade?: components["schemas"]["DecisionCascadeTrace"];
         };
         InferenceModelsResponse: {
             /** @description Whether public inference execution is enabled on this deployment. When false, locally installed models are still listed with `invocable: false` and remote upstreams are not probed. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
@@ -26618,6 +26996,11 @@ export interface components {
             mode: "external" | "managed" | "policy";
             /** Format: uint64 */
             knowledge_revision: number;
+            /**
+             * Format: uint64
+             * @default 0
+             */
+            feedback_revision?: number;
             /** Format: uint64 */
             config_generation: number;
             config_fingerprint: string;
@@ -26731,6 +27114,16 @@ export interface components {
              * @default 0
              */
             true_negative?: number;
+            /**
+             * Format: uint64
+             * @default 0
+             */
+            tokens?: number;
+            /**
+             * Format: uint64
+             * @default 0
+             */
+            token_cases?: number;
         };
         MemoryEvaluationReport: {
             counts: components["schemas"]["MemoryEvaluationCounts"];
@@ -26744,6 +27137,11 @@ export interface components {
             coverage: number | null;
             /** Format: double */
             accuracy: number | null;
+            /**
+             * Format: double
+             * @default null
+             */
+            mean_tokens?: number | null;
         };
         MemoryEvaluationJudgeTask: {
             case_id: string;
@@ -26769,6 +27167,11 @@ export interface components {
             /** @default null */
             ranking?: string[] | null;
             reason?: string;
+            /**
+             * Format: uint64
+             * @default null
+             */
+            token_upper_bound?: number | null;
         };
         MemoryEvaluationJudgeOutput: {
             /**
@@ -26831,6 +27234,12 @@ export interface components {
             invalid_output?: boolean;
         };
         MemoryEvaluationPolicyInput: {
+            /**
+             * @default recall
+             * @enum {string}
+             */
+            retrieval?: "recall" | "brief" | "none";
+            brief?: components["schemas"]["MemoryBriefRequest"];
             seed?: string;
             target?: string;
             entity_candidates?: components["schemas"]["MemoryEntityCandidateRequest"];
@@ -27374,6 +27783,8 @@ export interface components {
             reconciliation_reason?: string | null;
         };
         MemoryObservationRequest: {
+            /** @default false */
+            scoped_evidence_ids?: boolean;
             /** @default null */
             origin?: {
                 /** @default null */
@@ -27637,8 +28048,19 @@ export interface components {
                  */
                 dimensions?: number | null;
             } | null;
+            /**
+             * Format: double
+             * @default 0
+             */
+            utility_weight?: number;
         };
         MemoryOperation: {
+            evidence_ids?: string[];
+            duplicate_ids?: string[];
+            near_duplicate_ids?: string[];
+            proposal_ids?: string[];
+            /** @default null */
+            review_cursor?: string | null;
             /** @default null */
             evaluation_id?: string | null;
             branch?: string;
@@ -27809,6 +28231,11 @@ export interface components {
              * @default 0
              */
             recorded_at?: number;
+            /**
+             * Format: int64
+             * @default null
+             */
+            last_verified_at?: number | null;
             /** Format: uint64 */
             revision: number;
             /**
@@ -29050,6 +29477,11 @@ export interface components {
                      * @default 0
                      */
                     recorded_at?: number;
+                    /**
+                     * Format: int64
+                     * @default null
+                     */
+                    last_verified_at?: number | null;
                     /** Format: uint64 */
                     revision: number;
                     /**
@@ -29468,6 +29900,11 @@ export interface components {
                  * @default 0
                  */
                 recorded_at?: number;
+                /**
+                 * Format: int64
+                 * @default null
+                 */
+                last_verified_at?: number | null;
                 /** Format: uint64 */
                 revision: number;
                 /**
@@ -29540,6 +29977,7 @@ export interface components {
             complete: boolean;
         };
         MemoryInspection: {
+            statistics?: components["schemas"]["MemoryStatistics"];
             state: {
                 /**
                  * Format: uint64
@@ -29949,6 +30387,212 @@ export interface components {
                 generator_available: boolean;
                 embedder_available: boolean;
             };
+        };
+        MemoryStatistics: {
+            stats?: components["schemas"]["MemorySpaceStats"];
+            /** @default null */
+            next_cursor?: string | null;
+            /** @default true */
+            complete?: boolean;
+            /**
+             * Format: uint64
+             * @default 0
+             */
+            scanned?: number;
+        };
+        MemoryAccess: {
+            memory_ids: string[];
+        };
+        MemoryUsage: {
+            /**
+             * Format: uint64
+             * @default 0
+             */
+            recalls?: number;
+            /**
+             * Format: int64
+             * @default null
+             */
+            last_recalled_at?: number | null;
+            /**
+             * Format: int64
+             * @default null
+             */
+            last_verified_at?: number | null;
+            utility?: components["schemas"]["MemoryUtility"];
+        };
+        MemoryStoredEvidence: {
+            materialization?: components["schemas"]["MemoryIntakeMaterialization"];
+            /** @default false */
+            context_only?: boolean;
+            evidence: components["schemas"]["MemoryEvidence"];
+            owner: string;
+            /** Format: int64 */
+            recorded_at: number;
+            /** Format: uint64 */
+            revision: number;
+            /** @default false */
+            forgotten?: boolean;
+        };
+        MemoryResolvedEntity: {
+            entity: components["schemas"]["MemoryEntity"];
+            resource_ref: components["schemas"]["ResourceReference"];
+            canonical_id: string;
+            requested_id: string;
+            /** Format: uint64 */
+            revision: number;
+            identity: string;
+            uncertainty: string;
+        };
+        MemoryUtility: {
+            /**
+             * Format: uint32
+             * @default 0
+             */
+            successes?: number;
+            /**
+             * Format: uint32
+             * @default 0
+             */
+            failures?: number;
+            /**
+             * Format: double
+             * @default 0
+             */
+            score?: number;
+            /** @default true */
+            complete?: boolean;
+        };
+        MemoryPin: {
+            id: string;
+            /** @default true */
+            pinned?: boolean;
+            reason?: string;
+        };
+        MemoryBriefRequest: {
+            /** @default null */
+            scope?: string | null;
+            /** @default null */
+            task?: string | null;
+            /** @default null */
+            environment?: string | null;
+            /** @default false */
+            include_provisional?: boolean;
+            /**
+             * Format: uint32
+             * @default 16
+             */
+            limit?: number;
+            /**
+             * Format: uint32
+             * @default 1024
+             */
+            token_budget?: number;
+        };
+        MemoryBriefItem: {
+            id: string;
+            statement: string;
+            /** @enum {string} */
+            kind: "semantic" | "episodic" | "procedural" | "decision" | "rationale" | "preference" | "lesson" | "constraint" | "open_question" | "alternative" | "summary";
+            subject: string;
+            predicate: string;
+            scope: string;
+            /** @enum {string} */
+            stability: "provisional" | "settled";
+            /** Format: int64 */
+            valid_from: number | null;
+            pinned: boolean;
+            /** Format: double */
+            score: number;
+            utility: components["schemas"]["MemoryUtility"];
+        };
+        MemorySubjectCount: {
+            subject: string;
+            /** Format: uint32 */
+            memories: number;
+        };
+        MemoryCount: {
+            name: string;
+            /** Format: uint32 */
+            memories: number;
+        };
+        MemoryBrief: {
+            items: components["schemas"]["MemoryBriefItem"][];
+            subjects: components["schemas"]["MemorySubjectCount"][];
+            guidance: string;
+            /** Format: uint64 */
+            scanned: number;
+            /** Format: uint64 */
+            omitted: number;
+            complete: boolean;
+            /** Format: uint64 */
+            token_upper_bound: number;
+            /** Format: uint64 */
+            revision: number;
+            /** Format: uint64 */
+            config_generation: number;
+        };
+        MemoryConsolidationRequest: {
+            /**
+             * Format: uint32
+             * @default 32
+             */
+            limit?: number;
+            /**
+             * Format: uint64
+             * @default null
+             */
+            stale_after_ms?: number | null;
+            /** @default null */
+            cursor?: string | null;
+        };
+        MemoryFinding: {
+            /** @enum {string} */
+            kind: "duplicate" | "dispute" | "unordered" | "unverified" | "harmful" | "stale" | "dangling_link" | "orphan_entity" | "promote";
+            memory_ids?: string[];
+            /** @default null */
+            entity_id?: string | null;
+            /** @default null */
+            target_id?: string | null;
+            reason: string;
+            /** @enum {string} */
+            suggested_action: "propose_supersession" | "review_supersession" | "correct" | "add_valid_from" | "verify" | "fix_link" | "curate_entity" | "pin";
+        };
+        MemorySpaceStats: {
+            /**
+             * Format: uint32
+             * @default 0
+             */
+            memories?: number;
+            by_kind?: components["schemas"]["MemoryCount"][];
+            by_lifecycle?: components["schemas"]["MemoryCount"][];
+            by_stability?: components["schemas"]["MemoryCount"][];
+            by_producer?: components["schemas"]["MemoryCount"][];
+            /**
+             * Format: uint32
+             * @default 0
+             */
+            pinned?: number;
+            /**
+             * Format: uint32
+             * @default 0
+             */
+            entities?: number;
+        };
+        MemoryConsolidation: {
+            /** @default null */
+            next_cursor?: string | null;
+            findings: components["schemas"]["MemoryFinding"][];
+            stats: components["schemas"]["MemorySpaceStats"];
+            /** Format: uint64 */
+            scanned: number;
+            /** Format: uint64 */
+            omitted: number;
+            complete: boolean;
+            /** Format: uint64 */
+            revision: number;
+            /** Format: uint64 */
+            config_generation: number;
         };
         MemoryCreateSpaceRequest: {
             space: string;
@@ -30883,6 +31527,89 @@ export interface components {
             };
         };
         InferenceDecideAnswer: components["schemas"]["GeneratedChoiceAnswer"] | components["schemas"]["GeneratedMultiChoiceAnswer"] | components["schemas"]["GeneratedPredicateAnswer"] | components["schemas"]["GeneratedScoreAnswer"] | components["schemas"]["TrainedChoiceAnswer"] | components["schemas"]["TrainedScoreAnswer"] | components["schemas"]["TrainedPredicateAnswer"] | components["schemas"]["EmbeddingChoiceAnswer"] | components["schemas"]["EmbeddingMultiChoiceAnswer"];
+        /**
+         * @description A required comparison agreed, disagreed, or could not run because its stage failed with keep_previous or its upstream abstained. Disagreed and unverified outcomes abstain without discarding model answers or usage.
+         * @enum {string}
+         */
+        DecisionCascadeAgreementStatus: "agreed" | "disagreed" | "unverified";
+        /** @description Flat execution dependency relative to the upstream Decisions invocation. Model entries pin generated model revisions; cascade entries pin definitions. Unverified entries mark incomplete historical provenance and cannot authorize receipt reuse. */
+        DecisionRevisionDependency: {
+            /** @enum {string} */
+            kind: "model" | "cascade" | "unverified";
+            path: string[];
+            identity: string;
+            model?: string;
+        };
+        /** @description Bounded agreement summary reported by the stage's upstream provider. This preserves upstream abstention without recursively embedding its trace; the upstream definition is not locally verified. A disagreed or unverified upstream stops the input, including at the first or an unguarded stage. */
+        DecisionCascadeUpstreamAgreement: {
+            agreement_status: components["schemas"]["DecisionCascadeAgreementStatus"];
+            /** @description True for agreed, false for disagreed, absent for unverified. */
+            agreed?: boolean;
+            /** @description Sorted names from this stage's answers; required only for disagreed. */
+            disagreed_questions?: string[];
+            decider?: string;
+            definition_sha256?: string;
+            answered_by?: string;
+        };
+        DecisionUsage: {
+            /** @description True for estimated usage, including apportioned shared generated-batch costs and embedding-based estimates. Generated cascades divide shared totals evenly, assigning integer remainders in input order; their request aggregate remains measured. */
+            estimated?: boolean;
+            /** @description Encoded tokens including repeated input text for split model tasks. */
+            input_tokens: number;
+            /** @description Zero for classifiers, which generate no tokens. */
+            output_tokens: number;
+        };
+        DecisionCascadeStageTrace: {
+            /** @description Whether the version-2 projection has complete provenance. False preserves uncertainty without consuming a dependency slot. Required with version 2; absent with version 1, whose legacy unverified entries still imply incompleteness. Unversioned projections remain incomplete. */
+            upstream_revisions_complete?: boolean;
+            /**
+             * Format: int32
+             * @description Version 2 requires upstream_revisions_complete and separates provenance from the bounded dependency nodes. Version 1 uses legacy unverified entries to represent incompleteness. Unversioned historical projections may have lost definitions and cannot authorize identity verdict reuse.
+             */
+            upstream_revisions_version?: number;
+            /** @description Sorted question names compared by this stage. Present only when a local comparison ran. Allows upstream consumers to verify scoped agreement directly from the stage answers without reconstructing its policy. Historical traces may omit this field; ambiguous historical agreement abstains. */
+            agreement_questions?: string[];
+            /** @description Bounded upstream execution dependencies. New version-2 projections contain actual dependencies and use upstream_revisions_complete for uncertainty. Complete empty projections record no versioned dependencies. Version-1 legacy unverified entries are still readable; unversioned projections cannot prove completeness. */
+            upstream_revisions?: components["schemas"]["DecisionRevisionDependency"][];
+            upstream_agreement?: components["schemas"]["DecisionCascadeUpstreamAgreement"];
+            agreement_status?: components["schemas"]["DecisionCascadeAgreementStatus"];
+            /** @description Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable. */
+            agreed?: boolean;
+            /** @description Sorted question names that disagreed. Present only when agreement_status is disagreed. */
+            disagreed_questions?: string[];
+            name: string;
+            /** @enum {string} */
+            decision_method: "typed" | "generated";
+            model?: string;
+            /** @description Immutable model revision reported by this stage, when available. */
+            model_revision?: string;
+            /** @description This stage's answers. Absent when the stage failed. */
+            answers?: components["schemas"]["InferenceDecideAnswer"][];
+            usage?: components["schemas"]["DecisionUsage"];
+            /** @description Producer provenance reported for this stage, when present. */
+            provenance?: {
+                [key: string]: unknown;
+            };
+            /** @description Whether this answer fell inside the next stage's band, sending the input on. */
+            escalated: boolean;
+            /** @description Error code when this stage failed for the input. With on_failure keep_previous, the previous stage's answer stands. */
+            error?: string;
+        };
+        /** @description Present when a cascade decider answered. Lists the stages that ran for this input, in order. The top-level model and answers come from the answering stage, and usage is the sum over these stages. */
+        DecisionCascadeTrace: {
+            agreement_status?: components["schemas"]["DecisionCascadeAgreementStatus"];
+            /** @description Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable. */
+            agreed?: boolean;
+            /** @description Sorted question names that disagreed. Present only when agreement_status is disagreed. */
+            disagreed_questions?: string[];
+            /** @description The configured cascade name. */
+            decider: string;
+            /** @description Identity of the cascade definition, excluding credentials. Any change to stages, bands, failure policy or budget changes it. */
+            definition_sha256: string;
+            /** @description Name of the stage whose answer is final. */
+            answered_by: string;
+            stages: components["schemas"]["DecisionCascadeStageTrace"][];
+        };
         DecisionBatchItem: {
             input_index: number;
             id?: string;
@@ -30891,12 +31618,7 @@ export interface components {
             /** @description Resolved model reported for a successful named gateway batch item. */
             model?: string;
             answers: components["schemas"]["InferenceDecideAnswer"][];
-        };
-        DecisionUsage: {
-            /** @description Encoded tokens including repeated input text for split model tasks. */
-            input_tokens: number;
-            /** @description Zero for classifiers, which generate no tokens. */
-            output_tokens: number;
+            cascade?: components["schemas"]["DecisionCascadeTrace"];
         };
         QueryAdmissionConfig: {
             /**
@@ -33657,6 +34379,31 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getTransactionStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                transaction_id: components["parameters"]["TransactionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Principal-bound transaction status without row data */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TransactionSessionStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -36925,6 +37672,227 @@ export interface operations {
                 content?: never;
             };
             404: components["responses"]["NotFound"];
+        };
+    };
+    listGraphs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Immutable graph definitions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphCatalogEntry"][];
+                };
+            };
+        };
+    };
+    getGraph: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Graph definition and immutable incarnation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphCatalogEntry"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    updateGraph: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphDefinitionUpdate"];
+            };
+        };
+        responses: {
+            /** @description Graph definition updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphCatalogEntry"];
+                };
+            };
+            /** @description Committed with visibility pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Graph administration or mapped-table read permission denied */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Expected definition revision or dependency incarnation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createGraph: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphDefinition"];
+            };
+        };
+        responses: {
+            /** @description Graph created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphCatalogEntry"];
+                };
+            };
+            /** @description Committed with visibility pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Graph already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropGraph: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Graph dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    executeGraphQuery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graphName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphQueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Complete graph query result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphQueryResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Graph or underlying table access denied */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Catalog or policy generation changed, or a write conflicted */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Query capacity or resource budget exhausted */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Required owner unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     listTablespaces: {
@@ -44291,6 +45259,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["InferenceDictateRequest"];
+                "application/vnd.antfly.attachments.v1": string;
             };
         };
         responses: {
@@ -46312,7 +47281,10 @@ export interface operations {
     };
     getMemorySpace: {
         parameters: {
-            query?: never;
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
             header?: {
                 /** @description Catalog scope for this memory space. */
                 "X-Antfly-Database"?: string;
@@ -46335,6 +47307,122 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MemoryInspection"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
+    putMemorySpace: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Memory-Branch"?: string;
+                /** @description Stable per-principal operation key. Conflicting reuse returns 409. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                space: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemorySpaceConfig"];
+            };
+        };
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryOperation"];
                 };
             };
             /** @description Memory validation, authorization, concurrency, capability, or execution error. */
@@ -46451,6 +47539,117 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MemoryOperation"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
+    getMemoryUsage: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Memory-Branch"?: string;
+            };
+            path: {
+                space: string;
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryUsage"];
                 };
             };
             /** @description Memory validation, authorization, concurrency, capability, or execution error. */
@@ -47137,6 +48336,354 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["MemoryOutcome"];
+            };
+        };
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryOperation"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
+    pinMemory: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Memory-Branch"?: string;
+                /** @description Stable per-principal operation key. Conflicting reuse returns 409. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                space: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryPin"];
+            };
+        };
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryOperation"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
+    recordMemoryAccess: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Memory-Branch"?: string;
+                /** @description Stable per-principal operation key. Conflicting reuse returns 409. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                space: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryAccess"];
+            };
+        };
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryOperation"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
+    prepareMemoryConsolidation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Memory-Branch"?: string;
+                /** @description Stable per-principal operation key. Conflicting reuse returns 409. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                space: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryConsolidationRequest"];
             };
         };
         responses: {
@@ -51132,6 +52679,351 @@ export interface operations {
             };
         };
     };
+    getMemoryBrief: {
+        parameters: {
+            query?: {
+                limit?: number;
+                token_budget?: number;
+                scope?: string;
+                task?: string;
+                environment?: string;
+                include_provisional?: boolean;
+            };
+            header?: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Memory-Branch"?: string;
+            };
+            path: {
+                space: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryBrief"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
+    briefMemory: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Memory-Branch"?: string;
+            };
+            path: {
+                space: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryBriefRequest"];
+            };
+        };
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryBrief"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
+    consolidateMemory: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Memory-Branch"?: string;
+            };
+            path: {
+                space: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryConsolidationRequest"];
+            };
+        };
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryConsolidation"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
     getMemory: {
         parameters: {
             query?: never;
@@ -51829,7 +53721,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["MemoryResult"];
+                    "application/json": components["schemas"]["MemoryStoredEvidence"];
                 };
             };
             /** @description Memory validation, authorization, concurrency, capability, or execution error. */
@@ -52056,7 +53948,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["MemoryResult"];
+                    "application/json": components["schemas"]["MemoryResolvedEntity"];
                 };
             };
             /** @description Memory validation, authorization, concurrency, capability, or execution error. */

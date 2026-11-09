@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
         const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
         // Shared native owners keep their real imports, options and native
         // objects. The cache fixture replaces expensive bodies for these
-        // providers just as it does for the seven runtime archives below.
+        // providers just as it does for the eight runtime archives below.
         if (std.mem.eql(u8, artifact.name, "antfly-storage-engine") or
             std.mem.eql(u8, artifact.name, "antfly-inference-core"))
             artifact.root_module.root_source_file = sources.add(b.fmt("{s}-cache-body.zig", .{artifact.name}), "comptime {}\n");
@@ -74,7 +74,7 @@ pub fn build(b: *std.Build) void {
         }
         if (artifact.kind.isTest()) {
             var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
-            rejectMetadata(artifact.root_module, inference.build_info_object, &seen);
+            rejectMetadata(artifact.root_module, inference.build_info_object, &seen, artifact.name);
             test_count += 1;
         }
         if (artifact.root_module.root_source_file) |source| switch (source) {
@@ -109,7 +109,13 @@ pub fn build(b: *std.Build) void {
                     b.step("cache-vopr-tests", "Exercise actual simulation test imports").dependOn(&b.addRunArtifact(artifact).step);
                     vopr_test_found = true;
                 }
-                if (std.mem.endsWith(u8, path.sub_path, "/template_test_root.zig")) template = artifact;
+                // The same source also has independently linked test objects.
+                // Only a complete test artifact is executable here; pointer-map
+                // iteration must never select an object file as the runner.
+                if (artifact.kind == .@"test" and std.mem.endsWith(u8, path.sub_path, "/template_test_root.zig")) {
+                    if (template != null) @panic("ambiguous runnable template suite");
+                    template = artifact;
+                }
             },
             else => {},
         };
@@ -156,6 +162,7 @@ pub fn build(b: *std.Build) void {
     template_tests.root_module.root_source_file = sources.add("template_test.zig",
         \\test "unit metadata is stable without a release object" {
         \\    try @import("std").testing.expectEqualStrings("test", @import("build_info").version());
+        \\    @import("std").debug.print("UNIT_METADATA_PROBE {s}\n", .{@import("build_info").version()});
         \\}
     );
     unit_tests.dependOn(&b.addRunArtifact(template_tests).step);
@@ -209,13 +216,15 @@ pub fn build(b: *std.Build) void {
                 "observabilityRevision(@import(\"cache_prometheus\")) ^ (observabilityRevision(@import(\"cache_structlog\")) << 8)"
         else if (unit == .distributed)
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @intFromBool(@import(\"cache_lite_capabilities\").capabilitiesForProfile(.native).local_inference_runtime) ^ ownerRevision(@import(\"raft_engine\"))"
+        else if (unit == .local_query)
+            "@import(\"local_query_abi\").abi_version ^ ownerRevision(@import(\"local_query_abi\"))"
         else if (unit == .storage_kernel)
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ ownerRevision(@import(\"raft_engine\"))"
         else
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\")";
         const declarations = switch (unit) {
             .api_kernel => "const specs = @import(\"antfly_openapi_specs\");\n" ++ profiles.owner_probe_source,
-            .distributed, .storage_kernel => profiles.owner_probe_source,
+            .distributed, .storage_kernel, .local_query => profiles.owner_probe_source,
             .inference => profiles.observability_probe_source,
             else => "",
         };
@@ -233,11 +242,12 @@ pub fn build(b: *std.Build) void {
         \\extern fn probe_inference() u64;
         \\extern fn probe_api_kernel() u64;
         \\extern fn probe_storage_kernel() u64;
+        \\extern fn probe_local_query() u64;
         \\extern fn probe_enrichment_compute() u64;
         \\pub fn main() void {
-        \\    std.debug.print("CACHE_PROBE {s} {x} {x} {x} {x} {x} {x} {x}\n", .{
+        \\    std.debug.print("CACHE_PROBE {s} {x} {x} {x} {x} {x} {x} {x} {x}\n", .{
         \\        @import("build_info").version(), probe_cli(), probe_distributed(),
-        \\        probe_serverless(), probe_inference(), probe_api_kernel(), probe_storage_kernel(), probe_enrichment_compute(),
+        \\        probe_serverless(), probe_inference(), probe_api_kernel(), probe_storage_kernel(), probe_local_query(), probe_enrichment_compute(),
         \\    });
         \\}
     );
@@ -285,6 +295,7 @@ pub fn build(b: *std.Build) void {
             return std.mem.lessThan(u8, config.stringSlice(a.sub_path), config.stringSlice(c.sub_path));
         }
     }.lessThan);
+    profiles.retainCacheTargets(b, "cache-probe");
 }
 
 fn inferenceIdentityPath(b: *std.Build, module: *std.Build.Module, seen: *std.AutoHashMap(*std.Build.Module, void), path: []const u8) ?[]const u8 {
@@ -347,8 +358,8 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
             std.debug.panic("{s} archive depends on Lite capability settings", .{@tagName(unit)});
         if (unit != .api_kernel and (std.mem.eql(u8, name, "antfly_mcp") or std.mem.eql(u8, name, "antfly_a2a")))
             std.debug.panic("{s} archive depends on API protocol adapters", .{@tagName(unit)});
-        if (unit == .serverless and std.mem.eql(u8, name, "raft_engine"))
-            @panic("serverless archive depends on Raft");
+        if ((unit == .serverless or unit == .local_query) and std.mem.eql(u8, name, "raft_engine"))
+            std.debug.panic("{s} archive depends on Raft", .{@tagName(unit)});
         if (unit != .api_kernel and std.mem.eql(u8, name, "antfly_openapi_specs"))
             std.debug.panic("{s} archive depends on served schemas", .{@tagName(unit)});
         if (unit != .inference and (std.mem.eql(u8, name, "metal_jit_identity") or std.mem.eql(u8, name, "cuda_jit_identity")))
@@ -360,16 +371,16 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
     }
 }
 
-fn rejectMetadata(module: *std.Build.Module, metadata: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
+fn rejectMetadata(module: *std.Build.Module, metadata: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Module, void), owner: []const u8) void {
     if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
     for (module.link_objects.items) |object| switch (object) {
         .other_step => |artifact| {
-            if (artifact == metadata) @panic("unit test depends on release metadata");
-            rejectMetadata(artifact.root_module, metadata, seen);
+            if (artifact == metadata) std.debug.panic("unit test depends on release metadata: {s} via {s}", .{ owner, if (module.root_source_file) |source| source.getDisplayName() else "link-only module" });
+            rejectMetadata(artifact.root_module, metadata, seen, owner);
         },
         else => {},
     };
-    for (module.import_table.values()) |dependency| rejectMetadata(dependency, metadata, seen);
+    for (module.import_table.values()) |dependency| rejectMetadata(dependency, metadata, seen, owner);
 }
 
 fn isSqlGenerator(b: *std.Build, artifact: *std.Build.Step.Compile) bool {

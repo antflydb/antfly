@@ -42,12 +42,15 @@ CUDA with identical output IDs. Exact unseen names and codes remain an explicit
 quality gate; source-verified hybrid qualification does not satisfy that gate.
 The [published-data diagnostic](history/memorilla/2026-11-09-latent-published-qa.md)
 records 20/32 Python BF16 TriviaQA exact matches, distinguishing those operational
-failures from a claim that all latent-only QA fails. The original vLLM engine
-was not executed.
+failures from a claim that all latent-only QA fails. That diagnostic did not
+execute the original vLLM engine.
 The subsequent [official vLLM engine check](history/memorilla/2026-11-09-vllm-engine-qualification.md)
 executes the pinned vLLM 0.9.1 path: QA scores match the independent BF16 control,
 and fresh warm latency is 0.819 s native F32 versus 0.823 s vLLM BF16 on GB10.
 The small median difference does not establish a general speed advantage.
+The [PR integration record](history/memorilla/2026-11-09-pr-integration.md)
+checks the implementation after merging current main, with fresh native
+numerical, supervised HTTP, generated-client and lifecycle validation.
 The [reader residency performance report](history/memorilla/2026-11-09-native-performance.md)
 records the subsequent native latency improvement and cache lifecycle checks.
 The [native/Python latency comparison](history/memorilla/2026-11-09-native-python-latency.md)

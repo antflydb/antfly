@@ -5,6 +5,12 @@ Status: active. Research date: 2026-11-07. Antfly source baseline:
 `d8f18891a50bf33c18f04fe5167c22f51e58c9cd`. Paper: [version 3, November 3,
 2026](https://arxiv.org/html/2610.21375v3).
 
+PR integration is recorded against main at `c776a772e4`; see the
+[refreshed validation and scope](../design/inference/history/memorilla/2026-11-09-pr-integration.md).
+The supplied-feature native compatibility milestone is implemented. Database
+collection integration, exact latent-only operational QA, native BF16 and Gemma
+training remain separate work; the opt-in serving route stays disabled by default.
+
 Checkpoint conversion and native memory-module execution are implemented.
 All five released modules passed strict export validation and 1,320 boundary
 comparisons on CPU and GB10 CUDA under the explicit trained F32 profile. The

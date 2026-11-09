@@ -1,5 +1,18 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Bounded numerical and recipe checks without model or network dependencies."""
 
 import hashlib
@@ -187,7 +200,9 @@ def test_cuda_diagnostics_require_forward_work_and_zero_fallback(field, value):
         validate_native_response(payload, [[3, EOS], [4, 5, EOS]], "cuda")
 
 
-@pytest.mark.parametrize("mutation", ("missing", "counter_missing", "scope", "resident"))
+@pytest.mark.parametrize(
+    "mutation", ("missing", "counter_missing", "scope", "resident")
+)
 def test_cuda_backend_label_alone_cannot_qualify_execution(mutation):
     payload = response()
     if mutation == "missing":
@@ -221,24 +236,34 @@ def strict_response():
     payload.update(
         scope="offline-strict-f32-encoder-reference",
         arithmetic="BF16-source-weights-widened-F32; F32-activations",
-        model=lock["model"], revision=lock["revision"],
+        model=lock["model"],
+        revision=lock["revision"],
         base_model_lock_sha256=hashlib.sha256(LOCK_PATH.read_bytes()).hexdigest(),
     )
     payload["cuda_execution"].update(
-        strict_f32_weights=True, resident_weights=398,
-        low_precision_activation_staging_calls=0, low_precision_matmul_calls=0,
+        strict_f32_weights=True,
+        resident_weights=398,
+        low_precision_activation_staging_calls=0,
+        low_precision_matmul_calls=0,
     )
     return payload
 
 
 def test_strict_f32_encoder_scope_accepts_verified_precision_and_identity():
-    assert validate_native_response(strict_response(), [[3, EOS], [4, 5, EOS]], "cuda").shape == (2, WIDTH)
+    assert validate_native_response(
+        strict_response(), [[3, EOS], [4, 5, EOS]], "cuda"
+    ).shape == (2, WIDTH)
 
 
-@pytest.mark.parametrize("field,value", [
-    ("arithmetic", "mixed"), ("revision", "changed"),
-    ("model", "Qwen/Qwen3-8B"), ("base_model_lock_sha256", "0"*64),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("arithmetic", "mixed"),
+        ("revision", "changed"),
+        ("model", "Qwen/Qwen3-8B"),
+        ("base_model_lock_sha256", "0" * 64),
+    ],
+)
 def test_strict_f32_encoder_scope_rejects_identity_drift(field, value):
     payload = strict_response()
     payload[field] = value
@@ -246,10 +271,15 @@ def test_strict_f32_encoder_scope_rejects_identity_drift(field, value):
         validate_native_response(payload, [[3, EOS], [4, 5, EOS]], "cuda")
 
 
-@pytest.mark.parametrize("field,value", [
-    ("strict_f32_weights", False), ("resident_weights", 0),
-    ("low_precision_activation_staging_calls", 1), ("low_precision_matmul_calls", 1),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("strict_f32_weights", False),
+        ("resident_weights", 0),
+        ("low_precision_activation_staging_calls", 1),
+        ("low_precision_matmul_calls", 1),
+    ],
+)
 def test_strict_f32_encoder_scope_rejects_low_precision_execution(field, value):
     payload = strict_response()
     payload["cuda_execution"][field] = value

@@ -36,6 +36,8 @@ pub const Codec = enum { avc, mjpeg, hevc, av1 };
 pub const Track = struct {
     codec: Codec = .avc,
     inband_parameter_sets: bool = false,
+    /// Header inspection resolved HEVC activation and validated one static policy.
+    hevc_policy_validated: bool = false,
     id: u32,
     timescale: u32,
     width: u16,
@@ -46,6 +48,8 @@ pub const Track = struct {
     codec_config: []const u8 = &.{},
     nal_length_bytes: u3,
     pixel_aspect: struct { horizontal: u32 = 1, vertical: u32 = 1 } = .{},
+    /// A pasp box was present. An explicit 1:1 differs from having no declaration.
+    pixel_aspect_declared: bool = false,
     /// Raw colr payload; downstream preparation must qualify its color policy.
     color_info: []const u8 = &.{},
     edit: timeline.Edit = .{},
@@ -215,6 +219,27 @@ pub const Reader = struct {
         }
     }
 };
+
+/// Allocation-free route/admission probe. Only movie metadata is interpreted;
+/// sample tables are not expanded and media payloads are never inspected.
+/// The returned track borrows `bytes`. Full Reader validation still owns errors.
+pub fn probeTrack(bytes: []const u8, limits: Limits, control: source.Control) !Track {
+    try control.check();
+    var parser = Parser{ .limits = limits, .control = control };
+    var cursor: usize = 0;
+    var movie: ?[]const u8 = null;
+    while (cursor < bytes.len) {
+        const box = try parser.box(bytes, cursor);
+        if (box.typ == tag("moov")) {
+            if (movie != null) return error.MalformedMedia;
+            if (box.payload.len > limits.max_metadata_bytes) return error.ResourceLimitExceeded;
+            movie = box.payload;
+        }
+        cursor = box.end;
+    }
+    const tables = try parser.movie(movie orelse return error.MissingMovieMetadata);
+    return tables.track orelse error.UnsupportedVideoCodec;
+}
 
 /// Validate a moov payload for fragmented video before any media arrives.
 /// The returned track borrows the payload; callers must retain its storage.
@@ -389,6 +414,7 @@ const Parser = struct {
                 var configuration: ?[]const u8 = null;
                 var color: []const u8 = &.{};
                 var horizontal: u32 = 1;
+                var aspect_declared = false;
                 var vertical: u32 = 1;
                 while (child < b.payload.len) {
                     const c = try self.box(b.payload, child);
@@ -411,6 +437,7 @@ const Parser = struct {
                         horizontal = u32be(c.payload[0..4]);
                         vertical = u32be(c.payload[4..8]);
                         if (horizontal == 0 or vertical == 0) return error.MalformedMedia;
+                        aspect_declared = true;
                     }
                     child = c.end;
                 }
@@ -434,7 +461,7 @@ const Parser = struct {
                     .mjpeg => {},
                 }
                 if (nal_len == 3) return error.MalformedMedia;
-                t.track = .{ .inband_parameter_sets = b.typ == tag("avc3") or b.typ == tag("hev1"), .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = if (codec == .avc) config else &.{}, .codec_config = if (codec == .hevc or codec == .av1) config else &.{}, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .color_info = color, .display_matrix = @splat(0) };
+                t.track = .{ .inband_parameter_sets = b.typ == tag("avc3") or b.typ == tag("hev1"), .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = if (codec == .avc) config else &.{}, .codec_config = if (codec == .hevc or codec == .av1) config else &.{}, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .pixel_aspect_declared = aspect_declared, .color_info = color, .display_matrix = @splat(0) };
             }
             cursor = b.end;
         }
@@ -961,4 +988,27 @@ test "MP4 index allocator charges moving growth overlap and releases failed prob
     }
     try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
     try std.testing.expectEqual(@as(usize, 0), scoped.live);
+}
+
+test "MP4 metadata probe agrees with indexed track and enforces cancellation and limits" {
+    const a = std.testing.allocator;
+    inline for (.{ "compact-co64.mp4", "fragmented.mp4" }) |name| {
+        const bytes = @embedFile("../testdata/" ++ name);
+        var input = source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "probe" };
+        var reader = try Reader.init(a, &input, .{});
+        defer reader.deinit();
+        const track = try probeTrack(bytes, .{}, .{});
+        try std.testing.expectEqualDeep(reader.track.codec, track.codec);
+        try std.testing.expectEqual(reader.track.width, track.width);
+        try std.testing.expectEqual(reader.track.height, track.height);
+        try std.testing.expectEqualSlices(u8, reader.track.avcc, track.avcc);
+        try std.testing.expectError(error.ResourceLimitExceeded, probeTrack(bytes, .{ .max_boxes = 1 }, .{}));
+    }
+    const Cancel = struct {
+        fn check(_: ?*const anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, probeTrack(@embedFile("../testdata/fragmented.mp4"), .{}, .{ .check_fn = Cancel.check }));
+    try std.testing.expectError(error.MalformedMedia, probeTrack(&.{ 0, 0, 0, 7, 'm', 'o', 'o', 'v' }, .{}, .{}));
 }

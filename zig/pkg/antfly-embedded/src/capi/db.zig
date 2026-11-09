@@ -16,6 +16,7 @@
 //! Public embedded DB C ABI.
 comptime {
     _ = @import("sql_describe.zig");
+    _ = @import("cypher.zig");
 }
 const handles = @import("handles.zig");
 pub const testMaintenanceCaptureAdmission = @import("lite_connection.zig").testMaintenanceCaptureAdmission;
@@ -721,7 +722,7 @@ pub fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_
         var cancellation = req.cancellation;
         const response = try local_query_client.executeJsonAlloc(
             handle.alloc,
-            @ptrCast(handle.database()),
+            handle.database(),
             "docs",
             request_json,
             .internal,
@@ -803,6 +804,38 @@ pub const HandleGuard = struct {
     /// example after inference), not each admission separately. Null means
     /// the connection has no busy timeout.
     admission_budget_ns: ?i96 = null,
+    suspended_immutable_query: bool = false,
+    immutable_readonly: ?struct { store: bool, file: bool } = null,
+
+    pub fn suspendImmutableQuery(self: *HandleGuard) void {
+        const connection = self.connection orelse return;
+        std.debug.assert(self.connection_gate_held and self.entry_error == null);
+        const root = connection.current.?;
+        std.debug.assert(root.immutable_query_borrows == 0);
+        const store = root.owned_lite_backend.?.native_docstore.?;
+        self.immutable_readonly = .{ .store = store.read_only, .file = store.file.read_only };
+        // Read admission can inspect these flags. Freeze them before dropping
+        // the gate, rather than changing them concurrently during retirement.
+        store.read_only = true;
+        store.file.read_only = true;
+        root.immutable_query_borrows += 1;
+        self.suspended_immutable_query = true;
+        self.suspendQuery();
+    }
+
+    /// Caller holds the path gate and has finished all uses of the snapshot.
+    fn releaseImmutableQuery(self: *HandleGuard) void {
+        if (!self.suspended_immutable_query) return;
+        const root = self.suspended_query_root.?;
+        root.immutable_query_borrows -= 1;
+        if (self.connection.?.current == root) {
+            const store = root.owned_lite_backend.?.native_docstore.?;
+            store.read_only = self.immutable_readonly.?.store;
+            store.file.read_only = self.immutable_readonly.?.file;
+        }
+        self.immutable_readonly = null;
+        self.suspended_immutable_query = false;
+    }
 
     /// Keep registry references and the provider snapshot alive, releasing both
     /// process and file locks while inference runs on an owned request plan.
@@ -831,10 +864,18 @@ pub const HandleGuard = struct {
     }
     pub fn resumeAccess(self: *HandleGuard, ptr: ?*anyopaque, access: HandleAccess) bool {
         if (self.suspended_query_root == null) return true;
+        const connection = self.connection.?;
+        if (self.suspended_immutable_query) {
+            // The caller has finished using the snapshot. Keep the lifetime
+            // borrow until reentry, but permit refresh to reuse this root when
+            // no overlapping query required a replacement.
+            connection.gate.mutex.lockUncancelable(handleLockIo());
+            self.releaseImmutableQuery();
+            connection.gate.mutex.unlock(handleLockIo());
+        }
         // Original registry references keep the connection/owner alive.
         const entry = HandleEntry.capture(ptr) orelse return false;
         const next = enterWithAdmissionBudget(entry, ptr, access, if (access == .read) .read_only else .mutation, false, self.admission_budget_ns) orelse return false;
-        const connection = self.connection.?;
         if (!next.connection_gate_held) connection.gate.mutex.lockUncancelable(handleLockIo());
         self.suspended_query_root.?.query_borrows -= 1;
         connection.collectRetired();
@@ -865,6 +906,8 @@ pub const HandleGuard = struct {
             const connection = self.connection.?;
             connection.gate.mutex.lockUncancelable(io);
             root.query_borrows -= 1;
+            var owned = self;
+            owned.releaseImmutableQuery();
             connection.collectRetired();
             connection.gate.mutex.unlock(io);
             return;
@@ -1081,7 +1124,7 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
         // only contention waits consult the deadline. The retry loop checks
         // expiry before starting a new attempt after backoff.
         if (!pinned) {
-            guard.path_lease = connection.acquire() catch |err| {
+            guard.path_lease = (if (access == .maintain) connection.acquireForMaintenance() else connection.acquire()) catch |err| {
                 guard.entry_error = capi.mapError(err);
                 return guard;
             };
@@ -3128,6 +3171,7 @@ pub fn openLiteHandleAllocWithSharedInference(
         opts.start_optional_runtime_workers = false;
         opts.start_resolver_workers = false;
         opts.defer_index_backfill_on_open = true;
+        opts.defer_derived_replay_on_open = true;
     }
     try backend.configureDbOpenOptions(&opts);
 
@@ -4971,7 +5015,7 @@ pub fn antfly_db_batch_json(
     defer receipt_scope.end();
     var primary_committed = false;
     // A table handle commits to its table's database, which holds the marker.
-    trackedBatch(handle.database(), owned.req, &primary_committed, handle.selected_table_name) catch |err| return batchFailureCode(err, primary_committed);
+    trackedBatch(handle.database(), db_mod.types.fromPublicMutation(owned.req), &primary_committed, handle.selected_table_name) catch |err| return batchFailureCode(err, primary_committed);
     // Committed: a response failure must not read as a failed batch.
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch
         return capi.recordError(.stalled, "batch committed; its response could not be encoded; do not retry the batch");
@@ -6131,7 +6175,7 @@ pub fn searchPublicQueryJson(
             var failure: kernel_owner_abi.FailureIdentity = .{};
             const response = local_query_client.executeJsonAlloc(
                 std.heap.c_allocator,
-                @ptrCast(handle.database()),
+                handle.database(),
                 table_name,
                 request_json.bytes(),
                 .public,
@@ -6337,7 +6381,7 @@ fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_j
         if (value.failed) return error.SqlTransactionAborted;
         if (value.active and (compiled.statement == .create_table or compiled.statement == .drop_table or compiled.statement == .catalog_ddl or compiled.statement == .policy_ddl)) return error.UnsupportedSqlExecution;
     }
-    var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
+    var adapter = sql.Adapter(antfly){ .graph_parameters = parsed.value.parameters, .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
         if (err == error.SqlNotNullViolation or err == error.SqlUntranslatableCharacter) out_buf.* = try stringifyJson(.{ .@"error" = error_context.diagnostic(err) });

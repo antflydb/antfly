@@ -16,6 +16,27 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **Cascade agreement guards** — later decider stages can require matching votes
+  before acceptance. Disagreed or unverified checks abstain, preserve raw evidence
+  and usage, and remain REVIEW during resolver replay. Enabled guards fence older
+  readers with epoch 31.
+
+- **Decider cascades** — a named decider can run a cheap stage on every input
+  and escalate only inputs whose answer probability falls inside a configured
+  band to a stronger stage (`decision_method: cascade`). Cascades work in
+  `/ai/v1/decisions`, SQL decision functions, decision enrichments and resolver
+  REVIEW adjudication. Responses and adjudication receipts carry a per-stage
+  trace. Definitions compile once; optional native stages discover models under
+  the cascade deadline and failure policy. Shared generated-batch usage is
+  apportioned across inputs and marked as estimated; retained typed failures
+  preserve measured usage, including costs from all completed siblings after a
+  token-limit overrun; later windows stop and generated costs remain apportioned.
+  SDK-emitted first-stage `on_failure: fail` defaults
+  are accepted, public image-capability denials constrain the whole cascade,
+  and committed failure receipts remain stable on replay. Resolver batches reuse
+  one compiled classification plan. Resolver catalogs and decision enrichment producers that use a cascade
+  require reader epoch 30.
+
 - **`@antfly/design-system` license** — first-party code in the package is now
   Apache-2.0, matching the rest of the repository. shadcn/ui-derived code keeps
   its MIT notice, and the Aeonik font files are excluded from the package license.

@@ -376,9 +376,9 @@ pub const Command = struct {
     /// codecs and catalog consumer authorization are checked by the owner too.
     pub fn validate(self: Command, alloc: std.mem.Allocator) !void {
         if (self.execution_identity != null) {
-            if (self.mode != .publish or self.producer_kind != .index or self.producer_scope_key.len != 0 or
-                self.sources.len != 1 or self.mutation_preconditions.len != 1 or self.mutations.len != 1 or
-                self.mutations[0].family != .base_vector or !std.mem.eql(u8, self.mutations[0].key, self.mutation_preconditions[0].key)) return error.InvalidBatchRequest;
+            if (self.mode != .publish or self.producer_kind != .index or
+                (self.producer_scope_key.len == 0 and self.sources.len != 1) or self.mutation_preconditions.len != 1 or self.mutations.len != 1 or
+                self.mutations[0].family != (if (self.producer_scope_key.len == 0) @as(@FieldType(Mutation, "family"), .base_vector) else @as(@FieldType(Mutation, "family"), .derived_vector)) or !std.mem.eql(u8, self.mutations[0].key, self.mutation_preconditions[0].key)) return error.InvalidBatchRequest;
         }
         if (self.authority_epoch == 0 or std.mem.allEqual(u8, &self.namespace, 0) or
             std.mem.allEqual(u8, &self.catalog_digest, 0)) return error.InvalidBatchRequest;
@@ -982,6 +982,21 @@ pub const UploadRecovery = struct {
 };
 
 pub const Dispatcher = struct {
+    const named = @import("../named_callback.zig");
+    const native = @import("antfly_runtime_abi").native_abi;
+    const RecoveryInvocation = struct {
+        io: native.IoBorrow,
+        now_ns: u64,
+        inventory: @FieldType(UploadRecoveryInvocation, "inventory"),
+        trigger: @FieldType(UploadRecoveryInvocation, "trigger"),
+    };
+    const RecoveryReceiver = *const fn (*anyopaque, @FieldType(UploadRecovery, "recover"), RecoveryInvocation) anyerror!bool;
+    const EnqueueCallback = *const fn (*anyopaque, Namespace, []const u8) anyerror!void;
+    const NativeCallbacks = struct { enqueue: EnqueueCallback, recover: RecoveryReceiver };
+    const NativeBoundary = named.Boundary(NativeCallbacks);
+    callback_dispatch: named.Dispatch = NativeBoundary.local_dispatch,
+    recovery_receiver: RecoveryReceiver = receiveRecovery,
+
     ptr: *anyopaque,
     /// Borrowed synchronous owner capability. Storage releases its snapshot
     /// before recovery; absence leaves external publication recovery inert.
@@ -997,9 +1012,17 @@ pub const Dispatcher = struct {
         if (self.enqueue_status) |enqueue|
             return @import("kernel_error_identity").statusToError(enqueue(self.ptr, &namespace, command.ptr, command.len));
         const enqueue = self.enqueue orelse return error.ArtifactCatalogDrift;
-        return enqueue(self.ptr, namespace, command);
+        return NativeBoundary.call("enqueue", self.callback_dispatch, enqueue, .{ self.ptr, namespace, command });
     }
 
+    fn receiveRecovery(ptr: *anyopaque, callback: @FieldType(UploadRecovery, "recover"), invocation: RecoveryInvocation) !bool {
+        var receiver = try invocation.io.receive();
+        return callback(ptr, .{ .io = receiver.io(), .now_ns = invocation.now_ns, .inventory = invocation.inventory, .trigger = invocation.trigger });
+    }
+    pub fn recoverUploads(self: Dispatcher, invocation: UploadRecoveryInvocation) !bool {
+        const recovery = self.upload_recovery orelse return false;
+        return NativeBoundary.call("recover", self.callback_dispatch, self.recovery_receiver, .{ self.ptr, recovery.recover, RecoveryInvocation{ .io = native.IoBorrow.init(&invocation.io), .now_ns = invocation.now_ns, .inventory = invocation.inventory, .trigger = invocation.trigger } });
+    }
     /// Submit an already validated, bounded producer command. Queue/resource
     /// admission and leadership are transient control state, never evidence
     /// that inference failed or that this stream completed. Keep that boundary
@@ -1400,10 +1423,11 @@ test "ordered artifact inventory publication projects every shared consumer and 
         .{ .name = "first", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}", .coverage_generation = 7 },
         .{ .name = "second", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}", .coverage_generation = 9 },
         .{ .name = "other", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"other-model\"}", .coverage_generation = 11 },
+        .{ .name = "legacy", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"legacy\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"legacy\"}}", .coverage_generation = 13 },
     };
     var catalog: std.ArrayList(u8) = .empty;
     defer catalog.deinit(alloc);
-    try catalog.appendSlice(alloc, "AIDX\x02\x00\x00\x00\x03\x00\x00\x00");
+    try catalog.appendSlice(alloc, "AIDX\x02\x00\x00\x00\x04\x00\x00\x00");
     for (configs) |config| {
         var length: [4]u8 = undefined;
         std.mem.writeInt(u32, &length, @intCast(config.name.len), .little);
@@ -1443,6 +1467,17 @@ test "ordered artifact inventory publication projects every shared consumer and 
     command.producer_artifact_name = "other-model";
     command.publication_digest = command.digest();
     try std.testing.expectError(error.InvalidBatchRequest, prepareBaseVectors(alloc, command, catalogs));
+    const legacy_key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "legacy");
+    defer alloc.free(legacy_key);
+    command.producer_name = "legacy";
+    command.producer_generation = 13;
+    command.producer_artifact_name = "legacy";
+    command.mutations = &.{.{ .family = .base_vector, .key = legacy_key, .value = payload, .source_index = 0 }};
+    command.publication_digest = command.digest();
+    var legacy = try prepareBaseVectors(alloc, command, catalogs);
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(usize, 1), legacy.batch.dense_embeddings.len);
+    try std.testing.expectEqualStrings("legacy", legacy.batch.dense_embeddings[0].index_name);
 }
 
 test "ordered artifact inventory final materialization observes activation in its write snapshot" {
@@ -1573,6 +1608,21 @@ test "ordered artifact inventory publication coverage is point bounded idempoten
     try stageRejection(&txn, changed, 9, .stale_source);
     try stageReceipts(&txn, command, 10);
     try std.testing.expect((try rejected(&txn, changed)) != null);
+}
+
+test "ordered artifact inventory producer dispatch preserves foreign named failures" {
+    const Harness = struct {
+        fn enqueue(_: *anyopaque, _: Namespace, _: []const u8) !void {
+            return error.NotLeader;
+        }
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: *anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return Dispatcher.NativeBoundary.local_dispatch(contract, callback, args, output);
+        }
+    };
+    var context: u8 = 0;
+    const dispatcher: Dispatcher = .{ .ptr = &context, .enqueue = Harness.enqueue, .callback_dispatch = Harness.dispatch };
+    try std.testing.expectError(error.NotLeader, dispatcher.enqueueCommand(@splat(1), "control"));
+    try std.testing.expectError(error.ArtifactPublicationPending, dispatcher.submit(@splat(1), "output"));
 }
 
 test "privacy publication control pages admit one large key within bounded identity budgets" {

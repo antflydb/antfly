@@ -3420,11 +3420,14 @@ fn stripRuntimeDenseNativeStatus(record: *metadata_table_manager.StoreRecord) vo
     }
 }
 
+const runtimeGroupsRequireFramedIndexStatus = metadata_runtime_status_protocol.requiresFramedIndexStatus;
+
 fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
     for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return metadata_runtime_status_protocol.schema_epoch_record_version;
     }
-    if (record.relational_topology_protocol_version != 0) return metadata_runtime_status_protocol.framed_index_record_version;
+    if (record.relational_topology_protocol_version != 0 or runtimeGroupsRequireFramedIndexStatus(record.runtime_statuses))
+        return metadata_runtime_status_protocol.framed_index_record_version;
     if (record.dense_native_storage_protocol_version != 0 or
         storeHasDenseVectorProjectionPending(record) or
         storeHasDenseNativeStorageStatus(record))
@@ -3448,7 +3451,8 @@ fn runtimeStatusMandatoryRecordVersion(record: metadata_table_manager.StoreRecor
     for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return metadata_runtime_status_protocol.schema_epoch_record_version;
     }
-    if (record.relational_topology_protocol_version != 0) return metadata_runtime_status_protocol.framed_index_record_version;
+    if (record.relational_topology_protocol_version != 0 or runtimeGroupsRequireFramedIndexStatus(record.runtime_statuses))
+        return metadata_runtime_status_protocol.framed_index_record_version;
     if (record.dense_native_storage_protocol_version != 0 or
         storeHasDenseVectorProjectionPending(record) or
         storeHasDenseNativeStorageStatus(record))
@@ -3530,6 +3534,35 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    var required = transitionBaseDecoderVersion(command);
+    switch (command) {
+        .upsert_table => |table| required = @max(required, tableDecoderVersion(table)),
+        .compare_and_replace_table => |cas| required = @max(required, @max(tableDecoderVersion(cas.expected), tableDecoderVersion(cas.replacement))),
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |create| required = @max(required, tableDecoderVersion(create.table)),
+            .drop => {},
+        },
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| {
+            for (delta.upsert_tables) |table| required = @max(required, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+        },
+        else => {},
+    }
+    return required;
+}
+
+// Table features compose: adding a lower-floor feature must never mask a
+// higher decoder requirement, including the prior definition in a CAS.
+fn tableDecoderVersion(table: metadata_table_manager.TableRecord) u16 {
+    var required: u16 = 0;
+    if (table.storage.engine == .object) required = @max(required, metadata_topology_protocol.object_table_engine_version);
+    if (table.lake_index_catalog_json.len != 0) required = @max(required, metadata_topology_protocol.lake_index_catalog_version);
+    if (metadata_topology_protocol.usesPrivacy(table.indexes_json)) required = @max(required, metadata_topology_protocol.privacy_version);
+    if (metadata_topology_protocol.usesResolverRecords(table.indexes_json)) required = @max(required, metadata_topology_protocol.resolver_records_version);
+    if (metadata_topology_protocol.usesResolverNamespaces(table.indexes_json)) required = @max(required, metadata_topology_protocol.resolver_namespaces_version);
+    return required;
+}
+
+fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
     if (command == .compare_and_set_job_state) return if (std.mem.startsWith(u8, command.compare_and_set_job_state.key, "privacy/")) metadata_topology_protocol.privacy_version else metadata_topology_protocol.job_state_version;
     const namespace_indexes = switch (command) {
         .apply_restore_staging, .apply_system_catalog => |bytes| bytes,
@@ -3551,6 +3584,13 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
             if (required >= metadata_topology_protocol.resolver_namespaces_version) return required;
         },
         else => {},
+    }
+    if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
+    if (command == .apply_system_catalog) {
+        const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind } };
+        var parsed = std.json.parseFromSlice(Header, std.heap.page_allocator, command.apply_system_catalog, .{ .ignore_unknown_fields = true }) catch return metadata_topology_protocol.current_version;
+        defer parsed.deinit();
+        if (parsed.value.mutation.kind == .graph) return metadata_topology_protocol.graph_definition_version;
     }
     if (command == .apply_resolver_authority or command == .advance_resolver_namespace) return metadata_topology_protocol.resolver_records_version;
     if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
@@ -4814,7 +4854,7 @@ fn SharedStoreReports(comptime T: type, comptime free: anytype) type {
     };
 }
 const StoreCapabilities = struct {
-    const Kind = enum { repair, vector_projection, native_storage, artifact_source, reporter_fence, inference, native_restore, relational_topology };
+    const Kind = enum { repair, vector_projection, native_storage, artifact_source, reporter_fence, inference, native_restore, relational_topology, framed_index_status };
     flags: std.EnumSet(Kind) = .empty,
     fn fromStores(stores: []const metadata_table_manager.StoreRecord) StoreCapabilities {
         var out: StoreCapabilities = .{};
@@ -4825,6 +4865,10 @@ const StoreCapabilities = struct {
         if (storesHaveRuntimeReporterFence(stores)) out.flags.insert(.reporter_fence);
         if (storesHaveRuntimeInferenceDiagnostics(stores)) out.flags.insert(.inference);
         if (storesHaveNativeGenerationRestoreCapability(stores)) out.flags.insert(.native_restore);
+        for (stores) |store| if (runtimeGroupsRequireFramedIndexStatus(store.runtime_statuses)) {
+            out.flags.insert(.framed_index_status);
+            break;
+        };
         for (stores) |store| if (store.relational_topology_protocol_version != 0) {
             out.flags.insert(.relational_topology);
             break;
@@ -15761,8 +15805,13 @@ fn reportStoreStatusesWithCapabilities(
     // Relational topology is a framed V17 admission fact too. Asking only
     // for V15 here can silently discard every ordinary group heartbeat at
     // the mandatory-profile fence below, even when all voters support V17.
+    const framed_index_status_transition_possible = blk: {
+        if (capabilities.flags.contains(.framed_index_status)) break :blk true;
+        for (reports) |report| if (runtimeGroupsRequireFramedIndexStatus(report.runtime_statuses)) break :blk true;
+        break :blk false;
+    };
     const framed_profile_required = vector_projection_transition_possible or
-        native_storage_transition_possible or relational_topology_transition_possible;
+        native_storage_transition_possible or relational_topology_transition_possible or framed_index_status_transition_possible;
     var schema_epoch_required = false;
     for (reports) |report| {
         for (report.runtime_statuses) |status| {
@@ -23480,6 +23529,74 @@ test "metadata.lake index object table engine requires its own decoder capabilit
     try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } }));
 }
 
+test "metadata runtime status producer completion requires framed transport" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
+        ready_version: u16 = metadata_runtime_status_protocol.positional_record_version,
+        pub fn runtimeStatusProtocolReady(self: *@This(), required: u16) bool {
+            return metadata_runtime_status_protocol.profileSatisfies(self.ready_version, required);
+        }
+    };
+    for ([_]bool{ false, true }) |completion_proof| {
+        var sources = [_]metadata_table_manager.RuntimeIndexSourceReplayStatusReport{.{ .artifact_name = "kg", .producer_complete = completion_proof }};
+        var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{ .name = "graph", .kind = "graph", .graph_counts_pending = !completion_proof, .source_replay = &sources }};
+        var statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{ .group_id = 10, .indexes = &indexes }};
+        const record: metadata_table_manager.StoreRecord = .{ .store_id = 7, .node_id = 9, .runtime_statuses = &statuses };
+        try std.testing.expectEqual(metadata_runtime_status_protocol.framed_index_record_version, runtimeStatusRequiredRecordVersion(record));
+        try std.testing.expectEqual(metadata_runtime_status_protocol.framed_index_record_version, runtimeStatusMandatoryRecordVersion(record));
+        try std.testing.expect(StoreCapabilities.fromStores(&.{record}).flags.contains(.framed_index_status));
+        var service: FakeService = .{};
+        var owned: ?metadata_table_manager.StoreRecord = null;
+        defer if (owned) |value| metadata_table_manager.freeStore(std.testing.allocator, value);
+        try std.testing.expectError(error.RuntimeStatusProtocolUnavailable, runtimeStatusProtocolSafeCommand(&service, .{ .register_store = record }, &owned));
+        try std.testing.expectError(error.RuntimeStatusProtocolUnavailable, runtimeStatusProtocolSafeCommand(&service, .{ .upsert_store = record }, &owned));
+        try std.testing.expect(owned == null);
+        service.ready_version = metadata_runtime_status_protocol.framed_index_record_version;
+        const accepted = try runtimeStatusProtocolSafeCommand(&service, .{ .upsert_store = record }, &owned);
+        try std.testing.expect(owned == null);
+        try std.testing.expectEqual(completion_proof, accepted.upsert_store.runtime_statuses[0].indexes[0].source_replay[0].producer_complete);
+        try std.testing.expectEqual(!completion_proof, accepted.upsert_store.runtime_statuses[0].indexes[0].graph_counts_pending);
+    }
+}
+
+test "metadata runtime status producer completion selects framed heartbeat profile" {
+    const alloc = std.testing.allocator;
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        ready: bool = false,
+        framed_probes: usize = 0,
+        upserts: usize = 0,
+        complete: bool = false,
+        pub fn runtimeStatusProtocolReady(self: *@This(), required: u16) bool {
+            if (required == metadata_runtime_status_protocol.framed_index_record_version) {
+                self.framed_probes += 1;
+                return self.ready;
+            }
+            return metadata_runtime_status_protocol.profileSatisfies(metadata_runtime_status_protocol.positional_record_version, required);
+        }
+        fn upsertStore(self: *@This(), record: metadata_table_manager.StoreRecord) !void {
+            self.upserts += 1;
+            self.complete = record.runtime_statuses[0].indexes[0].source_replay[0].producer_complete;
+        }
+    };
+    for ([_]bool{ false, true }) |committed| {
+        var sources = [_]metadata_table_manager.RuntimeIndexSourceReplayStatusReport{.{ .artifact_name = "kg", .producer_complete = true }};
+        var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{ .name = "graph", .kind = "graph", .source_replay = &sources }};
+        var statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{ .group_id = 10, .indexes = &indexes }};
+        var projected = [_]metadata_table_manager.StoreRecord{try metadata_table_manager.cloneStore(alloc, .{ .store_id = 7, .node_id = 9, .runtime_statuses = if (committed) &statuses else &.{} })};
+        defer metadata_table_manager.freeStore(alloc, projected[0]);
+        const reports = [_]metadata_table_manager.StoreStatusReport{.{ .store_id = 7, .capacity_bytes = 200, .runtime_statuses = &statuses }};
+        var service: FakeService = .{ .alloc = alloc };
+        try std.testing.expectError(error.RuntimeStatusProtocolUnavailable, reportStoreStatusesWithProjected(&service, &projected, &reports));
+        try std.testing.expect(service.framed_probes != 0);
+        try std.testing.expectEqual(@as(usize, 0), service.upserts);
+        service.ready = true;
+        _ = try reportStoreStatusesWithProjected(&service, &projected, &reports);
+        try std.testing.expectEqual(@as(usize, 1), service.upserts);
+        try std.testing.expect(service.complete);
+    }
+}
+
 pub fn proposeCatalogWithContext(service: anytype, context: api_operation.RequestContext, command: metadata_storage.TransitionCommand) @TypeOf(service.proposeTransitionCommandWithReceipt(command)) {
     try context.ensureActive();
     if (comptime @hasDecl(@TypeOf(service.*), "proposeTransitionCommandWithReceiptObserved"))
@@ -23487,4 +23604,17 @@ pub fn proposeCatalogWithContext(service: anytype, context: api_operation.Reques
     // Foreign/test services without an admission witness remain conservative.
     context.markSQLSubmission();
     return service.proposeTransitionCommandWithReceipt(command);
+}
+
+test "metadata.lake combined table features retain the highest decoder floor" {
+    const protocol = metadata_topology_protocol;
+    for ([_][]const u8{ "{}", "{\"resolvers\":{}}", "{\"_resolver_record_store\":{}}", "{\"_privacy\":{}}" }) |indexes| {
+        var table: metadata_table_manager.TableRecord = .{ .table_id = 9, .name = "objects", .storage = .{ .engine = .object }, .min_ranges = 0, .desired_replica_count = 0, .lake_index_catalog_json = "{\"version\":1}", .indexes_json = indexes };
+        try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+        try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } }));
+        try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } }));
+        const before = table;
+        table.lake_index_catalog_json = "";
+        try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = before, .replacement = table } }));
+    }
 }

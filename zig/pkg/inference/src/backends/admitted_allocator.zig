@@ -24,6 +24,9 @@ pub const AdmittedAllocator = struct {
     session: ?sessions.Session = null,
     admission_context: ?*anyopaque = null,
     admit: ?*const fn (*anyopaque, usize) anyerror!memory.AdmissionLease = null,
+    /// Refund auxiliary ledgers when a successful custom admission cannot be
+    /// adopted because reservation metadata allocation fails.
+    rollback_admission: ?*const fn (*anyopaque, usize) void = null,
     trim_on_free: bool = false,
     live_bytes: usize = 0,
     reserved_bytes: usize = 0,
@@ -112,11 +115,14 @@ pub const AdmittedAllocator = struct {
         const minimum = try std.math.add(usize, needed - capacity, @sizeOf(Reservation));
         var amount = @max(minimum, quantum);
         var lease = self.reserve(amount) catch |err| blk: {
-            if (amount == minimum or (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable)) return err;
+            if (amount == minimum or (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable and err != error.MemoryBudgetExceeded)) return err;
             amount = minimum; // Slack must not reject requests fitting tight limits.
             break :blk try self.reserve(amount);
         };
-        errdefer if (lease) |*active| active.release();
+        errdefer {
+            if (lease) |*active| active.release();
+            if (self.rollback_admission) |rollback| rollback(self.admission_context.?, amount);
+        }
         const reservation = try self.backing.create(Reservation);
         reservation.* = .{ .next = self.reservations, .lease = lease, .bytes = amount };
         self.reservations = reservation;

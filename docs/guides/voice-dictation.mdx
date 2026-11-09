@@ -12,6 +12,17 @@ order: 8
 - How do I send microphone audio to Antfly in chunks?
 </Questions>
 
+## Install the macOS example
+
+[Download Antfly Dictation v0.1.0-beta.1 for Apple Silicon](https://releases.antfly.io/antfly-dictation/releases/0.1.0-beta.1/Antfly-Dictation-0.1.0-beta.1-arm64.zip)
+when the signed beta release is published. Unzip it, move **Antfly Dictation.app**
+to Applications, and open it. Allow microphone and Accessibility access for the
+Fn/Globe shortcut and automatic paste. **On this Mac** uses the included Antfly
+runtime; ready Apple Speech is selected automatically, with Whisper Tiny available
+as a download. Use **Check for Updates…** for subsequent app releases.
+
+See the [example setup and configuration](https://github.com/antflydb/antfly/tree/main/examples/dictation).
+
 ## The Result
 
 A desktop or browser client records while a key is held, posts the clip, and pastes the reply. The reply is written text, not a raw transcript: fillers and false starts are gone, punctuation is in, and names from your dictionary are spelled your way.
@@ -70,6 +81,113 @@ curl -X POST http://127.0.0.1:8080/ai/v1/dictate \
 ```
 
 For live captions the same models sit behind a session API that returns `partial` and `final` transcript events as audio arrives.
+
+## A consistent push-to-talk experience
+
+The native [dictation example](https://github.com/antflydb/antfly/tree/main/examples/dictation)
+separates the desired output from how the selected backend executes it:
+
+| Preset mode | Result | Cleanup execution |
+| --- | --- | --- |
+| **Verbatim** | The recognizer's text, including its wording | No generative cleanup |
+| **Clean** (default) | Punctuation, filler removal, and dictionary corrections | Final segments are cleaned while speaking when supported |
+| **Rewrite** | Tone, formatting, or custom instructions | One cleanup pass over the complete utterance |
+
+A cleanup generator must be configured for Clean or Rewrite to perform cleanup.
+Without one, settings explicitly show recognition-only operation. Clean ignores
+rewrite instructions and tone; switching back to Rewrite preserves those settings.
+Existing presets infer their mode from style/instructions until explicitly changed.
+
+New settings use Fn/Globe to record, with a Control + Option preset for keyboards
+without Fn. **Set up shortcut & paste access** applies and saves the selected shortcut, guiding you to Accessibility
+if needed and completing when you return with permission granted. It preserves
+other saved/unsaved settings and credentials; Cancel setup keeps the previous binding.
+**Keyboard settings** opens the Globe-key action preferences without changing them.
+Click modifier buttons or use Record shortcut to customize; numeric
+key codes are not required. Shortcut selection pauses dictation, Escape cancels,
+and Save applies the choice. Fn/modifier-only global shortcuts need Accessibility
+access; the app does not change macOS keyboard preferences. Existing saved shortcuts
+are preserved; Reset to Fn explicitly adopts the new default.
+
+Hold the shortcut to record, or use press-to-toggle. A nonactivating overlay shows
+**Listening**, then the actual remaining stage (**Transcribing** or **Cleaning**).
+It never moves focus away from the captured text field. Provisional recognition
+and completed cleanup segments are previews; the app sends one paste only after
+recognition and cleanup finish successfully. A focus change leaves the result
+available to copy. Silence returns to idle without inserting text.
+
+Under **Processing & models**, choose:
+
+- **Automatic:** use stable-session recognition where advertised. Clean overlaps
+  cleanup with recognition; Rewrite waits for the complete transcript. If session
+  setup or recognition fails, the recorded clip can use the same transcriber on
+  release, with an explicit explanation. This never changes providers.
+- **Incremental:** require stable-session support. Unsupported backends and Rewrite
+  are rejected before recording. Recognition failures do not silently select a
+  different processing strategy.
+- **Whole utterance:** cleanup waits for the entire transcript. Recognition can
+  still run while speaking when stable sessions are available.
+
+Named Antfly/Whisper transcribers advertise `stable_segments` and `text_cleanup`.
+The current Apple Speech adapter advertises `text_cleanup` but not stable sessions:
+it recognizes the recorded file after release, followed by optional cleanup.
+Unknown capabilities use recorded-clip processing. Legacy live preview remains
+available for older Whisper servers, but does not count as authoritative session
+recognition and still requires the final clip pass.
+
+### Compose recognition and cleanup without repeating recognition
+
+`stream: true` on `/ai/v1/dictate` controls **response delivery**. Incremental
+execution uses transcription sessions plus text-only cleanup requests:
+
+1. Create a transcription session; append microphone audio sequentially. Preserve
+   each event's sequence and time range. Display `partial` hypotheses, but clean
+   only `final` events. A partial's `stable_text` can change and is not final.
+2. Submit finalized text to the same named-transcriber dictation cleanup path:
+
+   ```json
+   {
+     "model": "transcribers/whisper",
+     "audio": "",
+     "transcript_text": "um ant fly is ready",
+     "cleanup_model": "generators/cleanup",
+     "style": "clean",
+     "dictionary": ["Antfly"],
+     "stream": true
+   }
+   ```
+
+   `audio` must be empty; attachments and recognition hints are forbidden with
+   `transcript_text`. This route does not invoke recognition. It accepts at most
+   65,536 UTF-8 bytes, including an empty transcript, which skips cleanup. Raw
+   runtime model requests do not support this option; check advertised capabilities.
+3. On release, stop capture, finish the in-flight append, and commit the remaining
+   audio. Wait for cleanup of all final segments, then assemble the result. Do not
+   transcribe the complete recording again or run a second whole-utterance cleanup
+   in incremental mode. Coalesce pending finalized segments to bound model calls.
+4. Delete the session on completion, failure, or cancellation. Ignore late callbacks
+   from an old recording. Replayed events must not duplicate cleaned text; conflicting
+   final segments must fail rather than revise text already considered final.
+
+The example uses bounded binary AFATT001 uploads for both final WAV and live PCM
+chunks. One FIFO request gate per recording client serializes recognition and
+cleanup network requests, so a server configured for one inference invocation can
+still make progress while microphone capture continues independently. Enable **Allow parallel recognition and cleanup** for a server with at least two
+inference slots; the client then allows two concurrent requests. Leave it off for
+a single-slot server. Buffered
+Apple cleanup emits complete text for each cleaned batch; it does not provide
+provisional generation tokens. This is distinct from overlapping the pipeline.
+
+Cleanup failures preserve the full final raw transcript. Offer **Insert original**,
+**Copy original**, and **Retry cleanup**. Retrying cleanup sends text, not audio, and
+uses corrected settings with automatic insertion disabled. Never substitute partial
+cleanup for a completed result. Failed recognition retains the recording for an
+explicit retry; its provisional transcript is not treated as complete speech.
+
+The Transcript tab exposes recognition-request, cleanup-request, session, and
+release-to-result durations. Request durations include transport and queueing and
+can overlap; they should not be added to estimate session duration. History sync
+runs separately and never delays the next recording.
 
 ## Before You Start
 
@@ -266,3 +384,106 @@ Then prompt it with the outcome, for example "Add push-to-talk dictation to my E
 - [Local Model Compatibility](/docs/guides/supported-models) to pick a larger Whisper checkpoint or a different cleanup generator.
 - [Index Recorded Calls and Podcasts](/docs/guides/transcription) to transcribe recordings at write time and search them with timestamps.
 - [Multimodal Search](/docs/guides/multimodal) to index the transcripts you collect so they are searchable next to everything else.
+
+The desktop app saves connection and preset settings even when shortcut permission
+is pending; shortcut activation has its own visible status. Discovery requests are
+debounced and superseded requests are canceled. The parallel-processing setting
+controls actual client admission (one or two inference requests), and HTTP failures
+include bounded server diagnostics. Discovered hosted transcribers support shared
+named cleanup, while runtime connections keep their raw-model contract.
+
+Retained history records its original server and table. Deletion cancels matching
+queued uploads across all destinations before remote deletion; remote failures keep
+local entries available for retry. Successful live sessions avoid full-clip WAV
+encoding, and clip encoding runs off the UI actor with cancellation support.
+
+
+### Result delivery and optional work
+
+Recorded recognition and cleanup reserve inference admission per stage. A sequential
+recorded Whisper request with hosted or native cleanup works with one inference slot;
+two slots are required only to overlap recognition and cleanup requests.
+
+The desktop app delivers completed text without awaiting session disposal, optional
+audio archival, or clipboard restoration. Session DELETE uses a three-second request
+timeout and the server session TTL remains the fallback. Audio archival has independent
+error reporting and checks both recording generation and retention changes before publishing.
+Clipboard snapshots are read off the UI thread with limits on retained bytes, items, and
+formats. Overlapping pastes share the original clipboard snapshot; a user copy prevents
+restoration. Focus is revalidated immediately before insertion.
+
+History deletion waits for dispatched uploads even when retention is disabled during
+the wait. An unavailable outbox prevents successful remote deletion, preserving the local
+records for retry. Disabling retention retires an unavailable queue before removing its
+files, preventing later queue recovery from uploading discarded transcripts.
+
+
+History persistence also runs outside result delivery. The desktop app immediately
+returns to idle, then an ordered writer saves the latest bounded local snapshot and
+enqueues remote uploads. Local history is limited to 500 entries and a conservative
+16 MiB JSON budget; queued upload work is bounded separately. Normal application
+termination drains local persistence without waiting for remote synchronization.
+
+Saving retention off invalidates earlier history producers, including manual uploads
+and startup migration, and drains them before purging pending jobs. Unreadable or
+missing settings preserve existing retained data and pause uploads until settings
+are restored or explicitly saved. Settings validation and persistence share a 1 MiB
+limit, so accepted settings can always be loaded again. Recovery insertion uses the
+same owned cancellation task as normal delivery and checks recording generation
+immediately before sending the paste.
+
+
+Deletion retry plans are persisted separately from retained transcripts and upload
+jobs. The bounded journal contains document IDs, destinations, and acknowledgments;
+it contains no transcript text or credentials. Pending upload jobs are discarded only
+after the complete plan is durable. Startup removes matching queued uploads before dispatch.
+Acknowledged destinations stay acknowledged on retry, and a plan is removed only
+when every destination and local archive cleanup have committed. Final cleanup is
+ordered with ordinary history writes; revision fencing tracks actual commits,
+so a failed newer snapshot cannot suppress an older cleanup. The History tab
+shows pending deletion count and supports retry after restart or a local clear,
+without adding newer transcripts to the old deletion request.
+If deletion metadata is corrupt, uploads remain paused while local retention stays usable.
+
+Graceful quit waits for explicit local clears, completed audio archives, and owned
+clipboard restoration as well as transcript persistence. Ordinary paste delivery
+never waits for the restoration timer, and user clipboard changes retain ownership.
+Audio retention admits one active writer and only the newest pending clip, so a
+write that cannot observe cancellation does not accumulate parallel staging work. Completed audio has ownership separate from the active
+recording generation; active recording cancellation and retention changes still
+prevent later publication. A canceled clip permanently loses publication eligibility;
+canceling a newer queued clip cannot restore it. Both native and TypeScript stream clients treat
+completion as terminal for transcript and delta events, rejecting late mutations
+and duplicate completions rather than accepting unvalidated text.
+
+### Desktop app updates
+
+Official macOS releases support signed Sparkle updates, automatic-check and
+download preferences, and beta opt-in. Install the signed app in Applications.
+An update restart waits for dictation and setup to finish, then drains owned
+clipboard restoration and local persistence. Development builds have updating
+disabled. App updates preserve Application Support and Keychain data and do not
+replace user data or downloaded models. The bundled engine updates with the app;
+external Antfly servers are updated separately.
+
+See the [release setup guide](https://github.com/antflydb/antfly/blob/main/examples/dictation/UPDATES.md)
+for organization signing, notarization, release qualification, and the separate
+managed-local-runtime installation and release activation.
+
+## Downloaded macOS app
+
+Official Apple Silicon Antfly Dictation builds require macOS 15+ and include a pinned, released Antfly engine. New installs
+start it automatically; Settings offers an explicit Whisper Tiny download.
+The bundled rc.13 runtime includes the native Apple bridge. Automatic local
+presets prefer Apple speech on macOS 26+ when the server reports it ready and
+otherwise use Whisper; explicit model choices are preserved. Existing external-server settings
+are preserved. The app and compatible engine update together using signed
+Sparkle feeds and immutable downloads on `releases.antfly.io/antfly-dictation`.
+Models and user data remain in Application Support; server credentials stay in
+Keychain. External Antfly servers remain supported and are updated separately.
+Unzip the signed app and move it into `/Applications` or `~/Applications` before
+launching. Grant microphone and Accessibility access; bundled mode requires no
+server address or bearer token. Download Whisper Tiny if Apple speech is not ready.
+The first signed Dictation app release must be published before a public app
+download URL is available. See the [example installation guide](https://github.com/antflydb/antfly/blob/main/examples/dictation/README.md#install-the-macos-app)
+and [release guide](https://github.com/antflydb/antfly/blob/main/examples/dictation/UPDATES.md) for installation, packaging, and recovery.

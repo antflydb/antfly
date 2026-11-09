@@ -65,7 +65,12 @@ def test_proposals_and_absorbed_suppression_use_scoped_typed_resources() -> None
     suppressed = client.entities.suppress(
         "entities", "concept/noise", EntitySuppressRequest(absorbed=EntitySuppressRequestAbsorbed.SUPPRESS)
     )
-    assert [item.key for namespace in suppressed.namespaces for item in namespace.absorbed] == ["concept/notes"]
+    absorbed_keys: list[str] = []
+    assert isinstance(suppressed.namespaces, list)
+    for namespace in suppressed.namespaces:
+        assert isinstance(namespace.absorbed, list)
+        absorbed_keys.extend(item.key for item in namespace.absorbed)
+    assert absorbed_keys == ["concept/notes"]
     assert all("absorbed" not in row.to_dict() for row in suppressed.results)
     client._request.assert_called_once_with(
         "POST",
@@ -92,7 +97,12 @@ def test_proposals_and_absorbed_suppression_use_scoped_typed_resources() -> None
         CurationProposalDecisionRequest(actor="curator"),
     )
     assert result.applied is False
-    assert [item.key for namespace in result.namespaces for item in namespace.absorbed] == ["concept/notes"]
+    absorbed_keys = []
+    assert isinstance(result.namespaces, list)
+    for namespace in result.namespaces:
+        assert isinstance(namespace.absorbed, list)
+        absorbed_keys.extend(item.key for item in namespace.absorbed)
+    assert absorbed_keys == ["concept/notes"]
     client._request.assert_called_once_with(
         "POST",
         "/db/v1/databases/app/namespaces/private/tables/entities/curation/proposals/proposal%2Fone:accept",
@@ -121,3 +131,13 @@ def test_entity_progress_pages_keep_scope_cursor_and_encoded_keys() -> None:
         "/db/v1/databases/app/namespaces/private/tables/notes/entities/concept%2Falpha/progress",
         params={"limit": 7, "cursor": "opaque-next"},
     )
+
+
+def test_resolution_base_binding_round_trip() -> None:
+    from antfly.client_generated.models import ResolverResolveResponse
+
+    for binding in (None, "a" * 64):
+        wire = {"extraction": {}, "resolution": {"config_generation": 1, "entities": []}}
+        if binding is not None:
+            wire["resolution"]["adjudication_execution_hash"] = binding
+        assert ResolverResolveResponse.from_dict(wire).to_dict() == wire

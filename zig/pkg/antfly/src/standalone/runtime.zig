@@ -2405,6 +2405,10 @@ const LocalStandaloneMetadata = struct {
             const table = self.owner.manager.tables.get(id) orelse return null;
             return .{ .id = table.table_id, .name = try self.alloc.dupe(u8, table.name) };
         }
+        pub fn graphIndexIdentity(self: @This(), id: u64, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
+            const table = self.owner.manager.tables.get(id) orelse return null;
+            return @import("../system_catalog/graph_bindings.zig").indexIdentity(self.alloc, table.indexes_json, name);
+        }
     };
     fn planCatalogLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, command: system_catalog.Mutation) !system_catalog.Delta {
         return self.planCatalogTopologyLocked(alloc, command, false);
@@ -2739,6 +2743,11 @@ const LocalStandaloneMetadata = struct {
         }
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
+        if (call == .lake_source_owner_read) {
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            return (self.lifecycle_store orelse return error.UnsupportedOperation).getLakeSourceOwner(alloc, group_ids.main_metadata_group_id, call.lake_source_owner_read);
+        }
         if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, admission);
         if (call == .lake_index_lifecycle_work) {
             try lockAtomicForRequest(&self.mutex, admission);
@@ -2817,7 +2826,7 @@ const LocalStandaloneMetadata = struct {
                 read.standalone = true;
                 return self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, read);
             },
-            .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
+            .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,
@@ -3129,6 +3138,10 @@ const LocalStandaloneMetadata = struct {
                     .extension_members = self.extension_catalog.members.items,
                     .extension_dependencies = self.extension_catalog.dependencies.items,
                 }, .{});
+            },
+            .graph_authority => |request| {
+                const record = if (self.system_catalog_state) |*state| state.index.find(.graph, 0, request.name) else null;
+                return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").GraphAuthorityResult{ .present = record != null and record.?.id == request.graph_id }, .{});
             },
             .read => |request| {
                 var empty = try system_catalog.StateIndex.init(alloc, .{});
@@ -5327,16 +5340,7 @@ pub fn runFromIterator(
         secret_store_initialized = true;
     }
 
-    var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
-        try antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(
-            alloc,
-            setup_io.io(),
-            config_path,
-            &secret_store,
-            .standalone,
-        )
-    else
-        null;
+    var loaded_config: ?antfly.common.config.Config = try loadStandaloneConfig(alloc, setup_io.io(), cli.config_path, &secret_store);
     defer if (loaded_config) |*cfg| cfg.deinit();
     if (loaded_config) |*cfg| try applyHotStandbyConfigDefaults(alloc, &cli, cfg);
 
@@ -5403,6 +5407,7 @@ pub fn runFromIterator(
     defer if (trusted_principal_secret) |value| alloc.free(value);
     const trusted_principal_issuer = try resolveRuntimeSecretValue(alloc, &secret_store, "antfly.trusted_principal.issuer");
     defer if (trusted_principal_issuer) |value| alloc.free(value);
+    if ((trusted_principal_secret == null) != (trusted_principal_issuer == null)) return error.InvalidConfig;
     // A hosted verifier secures public requests without creating a local
     // password authority. Local user-store bootstrap still follows auth_enabled.
     const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
@@ -12428,6 +12433,33 @@ test "standalone runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings(expected_snapshot_root, resolved.snapshot_root_dir);
     try std.testing.expectEqualStrings(expected_extension_store, resolved.extension_package_store_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/secrets.json", resolved.secret_store_path);
+}
+
+// Background maintenance uses the same defaults whether or not a config file
+// was supplied. In particular, a null API node_config silently disables GC.
+fn loadStandaloneConfig(alloc: std.mem.Allocator, io: std.Io, path: ?[]const u8, secret_store: ?*antfly.common.secrets.FileStore) !antfly.common.config.Config {
+    if (path) |config_path| return antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(alloc, io, config_path, secret_store, .standalone);
+    return antfly.common.config.Config.parseFromSliceWithSecretsForDeployment(alloc, "{}", secret_store, .standalone);
+}
+
+test "standalone without config supplies default artifact collection policy" {
+    var config = try loadStandaloneConfig(std.testing.allocator, std.testing.io, null, null);
+    defer config.deinit();
+    try std.testing.expectEqual(antfly.common.config.DeploymentMode.standalone, config.deployment_mode);
+    try std.testing.expect(config.lake_indexes.artifact_gc.enabled);
+    try std.testing.expect(!config.lake_indexes.artifact_gc.dry_run);
+    try std.testing.expectEqual(@as(u64, 30_000), config.lake_indexes.artifact_gc.interval_ms);
+    // Supplying defaults must not override an explicit operator policy.
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("standalone-gc-config");
+    defer directory.cleanup();
+    try ensureDirPath(std.testing.io, directory.path());
+    const path = try std.fs.path.join(std.testing.allocator, &.{ directory.path(), "config.json" });
+    defer std.testing.allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "{\"lake_indexes\":{\"artifact_gc\":{\"enabled\":false,\"dry_run\":true}}}" });
+    var explicit = try loadStandaloneConfig(std.testing.allocator, std.testing.io, path, null);
+    defer explicit.deinit();
+    try std.testing.expect(!explicit.lake_indexes.artifact_gc.enabled);
+    try std.testing.expect(explicit.lake_indexes.artifact_gc.dry_run);
 }
 
 test "standalone resolves the default secret store before full config parsing" {

@@ -97,6 +97,35 @@ pub const Read = struct {
         try self.cancellation.check();
     }
 };
+/// Seed a bounded working set through the exact same verified caches used by
+/// demand reads. The rest of the index remains remote and fills on misses.
+pub fn warmBounded(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
+    if (ref.byte_len > maximum_bytes or ref.byte_len > 512 * 1024) return 0;
+    try read.check();
+    const directory = try loadDirectory(a, read, ref);
+    var spent: usize = @intCast(ref.byte_len);
+    var bundled = false;
+    if (directory.metadata_bundle) |bundle| if (bundle.byte_len <= maximum_bytes -| spent) {
+        const bytes = try artifacts.readArtifact(a, read.store, bundle, read.cancellation, read.cache);
+        defer a.free(bytes);
+        spent += bytes.len;
+        bundled = true;
+    };
+    for ([_][]const Piece{ if (bundled) &.{} else directory.metadata, directory.blocks }) |pieces| {
+        // Cover dictionary/locator opening pages and a bounded sample of
+        // posting/source blocks; actual query blocks remain in the shared
+        // memory/disk cache after their first authenticated demand read.
+        for (pieces, 0..) |piece, index| {
+            if (index == 4) break;
+            if (piece.ref.byte_len > maximum_bytes -| spent) break;
+            try read.check();
+            var held = try readPieceLease(a, read.store, piece, read.cancellation, read.cache);
+            spent += @intCast(piece.ref.byte_len);
+            held.deinit();
+        }
+    }
+    return spent;
+}
 fn upload(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation) !Ref {
     var writer = store.*;
     writer.allocator = a;
@@ -2465,6 +2494,24 @@ test "external lake seekable metadata opens all field navigation with two authen
     try std.testing.expectEqual(owner.metadata_bundle.len, data.native.retainedBytes());
     try std.testing.expectEqual(@as(u16, 5), owner.directory.version);
     try std.testing.expect(owner.directory.metadata_bundle.?.byte_len < owner.metadata_bundle.len);
+    {
+        var warmed = ServingCache.init(a);
+        defer warmed.deinit();
+        const warm_read: Read = .{ .store = store, .cache = .{ .cache = &warmed, .scope = @splat(2), .context = .{ .io = std.testing.io } }, .context = .{}, .cancellation = .none };
+        const spent = try warmBounded(ca, warm_read, ref, 16 * 1024 * 1024);
+        var expected: u64 = ref.byte_len + owner.directory.metadata_bundle.?.byte_len;
+        for (owner.directory.blocks[0..@min(4, owner.directory.blocks.len)]) |piece| expected += piece.ref.byte_len;
+        try std.testing.expectEqual(expected, spent);
+        try std.testing.expectEqual(expected, warmed.snapshot().provider_bytes);
+        // Opening after warmup uses the authenticated compressed bundle, with
+        // no additional fetches for its redundant individual metadata pieces.
+        const before_open = warmed.snapshot().provider_reads;
+        var opened_data = try load(a, warm_read, ref);
+        defer opened_data.native.close();
+        const warmed_owner: *Owner = @ptrCast(@alignCast(opened_data.native.ranges.ptr));
+        _ = try warmed_owner.metadataBytes(warmed_owner.directory, warm_read, false);
+        try std.testing.expectEqual(before_open, warmed.snapshot().provider_reads);
+    }
     for (owner.loaded) |loaded| try std.testing.expect(!loaded);
     var eager = try local.index.IndexWriter.init(a);
     defer eager.deinit();

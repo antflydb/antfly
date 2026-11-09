@@ -113,7 +113,10 @@ const std = @import("std");
 /// Version 80 stores private range checkpoints as immutable, owner-fenced blobs.
 /// Version 81 accounts retained checkpoint bytes through final reclamation.
 /// Version 82 requires compact, authoritative privacy read bindings.
-pub const current_version: u16 = 82;
+/// Version 83 decodes independent durable query-artifact store ownership and
+/// its restartable cleanup frontier, including the global composed-cursor row.
+/// Version 84 adds graph definitions and transaction sessions.
+pub const current_version: u16 = 84;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
@@ -134,11 +137,15 @@ pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
 }
 
+/// Version 84 adds graph definitions and transaction sessions alongside main's
+/// resolver namespace and document job formats, preserving command tags 0..80.
+pub const transaction_sessions_version: u16 = 84;
+pub const graph_definition_version: u16 = 84;
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;
 pub const object_table_engine_version: u16 = 30;
-pub const lake_index_catalog_version: u16 = 29;
+pub const lake_index_catalog_version: u16 = 83;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.

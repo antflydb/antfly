@@ -380,6 +380,101 @@
           }
         }
       }
+    },
+    "/sources/{source_id}/processing-preview": {
+      "post": {
+        "operationId": "previewProcessing",
+        "description": "Native processing only; never runs acquisition. Processing jobs have table-wide artifact scope and require table administrator access.",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProcessingPreset"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Processing result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessingPreview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid declaration"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "503": {
+            "description": "Native operation unavailable"
+          }
+        }
+      }
+    },
+    "/sources/{source_id}/processing-jobs": {
+      "post": {
+        "operationId": "operateProcessingJob",
+        "description": "Native processing only; never runs acquisition. Processing jobs have table-wide artifact scope and require table administrator access.",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProcessingJobRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Processing result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid declaration"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "503": {
+            "description": "Native operation unavailable"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -422,6 +517,32 @@
           },
           "serialized_runs": {
             "type": "boolean"
+          },
+          "search_versions": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "x-go-type-skip-optional-pointer": true
+          },
+          "artifact_discovery": {
+            "type": "boolean"
+          },
+          "processing_presets": {
+            "type": "boolean"
+          },
+          "processing_jobs": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SourceIdentity": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "namespace": {
+            "type": "string",
+            "description": "Opaque prefix that scopes this source's row keys, independent of its connection or config. Assigned automatically at creation and immutable once set."
           }
         }
       },
@@ -470,6 +591,14 @@
           "permissions": {
             "$ref": "#/components/schemas/Permissions"
           },
+          "identity": {
+            "$ref": "#/components/schemas/SourceIdentity"
+          },
+          "rekeys": {
+            "type": "boolean",
+            "readOnly": true,
+            "description": "Set only on a PUT response. True when the call makes the next sync re-key this source's existing rows. A new source, or one that already has a namespace, never re-keys."
+          },
           "permission_ttl_seconds": {
             "type": "integer",
             "minimum": 60,
@@ -479,10 +608,35 @@
             "type": "array",
             "maxItems": 64,
             "items": {
-              "$ref": "#/components/schemas/TextStream"
+              "$ref": "#/components/schemas/SearchStream"
             },
             "x-go-type-skip-optional-pointer": true,
             "description": "Searchable source-text and native artifact bindings; credentials and producer execution remain separate."
+          },
+          "search_version": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2,
+            "x-go-type-skip-optional-pointer": true,
+            "description": "Omitted/1 uses legacy text bindings. Version 2 enables SearchStream retrieval and artifact declarations."
+          },
+          "artifacts": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/ArtifactBinding"
+            },
+            "x-go-type-skip-optional-pointer": true
+          },
+          "search_status": {
+            "$ref": "#/components/schemas/SearchStatus",
+            "readOnly": true,
+            "x-go-type-skip-optional-pointer": false
+          },
+          "processing": {
+            "$ref": "#/components/schemas/ProcessingDeclaration",
+            "description": "Native processing desired state. Hosted reads expose this only to table administrators. On update, omission or null preserves existing processing; an explicit empty indexes list clears the declaration and requires table administration. Native indexes are retired separately through native administration.",
+            "x-go-type-skip-optional-pointer": false
           }
         },
         "additionalProperties": false
@@ -651,13 +805,11 @@
           }
         }
       },
-      "TextStream": {
+      "SearchStream": {
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "name",
-          "field",
-          "default"
+          "name"
         ],
         "properties": {
           "name": {
@@ -676,7 +828,8 @@
             "type": "string",
             "minLength": 1,
             "pattern": "^[^\\u0000\\r\\n]+$",
-            "x-go-type-skip-optional-pointer": true
+            "x-go-type-skip-optional-pointer": true,
+            "description": "Legacy full-text binding; incompatible with retrieval. Use search_version=2 and retrieval for new configurations."
           },
           "field": {
             "type": "string",
@@ -698,7 +851,8 @@
           },
           "default": {
             "type": "boolean",
-            "x-go-type-skip-optional-pointer": true
+            "x-go-type-skip-optional-pointer": true,
+            "description": "Legacy default for exact matching; version 2 uses defaults on each retrieval mode."
           },
           "generated": {
             "type": "boolean",
@@ -711,12 +865,461 @@
             ],
             "x-go-type-skip-optional-pointer": true,
             "type": "string"
+          },
+          "resource_field": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "retrieval": {
+            "$ref": "#/components/schemas/RetrievalBindings",
+            "x-go-type-skip-optional-pointer": false
+          }
+        }
+      },
+      "TextStream": {
+        "$ref": "#/components/schemas/SearchStream",
+        "deprecated": true,
+        "description": "Compatibility alias; new declarations use SearchStream."
+      },
+      "RetrievalBindings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "exact": {
+            "$ref": "#/components/schemas/ExactRetrieval",
+            "x-go-type-skip-optional-pointer": false
+          },
+          "full_text": {
+            "$ref": "#/components/schemas/FullTextRetrieval",
+            "x-go-type-skip-optional-pointer": false
+          },
+          "semantic": {
+            "$ref": "#/components/schemas/SemanticRetrieval",
+            "x-go-type-skip-optional-pointer": false
+          }
+        }
+      },
+      "ExactRetrieval": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "default": {
+            "type": "boolean"
+          }
+        }
+      },
+      "FullTextRetrieval": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "default": {
+            "type": "boolean"
           }
         },
-        "dependentRequired": {
-          "artifact": [
-            "index"
-          ]
+        "required": [
+          "index"
+        ]
+      },
+      "VectorSpace": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "dimension": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "cosine",
+              "inner_product",
+              "l2_squared"
+            ],
+            "x-go-type-skip-optional-pointer": true
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "revision": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "query_preprocessing": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "document_preprocessing": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "query_modality": {
+            "type": "string",
+            "enum": [
+              "text",
+              "image",
+              "audio",
+              "multimodal"
+            ],
+            "x-go-type-skip-optional-pointer": true
+          },
+          "document_modality": {
+            "type": "string",
+            "enum": [
+              "text",
+              "image",
+              "audio",
+              "multimodal"
+            ],
+            "x-go-type-skip-optional-pointer": true
+          }
+        },
+        "required": [
+          "id",
+          "dimension",
+          "metric",
+          "model",
+          "revision",
+          "query_preprocessing",
+          "document_preprocessing",
+          "query_modality",
+          "document_modality"
+        ]
+      },
+      "SemanticRetrieval": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "member_artifacts": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[^\\u0000\\r\\n]+$",
+              "x-go-type-skip-optional-pointer": true
+            },
+            "maxItems": 64,
+            "x-go-type-skip-optional-pointer": true
+          },
+          "vector_space": {
+            "$ref": "#/components/schemas/VectorSpace"
+          },
+          "query_inputs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "text",
+                "vector"
+              ],
+              "x-go-type-skip-optional-pointer": true
+            },
+            "minItems": 1,
+            "maxItems": 2,
+            "uniqueItems": true,
+            "x-go-type-skip-optional-pointer": true
+          },
+          "default": {
+            "type": "boolean"
+          },
+          "external": {
+            "type": "boolean"
+          },
+          "member_field": {
+            "type": "string",
+            "description": "Projection returned from semantic members. Chunk-backed embeddings use text even when their ancestor representation is scalar ($). Managed textual streams must declare this field."
+          }
+        },
+        "required": [
+          "index",
+          "vector_space",
+          "query_inputs"
+        ]
+      },
+      "ArtifactBinding": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "artifact": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "purpose": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "content_type": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "schema_uri": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "location_field": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "generated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "artifact",
+          "content_type"
+        ]
+      },
+      "RepresentationStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "disabled",
+              "building",
+              "ready",
+              "partial",
+              "failed",
+              "unsupported"
+            ],
+            "x-go-type-skip-optional-pointer": true
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          }
+        },
+        "required": [
+          "name",
+          "state"
+        ]
+      },
+      "SearchStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "integer"
+          },
+          "streams": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/RepresentationStatus"
+            },
+            "x-go-type-skip-optional-pointer": true
+          },
+          "artifacts": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/RepresentationStatus"
+            },
+            "x-go-type-skip-optional-pointer": true
+          },
+          "observed_at": {
+            "type": "integer"
+          },
+          "consistency": {
+            "type": "string",
+            "enum": [
+              "retained_snapshot",
+              "live_read",
+              "unknown"
+            ],
+            "x-go-type-skip-optional-pointer": true
+          }
+        },
+        "required": [
+          "version",
+          "observed_at",
+          "streams",
+          "artifacts",
+          "consistency"
+        ]
+      },
+      "NativeIndexDeclaration": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "config"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "An ordinary Antfly IndexConfig, including native enrichments. Validated by Antfly; no source-specific producer language."
+          }
+        }
+      },
+      "ProcessingDeclaration": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "indexes": {
+            "type": "array",
+            "maxItems": 32,
+            "items": {
+              "$ref": "#/components/schemas/NativeIndexDeclaration"
+            },
+            "x-go-type-skip-optional-pointer": true
+          }
+        }
+      },
+      "ProcessingPreset": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "kind"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "content",
+              "extract",
+              "transcription",
+              "caption",
+              "summary"
+            ]
+          },
+          "producer_config": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "embedder": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "dimension": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65536
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "cosine",
+              "inner_product",
+              "l2_squared"
+            ]
+          }
+        }
+      },
+      "ProcessingPreview": {
+        "type": "object",
+        "required": [
+          "processing",
+          "stream",
+          "artifact"
+        ],
+        "properties": {
+          "processing": {
+            "$ref": "#/components/schemas/ProcessingDeclaration"
+          },
+          "stream": {
+            "$ref": "#/components/schemas/SearchStream"
+          },
+          "artifact": {
+            "$ref": "#/components/schemas/ArtifactBinding"
+          }
+        }
+      },
+      "ProcessingJobRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "artifact",
+          "action"
+        ],
+        "properties": {
+          "artifact": {
+            "type": "string",
+            "minLength": 1
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "start",
+              "status",
+              "advance",
+              "cancel"
+            ]
+          },
+          "job_id": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 256
+          }
         }
       }
     }

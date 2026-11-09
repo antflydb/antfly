@@ -22,10 +22,10 @@ fn repeatBytesComptime(comptime bytes: []const u8, comptime count: usize) [bytes
     }
     return repeated;
 }
-const syntax = @import("syntax.zig");
+const syntax = @import("pdf_syntax");
+const text_encoding = @import("pdf_text_encoding");
 const inline_image = @import("inline_image.zig");
 const structure_text = @import("structure_text.zig");
-const text_encoding = @import("text_encoding.zig");
 const jbig2 = @import("jbig2.zig");
 const image_lib = @import("antfly_image");
 const font_lib = @import("antfly_font");
@@ -343,8 +343,8 @@ const ImageDecodeTarget = struct {
     max_dimension: u32,
 };
 
-pub const default_max_decoded_stream_bytes: usize = 64 * 1024 * 1024;
-pub const default_max_decode_working_set_bytes: usize = 128 * 1024 * 1024;
+pub const default_max_decoded_stream_bytes = @import("pdf_values").default_max_decoded_stream_bytes;
+pub const default_max_decode_working_set_bytes = @import("pdf_values").default_max_decode_working_set_bytes;
 const jbig2_work_units_per_expected_pixel: u64 = 8;
 const jbig2_work_unit_floor: u64 = 4_000_000;
 // A hard ceiling keeps unusually large but valid output dimensions from
@@ -356,15 +356,7 @@ const jbig2_work_unit_ceiling: u64 = 256_000_000;
 /// intentionally separate: chained filters and predictors retain their input
 /// until the next output has been produced. Image XObjects share that same
 /// working-set budget across codec scratch space and their complete mask tree.
-pub const DecodeLimits = struct {
-    max_decoded_stream_bytes: usize = default_max_decoded_stream_bytes,
-    max_working_set_bytes: usize = default_max_decode_working_set_bytes,
-
-    pub fn validate(self: DecodeLimits) !void {
-        if (self.max_decoded_stream_bytes == 0 or self.max_working_set_bytes == 0)
-            return error.InvalidPdfDecodeLimits;
-    }
-};
+pub const DecodeLimits = @import("pdf_values").DecodeLimits;
 
 const DecodeBudgetAllocator = struct {
     backing: Allocator,
@@ -1327,174 +1319,27 @@ const Type3Font = struct {
         return null;
     }
 };
-pub const TextExtractionPolicy = enum {
-    source,
-    page,
-    visible,
-};
+pub const TextExtractionPolicy = @import("pdf_values").TextExtractionPolicy;
 
-pub const NativeTextDiagnostics = struct {
-    actual_text_incomplete: bool = false,
-    actual_text_replacements: usize = 0,
-    outside_page_runs: usize = 0,
-    invisible_runs: usize = 0,
-    unaligned_runs: usize = 0,
-    unsupported_ordering_runs: usize = 0,
-    source_run_count: usize = 0,
-    emitted_run_count: usize = 0,
-    outside_page_spans: usize = 0,
-    invisible_spans: usize = 0,
-    unpositioned_spans: usize = 0,
-};
+pub const NativeTextDiagnostics = @import("pdf_values").NativeTextDiagnostics;
 
 const TextExtractionState = struct {
     current_font_index: ?usize = null,
 };
 
-pub const TextOutputSpan = struct {
-    start: usize,
-    end: usize,
-};
+pub const TextOutputSpan = @import("pdf_values").TextOutputSpan;
 
-pub const TextFallbackReason = enum {
-    missing_font,
-    unsupported_font,
-    missing_text_data,
-    missing_glyph,
-    invalid_font_program,
-    outline_too_complex,
-    unsupported_resource,
-    materialization_limit,
-    vector_work_limit,
-    font_work_limit,
-    other,
-};
+pub const TextFallbackReason = @import("pdf_values").TextFallbackReason;
 
-pub const PageRenderDiagnostics = struct {
-    text_groups: u32 = 0,
-    vector_text_groups: u32 = 0,
-    fallback_text_groups: u32 = 0,
-    vector_text_runs: u32 = 0,
-    fallback_text_runs: u32 = 0,
-    first_fallback_reason: ?TextFallbackReason = null,
-    fallback_reason_counts: [@typeInfo(TextFallbackReason).@"enum".field_names.len]u32 =
-        @as([@typeInfo(TextFallbackReason).@"enum".field_names.len]u32, @splat(0)),
-    text_materialization_bytes: u64 = 0,
-    peak_operator_materialization_bytes: u64 = 0,
-    remaining_edge_tests: u64 = 0,
-    remaining_scanline_work: u64 = 0,
-    remaining_points: u64 = 0,
-    remaining_resource_bytes: u64 = 0,
-    remaining_materialization_bytes: u64 = 0,
-    remaining_font_operations: u64 = 0,
-    glyph_outline_cache_hits: u32 = 0,
-    glyph_outline_cache_misses: u32 = 0,
-    glyph_outline_cache_bytes: u64 = 0,
+pub const PageRenderDiagnostics = @import("pdf_values").PageRenderDiagnostics;
 
-    fn recordFallback(self: *PageRenderDiagnostics, reason: TextFallbackReason, run_count: usize) void {
-        self.fallback_text_groups +|= 1;
-        self.fallback_text_runs +|= @intCast(@min(run_count, std.math.maxInt(u32)));
-        self.fallback_reason_counts[@backingInt(reason)] +|= 1;
-        if (self.first_fallback_reason == null) self.first_fallback_reason = reason;
-    }
-};
-
-pub const CancellationProbe = struct {
-    context: ?*const anyopaque = null,
-    is_cancelled_fn: ?*const fn (?*const anyopaque) bool = null,
-
-    pub fn check(self: CancellationProbe) !void {
-        if (self.is_cancelled_fn) |is_cancelled| if (is_cancelled(self.context)) return error.Canceled;
-    }
-};
+pub const CancellationProbe = @import("pdf_values").CancellationProbe;
 
 fn jpeg2000CancellationProbe(probe: CancellationProbe) image_lib.jpeg2000.CancellationProbe {
     return .{ .context = probe.context, .is_cancelled_fn = probe.is_cancelled_fn };
 }
 
-pub const TextRun = struct {
-    text: []const u8,
-    raw_text: ?[]const u8 = null,
-    font_index: ?u16 = null,
-    /// Render-time font resource for text nested inside a Form XObject. Form
-    /// font indices are local to their resource dictionary and cannot be
-    /// interpreted against the page font slice. This borrow is consumed and
-    /// cleared before PageRenderRuns escapes the Reader call.
-    render_font: ?*const PageFont = null,
-    vectorizable: bool = false,
-    fallback_reason: ?TextFallbackReason = null,
-    x: f64,
-    y: f64,
-    font_size: f64,
-    bold: ?bool = null,
-    italic: ?bool = null,
-    a: f64 = 1,
-    b: f64 = 0,
-    c: f64 = 0,
-    d: f64 = 1,
-    /// Graphics CTM at the point where this text run was painted. The text
-    /// basis above is already transformed, but pattern space is defined by
-    /// the graphics CTM and must not be reconstructed from the glyph basis.
-    graphics_matrix: GraphicsMatrix = .{},
-    alpha: u8 = 0xff,
-    stroke_alpha: u8 = 0xff,
-    render_mode: i64 = 0,
-    fill_color: [4]u8 = .{ 0, 0, 0, 0xff },
-    stroke_color: [4]u8 = .{ 0, 0, 0, 0xff },
-    stroke_width: f64 = 1,
-    horizontal_scale: f64 = 1.0,
-    vertical: bool = false,
-    char_spacing: f64 = 0,
-    word_spacing: f64 = 0,
-    advance_width: f64 = 0,
-    ascent: f64 = 0,
-    descent: f64 = 0,
-    paint_order: usize = 0,
-    /// Opening BT paint position; null for caller-constructed runs.
-    text_object_id: ?usize = null,
-    /// Consistent TJ positioning measured on both sides of authored whitespace.
-    /// Only matching local gaps between glyph fragments count as tracking.
-    text_show_tracking_gap: ?f64 = null,
-    paint_phase: usize = 0,
-    output_span: ?TextOutputSpan = null,
-    /// Policy filtering leaves source text and geometry intact for auditing.
-    /// Reconstruction skips these runs and leaves `output_span` null.
-    policy_excluded: bool = false,
-    /// Index into PageTextAnalysis.semantic_spans; source glyphs stay intact.
-    semantic_span_index: usize = no_semantic_span,
-    /// Extraction-only ancestry evidence; group_alpha belongs to the immediate
-    /// render group and must retain its original compositing semantics.
-    ancestor_groups_visible: bool = true,
-
-    blend_mode: BlendMode = .normal,
-    group_id: ?u32 = null,
-    group_parent_id: ?u32 = null,
-    group_isolated: bool = true,
-    group_knockout: bool = false,
-    group_alpha: u8 = 0xff,
-    group_blend_mode: BlendMode = .normal,
-    fill_pattern_name: ?[]const u8 = null,
-    stroke_pattern_name: ?[]const u8 = null,
-    clip_box: ?PageBox = null,
-    clip_points: ?[]const [2]f64 = null,
-    clip_fill_rule: FillRule = .nonzero,
-
-    /// Page-space bounds of horizontal text, including its transformed basis
-    /// and font ascent/descent. Vertical writing needs per-glyph vertical
-    /// origins; leave that geometry unknown rather than inventing a rectangle.
-    pub fn bounds(self: TextRun) ?PageBox {
-        return extractionTextRunBounds(self);
-    }
-
-    pub fn deinit(self: *TextRun, alloc: Allocator) void {
-        if (self.clip_points) |points| alloc.free(points);
-        if (self.fill_pattern_name) |name| alloc.free(name);
-        if (self.stroke_pattern_name) |name| alloc.free(name);
-        if (self.raw_text) |raw| alloc.free(raw);
-        alloc.free(self.text);
-        self.* = undefined;
-    }
-};
+pub const TextRun = @import("pdf_values").TextRun;
 /// Unknown geometry is retained conservatively by extraction policies.
 fn extractionTextRunBounds(run: anytype) ?PageBox {
     if (run.vertical) return null;
@@ -1564,42 +1409,9 @@ fn contentHasNontextPaint(alloc: Allocator, bytes: []const u8, cancellation: Can
     }
 }
 
-pub const PageTextAnalysis = struct {
-    text: []u8,
-    runs: []TextRun,
-    semantic_spans: []SemanticTextSpan = &.{},
-    outline_fallback: bool = false,
-    has_nontext_visual: bool = false,
-    has_unrendered_annotations: bool = false,
-    diagnostics: NativeTextDiagnostics = .{},
+pub const PageTextAnalysis = @import("pdf_values").PageTextAnalysis;
 
-    pub fn deinit(self: *PageTextAnalysis, alloc: Allocator) void {
-        alloc.free(self.text);
-        for (self.runs) |*run| run.deinit(alloc);
-        if (self.runs.len > 0) alloc.free(self.runs);
-        for (self.semantic_spans) |*span| span.deinit(alloc);
-        if (self.semantic_spans.len > 0) alloc.free(self.semantic_spans);
-        self.* = undefined;
-    }
-};
-
-const SharedImageRgba = struct {
-    bytes: []u8,
-    references: usize = 1,
-
-    fn retain(self: *SharedImageRgba) void {
-        self.references = std.math.add(usize, self.references, 1) catch std.math.maxInt(usize);
-    }
-
-    fn release(self: *SharedImageRgba, alloc: Allocator) void {
-        std.debug.assert(self.references > 0);
-        self.references -= 1;
-        if (self.references == 0) {
-            alloc.free(self.bytes);
-            alloc.destroy(self);
-        }
-    }
-};
+const SharedImageRgba = @import("pdf_values").SharedImageRgba;
 
 const CachedPageImage = struct {
     shared_rgba: *SharedImageRgba,
@@ -1634,240 +1446,29 @@ const DecodedImageCache = struct {
     }
 };
 
-pub const ImageRun = struct {
-    rgba: []u8,
-    /// Decoded XObject samples are immutable and shared by every `Do`
-    /// occurrence. Ad-hoc callers may leave this null and retain the legacy
-    /// owned-slice behavior.
-    shared_rgba: ?*SharedImageRgba = null,
-    width: u32,
-    height: u32,
-    interpolate: bool = false,
-    /// True when the source is one-bit scan/line-art data. OCR rendering may
-    /// use coverage-preserving minification without changing exact PDF mode.
-    bilevel: bool = false,
-    /// Whole-image premultiplied coverage summary. OCR minification uses this
-    /// only when a full-source footprint cannot afford exact integration.
-    bilevel_fallback: ?[4]u8 = null,
-    ocr_coverage_minify: bool = false,
-    /// PDF image masks are stencils: their decoded samples provide coverage,
-    /// while the active nonstroking color at each `Do` provides paint. Keep
-    /// that color on the occurrence instead of mutating shared decoded RGBA.
-    stencil_color: ?[4]u8 = null,
-    /// A graphics-state soft mask whose group is a single image covering the
-    /// painted image. The mask is sampled in the same normalized image space.
-    opacity_mask_rgba: ?[]u8 = null,
-    opacity_mask_shared_rgba: ?*SharedImageRgba = null,
-    opacity_mask_width: u32 = 0,
-    opacity_mask_height: u32 = 0,
-    opacity_mask_luminosity: bool = false,
-    opacity_mask_interpolate: bool = false,
-    alpha: u8 = 0xff,
-    paint_order: usize = 0,
-    paint_phase: usize = 0,
-    blend_mode: BlendMode = .normal,
-    group_id: ?u32 = null,
-    group_parent_id: ?u32 = null,
-    group_isolated: bool = true,
-    group_knockout: bool = false,
-    group_alpha: u8 = 0xff,
-    group_blend_mode: BlendMode = .normal,
-    clip_box: ?PageBox = null,
-    clip_points: ?[]const [2]f64 = null,
-    clip_fill_rule: FillRule = .nonzero,
-    a: f64,
-    b: f64,
-    c: f64,
-    d: f64,
-    e: f64,
-    f: f64,
-    x: f64,
-    y: f64,
-    draw_width: f64,
-    draw_height: f64,
+pub const ImageRun = @import("pdf_values").ImageRun;
 
-    pub fn deinit(self: *ImageRun, alloc: Allocator) void {
-        if (self.clip_points) |points| alloc.free(points);
-        if (self.opacity_mask_shared_rgba) |shared|
-            shared.release(alloc)
-        else if (self.opacity_mask_rgba) |mask|
-            alloc.free(mask);
-        if (self.shared_rgba) |shared| shared.release(alloc) else alloc.free(self.rgba);
-        self.* = undefined;
-    }
-};
-
-const shading_uniform_color_sample_count: usize = 64;
-const shading_color_sample_capacity: usize = 128;
-const shading_color_sample_count = shading_uniform_color_sample_count;
-const shading_discontinuity_capacity: usize = (shading_color_sample_capacity - shading_uniform_color_sample_count) / 2;
+const shading_uniform_color_sample_count = @import("pdf_values").shading_uniform_color_sample_count;
+const shading_color_sample_capacity = @import("pdf_values").shading_color_sample_capacity;
+const shading_color_sample_count = @import("pdf_values").shading_color_sample_count;
+const shading_discontinuity_capacity = @import("pdf_values").shading_discontinuity_capacity;
 const shading_function_node_capacity: u16 = 128;
 
-pub const ShadingRun = struct {
-    kind: enum { axial, radial },
-    paint_order: usize = 0,
-    paint_phase: usize = 0,
-    blend_mode: BlendMode = .normal,
-    group_id: ?u32 = null,
-    group_parent_id: ?u32 = null,
-    group_isolated: bool = true,
-    group_knockout: bool = false,
-    group_alpha: u8 = 0xff,
-    group_blend_mode: BlendMode = .normal,
-    clip_box: ?PageBox = null,
-    clip_points: ?[]const [2]f64 = null,
-    clip_fill_rule: FillRule = .nonzero,
-    x0: f64,
-    y0: f64,
-    r0: f64 = 0,
-    x1: f64,
-    y1: f64,
-    r1: f64 = 0,
-    c0: [4]u8,
-    c1: [4]u8,
-    color_samples: [shading_color_sample_capacity][4]u8 = @as([shading_color_sample_capacity][4]u8, @splat(.{ 0, 0, 0, 0xff })),
-    color_sample_positions: [shading_color_sample_capacity]f64 = @splat(0),
-    color_sample_count: u8 = 0,
-    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = @as([shading_discontinuity_capacity][4]u8, @splat(.{ 0, 0, 0, 0xff })),
-    exact_boundary_positions: [shading_discontinuity_capacity]f64 = @splat(0),
-    exact_boundary_count: u8 = 0,
-    extend_start: bool = false,
-    extend_end: bool = false,
+pub const ShadingRun = @import("pdf_values").ShadingRun;
 
-    pub fn deinit(self: *ShadingRun, alloc: Allocator) void {
-        if (self.clip_points) |points| alloc.free(points);
-        self.* = undefined;
-    }
-};
+pub const PatternRun = @import("pdf_values").PatternRun;
 
-pub const PatternRun = struct {
-    kind: enum { fill, stroke },
-    mode: enum { tiling, shading } = .tiling,
-    paint_order: usize = 0,
-    /// Orders multiple paint phases emitted by one PDF operator, independent
-    /// of backing paint type. Synthesized outlines use fill then stroke;
-    /// Type3 glyphs retain their intrinsic CharProc operator sequence.
-    paint_phase: usize = 0,
-    blend_mode: BlendMode = .normal,
-    group_id: ?u32 = null,
-    group_parent_id: ?u32 = null,
-    group_isolated: bool = true,
-    group_knockout: bool = false,
-    group_alpha: u8 = 0xff,
-    group_blend_mode: BlendMode = .normal,
-    fill_rule: FillRule = .nonzero,
-    line_cap: @FieldType(ShapeRun, "line_cap") = .butt,
-    line_join: @FieldType(ShapeRun, "line_join") = .miter,
-    miter_limit: f64 = 10,
-    dash_array: ?[]f64 = null,
-    dash_phase: f64 = 0,
-    stroke_width: f64 = 1,
-    closed: bool = true,
-    clip_box: ?PageBox = null,
-    clip_points: ?[]const [2]f64 = null,
-    clip_fill_rule: FillRule = .nonzero,
-    points: [][2]f64,
-    subpath_starts: ?[]usize = null,
-    subpath_closed: ?[]bool = null,
-    /// A Pattern-colored image mask uses the image only as target coverage.
-    /// Keeping the immutable decoded mask here avoids premature rasterization
-    /// and preserves the pattern cell, transform, clip, and blend semantics.
-    stencil_mask: ?ImageRun = null,
-    pattern_matrix: GraphicsMatrix = .{},
-    pattern_bbox: PageBox,
-    pattern_x_step: f64,
-    pattern_y_step: f64,
-    base_color: ?[4]u8 = null,
-    shading: ?ShadingRun = null,
-    tile_text_runs: []TextRun = &.{},
-    tile_image_runs: []ImageRun = &.{},
-    tile_shading_runs: []ShadingRun = &.{},
-    tile_pattern_runs: []PatternRun = &.{},
-    tile_shape_runs: []ShapeRun = &.{},
+pub const PageBox = @import("pdf_values").PageBox;
 
-    pub fn deinit(self: *PatternRun, alloc: Allocator) void {
-        if (self.dash_array) |dash| alloc.free(dash);
-        if (self.clip_points) |clip| alloc.free(clip);
-        if (self.subpath_starts) |starts| alloc.free(starts);
-        if (self.subpath_closed) |closed| alloc.free(closed);
-        alloc.free(self.points);
-        if (self.stencil_mask) |*mask| mask.deinit(alloc);
-        if (self.shading) |*shading| shading.deinit(alloc);
-        for (self.tile_text_runs) |*run| run.deinit(alloc);
-        if (self.tile_text_runs.len > 0) alloc.free(self.tile_text_runs);
-        for (self.tile_image_runs) |*run| run.deinit(alloc);
-        if (self.tile_image_runs.len > 0) alloc.free(self.tile_image_runs);
-        for (self.tile_shading_runs) |*run| run.deinit(alloc);
-        if (self.tile_shading_runs.len > 0) alloc.free(self.tile_shading_runs);
-        for (self.tile_pattern_runs) |*run| run.deinit(alloc);
-        if (self.tile_pattern_runs.len > 0) alloc.free(self.tile_pattern_runs);
-        for (self.tile_shape_runs) |*run| run.deinit(alloc);
-        if (self.tile_shape_runs.len > 0) alloc.free(self.tile_shape_runs);
-        self.* = undefined;
-    }
-};
+const FillRule = @import("pdf_values").FillRule;
 
-pub const PageBox = struct {
-    min_x: f64,
-    min_y: f64,
-    max_x: f64,
-    max_y: f64,
-};
+pub const BlendMode = @import("pdf_values").BlendMode;
 
-const FillRule = enum { nonzero, even_odd };
+pub const ShapeKind = @import("pdf_values").ShapeKind;
+pub const ShapeLineCap = @import("pdf_values").ShapeLineCap;
+pub const ShapeLineJoin = @import("pdf_values").ShapeLineJoin;
 
-pub const BlendMode = enum {
-    normal,
-    multiply,
-    screen,
-    overlay,
-    darken,
-    lighten,
-};
-
-pub const ShapeRun = struct {
-    kind: enum { fill, stroke },
-    paint_order: usize = 0,
-    paint_phase: usize = 0,
-    blend_mode: BlendMode = .normal,
-    group_id: ?u32 = null,
-    group_parent_id: ?u32 = null,
-    group_isolated: bool = true,
-    group_knockout: bool = false,
-    group_alpha: u8 = 0xff,
-    group_blend_mode: BlendMode = .normal,
-    fill_rule: FillRule = .nonzero,
-    line_cap: enum { butt, round, square } = .butt,
-    line_join: enum { miter, round, bevel } = .miter,
-    miter_limit: f64 = 10,
-    dash_array: ?[]f64 = null,
-    dash_phase: f64 = 0,
-    color: [4]u8,
-    stroke_width: f64,
-    closed: bool,
-    clip_box: ?PageBox = null,
-    clip_points: ?[]const [2]f64 = null,
-    clip_fill_rule: FillRule = .nonzero,
-    points: [][2]f64,
-    antialias: bool = false,
-    /// Start offsets for independently closed subpaths in `points`. Font
-    /// glyphs need all contours painted as one path so counter contours
-    /// (the holes in O, B, 8, and similar glyphs) participate in winding.
-    subpath_starts: ?[]usize = null,
-    /// Per-subpath closure for compound stroked paths. Filled paths close
-    /// implicitly, but PDF permits one stroke operator to mix open and closed
-    /// contours; one page-wide `closed` bit cannot represent that faithfully.
-    subpath_closed: ?[]bool = null,
-
-    pub fn deinit(self: *ShapeRun, alloc: Allocator) void {
-        if (self.dash_array) |dash| alloc.free(dash);
-        if (self.clip_points) |clip| alloc.free(clip);
-        if (self.subpath_starts) |starts| alloc.free(starts);
-        if (self.subpath_closed) |closed| alloc.free(closed);
-        alloc.free(self.points);
-        self.* = undefined;
-    }
-};
+pub const ShapeRun = @import("pdf_values").ShapeRun;
 
 const RenderTarget = struct { width: u32, height: u32 };
 // Detailed embedded display fonts and traced CJK subsets routinely contain
@@ -2196,29 +1797,7 @@ fn appendOwnedValue(comptime T: type, alloc: Allocator, out: *std.ArrayList(T), 
     try out.append(alloc, owned);
 }
 
-pub const PageRenderRuns = struct {
-    page_box: PageBox = .{ .min_x = 0, .min_y = 0, .max_x = 612, .max_y = 792 },
-    text_runs: []TextRun = &.{},
-    image_runs: []ImageRun = &.{},
-    shading_runs: []ShadingRun = &.{},
-    pattern_runs: []PatternRun = &.{},
-    shape_runs: []ShapeRun = &.{},
-    diagnostics: PageRenderDiagnostics = .{},
-
-    pub fn deinit(self: *PageRenderRuns, alloc: Allocator) void {
-        for (self.text_runs) |*run| run.deinit(alloc);
-        if (self.text_runs.len > 0) alloc.free(self.text_runs);
-        for (self.image_runs) |*run| run.deinit(alloc);
-        if (self.image_runs.len > 0) alloc.free(self.image_runs);
-        for (self.shading_runs) |*run| run.deinit(alloc);
-        if (self.shading_runs.len > 0) alloc.free(self.shading_runs);
-        for (self.pattern_runs) |*run| run.deinit(alloc);
-        if (self.pattern_runs.len > 0) alloc.free(self.pattern_runs);
-        for (self.shape_runs) |*run| run.deinit(alloc);
-        if (self.shape_runs.len > 0) alloc.free(self.shape_runs);
-        self.* = undefined;
-    }
-};
+pub const PageRenderRuns = @import("pdf_values").PageRenderRuns;
 
 const TextRunState = struct {
     ancestor_groups_visible: bool = true,
@@ -2307,14 +1886,7 @@ const TextRunStackEntry = struct {
     }
 };
 
-const GraphicsMatrix = struct {
-    a: f64 = 1,
-    b: f64 = 0,
-    c: f64 = 0,
-    d: f64 = 1,
-    e: f64 = 0,
-    f: f64 = 0,
-};
+const GraphicsMatrix = @import("pdf_values").GraphicsMatrix;
 
 /// Content operands are released after every operator, so color-space state
 /// must not retain their name slices. Keep it as a value and make unsupported
@@ -2937,12 +2509,18 @@ fn prepareOcrImageRunsWithSummariesAlloc(
     alloc: Allocator,
     image_runs: []ImageRun,
     summaries: *std.AutoHashMapUnmanaged(usize, [4]u8),
+    profile: @import("pdf_values").RenderProfile,
     cancellation: CancellationProbe,
 ) !void {
     for (image_runs, 0..) |*run, index| {
         if (index & 255 == 0) try cancellation.check();
-        run.ocr_coverage_minify = run.bilevel;
-        if (!run.bilevel or run.rgba.len == 0) continue;
+        // OCR consumes a resampled image rather than an exact PDF painting.
+        // Smooth continuous-tone samples before the vision encoder resizes the
+        // page again; nearest-neighbour magnification aliases small lettering.
+        // One-bit scans retain their separate coverage-preserving policy.
+        run.ocr_interpolate = profile != .exact and (profile == .smooth or !run.bilevel) and run.stencil_color == null;
+        run.ocr_coverage_minify = profile == .ocr and run.bilevel;
+        if (!run.ocr_coverage_minify or run.rgba.len == 0) continue;
         const key = @intFromPtr(run.rgba.ptr);
         const entry = try summaries.getOrPut(alloc, key);
         if (!entry.found_existing) {
@@ -2959,6 +2537,7 @@ fn prepareOcrPatternRunsWithSummariesAlloc(
     alloc: Allocator,
     pattern_runs: []PatternRun,
     summaries: *std.AutoHashMapUnmanaged(usize, [4]u8),
+    profile: @import("pdf_values").RenderProfile,
     cancellation: CancellationProbe,
     depth: u8,
 ) !void {
@@ -2969,14 +2548,14 @@ fn prepareOcrPatternRunsWithSummariesAlloc(
     for (pattern_runs, 0..) |*pattern, index| {
         if (index & 63 == 0) try cancellation.check();
         if (pattern.stencil_mask) |*mask|
-            try prepareOcrImageRunsWithSummariesAlloc(alloc, @as(*[1]ImageRun, @ptrCast(mask))[0..], summaries, cancellation);
-        try prepareOcrImageRunsWithSummariesAlloc(alloc, pattern.tile_image_runs, summaries, cancellation);
-        try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern.tile_pattern_runs, summaries, cancellation, depth + 1);
+            try prepareOcrImageRunsWithSummariesAlloc(alloc, @as(*[1]ImageRun, @ptrCast(mask))[0..], summaries, profile, cancellation);
+        try prepareOcrImageRunsWithSummariesAlloc(alloc, pattern.tile_image_runs, summaries, profile, cancellation);
+        try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern.tile_pattern_runs, summaries, profile, cancellation, depth + 1);
     }
 }
 
-/// Prepare every bilevel resource reachable by OCR rendering, including
-/// pattern-cell images and image masks retained as Pattern paint targets.
+/// Prepare OCR sampling for every reachable image: continuous-tone smoothing
+/// and bilevel coverage, including pattern-cell images and retained masks.
 /// Shared decoded XObjects use one summary regardless of how many occurrences
 /// reference them.
 pub fn prepareOcrRenderRunsAlloc(
@@ -2985,10 +2564,20 @@ pub fn prepareOcrRenderRunsAlloc(
     pattern_runs: []PatternRun,
     cancellation: CancellationProbe,
 ) !void {
+    return prepareRenderRunsAlloc(alloc, image_runs, pattern_runs, .ocr, cancellation);
+}
+
+pub fn prepareRenderRunsAlloc(
+    alloc: Allocator,
+    image_runs: []ImageRun,
+    pattern_runs: []PatternRun,
+    profile: @import("pdf_values").RenderProfile,
+    cancellation: CancellationProbe,
+) !void {
     var summaries = std.AutoHashMapUnmanaged(usize, [4]u8).empty;
     defer summaries.deinit(alloc);
-    try prepareOcrImageRunsWithSummariesAlloc(alloc, image_runs, &summaries, cancellation);
-    try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern_runs, &summaries, cancellation, 0);
+    try prepareOcrImageRunsWithSummariesAlloc(alloc, image_runs, &summaries, profile, cancellation);
+    try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern_runs, &summaries, profile, cancellation, 0);
 }
 
 /// Compatibility helper for callers that render only standalone images.
@@ -4273,7 +3862,7 @@ const PositionedTextOutput = union(enum) {
         };
     }
 };
-const no_semantic_span = std.math.maxInt(usize);
+const no_semantic_span = @import("pdf_values").no_semantic_span;
 
 fn unionTextBox(left: ?PageBox, right: PageBox) PageBox {
     const box = left orelse return right;
@@ -4283,72 +3872,12 @@ fn unionTextBox(left: ?PageBox, right: PageBox) PageBox {
 /// Constant-space summary of the actual source paints. Eligibility is tested
 /// per paint, before unioning bounds, so two exterior paints cannot invent an
 /// on-page intersection by straddling the page.
-const SemanticPaint = struct {
-    has_paint: bool = false,
-    any_visible: bool = false,
-    page_eligible: bool = false,
-    visible_eligible: bool = false,
-    source_unknown: bool = false,
-    page_unknown: bool = false,
-    visible_unknown: bool = false,
-    source_bounds: ?PageBox = null,
-    page_bounds: ?PageBox = null,
-    visible_bounds: ?PageBox = null,
-
-    fn merge(self: *@This(), other: @This()) void {
-        inline for (.{ "has_paint", "any_visible", "page_eligible", "visible_eligible", "source_unknown", "page_unknown", "visible_unknown" }) |field|
-            @field(self, field) = @field(self, field) or @field(other, field);
-        inline for (.{ "source_bounds", "page_bounds", "visible_bounds" }) |field|
-            if (@field(other, field)) |box| {
-                @field(self, field) = unionTextBox(@field(self, field), box);
-            };
-    }
-
-    fn add(self: *@This(), bounds: ?PageBox, clip: ?PageBox, visible: bool, page: ?PageBox) void {
-        self.has_paint = true;
-        self.any_visible = self.any_visible or visible;
-        if (bounds) |box| self.source_bounds = unionTextBox(self.source_bounds, box) else self.source_unknown = true;
-        if (clip) |box| if (page) |page_box| if (!pageBoxesOverlap(box, page_box)) return;
-        if (clip) |box| if (box.min_x >= box.max_x or box.min_y >= box.max_y) return;
-        if (bounds) |box| {
-            if (page) |page_box| if (!pageBoxesOverlap(box, page_box)) return;
-            if (clip) |clip_box| if (!pageBoxesOverlap(box, clip_box)) return;
-            self.page_bounds = unionTextBox(self.page_bounds, box);
-            if (visible) self.visible_bounds = unionTextBox(self.visible_bounds, box);
-        } else {
-            self.page_unknown = true;
-            self.visible_unknown = self.visible_unknown or visible;
-        }
-        self.page_eligible = true;
-        self.visible_eligible = self.visible_eligible or visible;
-    }
-};
+const SemanticPaint = @import("pdf_values").SemanticPaint;
 
 /// One authored semantic replacement, independent of its source glyphs.
 /// run_start/run_end retain the source-order slot even when no glyphs exist.
 /// Entry/exit indices and output bounds are selected once for the active policy.
-pub const SemanticTextSpan = struct {
-    /// Several marked-content sequences can share one structure replacement.
-    /// run_start/end enclose them; TextRun.semantic_span_index is membership.
-    multiple_scopes: bool = false,
-    text: []const u8,
-    run_start: usize,
-    run_end: usize,
-    paint: SemanticPaint = .{},
-    output_span: ?TextOutputSpan = null,
-    output_bounds: ?PageBox = null,
-    entry_run: ?usize = null,
-    exit_run: ?usize = null,
-    policy_excluded: bool = false,
-    font_size: ?f64 = null,
-    bold: ?bool = null,
-    italic: ?bool = null,
-
-    pub fn deinit(self: *@This(), alloc: Allocator) void {
-        alloc.free(self.text);
-        self.* = undefined;
-    }
-};
+pub const SemanticTextSpan = @import("pdf_values").SemanticTextSpan;
 
 const SemanticTextContext = struct {
     structure: ?*structure_text.Lookup = null,
@@ -6487,7 +6016,14 @@ pub const Reader = struct {
             var annotation = try self.annotationValue(raw);
             defer annotation.deinit(self.alloc);
             if (!try self.annotationIsVisible(&annotation.value)) continue;
-            var appearance = (try self.staticAppearance(&annotation.value, true)) orelse return true;
+            // An invalid appearance prevents trustworthy rendering, but must not
+            // discard otherwise valid native page text during metadata analysis.
+            // Rendering still sees the unsupported-annotation flag and refuses
+            // incomplete painting. Resource/cancellation errors remain fatal.
+            var appearance = (self.staticAppearance(&annotation.value, true) catch |err| switch (err) {
+                error.InvalidPdfAnnotations => return true,
+                else => return err,
+            }) orelse return true;
             appearance.deinit(self.alloc);
         }
         return false;
@@ -7153,7 +6689,7 @@ pub const Reader = struct {
     }
 
     fn fontForTextRun(fonts: []const PageFont, run: TextRun) ?*const PageFont {
-        if (run.render_font) |font| return font;
+        if (run.render_font) |font| return @ptrCast(@alignCast(font));
         const index = run.font_index orelse return null;
         if (index >= fonts.len) return null;
         return &fonts[index];
@@ -18954,9 +18490,10 @@ fn applyShapeOperator(
         const closed = current_path_closed.* or std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*");
         if ((std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*")) and current_subpath_closed.items.len > 0)
             current_subpath_closed.items[current_subpath_closed.items.len - 1] = true;
-        if (current_path.items.len >= 3) {
+        if (current_path.items.len >= 2) {
             const order = paint_order.*;
-            if (try solidShapePaintAvailable(state.fill_color_space.kind)) {
+            // A two-point path has no fill area but still has a valid stroke.
+            if (current_path.items.len >= 3 and try solidShapePaintAvailable(state.fill_color_space.kind)) {
                 try emitPolygonShapeRun(
                     alloc,
                     out,
@@ -20156,34 +19693,9 @@ fn textRunForwardGap(previous: anytype, current: anytype) f64 {
         (current.y - previous_end_y) * (previous.b / axis);
 }
 
-const TextRunBounds = struct {
-    min_x: f64,
-    min_y: f64,
-    max_x: f64,
-    max_y: f64,
+const TextRunBounds = @import("pdf_values").TextRunBounds;
 
-    fn include(self: *TextRunBounds, other: TextRunBounds) void {
-        self.min_x = @min(self.min_x, other.min_x);
-        self.min_y = @min(self.min_y, other.min_y);
-        self.max_x = @max(self.max_x, other.max_x);
-        self.max_y = @max(self.max_y, other.max_y);
-    }
-};
-
-fn textRunBounds(run: anytype) TextRunBounds {
-    const end_x = run.x + run.a * run.advance_width;
-    const end_y = run.y + run.b * run.advance_width;
-    const top_x = run.c * run.ascent;
-    const top_y = run.d * run.ascent;
-    const bottom_x = -run.c * run.descent;
-    const bottom_y = -run.d * run.descent;
-    return .{
-        .min_x = @min(@min(run.x + top_x, run.x + bottom_x), @min(end_x + top_x, end_x + bottom_x)),
-        .min_y = @min(@min(run.y + top_y, run.y + bottom_y), @min(end_y + top_y, end_y + bottom_y)),
-        .max_x = @max(@max(run.x + top_x, run.x + bottom_x), @max(end_x + top_x, end_x + bottom_x)),
-        .max_y = @max(@max(run.y + top_y, run.y + bottom_y), @max(end_y + top_y, end_y + bottom_y)),
-    };
-}
+const textRunBounds = @import("pdf_values").preciseTextRunBounds;
 
 fn textRunIsVertical(run: anytype) bool {
     return if (comptime @hasField(@TypeOf(run), "vertical"))
@@ -23764,6 +23276,8 @@ test "OCR bilevel summaries are prepared lazily and reused by decoded buffer" {
     try std.testing.expectEqual(runs[0].bilevel_fallback, runs[1].bilevel_fallback);
     try std.testing.expect(runs[0].ocr_coverage_minify);
     try std.testing.expect(runs[1].ocr_coverage_minify);
+    try std.testing.expect(!runs[0].ocr_interpolate);
+    try std.testing.expect(!runs[1].ocr_interpolate);
 }
 
 test "OCR preparation reaches retained pattern stencils and tile images" {
@@ -32640,7 +32154,7 @@ test "reader extracts text and shapes through form xobject" {
     try std.testing.expectEqual(@as(u32, 1), render_runs.diagnostics.vector_text_groups);
     try std.testing.expectEqual(@as(u32, 0), render_runs.diagnostics.fallback_text_groups);
     try std.testing.expect(render_runs.shape_runs.len > shape_runs.len);
-    try std.testing.expectEqual(@as(?*const PageFont, null), render_runs.text_runs[0].render_font);
+    try std.testing.expectEqual(@as(?*const anyopaque, null), render_runs.text_runs[0].render_font);
 }
 
 test "reader text analysis ignores raster resources while preserving form positions" {
@@ -39967,4 +39481,61 @@ test "reader color frontiers preserve nested spaces default aliases ICC metadata
     const lookup = try cache.table(&reader, resources.get("ColorSpace").?.*);
     try std.testing.expectEqual(@as(usize, 3), lookup.scans);
     try std.testing.expect(lookup.dependency_requests == null);
+}
+
+test "invalid annotation appearance preserves native text but remains unrendered" {
+    const a = std.testing.allocator;
+    const content = "BT /F1 12 Tf 10 50 Td (Preserve native text) Tj ET\n";
+    const stream = try std.fmt.allocPrint(a, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
+    defer a.free(stream);
+    for ([_][]const u8{ "0 0 0 20", "20 0 0 20" }) |bounds| {
+        const appearance = try std.fmt.allocPrint(a, "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [{s}] /Length 0 >>\nstream\nendstream\nendobj\n", .{bounds});
+        defer a.free(appearance);
+        const bytes = try buildImageDecodeTestPdfAlloc(a, &.{
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R /Annots [6 0 R] >>\nendobj\n",
+            stream,
+            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n",
+            "6 0 obj\n<< /Subtype /Stamp /Rect [0 0 20 20] /AP << /N 7 0 R >> >>\nendobj\n",
+            appearance,
+        });
+        defer a.free(bytes);
+        var parsed = try Reader.init(a, bytes);
+        defer parsed.deinit();
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expect(std.mem.indexOf(u8, analysis.text, "Preserve native text") != null);
+        try std.testing.expect(analysis.has_unrendered_annotations);
+        try std.testing.expectError(error.InvalidPdfAnnotations, parsed.extractPageRenderRunsAlloc(1));
+    }
+}
+
+test "fill stroke operators retain two point rule strokes" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "B", "B*", "b", "b*" }) |op| {
+        const content = try std.fmt.allocPrint(a, "1 0 0 RG\n10 10 m\n90 10 l\n{s}\n", .{op});
+        defer a.free(content);
+        const stream = try std.fmt.allocPrint(a, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
+        defer a.free(stream);
+        const bytes = try buildImageDecodeTestPdfAlloc(a, &.{
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>\nendobj\n",
+            stream,
+        });
+        defer a.free(bytes);
+        var parsed = try Reader.init(a, bytes);
+        defer parsed.deinit();
+        const shapes = try parsed.extractPageShapeRunsAlloc(1);
+        defer {
+            for (shapes) |*shape| shape.deinit(a);
+            a.free(shapes);
+        }
+        try std.testing.expectEqual(@as(usize, 1), shapes.len);
+        try std.testing.expect(shapes[0].kind == .stroke);
+        try std.testing.expectEqual(@as(usize, 2), shapes[0].points.len);
+        try std.testing.expectApproxEqAbs(@as(f64, 10), shapes[0].points[0][0], 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f64, 90), shapes[0].points[1][0], 0.0001);
+    }
 }

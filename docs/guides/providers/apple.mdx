@@ -25,17 +25,42 @@ None. Everything runs on the device.
 
 ## Enable It
 
-macOS server release archives include Vision OCR. For source builds, run this
-from the repository's `zig` directory with Zig 0.17:
+Native macOS CLI and embedded-library builds enable **Vision OCR, speech
+transcription, and Foundation Models generation together by default**. One
+`apple-providers` switch controls all three; there is no separate OCR toggle.
+From the repository's `zig` directory with Zig 0.17:
 
 ```bash
-zig build antfly -Dapple-ocr=true          # OCR only
-zig build antfly -Dapple-providers=true    # OCR, transcription, and generation
+zig build antfly capi                     # All Apple providers, default on macOS
+zig build antfly -Dapple-providers=false  # Disable all three, for example with an older SDK
 ```
 
-The build needs the macOS 27 SDK and the Swift 6 command-line toolchain.
-Transcription and generation live in `lib/libantfly-apple.dylib`, which both the
-`antfly` and `capi` steps install. Keep it in the `lib/` directory beside
+Release build contract 7 includes the committed ARM64 bridge in both macOS server
+and embedded archives. Existing older releases are unchanged. Linux release jobs
+verify its Swift source hash, binary hash, architecture and ABI before packaging.
+CLI and SDK packages retain the adjacent bridge; users need neither Xcode nor Swift.
+Native and cross-compiled ARM64 builds use and verify the committed bridge by default.
+
+`make generate` rebuilds the bridge automatically on Apple Silicon Macs.
+Use `make apple-bridge-generate` to rebuild only the bridge. Other platforms
+keep the committed binary. When changing `zig/lib/apple_native/src/bridge.swift`, rebuild on a Mac with
+Swift 6 and the macOS 27 SDK, then commit both the dylib and its metadata:
+
+```bash
+python3 scripts/packaging/apple_bridge.py build \
+  --directory zig/lib/apple_native/prebuilt/arm64 --architecture arm64
+python3 scripts/packaging/apple_bridge.py verify \
+  --directory zig/lib/apple_native/prebuilt/arm64 --architecture arm64
+```
+
+The metadata records the build's provenance commit and the actual Swift source
+hash. Verification checks source contents rather than requiring the build's commit
+to equal each subsequent release commit. Source edits require a rebuilt bridge;
+unrelated Antfly changes reuse the existing binary. `-Dapple-bridge-path` can
+explicitly select a custom bridge.
+
+Transcription and generation live in `lib/libantfly-apple.dylib`, which the
+`antfly`, `capi`, and independent `libantfly` steps install. Keep it in the `lib/` directory beside
 `libantfly`, or beside the CLI's installation. For a custom Lite layout, set
 `ANTFLY_APPLE_BRIDGE_PATH` to the library's absolute path. The CLI and `libantfly`
 can target older macOS releases:
@@ -193,8 +218,38 @@ refusals return errors rather than truncated output.
   each transcription or generation call reserves 512 MiB. Small process memory
   budgets can reject large documents with `DocumentExtractionWorkingSetTooLarge`.
 
+## Push-to-talk dictation
+
+Named Apple transcribers work with `POST /ai/v1/dictate` on database nodes. Set
+`model` to `transcribers/<name>` and optionally `cleanup_model` to a named generator
+(`cleanup` or `generators/cleanup`). Dictionary spellings, style, context, and
+instructions use the same cleanup prompts as Whisper. Without a cleanup generator,
+or with `style: verbatim`, the raw transcript is returned. Apple rejects
+Whisper-specific recognition hints, VAD tuning, and audio-context options.
+
+With `stream: true`, the raw transcript arrives before cleanup. Provider cleanup
+can emit the entire result as one delta; this does not enable live Apple
+transcription. Model discovery exposes named transcriber dictation capabilities,
+native availability, and installed speech locales without installing assets.
+
+The [`examples/dictation`](https://github.com/antflydb/antfly/tree/main/examples/dictation)
+macOS app demonstrates both engines, global hold/toggle shortcuts, per-app presets,
+a dictionary, local settings caching, Antfly snapshots, and searchable history.
+Apple runs on the Antfly server, so using a user's Mac requires a local Apple-enabled
+Antfly instance.
+
 ## Related
 
 - [Inference providers](/docs/guides/inference-providers): every provider and component
 - [Index PDFs and Scanned Documents](/docs/guides/index-documents): document extraction and OCR options
 - [Apple native provider design](https://github.com/antflydb/antfly/blob/main/docs/design/apple-intelligence-provider.md): bridge loading, validation, and test commands
+
+
+Dictation cleanup requires Apple bridge ABI 2 so completion checks cannot be
+silently skipped by an older sidecar. Apple’s token limit can return partial text
+without an error ([maximumResponseTokens](https://developer.apple.com/documentation/foundationmodels/generationoptions/maximumresponsetokens)).
+For dictation cleanup, the bridge therefore allows natural completion under the
+request deadline and a streaming byte bound of eight times the token budget.
+macOS 27 additionally checks measured output tokens against the budget. Failed
+or incomplete cleanup never replaces the raw transcript. Other generation calls
+retain their configured token cap.

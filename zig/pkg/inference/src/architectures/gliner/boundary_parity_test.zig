@@ -72,21 +72,8 @@ test "gliner boundary Python parity rectangular assignment scipy tie profile" {
     }
 }
 
-pub fn fixtureBytes(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    return readFixtureBytes(allocator, name, 16 * 1024 * 1024);
-}
-
-fn readFixtureBytes(allocator: std.mem.Allocator, name: []const u8, max_bytes: usize) ![]u8 {
-    for ([_][]const u8{ "", "pkg/inference/", "zig/pkg/inference/" }) |prefix| {
-        const path = try std.fmt.allocPrint(allocator, "{s}testdata/gliner25/{s}", .{ prefix, name });
-        defer allocator.free(path);
-        return c_file.readFileMax(allocator, path, max_bytes) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
-        };
-    }
-    return error.FileNotFound;
-}
+pub const fixtureBytes = @import("fixture_bytes.zig").fixtureBytes;
+const readFixtureBytes = @import("fixture_bytes.zig").readFixtureBytes;
 
 pub const TensorFixture = struct {
     allocator: std.mem.Allocator,

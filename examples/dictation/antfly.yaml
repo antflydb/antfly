@@ -1,0 +1,16 @@
+# Merge into your local Antfly configuration; start with `antfly standalone --help`.
+transcribers:
+  apple-speech:
+    provider: apple
+    language_code: en-US
+    timestamps: true
+    download_assets: false
+  whisper:
+    provider: antfly
+    model: openai/whisper-small
+generators:
+  cleanup:
+    provider: apple
+    max_tokens: 1024
+# Apple generation has independent readiness requirements. Replace `cleanup`
+# with any supported local/hosted generator, or choose Verbatim to skip cleanup.

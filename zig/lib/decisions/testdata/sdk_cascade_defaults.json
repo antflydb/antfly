@@ -1,0 +1,38 @@
+{
+  "decision_method": "cascade",
+  "cascade": {
+    "stages": [
+      {
+        "name": "fast",
+        "decider": {
+          "decision_method": "typed",
+          "model": "fast",
+          "max_rows": 10000,
+          "max_input_tokens": 1000000,
+          "batch_size": 32
+        },
+        "on_failure": "fail"
+      },
+      {
+        "name": "strong",
+        "decider": {
+          "decision_method": "typed",
+          "model": "strong",
+          "max_rows": 10000,
+          "max_input_tokens": 1000000,
+          "batch_size": 32
+        },
+        "when": {
+          "probability_between": [
+            0.3,
+            0.9
+          ]
+        },
+        "on_failure": "fail"
+      }
+    ]
+  },
+  "max_rows": 10000,
+  "max_input_tokens": 1000000,
+  "batch_size": 32
+}

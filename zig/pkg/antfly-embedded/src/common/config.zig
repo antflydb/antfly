@@ -209,6 +209,8 @@ pub const Config = struct {
         protected_bytes: usize = 256 * 1024 * 1024,
     };
     pub const LakeIndexConfig = struct {
+        /// Opt in after upgrading all writers; ownership is durably fenced.
+        serving_cuts: struct { enabled: bool = false } = .{},
         /// Optional verified identity construction owns an independent scratch
         /// quota. Exhaustion selects physical rebuilding, never unavailability.
         row_identity: struct { max_spill_bytes: u64 = 1024 * 1024 * 1024 } = .{},

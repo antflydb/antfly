@@ -28,6 +28,7 @@ def test_separate_object_tables_and_scoped_cloud_keys():
     tables = native_plan("antfly-showcases", archive, current)
     for name in ("archive-table.json", "current-table.json"):
         assert tables[name]["storage"] == {"engine": "object"}
+        assert tables[name]["schema"]["base_source"]["object_mutability"] == "immutable"
         assert "num_shards" not in tables[name]
         assert tables[name]["indexes"]["body_text"] == {
             "type": "full_text",
@@ -125,3 +126,28 @@ def test_sample_archive_isolated_from_future_full_export():
     ):
         with pytest.raises(ValueError, match="Archive prefix"):
             native_plan("antfly-showcases", archive, current, prefix)
+
+
+def test_owned_serving_requires_sealed_history_and_keeps_current_managed_iceberg():
+    archive, current = str(uuid4()), str(uuid4())
+    with pytest.raises(ValueError, match="sealed"):
+        native_plan("antfly-showcases", archive, current, owned_serving=True)
+    plan = native_plan(
+        "antfly-showcases",
+        archive,
+        current,
+        "archive/_snapshots/example/archive.parquet-manifest.json",
+        owned_serving=True,
+    )
+    assert plan["archive-table.json"]["schema"]["base_source"]["uri"].endswith(
+        ".parquet-manifest.json"
+    )
+    assert plan["current-table.json"]["schema"]["base_source"]["catalog"] == {
+        "type": "managed"
+    }
+    assert plan["native-serving-config.json"] == {
+        "lake_indexes": {"serving_cuts": {"enabled": True}}
+    }
+    assert "native-serving-config.json" not in native_plan(
+        "antfly-showcases", archive, current
+    )

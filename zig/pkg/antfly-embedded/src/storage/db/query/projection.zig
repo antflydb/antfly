@@ -57,6 +57,8 @@ pub const SpecialFieldLoader = struct {
 pub fn buildLookupFieldSelectionPlan(opts: types.LookupOptions) FieldSelectionPlan {
     var plan = buildFieldSelectionPlan(opts.fields, opts.include_all_fields);
     plan.projection.output_exact = opts.output_exact;
+    plan.projection.cypher_presence_fields = opts.cypher_presence_fields;
+    plan.projection.cypher_projection_json = opts.cypher_projection_json;
     return plan;
 }
 

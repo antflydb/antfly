@@ -37,6 +37,8 @@ pub const SessionPool = session_pool.SessionPool;
 pub const imported_onnx_session = @import("imported_onnx_session.zig");
 pub const metal_kv_storage = if (build_options.enable_metal) @import("metal_kv_storage.zig") else struct {};
 
+pub const ModelSource = @import("../models/model_source.zig").ModelSource;
+
 const session_factory = @import("../architectures/session_factory.zig");
 
 pub const BackendType = enum {
@@ -336,13 +338,26 @@ pub const SessionManager = struct {
         return scoped.loadModel(model_path);
     }
 
+    pub fn loadModelSourceWithControl(self: *SessionManager, source: ModelSource, shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext, control: ?execution_control.InferenceExecutionControl) !Session {
+        var scoped = self.*;
+        scoped.model_load_control = control;
+        return scoped.loadModelSource(source, shared_backend_ctx);
+    }
+
     pub fn loadModelWithImportedOnnxContext(
         self: *SessionManager,
         model_path: []const u8,
         shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
     ) !Session {
-        var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
-        defer if (manifest) |*m| m.deinit();
+        return self.loadModelSource(ModelSource.fromPath(model_path), shared_backend_ctx);
+    }
+
+    pub fn loadModelSource(self: *SessionManager, source: ModelSource, shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext) !Session {
+        const model_path = source.path;
+        var manifest: ?manifest_mod.ModelManifest = if (source.manifest) |provided| provided.* else manifest_mod.loadFromDir(self.allocator, model_path) catch null;
+        defer if (source.manifest == null) {
+            if (manifest) |*m| m.deinit();
+        };
         const memorilla_profile = if (manifest) |m| m.memorilla_profile else null;
         if (memorilla_profile != null and (self.gliner_cuda_precision != null or self.a4b_inference_request != null or self.graph_runtime_strategy != null))
             return error.IncompatibleCudaLoadPolicies;
@@ -408,7 +423,7 @@ pub const SessionManager = struct {
             // directly, so this check does not depend on manifest fallback.
             if (self.a4b_inference_request != null and
                 backend == .metal and
-                self.shouldUseImportedOnnxGraphRuntime(model_path))
+                source.kind == .onnx)
             {
                 return error.A4bUnsupportedArtifact;
             }
@@ -432,32 +447,29 @@ pub const SessionManager = struct {
                 first_err = first_err orelse error.ProcessIsolationRequired;
                 continue;
             }
-            const effective_model_path = switch (backend) {
-                .wasm => if (manifest) |m| m.onnx_path orelse model_path else model_path,
-                else => model_path,
-            };
+            const effective_model_path = if (backend == .wasm and source.kind == .directory)
+                (if (manifest) |m| m.onnx_path orelse model_path else model_path)
+            else
+                model_path;
+            const imported_onnx = source.kind == .onnx or (backend == .wasm and source.kind == .directory and manifest != null and manifest.?.onnx_path != null);
+            const external_base = source.external_base_dir orelse if (manifest) |m| if (m.onnx_logical_path) |path| std.fs.path.dirname(path) else null else null;
+            const logical_path = if (backend == .wasm and source.kind == .directory and manifest != null) manifest.?.onnx_logical_path orelse effective_model_path else source.logical_path orelse effective_model_path;
             if (self.kernel_jit.qualified_profile_path != null and
-                !backendAcceptsQualifiedProfile(backend, effective_model_path)) continue;
+                (backend != .metal or imported_onnx)) continue;
             const jit_capable_session = backend.supportsKernelJitSession() and
-                !isOnnxFilePath(effective_model_path);
+                !imported_onnx;
             if (self.kernel_jit.mode.failClosed() and !jit_capable_session) continue;
             std.log.info("trying backend {s} for {s}", .{ @tagName(backend), model_path });
 
             const session = switch (backend) {
-                .metal => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx) catch |err| {
+                .metal => if (imported_onnx)
+                    self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
                         std.log.err("imported onnx metal session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
                     }
                 else if (build_options.enable_metal)
-                    session_factory.createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
-                        self.allocator,
-                        model_path,
-                        self.kernel_jit,
-                        self.kernel_jit_load_context,
-                        self.a4b_inference_request,
-                    ) catch |err| {
+                    self.createDirectSession(source, .metal) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (self.kernel_jit.qualified_profile_path != null or self.kernel_jit.profile_capture_only) return err;
                         if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
@@ -466,28 +478,17 @@ pub const SessionManager = struct {
                     }
                 else
                     continue,
-                .cuda => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .cuda, shared_backend_ctx) catch |err| {
+                .cuda => if (imported_onnx)
+                    self.createImportedOnnxSession(effective_model_path, .cuda, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
                         std.log.err("imported onnx CUDA session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
                     }
                 else if (build_options.enable_cuda)
                     (if (memorilla_profile != null)
-                        session_factory.createCudaSessionWithManagedMemorillaProfile(self.allocator, model_path, self.kernel_jit, self.kernel_jit_load_context, self.model_load_control)
-                    else if (self.gliner_cuda_precision) |precision|
-                        (if (if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false)
-                            session_factory.createCudaSessionWithGlinerPrecisionForTest(self.allocator, model_path, self.kernel_jit, self.kernel_jit_load_context, precision)
-                        else
-                            session_factory.createCudaSessionWithGlinerPrecision(self.allocator, model_path, self.kernel_jit, self.kernel_jit_load_context, precision))
+                        session_factory.createCudaSessionWithManagedMemorillaProfile(self.allocator, model_path, self.kernel_jit, self.kernel_jit_load_context, self.model_load_control, if (manifest) |*m| m else null)
                     else
-                        session_factory.createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(
-                            self.allocator,
-                            model_path,
-                            self.kernel_jit,
-                            self.kernel_jit_load_context,
-                            self.a4b_inference_request,
-                        )) catch |err| {
+                        self.createDirectSession(source, .cuda)) catch |err| {
                         std.log.err("CUDA session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
                         first_err = first_err orelse err;
@@ -495,20 +496,20 @@ pub const SessionManager = struct {
                     }
                 else
                     continue,
-                .native => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
+                .native => if (imported_onnx)
+                    self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
                         std.log.err("imported onnx native session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
                     }
                 else
-                    session_factory.createNativeSession(self.allocator, model_path) catch |err| {
+                    self.createDirectSession(source, .native) catch |err| {
                         std.log.err("native session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
                     },
-                .wasm => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .wasm, shared_backend_ctx) catch |err| {
+                .wasm => if (imported_onnx)
+                    self.createImportedOnnxSession(effective_model_path, .wasm, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
                         std.log.err("imported onnx wasm session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
@@ -580,13 +581,35 @@ pub const SessionManager = struct {
         return required == backend;
     }
 
+    fn createDirectSession(self: *SessionManager, source: ModelSource, backend: BackendType) !Session {
+        if (source.manifest) |manifest| return session_factory.createSessionFromManifest(self.allocator, source.path, manifest, backend, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request, self.gliner_cuda_precision, if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false);
+        return switch (backend) {
+            .native => session_factory.createNativeSession(self.allocator, source.path),
+            .metal => session_factory.createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(self.allocator, source.path, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request),
+            .cuda => if (self.gliner_cuda_precision) |precision|
+                if (if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false)
+                    session_factory.createCudaSessionWithGlinerPrecisionForTest(self.allocator, source.path, self.kernel_jit, self.kernel_jit_load_context, precision)
+                else
+                    session_factory.createCudaSessionWithGlinerPrecision(self.allocator, source.path, self.kernel_jit, self.kernel_jit_load_context, precision)
+            else
+                session_factory.createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(self.allocator, source.path, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request),
+            else => error.UnsupportedBackend,
+        };
+    }
+
     fn createImportedOnnxSession(
         self: *SessionManager,
         model_path: []const u8,
         backend: BackendType,
         shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
+        external_base_dir: ?[]const u8,
+        logical_path: []const u8,
+        external_reader: ?@import("onnx_graph").tensor.ExternalDataReader,
     ) !Session {
         return imported_onnx_session.createSessionWithOptions(self.allocator, model_path, backend, .{
+            .external_base_dir = external_base_dir,
+            .external_reader = external_reader,
+            .logical_path = logical_path,
             .graph_runtime_strategy = self.graph_runtime_strategy,
             .shared_backend_ctx = shared_backend_ctx,
             .io = self.io,
@@ -885,6 +908,23 @@ test "automatic execution order checks cancellation before probing a device" {
     const before = cuda_probe.load(.acquire);
     try std.testing.expectError(error.Cancelled, manager.executionBackendOrder(&scratch, preferred, control));
     try std.testing.expectEqual(before, cuda_probe.load(.acquire));
+}
+
+test "Memorilla borrowed model source preserves scoped cancellation before device probing" {
+    const Cancelled = struct {
+        fn cancelled(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    var manager = SessionManager.init(std.testing.allocator);
+    var manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .memorilla_profile = .qwen3_encoder_f32_v1 };
+    const source = ModelSource{ .path = "/nonexistent-memorilla-model", .kind = .directory, .manifest = &manifest };
+    const control: execution_control.InferenceExecutionControl = .{ .cancellation = .{ .is_cancelled_fn = Cancelled.cancelled } };
+    const before = cuda_probe.load(.acquire);
+    try std.testing.expectError(error.Cancelled, manager.loadModelSourceWithControl(source, null, control));
+    try std.testing.expectEqual(before, cuda_probe.load(.acquire));
+    try std.testing.expect(manager.model_load_control == null);
+    try std.testing.expectEqual(@as(?@import("../models/memorilla_qualification.zig").Profile, .qwen3_encoder_f32_v1), manifest.memorilla_profile);
 }
 
 test "auto backend order prefers Metal then native without compiled CUDA" {

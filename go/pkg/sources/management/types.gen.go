@@ -48,6 +48,108 @@ func (e ErrorVersion) Valid() bool {
 	}
 }
 
+// Defines values for ProcessingJobRequestAction.
+const (
+	Advance ProcessingJobRequestAction = "advance"
+	Cancel  ProcessingJobRequestAction = "cancel"
+	Start   ProcessingJobRequestAction = "start"
+	Status  ProcessingJobRequestAction = "status"
+)
+
+// Valid indicates whether the value is a known member of the ProcessingJobRequestAction enum.
+func (e ProcessingJobRequestAction) Valid() bool {
+	switch e {
+	case Advance:
+		return true
+	case Cancel:
+		return true
+	case Start:
+		return true
+	case Status:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ProcessingPresetKind.
+const (
+	Caption       ProcessingPresetKind = "caption"
+	Content       ProcessingPresetKind = "content"
+	Extract       ProcessingPresetKind = "extract"
+	Summary       ProcessingPresetKind = "summary"
+	Transcription ProcessingPresetKind = "transcription"
+)
+
+// Valid indicates whether the value is a known member of the ProcessingPresetKind enum.
+func (e ProcessingPresetKind) Valid() bool {
+	switch e {
+	case Caption:
+		return true
+	case Content:
+		return true
+	case Extract:
+		return true
+	case Summary:
+		return true
+	case Transcription:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ProcessingPresetMetric.
+const (
+	ProcessingPresetMetricCosine       ProcessingPresetMetric = "cosine"
+	ProcessingPresetMetricInnerProduct ProcessingPresetMetric = "inner_product"
+	ProcessingPresetMetricL2Squared    ProcessingPresetMetric = "l2_squared"
+)
+
+// Valid indicates whether the value is a known member of the ProcessingPresetMetric enum.
+func (e ProcessingPresetMetric) Valid() bool {
+	switch e {
+	case ProcessingPresetMetricCosine:
+		return true
+	case ProcessingPresetMetricInnerProduct:
+		return true
+	case ProcessingPresetMetricL2Squared:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RepresentationStatusState.
+const (
+	RepresentationStatusStateBuilding    RepresentationStatusState = "building"
+	RepresentationStatusStateDisabled    RepresentationStatusState = "disabled"
+	RepresentationStatusStateFailed      RepresentationStatusState = "failed"
+	RepresentationStatusStatePartial     RepresentationStatusState = "partial"
+	RepresentationStatusStateReady       RepresentationStatusState = "ready"
+	RepresentationStatusStateUnsupported RepresentationStatusState = "unsupported"
+)
+
+// Valid indicates whether the value is a known member of the RepresentationStatusState enum.
+func (e RepresentationStatusState) Valid() bool {
+	switch e {
+	case RepresentationStatusStateBuilding:
+		return true
+	case RepresentationStatusStateDisabled:
+		return true
+	case RepresentationStatusStateFailed:
+		return true
+	case RepresentationStatusStatePartial:
+		return true
+	case RepresentationStatusStateReady:
+		return true
+	case RepresentationStatusStateUnsupported:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for RunOperation.
 const (
 	RunOperationPurge RunOperation = "purge"
@@ -138,35 +240,35 @@ func (e RunInputOperation) Valid() bool {
 	}
 }
 
-// Defines values for SourcePublication.
+// Defines values for SearchStatusConsistency.
 const (
-	Media  SourcePublication = "media"
-	Native SourcePublication = "native"
-	Text   SourcePublication = "text"
+	SearchStatusConsistencyLiveRead         SearchStatusConsistency = "live_read"
+	SearchStatusConsistencyRetainedSnapshot SearchStatusConsistency = "retained_snapshot"
+	SearchStatusConsistencyUnknown          SearchStatusConsistency = "unknown"
 )
 
-// Valid indicates whether the value is a known member of the SourcePublication enum.
-func (e SourcePublication) Valid() bool {
+// Valid indicates whether the value is a known member of the SearchStatusConsistency enum.
+func (e SearchStatusConsistency) Valid() bool {
 	switch e {
-	case Media:
+	case SearchStatusConsistencyLiveRead:
 		return true
-	case Native:
+	case SearchStatusConsistencyRetainedSnapshot:
 		return true
-	case Text:
+	case SearchStatusConsistencyUnknown:
 		return true
 	default:
 		return false
 	}
 }
 
-// Defines values for TextStreamBoundary.
+// Defines values for SearchStreamBoundary.
 const (
-	Record TextStreamBoundary = "record"
-	Unit   TextStreamBoundary = "unit"
+	Record SearchStreamBoundary = "record"
+	Unit   SearchStreamBoundary = "unit"
 )
 
-// Valid indicates whether the value is a known member of the TextStreamBoundary enum.
-func (e TextStreamBoundary) Valid() bool {
+// Valid indicates whether the value is a known member of the SearchStreamBoundary enum.
+func (e SearchStreamBoundary) Valid() bool {
 	switch e {
 	case Record:
 		return true
@@ -177,17 +279,140 @@ func (e TextStreamBoundary) Valid() bool {
 	}
 }
 
+// Defines values for SemanticRetrievalQueryInputs.
+const (
+	SemanticRetrievalQueryInputsText   SemanticRetrievalQueryInputs = "text"
+	SemanticRetrievalQueryInputsVector SemanticRetrievalQueryInputs = "vector"
+)
+
+// Valid indicates whether the value is a known member of the SemanticRetrievalQueryInputs enum.
+func (e SemanticRetrievalQueryInputs) Valid() bool {
+	switch e {
+	case SemanticRetrievalQueryInputsText:
+		return true
+	case SemanticRetrievalQueryInputsVector:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for SourcePublication.
+const (
+	SourcePublicationMedia  SourcePublication = "media"
+	SourcePublicationNative SourcePublication = "native"
+	SourcePublicationText   SourcePublication = "text"
+)
+
+// Valid indicates whether the value is a known member of the SourcePublication enum.
+func (e SourcePublication) Valid() bool {
+	switch e {
+	case SourcePublicationMedia:
+		return true
+	case SourcePublicationNative:
+		return true
+	case SourcePublicationText:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for VectorSpaceDocumentModality.
+const (
+	VectorSpaceDocumentModalityAudio      VectorSpaceDocumentModality = "audio"
+	VectorSpaceDocumentModalityImage      VectorSpaceDocumentModality = "image"
+	VectorSpaceDocumentModalityMultimodal VectorSpaceDocumentModality = "multimodal"
+	VectorSpaceDocumentModalityText       VectorSpaceDocumentModality = "text"
+)
+
+// Valid indicates whether the value is a known member of the VectorSpaceDocumentModality enum.
+func (e VectorSpaceDocumentModality) Valid() bool {
+	switch e {
+	case VectorSpaceDocumentModalityAudio:
+		return true
+	case VectorSpaceDocumentModalityImage:
+		return true
+	case VectorSpaceDocumentModalityMultimodal:
+		return true
+	case VectorSpaceDocumentModalityText:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for VectorSpaceMetric.
+const (
+	VectorSpaceMetricCosine       VectorSpaceMetric = "cosine"
+	VectorSpaceMetricInnerProduct VectorSpaceMetric = "inner_product"
+	VectorSpaceMetricL2Squared    VectorSpaceMetric = "l2_squared"
+)
+
+// Valid indicates whether the value is a known member of the VectorSpaceMetric enum.
+func (e VectorSpaceMetric) Valid() bool {
+	switch e {
+	case VectorSpaceMetricCosine:
+		return true
+	case VectorSpaceMetricInnerProduct:
+		return true
+	case VectorSpaceMetricL2Squared:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for VectorSpaceQueryModality.
+const (
+	VectorSpaceQueryModalityAudio      VectorSpaceQueryModality = "audio"
+	VectorSpaceQueryModalityImage      VectorSpaceQueryModality = "image"
+	VectorSpaceQueryModalityMultimodal VectorSpaceQueryModality = "multimodal"
+	VectorSpaceQueryModalityText       VectorSpaceQueryModality = "text"
+)
+
+// Valid indicates whether the value is a known member of the VectorSpaceQueryModality enum.
+func (e VectorSpaceQueryModality) Valid() bool {
+	switch e {
+	case VectorSpaceQueryModalityAudio:
+		return true
+	case VectorSpaceQueryModalityImage:
+		return true
+	case VectorSpaceQueryModalityMultimodal:
+		return true
+	case VectorSpaceQueryModalityText:
+		return true
+	default:
+		return false
+	}
+}
+
+// ArtifactBinding defines model for ArtifactBinding.
+type ArtifactBinding struct {
+	Artifact      string `json:"artifact"`
+	ContentType   string `json:"content_type"`
+	Generated     bool   `json:"generated,omitempty,omitzero"`
+	LocationField string `json:"location_field,omitempty,omitzero"`
+	Name          string `json:"name"`
+	Purpose       string `json:"purpose,omitempty,omitzero"`
+	SchemaUri     string `json:"schema_uri,omitempty,omitzero"`
+}
+
 // Capabilities defines model for Capabilities.
 type Capabilities struct {
-	CancelRuns       bool                `json:"cancel_runs"`
-	ConfigurationUrl string              `json:"configuration_url,omitempty,omitzero"`
-	ConfigureSources bool                `json:"configure_sources,omitempty,omitzero"`
-	MediaProxy       bool                `json:"media_proxy,omitempty,omitzero"`
-	PerSourceRuns    bool                `json:"per_source_runs"`
-	PurgeSources     bool                `json:"purge_sources,omitempty,omitzero"`
-	Runtime          string              `json:"runtime"`
-	SerializedRuns   bool                `json:"serialized_runs,omitempty,omitzero"`
-	Version          CapabilitiesVersion `json:"version"`
+	ArtifactDiscovery bool                `json:"artifact_discovery,omitempty,omitzero"`
+	CancelRuns        bool                `json:"cancel_runs"`
+	ConfigurationUrl  string              `json:"configuration_url,omitempty,omitzero"`
+	ConfigureSources  bool                `json:"configure_sources,omitempty,omitzero"`
+	MediaProxy        bool                `json:"media_proxy,omitempty,omitzero"`
+	PerSourceRuns     bool                `json:"per_source_runs"`
+	ProcessingJobs    bool                `json:"processing_jobs,omitempty,omitzero"`
+	ProcessingPresets bool                `json:"processing_presets,omitempty,omitzero"`
+	PurgeSources      bool                `json:"purge_sources,omitempty,omitzero"`
+	Runtime           string              `json:"runtime"`
+	SearchVersions    []int               `json:"search_versions,omitempty,omitzero"`
+	SerializedRuns    bool                `json:"serialized_runs,omitempty,omitzero"`
+	Version           CapabilitiesVersion `json:"version"`
 }
 
 // CapabilitiesVersion defines model for Capabilities.Version.
@@ -202,16 +427,90 @@ type Error struct {
 // ErrorVersion defines model for Error.Version.
 type ErrorVersion int
 
+// ExactRetrieval defines model for ExactRetrieval.
+type ExactRetrieval struct {
+	Default bool `json:"default,omitempty,omitzero"`
+}
+
+// FullTextRetrieval defines model for FullTextRetrieval.
+type FullTextRetrieval struct {
+	Default bool   `json:"default,omitempty,omitzero"`
+	Index   string `json:"index"`
+}
+
 // Mutation defines model for Mutation.
 type Mutation struct {
 	SourceId string `json:"source_id"`
 	State    string `json:"state"`
 }
 
+// NativeIndexDeclaration defines model for NativeIndexDeclaration.
+type NativeIndexDeclaration struct {
+	// Config An ordinary Antfly IndexConfig, including native enrichments. Validated by Antfly; no source-specific producer language.
+	Config map[string]interface{} `json:"config"`
+	Name   string                 `json:"name"`
+}
+
 // Permissions defines model for Permissions.
 type Permissions struct {
 	Public  bool     `json:"public"`
 	Readers []string `json:"readers"`
+}
+
+// ProcessingDeclaration defines model for ProcessingDeclaration.
+type ProcessingDeclaration struct {
+	Indexes []NativeIndexDeclaration `json:"indexes,omitempty,omitzero"`
+}
+
+// ProcessingJobRequest defines model for ProcessingJobRequest.
+type ProcessingJobRequest struct {
+	Action   ProcessingJobRequestAction `json:"action"`
+	Artifact string                     `json:"artifact"`
+	JobId    string                     `json:"job_id,omitempty,omitzero"`
+	Limit    int                        `json:"limit,omitempty,omitzero"`
+}
+
+// ProcessingJobRequestAction defines model for ProcessingJobRequest.Action.
+type ProcessingJobRequestAction string
+
+// ProcessingPreset defines model for ProcessingPreset.
+type ProcessingPreset struct {
+	Dimension      int                    `json:"dimension,omitempty,omitzero"`
+	Embedder       map[string]interface{} `json:"embedder,omitempty,omitzero"`
+	Kind           ProcessingPresetKind   `json:"kind"`
+	Metric         ProcessingPresetMetric `json:"metric,omitempty,omitzero"`
+	Name           string                 `json:"name"`
+	ProducerConfig map[string]interface{} `json:"producer_config,omitempty,omitzero"`
+}
+
+// ProcessingPresetKind defines model for ProcessingPreset.Kind.
+type ProcessingPresetKind string
+
+// ProcessingPresetMetric defines model for ProcessingPreset.Metric.
+type ProcessingPresetMetric string
+
+// ProcessingPreview defines model for ProcessingPreview.
+type ProcessingPreview struct {
+	Artifact   ArtifactBinding       `json:"artifact"`
+	Processing ProcessingDeclaration `json:"processing"`
+	Stream     SearchStream          `json:"stream"`
+}
+
+// RepresentationStatus defines model for RepresentationStatus.
+type RepresentationStatus struct {
+	Name   string                    `json:"name"`
+	Reason string                    `json:"reason,omitempty,omitzero"`
+	State  RepresentationStatusState `json:"state"`
+}
+
+// RepresentationStatusState defines model for RepresentationStatus.State.
+type RepresentationStatusState string
+
+// RetrievalBindings defines model for RetrievalBindings.
+type RetrievalBindings struct {
+	Exact    *ExactRetrieval    `json:"exact,omitempty"`
+	FullText *FullTextRetrieval `json:"full_text,omitempty"`
+	Semantic *SemanticRetrieval `json:"semantic,omitempty"`
 }
 
 // Run defines model for Run.
@@ -251,28 +550,94 @@ type RunPage struct {
 	NextCursor string `json:"next_cursor,omitempty,omitzero"`
 }
 
+// SearchStatus defines model for SearchStatus.
+type SearchStatus struct {
+	Artifacts   []RepresentationStatus  `json:"artifacts"`
+	Consistency SearchStatusConsistency `json:"consistency"`
+	ObservedAt  int                     `json:"observed_at"`
+	Streams     []RepresentationStatus  `json:"streams"`
+	Version     int                     `json:"version"`
+}
+
+// SearchStatusConsistency defines model for SearchStatus.Consistency.
+type SearchStatusConsistency string
+
+// SearchStream defines model for SearchStream.
+type SearchStream struct {
+	Artifact string               `json:"artifact,omitempty,omitzero"`
+	Boundary SearchStreamBoundary `json:"boundary,omitempty,omitzero"`
+
+	// Default Legacy default for exact matching; version 2 uses defaults on each retrieval mode.
+	Default   bool   `json:"default,omitempty,omitzero"`
+	Field     string `json:"field,omitempty,omitzero"`
+	Generated bool   `json:"generated,omitempty,omitzero"`
+
+	// Index Legacy full-text binding; incompatible with retrieval. Use search_version=2 and retrieval for new configurations.
+	Index         string             `json:"index,omitempty,omitzero"`
+	LocationField string             `json:"location_field,omitempty,omitzero"`
+	Name          string             `json:"name"`
+	Purpose       string             `json:"purpose,omitempty,omitzero"`
+	ResourceField string             `json:"resource_field,omitempty,omitzero"`
+	Retrieval     *RetrievalBindings `json:"retrieval,omitempty"`
+}
+
+// SearchStreamBoundary defines model for SearchStream.Boundary.
+type SearchStreamBoundary string
+
+// SemanticRetrieval defines model for SemanticRetrieval.
+type SemanticRetrieval struct {
+	Default         bool     `json:"default,omitempty,omitzero"`
+	External        bool     `json:"external,omitempty,omitzero"`
+	Index           string   `json:"index"`
+	MemberArtifacts []string `json:"member_artifacts,omitempty,omitzero"`
+
+	// MemberField Projection returned from semantic members. Chunk-backed embeddings use text even when their ancestor representation is scalar ($). Managed textual streams must declare this field.
+	MemberField string                         `json:"member_field,omitempty,omitzero"`
+	QueryInputs []SemanticRetrievalQueryInputs `json:"query_inputs"`
+	VectorSpace VectorSpace                    `json:"vector_space"`
+}
+
+// SemanticRetrievalQueryInputs defines model for SemanticRetrieval.QueryInputs.
+type SemanticRetrievalQueryInputs string
+
 // Source defines model for Source.
 type Source struct {
+	Artifacts            []ArtifactBinding      `json:"artifacts,omitempty,omitzero"`
 	Config               map[string]interface{} `json:"config"`
 	Connection           string                 `json:"connection"`
 	Id                   string                 `json:"id"`
+	Identity             SourceIdentity         `json:"identity,omitempty,omitzero"`
 	Name                 string                 `json:"name"`
 	PermissionTtlSeconds int                    `json:"permission_ttl_seconds,omitempty,omitzero"`
 	Permissions          Permissions            `json:"permissions"`
+	Processing           *ProcessingDeclaration `json:"processing,omitempty"`
 
 	// Publication Native acquisition is the default: text stays inline and binary originals are revision-pinned for native artifact producers.
 	Publication SourcePublication `json:"publication"`
+
+	// Rekeys Set only on a PUT response. True when the call makes the next sync re-key this source's existing rows. A new source, or one that already has a namespace, never re-keys.
+	Rekeys       bool          `json:"rekeys,omitempty,omitzero"`
+	SearchStatus *SearchStatus `json:"search_status,omitempty"`
+
+	// SearchVersion Omitted/1 uses legacy text bindings. Version 2 enables SearchStream retrieval and artifact declarations.
+	SearchVersion int `json:"search_version,omitempty,omitzero"`
 
 	// State Runtime lifecycle state. PUT configures a source; retirement and purge use explicit operations.
 	State string `json:"state"`
 
 	// Streams Searchable source-text and native artifact bindings; credentials and producer execution remain separate.
-	Streams []TextStream `json:"streams,omitempty,omitzero"`
-	Table   string       `json:"table"`
+	Streams []SearchStream `json:"streams,omitempty,omitzero"`
+	Table   string         `json:"table"`
 }
 
 // SourcePublication Native acquisition is the default: text stays inline and binary originals are revision-pinned for native artifact producers.
 type SourcePublication string
+
+// SourceIdentity defines model for SourceIdentity.
+type SourceIdentity struct {
+	// Namespace Opaque prefix that scopes this source's row keys, independent of its connection or config. Assigned automatically at creation and immutable once set.
+	Namespace string `json:"namespace,omitempty,omitzero"`
+}
 
 // SourcePage defines model for SourcePage.
 type SourcePage struct {
@@ -281,20 +646,29 @@ type SourcePage struct {
 }
 
 // TextStream defines model for TextStream.
-type TextStream struct {
-	Artifact      string             `json:"artifact,omitempty,omitzero"`
-	Boundary      TextStreamBoundary `json:"boundary,omitempty,omitzero"`
-	Default       bool               `json:"default"`
-	Field         string             `json:"field"`
-	Generated     bool               `json:"generated,omitempty,omitzero"`
-	Index         string             `json:"index,omitempty,omitzero"`
-	LocationField string             `json:"location_field,omitempty,omitzero"`
-	Name          string             `json:"name"`
-	Purpose       string             `json:"purpose,omitempty,omitzero"`
+type TextStream = SearchStream
+
+// VectorSpace defines model for VectorSpace.
+type VectorSpace struct {
+	Dimension             int                         `json:"dimension"`
+	DocumentModality      VectorSpaceDocumentModality `json:"document_modality"`
+	DocumentPreprocessing string                      `json:"document_preprocessing"`
+	Id                    string                      `json:"id"`
+	Metric                VectorSpaceMetric           `json:"metric"`
+	Model                 string                      `json:"model"`
+	QueryModality         VectorSpaceQueryModality    `json:"query_modality"`
+	QueryPreprocessing    string                      `json:"query_preprocessing"`
+	Revision              string                      `json:"revision"`
 }
 
-// TextStreamBoundary defines model for TextStream.Boundary.
-type TextStreamBoundary string
+// VectorSpaceDocumentModality defines model for VectorSpace.DocumentModality.
+type VectorSpaceDocumentModality string
+
+// VectorSpaceMetric defines model for VectorSpace.Metric.
+type VectorSpaceMetric string
+
+// VectorSpaceQueryModality defines model for VectorSpace.QueryModality.
+type VectorSpaceQueryModality string
 
 // ListSourcesParams defines parameters for ListSources.
 type ListSourcesParams struct {
@@ -320,6 +694,12 @@ type StartSourceRunParams struct {
 
 // PutSourceJSONRequestBody defines body for PutSource for application/json ContentType.
 type PutSourceJSONRequestBody = Source
+
+// OperateProcessingJobJSONRequestBody defines body for OperateProcessingJob for application/json ContentType.
+type OperateProcessingJobJSONRequestBody = ProcessingJobRequest
+
+// PreviewProcessingJSONRequestBody defines body for PreviewProcessing for application/json ContentType.
+type PreviewProcessingJSONRequestBody = ProcessingPreset
 
 // StartSourceRunJSONRequestBody defines body for StartSourceRun for application/json ContentType.
 type StartSourceRunJSONRequestBody = RunInput
