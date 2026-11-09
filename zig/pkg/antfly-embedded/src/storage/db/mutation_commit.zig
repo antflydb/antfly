@@ -693,6 +693,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                         effect.timestamp_value = try encodeTimestampValue(effects_alloc, write_timestamp_ns);
                                     }
                                 }
+                                try S.ownerField(self, "core").*.index_manager.validateExternalVectorSpacesParsed(row.extracted.dense_embeddings, row.parsedValue());
                                 for (row.extracted.dense_embeddings) |*embedding| {
                                     if (embedding.artifact_key != null) continue;
                                     embedding.artifact_key = try appendEmbeddingArtifactWrite(
@@ -1700,6 +1701,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     write_buffers.prepared_embedding_artifact_count = write_buffers.explicit_embedding_artifact_writes.items.len;
                     effects.embedding_writes.clearRetainingCapacity();
                 } else {
+                    if (prepared_relational) |*prepared|
+                        try S.ownerField(self, "core").*.index_manager.validateExternalVectorSpacesParsed(extracted[i].dense_embeddings, prepared.parsedValue())
+                    else
+                        try S.ownerField(self, "core").*.index_manager.validateExternalVectorSpaces(S.ownerField(self, "alloc").*, extracted[i].dense_embeddings, write.value);
                     for (extracted[i].dense_embeddings) |*embedding| {
                         if (embedding.artifact_key != null) continue;
                         embedding.artifact_key = try appendEmbeddingArtifactWrite(

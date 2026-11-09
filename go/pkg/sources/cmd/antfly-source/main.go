@@ -38,6 +38,12 @@ func main() {
 	}
 }
 func run() error {
+	if len(os.Args) >= 2 && os.Args[1] == "search" {
+		return searchCommand(os.Args[2:])
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "processing" {
+		return processingCommand(os.Args[2:])
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "serve" {
 		return serve(os.Args[2:])
 	}

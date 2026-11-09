@@ -635,6 +635,9 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				existing := next.Sources[index]
+				if source.Processing == nil {
+					source.Processing = existing.Processing
+				}
 				switch {
 				case source.Identity.Namespace == "":
 					// Omitting identity on an update leaves it exactly as it

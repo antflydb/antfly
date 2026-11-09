@@ -6016,7 +6016,14 @@ pub const Reader = struct {
             var annotation = try self.annotationValue(raw);
             defer annotation.deinit(self.alloc);
             if (!try self.annotationIsVisible(&annotation.value)) continue;
-            var appearance = (try self.staticAppearance(&annotation.value, true)) orelse return true;
+            // An invalid appearance prevents trustworthy rendering, but must not
+            // discard otherwise valid native page text during metadata analysis.
+            // Rendering still sees the unsupported-annotation flag and refuses
+            // incomplete painting. Resource/cancellation errors remain fatal.
+            var appearance = (self.staticAppearance(&annotation.value, true) catch |err| switch (err) {
+                error.InvalidPdfAnnotations => return true,
+                else => return err,
+            }) orelse return true;
             appearance.deinit(self.alloc);
         }
         return false;
@@ -18483,9 +18490,10 @@ fn applyShapeOperator(
         const closed = current_path_closed.* or std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*");
         if ((std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*")) and current_subpath_closed.items.len > 0)
             current_subpath_closed.items[current_subpath_closed.items.len - 1] = true;
-        if (current_path.items.len >= 3) {
+        if (current_path.items.len >= 2) {
             const order = paint_order.*;
-            if (try solidShapePaintAvailable(state.fill_color_space.kind)) {
+            // A two-point path has no fill area but still has a valid stroke.
+            if (current_path.items.len >= 3 and try solidShapePaintAvailable(state.fill_color_space.kind)) {
                 try emitPolygonShapeRun(
                     alloc,
                     out,
@@ -39473,4 +39481,61 @@ test "reader color frontiers preserve nested spaces default aliases ICC metadata
     const lookup = try cache.table(&reader, resources.get("ColorSpace").?.*);
     try std.testing.expectEqual(@as(usize, 3), lookup.scans);
     try std.testing.expect(lookup.dependency_requests == null);
+}
+
+test "invalid annotation appearance preserves native text but remains unrendered" {
+    const a = std.testing.allocator;
+    const content = "BT /F1 12 Tf 10 50 Td (Preserve native text) Tj ET\n";
+    const stream = try std.fmt.allocPrint(a, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
+    defer a.free(stream);
+    for ([_][]const u8{ "0 0 0 20", "20 0 0 20" }) |bounds| {
+        const appearance = try std.fmt.allocPrint(a, "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [{s}] /Length 0 >>\nstream\nendstream\nendobj\n", .{bounds});
+        defer a.free(appearance);
+        const bytes = try buildImageDecodeTestPdfAlloc(a, &.{
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R /Annots [6 0 R] >>\nendobj\n",
+            stream,
+            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n",
+            "6 0 obj\n<< /Subtype /Stamp /Rect [0 0 20 20] /AP << /N 7 0 R >> >>\nendobj\n",
+            appearance,
+        });
+        defer a.free(bytes);
+        var parsed = try Reader.init(a, bytes);
+        defer parsed.deinit();
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expect(std.mem.indexOf(u8, analysis.text, "Preserve native text") != null);
+        try std.testing.expect(analysis.has_unrendered_annotations);
+        try std.testing.expectError(error.InvalidPdfAnnotations, parsed.extractPageRenderRunsAlloc(1));
+    }
+}
+
+test "fill stroke operators retain two point rule strokes" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "B", "B*", "b", "b*" }) |op| {
+        const content = try std.fmt.allocPrint(a, "1 0 0 RG\n10 10 m\n90 10 l\n{s}\n", .{op});
+        defer a.free(content);
+        const stream = try std.fmt.allocPrint(a, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
+        defer a.free(stream);
+        const bytes = try buildImageDecodeTestPdfAlloc(a, &.{
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>\nendobj\n",
+            stream,
+        });
+        defer a.free(bytes);
+        var parsed = try Reader.init(a, bytes);
+        defer parsed.deinit();
+        const shapes = try parsed.extractPageShapeRunsAlloc(1);
+        defer {
+            for (shapes) |*shape| shape.deinit(a);
+            a.free(shapes);
+        }
+        try std.testing.expectEqual(@as(usize, 1), shapes.len);
+        try std.testing.expect(shapes[0].kind == .stroke);
+        try std.testing.expectEqual(@as(usize, 2), shapes[0].points.len);
+        try std.testing.expectApproxEqAbs(@as(f64, 10), shapes[0].points[0][0], 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f64, 90), shapes[0].points[1][0], 0.0001);
+    }
 }

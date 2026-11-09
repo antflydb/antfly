@@ -192,13 +192,13 @@ jobs:
       # cross-target providers. All compilation uses Zig CI's pinned glibc-linked
       # compiler; formatting alone can use the lightweight static download.
       - name: Install Nix for native checks
-        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.release == 'true'
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.sources == 'true' || steps.scopes.outputs.release == 'true'
         uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
 
       - name: Install glibc-linked Zig for native checks
-        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.release == 'true'
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.sources == 'true' || steps.scopes.outputs.release == 'true'
         env:
           ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
           ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
@@ -211,7 +211,7 @@ jobs:
           echo "$zig_path/bin" >> "$GITHUB_PATH"
 
       - name: Set up Zig for formatting
-        if: steps.scopes.outputs.format_zig == 'true' && steps.scopes.outputs.sdk != 'true' && steps.scopes.outputs.memory != 'true' && steps.scopes.outputs.release != 'true'
+        if: steps.scopes.outputs.format_zig == 'true' && steps.scopes.outputs.sdk != 'true' && steps.scopes.outputs.memory != 'true' && steps.scopes.outputs.sources != 'true' && steps.scopes.outputs.release != 'true'
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}

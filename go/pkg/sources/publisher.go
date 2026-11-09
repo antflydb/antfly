@@ -75,6 +75,9 @@ func (p *Publisher) callContentType(ctx context.Context, method, path string, bo
 		return nil, err
 	}
 	request.Header.Set("Content-Type", contentType)
+	if scope, ok := ctx.Value(searchScopeKey{}).(*searchScope); ok {
+		scope.headers(request.Header)
+	}
 	if p.Token != "" {
 		request.Header.Set("Authorization", "Bearer "+p.Token)
 	}
@@ -98,6 +101,11 @@ func (p *Publisher) callContentType(ctx context.Context, method, path string, bo
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, &PublishHTTPError{Status: response.StatusCode, RetryAt: providerRetryAt(response.Header.Get("Retry-After"), time.Now())}
 	}
+	if scope, ok := ctx.Value(searchScopeKey{}).(*searchScope); ok {
+		if err := scope.observe(response.Header); err != nil {
+			return nil, err
+		}
+	}
 	return data, nil
 }
 
@@ -118,7 +126,7 @@ func (p *Publisher) EnsureTable(ctx context.Context, table string) error {
 	if status, ok := err.(*PublishHTTPError); !ok || status.Status != 404 {
 		return err
 	}
-	_, err = p.call(ctx, "POST", tablePath(table), map[string]any{"num_shards": 1})
+	_, err = p.call(ctx, "POST", tablePath(table), SourceTableConfig())
 	return err
 }
 func (p *Publisher) Batch(ctx context.Context, table string, inserts map[string]any, deletes []string) error {

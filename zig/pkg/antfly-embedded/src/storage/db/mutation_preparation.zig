@@ -1560,6 +1560,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // the composed neighbor input/skip hash. Retain this request for postcommit
             // replay; synchronous levels still wait for its generated coverage there.
             if (request.requires_committed_graph or request.neighbor_context_json.len != 0) return false;
+            // An upstream asset's field is not a field of the primary row.
+            // Chunk/vector descendants must consume accepted producer bytes
+            // after commit, with the upstream causal witness. Precomputing them
+            // here could publish empty chunks and incorrectly settle coverage.
+            if (request.kind != .asset and request.upstream_artifact_name.len != 0) return false;
             // PDF page embeddings require their renderer, page-stage namespace
             // and capability lease. The ordinary text precompute path must not
             // embed the source URL as if it were document text.
