@@ -518,6 +518,12 @@ fn buildPreflightStructuredFilterProbeRequest(req: types.SearchRequest) types.Se
         else => .{ .match_all = {} },
     };
     probe_req.offset = 0;
+    // This probe measures predicate selectivity over the snapshot, independent
+    // of the requested page. Count-only execution cannot accept an ordered
+    // page; bounded probes likewise must not start at the user's cursor.
+    probe_req.order_by = &.{};
+    probe_req.search_after = &.{};
+    probe_req.search_before = &.{};
     probe_req.include_stored = false;
     probe_req.profile = false;
     probe_req.aggregations_json = "";
@@ -743,7 +749,7 @@ test {
     _ = PlanningStatsCollector;
 }
 
-test "exact structured filter counts tighten derived estimates without budget-limited metadata" {
+test "time series preflight exact and bounded filter probes ignore ordered paging" {
     const alloc = std.testing.allocator;
 
     const MockCollector = struct {
@@ -755,7 +761,7 @@ test "exact structured filter counts tighten derived estimates without budget-li
         ) !?query_search.TextIndexEstimate {
             return .{
                 .name = try test_alloc.dupe(u8, index_name orelse "ft_v1"),
-                .doc_count = 0,
+                .doc_count = 100,
             };
         }
 
@@ -804,8 +810,21 @@ test "exact structured filter counts tighten derived estimates without budget-li
         fn searchRequest(
             _: *anyopaque,
             test_alloc: std.mem.Allocator,
-            _: types.SearchRequest,
+            req: types.SearchRequest,
         ) !types.SearchResult {
+            // Count-only execution rejects ordered pages. Preflight must count
+            // the predicate independently of the user's requested page.
+            try std.testing.expectEqual(req.limit == 0, req.count_only);
+            if (!req.count_only) try std.testing.expectEqual(@as(u32, 1), req.limit);
+            try std.testing.expectEqual(@as(usize, 0), req.order_by.len);
+            try std.testing.expectEqual(@as(usize, 0), req.search_after.len);
+            try std.testing.expectEqual(@as(usize, 0), req.search_before.len);
+            try std.testing.expectEqual(@as(?u64, 7), req.identity_read_generation);
+            try std.testing.expectEqual(@as(?u64, 1234), req.execution_deadline_ns);
+            try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, req.filter_ids);
+            try std.testing.expectEqualSlices(u64, &.{4}, req.exclude_ids);
+            try std.testing.expect(req.filter_query_json.len > 0);
+            try std.testing.expect(req.exclusion_query_json.len > 0);
             return try query_search.emptySearchResult(test_alloc);
         }
     };
@@ -824,24 +843,32 @@ test "exact structured filter counts tighten derived estimates without budget-li
         },
     };
 
-    var summary = try collectSearchRequestStatsAlloc(alloc, collector, .{
-        .index_name = "ft_v1",
-        .query = .{ .doc_id = .{ .ids = &.{ "doc:a", "doc:b" } } },
-        .filter_ids = &.{ 1, 2, 3 },
-        .exclude_ids = &.{4},
-        .filter_query_json = "{\"bool\":{\"must\":[{\"numeric_range\":{\"field\":\"score\",\"min\":1}},{\"doc_id\":[\"doc:c\"]}]}}",
-        .exclusion_query_json = "{\"bool\":{\"must_not\":[{\"term_range\":{\"field\":\"tag\",\"min\":\"a\",\"max\":\"m\"}},{\"ip_range\":{\"field\":\"ip\",\"cidr\":\"10.0.0.0/8\"}}]}}",
-    }, 0);
-    defer summary.deinit(alloc);
+    for ([_]u32{ 0, 1 }) |max_work| {
+        const cursor = &[_]std.json.Value{ .{ .string = "2026-11-06T12:00:00Z" }, .{ .string = "doc:a" } };
+        var summary = try collectSearchRequestStatsAlloc(alloc, collector, .{
+            .index_name = "ft_v1",
+            .order_by = &.{.{ .field = "observed_at", .desc = true }},
+            .search_after = if (max_work == 0) cursor else &.{},
+            .search_before = if (max_work != 0) cursor else &.{},
+            .identity_read_generation = 7,
+            .execution_deadline_ns = 1234,
+            .query = .{ .doc_id = .{ .ids = &.{ "doc:a", "doc:b" } } },
+            .filter_ids = &.{ 1, 2, 3 },
+            .exclude_ids = &.{4},
+            .filter_query_json = "{\"bool\":{\"must\":[{\"numeric_range\":{\"field\":\"score\",\"min\":1}},{\"doc_id\":[\"doc:c\"]}]}}",
+            .exclusion_query_json = "{\"bool\":{\"must_not\":[{\"term_range\":{\"field\":\"tag\",\"min\":\"a\",\"max\":\"m\"}},{\"ip_range\":{\"field\":\"ip\",\"cidr\":\"10.0.0.0/8\"}}]}}",
+        }, max_work);
+        defer summary.deinit(alloc);
 
-    try std.testing.expectEqual(@as(?u32, 1), summary.positive_id_result_upper_bound);
-    try std.testing.expectEqual(@as(?u64, 0), summary.structured_filter_doc_count_estimate);
-    try std.testing.expect(summary.structured_filter_count_exact);
-    try std.testing.expectEqual(@as(?u64, null), summary.structured_filter_count_budget_limit);
-    try std.testing.expectEqual(@as(?u32, 0), summary.result_doc_upper_bound);
-    try std.testing.expectEqual(@as(?u32, 0), summary.result_doc_estimate);
-    if (summary.selectivity_upper_bound_ratio) |ratio| {
-        try std.testing.expectApproxEqAbs(@as(f32, 0.0), ratio, 0.0001);
+        try std.testing.expectEqual(@as(?u32, 1), summary.positive_id_result_upper_bound);
+        try std.testing.expectEqual(@as(?u64, 0), summary.structured_filter_doc_count_estimate);
+        try std.testing.expect(summary.structured_filter_count_exact);
+        try std.testing.expectEqual(if (max_work == 0) @as(?u64, null) else @as(?u64, 1), summary.structured_filter_count_budget_limit);
+        try std.testing.expectEqual(@as(?u32, 0), summary.result_doc_upper_bound);
+        try std.testing.expectEqual(@as(?u32, 0), summary.result_doc_estimate);
+        if (summary.selectivity_upper_bound_ratio) |ratio| {
+            try std.testing.expectApproxEqAbs(@as(f32, 0.0), ratio, 0.0001);
+        }
     }
 }
 

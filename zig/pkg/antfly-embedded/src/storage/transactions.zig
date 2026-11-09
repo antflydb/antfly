@@ -204,6 +204,17 @@ fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
     return std.math.add(u64, primary, intent.retained_artifact_bytes) catch error.TransactionTooLarge;
 }
 
+fn retainedIntentBytesForLanguage(alloc: Allocator, intent: WriteIntent, sources: bool) !u64 {
+    const bytes = try retainedIntentBytes(alloc, intent);
+    // A live document may acquire a signed TTL source at resolution. Reserve
+    // the full source slot before voting yes; deletes and relational rows do
+    // not encode this slot. The retained language cannot change with intents.
+    if (sources and bytes != 0 and intent.value != null and intent.prepared_row == null and
+        !@import("db/relational_integrity_contract.zig").isKey(intent.key))
+        return std.math.add(u64, bytes, 16) catch error.TransactionTooLarge;
+    return bytes;
+}
+
 fn retainedIntentKeys(intent: WriteIntent, retained: u64) !u64 {
     if (retained == 0) return 0;
     return std.math.add(u64, 1, intent.retained_artifact_keys) catch error.TransactionTooLarge;
@@ -353,6 +364,7 @@ pub const ResolutionExtraBatch = struct {
 /// transaction metadata transition. Raft apply uses this to fence the exact log
 /// entry without a crash window between the transaction and its replay marker.
 pub const MutationExtraBatch = struct {
+    document_revisions: ?bool = null,
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
     /// DB preparation supplies a binding (including explicit schemaless).
@@ -405,6 +417,7 @@ pub const ReplayAppend = struct {
 };
 
 pub const IntentBatch = struct {
+    document_revisions: bool = false,
     writes: []docstore.KVPair = &.{},
     deletes: [][]const u8 = &.{},
     revision: u64 = 0,
@@ -435,6 +448,7 @@ pub const IntentBatch = struct {
 };
 
 const TxnRecord = struct {
+    document_revisions: bool = false,
     status: TxnStatus,
     begin_timestamp: u64,
     commit_version: u64,
@@ -482,6 +496,7 @@ const txn_record_v3_size = 50;
 const txn_record_v4_size = 51;
 const txn_record_v5_size = 52;
 const txn_record_v6_size = 53;
+const txn_record_v7_size = 54;
 
 // ============================================================================
 // TxnManager
@@ -715,6 +730,7 @@ pub const TxnManager = struct {
         for (intents) |intent| if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
+        const first_prepare = record.prepared_known and !record.prepared and record.intent_revision == 0;
 
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var schema_lease_value: [5]u8 = @splat(0);
@@ -751,6 +767,11 @@ pub const TxnManager = struct {
         try self.checkIntentConflicts(extra_batch.graph_sources, txn_id);
         try self.checkIndexSpanGuardConflicts(extra_batch.index_span_digests, txn_id);
 
+        const source_language = blk: {
+            var probe = try self.store.beginProbe();
+            defer probe.abort();
+            break :blk if (try retained_effects.load(&probe)) |state| state.ttl_sources else false;
+        };
         const previous_admission = try self.loadIntentAdmission(self.alloc, txn_id);
         var admission = previous_admission orelse IntentAdmission{};
         var pending_costs = std.StringHashMapUnmanaged(IntentCost).empty;
@@ -784,7 +805,7 @@ pub const TxnManager = struct {
                 const decoded = try IntentValue.decode(entry.value);
                 const previous_intent: WriteIntent = .{ .key = key, .value = decoded.value, .prepared_row = decoded.prepared_row };
                 const cost = try intentAdmissionBytes(previous_intent);
-                const retained = try retainedIntentBytes(self.alloc, previous_intent);
+                const retained = try retainedIntentBytesForLanguage(self.alloc, previous_intent, source_language);
                 admission.count += 1;
                 admission.bytes = std.math.add(u64, admission.bytes, cost) catch return error.TransactionTooLarge;
                 admission.retained_bytes = std.math.add(u64, admission.retained_bytes, retained) catch return error.TransactionTooLarge;
@@ -818,7 +839,7 @@ pub const TxnManager = struct {
                 break :blk IntentCost{ .bytes = std.mem.readInt(u64, raw[0..8], .little), .retained = std.mem.readInt(u64, raw[8..16], .little), .retained_keys = if (raw.len == 24) std.mem.readInt(u64, raw[16..24], .little) else @intFromBool(std.mem.readInt(u64, raw[8..16], .little) != 0) };
             };
             const cost = try intentAdmissionBytes(intent);
-            const retained = try retainedIntentBytes(self.alloc, intent);
+            const retained = try retainedIntentBytesForLanguage(self.alloc, intent, source_language);
             const retained_keys = try retainedIntentKeys(intent, retained);
             if (prior) |old| {
                 admission.bytes = std.math.sub(u64, admission.bytes, old.bytes) catch return error.InvalidTxnRecord;
@@ -914,6 +935,12 @@ pub const TxnManager = struct {
         // Recovery can therefore never observe intents without the durable
         // fencing bit that prevents presumed abort.
         record.prepared = true;
+        // Pin the scheme with the first vote. A transaction may span a
+        // rolling activation; later prepares preserve its durable contract.
+        // Records predating the prepare bit remain conservatively legacy.
+        if (first_prepare) if (extra_batch.document_revisions) |enabled| {
+            record.document_revisions = enabled;
+        };
         const record_key = makeRecordKey(txn_id);
         const record_value = try self.encodeRecord(record);
         try appendOwnedBytes(self.alloc, &write_vals, record_value);
@@ -1136,6 +1163,26 @@ pub const TxnManager = struct {
         try deletes.append(self.alloc, &admission_key);
         try deletes.append(self.alloc, &intent_keys_key);
         try deletes.append(self.alloc, &schema_lease_key);
+        var revision_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer revision_arena.deinit();
+        const revision_alloc = revision_arena.allocator();
+        var resolved_version = timestamp;
+        if (status == .committed and record.document_revisions and !extra_batch.skip_all_intent_application) {
+            var revision_writes = std.ArrayList(docstore.KVPair).empty;
+            var revision_deletes = std.ArrayList([]const u8).empty;
+            for (intent_entries) |entry| {
+                const key = entry.key[intents_prefix.len + 17 ..];
+                if (isRawMetadataIntentKey(key) or skipped_intent_keys.contains(key)) continue;
+                const intent = try IntentValue.decode(entry.value);
+                if (intent.value) |value| try revision_writes.append(revision_alloc, .{ .key = key, .value = value }) else try revision_deletes.append(revision_alloc, key);
+            }
+            if (try ttl.nextDocumentVersion(self.store, revision_alloc, timestamp, revision_writes.items, revision_deletes.items)) |version| {
+                resolved_version = version;
+                const bytes = try revision_alloc.alloc(u8, 8);
+                std.mem.writeInt(u64, bytes[0..8], version, .little);
+                try writes.append(self.alloc, .{ .key = ttl.document_version_watermark_key, .value = bytes });
+            }
+        }
         if (status == .committed) {
             // Apply intents to real keys
             for (intent_entries) |entry| {
@@ -1174,9 +1221,8 @@ pub const TxnManager = struct {
                     // Write timestamp for the key
                     const ts_key = try internal_keys.ttlKeyAlloc(self.alloc, user_key);
                     try owned_apply_keys.append(self.alloc, ts_key);
-                    var ts_val: [8]u8 = undefined;
-                    std.mem.writeInt(u64, &ts_val, timestamp, .little);
-                    try writes.append(self.alloc, .{ .key = ts_key, .value = &ts_val });
+                    const ts_val = try ttl.encodeTimestampAlloc(revision_alloc, resolved_version, @as(i128, timestamp));
+                    try writes.append(self.alloc, .{ .key = ts_key, .value = ts_val });
                 }
             }
         }
@@ -1260,7 +1306,7 @@ pub const TxnManager = struct {
                 writes_initialized += 1;
             }
         }
-        return .{ .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries };
+        return .{ .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
     }
 
     pub fn loadSchemaBinding(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?SchemaBinding {
@@ -2308,7 +2354,7 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        const buf = try self.alloc.alloc(u8, txn_record_v6_size);
+        const buf = try self.alloc.alloc(u8, if (record.document_revisions) txn_record_v7_size else txn_record_v6_size);
         buf[0] = @backingInt(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
@@ -2320,6 +2366,7 @@ pub const TxnManager = struct {
         buf[50] = @intFromBool(record.coordinator);
         buf[51] = @intFromBool(record.retain_terminal);
         buf[52] = @intFromBool(record.intents_resolved);
+        if (record.document_revisions) buf[53] = 1;
         return buf;
     }
 
@@ -2670,8 +2717,7 @@ pub const TxnManager = struct {
             else => return err,
         };
         defer self.alloc.free(val);
-        if (val.len < 8) return null;
-        return std.mem.readInt(u64, val[0..8], .little);
+        return @import("ttl.zig").writeVersion(val);
     }
 };
 
@@ -2981,6 +3027,12 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
 }
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
+    if (raw.len == txn_record_v7_size) {
+        if (raw[53] != 1) return error.InvalidTxnRecord;
+        var record = try decodeRecord(raw[0..txn_record_v6_size]);
+        record.document_revisions = true;
+        return record;
+    }
     if (raw.len == txn_record_v6_size) {
         if (raw[49] > 1 or raw[50] > 1 or raw[51] > 1 or raw[52] > 1) return TxnError.InvalidTxnRecord;
         return .{
@@ -5030,4 +5082,49 @@ test "transaction participant batch releases migration allocations on every fail
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "time series prepared revision scheme survives reopening and generic recovery" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-revision-recovery");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    for ([_]bool{ false, true }) |modern| {
+        cleanupTestDir(path);
+        const id: TxnId = @splat(7);
+        {
+            var store = try DocStore.open(a, path, .{});
+            defer store.close();
+            var manager = try TxnManager.init(a, &store);
+            defer manager.deinit();
+            try manager.initTransaction(id, 1);
+            try manager.writeIntentsExtraBatch(id, &.{.{ .key = "row", .value = "{}" }}, &.{}, .{ .document_revisions = modern });
+            try manager.writeIntentsExtraBatch(id, &.{.{ .key = "row", .value = "{\"corrected\":true}" }}, &.{}, .{ .document_revisions = !modern });
+            const raw = try store.get(a, &makeRecordKey(id));
+            defer a.free(raw);
+            try std.testing.expectEqual(@as(usize, if (modern) txn_record_v7_size else txn_record_v6_size), raw.len);
+            try std.testing.expectEqual(modern, (try decodeRecord(raw)).document_revisions);
+        }
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try manager.resolveIntents(id, .committed, 0);
+        const key = try internal_keys.ttlKeyAlloc(a, "row");
+        defer a.free(key);
+        const raw = try store.get(a, key);
+        defer a.free(raw);
+        try std.testing.expectEqual(@as(u64, if (modern) 1 else 0), ttl.writeVersion(raw).?);
+        try std.testing.expectEqual(@as(usize, if (modern) 24 else 8), raw.len);
+        try std.testing.expectEqual(@as(?i128, 0), ttl.sourceTimestamp(raw));
+    }
+}
+
+test "time series source language reserves signed source slots before voting" {
+    const intent: WriteIntent = .{ .key = "row", .value = "{}" };
+    const legacy = try retainedIntentBytes(std.testing.allocator, intent);
+    try std.testing.expectEqual(legacy, try retainedIntentBytesForLanguage(std.testing.allocator, intent, false));
+    try std.testing.expectEqual(legacy + 16, try retainedIntentBytesForLanguage(std.testing.allocator, intent, true));
+    const deleted: WriteIntent = .{ .key = "row", .value = null };
+    try std.testing.expectEqual(try retainedIntentBytes(std.testing.allocator, deleted), try retainedIntentBytesForLanguage(std.testing.allocator, deleted, true));
 }

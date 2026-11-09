@@ -176,20 +176,20 @@ class McpSchemaFragmentTests(unittest.TestCase):
         child_mode_rejection = next(
             branch
             for branch in query_schema["not"]["anyOf"]
-            if len(branch.get("allOf", [])) == 2
-            and branch["allOf"][0]
-            == {
-                "required": ["hierarchy"],
-                "properties": {"hierarchy": {"required": ["children"]}},
-            }
-            and "anyOf" in branch["allOf"][1]
+            if any(
+                part.get("properties", {}).get("hierarchy", {}).get("required")
+                == ["children"]
+                for part in branch.get("allOf", [])
+            )
+            and any(
+                {"required": ["query"]} in part.get("anyOf", [])
+                for part in branch.get("allOf", [])
+            )
         )
         rejected_child_fields = {
             item["required"][0] for item in child_mode_rejection["allOf"][1]["anyOf"]
         }
         allowed_child_fields = {
-            # Source traversal now permits filtering; unit traversal retains
-            # its separate conditional rejection below.
             "filter_query",
             "table",
             "table_target",

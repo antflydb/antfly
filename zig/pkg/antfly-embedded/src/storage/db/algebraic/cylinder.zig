@@ -16,27 +16,56 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const Bucket = enum {
+const datetime = @import("../../../datetime.zig");
+pub const Bucket = union(enum) {
+    minute,
     hour,
     day,
+    week,
     month,
+    quarter,
+    year,
+    fixed: u64,
 
     pub fn parse(text: []const u8) ?Bucket {
-        const info = @typeInfo(Bucket).@"enum";
-        inline for (info.field_names, info.field_values) |reflected_name, field_value| {
-            if (std.mem.eql(u8, text, reflected_name)) return @fromBackingInt(@intCast(field_value));
+        inline for (.{ "minute", "hour", "day", "week", "month", "quarter", "year" }) |name| {
+            if (std.mem.eql(u8, text, name)) return @unionInit(Bucket, name, {});
         }
-        return null;
+        return .{ .fixed = datetime.durationNs(text) orelse return null };
     }
 };
 
+/// Canonical aliases preserve existing whole-hour/day materializations. Fixed
+/// weeks remain epoch aligned and must never alias calendar Monday weeks.
+pub fn canonicalBucketName(text: []const u8) ?[]const u8 {
+    const bucket = Bucket.parse(text) orelse return null;
+    if (bucket == .fixed) {
+        if (bucket.fixed == std.time.ns_per_min) return "minute";
+        if (bucket.fixed == std.time.ns_per_hour) return "hour";
+        if (bucket.fixed == std.time.ns_per_day) return "day";
+    }
+    return text;
+}
+
 pub fn bucketStartAlloc(alloc: Allocator, bucket: Bucket, rfc3339: []const u8) ![]u8 {
-    if (!isSupportedRfc3339Utc(rfc3339)) return error.InvalidTimestamp;
-    return switch (bucket) {
-        .hour => try std.fmt.allocPrint(alloc, "{s}:00:00Z", .{rfc3339[0..13]}),
-        .day => try std.fmt.allocPrint(alloc, "{s}T00:00:00Z", .{rfc3339[0..10]}),
-        .month => try std.fmt.allocPrint(alloc, "{s}-01T00:00:00Z", .{rfc3339[0..7]}),
-    };
+    const ns = datetime.parseRfc3339ToSignedNs(rfc3339) orelse return error.InvalidTimestamp;
+    const start = if (bucket == .fixed) datetime.binSigned(ns, bucket.fixed, 0).? else datetime.truncateSigned(ns, switch (bucket) {
+        .minute => .minute,
+        .hour => .hour,
+        .day => .day,
+        .week => .week,
+        .month => .month,
+        .quarter => .quarter,
+        .year => .year,
+        .fixed => unreachable,
+    }) orelse return error.InvalidTimestamp;
+    const formatted = try datetime.formatDateTimeSignedNsAlloc(alloc, start);
+    // Preserve existing whole-second materialization keys across upgrades.
+    if (@mod(start, std.time.ns_per_s) == 0) {
+        defer alloc.free(formatted);
+        return std.fmt.allocPrint(alloc, "{s}Z", .{formatted[0..19]});
+    }
+    return formatted;
 }
 
 pub fn unixSeconds(rfc3339: []const u8) !i64 {
@@ -93,7 +122,26 @@ test "bucket start normalizes simple RFC3339 strings" {
     defer alloc.free(month);
     try std.testing.expectEqualStrings("2026-05-01T00:00:00Z", month);
     try std.testing.expectError(error.InvalidTimestamp, bucketStartAlloc(alloc, .day, "2026-05-10"));
-    try std.testing.expectError(error.InvalidTimestamp, bucketStartAlloc(alloc, .day, "2026-05-10T14:03:00-07:00"));
+    const offset = try bucketStartAlloc(alloc, .day, "2026-05-10T14:03:00-07:00");
+    defer alloc.free(offset);
+    try std.testing.expectEqualStrings("2026-05-10T00:00:00Z", offset);
     try std.testing.expectEqual(@as(i64, 0), try unixSeconds("1970-01-01T00:00:00Z"));
     try std.testing.expectEqual(@as(i64, 3600), try unixSeconds("1970-01-01T01:00:00Z"));
+}
+
+test "time series algebraic buckets share fixed duration and normalized instants" {
+    const a = std.testing.allocator;
+    const first = try bucketStartAlloc(a, Bucket.parse("5m").?, "2026-11-06T13:04:59.999999999+01:00");
+    defer a.free(first);
+    try std.testing.expectEqualStrings("2026-11-06T12:00:00Z", first);
+    const precise = try bucketStartAlloc(a, Bucket.parse("10ns").?, "2026-11-06T12:00:00.000000019Z");
+    defer a.free(precise);
+    try std.testing.expectEqualStrings("2026-11-06T12:00:00.000000010Z", precise);
+    try std.testing.expect(Bucket.parse("0s") == null);
+}
+
+pub fn equivalentBucketNames(left: []const u8, right: []const u8) bool {
+    const a = Bucket.parse(canonicalBucketName(left) orelse return false) orelse return false;
+    const b = Bucket.parse(canonicalBucketName(right) orelse return false) orelse return false;
+    return std.meta.eql(a, b);
 }
