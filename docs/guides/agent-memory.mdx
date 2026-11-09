@@ -155,7 +155,7 @@ curl -X POST http://127.0.0.1:8080/memory/v1/spaces/agent/outcomes \
 {"action": "outcome", "phase": "succeeded", "revision": 7}
 ```
 
-Outcomes feed back into ranking only where you ask for it. Recall with `"utility_weight": 0.5` (0 to 1) adds that weight times the memory's outcome utility, `(successes - failures) / (successes + failures + 2)`, to its score. The default of 0 leaves ranking unchanged. Utility counts only retained outcomes the caller is allowed to read, in the selected branch. Forgetting any memory used by an outcome immediately excludes that outcome from every utility score. Historical recall excludes outcomes recorded after `known_at`.
+Outcomes feed back into ranking only where you ask for it. Recall with `"utility_weight": 0.5` (0 to 1) adds that weight times the memory's outcome utility, `(successes - failures) / (successes + failures + 2)`, to its score. The default of 0 leaves ranking unchanged. Utility counts only retained outcomes the caller is allowed to read, in the selected branch. Forgetting any memory used by an outcome immediately excludes that outcome from every utility score. Historical recall excludes outcomes recorded after `known_at`. Utility reads at most 64 outcomes per memory from your own feedback; administrators use an all-owner view. Other users’ private outcomes do not consume your limit. Existing spaces backfill owner indexes through bounded background maintenance, reporting `utility.complete=false` until that migration finishes.
 
 ### 6. Load a Session Brief
 
