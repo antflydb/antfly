@@ -1361,6 +1361,7 @@ const StagesJson = struct {
     algebraic_bulk_finish: StageJson,
     algebraic_hll_maintenance: StageJson,
     algebraic_adaptive: StageJson,
+    ride_along_flush: StageJson,
     other: StageJson,
 };
 
@@ -1440,6 +1441,7 @@ fn modeJson(mode: ModeReport) ModeJson {
             .algebraic_bulk_finish = stageJson(mode, .algebraic_bulk_finish),
             .algebraic_hll_maintenance = stageJson(mode, .algebraic_hll_maintenance),
             .algebraic_adaptive = stageJson(mode, .algebraic_adaptive),
+            .ride_along_flush = stageJson(mode, .ride_along_flush),
             .other = stageJson(mode, .other),
         },
         .background_ops = .{
@@ -2084,39 +2086,47 @@ test "lite write amplification report: relational write surface" {
     std.debug.print("lite_write_amplification_relational_json_begin\n{s}\nlite_write_amplification_relational_json_end\n", .{json_text});
 
     // Regression gates (lite-single-commit-write-path.md §3.3c). A
-    // single-statement coordinated write (UNIQUE/FK) and an explicit
+    // single-statement coordinated write (UNIQUE) and an explicit
     // multi-statement session transaction used to always take the full
     // cross-database two-phase commit protocol in `sql_commit.zig` --
     // store the recovery hint, begin the root as coordinator, begin the
     // one participant, write its intents, decide on the root, resolve the
     // participant, clear the hint -- about 11-12 native commits for one
-    // write. `sql.zig`'s `mutate`/`sql_session.zig`'s `commit` now route a
+    // write. `sql.zig`'s `mutate` and (task 3: `sql_session.zig`'s
+    // `commit`, now also `allow_local_decision = true`) both route a
     // write whose prepared plan touches exactly one table on a Lite
-    // single-file store through `commitCoordinated` instead: begin, write
-    // the intents, and resolve them against that one table directly, with
-    // no cross-database decision record. That is 3 native commits, not the
-    // 1 a fully collapsed write would need (`writeIntentsExtraBatch`
-    // reads back the record `beginTransaction` wrote, and `resolveIntents`
-    // reads back the intents `writeIntents` wrote; a group-commit member
-    // is only applied -- and so only readable by the next step -- once
-    // something drives/waits its group, not at `enqueue` time, so these
-    // three steps cannot share one native commit without a combined batch
-    // that skips the durable round trip through "intents" entirely, which
-    // is follow-up work). 5.0 leaves headroom above the measured ~4.2-4.5
-    // (admission retries, background work) while still catching a
-    // regression back toward the ~11-12 two-phase-commit baseline by more
-    // than 2x.
-    try expectAtMost(unique_index.durableCommitsPerWrite(), 5.0, "relational unique-constraint durable commits/write");
-    try expectAtMost(unique_index_concurrent.durableCommitsPerWrite(), 5.0, "relational unique-constraint 8-writer durable commits/write");
-    try expectAtMost(transaction.durableCommitsPerWrite(), 5.0, "2-document SQL transaction durable commits/write");
-    try expectAtMost(transaction_concurrent.durableCommitsPerWrite(), 5.0, "2-document SQL transaction 8-writer durable commits/write");
+    // single-file store through `commitCoordinatedLocal` instead: one
+    // native commit, no begin record, no durable intent record -- an
+    // ambiguous outcome resolves through the bounded outcome-receipt
+    // marker scheme instead (`DB.outcomeMarkerFallbackStatus`). Task 4
+    // (lite-single-commit-write-path.md §3.3c) converted the columnar
+    // maintenance scheduler's own standalone background commits
+    // (`relational_columns.zig`'s `selectReady`/`compact`/`prune`/
+    // `drainCleanup`/`drainGarbage` -- all redoable bookkeeping over a
+    // derived secondary index) to ride along the next foreground commit
+    // instead of forcing their own fsync, which moved the measured
+    // baseline down from ~1.6-1.9 to ~1.3-1.6. What is left in that
+    // residual is `write_amplification_trace.zig`'s own `.ride_along_flush`
+    // tag (the bounded idle-flush timer that keeps a ride-along write from
+    // sitting undurable indefinitely when no foreground commit comes along
+    // to carry it -- see its doc comment) plus one-time fixture/schema/
+    // index-provisioning setup, neither a per-write cost. 2.0 leaves
+    // headroom above that ~1.3-1.6 baseline (timer-firing jitter under
+    // load) while still catching a regression back toward the old
+    // two-phase-commit baseline (~4.5 for the transaction case, ~11-12 for
+    // a cross-database one) by a wide margin.
+    try expectAtMost(unique_index.durableCommitsPerWrite(), 2.0, "relational unique-constraint durable commits/write");
+    try expectAtMost(unique_index_concurrent.durableCommitsPerWrite(), 2.0, "relational unique-constraint 8-writer durable commits/write");
+    try expectAtMost(transaction.durableCommitsPerWrite(), 2.0, "2-document SQL transaction durable commits/write");
+    try expectAtMost(transaction_concurrent.durableCommitsPerWrite(), 2.0, "2-document SQL transaction 8-writer durable commits/write");
     // Unaffected by the above: `secondary_index`/`sql_insert_update` never
     // had a coordinated constraint to route around `sql_commit.zig` in the
     // first place (no UNIQUE/FK on this mode's table), so their own,
-    // separate baseline (~1.6-1.9) is gated at its existing level, loosely,
-    // just to catch an unrelated regression.
-    try expectAtMost(secondary_index.durableCommitsPerWrite(), 2.5, "relational secondary-index durable commits/write");
-    try expectAtMost(sql_insert_update.durableCommitsPerWrite(), 2.5, "SQL INSERT/UPDATE via C API durable commits/write");
+    // separate baseline (now ~1.3-1.6, see the task 4 comment above) is
+    // gated at its existing level, loosely, just to catch an unrelated
+    // regression.
+    try expectAtMost(secondary_index.durableCommitsPerWrite(), 2.0, "relational secondary-index durable commits/write");
+    try expectAtMost(sql_insert_update.durableCommitsPerWrite(), 2.0, "SQL INSERT/UPDATE via C API durable commits/write");
     // `foreign_key` still spans two physical tables (the child row plus an
     // `.attach` inbound-reference record against the parent -- see
     // `Plan.expand` in `api/relational_integrity.zig`), so it still takes

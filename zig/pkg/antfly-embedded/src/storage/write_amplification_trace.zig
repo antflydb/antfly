@@ -160,6 +160,14 @@ pub const Stage = enum(u8) {
     algebraic_bulk_finish,
     algebraic_hll_maintenance,
     algebraic_adaptive,
+    // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): docstore.zig's
+    // `rideAlongFlushLoop` idle-flush timer (barrier (a)) -- the background
+    // thread that bounds how long a ride-along write can sit undurable when
+    // no foreground commit comes along to carry it. This is the expected,
+    // amortized cost of ride-along's staleness bound, not an avoidable
+    // per-write sync; distinguishing it from a genuinely unattributed
+    // `.other` background sync is the point of this tag.
+    ride_along_flush,
     other,
 };
 const stage_count = std.meta.tags(Stage).len;
@@ -334,7 +342,8 @@ fn currentStage() Stage {
 pub fn recordSync() void {
     if (!enabled) return;
     const lane = currentLane();
-    _ = sync_calls[@backingInt(lane)][@backingInt(currentStage())].fetchAdd(1, .monotonic);
+    const stage = currentStage();
+    _ = sync_calls[@backingInt(lane)][@backingInt(stage)].fetchAdd(1, .monotonic);
 }
 
 /// Record one write/pwrite submission of `bytes` attributed to the calling

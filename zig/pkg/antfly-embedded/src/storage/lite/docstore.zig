@@ -3375,6 +3375,12 @@ pub const Store = struct {
             if (!pending) continue;
             const now = std.Io.Clock.awake.now(io).nanoseconds;
             if (now -| last_ns < @as(i96, @intCast(self.ride_along_idle_ns))) continue; // not idle long enough; re-check on the next wake.
+            // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): tag
+            // this background thread's own forced flush so it attributes to
+            // `.ride_along_flush`, not the unattributed `.other` bucket --
+            // see the doc comment on that Stage tag.
+            const flush_scope = wal_trace.scope(.ride_along_flush);
+            defer flush_scope.end();
             self.forceDrainDurable();
         }
     }
