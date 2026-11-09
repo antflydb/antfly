@@ -17549,6 +17549,21 @@ pub const DB = struct {
                         .next_retry_at_ms = 0,
                         .replace_last_error = true,
                     });
+                } else if (current.intent.next_retry_at_ms != 0) {
+                    // The scheduler-paced backoff below assumes a periodic
+                    // background owner will wait it out in real time and try
+                    // again later. A forced call has no such owner waiting on
+                    // its behalf -- the caller IS the next attempt, right now.
+                    // Without this, a transient failure's backoff can survive
+                    // across this short-lived handle's own close/reopen (the
+                    // durable intent persists it) and a direct/embedded caller
+                    // retrying synchronously, exactly as documented for the
+                    // owner-less fallback, would stall for the full scheduler
+                    // backoff window instead of making immediate progress.
+                    try self.updateIndexRepairIntent(alloc, repair_id, .{
+                        .failure_streak = 0,
+                        .next_retry_at_ms = 0,
+                    });
                 }
             }
             if (options.defer_durable_index_repair_execution) {

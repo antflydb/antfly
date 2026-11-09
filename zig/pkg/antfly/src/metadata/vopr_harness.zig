@@ -1222,12 +1222,17 @@ pub fn mirrorGroupBatchToActiveReplicas(
         if (cluster.node(i).status(group_id) != .active) continue;
         var response = try client.fetchGroupBatch(base_uri, group_id, table_name, body);
         defer response.deinit(client.alloc);
-        // This coarse fixture has no DataServer repair scheduler. Own the
-        // bounded initial-index materialization through the production repair
-        // endpoint before treating the mirrored replica as query-ready.
+        // This coarse fixture has no DataServer repair scheduler, so nothing
+        // else will ever wait out a scheduler-paced retry backoff on this
+        // repair's behalf; `force` tells the synchronous fallback that this
+        // call is the next attempt and must not stall behind that backoff
+        // (see `req.force`'s handling in repairIndexGenerationIssuesWithRequest).
+        // Own the bounded initial-index materialization through the
+        // production repair endpoint before treating the mirrored replica as
+        // query-ready.
         for (0..40) |_| {
             var repair = try client.fetchGroupArtifactRepairRun(base_uri, group_id, table_name,
-                \\{"target":"index","index_name":"full_text_index_v0","limit":16}
+                \\{"target":"index","index_name":"full_text_index_v0","limit":16,"force":true}
             );
             defer repair.deinit(client.alloc);
             var result = try std.json.parseFromSlice(struct { debt_remaining: bool, has_more: bool }, cluster.alloc, repair.body, .{ .ignore_unknown_fields = true });
@@ -8539,7 +8544,11 @@ pub const VoprPublicClusterFixture = struct {
             for (self.api_base_uris[0..self.uri_count], 0..) |base_uri, node_index| {
                 if (self.cluster.node(node_index).status(group_id) != .active) continue;
                 for ([_][]const u8{ graph_index_name, api_tables.default_full_text_index_name }) |index_name| {
-                    const body = try std.fmt.allocPrint(self.alloc, "{{\"target\":\"index\",\"index_name\":\"{s}\",\"limit\":16}}", .{index_name});
+                    // `force` tells the synchronous fallback this call is the
+                    // next attempt; this coarse fixture has no DataServer
+                    // scheduler to ever wait out a scheduler-paced retry
+                    // backoff on its behalf (see mirrorGroupBatchToActiveReplicas).
+                    const body = try std.fmt.allocPrint(self.alloc, "{{\"target\":\"index\",\"index_name\":\"{s}\",\"limit\":16,\"force\":true}}", .{index_name});
                     defer self.alloc.free(body);
                     for (0..40) |_| {
                         var response = try repair_client.fetchGroupArtifactRepairRun(base_uri, group_id, "docs", body);

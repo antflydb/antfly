@@ -148,6 +148,18 @@ pub const Stage = enum(u8) {
     // physical store (`sql.zig`'s single-store fast path bypasses this
     // coordinator entirely for the common single-table case).
     relational_coordinator_hint,
+    // Algebraic index write attribution (single-commit write path, algebraic
+    // workstream): `algebraic_apply` is the foreground per-write fact commit
+    // (`Index.applyBatchWritesLocked`/`applyAppendOnlyBatchWithOptions`),
+    // `algebraic_bulk_finish` is bulk-ingest session finalization
+    // (`finishBulkIngestSessionWithOptions`), `algebraic_hll_maintenance` is
+    // background HLL sketch maintenance/backfill, and `algebraic_adaptive` is
+    // adaptive-materialization bookkeeping (candidate/progress/lifecycle
+    // persistence) outside the foreground apply commit.
+    algebraic_apply,
+    algebraic_bulk_finish,
+    algebraic_hll_maintenance,
+    algebraic_adaptive,
     other,
 };
 const stage_count = std.meta.tags(Stage).len;
