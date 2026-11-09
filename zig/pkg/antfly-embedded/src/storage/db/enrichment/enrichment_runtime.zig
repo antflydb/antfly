@@ -5566,6 +5566,7 @@ const media_output_counts = @import("media_output_counts.zig");
 const model_chunk_client = @import("../../../chunking/inference.zig");
 
 const WorkerChunkCacheEntry = struct {
+    upstream_digest: ?[32]u8 = null,
     media_pass_scope: ?[]u8 = null,
     media_pass_input_digest: ?[32]u8 = null,
     key: []u8,
@@ -5574,6 +5575,7 @@ const WorkerChunkCacheEntry = struct {
 };
 
 const WorkerChunkSource = struct {
+    upstream_digest: ?[32]u8 = null,
     chunks: []const chunker_mod.Chunk,
     source_record_digest: ?[32]u8,
 };
@@ -5672,6 +5674,9 @@ const AssetProducerBatchItem = struct {
     raw_doc: []u8,
     source_text: []const u8,
     source_parts_json: ?[]u8 = null,
+    // Captured from stored upstream bytes before projection/context rendering.
+    // Producer input and upstream publication identity are different domains.
+    upstream_digest: ?[32]u8 = null,
     artifact_key: []u8,
     state_key: []u8,
     state_value: []u8,
@@ -6084,7 +6089,7 @@ fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enric
         var producer = try asset_producer_mod.parseProducerConfig(runtime.alloc, upstream.producer_json);
         defer producer.deinit(runtime.alloc);
         const privacy_source = @import("../../../privacy/document.zig").isProtectedArtifactName(upstream.name) or @import("../../../privacy/document.zig").consumerPolicyVersion(upstream.name) != null;
-        if (!privacy_source and (producer.type != .media_output or !std.mem.eql(u8, request.source_field, "text") or request.source_template.len != 0)) return error.InvalidEnrichmentConfig;
+        if (!privacy_source and (!asset_producer_mod.supportsScalarTextProjection(producer.type, upstream.content_type) or request.source_field.len == 0 or request.source_template.len != 0)) return error.InvalidEnrichmentConfig;
         const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", upstream.name);
         defer runtime.alloc.free(key);
         upstream_raw = try storeGetOptionalAllocWithRetry(runtime, key);
@@ -6100,8 +6105,17 @@ fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enric
     const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
     const raw = try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key);
+    defer if (raw) |value| runtime.alloc.free(value);
     const source_digest: ?[32]u8 = if (raw) |value| sourceRecordDigest(value) else null;
     errdefer if (source_digest) |digest| if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), digest);
+    if (upstream_raw) |bytes| if (raw) |parent| {
+        const privacy = @import("../../../privacy/document.zig");
+        if (!privacy.isProtectedArtifactName(request.upstream_artifact_name) and privacy.consumerPolicyVersion(request.upstream_artifact_name) == null) {
+            var read = try runtime.store.beginProbe();
+            defer read.abort();
+            if (try ordered_publication.authority(&read) == null) try requireLocalAssetSource(runtime, &read, request.doc_key, request.upstream_artifact_name, parent, bytes);
+        }
+    };
     // A replay window can contain a newer update for the same document. Keep
     // old cache entries alive for already queued provider inputs, but reuse
     // only an entry captured from this exact source version.
@@ -6112,9 +6126,8 @@ fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enric
         if (source_digest) |digest| {
             if (!std.mem.eql(u8, &entry.source_record_digest.?, &digest)) continue;
         }
-        if (raw) |value| runtime.alloc.free(value);
         runtime.alloc.free(cache_key);
-        return .{ .chunks = entry.chunks, .source_record_digest = entry.source_record_digest };
+        return .{ .chunks = entry.chunks, .source_record_digest = entry.source_record_digest, .upstream_digest = entry.upstream_digest };
     }
     if (raw == null) {
         const retired_scope = try media_pass.scope(runtime.alloc, request.doc_key, requestArtifactName(request), request.source_field);
@@ -6128,9 +6141,25 @@ fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enric
         });
         return .{ .chunks = empty, .source_record_digest = source_digest };
     }
-    defer runtime.alloc.free(raw.?);
 
-    if (request.upstream_artifact_name.len != 0 and upstream_raw == null) return error.ArtifactPublicationPending;
+    if (request.upstream_artifact_name.len != 0 and upstream_raw == null) {
+        // A mixed text/media corpus legitimately has no text input on some
+        // parents. Prove that absence from the captured primary, rather than
+        // retrying a producer that intentionally published no output forever.
+        // Nested upstreams and nonempty inputs still require publication proof.
+        const upstream = runtime.index_manager.getEnrichment(.asset, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
+        if (upstream.source_artifact_name.len != 0) return error.ArtifactPublicationPending;
+        var root_request = request;
+        root_request.kind = .asset;
+        root_request.source_field = upstream.source_field;
+        root_request.source_template = upstream.source_template;
+        const input = try extractAssetSourceValue(runtime.alloc, runtime.config, raw.?, root_request);
+        defer if (input) |text| runtime.alloc.free(@constCast(text));
+        if (input != null) return error.ArtifactPublicationPending;
+        const empty = try runtime.alloc.alloc(chunker_mod.Chunk, 0);
+        try cache.append(runtime.alloc, .{ .key = cache_key, .chunks = empty, .source_record_digest = source_digest });
+        return .{ .chunks = empty, .source_record_digest = source_digest };
+    }
     if (upstream_raw) |bytes| {
         const privacy = @import("../../../privacy/document.zig");
         if (privacy.isProtectedArtifactName(request.upstream_artifact_name) or privacy.consumerPolicyVersion(request.upstream_artifact_name) != null) {
@@ -6162,6 +6191,30 @@ fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enric
             errdefer chunker_mod.freeChunks(runtime.alloc, chunks);
             try cache.append(runtime.alloc, .{ .key = cache_key, .chunks = chunks, .source_record_digest = source_digest });
             return .{ .chunks = chunks, .source_record_digest = source_digest };
+        }
+        const upstream = runtime.index_manager.getEnrichment(.asset, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
+        var producer = try asset_producer_mod.parseProducerConfig(runtime.alloc, upstream.producer_json);
+        defer producer.deinit(runtime.alloc);
+        if (producer.type != .media_output) {
+            // Local consumers require a storage-authored receipt above; ordered
+            // consumers additionally carry readUpstream causal publication guards.
+            const document = if (std.mem.eql(u8, upstream.content_type, "text/plain"))
+                try std.json.Stringify.valueAlloc(runtime.alloc, .{ .text = bytes }, .{})
+            else
+                try runtime.alloc.dupe(u8, bytes);
+            defer runtime.alloc.free(document);
+            const text = try extractSourceText(runtime.alloc, runtime.config, document, request);
+            defer if (text) |value| runtime.alloc.free(value);
+            const chunks = if (text) |value|
+                if (request.chunker_json.len > 0)
+                    try chunker_mod.chunkTextWithConfigJsonAndProvider(runtime.alloc, value, request.chunker_json, runtime.config.chunk_provider)
+                else
+                    try chunker_mod.chunkText(runtime.alloc, value, request.chunk_size, request.chunk_overlap)
+            else
+                try runtime.alloc.alloc(chunker_mod.Chunk, 0);
+            errdefer chunker_mod.freeChunks(runtime.alloc, chunks);
+            try cache.append(runtime.alloc, .{ .key = cache_key, .chunks = chunks, .source_record_digest = source_digest, .upstream_digest = sourceRecordDigest(bytes) });
+            return .{ .chunks = chunks, .source_record_digest = source_digest, .upstream_digest = sourceRecordDigest(bytes) };
         }
         var asset = try std.json.parseFromSlice(struct { text: []const u8 }, runtime.alloc, bytes, .{ .ignore_unknown_fields = true });
         defer asset.deinit();
@@ -16190,7 +16243,17 @@ fn processAsset(
             defer read.abort();
             break :blk try @import("../artifact_asset_publication.zig").readUpstream(runtime.alloc, value, &read, upstream_key);
         }
-        break :blk try storeGetOptionalAllocWithRetry(runtime, upstream_key);
+        const bytes = try storeGetOptionalAllocWithRetry(runtime, upstream_key);
+        errdefer if (bytes) |value| runtime.alloc.free(value);
+        if (bytes) |value| {
+            const privacy = @import("../../../privacy/document.zig");
+            if (!privacy.isProtectedArtifactName(request.upstream_artifact_name) and privacy.consumerPolicyVersion(request.upstream_artifact_name) == null) {
+                var read = try runtime.store.beginProbe();
+                defer read.abort();
+                try requireLocalAssetSource(runtime, &read, request.doc_key, request.upstream_artifact_name, raw, value);
+            }
+        }
+        break :blk bytes;
     } else try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request)) orelse {
         if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
@@ -16198,7 +16261,7 @@ fn processAsset(
         if (producer_cfg.type == .document_extraction) {
             try deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window);
         } else {
-            try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
+            try retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_absent = consumes_upstream });
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         }
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
@@ -16210,6 +16273,11 @@ fn processAsset(
     };
     var source_text_owned = true;
     defer if (source_text_owned) runtime.alloc.free(@constCast(source_text));
+    const upstream_digest: ?[32]u8 = digest: {
+        const privacy = @import("../../../privacy/document.zig");
+        if (context != null or !consumes_upstream or privacy.isProtectedArtifactName(request.upstream_artifact_name) or privacy.consumerPolicyVersion(request.upstream_artifact_name) != null) break :digest null;
+        break :digest sourceRecordDigest(source_text);
+    };
     if (consumes_upstream and context == null) {
         const privacy = @import("../../../privacy/document.zig");
         const root = privacy.isProtectedArtifactName(request.upstream_artifact_name);
@@ -16237,7 +16305,7 @@ fn processAsset(
             if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
             const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
             defer runtime.alloc.free(state_key);
-            try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
+            try retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest });
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
             try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
             try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
@@ -16264,7 +16332,7 @@ fn processAsset(
         if (producer_cfg.type == .document_extraction) {
             try deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window);
         } else {
-            try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
+            try retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest });
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         }
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
@@ -16308,7 +16376,7 @@ fn processAsset(
 
     if (producer_cfg.type == .copy) {
         if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, source_text);
-        if (try shouldSkipAssetArtifact(runtime, key, source_text)) {
+        if (try shouldSkipAssetArtifact(runtime, key, source_text) and try reusableLocalAsset(runtime, request.doc_key, artifact_name, raw, source_text)) {
             try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
             try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
             // The artifact exists and is current: produced coverage, so an
@@ -16316,7 +16384,12 @@ fn processAsset(
             try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
             return;
         }
-        try storePutWithRetry(runtime, key, source_text);
+        const local = @import("../artifact_local_publication.zig");
+        const receipt_key = try local.key(runtime.alloc, key);
+        defer runtime.alloc.free(receipt_key);
+        const producer_recipe = local.requestRecipe(request);
+        const receipt = local.encode(producer_recipe, raw, source_text);
+        try storePutBatchGuardedWithRetry(runtime, &.{ .{ .key = key, .value = source_text }, .{ .key = receipt_key, .value = &receipt } }, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest, .producer_name = artifact_name, .producer_recipe = producer_recipe });
         try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
         try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
@@ -16375,7 +16448,7 @@ fn processAsset(
         const existing = try storeGetOptionalAllocWithRetry(runtime, key);
         if (existing) |value| {
             defer runtime.alloc.free(value);
-            if (try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
+            if (try reusableLocalAsset(runtime, request.doc_key, artifact_name, raw, value) and try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
                 try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
                 try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
                 // Private outputs also require their destination-owned witness.
@@ -16410,6 +16483,7 @@ fn processAsset(
         .raw_doc = if (context == null) raw else @constCast(""),
         .source_text = source_text,
         .source_parts_json = source_parts_json,
+        .upstream_digest = upstream_digest,
         .artifact_key = key,
         .state_key = state_key,
         .state_value = state_value,
@@ -18001,7 +18075,14 @@ fn applyAssetProducerBatchOutput(
         witness = local.encode(version, if (private_consumer_version != null) item.raw_doc else item.source_text, validated);
         try writes.append(runtime.alloc, .{ .key = witness_key.?, .value = &witness });
     }
-    try storePutBatch(runtime, writes.items, &.{});
+    const local = @import("../artifact_local_publication.zig");
+    const receipt_key = try local.key(runtime.alloc, item.artifact_key);
+    defer runtime.alloc.free(receipt_key);
+    const producer_recipe = local.requestRecipe(item.request);
+    const receipt = local.encode(producer_recipe, item.raw_doc, validated);
+    try writes.append(runtime.alloc, .{ .key = receipt_key, .value = &receipt });
+    try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe });
+
     try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, item.artifact_key);
 
     const artifact_name = requestArtifactName(item.request);
@@ -26951,6 +27032,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .transcript_confidence = unit.transcript_confidence,
         .extraction_warning = unit.extraction_warning,
     });
+    try chunk_artifact_mod.appendTranscriptSpans(alloc, &obj, unit.transcript_spans, chunk);
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
 
@@ -31572,7 +31654,7 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
             const upstream = runtime.index_manager.getEnrichment(.asset, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
             var producer = try asset_producer_mod.parseProducerConfig(runtime.alloc, upstream.producer_json);
             defer producer.deinit(runtime.alloc);
-            if (producer.type != .media_output and !@import("../../../privacy/document.zig").isProtectedArtifactName(upstream.name) and @import("../../../privacy/document.zig").consumerPolicyVersion(upstream.name) == null) return error.OnlineMergeArtifactTailsUnsupported;
+            if (!asset_producer_mod.supportsScalarTextProjection(producer.type, upstream.content_type) and !@import("../../../privacy/document.zig").isProtectedArtifactName(upstream.name) and @import("../../../privacy/document.zig").consumerPolicyVersion(upstream.name) == null) return error.OnlineMergeArtifactTailsUnsupported;
         }
         var plan = try runtime.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
@@ -31871,6 +31953,7 @@ fn processChunkText(
         artifact_name,
         desired_stored_chunk_keys,
         desired_chunk_keys,
+        .{ .doc_key = request.doc_key, .digest = chunk_source.source_record_digest, .upstream_name = request.upstream_artifact_name, .upstream_digest = chunk_source.upstream_digest },
     );
     defer freeKeyList(runtime.alloc, stale_chunk_keys);
     // Graph reconciliation consumes the artifact journal, not the vector/text
@@ -31910,7 +31993,7 @@ fn processChunkText(
                 try writes.append(runtime.alloc, .{ .key = key, .value = &witnesses[i] });
             }
         }
-        try storePutBatchWithRetry(runtime, writes.items, &.{});
+        try storePutBatchGuardedWithRetry(runtime, writes.items, &.{}, .{ .doc_key = request.doc_key, .digest = chunk_source.source_record_digest, .upstream_name = request.upstream_artifact_name, .upstream_digest = chunk_source.upstream_digest });
         for (prepared_chunks.?.mutations) |write| {
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, write.key);
         }
@@ -33981,6 +34064,16 @@ fn shouldSkipAssetArtifact(runtime: *EnrichmentRuntime, artifact_key: []const u8
 /// Native restore retains artifact bodies and producer skip state, but never
 /// imports standalone publication authority. Missing/stale witnesses require
 /// ordinary producer execution and its atomic output/witness commit.
+fn reusableLocalAsset(runtime: *EnrichmentRuntime, doc_key: []const u8, name: []const u8, parent: []const u8, output: []const u8) !bool {
+    var read = try runtime.store.beginProbe();
+    defer read.abort();
+    requireLocalAssetSource(runtime, &read, doc_key, name, parent, output) catch |err| switch (err) {
+        error.ArtifactPublicationPending, error.EnrichmentSourceChanged => return false,
+        else => return err,
+    };
+    return true;
+}
+
 fn reusablePrivateAsset(runtime: *EnrichmentRuntime, name: []const u8, artifact: []const u8, source: []const u8, primary: []const u8, config_json: []const u8, output: []const u8) !bool {
     const privacy = @import("../../../privacy/document.zig");
     const consumer_version = privacy.consumerPolicyVersion(name);
@@ -35765,6 +35858,7 @@ fn deleteStaleChunkArtifacts(
     artifact_name: []const u8,
     desired_stored_chunk_keys: []const []const u8,
     desired_logical_chunk_keys: []const []const u8,
+    source: LocalSourceFence,
 ) ![][]u8 {
     const prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "chunk", artifact_name);
     defer runtime.alloc.free(prefix);
@@ -35796,7 +35890,7 @@ fn deleteStaleChunkArtifacts(
         // Deleting them here withdraws serving vectors before a retryable
         // provider can produce replacements, including across process reopen.
     }
-    if (deletes.items.len > 0) try storePutBatchWithRetry(runtime, &.{}, deletes.items);
+    if (deletes.items.len > 0) try storePutBatchGuardedWithRetry(runtime, &.{}, deletes.items, source);
     return try stale_chunk_keys.toOwnedSlice(runtime.alloc);
 }
 
@@ -38028,7 +38122,83 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
     try txn.commit();
 }
 
+const LocalSourceFence = struct {
+    doc_key: []const u8,
+    digest: ?[32]u8,
+    upstream_name: []const u8 = "",
+    upstream_digest: ?[32]u8 = null,
+    upstream_absent: bool = false,
+    producer_name: []const u8 = "",
+    producer_recipe: ?[32]u8 = null,
+};
+
+fn requireLocalAssetSource(runtime: *EnrichmentRuntime, txn: anytype, doc_key: []const u8, name: []const u8, parent: []const u8, output: []const u8) !void {
+    if (try @import("../../source_authority.zig").maintenanceMode(txn) != .local) return error.ArtifactPublicationPending;
+    const local = @import("../artifact_local_publication.zig");
+    const entry = runtime.index_manager.getEnrichment(.asset, name) orelse return error.InvalidEnrichmentConfig;
+    const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "asset", name);
+    defer runtime.alloc.free(key);
+    try local.require(runtime.alloc, txn, key, local.recipe(entry), parent, output);
+}
+
+fn validateLocalSourceFence(runtime: *EnrichmentRuntime, txn: anytype, guard: LocalSourceFence) !void {
+    if (try @import("../../source_authority.zig").maintenanceMode(txn) != .local) return error.ArtifactPublicationPending;
+    if (guard.producer_recipe) |expected| {
+        const entry = runtime.index_manager.getEnrichment(.asset, guard.producer_name) orelse return error.EnrichmentSourceChanged;
+        if (!std.mem.eql(u8, &expected, &@import("../artifact_local_publication.zig").recipe(entry))) return error.EnrichmentSourceChanged;
+    }
+    const key = try documentSourceStoreKeyAlloc(runtime, guard.doc_key);
+    defer runtime.alloc.free(key);
+    const stored = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+    const logical = if (stored) |bytes| try materializeProducerInput(runtime.index_manager, runtime.alloc, key, bytes) else null;
+    defer if (logical) |bytes| runtime.alloc.free(bytes);
+    if (!std.meta.eql(guard.digest, if (logical) |bytes| sourceRecordDigest(bytes) else @as(?[32]u8, null))) return error.EnrichmentSourceChanged;
+    if (guard.upstream_absent) {
+        const upstream_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, guard.doc_key, "asset", guard.upstream_name);
+        defer runtime.alloc.free(upstream_key);
+        const value = txn.get(upstream_key) catch |err| if (err == error.NotFound) null else return err;
+        if (value != null) return error.EnrichmentSourceChanged;
+    }
+    if (guard.upstream_digest) |expected| {
+        const upstream_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, guard.doc_key, "asset", guard.upstream_name);
+        defer runtime.alloc.free(upstream_key);
+        const output = txn.get(upstream_key) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
+        if (!std.mem.eql(u8, &expected, &sourceRecordDigest(output))) return error.EnrichmentSourceChanged;
+        try requireLocalAssetSource(runtime, txn, guard.doc_key, guard.upstream_name, logical orelse return error.EnrichmentSourceChanged, output);
+    }
+}
+
+fn retireLocalAssetOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, key: []const u8, state_key: []const u8, source: LocalSourceFence) !void {
+    const local = @import("../artifact_local_publication.zig");
+    const receipt_key = try local.key(runtime.alloc, key);
+    defer runtime.alloc.free(receipt_key);
+    var guard = source;
+    guard.producer_name = requestArtifactName(request);
+    guard.producer_recipe = local.requestRecipe(request);
+    try storePutBatchGuardedWithRetry(runtime, &.{}, &.{ key, state_key, receipt_key }, guard);
+}
+
 fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
+    return storePutBatchGuarded(runtime, writes, deletes, null);
+}
+
+fn storePutBatchGuardedWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8, source: LocalSourceFence) !void {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        try heartbeatEnrichmentLease(runtime);
+        storePutBatchGuarded(runtime, writes, deletes, source) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+}
+
+fn storePutBatchGuarded(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8, source: ?LocalSourceFence) !void {
     var publication_store = try RuntimePublicationStore.init(runtime);
     defer publication_store.deinit();
     const live_store = publication_store.store(runtime);
@@ -38040,6 +38210,7 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
     var batch = try live_store.*.beginBatch();
     errdefer batch.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
+    if (source) |guard| try validateLocalSourceFence(runtime, &batch, guard);
     for (writes) |write| try @import("../artifact_publication.zig").requireLegacyMaterialization(&batch, write.key);
     for (deletes) |key| try @import("../artifact_publication.zig").requireLegacyMaterialization(&batch, key);
     try updateDenseArtifactTargetCountersTxn(runtime, &batch, writes, deletes);
@@ -41299,7 +41470,7 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
     try std.testing.expect(runtime.retry_error_has_request_identity);
 }
 
-test "asset producer neighbor context samples local graph adjacency into the input and skip state" {
+test "generic contextual asset publication keeps raw upstream identity" {
     const alloc = std.testing.allocator;
     const DB = @import("../mod.zig").DB;
     const doc_key = "entities/org/black_mountain_college";
@@ -41384,16 +41555,218 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         .{ .key = doc_store_key, .value = "{\"name\":\"Black Mountain College\"}" },
     }, &.{});
 
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{
+    var request: enrichment_types.GeneratedEnrichmentRequest = .{
         .kind = .asset,
         .index_name = "conceptualize_v1",
         .artifact_name = "conceptualize_v1",
         .doc_key = doc_key,
-        .source_field = "name",
+        .source_field = "",
+        .upstream_artifact_name = "upstream",
+        .content_type = "application/json",
         .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .neighbor_context_json = "{\"graph_index\":\"taxonomy\",\"direction\":\"out\",\"limit\":8}",
         .sequence = 3,
     };
+    var prepared_sources = PreparedDocumentSourceCache.init(&runtime);
+    defer prepared_sources.deinit();
+
+    const runOnce = struct {
+        fn run(rt: *EnrichmentRuntime, req: enrichment_types.GeneratedEnrichmentRequest, sources: *PreparedDocumentSourceCache, win: *GeneratedReplayWindow) !void {
+            var batch = PreparedAssetBatch{};
+            defer batch.deinit(rt.alloc);
+            var scope = FailureScope{ .fingerprint = requestFailureFingerprint(req) };
+            try processAsset(rt, req, &batch, sources, win, &scope);
+            try batch.flush(rt, win, &scope);
+            try std.testing.expect(batch.retry_error == null);
+        }
+    }.run;
+
+    try db.core.index_manager.addEnrichment(&store, .{ .name = "upstream", .kind = .asset, .field = "name", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.core.index_manager.addEnrichment(&store, .{ .name = request.artifact_name, .kind = .asset, .source_artifact_name = "upstream", .content_type = request.content_type, .producer_json = request.producer_json, .neighbor_context = .{ .graph_index = "taxonomy", .direction = .out, .limit = 8 } });
+    request.neighbor_context_json = db.core.index_manager.getEnrichment(.asset, request.artifact_name).?.neighbor_context_json;
+    const local = @import("../artifact_local_publication.zig");
+    const upstream = db.core.index_manager.getEnrichment(.asset, "upstream").?;
+    const upstream_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", "upstream");
+    defer alloc.free(upstream_key);
+    const receipt_key = try local.key(alloc, upstream_key);
+    defer alloc.free(receipt_key);
+    const parent = "{\"name\":\"Black Mountain College\"}";
+    const raw_upstream = "upstream input";
+    const receipt = local.encode(local.recipe(upstream), parent, raw_upstream);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = upstream_key, .value = raw_upstream }, .{ .key = receipt_key, .value = &receipt } }, &.{});
+    try runOnce(&runtime, request, &prepared_sources, &window);
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    try std.testing.expect(std.mem.startsWith(u8, harness.last_input.items, "upstream input\n{\"neighbors\":"));
+    // An unchanged contextual input does not invoke the model twice.
+    try runOnce(&runtime, request, &prepared_sources, &window);
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    try db.batch(.{ .graph_writes = &.{.{ .index_name = "taxonomy", .source = doc_key, .target = "changed-neighbor", .edge_type = "mentions" }}, .sync_level = .full_index });
+    var batch = PreparedAssetBatch{};
+    defer batch.deinit(alloc);
+    var scope = FailureScope{ .fingerprint = requestFailureFingerprint(request) };
+    try processAsset(&runtime, request, &batch, &prepared_sources, &window, &scope);
+    try std.testing.expectEqual(@as(usize, 1), batch.items.items.len);
+    try std.testing.expectEqual(sourceRecordDigest(raw_upstream), batch.items.items[0].upstream_digest.?);
+    // A newer upstream must reject a result captured from the older bytes.
+    try storePutWithRetry(&runtime, upstream_key, "new input");
+    try std.testing.expectError(error.EnrichmentSourceChanged, applyAssetProducerBatchOutput(&runtime, &batch.items.items[0], "{\"entities\":[]}", &window));
+    // Empty input retires the output and its receipt atomically.
+    const missing = "";
+    const missing_receipt = local.encode(local.recipe(upstream), parent, missing);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = upstream_key, .value = missing }, .{ .key = receipt_key, .value = &missing_receipt } }, &.{});
+    try runOnce(&runtime, request, &prepared_sources, &window);
+    const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", request.artifact_name);
+    defer alloc.free(output_key);
+    const output_receipt = try local.key(alloc, output_key);
+    defer alloc.free(output_receipt);
+    const retired_output = try storeGetOptionalAllocWithRetry(&runtime, output_key);
+    defer if (retired_output) |value| alloc.free(value);
+    const retired_receipt = try storeGetOptionalAllocWithRetry(&runtime, output_receipt);
+    defer if (retired_receipt) |value| alloc.free(value);
+    try std.testing.expect(retired_output == null and retired_receipt == null);
+    // A delayed no-input request from an older recipe must not retire a newer
+    // producer's output, receipt or skip state, nor publish skipped coverage.
+    const current_receipt = local.encode(local.recipe(upstream), parent, raw_upstream);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = upstream_key, .value = raw_upstream }, .{ .key = receipt_key, .value = &current_receipt } }, &.{});
+    try runOnce(&runtime, request, &prepared_sources, &window);
+    const output_state = try assetStateKeyAlloc(alloc, doc_key, request.artifact_name);
+    defer alloc.free(output_state);
+    const protected_keys = [_][]const u8{ output_key, output_receipt, output_state };
+    var previous: [3][]u8 = undefined;
+    for (protected_keys, 0..) |protected, i| previous[i] = (try storeGetOptionalAllocWithRetry(&runtime, protected)).?;
+    defer for (previous) |value| alloc.free(value);
+    const window_items = window.itemCount();
+    const coverage_items = window.coverage_transitions.items.len;
+    for ([_]bool{ false, true }) |root_selector| {
+        var obsolete = request;
+        obsolete.upstream_artifact_name = if (root_selector) "" else "retired_upstream";
+        obsolete.source_field = if (root_selector) "retired_field" else "";
+        try std.testing.expectError(error.EnrichmentSourceChanged, runOnce(&runtime, obsolete, &prepared_sources, &window));
+        for (protected_keys, previous) |protected, expected| {
+            const current = (try storeGetOptionalAllocWithRetry(&runtime, protected)).?;
+            defer alloc.free(current);
+            try std.testing.expectEqualSlices(u8, expected, current);
+        }
+        try std.testing.expectEqual(window_items, window.itemCount());
+        try std.testing.expectEqual(coverage_items, window.coverage_transitions.items.len);
+    }
+}
+
+test "asset producer neighbor context samples local graph adjacency into the input and skip state" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+    const doc_key = "entities/org/black_mountain_college";
+
+    const Harness = struct {
+        calls: usize = 0,
+        publications: u64 = 0,
+        last_input: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn produce(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_input.clearRetainingCapacity();
+            try self.last_input.appendSlice(std.testing.allocator, request.source_text);
+            return try a.dupe(u8, "{\"entities\":[{\"id\":\"c1\",\"label\":\"concept\",\"text\":\"college\"}]}");
+        }
+        fn canBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
+            return false;
+        }
+        fn write(
+            ptr: *anyopaque,
+            _: derived_types.DerivedBatch,
+            _: []const GeneratedArtifactPromotion,
+            _: []const []const u8,
+            _: []const GeneratedSourceGuard,
+            _: ?GeneratedWriteFence,
+        ) !GeneratedRecordCommit {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.publications += 1;
+            return .{ .sequence = self.publications };
+        }
+        fn notify(_: *anyopaque, _: u64) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const db_path = try std.fmt.bufPrint(&db_path_buf, ".zig-cache/tmp/{s}/graph-db", .{tmp.sub_path});
+    var db = try DB.open(alloc, db_path, .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "taxonomy", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .graph_writes = &.{
+        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/john_andrew_rice", .edge_type = "started_by", .weight = 0.98 },
+        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/place/north_carolina", .edge_type = "located_in", .weight = 0.5 },
+    }, .sync_level = .full_index });
+
+    // Without an admitted owner, a thin edge write must not emit work.
+    try db.batch(.{ .graph_writes = &.{
+        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/anni_albers", .edge_type = "taught", .weight = 0.6 },
+    } });
+    {
+        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), 0);
+        defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
+        try std.testing.expectEqual(@as(usize, 0), groups.len);
+    }
+
+    // Settle the thin graph write before observing context. Background replay
+    // is allowed to advance independently of this fixture's manual producer.
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    // Manual execution uses the admitted catalog and its publication fences.
+    try db.addEnrichment(.{
+        .name = "conceptualize_v1",
+        .kind = .asset,
+        .field = "name",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .neighbor_context = .{ .graph_index = "taxonomy" },
+    });
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var harness = Harness{};
+    defer harness.last_input.deinit(std.testing.allocator);
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = db.core.index_manager,
+        .write_ctx = &harness,
+        .write_fn = Harness.write,
+        .notify_ctx = &harness,
+        .notify_fn = Harness.notify,
+        .config = .{ .asset_producer = .{ .ptr = &harness, .vtable = &.{
+            .produce = Harness.produce,
+            .can_produce_batch = Harness.canBatch,
+            .invocation_memory_for_requests = testInvocationMemoryForRequests,
+        } }, .inline_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+    defer clearPublishedGeneratedArtifacts(&runtime);
+    defer clearIsolatedFailedIndexes(&runtime);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+
+    const doc_store_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    defer alloc.free(doc_store_key);
+    try storePutPrivateBatchWithRetry(&runtime, &runtime.store, &.{
+        .{ .key = doc_store_key, .value = "{\"name\":\"Black Mountain College\"}" },
+    }, &.{});
+
+    // Use canonical catalog-planned requests, including serialized context
+    // defaults, so the recipe fence certifies the definition actually invoked.
+    var manual_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
+    defer freeRequestPlanCache(alloc, &manual_plan_cache);
+    const manual_requests = try getOrCreatePlannedRequests(&runtime, doc_key, &manual_plan_cache);
+    try std.testing.expectEqual(@as(usize, 1), manual_requests.len);
+    var request = manual_requests[0];
+    request.sequence = 3;
     var prepared_sources = PreparedDocumentSourceCache.init(&runtime);
     defer prepared_sources.deinit();
 
@@ -41415,7 +41788,8 @@ test "asset producer neighbor context samples local graph adjacency into the inp
     try std.testing.expectEqualStrings(
         "Black Mountain College\n{\"neighbors\":[" ++
             "{\"edge_type\":\"located_in\",\"direction\":\"out\",\"target\":\"entities/place/north_carolina\",\"weight\":0.5}," ++
-            "{\"edge_type\":\"started_by\",\"direction\":\"out\",\"target\":\"entities/person/john_andrew_rice\",\"weight\":0.98}]}",
+            "{\"edge_type\":\"started_by\",\"direction\":\"out\",\"target\":\"entities/person/john_andrew_rice\",\"weight\":0.98}," ++
+            "{\"edge_type\":\"taught\",\"direction\":\"out\",\"target\":\"entities/person/anni_albers\",\"weight\":0.6}]}",
         harness.last_input.items,
     );
 
@@ -41435,52 +41809,40 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         "Black Mountain College\n{\"neighbors\":[" ++
             "{\"edge_type\":\"influenced\",\"direction\":\"out\",\"target\":\"entities/person/josef_albers\",\"weight\":0.75}," ++
             "{\"edge_type\":\"located_in\",\"direction\":\"out\",\"target\":\"entities/place/north_carolina\",\"weight\":0.5}," ++
-            "{\"edge_type\":\"started_by\",\"direction\":\"out\",\"target\":\"entities/person/john_andrew_rice\",\"weight\":0.98}]}",
+            "{\"edge_type\":\"started_by\",\"direction\":\"out\",\"target\":\"entities/person/john_andrew_rice\",\"weight\":0.98}," ++
+            "{\"edge_type\":\"taught\",\"direction\":\"out\",\"target\":\"entities/person/anni_albers\",\"weight\":0.6}]}",
         harness.last_input.items,
     );
 
     // A request without neighbor context keeps its input untouched even when
     // graph indexes exist for the table.
-    var plain = request;
-    plain.artifact_name = "plain_v1";
-    plain.index_name = "plain_v1";
-    plain.neighbor_context_json = "";
+    try db.addEnrichment(.{
+        .name = "plain_v1",
+        .kind = .asset,
+        .field = "name",
+        .producer_json = request.producer_json,
+    });
+    var plain_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
+    defer freeRequestPlanCache(alloc, &plain_plan_cache);
+    const plain_requests = try getOrCreatePlannedRequests(&runtime, doc_key, &plain_plan_cache);
+    const plain = blk: {
+        for (plain_requests) |planned| {
+            if (std.mem.eql(u8, planned.artifact_name, "plain_v1")) break :blk planned;
+        }
+        return error.TestUnexpectedResult;
+    };
     try runOnce(&runtime, plain, &prepared_sources, &window);
     try std.testing.expectEqual(@as(usize, 3), harness.calls);
     try std.testing.expectEqualStrings("Black Mountain College", harness.last_input.items);
 
-    // --- Scheduling. The manual invocations above prove the skip-state
-    // behavior; the rest drives the re-run through the scheduling path the
-    // worker uses (edge batch -> replay hint emission -> worker selection ->
-    // catalog-planned request). Before any asset enrichment references the
-    // graph index, an edge-only batch on the default thin-replay sync level
-    // emits no enrichment hint, so worker selection yields nothing.
-    try db.batch(.{ .graph_writes = &.{
-        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/anni_albers", .edge_type = "taught", .weight = 0.6 },
-    } });
-    {
-        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), 0);
-        defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
-        try std.testing.expectEqual(@as(usize, 0), groups.len);
-    }
-
-    // Admit the neighbor-context enrichment and apply another edge-only
-    // batch through the same thin path. The journal record now carries the
-    // enrichment hint for the owning source document and, because the
-    // context samples reverse edges (direction `both`), for the same-table
-    // target document.
-    try db.addEnrichment(.{
-        .name = "conceptualize_v1",
-        .kind = .asset,
-        .field = "name",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-        .neighbor_context = .{ .graph_index = "taxonomy" },
-    });
+    // The manual invocations handled earlier changes. Observe only subsequent
+    // hints when driving admitted producers through the scheduling path.
+    const scheduling_after = db.core.nextDerivedSequence();
     try db.batch(.{ .graph_writes = &.{
         .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/ruth_asawa", .edge_type = "exhibited", .weight = 0.25 },
     } });
     const write_hint_sequence = blk: {
-        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), 0);
+        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), scheduling_after);
         defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
         try std.testing.expectEqual(@as(usize, 2), groups.len);
         try std.testing.expectEqualStrings(doc_key, groups[0].doc_key);
@@ -41519,7 +41881,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
     }.run;
     try db.runDerivedUntil(write_hint_sequence);
     {
-        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), 0);
+        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), scheduling_after);
         defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
         try runScheduled(&runtime, groups, &request_plan_cache, &prepared_sources, &window);
     }
@@ -42325,6 +42687,60 @@ test "enrichment extractSourceText empty fields and templates share no output wh
         defer alloc.free(whitespace);
         try std.testing.expectEqualStrings(" \t\n", whitespace);
     }
+}
+
+test "source semantic media input preserves typed bytes instead of embedding URI text" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        fn text(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedTextEmbedding;
+        }
+        fn parts(ptr: *anyopaque, alloc: Allocator, _: []const u8, input: []const template.ContentPart, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), input.len);
+            try std.testing.expect(input[0] == .binary);
+            try std.testing.expectEqualStrings("image/png", input[0].binary.mime_type);
+            try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, input[0].binary.data);
+            self.calls += 1;
+            return alloc.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    var probe = Probe{};
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &probe, .dense_embed_fn = Probe.text, .dense_embed_parts_fn = Probe.parts };
+    const raw = "{\"content\":{\"resource\":{\"uri\":\"data:image/png;base64,AQID\"}}}";
+    var request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "images", .doc_key = "doc", .source_field = "", .source_template = "{{media url=content.resource.uri}}" };
+    var media = try prepareDenseSourceInput(a, .{}, provider, raw, request);
+    defer media.deinit(a);
+    try std.testing.expect(media == .parts);
+    const vector = try provider.embedDenseParts(a, "images", media.parts, 2);
+    defer a.free(vector);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+
+    // This formerly passed Sources media readiness, but native rendering has
+    // always produced a text part containing the URI, not the media bytes.
+    request.source_template = "{{content.resource.uri}}";
+    var text = try prepareDenseSourceInput(a, .{}, provider, raw, request);
+    defer text.deinit(a);
+    try std.testing.expect(text == .parts);
+    try std.testing.expectEqual(@as(usize, 1), text.parts.len);
+    try std.testing.expect(text.parts[0] == .text);
+    try std.testing.expectEqualStrings("data:image/png;base64,AQID", text.parts[0].text);
+    // Native field selectors are literal root keys. PDF locator templates must
+    // select the nested source and preserve signed URI bytes without escaping.
+    const signed = "https://example.com/file.pdf?token=a&part=b";
+    const pdf_raw = "{\"content\":{\"resource\":{\"uri\":\"https://example.com/file.pdf?token=a&part=b\"}}}";
+    request.embedding_input = .pdf_page_images;
+    request.source_template = "";
+    request.source_field = "content.resource.uri";
+    const dotted = try extractSourceText(a, .{}, pdf_raw, request);
+    defer if (dotted) |value| a.free(value);
+    try std.testing.expect(dotted == null);
+    request.source_field = "";
+    request.source_template = "{{{content.resource.uri}}}";
+    const nested = (try extractSourceText(a, .{}, pdf_raw, request)).?;
+    defer a.free(nested);
+    try std.testing.expectEqualStrings(signed, nested);
 }
 
 test "extractSourceText with template skips _embeddings field" {
@@ -46454,6 +46870,73 @@ test "document preparation copy admission failure discards optional state withou
     try std.testing.expectEqualStrings("native text", units[0].text);
     try std.testing.expectEqualStrings("pending_ocr", units[0].extraction_status.?);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
+test "generic scalar chunks reject stale upstream and fence publication" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/generic-upstream-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    defer clearIndexEmbeddingActivity(&runtime);
+    var cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
+    defer {
+        freeWorkerChunkCache(alloc, &cache);
+    }
+
+    try index_manager.addEnrichment(&store, .{ .name = "units", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    const local = @import("../artifact_local_publication.zig");
+    const entry = index_manager.getEnrichment(.asset, "units").?;
+    const parent_key = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer alloc.free(parent_key);
+    const upstream_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "units");
+    defer alloc.free(upstream_key);
+    const receipt_key = try local.key(alloc, upstream_key);
+    defer alloc.free(receipt_key);
+    const old_parent = "{\"body\":\"old revision content\"}";
+    const new_parent = "{\"body\":\"new revision content\"}";
+    const bytes = "old revision content";
+    try storePutWithRetry(&runtime, parent_key, new_parent);
+    try storePutWithRetry(&runtime, upstream_key, bytes);
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .chunk_text, .index_name = "chunks", .artifact_name = "chunks", .doc_key = "doc", .upstream_artifact_name = "units", .source_field = "text", .chunk_size = 512 };
+    try std.testing.expectError(error.ArtifactPublicationPending, getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null));
+    const receipt = local.encode(local.recipe(entry), old_parent, bytes);
+    try storePutWithRetry(&runtime, receipt_key, &receipt);
+    try std.testing.expectError(error.EnrichmentSourceChanged, getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null));
+    try storePutWithRetry(&runtime, parent_key, old_parent);
+    const accepted = try getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null);
+    try std.testing.expectEqual(@as(usize, 1), accepted.chunks.len);
+    try std.testing.expectEqual(sourceRecordDigest(old_parent), accepted.source_record_digest.?);
+    // A parent update after preparation must also fail in the publication txn.
+    try storePutWithRetry(&runtime, parent_key, new_parent);
+    try std.testing.expectError(error.EnrichmentSourceChanged, storePutBatchGuarded(&runtime, &.{}, &.{}, .{ .doc_key = "doc", .digest = accepted.source_record_digest, .upstream_name = "units", .upstream_digest = accepted.upstream_digest }));
+    // Cache reuse must validate the receipt again, not reuse the old proof.
+    try std.testing.expectError(error.EnrichmentSourceChanged, getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null));
 }
 
 test "OCR sampling reuse gate requires current state before skipping extraction" {

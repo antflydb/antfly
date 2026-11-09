@@ -40,7 +40,7 @@ fn configFor(a: Allocator, command: publication.Command, catalogs: inventory.Cat
             if (value.kind == .asset and std.mem.eql(u8, value.name, config.source_artifact_name)) break value;
         } else return error.InvalidBatchRequest;
         const producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(a, upstream.producer_json);
-        if (producer.type != .media_output) return error.OnlineMergeArtifactTailsUnsupported;
+        if (!@import("enrichment/asset_producer.zig").supportsScalarTextProjection(producer.type, upstream.content_type)) return error.OnlineMergeArtifactTailsUnsupported;
     }
     return .{ .config = config, .configs = configs };
 }

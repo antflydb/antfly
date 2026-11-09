@@ -4523,6 +4523,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .transcript_confidence = unit.transcript_confidence,
                 .extraction_warning = unit.extraction_warning,
             });
+            try chunk_artifact_mod.appendTranscriptSpans(alloc, &obj, unit.transcript_spans, chunk);
             return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
         }
 
@@ -5095,6 +5096,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const privacy_prefix = try @import("../../privacy/local_publication.zig").key(alloc, document_prefix);
             defer alloc.free(privacy_prefix);
             try collectDeleteKeysForPrefix(alloc, store, privacy_prefix, delete_keys, owned_delete_keys, null);
+            const local_asset_prefix = try @import("artifact_local_publication.zig").key(alloc, document_prefix);
+            defer alloc.free(local_asset_prefix);
+            try collectDeleteKeysForPrefix(alloc, store, local_asset_prefix, delete_keys, owned_delete_keys, null);
             const retry_prefix = try @import("../../privacy/retry.zig").key(alloc, document_prefix);
             defer alloc.free(retry_prefix);
             try collectDeleteKeysForPrefix(alloc, store, retry_prefix, delete_keys, owned_delete_keys, null);

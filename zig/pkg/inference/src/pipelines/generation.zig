@@ -209,6 +209,13 @@ fn qwenVisionLimits(allocator: std.mem.Allocator, model_dir: []const u8, config:
     return .{ .min_merged_tokens = min_tokens, .max_merged_tokens = max_tokens, .hard_max_merged_tokens = max_tokens };
 }
 
+/// The fallback owner is selected only without an external projector or the
+/// integrated Qwen3-VL architecture contract. Other media owners budget their
+/// own routes; do not prepay this owner's credit for those paths.
+pub fn fallbackImagePreparationBytes(config: gpt_mod.Config, projector_path: ?[]const u8, media: NativeGenerationMediaAdmission) usize {
+    return if (projector_path == null and config.family == .qwen3_5 and !config.hasQwen35VisionArchitectureContract()) media.host_scratch_bytes else 0;
+}
+
 pub fn nativeGenerationMediaAdmission(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
@@ -4185,6 +4192,8 @@ pub const NativeGenerationPipeline = struct {
     /// Borrowed invocation budget; portable video scratch is additional to the
     /// generation estimate and must also respect offline CLI memory limits.
     media_run_budget: ?*runtime.tier.memory.RunBudget = null,
+    /// Borrowed process credit for media preparation, held until generate returns.
+    media_prepaid: @import("preprocessing_memory.zig").Credit = .{},
     /// An operator's scratch cap. Zero leaves the automatic cap free to grow.
     explicit_scratch_limit: usize = 0,
     gpt_config: gpt_mod.Config,
@@ -5743,6 +5752,8 @@ pub const NativeGenerationPipeline = struct {
             .{ prompt.len, actual_prompt_tokens },
         );
 
+        var image_memory = @import("preprocessing_memory.zig").Scope.init(allocator, self.session, self.media_prepaid, self.media_run_budget);
+        defer image_memory.deinit();
         var prepared_multimodal_prompt: ?gemma3_mm.PreparedPrompt = null;
         defer if (prepared_multimodal_prompt) |*prepared| {
             var execution_scope = if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex) else null;
@@ -6023,14 +6034,14 @@ pub const NativeGenerationPipeline = struct {
                     if (qwen_prompt_tokens == 0) return error.EmptyPrompt;
 
                     debugGenerationStage("qwen3.5 multimodal prepare embeddings prompt_tokens={d}", .{qwen_prompt_tokens});
-                    const qwen_prepared = try qwen2vl_mm.prepareExpandedPromptEmbeddings(
+                    const qwen_prepared = qwen2vl_mm.prepareExpandedPromptEmbeddings(
                         &self.cb,
-                        allocator,
+                        try image_memory.allocator(),
                         self.gpt_config,
                         prep_cfg,
                         qwen_encoded.ids[0..qwen_prompt_tokens],
                         images,
-                    );
+                    ) catch |err| return image_memory.failure(err);
                     debugGenerationStage("qwen3.5 multimodal prepared tokens={d}", .{qwen_prepared.token_ids.len});
                     prepared_multimodal_prompt = .{
                         .allocator = qwen_prepared.allocator,
@@ -6039,6 +6050,9 @@ pub const NativeGenerationPipeline = struct {
                         .input_embeddings = qwen_prepared.input_embeddings,
                         .attn_or_mask = qwen_prepared.attn_or_mask,
                     };
+                    // Decoder scratch has retired. Keep output credit, but do
+                    // not hold unused growth throughout a long generation.
+                    image_memory.trim() catch {};
                 } else {
                     const expanded_prompt = try gemma3_mm.expandPromptText(allocator, prompt, self.gpt_config, images.len);
                     defer allocator.free(expanded_prompt);
@@ -21131,5 +21145,14 @@ test "model processor resampling rejects native projector mismatch" {
             const limits = try qwenVisionLimits(a, path, config);
             try std.testing.expect(limits.max_merged_tokens > 0);
         } else try std.testing.expectError(error.UnsupportedQwen2VlPreprocessorConfig, qwenVisionLimits(a, path, config));
+    }
+}
+
+test "image decode admission planning credit follows the fallback image executor" {
+    const media = NativeGenerationMediaAdmission{ .host_scratch_bytes = 4096 };
+    try std.testing.expectEqual(@as(usize, 4096), fallbackImagePreparationBytes(.{ .family = .qwen3_5 }, null, media));
+    try std.testing.expectEqual(@as(usize, 0), fallbackImagePreparationBytes(.{ .family = .qwen3_5 }, "external.gguf", media));
+    for ([_]gpt_mod.ModelFamily{ .gemma, .qwen3_vl }) |family| {
+        try std.testing.expectEqual(@as(usize, 0), fallbackImagePreparationBytes(.{ .family = family }, null, media));
     }
 }

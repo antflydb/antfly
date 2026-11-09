@@ -1,0 +1,1 @@
+Synthetic 4096×1 RGBA PNG decoder-admission fixtures, generated with Python standard-library zlib. Each byte is `(i * 71 + i // 11 * 83) % 256`; rows use filter zero. The 8-bit and 16-bit inputs exercise scanline storage independently of model output geometry. No external corpus data is included.
