@@ -16705,8 +16705,9 @@ fn processAssetOrDefer(
     // their existing bounded execution paths; they do not queue provider input.
     var batch = PreparedAssetBatch{};
     defer batch.deinit(runtime.alloc);
-    // Scanner thread: the identity is the runtime-global active request.
-    var scope = FailureScope{ .fingerprint = runtime.active_failure_fingerprint };
+    // Keep the request owner for durable retry admission and terminal receipts.
+    var scope = FailureScope{};
+    scope.enterRequest(request);
     processAsset(runtime, request, &batch, prepared_sources, window, &scope) catch |err| return scope.scannerFailure(runtime, err);
     std.debug.assert(batch.items.items.len == 0);
 }
@@ -18164,7 +18165,9 @@ fn processDocumentExtractionAsset(
             documentExtractionBudgetDenialError(&prepared_sources.budgeted.?)
         else
             raw_err;
-        if (shouldYieldRequestError(runtime, err)) return err;
+        // Consult the owning durable retry scope before publishing a terminal
+        // receipt. The runtime-global counter does not own lane retries.
+        if (try scope.shouldYield(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
@@ -18181,15 +18184,17 @@ fn processDocumentExtractionAsset(
             from_generation,
             window,
         );
-        try recordIsolatedRequestError(runtime, window, request, err);
+        try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
         return;
     };
     var prepared_source_lease = switch (fetched) {
         .ok => |lease| lease,
         .http_error => |http_error| {
-            if (shouldYieldRemoteHttpFailure(runtime, http_error.status)) {
+            if (document_extraction_mod.remoteHttpStatusIsTransient(http_error.status)) {
+                // Parking persists the deadline, so install the server hint
+                // before asking the durable scope to schedule this attempt.
                 setRetryAfterHintFor(runtime, requestFailureFingerprint(request), http_error.retry_after_ms);
-                return error.RemoteDocumentFetchFailed;
+                if (try scope.shouldYield(runtime, error.RemoteDocumentFetchFailed)) return error.RemoteDocumentFetchFailed;
             }
             const message = try std.fmt.allocPrint(runtime.alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
             defer runtime.alloc.free(message);
@@ -18209,7 +18214,7 @@ fn processDocumentExtractionAsset(
                 from_generation,
                 window,
             );
-            try recordIsolatedRequestError(runtime, window, request, error.RemoteDocumentFetchFailed);
+            try recordIsolatedRequestErrorFor(runtime, window, request, error.RemoteDocumentFetchFailed, scope.attemptNumber(runtime));
             return;
         },
     };
@@ -18241,7 +18246,7 @@ fn processDocumentExtractionAsset(
             from_generation,
             window,
         );
-        try recordIsolatedRequestError(runtime, window, request, raw_err);
+        try recordIsolatedRequestErrorFor(runtime, window, request, raw_err, scope.attemptNumber(runtime));
         return;
     };
     const byte_source_fingerprint = if (metadata_fingerprint == null)
@@ -18311,7 +18316,7 @@ fn processDocumentExtractionAsset(
             configured_pdf_decode_limits,
             runtime.syncWaitTimeoutMs(),
         ) catch |err| {
-            if (shouldYieldRequestError(runtime, err)) return err;
+            if (try scope.shouldYield(runtime, err)) return err;
             try writeDocumentExtractionFailureManifest(
                 runtime,
                 request.doc_key,
@@ -18328,7 +18333,7 @@ fn processDocumentExtractionAsset(
                 from_generation,
                 window,
             );
-            try recordIsolatedRequestError(runtime, window, request, err);
+            try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
             return;
         }
     else
@@ -18466,7 +18471,7 @@ fn processDocumentExtractionAsset(
             documentExtractionBudgetDenialError(&prepared_sources.budgeted.?)
         else
             raw_err;
-        if (shouldYieldRequestError(runtime, err)) return err;
+        if (try scope.shouldYield(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
@@ -18483,7 +18488,7 @@ fn processDocumentExtractionAsset(
             from_generation,
             window,
         );
-        try recordIsolatedRequestError(runtime, window, request, err);
+        try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
         return;
     };
     // Page rendering is complete. Its task-local coordinator is gone, while the
@@ -18694,7 +18699,7 @@ fn processDocumentExtractionAsset(
             error.DocumentExtractionWorkingSetTooLarge
         else
             raw_err;
-        if (shouldYieldRequestError(runtime, err)) return err;
+        if (try scope.shouldYield(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
@@ -18711,7 +18716,7 @@ fn processDocumentExtractionAsset(
             from_generation,
             window,
         );
-        try recordIsolatedRequestError(runtime, window, request, err);
+        try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
         return;
     };
     config.pdf_decode_limits = configured_pdf_decode_limits;
@@ -45592,6 +45597,44 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
     const ready = try restarted.state.due(a, deadline);
     defer ready.deinit(a);
     try std.testing.expectEqualStrings("bad", ready.groups[0].doc_key);
+    {
+        // A lane's terminal extraction receipt must use its restored owner
+        // budget even when no scanner-global request identity is installed.
+        const http = @import("../../../common/http/http_common.zig");
+        const App = struct {
+            fn execute(_: *anyopaque, _: Allocator, _: http.HttpRequest) !http.HttpResponse {
+                return .{ .status = 503 };
+            }
+        };
+        var marker: u8 = 0;
+        var listener = @import("../../../common/http/std_http_listener.zig").StdHttpListener.init(a, .{}, .{ .ptr = &marker, .vtable = &.{ .execute = App.execute } });
+        defer listener.deinit();
+        try listener.start();
+        const uri = try listener.baseUri(a);
+        defer a.free(uri);
+        const remote = scraping.RemoteContentConfig{ .security = .{ .block_private_ips = false } };
+        runtime.config.io = std.testing.io;
+        runtime.config.remote_content = &remote;
+        defer runtime.config.remote_content = null;
+        defer clearIsolatedFailedIndexes(&runtime);
+        var sources = PreparedDocumentSourceCache.init(&runtime);
+        defer sources.deinit();
+        var window = GeneratedReplayWindow{ .alloc = a };
+        defer window.deinit();
+        var extraction_scope = FailureScope{};
+        extraction_scope.enterRequest(request);
+        const manifest_key = try internal_keys.artifactNamedPrefixAlloc(a, request.doc_key, "asset", requestArtifactName(request));
+        defer a.free(manifest_key);
+        try processDocumentExtractionAsset(&runtime, request, "{}", uri, "{}", manifest_key, &sources, &window, &extraction_scope);
+        const manifest = try storeGetAlloc(&runtime, manifest_key);
+        defer a.free(manifest);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, manifest, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("error", parsed.value.object.get("route_type").?.string);
+        try std.testing.expectEqualStrings("RemoteDocumentFetchFailed", parsed.value.object.get("last_error").?.object.get("code").?.string);
+        try std.testing.expectEqual(@as(u64, 2), extraction_scope.attemptNumber(&runtime));
+        try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
+    }
     // The retry identity follows the producer, not journal notifications or
     // physical rebatching. A new model/template owns a new retry episode.
     var changed = request;
