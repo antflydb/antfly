@@ -61,6 +61,7 @@ const api = @import("../../capi/db.zig");
 const capi_types = @import("../../capi/types.zig");
 const db_mod = api.db_mod;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+const native = @import("native.zig");
 
 const default_updates: usize = 128;
 const default_writers: usize = 8;
@@ -90,6 +91,65 @@ fn cpuNowNs() u64 {
 // `enable_memory_limit` is set, so this thin wrapper is the simplest way to
 // get "allocations/write" as a real count rather than an estimate.
 // ---------------------------------------------------------------------------
+
+/// Return-address histogram for the allocation-site attribution task: a
+/// small, mutex-protected map from `ret_addr` (the immediate caller of
+/// `allocator.alloc`/`create`/etc., per `std.mem.Allocator.VTable`'s own
+/// `ret_addr` parameter -- the same value `std.testing.allocator`'s stack
+/// capture would start unwinding from) to a call count. Only armed during
+/// the dedicated attribution test (see `histogram_armed`); the steady
+/// report/ceilings/profile-loop tests never pay this lock, so their
+/// numbers stay exactly what they were before this file added attribution.
+const AllocSiteHistogram = struct {
+    // A plain spin lock (tryLock/unlock only, no blocking lock()) is
+    // enough: this histogram is only armed for the single-writer
+    // attribution test, so contention is a non-issue, and it avoids
+    // pulling in an Io-aware mutex for a CPU-only data structure.
+    mutex: std.atomic.Mutex = .unlocked,
+    counts: std.AutoHashMapUnmanaged(usize, u64) = .empty,
+    backing: std.mem.Allocator = std.heap.page_allocator,
+
+    fn lockSpin(self: *AllocSiteHistogram) void {
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+    }
+
+    fn record(self: *AllocSiteHistogram, ret_addr: usize) void {
+        self.lockSpin();
+        defer self.mutex.unlock();
+        const entry = self.counts.getOrPut(self.backing, ret_addr) catch return;
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* += 1;
+    }
+
+    fn reset(self: *AllocSiteHistogram) void {
+        self.lockSpin();
+        defer self.mutex.unlock();
+        self.counts.clearRetainingCapacity();
+    }
+
+    const Entry = struct { addr: usize, count: u64 };
+
+    /// Returns the top `n` (addr, count) pairs by count, descending, owned
+    /// by `alloc` (caller frees).
+    fn top(self: *AllocSiteHistogram, alloc: std.mem.Allocator, n: usize) ![]Entry {
+        self.lockSpin();
+        defer self.mutex.unlock();
+        var list: std.ArrayListUnmanaged(Entry) = .empty;
+        defer list.deinit(alloc);
+        var it = self.counts.iterator();
+        while (it.next()) |kv| try list.append(alloc, .{ .addr = kv.key_ptr.*, .count = kv.value_ptr.* });
+        const lessThan = struct {
+            fn call(_: void, a: Entry, b: Entry) bool {
+                return a.count > b.count;
+            }
+        }.call;
+        std.mem.sort(Entry, list.items, {}, lessThan);
+        const take = @min(n, list.items.len);
+        return try alloc.dupe(Entry, list.items[0..take]);
+    }
+};
+var alloc_site_histogram: AllocSiteHistogram = .{};
+var histogram_armed = std.atomic.Value(bool).init(false);
 
 const CountingAllocator = struct {
     child: std.mem.Allocator,
@@ -124,6 +184,7 @@ const CountingAllocator = struct {
         if (result != null) {
             _ = self.allocs.fetchAdd(1, .monotonic);
             _ = self.bytes_requested.fetchAdd(len, .monotonic);
+            if (histogram_armed.load(.monotonic)) alloc_site_histogram.record(ret_addr);
         }
         return result;
     }
@@ -527,6 +588,32 @@ fn measureConcurrent(alloc: std.mem.Allocator, comptime name: []const u8, mode: 
     return snapshotReport(writers * updates_per_writer, cpu_elapsed, wall_elapsed);
 }
 
+// ---------------------------------------------------------------------------
+// Symbol resolution for the allocation-site histogram: resolves a return
+// address against this process's own embedded debug info (DWARF on this
+// target), the same mechanism `std.debug.dumpStackTrace`/panic stack traces
+// use internally (`printSourceAtAddress`/`SelfInfo.getSymbols` in
+// lib/std/debug.zig), reimplemented at the public-API layer here since that
+// helper itself is private to std. In-process resolution avoids needing the
+// live load address `atos` would require (ASLR means it differs every run).
+// ---------------------------------------------------------------------------
+
+fn resolveAddressSymbol(io: std.Io, address: usize, buf: []u8) []const u8 {
+    const debug_info = std.debug.getSelfDebugInfo() catch return "???";
+    var text_arena = std.heap.ArenaAllocator.init(std.debug.getDebugInfoAllocator());
+    defer text_arena.deinit();
+    var symbols = std.ArrayList(std.debug.Symbol).initCapacity(std.debug.getDebugInfoAllocator(), 1) catch return "???";
+    defer symbols.deinit(std.debug.getDebugInfoAllocator());
+    debug_info.getSymbols(io, std.debug.getDebugInfoAllocator(), text_arena.allocator(), address, false, &symbols) catch return "???";
+    if (symbols.items.len == 0) return "???";
+    const symbol = symbols.items[0];
+    const name = symbol.name orelse "???";
+    if (symbol.source_location) |sl| {
+        return std.fmt.bufPrint(buf, "{s} ({s}:{d})", .{ name, sl.file_name, sl.line }) catch name;
+    }
+    return std.fmt.bufPrint(buf, "{s}", .{name}) catch "???";
+}
+
 fn printReport(comptime label: []const u8, report: CpuReport) void {
     std.debug.print(
         "  {s}: updates={d} cpu_us/write={d:.1} allocs/write={d:.2} frees/write={d:.2} " ++
@@ -648,6 +735,74 @@ test "lite write amplification cpu profile loop" {
     const profile_updates: usize = 6000;
     const report = try measureSingleWriter(alloc, "lite-write-amp-cpu-profile", .primary_only, profile_updates);
     printReport("profile loop: primary-only", report);
+}
+
+// Diagnostic-only attribution report (not a gate): (a) the top 20
+// allocation call sites by count, resolved to function/file/line via this
+// process's own embedded debug info, and (b) a pwrite breakdown by
+// `PageKind` (native.zig's `PageWriteMetrics`, instrumented at the four
+// call sites that actually issue `writePositionalAll`: the regular
+// `PageWriteBatch` flush, `persistAllocator`'s ledger/free-map write,
+// `tryBuildCommitManifest`'s manifest page, and `publishCheckpoint`'s
+// checkpoint-slot page). Not filtered into the default run; invoke with
+// `--test-filter "lite write amplification cpu attribution"`.
+test "lite write amplification cpu attribution" {
+    const alloc = cpuAllocator();
+    const updates: usize = 2000;
+
+    alloc_site_histogram.reset();
+    native.PageWriteMetrics.reset();
+    histogram_armed.store(true, .monotonic);
+    const report = try measureSingleWriter(alloc, "lite-write-amp-cpu-attrib", .primary_only, updates);
+    histogram_armed.store(false, .monotonic);
+
+    std.debug.print("lite write amplification CPU attribution (updates={d}):\n", .{updates});
+    printReport("primary-only", report);
+
+    const top_sites = alloc_site_histogram.top(std.heap.page_allocator, 20) catch &.{};
+    defer std.heap.page_allocator.free(top_sites);
+    std.debug.print("  top {d} allocation sites (count/write):\n", .{top_sites.len});
+    var buf: [256]u8 = undefined;
+    for (top_sites, 0..) |entry, i| {
+        const symbol = resolveAddressSymbol(std.testing.io, entry.addr, &buf);
+        std.debug.print(
+            "    {d}. 0x{x} count={d} per_write={d:.3}  {s}\n",
+            .{ i + 1, entry.addr, entry.count, @as(f64, @floatFromInt(entry.count)) / @as(f64, @floatFromInt(updates)), symbol },
+        );
+    }
+
+    std.debug.print("  pwrite breakdown by PageKind (calls/write, bytes/write):\n", .{});
+    const kinds = [_]struct { kind: native.PageKind, label: []const u8 }{
+        .{ .kind = .data, .label = "data" },
+        .{ .kind = .catalog, .label = "catalog" },
+        .{ .kind = .document, .label = "document" },
+        .{ .kind = .value, .label = "value" },
+        .{ .kind = .free_map, .label = "free_map" },
+        .{ .kind = .document_index, .label = "document_index" },
+        .{ .kind = .value_extent, .label = "value_extent" },
+        .{ .kind = .catalog_index, .label = "catalog_index" },
+        .{ .kind = .record_bundle, .label = "record_bundle" },
+        .{ .kind = .allocator, .label = "allocator" },
+        .{ .kind = .key, .label = "key" },
+        .{ .kind = .checkpoint_slot, .label = "checkpoint_slot" },
+        .{ .kind = .commit_manifest, .label = "commit_manifest" },
+    };
+    var total_calls: u64 = 0;
+    var total_bytes: u64 = 0;
+    for (kinds) |entry| {
+        const snap = native.PageWriteMetrics.get(entry.kind);
+        total_calls += snap.calls;
+        total_bytes += snap.bytes;
+        if (snap.calls == 0) continue;
+        std.debug.print(
+            "    {s}: calls/write={d:.3} bytes/write={d:.1}\n",
+            .{ entry.label, @as(f64, @floatFromInt(snap.calls)) / @as(f64, @floatFromInt(updates)), @as(f64, @floatFromInt(snap.bytes)) / @as(f64, @floatFromInt(updates)) },
+        );
+    }
+    std.debug.print(
+        "    TOTAL (PageWriteMetrics): calls/write={d:.3} bytes/write={d:.1} (harness pwrite/write={d:.3} for cross-check)\n",
+        .{ @as(f64, @floatFromInt(total_calls)) / @as(f64, @floatFromInt(updates)), @as(f64, @floatFromInt(total_bytes)) / @as(f64, @floatFromInt(updates)), @as(f64, @floatFromInt(report.pwrite)) / @as(f64, @floatFromInt(report.updates)) },
+    );
 }
 
 // Regression gate: allocations/write and syscalls/write are build-mode
