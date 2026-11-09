@@ -175,17 +175,30 @@ pub const Digest = [32]u8;
 
 pub const Phase = enum { reserved, importing, imported, validated, published, canceled };
 
-pub const Timestamp = struct { key: []const u8, timestamp: u64 };
+pub const Timestamp = struct {
+    key: []const u8,
+    timestamp: u64,
+    ttl_source_ns: ?i128 = null,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "ttl_source_ns") and self.ttl_source_ns == null;
+    }
+};
 pub const Artifact = struct { key: []const u8, value: []const u8 };
 
 pub const ImportPage = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
-        return std.mem.eql(u8, name, "population") and self.population == null;
+        return (std.mem.eql(u8, name, "population") and self.population == null) or
+            (std.mem.eql(u8, name, "document_timestamps") and self.document_timestamps == null);
     }
     expected: Digest,
     next: []const u8,
     scope: Digest,
     timestamps: []const Timestamp,
+    /// Present only in the protected document-revision language. Each timestamp
+    /// carries its original TTL source; zero with no source means absent metadata.
+    /// The allocator floor includes revisions belonging to deleted documents.
+    document_timestamps: ?struct { version_floor: u64 } = null,
     /// Native artifact materialization precedes logical row import. These are
     /// logical document-scoped records, never source ordinals or control keys.
     artifact_page: bool = false,

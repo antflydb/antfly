@@ -1720,6 +1720,7 @@ pub const Program = struct {
                 .replace,
                 .starts_with,
                 .date_part,
+                .date_bin,
                 .date_trunc,
                 .to_timestamp,
                 .current_setting,
@@ -4772,7 +4773,7 @@ const Binder = struct {
                     .length, .octet_length, .bit_length, .strpos, .ascii => .int32,
                     .starts_with => .boolean,
                     .to_jsonb, .jsonb_build_object => .jsonb,
-                    .date_trunc, .to_timestamp => null,
+                    .date_bin, .date_trunc, .to_timestamp => null,
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .@"$single" => merged.element_type,
                     else => .text,
                 }, .kind = switch (function) {
@@ -4780,7 +4781,7 @@ const Binder = struct {
                     .length, .octet_length, .bit_length, .strpos, .ascii => .integer,
                     .starts_with, .@"$pattern_quantified" => .boolean,
                     .sqrt, .power, .date_part => .number,
-                    .date_trunc, .to_timestamp => .datetime,
+                    .date_bin, .date_trunc, .to_timestamp => .datetime,
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .@"$single" => merged.kind,
                     else => .string,
                 }, .domain_binding = switch (function) {
@@ -7094,9 +7095,9 @@ const Evaluator = struct {
             } else error.SqlTypeMismatch,
             .datetime => blk: {
                 if (value != .string) return error.SqlTypeMismatch;
-                const ns = datetime.parseDateTimeToNs(value.string) orelse return error.InvalidSqlDateTime;
+                const ns = datetime.parseDateTimeToSignedNs(value.string) orelse return error.InvalidSqlDateTime;
                 try self.charge(30);
-                break :blk .{ .string = try datetime.formatDateTimeNsAlloc(self.alloc, ns) };
+                break :blk .{ .string = try datetime.formatDateTimeSignedNsAlloc(self.alloc, ns) };
             },
             .json => if (value == .string) blk: {
                 try self.charge(value.string.len);
@@ -7941,14 +7942,23 @@ const Evaluator = struct {
                 try self.charge(size);
                 return .{ .string = try self.alloc.dupe(u8, buffer[0..size]) };
             },
+            .date_bin => {
+                if (first != .string or values[1] != .string or values[2] != .string) return error.SqlTypeMismatch;
+                const every = datetime.durationNs(first.string) orelse return error.InvalidSqlParameters;
+                const ns = datetime.parseDateTimeToSignedNs(values[1].string) orelse return error.InvalidSqlDateTime;
+                const origin = datetime.parseDateTimeToSignedNs(values[2].string) orelse return error.InvalidSqlDateTime;
+                const start = datetime.binSigned(ns, every, origin) orelse return error.InvalidSqlDateTime;
+                try self.charge(30);
+                return .{ .string = try datetime.formatDateTimeSignedNsAlloc(self.alloc, start) };
+            },
             .date_part, .date_trunc => {
                 if (first != .string or values[1] != .string) return error.SqlTypeMismatch;
                 const field = datetime.unit(first.string) orelse return error.InvalidSqlParameters;
-                const ns = datetime.parseDateTimeToNs(values[1].string) orelse return error.InvalidSqlDateTime;
-                if (function == .date_part) return .{ .float = datetime.part(ns, field) };
-                const truncated = datetime.truncate(ns, field) orelse return error.InvalidSqlDateTime;
+                const ns = datetime.parseDateTimeToSignedNs(values[1].string) orelse return error.InvalidSqlDateTime;
+                if (function == .date_part) return .{ .float = datetime.partSigned(ns, field) };
+                const truncated = datetime.truncateSigned(ns, field) orelse return error.InvalidSqlDateTime;
                 try self.charge(30);
-                return .{ .string = try datetime.formatDateTimeNsAlloc(self.alloc, truncated) };
+                return .{ .string = try datetime.formatDateTimeSignedNsAlloc(self.alloc, truncated) };
             },
             .to_timestamp => {
                 const seconds = try asFloat(first);
@@ -9222,6 +9232,7 @@ test "SQL scalar bound programs preserve lazy truth exact integers and function 
         .{ .sql = "'[1,2,3]'::json -> -1", .expected = "3" },
         .{ .sql = "'2024-02-29'::datetime", .expected = "\"2024-02-29T00:00:00.000000000Z\"" },
         .{ .sql = "date_part('year', '2024-02-29'::datetime)", .expected = "2024" },
+        .{ .sql = "date_bin('5m', '2026-11-06T12:07:30+01:00'::datetime, '1970-01-01T00:02:00Z'::datetime)", .expected = "\"2026-11-06T11:07:00.000000000Z\"" },
         .{ .sql = "date_trunc('month', '2024-02-29T13:14:15+01:00'::datetime)", .expected = "\"2024-02-01T00:00:00.000000000Z\"" },
         .{ .sql = "to_timestamp(0)", .expected = "\"1970-01-01T00:00:00.000000000Z\"" },
     };
@@ -11398,4 +11409,12 @@ test "SQL package native callbacks retain strict lazy typed execution and prepar
     const before = state.calls;
     try std.testing.expectError(error.Canceled, Program.invokeRoutine(&routine, a, &.{.json(.{ .integer = 1 })}, .{ .checkpoint = State.canceled }));
     try std.testing.expectEqual(before, state.calls);
+}
+
+test "time series date_bin is repeatable within a statement" {
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "date_bin('5m', '2026-11-06T12:07:30Z'::datetime, '1970-01-01T00:02:00Z'::datetime)", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expect(program.repeatable());
 }

@@ -268,8 +268,9 @@ pub fn getMany(db: anytype, a: A, cut: *Snapshot, keys: []const []const u8, inpu
             error.NotFound => null,
             else => return err,
         };
-        const version: u64 = if (timestamp) |bytes| if (bytes.len == 8) std.mem.readInt(u64, bytes[0..8], .little) else return error.InvalidData else 0;
-        if (duration != 0 and version != 0 and @import("../ttl.zig").isExpired(version, duration, cut.now)) continue;
+        const metadata = if (timestamp) |bytes| @import("../ttl.zig").decodeTimestamp(bytes) orelse return error.InvalidData else null;
+        const version: u64 = if (metadata) |value| value.version else 0;
+        if (duration != 0) if (metadata) |value| if (@import("../ttl.zig").isExpired(value.source, duration, cut.now)) continue;
         var privacy_row = std.heap.ArenaAllocator.init(cypher.backend.reclaimingAllocator(a));
         defer privacy_row.deinit();
         const safe = if (protected) privacy.project(privacy_row.allocator(), policy.?, key, raw, &read) catch |err| {

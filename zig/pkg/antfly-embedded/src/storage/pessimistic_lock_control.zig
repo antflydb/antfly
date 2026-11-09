@@ -452,7 +452,7 @@ pub fn validateBatch(input: @import("db/types.zig").BatchRequest) !void {
         if (comptime !std.mem.eql(u8, name, "sql_lock") and !std.mem.eql(u8, name, "timestamp_ns") and !std.mem.eql(u8, name, "sync_level")) {
             if (comptime @typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice) {
                 if (@field(input, name).len != 0) return error.InvalidBatchRequest;
-            } else if (!std.meta.eql(@field(input, name), @field(empty, name))) return error.InvalidBatchRequest;
+            } else if (!@import("control_field_defaults.zig").isolatedFieldMatchesDefault(name, @field(input, name), @field(empty, name))) return error.InvalidBatchRequest;
         }
     }
 }
@@ -477,6 +477,20 @@ test "SQL relation lifetime frozen native lock controls bind decision route and 
     };
     const command: Command = .{ .admission = admission, .native_control = capture, .operation = .{ .prepare = capture.decision } };
     try command.validate();
+    const codec = @import("../api/batch_internal.zig");
+    for ([_]@import("db/types.zig").DocumentVersionScheme{ .legacy, .admit_current }) |mode| {
+        const request: @import("db/types.zig").BatchRequest = .{ .sql_lock = command, .document_version_scheme = mode };
+        const encoded = try codec.encodeBatchRequest(a, request);
+        defer a.free(encoded);
+        var decoded = try codec.parseInternalBatchRequest(a, encoded);
+        defer decoded.deinit(a);
+        try validateBatch(decoded.req);
+        try std.testing.expectEqualDeep(command, decoded.req.sql_lock.?);
+        var mixed = request;
+        mixed.writes = &.{.{ .key = "forbidden-row", .value = "{}" }};
+        try std.testing.expectError(error.InvalidBatchRequest, codec.encodeBatchRequest(a, mixed));
+    }
+    try std.testing.expectError(error.InvalidBatchRequest, codec.encodeBatchRequest(a, .{ .sql_lock = command, .document_version_scheme = .revision_v1 }));
     const bytes = try std.json.Stringify.valueAlloc(a, command, .{});
     defer a.free(bytes);
     var parsed = try std.json.parseFromSlice(Command, a, bytes, .{});

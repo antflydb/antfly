@@ -253,6 +253,11 @@ pub const TransactionMutation = union(enum) {
     },
 };
 
+/// The ordered command owns version semantics, including during WAL/Raft
+/// replay. `admit_current` is local ingress only; absent private wire fields
+/// decode as legacy. The admission timestamp is separate from the revision.
+pub const DocumentVersionScheme = enum { legacy, revision_v1, admit_current };
+
 pub const BatchRequest = struct {
     graph_preparation: ?@import("prepared_graph_effects.zig").Admission = null,
     /// Private owner-leader checked lock control; never public batch JSON.
@@ -338,6 +343,9 @@ pub const BatchRequest = struct {
     /// Private ordered owner control. Never admitted from public batch JSON.
     relational_index_owner_control: ?@import("relational_index_raft_contract.zig").Command = null,
     timestamp_ns: u64 = 0,
+    /// `admit_current` is local admission only. Persisted commands explicitly
+    /// select revision_v1; an absent wire field always decodes as legacy.
+    document_version_scheme: DocumentVersionScheme = .admit_current,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion
     /// still runs under the DB apply lock, but the batch is rejected before
@@ -369,6 +377,17 @@ pub const BatchRequest = struct {
     /// Internal 2PC phase. Public batch parsing never accepts this field.
     transaction: ?TransactionMutation = null,
 
+    /// Freeze an ingress default only when the request carries row effects.
+    /// Explicit replay/import schemes retain their original contract, while
+    /// effect-free controls never acquire a document revision envelope.
+    pub fn admittedDocumentVersionScheme(self: @This(), revisions_supported: bool) DocumentVersionScheme {
+        if (self.document_version_scheme != .admit_current) return self.document_version_scheme;
+        // Planned graph cleanup carries only independently guarded internal
+        // retirement keys. Its hint never authorizes user row deletion.
+        const row_effects = !self.graph_endpoint_cleanup and (self.writes.len != 0 or self.deletes.len != 0 or self.transforms.len != 0);
+        return if (revisions_supported and row_effects) .revision_v1 else .legacy;
+    }
+
     /// Phase-two activation may use the already admitted external owner only
     /// when it carries no new effects. Check every field so newly introduced
     /// mutation channels cannot accidentally inherit this control authority.
@@ -395,6 +414,10 @@ pub const BatchRequest = struct {
 
     fn hasNoExternalControlEffects(self: @This()) bool {
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            // The scheme only interprets row effects, all of which this guard
+            // independently rejects. Control-only retries cannot change the
+            // revision mode frozen by the original prepare.
+            if (comptime std.mem.eql(u8, name, "document_version_scheme")) continue;
             if (comptime std.mem.eql(u8, name, "transaction") or
                 std.mem.eql(u8, name, "timestamp_ns") or std.mem.eql(u8, name, "sync_level")) continue;
             const value = @field(self, name);
@@ -1878,6 +1901,7 @@ pub const TransactionIntentRequest = struct {
     timestamp_ns: u64 = 0,
     external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
     external_activation: bool = false,
+    document_version_scheme: DocumentVersionScheme = .admit_current,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
@@ -5730,7 +5754,7 @@ pub fn validateLeannRecordCommand(req: BatchRequest) !void {
             const value = @field(req, field_name);
             if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (value.len != 0) return error.InvalidBatchRequest;
-            } else if (!std.meta.eql(value, @field(defaults, field_name))) return error.InvalidBatchRequest;
+            } else if (!@import("../control_field_defaults.zig").isolatedFieldMatchesDefault(field_name, value, @field(defaults, field_name))) return error.InvalidBatchRequest;
         }
     }
 }
@@ -5762,7 +5786,7 @@ pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
                 const value = @field(req, field_name);
                 if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                     if (value.len != 0) return error.InvalidBatchRequest;
-                } else if (!std.meta.eql(value, @field(defaults, field_name))) return error.InvalidBatchRequest;
+                } else if (!@import("../control_field_defaults.zig").isolatedFieldMatchesDefault(field_name, value, @field(defaults, field_name))) return error.InvalidBatchRequest;
             }
         }
     }
@@ -5821,4 +5845,35 @@ test "graph relationship protocol gates document effects before extraction" {
         "{}",
     }) |document| try std.testing.expect(requiresGraphRelationshipProtocol(.{ .writes = &.{.{ .key = "a", .value = document }} }));
     try std.testing.expect(!requiresGraphRelationshipProtocol(.{}));
+}
+
+test "time series intent document scheme survives canonical prepare and atomic conversions" {
+    for ([_]DocumentVersionScheme{ .admit_current, .legacy, .revision_v1 }) |scheme| {
+        const request: TransactionIntentRequest = .{ .document_version_scheme = scheme };
+        const batch = request.asBatch(@splat(7), 11);
+        try std.testing.expectEqual(scheme, batch.document_version_scheme);
+        try std.testing.expectEqual(scheme, (try TransactionIntentRequest.fromBatch(batch)).document_version_scheme);
+        const atomic = try request.asAtomicBatch();
+        try std.testing.expectEqual(scheme, atomic.document_version_scheme);
+        try std.testing.expectEqual(scheme, (try TransactionIntentRequest.fromAtomicBatch(atomic)).document_version_scheme);
+    }
+}
+
+test "document revision admission preserves explicit schemes and excludes isolated controls" {
+    for ([_]bool{ false, true }) |supported| {
+        const control: BatchRequest = .{ .activate_range_tracking = true };
+        try std.testing.expectEqual(DocumentVersionScheme.legacy, control.admittedDocumentVersionScheme(supported));
+        const cleanup: BatchRequest = .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .deletes = &.{"doc"} };
+        try std.testing.expectEqual(DocumentVersionScheme.legacy, cleanup.admittedDocumentVersionScheme(supported));
+        // The classification hint cannot make an unguarded document deletion
+        // a valid cleanup command.
+        try std.testing.expectError(error.InvalidBatchRequest, validateGraphEndpointCleanupCommand(cleanup));
+        const write: BatchRequest = .{ .writes = &.{.{ .key = "a", .value = "{}" }} };
+        try std.testing.expectEqual(if (supported) DocumentVersionScheme.revision_v1 else .legacy, write.admittedDocumentVersionScheme(supported));
+        var frozen = write;
+        frozen.document_version_scheme = .legacy;
+        try std.testing.expectEqual(DocumentVersionScheme.legacy, frozen.admittedDocumentVersionScheme(supported));
+        frozen.document_version_scheme = .revision_v1;
+        try std.testing.expectEqual(DocumentVersionScheme.revision_v1, frozen.admittedDocumentVersionScheme(supported));
+    }
 }

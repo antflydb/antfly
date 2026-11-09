@@ -1929,7 +1929,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidArgument => status(.invalid_argument, .invalid_argument),
         error.InvalidArguments => status(.invalid_argument, .invalid_arguments),
         error.InvalidRequest => status(.invalid_argument, .invalid_request),
-        error.InvalidQueryRequest => status(.invalid_argument, .invalid_query_request),
+        // Aggregations may run in either an owner or a coordinator. Transport
+        // their public query classes using existing details, including when
+        // they cross a callback before the HTTP boundary can normalize them.
+        error.InvalidQueryRequest, error.InvalidAggregation => status(.invalid_argument, .invalid_query_request),
         error.InvalidFilterQueryRequest => status(.invalid_argument, .invalid_filter_query_request),
         error.InvalidExclusionQueryRequest => status(.invalid_argument, .invalid_exclusion_query_request),
         error.InvalidBatchRequest => status(.invalid_argument, .invalid_batch_request),
@@ -2089,7 +2092,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidGraphEdges => status(.invalid_argument, .invalid_graph_edges),
         error.InvalidTableIndexMetadata => status(.invalid_argument, .invalid_table_index_metadata),
         error.InvalidEnrichmentConfig => status(.invalid_argument, .invalid_enrichment_config),
-        error.UnsupportedQueryRequest => status(.unsupported, .unsupported_query_request),
+        error.UnsupportedQueryRequest, error.UnsupportedAggregation => status(.unsupported, .unsupported_query_request),
         error.UnsupportedHierarchyGrouping => status(.unsupported, .unsupported_query_request),
         error.UnsupportedFilterQueryRequest => status(.unsupported, .unsupported_filter_query_request),
         error.UnsupportedExclusionQueryRequest => status(.unsupported, .unsupported_exclusion_query_request),
@@ -4400,4 +4403,15 @@ test "published main Detail inventory remains stable after SQL integration" {
     }
     try std.testing.expectEqual(@as(usize, 973), count);
     try std.testing.expectEqual(@as(u64, 10976950832745621870), hash);
+}
+
+test "time series aggregation callback failures use existing query identities" {
+    const invalid = statusFromError(error.InvalidAggregation);
+    try std.testing.expectEqualDeep(statusFromError(error.InvalidQueryRequest), invalid);
+    try std.testing.expectEqual(error.InvalidQueryRequest, errorFromStatus(invalid));
+    try std.testing.expect(errorHasStableDetail(error.InvalidAggregation));
+    const unsupported = statusFromError(error.UnsupportedAggregation);
+    try std.testing.expectEqualDeep(statusFromError(error.UnsupportedQueryRequest), unsupported);
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, errorFromStatus(unsupported));
+    try std.testing.expect(errorHasStableDetail(error.UnsupportedAggregation));
 }

@@ -1,0 +1,1095 @@
+{
+  "table": {
+    "num_shards": 2,
+    "schema": {
+      "index_sort": [
+        {
+          "field": "observed_at",
+          "order": "desc"
+        }
+      ],
+      "default_type": "reading",
+      "document_schemas": {
+        "reading": {
+          "schema": {
+            "type": "object",
+            "required": [
+              "observed_at",
+              "device_id",
+              "region"
+            ],
+            "properties": {
+              "observed_at": {
+                "type": "string",
+                "format": "date-time",
+                "x-antfly-field": {
+                  "type": "date",
+                  "sortable": true
+                }
+              },
+              "device_id": {
+                "type": "string",
+                "x-antfly-field": {
+                  "type": "keyword",
+                  "sortable": true
+                }
+              },
+              "region": {
+                "type": "string",
+                "x-antfly-field": {
+                  "type": "keyword",
+                  "sortable": true
+                }
+              },
+              "temperature": {
+                "type": "number",
+                "x-antfly-field": {
+                  "type": "number",
+                  "sortable": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "indexes": {
+      "series_aggregates": {
+        "type": "algebraic",
+        "derive_from_schema": true,
+        "aggregates": [
+          {
+            "name": "reading_count",
+            "op": "count",
+            "group_by": [
+              "device_id",
+              "region"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          },
+          {
+            "name": "m0_sum",
+            "op": "sum",
+            "measure": "temperature",
+            "group_by": [
+              "device_id",
+              "region"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          },
+          {
+            "name": "m0_avg",
+            "op": "avg",
+            "measure": "temperature",
+            "group_by": [
+              "device_id",
+              "region"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          },
+          {
+            "name": "m0_min",
+            "op": "min",
+            "measure": "temperature",
+            "group_by": [
+              "device_id",
+              "region"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          },
+          {
+            "name": "m0_max",
+            "op": "max",
+            "measure": "temperature",
+            "group_by": [
+              "device_id",
+              "region"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          }
+        ]
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "fixed",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T12:20:00Z",
+        "dimensions": {
+          "region": "west"
+        },
+        "groupBy": [
+          "device_id"
+        ],
+        "maxSeries": 2,
+        "profile": true,
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          },
+          "total": {
+            "op": "sum",
+            "field": "temperature"
+          },
+          "minimum": {
+            "op": "min",
+            "field": "temperature"
+          },
+          "maximum": {
+            "op": "max",
+            "field": "temperature"
+          },
+          "readings": {
+            "op": "count",
+            "field": "temperature"
+          }
+        },
+        "bucket": {
+          "every": "5m"
+        }
+      },
+      "query": {
+        "table": "fixture",
+        "timeout_ms": 30000,
+        "profile": true,
+        "filter_query": {
+          "conjuncts": [
+            {
+              "field": "observed_at",
+              "start": "2026-11-06T12:00:00Z",
+              "end": "2026-11-06T12:20:00Z",
+              "inclusive_start": true,
+              "inclusive_end": false
+            },
+            {
+              "field": "region",
+              "equals": "west"
+            }
+          ]
+        },
+        "limit": 0,
+        "aggregations": {
+          "series": {
+            "type": "terms",
+            "fields": [
+              "device_id"
+            ],
+            "exclude_null": true,
+            "size": 2,
+            "sub_aggregations": {
+              "points": {
+                "type": "date_histogram",
+                "field": "observed_at",
+                "fixed_interval": "5m",
+                "min_doc_count": 0,
+                "date_bounds": {
+                  "start": "2026-11-06T12:00:00Z",
+                  "end": "2026-11-06T12:20:00Z"
+                },
+                "sub_aggregations": {
+                  "average": {
+                    "type": "avg",
+                    "field": "temperature"
+                  },
+                  "total": {
+                    "type": "sum",
+                    "field": "temperature"
+                  },
+                  "minimum": {
+                    "type": "min",
+                    "field": "temperature"
+                  },
+                  "maximum": {
+                    "type": "max",
+                    "field": "temperature"
+                  },
+                  "readings": {
+                    "type": "count",
+                    "field": "temperature"
+                  },
+                  "__antfly_series_count_total": {
+                    "type": "avg",
+                    "field": "temperature"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"device_id\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND \"region\" = $5 AND NOT is_missing(\"device_id\") AND \"device_id\" IS NOT NULL GROUP BY \"device_id\" ORDER BY COUNT(*) DESC, \"device_id\" ASC LIMIT $6) SELECT \"__antfly_series_source\".\"device_id\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\", SUM(\"__antfly_series_source\".\"temperature\") AS \"total\", MIN(\"__antfly_series_source\".\"temperature\") AS \"minimum\", MAX(\"__antfly_series_source\".\"temperature\") AS \"maximum\", COUNT(*) AS \"readings\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"device_id\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"device_id\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND \"__antfly_series_source\".\"region\" = $5 AND NOT is_missing(\"__antfly_series_source\".\"device_id\") AND \"__antfly_series_source\".\"device_id\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"device_id\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, \"__antfly_series_source\".\"device_id\" ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T12:20:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z",
+          "west",
+          2
+        ]
+      }
+    },
+    {
+      "name": "composite",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T12:20:00Z",
+        "dimensions": {
+          "region": "west"
+        },
+        "groupBy": [
+          "device_id",
+          "region"
+        ],
+        "maxSeries": 2,
+        "profile": true,
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          },
+          "total": {
+            "op": "sum",
+            "field": "temperature"
+          },
+          "minimum": {
+            "op": "min",
+            "field": "temperature"
+          },
+          "maximum": {
+            "op": "max",
+            "field": "temperature"
+          },
+          "readings": {
+            "op": "count",
+            "field": "temperature"
+          }
+        },
+        "bucket": {
+          "every": "5m"
+        }
+      },
+      "query": {
+        "table": "fixture",
+        "timeout_ms": 30000,
+        "profile": true,
+        "filter_query": {
+          "conjuncts": [
+            {
+              "field": "observed_at",
+              "start": "2026-11-06T12:00:00Z",
+              "end": "2026-11-06T12:20:00Z",
+              "inclusive_start": true,
+              "inclusive_end": false
+            },
+            {
+              "field": "region",
+              "equals": "west"
+            }
+          ]
+        },
+        "limit": 0,
+        "aggregations": {
+          "series": {
+            "type": "terms",
+            "fields": [
+              "device_id",
+              "region"
+            ],
+            "exclude_null": true,
+            "size": 2,
+            "sub_aggregations": {
+              "points": {
+                "type": "date_histogram",
+                "field": "observed_at",
+                "fixed_interval": "5m",
+                "min_doc_count": 0,
+                "date_bounds": {
+                  "start": "2026-11-06T12:00:00Z",
+                  "end": "2026-11-06T12:20:00Z"
+                },
+                "sub_aggregations": {
+                  "average": {
+                    "type": "avg",
+                    "field": "temperature"
+                  },
+                  "total": {
+                    "type": "sum",
+                    "field": "temperature"
+                  },
+                  "minimum": {
+                    "type": "min",
+                    "field": "temperature"
+                  },
+                  "maximum": {
+                    "type": "max",
+                    "field": "temperature"
+                  },
+                  "readings": {
+                    "type": "count",
+                    "field": "temperature"
+                  },
+                  "__antfly_series_count_total": {
+                    "type": "avg",
+                    "field": "temperature"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"device_id\", \"region\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND \"region\" = $5 AND NOT is_missing(\"device_id\") AND \"device_id\" IS NOT NULL AND NOT is_missing(\"region\") AND \"region\" IS NOT NULL GROUP BY \"device_id\", \"region\" ORDER BY COUNT(*) DESC, concat('[', COALESCE(to_jsonb(\"device_id\")::text, 'null'), ',', COALESCE(to_jsonb(\"region\")::text, 'null'), ']') ASC LIMIT $6) SELECT \"__antfly_series_source\".\"device_id\", \"__antfly_series_source\".\"region\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\", SUM(\"__antfly_series_source\".\"temperature\") AS \"total\", MIN(\"__antfly_series_source\".\"temperature\") AS \"minimum\", MAX(\"__antfly_series_source\".\"temperature\") AS \"maximum\", COUNT(*) AS \"readings\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"device_id\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"device_id\" AND \"__antfly_series_source\".\"region\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"region\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND \"__antfly_series_source\".\"region\" = $5 AND NOT is_missing(\"__antfly_series_source\".\"device_id\") AND \"__antfly_series_source\".\"device_id\" IS NOT NULL AND NOT is_missing(\"__antfly_series_source\".\"region\") AND \"__antfly_series_source\".\"region\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"device_id\", \"__antfly_series_source\".\"region\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, concat('[', COALESCE(to_jsonb(\"__antfly_series_source\".\"device_id\")::text, 'null'), ',', COALESCE(to_jsonb(\"__antfly_series_source\".\"region\")::text, 'null'), ']') ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T12:20:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z",
+          "west",
+          2
+        ]
+      }
+    },
+    {
+      "name": "origin",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T12:20:00Z",
+        "dimensions": {
+          "region": "west"
+        },
+        "groupBy": [
+          "device_id"
+        ],
+        "maxSeries": 2,
+        "profile": true,
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          },
+          "total": {
+            "op": "sum",
+            "field": "temperature"
+          },
+          "minimum": {
+            "op": "min",
+            "field": "temperature"
+          },
+          "maximum": {
+            "op": "max",
+            "field": "temperature"
+          },
+          "readings": {
+            "op": "count",
+            "field": "temperature"
+          }
+        },
+        "bucket": {
+          "every": "7m",
+          "origin": "1970-01-01T00:02:00Z"
+        }
+      },
+      "query": {
+        "table": "fixture",
+        "timeout_ms": 30000,
+        "profile": true,
+        "filter_query": {
+          "conjuncts": [
+            {
+              "field": "observed_at",
+              "start": "2026-11-06T12:00:00Z",
+              "end": "2026-11-06T12:20:00Z",
+              "inclusive_start": true,
+              "inclusive_end": false
+            },
+            {
+              "field": "region",
+              "equals": "west"
+            }
+          ]
+        },
+        "limit": 0,
+        "aggregations": {
+          "series": {
+            "type": "terms",
+            "fields": [
+              "device_id"
+            ],
+            "exclude_null": true,
+            "size": 2,
+            "sub_aggregations": {
+              "points": {
+                "type": "date_histogram",
+                "field": "observed_at",
+                "fixed_interval": "7m",
+                "bucket_origin": "1970-01-01T00:02:00Z",
+                "min_doc_count": 0,
+                "date_bounds": {
+                  "start": "2026-11-06T12:00:00Z",
+                  "end": "2026-11-06T12:20:00Z"
+                },
+                "sub_aggregations": {
+                  "average": {
+                    "type": "avg",
+                    "field": "temperature"
+                  },
+                  "total": {
+                    "type": "sum",
+                    "field": "temperature"
+                  },
+                  "minimum": {
+                    "type": "min",
+                    "field": "temperature"
+                  },
+                  "maximum": {
+                    "type": "max",
+                    "field": "temperature"
+                  },
+                  "readings": {
+                    "type": "count",
+                    "field": "temperature"
+                  },
+                  "__antfly_series_count_total": {
+                    "type": "avg",
+                    "field": "temperature"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"device_id\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND \"region\" = $5 AND NOT is_missing(\"device_id\") AND \"device_id\" IS NOT NULL GROUP BY \"device_id\" ORDER BY COUNT(*) DESC, \"device_id\" ASC LIMIT $6) SELECT \"__antfly_series_source\".\"device_id\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\", SUM(\"__antfly_series_source\".\"temperature\") AS \"total\", MIN(\"__antfly_series_source\".\"temperature\") AS \"minimum\", MAX(\"__antfly_series_source\".\"temperature\") AS \"maximum\", COUNT(*) AS \"readings\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"device_id\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"device_id\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND \"__antfly_series_source\".\"region\" = $5 AND NOT is_missing(\"__antfly_series_source\".\"device_id\") AND \"__antfly_series_source\".\"device_id\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"device_id\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, \"__antfly_series_source\".\"device_id\" ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T12:20:00Z",
+          "7m",
+          "1970-01-01T00:02:00Z",
+          "west",
+          2
+        ]
+      }
+    },
+    {
+      "name": "calendar",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T12:20:00Z",
+        "dimensions": {
+          "region": "west"
+        },
+        "groupBy": [
+          "device_id"
+        ],
+        "maxSeries": 2,
+        "profile": true,
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          },
+          "total": {
+            "op": "sum",
+            "field": "temperature"
+          },
+          "minimum": {
+            "op": "min",
+            "field": "temperature"
+          },
+          "maximum": {
+            "op": "max",
+            "field": "temperature"
+          },
+          "readings": {
+            "op": "count",
+            "field": "temperature"
+          }
+        },
+        "bucket": {
+          "calendar": "hour"
+        }
+      },
+      "query": {
+        "table": "fixture",
+        "timeout_ms": 30000,
+        "profile": true,
+        "filter_query": {
+          "conjuncts": [
+            {
+              "field": "observed_at",
+              "start": "2026-11-06T12:00:00Z",
+              "end": "2026-11-06T12:20:00Z",
+              "inclusive_start": true,
+              "inclusive_end": false
+            },
+            {
+              "field": "region",
+              "equals": "west"
+            }
+          ]
+        },
+        "limit": 0,
+        "aggregations": {
+          "series": {
+            "type": "terms",
+            "fields": [
+              "device_id"
+            ],
+            "exclude_null": true,
+            "size": 2,
+            "sub_aggregations": {
+              "points": {
+                "type": "date_histogram",
+                "field": "observed_at",
+                "calendar_interval": "hour",
+                "min_doc_count": 0,
+                "date_bounds": {
+                  "start": "2026-11-06T12:00:00Z",
+                  "end": "2026-11-06T12:20:00Z"
+                },
+                "sub_aggregations": {
+                  "average": {
+                    "type": "avg",
+                    "field": "temperature"
+                  },
+                  "total": {
+                    "type": "sum",
+                    "field": "temperature"
+                  },
+                  "minimum": {
+                    "type": "min",
+                    "field": "temperature"
+                  },
+                  "maximum": {
+                    "type": "max",
+                    "field": "temperature"
+                  },
+                  "readings": {
+                    "type": "count",
+                    "field": "temperature"
+                  },
+                  "__antfly_series_count_total": {
+                    "type": "avg",
+                    "field": "temperature"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"device_id\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND \"region\" = $4 AND NOT is_missing(\"device_id\") AND \"device_id\" IS NOT NULL GROUP BY \"device_id\" ORDER BY COUNT(*) DESC, \"device_id\" ASC LIMIT $5) SELECT \"__antfly_series_source\".\"device_id\", date_trunc($3, \"__antfly_series_source\".\"observed_at\"::datetime) AS \"bucket\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\", SUM(\"__antfly_series_source\".\"temperature\") AS \"total\", MIN(\"__antfly_series_source\".\"temperature\") AS \"minimum\", MAX(\"__antfly_series_source\".\"temperature\") AS \"maximum\", COUNT(*) AS \"readings\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"device_id\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"device_id\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND \"__antfly_series_source\".\"region\" = $4 AND NOT is_missing(\"__antfly_series_source\".\"device_id\") AND \"__antfly_series_source\".\"device_id\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"device_id\", date_trunc($3, \"__antfly_series_source\".\"observed_at\"::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, \"__antfly_series_source\".\"device_id\" ASC, date_trunc($3, \"__antfly_series_source\".\"observed_at\"::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T12:20:00Z",
+          "hour",
+          "west",
+          2
+        ]
+      }
+    },
+    {
+      "name": "epoch_fixed",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "1969-12-31T23:40:00Z",
+        "end": "1970-01-01T00:00:00Z",
+        "dimensions": {
+          "region": "west"
+        },
+        "groupBy": [
+          "device_id"
+        ],
+        "maxSeries": 2,
+        "profile": true,
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          },
+          "total": {
+            "op": "sum",
+            "field": "temperature"
+          },
+          "minimum": {
+            "op": "min",
+            "field": "temperature"
+          },
+          "maximum": {
+            "op": "max",
+            "field": "temperature"
+          },
+          "readings": {
+            "op": "count",
+            "field": "temperature"
+          }
+        },
+        "bucket": {
+          "every": "5m"
+        }
+      },
+      "query": {
+        "table": "fixture",
+        "timeout_ms": 30000,
+        "profile": true,
+        "filter_query": {
+          "conjuncts": [
+            {
+              "field": "observed_at",
+              "start": "1969-12-31T23:40:00Z",
+              "end": "1970-01-01T00:00:00Z",
+              "inclusive_start": true,
+              "inclusive_end": false
+            },
+            {
+              "field": "region",
+              "equals": "west"
+            }
+          ]
+        },
+        "limit": 0,
+        "aggregations": {
+          "series": {
+            "type": "terms",
+            "fields": [
+              "device_id"
+            ],
+            "exclude_null": true,
+            "size": 2,
+            "sub_aggregations": {
+              "points": {
+                "type": "date_histogram",
+                "field": "observed_at",
+                "fixed_interval": "5m",
+                "min_doc_count": 0,
+                "date_bounds": {
+                  "start": "1969-12-31T23:40:00Z",
+                  "end": "1970-01-01T00:00:00Z"
+                },
+                "sub_aggregations": {
+                  "average": {
+                    "type": "avg",
+                    "field": "temperature"
+                  },
+                  "total": {
+                    "type": "sum",
+                    "field": "temperature"
+                  },
+                  "minimum": {
+                    "type": "min",
+                    "field": "temperature"
+                  },
+                  "maximum": {
+                    "type": "max",
+                    "field": "temperature"
+                  },
+                  "readings": {
+                    "type": "count",
+                    "field": "temperature"
+                  },
+                  "__antfly_series_count_total": {
+                    "type": "avg",
+                    "field": "temperature"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"device_id\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND \"region\" = $5 AND NOT is_missing(\"device_id\") AND \"device_id\" IS NOT NULL GROUP BY \"device_id\" ORDER BY COUNT(*) DESC, \"device_id\" ASC LIMIT $6) SELECT \"__antfly_series_source\".\"device_id\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\", SUM(\"__antfly_series_source\".\"temperature\") AS \"total\", MIN(\"__antfly_series_source\".\"temperature\") AS \"minimum\", MAX(\"__antfly_series_source\".\"temperature\") AS \"maximum\", COUNT(*) AS \"readings\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"device_id\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"device_id\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND \"__antfly_series_source\".\"region\" = $5 AND NOT is_missing(\"__antfly_series_source\".\"device_id\") AND \"__antfly_series_source\".\"device_id\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"device_id\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, \"__antfly_series_source\".\"device_id\" ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "1969-12-31T23:40:00Z",
+          "1970-01-01T00:00:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z",
+          "west",
+          2
+        ]
+      }
+    },
+    {
+      "name": "epoch_calendar",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "1969-12-31T23:40:00Z",
+        "end": "1970-01-01T00:00:00Z",
+        "dimensions": {
+          "region": "west"
+        },
+        "groupBy": [
+          "device_id"
+        ],
+        "maxSeries": 2,
+        "profile": true,
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          },
+          "total": {
+            "op": "sum",
+            "field": "temperature"
+          },
+          "minimum": {
+            "op": "min",
+            "field": "temperature"
+          },
+          "maximum": {
+            "op": "max",
+            "field": "temperature"
+          },
+          "readings": {
+            "op": "count",
+            "field": "temperature"
+          }
+        },
+        "bucket": {
+          "calendar": "hour"
+        }
+      },
+      "query": {
+        "table": "fixture",
+        "timeout_ms": 30000,
+        "profile": true,
+        "filter_query": {
+          "conjuncts": [
+            {
+              "field": "observed_at",
+              "start": "1969-12-31T23:40:00Z",
+              "end": "1970-01-01T00:00:00Z",
+              "inclusive_start": true,
+              "inclusive_end": false
+            },
+            {
+              "field": "region",
+              "equals": "west"
+            }
+          ]
+        },
+        "limit": 0,
+        "aggregations": {
+          "series": {
+            "type": "terms",
+            "fields": [
+              "device_id"
+            ],
+            "exclude_null": true,
+            "size": 2,
+            "sub_aggregations": {
+              "points": {
+                "type": "date_histogram",
+                "field": "observed_at",
+                "calendar_interval": "hour",
+                "min_doc_count": 0,
+                "date_bounds": {
+                  "start": "1969-12-31T23:40:00Z",
+                  "end": "1970-01-01T00:00:00Z"
+                },
+                "sub_aggregations": {
+                  "average": {
+                    "type": "avg",
+                    "field": "temperature"
+                  },
+                  "total": {
+                    "type": "sum",
+                    "field": "temperature"
+                  },
+                  "minimum": {
+                    "type": "min",
+                    "field": "temperature"
+                  },
+                  "maximum": {
+                    "type": "max",
+                    "field": "temperature"
+                  },
+                  "readings": {
+                    "type": "count",
+                    "field": "temperature"
+                  },
+                  "__antfly_series_count_total": {
+                    "type": "avg",
+                    "field": "temperature"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"device_id\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND \"region\" = $4 AND NOT is_missing(\"device_id\") AND \"device_id\" IS NOT NULL GROUP BY \"device_id\" ORDER BY COUNT(*) DESC, \"device_id\" ASC LIMIT $5) SELECT \"__antfly_series_source\".\"device_id\", date_trunc($3, \"__antfly_series_source\".\"observed_at\"::datetime) AS \"bucket\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\", SUM(\"__antfly_series_source\".\"temperature\") AS \"total\", MIN(\"__antfly_series_source\".\"temperature\") AS \"minimum\", MAX(\"__antfly_series_source\".\"temperature\") AS \"maximum\", COUNT(*) AS \"readings\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"device_id\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"device_id\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND \"__antfly_series_source\".\"region\" = $4 AND NOT is_missing(\"__antfly_series_source\".\"device_id\") AND \"__antfly_series_source\".\"device_id\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"device_id\", date_trunc($3, \"__antfly_series_source\".\"observed_at\"::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, \"__antfly_series_source\".\"device_id\" ASC, date_trunc($3, \"__antfly_series_source\".\"observed_at\"::datetime)",
+        "parameters": [
+          "1969-12-31T23:40:00Z",
+          "1970-01-01T00:00:00Z",
+          "hour",
+          "west",
+          2
+        ]
+      }
+    },
+    {
+      "name": "zero_fill",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T12:20:00Z",
+        "dimensions": {
+          "region": "zero"
+        },
+        "groupBy": [
+          "device_id"
+        ],
+        "maxSeries": 2,
+        "profile": true,
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          },
+          "total": {
+            "op": "sum",
+            "field": "temperature"
+          },
+          "minimum": {
+            "op": "min",
+            "field": "temperature"
+          },
+          "maximum": {
+            "op": "max",
+            "field": "temperature"
+          },
+          "readings": {
+            "op": "count",
+            "field": "temperature"
+          }
+        },
+        "bucket": {
+          "every": "5m"
+        },
+        "fill": 0
+      },
+      "query": {
+        "table": "fixture",
+        "timeout_ms": 30000,
+        "profile": true,
+        "filter_query": {
+          "conjuncts": [
+            {
+              "field": "observed_at",
+              "start": "2026-11-06T12:00:00Z",
+              "end": "2026-11-06T12:20:00Z",
+              "inclusive_start": true,
+              "inclusive_end": false
+            },
+            {
+              "field": "region",
+              "equals": "zero"
+            }
+          ]
+        },
+        "limit": 0,
+        "aggregations": {
+          "series": {
+            "type": "terms",
+            "fields": [
+              "device_id"
+            ],
+            "exclude_null": true,
+            "size": 2,
+            "sub_aggregations": {
+              "points": {
+                "type": "date_histogram",
+                "field": "observed_at",
+                "fixed_interval": "5m",
+                "min_doc_count": 0,
+                "date_bounds": {
+                  "start": "2026-11-06T12:00:00Z",
+                  "end": "2026-11-06T12:20:00Z"
+                },
+                "sub_aggregations": {
+                  "average": {
+                    "type": "avg",
+                    "field": "temperature"
+                  },
+                  "total": {
+                    "type": "sum",
+                    "field": "temperature"
+                  },
+                  "minimum": {
+                    "type": "min",
+                    "field": "temperature"
+                  },
+                  "maximum": {
+                    "type": "max",
+                    "field": "temperature"
+                  },
+                  "readings": {
+                    "type": "count",
+                    "field": "temperature"
+                  },
+                  "__antfly_series_count_total": {
+                    "type": "avg",
+                    "field": "temperature"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"device_id\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND \"region\" = $5 AND NOT is_missing(\"device_id\") AND \"device_id\" IS NOT NULL GROUP BY \"device_id\" ORDER BY COUNT(*) DESC, \"device_id\" ASC LIMIT $6) SELECT \"__antfly_series_source\".\"device_id\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket\", COALESCE(AVG(\"__antfly_series_source\".\"temperature\"), 0) AS \"average\", COALESCE(SUM(\"__antfly_series_source\".\"temperature\"), 0) AS \"total\", COALESCE(MIN(\"__antfly_series_source\".\"temperature\"), 0) AS \"minimum\", COALESCE(MAX(\"__antfly_series_source\".\"temperature\"), 0) AS \"maximum\", COUNT(*) AS \"readings\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"device_id\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"device_id\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND \"__antfly_series_source\".\"region\" = $5 AND NOT is_missing(\"__antfly_series_source\".\"device_id\") AND \"__antfly_series_source\".\"device_id\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"device_id\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, \"__antfly_series_source\".\"device_id\" ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T12:20:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z",
+          "zero",
+          2
+        ]
+      }
+    },
+    {
+      "name": "nullable_composite",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T12:20:00Z",
+        "dimensions": {},
+        "groupBy": [
+          "device_id",
+          "region"
+        ],
+        "maxSeries": 2,
+        "profile": true,
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          },
+          "total": {
+            "op": "sum",
+            "field": "temperature"
+          },
+          "minimum": {
+            "op": "min",
+            "field": "temperature"
+          },
+          "maximum": {
+            "op": "max",
+            "field": "temperature"
+          },
+          "readings": {
+            "op": "count",
+            "field": "temperature"
+          }
+        },
+        "bucket": {
+          "every": "5m"
+        }
+      },
+      "query": {
+        "table": "fixture",
+        "timeout_ms": 30000,
+        "profile": true,
+        "filter_query": {
+          "conjuncts": [
+            {
+              "field": "observed_at",
+              "start": "2026-11-06T12:00:00Z",
+              "end": "2026-11-06T12:20:00Z",
+              "inclusive_start": true,
+              "inclusive_end": false
+            }
+          ]
+        },
+        "limit": 0,
+        "aggregations": {
+          "series": {
+            "type": "terms",
+            "fields": [
+              "device_id",
+              "region"
+            ],
+            "exclude_null": true,
+            "size": 2,
+            "sub_aggregations": {
+              "points": {
+                "type": "date_histogram",
+                "field": "observed_at",
+                "fixed_interval": "5m",
+                "min_doc_count": 0,
+                "date_bounds": {
+                  "start": "2026-11-06T12:00:00Z",
+                  "end": "2026-11-06T12:20:00Z"
+                },
+                "sub_aggregations": {
+                  "average": {
+                    "type": "avg",
+                    "field": "temperature"
+                  },
+                  "total": {
+                    "type": "sum",
+                    "field": "temperature"
+                  },
+                  "minimum": {
+                    "type": "min",
+                    "field": "temperature"
+                  },
+                  "maximum": {
+                    "type": "max",
+                    "field": "temperature"
+                  },
+                  "readings": {
+                    "type": "count",
+                    "field": "temperature"
+                  },
+                  "__antfly_series_count_total": {
+                    "type": "avg",
+                    "field": "temperature"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"device_id\", \"region\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"device_id\") AND \"device_id\" IS NOT NULL AND NOT is_missing(\"region\") AND \"region\" IS NOT NULL GROUP BY \"device_id\", \"region\" ORDER BY COUNT(*) DESC, concat('[', COALESCE(to_jsonb(\"device_id\")::text, 'null'), ',', COALESCE(to_jsonb(\"region\")::text, 'null'), ']') ASC LIMIT $5) SELECT \"__antfly_series_source\".\"device_id\", \"__antfly_series_source\".\"region\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\", SUM(\"__antfly_series_source\".\"temperature\") AS \"total\", MIN(\"__antfly_series_source\".\"temperature\") AS \"minimum\", MAX(\"__antfly_series_source\".\"temperature\") AS \"maximum\", COUNT(*) AS \"readings\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"device_id\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"device_id\" AND \"__antfly_series_source\".\"region\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"region\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"device_id\") AND \"__antfly_series_source\".\"device_id\" IS NOT NULL AND NOT is_missing(\"__antfly_series_source\".\"region\") AND \"__antfly_series_source\".\"region\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"device_id\", \"__antfly_series_source\".\"region\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, concat('[', COALESCE(to_jsonb(\"__antfly_series_source\".\"device_id\")::text, 'null'), ',', COALESCE(to_jsonb(\"__antfly_series_source\".\"region\")::text, 'null'), ']') ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T12:20:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z",
+          2
+        ]
+      }
+    }
+  ]
+}

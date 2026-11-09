@@ -131,7 +131,7 @@ pub fn validateBatchRequest(request: anytype) !void {
             // identity is neither a mutation nor a semantic nondefault value.
             if (comptime @field(defaults, name).len != 0) @compileError("review nonempty default in isolated index control: " ++ name);
             if (value.len != 0) return error.InvalidBatchRequest;
-        } else if (!std.meta.eql(value, @field(defaults, name))) return error.InvalidBatchRequest;
+        } else if (!@import("../control_field_defaults.zig").isolatedFieldMatchesDefault(name, value, @field(defaults, name))) return error.InvalidBatchRequest;
     }
 }
 

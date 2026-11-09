@@ -48,6 +48,14 @@ test "borrowed document batches cross compiled owner without payload ownership t
     defer tmp.cleanup();
     const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(path);
+    // The shared control header keeps its own version when owner layouts
+    // advance. Reject a stale nested header before opening the physical DB.
+    try std.testing.expectError(error.InvalidAbiVersion, client.Owner.open(.{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 1,
+        .initial_range_control = .{ .version = abi.query_abi_version - 1 },
+    }));
     var owner = try client.Owner.open(.{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 1 });
     defer owner.deinit();
     const document = try alloc.dupe(u8, "{\"id\":9007199254740993,\"text\":\"borrowed\"}");
@@ -443,7 +451,7 @@ test "local query identity relay preserves origin and attributes protocol defect
     const failure = error_identity.failureFromError(
         error.InvalidQueryRequest,
         .local_query,
-        abi.abi_version,
+        abi.query_abi_version,
         @backingInt(abi.LocalQueryOperation.parse_internal_request),
     );
     var forwarded: abi.FailureIdentity = .{};
@@ -470,7 +478,7 @@ test "local query identity relay preserves origin and attributes protocol defect
     );
     try std.testing.expectEqual(abi.Status.invalid_boundary_failure_identity, replacement.status);
     try std.testing.expectEqual(abi.FailureBoundary.storage_owner, replacement.boundary);
-    try std.testing.expectEqual(abi.abi_version, replacement.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, replacement.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.validate_provider_response),
         replacement.operation,
@@ -1876,6 +1884,25 @@ test "opaque storage owner schedules source verification after reopen without tr
     return error.SourceVerificationDidNotRun;
 }
 
+// A committed entry is replayable at exactly this term/index. The production
+// Raft adapter normalizes a nonblocking writer lock into this retry identity;
+// maintenance can acquire that lock between any two fixture calls. Retry only
+// this admitted entry, never an ambiguous public write or a semantic rejection.
+fn applyRaftEntryEventually(owner: *client.Owner, table_name: []const u8, json: []const u8, term: u64, index: u64) !client.Response {
+    const time = @import("antfly_platform").time;
+    const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        return owner.replicatedBatchAtRaftEntryJson(table_name, json, term, index) catch |err| switch (err) {
+            error.RaftApplyWriterUnavailable => {
+                if (time.monotonicNs() >= deadline) return err;
+                try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 fn ownerStatusEventually(owner: *client.Owner) !client.Response {
     const time = @import("antfly_platform").time;
     const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
@@ -2161,7 +2188,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(std.mem.indexOf(u8, raft_counter.bytes(), "\"count\":1") != null);
     try std.testing.expectError(
         error.InvalidArgument,
-        owner.replicatedBatchAtRaftEntryJson("docs", "{}", 0, 42),
+        applyRaftEntryEventually(&owner, "docs", "{}", 0, 42),
     );
     try std.testing.expectError(error.InvalidBatchRequest, owner.batchJson("docs", "{"));
     try std.testing.expectError(error.InvalidBatchRequest, owner.replicatedBatchJson("docs", "{"));
@@ -2241,6 +2268,13 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     for ([_][]const u8{ "{", "{\"query_json\":\"{\"}" }) |invalid_json| {
         try std.testing.expectError(error.InvalidQueryRequest, owner.queryJson("docs", invalid_json));
     }
+    // Kernel operations relay query-provider errors under the query version,
+    // while failures originating in the outer owner retain its own version.
+    try std.testing.expectError(error.InvalidQueryRequest, owner.preflightJson("docs", "{"));
+    try std.testing.expectError(error.InvalidQueryRequest, owner.textStatsJson("docs", "{"));
+    try std.testing.expectError(error.InvalidQueryRequest, owner.algebraicPartialsJson("docs", "{"));
+    try std.testing.expectError(error.InvalidQueryRequest, owner.graphExpandJson("docs", "{", null, null, null));
+    try std.testing.expectError(error.InvalidArgument, owner.preflightJson("other", "{}"));
 
     // The nested distributed -> storage-owner -> local-query path must retain
     // both the semantic status and its originating stage, not merely rethrow a
@@ -2259,7 +2293,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.Status.invalid_query, invalid_query_status);
     try std.testing.expectEqual(invalid_query_status, invalid_query_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, invalid_query_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, invalid_query_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, invalid_query_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.parse_internal_request),
         invalid_query_failure.operation,
@@ -2271,7 +2305,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     var invalid_abi_response: abi.QueryOwnedResponse = .{};
     var invalid_abi_failure: abi.FailureIdentity = .{};
     var invalid_abi_request = abi.LocalQueryRequest{};
-    invalid_abi_request.version = abi.abi_version - 1;
+    invalid_abi_request.version = abi.query_abi_version - 1;
     const invalid_abi_status = abi.antfly_local_query_execute(
         &invalid_abi_request,
         &invalid_abi_response,
@@ -2308,7 +2342,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_algebraic_status != .ok);
     try std.testing.expectEqual(invalid_algebraic_status, operation_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.algebraic_partials),
         operation_failure.operation,
@@ -2324,7 +2358,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_text_stats_status != .ok);
     try std.testing.expectEqual(invalid_text_stats_status, operation_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.text_stats),
         operation_failure.operation,
@@ -2340,7 +2374,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_preflight_status != .ok);
     try std.testing.expectEqual(invalid_preflight_status, operation_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.preflight),
         operation_failure.operation,
@@ -2356,7 +2390,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_graph_status != .ok);
     try std.testing.expectEqual(invalid_graph_status, operation_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(abi.query_abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
         @backingInt(abi.LocalQueryOperation.parse_graph_expand),
         operation_failure.operation,
@@ -2826,7 +2860,7 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.antfly_storage_owner_algebraic_partials_json(null, &invalid_operation, &response, &query_failure),
     );
     try std.testing.expectEqual(@as(u64, 0), response.len);
-    const invalid_controlled = abi.ControlledJsonOperationRequest{ .version = abi.abi_version + 1 };
+    const invalid_controlled = abi.ControlledJsonOperationRequest{ .version = abi.query_abi_version + 1 };
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_expand_json(null, &invalid_controlled, &response, &query_failure));
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_hydrate_json(null, &invalid_controlled, &response, &query_failure));
@@ -3200,7 +3234,7 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
             var reopened = try client.Owner.open(self.options);
             defer reopened.deinit();
             for (entries) |entry| {
-                var result = try reopened.replicatedBatchAtRaftEntryJson("rows", entry.data, entry.term, entry.index);
+                var result = try applyRaftEntryEventually(&reopened, "rows", entry.data, entry.term, entry.index);
                 result.deinit();
             }
             self.batches += 1;
@@ -4594,7 +4628,7 @@ test "storage kernel status registry is unique and lossless" {
         const failure = error_identity.failureFromError(
             expected,
             .local_query,
-            abi.abi_version,
+            abi.query_abi_version,
             @backingInt(abi.LocalQueryOperation.execute_internal_query),
         );
         var forwarded: abi.FailureIdentity = .{};
@@ -5926,4 +5960,56 @@ test "opaque storage pipeline metrics snapshot versions and ownership" {
     try std.testing.expect(rejected.ptr == null);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_context_pipeline_metrics_json(context.handle, 2, &rejected));
     try std.testing.expect(rejected.ptr == null);
+}
+
+test "time series owner query preserves invalid histogram class before runtime callbacks" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var owner = try client.Owner.open(.{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7013,
+        .has_identity_namespace = 1,
+        .identity_table_id = 7,
+        .identity_shard_id = 7013,
+        .identity_range_id = 7013,
+    });
+    defer owner.deinit();
+    var batch = try owner.batchJson("docs",
+        \\{"inserts":{"lo":{"ts":-170141183460469231731687303715884105728},"hi":{"ts":170141183460469231731687303715884105727}},"sync_level":"full_index"}
+    );
+    defer batch.deinit();
+    const runtime_error = @import("antfly_runtime_abi").error_abi;
+    for ([_][]const u8{
+        \\{"query":{"match_all":{}},"limit":0,"aggregations":{"points":{"type":"date_histogram","field":"ts","fixed_interval":"1ns","min_doc_count":0}}}
+        ,
+        \\{"query":{"match_all":{}},"limit":0,"aggregations":{"points":{"type":"date_histogram","field":"ts","fixed_interval":"1ns","min_doc_count":1}}}
+        ,
+    }) |query| {
+        var response: abi.QueryOwnedResponse = .{};
+        defer abi.antfly_storage_owner_buffer_destroy(&response.buffer);
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_query_json(owner.handle, &.{ .control = .{
+            .table_name = .fromSlice("docs"),
+            .request_json = .fromSlice(query),
+        } }, &response, &failure);
+        try std.testing.expectEqual(abi.Status.invalid_query, status);
+        try std.testing.expectEqual(status, failure.status);
+        try std.testing.expectEqual(abi.FailureBoundary.local_query, failure.boundary);
+        try std.testing.expectEqual(abi.query_abi_version, failure.boundary_version);
+        try std.testing.expectEqual(@backingInt(abi.LocalQueryOperation.execute_internal_query), failure.operation);
+        try std.testing.expectEqualStrings("InvalidQueryRequest", failure.errorName());
+        const received = blk: {
+            client.statusToError(status) catch |err| break :blk err;
+            return error.ExpectedInvalidHistogram;
+        };
+        const transported = runtime_error.statusFromError(received);
+        try std.testing.expectEqual(@backingInt(runtime_error.Code.invalid_argument), transported.code);
+        try std.testing.expectEqual(error.InvalidQueryRequest, runtime_error.errorFromStatus(transported));
+    }
+    var healthy = try owner.queryJson("docs", "{\"query\":{\"match_all\":{}},\"limit\":1}");
+    defer healthy.deinit();
 }

@@ -2435,7 +2435,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original document producers preserve generated domains row filters and cold postimages",
             "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
             "mounted SQL original document MERGE retains native session fences postimages and cold versions",
-            "mounted SQL original document identities enforce create only conflicts returning versions and cold postimages",
+            "mounted SQL document revision contract rejects unassigned previews and retains cold committed versions",
+            "mounted SQL original self source document identity preserves empty returning duplicate refusal and cold rows",
             "mounted SQL original document integrity rejects invalid images and assignment indirection across cold owners",
             "SQL assignment target domains",
             "mounted SQL original source mutations preserve constrained postimages errors defaults and cold identities",
@@ -2786,10 +2787,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_document_merge_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-document-merge-lifecycle-test", "Run document MERGE with native serializable sessions and cold owner recovery")
         .dependOn(&sql_document_merge_run.step);
-    const sql_document_identity_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original document identities enforce create only conflicts returning versions and cold postimages", "transaction read preflight preserves physical unique absence without relabeling optimistic conflicts", "transaction commit version retains nanoseconds and rejects overflow", "SQL schema cache owns custom version fields through cache hits and owner release", "SQL session overlay staged versions retain original fences through projection and cursor release" });
+    const sql_document_identity_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original document identities enforce create only conflicts returning versions and cold postimages", "transaction read preflight preserves physical unique absence without relabeling optimistic conflicts", "transaction commit version retains nanoseconds and rejects overflow", "SQL schema cache separates document TTL from relational prepared versions through owner release", "SQL session overlay staged versions retain original fences through projection and cursor release" });
     sql_document_identity_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-document-identity-lifecycle-test", "Verify create-only document identities, conflict results and native RETURNING versions across restart")
         .dependOn(&sql_document_identity_run.step);
+    const sql_document_revision_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL document revision contract rejects unassigned previews and retains cold committed versions", "mounted SQL original self source document identity preserves empty returning duplicate refusal and cold rows", "SQL schema cache separates document TTL from relational prepared versions through owner release", "SQL session overlay staged versions retain original fences through projection and cursor release" });
+    sql_document_revision_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-document-revision-contract-test", "Verify actual committed document revisions, truthful precommit refusal, independent self-source SQL and cold owners").dependOn(&sql_document_revision_run.step);
     const sql_source_mutation_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original source mutations preserve constrained postimages errors defaults and cold identities"});
     sql_source_mutation_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-source-mutation-lifecycle-test", "Verify original source mutations with constrained owners and complete cold postimages").dependOn(&sql_source_mutation_run.step);

@@ -297,7 +297,7 @@ pub fn validateSqlDropBatch(request: anytype) !void {
         const same = if (comptime @typeInfo(@TypeOf(value)) == .pointer and @typeInfo(@TypeOf(value)).pointer.size == .slice)
             value.len == 0 and expected.len == 0
         else
-            std.meta.eql(value, expected);
+            @import("../control_field_defaults.zig").isolatedFieldMatchesDefault(name, value, expected);
         if (!same) return error.InvalidBatchRequest;
     }
 }

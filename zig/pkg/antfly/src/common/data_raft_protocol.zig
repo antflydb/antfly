@@ -40,12 +40,12 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = batch_coupled_schema_policy_protocol_version;
+pub const batch_protocol_version: u16 = batch_document_revisions_protocol_version;
 pub const batch_coupled_schema_policy_protocol_version: u16 = 35;
 /// Prepared graph attachments change both the root batch and intent payload.
 /// Serving remains independent: parsing a reserved barrier never admits it.
 pub const batch_graph_transaction_protocol_version: u16 = 34;
-pub const maximum_decodable_batch_protocol_version: u16 = batch_coupled_schema_policy_protocol_version;
+pub const maximum_decodable_batch_protocol_version: u16 = batch_document_revisions_protocol_version;
 
 /// Semantic data7 includes the graph batch34 decoder. Every production store
 /// report uses the compiled semantic version; overrides cannot split this pair.
@@ -95,6 +95,9 @@ pub const native_snapshot_origin_protocol_version = batch_schema_owner_control_p
 pub fn nativeSnapshotOriginEnabled(activated_protocol: u16) bool {
     return activated_protocol >= native_snapshot_origin_protocol_version;
 }
+/// Merged document revision effects require a fresh all-member barrier.
+/// SQL already owns27 and View36; Source37 remains a separate future tranche.
+pub const batch_document_revisions_protocol_version: u16 = 38;
 /// Version 25 carries leader-planned LEANN records (`_leann_record`), which
 /// replicas persist and apply verbatim in log order. Older peers cannot
 /// treat them as empty batches.

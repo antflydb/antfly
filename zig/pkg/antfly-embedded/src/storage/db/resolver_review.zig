@@ -165,7 +165,7 @@ pub fn validateRequest(req: anytype) !void {
         if (comptime !std.mem.eql(u8, name, "resolver_review") and !std.mem.eql(u8, name, "sync_level")) {
             if (comptime @typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice) {
                 if (@field(req, name).len != 0) return error.InvalidResolverCurationRequest;
-            } else if (!std.meta.eql(@field(req, name), @field(empty, name))) return error.InvalidResolverCurationRequest;
+            } else if (!@import("../control_field_defaults.zig").isolatedFieldMatchesDefault(name, @field(req, name), @field(empty, name))) return error.InvalidResolverCurationRequest;
         }
     }
 }

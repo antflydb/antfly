@@ -239,27 +239,36 @@ pub const Cache = struct {
     }
 };
 
-test "SQL schema cache owns custom version fields through cache hits and owner release" {
+test "SQL schema cache separates document TTL from relational prepared versions through owner release" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var cache = Cache.init(a);
     var live = true;
     defer if (live) cache.deinit();
-    const json = "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"ttl\":{\"duration\":\"1s\",\"field\":\"expires\"},\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":true}}}}";
+    const document_json = "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"ttl\":{\"duration\":\"1s\",\"field\":\"expires\"},\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":true}}}}";
+    const relational_json = "{\"version\":1,\"storage_mode\":\"relational\",\"ttl_duration_ns\":1,\"ttl_field\":\"expires\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"expires\":{\"type\":\"datetime\"}},\"additionalProperties\":false}}}}";
     var tables: [2]catalog.Table = undefined;
-    for (&tables) |*table| table.* = try cache.resolve(std.testing.io, arena.allocator(), json, 7, "docs");
-    for (cache.slots) |slot| if (slot.entry) |entry| for (tables) |table| {
-        try std.testing.expect(table.version_field.?.ptr != entry.layout.version_field.?.ptr);
+    for (&tables) |*table| table.* = try cache.resolve(std.testing.io, arena.allocator(), relational_json, 7, "rows");
+    const document = try cache.resolve(std.testing.io, arena.allocator(), document_json, 8, "docs");
+    try std.testing.expect(document.version_field == null);
+    for (cache.slots) |slot| if (slot.entry) |entry| if (entry.layout.version_field) |field| for (tables) |table| {
+        try std.testing.expect(table.version_field.?.ptr != field.ptr);
     };
     cache.deinit();
     live = false;
     var root: std.json.ObjectMap = .empty;
     try root.put(arena.allocator(), "expires", .{ .integer = 123 });
+    try std.testing.expectError(error.UnsupportedSqlExecution, document.preparedVersion(.{ .object = root }, 456));
     for (tables) |table| {
         try std.testing.expectEqualStrings("expires", table.version_field.?);
         try std.testing.expectEqual(@as(u64, 123), try table.preparedVersion(.{ .object = root }, 456));
         try std.testing.expectEqual(@as(u64, 456), try table.preparedVersion(.{ .object = .empty }, 456));
+        try root.put(arena.allocator(), "expires", .{ .integer = -1 });
+        try std.testing.expectError(error.InvalidTimestamp, table.preparedVersion(.{ .object = root }, 456));
+        try root.put(arena.allocator(), "expires", .{ .number_string = "18446744073709551616" });
+        try std.testing.expectError(error.InvalidTimestamp, table.preparedVersion(.{ .object = root }, 456));
+        try root.put(arena.allocator(), "expires", .{ .integer = 123 });
     }
 }
 
@@ -271,7 +280,7 @@ fn derive(layout: *Layout, json: []const u8, temporary: std.mem.Allocator, owned
     const alloc = scratch.allocator();
     const parsed = try schema.parseValidatedTableSchema(alloc, json);
     layout.has_triggers = if (parsed.sql_triggers) |state| state.value.entries.len != 0 else false;
-    layout.version_field = if (parsed.ttl_duration_ns != 0) try owned.dupe(u8, parsed.ttl_field) else null;
+    layout.version_field = if (parsed.storage_mode == .relational and parsed.ttl_duration_ns != 0) try owned.dupe(u8, parsed.ttl_field) else null;
     layout.constraints = try catalog.Constraint.derive(owned, parsed);
     if (parsed.storage_mode == .document) {
         layout.storage_mode = .document;

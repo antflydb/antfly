@@ -350,7 +350,7 @@ pub fn parseInput(kind: temporal.Kind, input: []const u8) ParseError!temporal.Va
     if (text.len == 0 or text.len > 4096) return error.InvalidTemporalText;
     if (std.ascii.eqlIgnoreCase(text, "infinity")) return parseCanonical(kind, "infinity");
     if (std.ascii.eqlIgnoreCase(text, "-infinity")) return parseCanonical(kind, "-infinity");
-    var parts = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    var parts: IntervalParts = .{ .fields = std.mem.tokenizeAny(u8, text, " \t\r\n") };
     var months: i128 = 0;
     var days: i128 = 0;
     var micros: i128 = 0;
@@ -377,7 +377,7 @@ pub fn parseInput(kind: temporal.Kind, input: []const u8) ParseError!temporal.Va
             break;
         };
         const decimal = try intervalDecimal(number);
-        const factor: i128 = if (intervalUnit(unit, "millennium", "millennia")) 12000 else if (intervalUnit(unit, "century", "centuries")) 1200 else if (intervalUnit(unit, "decade", "decades")) 120 else if (intervalUnit(unit, "year", "years")) 12 else if (intervalUnit(unit, "month", "months") or intervalUnit(unit, "mon", "mons")) 1 else 0;
+        const factor: i128 = if (intervalUnit(unit, "millennium", "millennia")) 12000 else if (intervalUnit(unit, "century", "centuries")) 1200 else if (intervalUnit(unit, "decade", "decades")) 120 else if ((intervalUnit(unit, "year", "years") or std.ascii.eqlIgnoreCase(unit, "y"))) 12 else if (intervalUnit(unit, "month", "months") or intervalUnit(unit, "mon", "mons")) 1 else 0;
         if (factor != 0) {
             const value = decimal.value * factor;
             if (factor != 1) {
@@ -392,12 +392,12 @@ pub fn parseInput(kind: temporal.Kind, input: []const u8) ParseError!temporal.Va
             const day_value = @rem(value, decimal.scale) * 30;
             days += @divTrunc(day_value, decimal.scale);
             micros += intervalRound(@rem(day_value, decimal.scale) * temporal.micros_per_day, decimal.scale);
-        } else if (intervalUnit(unit, "week", "weeks") or intervalUnit(unit, "day", "days")) {
-            const value = decimal.value * @as(i128, if (intervalUnit(unit, "week", "weeks")) 7 else 1);
+        } else if (intervalUnit(unit, "week", "weeks") or std.ascii.eqlIgnoreCase(unit, "w") or intervalUnit(unit, "day", "days") or std.ascii.eqlIgnoreCase(unit, "d")) {
+            const value = decimal.value * @as(i128, if (intervalUnit(unit, "week", "weeks") or std.ascii.eqlIgnoreCase(unit, "w")) 7 else 1);
             days += @divTrunc(value, decimal.scale);
             micros += intervalRound(@rem(value, decimal.scale) * temporal.micros_per_day, decimal.scale);
         } else {
-            const time_factor: i128 = if (intervalUnit(unit, "hour", "hours")) 3_600_000_000 else if (intervalUnit(unit, "minute", "minutes") or intervalUnit(unit, "min", "mins")) 60_000_000 else if (intervalUnit(unit, "second", "seconds") or intervalUnit(unit, "sec", "secs")) 1_000_000 else if (intervalUnit(unit, "millisecond", "milliseconds")) 1000 else if (intervalUnit(unit, "microsecond", "microseconds")) 1 else return error.InvalidTemporalText;
+            const time_factor: i128 = if (intervalUnit(unit, "hour", "hours") or std.ascii.eqlIgnoreCase(unit, "h")) 3_600_000_000 else if (intervalUnit(unit, "minute", "minutes") or intervalUnit(unit, "min", "mins") or std.ascii.eqlIgnoreCase(unit, "m")) 60_000_000 else if (intervalUnit(unit, "second", "seconds") or intervalUnit(unit, "sec", "secs") or std.ascii.eqlIgnoreCase(unit, "s")) 1_000_000 else if (intervalUnit(unit, "millisecond", "milliseconds") or std.ascii.eqlIgnoreCase(unit, "ms")) 1000 else if (intervalUnit(unit, "microsecond", "microseconds") or std.ascii.eqlIgnoreCase(unit, "us")) 1 else return error.InvalidTemporalText;
             micros += intervalRound(decimal.value * time_factor, decimal.scale);
         }
     }
@@ -420,6 +420,24 @@ test "SQL UUIDv7 interval input agrees with independent PostgreSQL binary witnes
         .{ .input = "0.0000005 seconds", .binary = "00000000000000000000000000000000" },
         .{ .input = "0.0000015 seconds", .binary = "00000000000000010000000000000000" },
         .{ .input = "1 day ago", .binary = "0000000000000000ffffffff00000000" },
+        .{ .input = "1h+30m", .binary = "0000000141dd76000000000000000000" },
+        .{ .input = "1h+30 m", .binary = "0000000141dd76000000000000000000" },
+        .{ .input = "-1h+30m", .binary = "ffffffff94b62e000000000000000000" },
+        .{ .input = "1h -30m", .binary = "000000006b49d2000000000000000000" },
+        .{ .input = "1h+30", .binary = "00000000d85d67800000000000000000" },
+        .{ .input = "5m", .binary = "0000000011e1a3000000000000000000" },
+        .{ .input = "5 m", .binary = "0000000011e1a3000000000000000000" },
+        .{ .input = "1h30m", .binary = "0000000141dd76000000000000000000" },
+        .{ .input = "5ms", .binary = "00000000000013880000000000000000" },
+        .{ .input = "5us", .binary = "00000000000000050000000000000000" },
+        .{ .input = "1Y2MON", .binary = "0000000000000000000000000000000e" },
+        .{ .input = "1.5h", .binary = "0000000141dd76000000000000000000" },
+        .{ .input = "-1h30m", .binary = "ffffffff94b62e000000000000000000" },
+        .{ .input = "5minutes", .binary = "0000000011e1a3000000000000000000" },
+        .{ .input = "1d", .binary = "00000000000000000000000100000000" },
+        .{ .input = "1w", .binary = "00000000000000000000000700000000" },
+        .{ .input = "1y", .binary = "0000000000000000000000000000000c" },
+        .{ .input = "1m2s", .binary = "0000000003b20b800000000000000000" },
         .{ .input = "infinity", .binary = "7fffffffffffffff7fffffff7fffffff" },
     };
     for (cases) |case| {
@@ -427,6 +445,45 @@ test "SQL UUIDv7 interval input agrees with independent PostgreSQL binary witnes
         var actual: [16]u8 = undefined;
         const value = try parseInput(.interval, case.input);
         try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&expected, case.binary), try temporal.encode(value, &actual));
+    }
+}
+
+// Split compact numeric/unit fields once, without allocating or rescanning
+// their tails. Clock fields remain intact for the existing time parser.
+const IntervalParts = struct {
+    fields: @TypeOf(std.mem.tokenizeAny(u8, "", " \t\r\n")),
+    field: []const u8 = "",
+    offset: usize = 0,
+
+    fn next(self: *@This()) ?[]const u8 {
+        if (self.offset == self.field.len) {
+            self.field = self.fields.next() orelse return null;
+            self.offset = 0;
+            if (std.mem.indexOfScalar(u8, self.field, ':') != null) {
+                self.offset = self.field.len;
+                return self.field;
+            }
+        }
+        const start = self.offset;
+        const first = self.field[start];
+        if (std.ascii.isAlphabetic(first)) {
+            while (self.offset < self.field.len and std.ascii.isAlphabetic(self.field[self.offset])) self.offset += 1;
+        } else if (std.ascii.isDigit(first) or first == '.' or (first == '+' or (first == '-' and start == 0))) {
+            self.offset += 1;
+            while (self.offset < self.field.len and (std.ascii.isDigit(self.field[self.offset]) or self.field[self.offset] == '.')) self.offset += 1;
+        } else {
+            // A minus between adjacent components (1h-30m) is not PostgreSQL
+            // interval syntax. Return an invalid token even when the tail is numeric.
+            self.offset = self.field.len;
+            return if (start == 0 and std.mem.eql(u8, self.field, "@")) self.field else "\x00";
+        }
+        return self.field[start..self.offset];
+    }
+};
+
+test "SQL compact interval rejects PostgreSQL-invalid adjacent signs and exponents" {
+    for ([_][]const u8{ "1h-30m", "1h-30 m", "1h-30", "1e2 seconds" }) |input| {
+        try std.testing.expectError(error.InvalidTemporalText, parseInput(.interval, input));
     }
 }
 

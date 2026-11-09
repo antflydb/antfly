@@ -19,6 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
+// Includes main v89 aggregation budgets, checked DB borrows and policy fences.
 // Main owns published job projections 72..74. Schema preflight appends at 75.
 // v116 also versions JSON semantics: v115 accepts the existing receipt-v3
 // wrapper but can ignore its new graph_preparation root. Engine descriptors
@@ -46,6 +47,8 @@ pub const FailureIdentity = failure_abi.FailureIdentity;
 pub const failure_error_name_capacity = failure_abi.failure_error_name_capacity;
 
 const query_abi = @import("local_query_abi");
+/// Shared query headers and failures evolve independently of storage layouts.
+pub const query_abi_version: u32 = query_abi.abi_version;
 pub const BorrowedBytes = query_abi.BorrowedBytes;
 pub const OwnedBytes = query_abi.OwnedBytes;
 
@@ -1535,6 +1538,10 @@ pub const AggregationRequest = extern struct {
     context_json: BorrowedBytes = .{},
     hits: ?[*]const AggregationHit = null,
     hit_count: u64 = 0,
+    execution_deadline_ns: u64 = 0,
+    has_execution_deadline: u8 = 0,
+    cancellation_ctx: ?*anyopaque = null,
+    cancellation_fn: ?CancellationCheckFn = null,
 };
 
 /// Synchronous coarse dispatch of one generated document-artifact child range.

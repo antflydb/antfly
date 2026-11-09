@@ -164,6 +164,8 @@ pub const Owner = struct {
         row.version = source.version;
         row.expected_content_digest = source.expected_content_digest;
         row.document_version = source.document_version;
+        row.document_version_state = source.document_version_state;
+        row.document_envelope = source.document_envelope;
         return row;
     }
 
@@ -171,7 +173,15 @@ pub const Owner = struct {
         const row = @constCast(try self.typedRow(key, value, json_null_fields));
         row.version = version;
         row.expected_content_digest = digest;
+        row.document_version_state = .assigned;
         return row;
+    }
+
+    /// NEW images have no assigned durable document revision. Version zero
+    /// is not an availability sentinel: sourceRow explicitly marks real OLD
+    /// images assigned, including genuine committed legacy zero.
+    pub fn stagedRow(self: *Owner, key: []const u8, value: Json, json_null_fields: []const []const u8) !*const catalog.Row {
+        return self.typedRow(key, value, json_null_fields);
     }
 
     fn typedRow(self: *Owner, key: []const u8, value: Json, json_null_fields: []const []const u8) !*const catalog.Row {
@@ -182,6 +192,7 @@ pub const Owner = struct {
             // normal SQL/document decoder, not relational transport bitmaps.
             const row = try self.a.create(catalog.Row);
             row.* = try projection.projectValue(self.a, key, 0, value);
+            row.document_version_state = .unassigned;
             return row;
         }
         const flags = try self.a.alloc(bool, value.object.count());

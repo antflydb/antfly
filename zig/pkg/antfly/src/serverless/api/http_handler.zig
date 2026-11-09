@@ -1991,6 +1991,7 @@ pub const HttpHandler = struct {
             source_hits,
         );
         defer ctx_owned.deinit(self.alloc);
+        ctx_owned.ctx.control.cancellation = execution.session.?.readCancellation();
 
         const db_hits = try allocDbAggregationHitsAlloc(self.alloc, &execution.session.?, source_hits);
         defer freeDbSearchHits(self.alloc, db_hits);
@@ -2047,6 +2048,15 @@ pub const HttpHandler = struct {
             .context_json = .fromSlice(context_json),
             .hits = if (hits.len == 0) null else hits.ptr,
             .hit_count = @intCast(hits.len),
+            .execution_deadline_ns = ctx.control.deadline_ns orelse 0,
+            .has_execution_deadline = @intFromBool(ctx.control.deadline_ns != null),
+            .cancellation_ctx = if (ctx.control.cancellation != null) @ptrCast(@constCast(&ctx.control.cancellation.?)) else null,
+            .cancellation_fn = if (ctx.control.cancellation != null) struct {
+                fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                    const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                    return @intFromBool(token.isCancelled());
+                }
+            }.cancelled else null,
         });
         defer response.deinit();
         const results = std.json.parseFromSliceLeaky(
@@ -6197,7 +6207,7 @@ pub const HttpHandler = struct {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         const guard = http_types.RequestGuard{ .context = request };
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
-        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (err) {
+        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (normalizePublicAggregationError(err)) {
             error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
@@ -10429,13 +10439,7 @@ fn queryOperationalFailureResponse(alloc: Allocator, err: anyerror) !?HttpRespon
 /// well-formed capability this deployment cannot execute. Stateful and
 /// serverless query surfaces share this normalization so callers receive the
 /// same 400/422 contract independent of the serving architecture.
-fn normalizePublicAggregationError(err: anyerror) anyerror {
-    return switch (err) {
-        error.InvalidQueryRequest, error.InvalidAggregation => error.InvalidQueryRequest,
-        error.UnsupportedQueryRequest, error.UnsupportedAggregation => error.UnsupportedQueryRequest,
-        else => err,
-    };
-}
+const normalizePublicAggregationError = public_table_http.normalizePublicAggregationError;
 
 const UnsupportedArtifactIndexSourcesError = struct {
     @"error": []const u8 = "unsupported_index_capability",

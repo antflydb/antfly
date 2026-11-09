@@ -15,6 +15,8 @@ order: 1
 
 A table stores JSON documents. Schema mappings describe how each field becomes a queryable structure, and the planner picks the exact or approximate execution path that matches the request. The decision this page is most often read for: when a query needs an exact sorted page, which fields can serve it, and why the planner refuses rather than guesses.
 
+For timestamped measurements, the [time-series guide](/docs/guides/time-series) combines typed mappings, exact reads, temporal aggregations, algebraic recipes, and Antfarm charting.
+
 The pieces the planner composes:
 
 - **Documents** are the source payload returned to clients. Stored JSON is never the production search or sort index.

@@ -257,6 +257,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "embedding validation failures share",
             "hierarchy validation body survives",
             "serverless create index normalization resolves and persists",
+            "serverless aggregation errors preserve invalid and unsupported classes",
+            "time series public aggregation failures retain client and operational classes",
         },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -4202,6 +4204,39 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
+    const time_series_filters = selectTestFilters(b, &.{"time series"});
+    const time_series_tests = b.addTest(.{
+        .name = "time-series-tests",
+        .root_module = antfly_test_mod,
+        .filters = time_series_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    // Expanded native snapshot coverage peaks at 10.83 GB on macOS
+    // ReleaseFast. Reserve 12 GiB for bounded compiler scheduling.
+    time_series_tests.step.max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024;
+    b.step("time-series-test", "Verify fixed temporal buckets, bounds and empty measurements").dependOn(&b.addRunArtifact(time_series_tests).step);
+    const time_series_storage_tests = b.addTest(.{
+        .name = "time-series-storage-tests",
+        .root_module = antfly_test_mod,
+        .filters = selectTestFilters(b, &.{ "date histogram", "storage.ttl.", "storage.backup_codec.", "storage.portable_backup.", "storage.retained_effects.", "storage.document_mutation_revision.", "storage.db.maintenance.ttl_runtime.", "time series portable document codec preserves signed TTL and write versions" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    // Portable archive and legacy histogram coverage peaks around 6.6 GB on
+    // native macOS ReleaseFast. Reserve enough for bounded build scheduling.
+    time_series_storage_tests.step.max_rss = 8 * 1024 * 1024 * 1024;
+    b.step("time-series-storage-test", "Verify histogram limits, TTL metadata, retained replay, and portable archive compatibility").dependOn(&b.addRunArtifact(time_series_storage_tests).step);
+    const time_series_runtime_tests = b.addTest(.{
+        .name = "time-series-runtime-tests",
+        .root_module = api_http_runtime_test_mod,
+        .filters = time_series_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    // Expanded revision/recovery and retained-tail coverage measured a
+    // 12.92 GB native macOS ReleaseFast peak. Reserve 16 GiB with headroom;
+    // the physical local partition inherits this scheduling claim.
+    time_series_runtime_tests.step.max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 8) * 1024 * 1024 * 1024;
+    b.step("time-series-runtime-test", "Verify temporal predicate proof, owner fanout and fallback contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, time_series_runtime_tests, time_series_filters).step);
+
     const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");
     const pessimistic_lock_native_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -7695,6 +7730,38 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("relational-index-catalog-test", "Verify native ordered catalog allocation, recovery and private reservation contracts")
         .dependOn(&addFilteredTestRunArtifact(b, native_index_catalog_tests).step);
+    const sql_revision_compatibility_step = b.step("sql-revision-compatibility-test", "Verify SQL controls, domain provenance and transaction codecs preserve document revisions");
+    const sql_revision_compatibility_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "time series record codec", "time series intent document scheme", "document revision admission" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_revision_compatibility_run = addFilteredTestRunArtifact(b, sql_revision_compatibility_tests);
+    sql_revision_compatibility_run.addArg("--require-no-skips");
+    sql_revision_compatibility_step.dependOn(&sql_revision_compatibility_run.step);
+    const sql_revision_codec_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/batch_codec_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configureEmbedded(b, sql_revision_codec_mod, true);
+    antfly_imports.storage_boundary.configureSources(sql_revision_codec_mod, false, false);
+    const sql_revision_codec_filters: []const []const u8 = &.{ "row policy publication Raft codec", "SQL domain internal preparation handoffs", "time series document revision wire", "time series merge revision floor", "time series staged timestamp wire", "range tracking activation codec", "ordered artifact inventory private batch roundtrip", "artifact publication upload control", "internal batch topology control", "SQL relation lifetime frozen native lock controls" };
+    const sql_revision_codec_tests = b.addTest(.{
+        .root_module = sql_revision_codec_mod,
+        .filters = sql_revision_codec_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_revision_codec_run = addFilteredTestRunArtifact(b, sql_revision_codec_tests);
+    sql_revision_codec_run.addArg("--require-no-skips");
+    const sql_revision_codec_inventory = b.addRunArtifact(sql_revision_codec_tests);
+    sql_revision_codec_inventory.addArg("--list-tests");
+    const sql_revision_codec_audit = b.addSystemCommand(&.{ "python3", "tools/audit_test_selection.py" });
+    for (sql_revision_codec_filters) |filter| sql_revision_codec_audit.addArgs(&.{ "--filter", filter });
+    sql_revision_codec_audit.addArg("--inventory");
+    sql_revision_codec_audit.addFileArg2(sql_revision_codec_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    sql_revision_codec_run.step.dependOn(&sql_revision_codec_audit.step);
+    sql_revision_compatibility_step.dependOn(&sql_revision_codec_run.step);
     const source_vector_contract_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "external vector compatibility declaration", "scalar text asset chunks", "generic scalar chunks reject stale upstream and fence publication", "generic contextual asset publication", "asset producer neighbor context samples", "source semantic media input", "transcript chunk public provenance", "transcript timing stamps", "diarized phrases carry", "transcript spans locate", "grouped artifact text filters use parent ordinals" },

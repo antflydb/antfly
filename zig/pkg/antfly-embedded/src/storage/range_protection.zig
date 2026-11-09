@@ -77,7 +77,7 @@ pub fn validateRequest(req: anytype) !void {
         const value = @field(req, reflected_name);
         if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
             if (value.len != 0) return error.InvalidBatchRequest;
-        } else if (!std.meta.eql(value, @field(defaults, reflected_name))) return error.InvalidBatchRequest;
+        } else if (!@import("control_field_defaults.zig").isolatedFieldMatchesDefault(reflected_name, value, @field(defaults, reflected_name))) return error.InvalidBatchRequest;
     }
 }
 

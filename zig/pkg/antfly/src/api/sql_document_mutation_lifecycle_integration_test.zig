@@ -626,28 +626,106 @@ const Campaign = struct {
         };
     }
 
+    fn expectTitle(ctx: *fixture.Context, connection: ?[]const u8, statement: []const u8, expected: []const u8) !void {
+        var response = try client.executeConnected(ctx, null, connection, statement, .never);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.columns.len);
+        try std.testing.expectEqualStrings("title", parsed.value.columns[0].name);
+        try std.testing.expect(compare.postgresColumnMatches(parsed.value.columns[0], 25));
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.rows[0].len);
+        try std.testing.expect(!parsed.value.sql_nulls.?[0][0]);
+        try std.testing.expectEqualStrings(expected, parsed.value.rows[0][0].string);
+    }
+
+    fn unsupportedVersion(ctx: *fixture.Context, connection: ?[]const u8, statement: []const u8) !void {
+        var response = try client.executeConnected(ctx, null, connection, statement, .never);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 501), response.status);
+        var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings("0A000", diagnostic.value.code);
+    }
+
+    fn primaryFingerprint(ctx: *fixture.Context, physical: []const u8) !Fingerprint {
+        const reads = ctx.data.http_server.?.table_reads orelse return error.MissingDocumentReader;
+        var row = (try reads.lookup(ctx.alloc, physical, "doc:a", .{ .include_primary_digest = true }, .read_index)) orelse return error.MissingDocumentPostimage;
+        defer row.deinit(ctx.alloc);
+        return .{ .table = physical, .key = "doc:a", .version = row.version, .digest = row.expected_content_digest orelse return error.MissingDocumentDigest };
+    }
+
+    fn unchanged(ctx: *fixture.Context, before: Fingerprint) !void {
+        const after = try primaryFingerprint(ctx, before.table);
+        try std.testing.expectEqual(before.version, after.version);
+        try std.testing.expectEqual(before.digest, after.digest);
+    }
+
     fn verifyStagedVersions(ctx: *fixture.Context) !void {
+        const physical = try physicalName(ctx);
+        defer ctx.alloc.free(physical);
+        const before = try primaryFingerprint(ctx, physical);
+        try std.testing.expectEqual(before.version, try version(ctx, null, "SELECT _version FROM docs WHERE _id='doc:a'"));
+        // A failed precommit version projection cannot publish the candidate.
+        try unsupportedVersion(ctx, null, "UPDATE docs SET title='must_not_commit' WHERE _id='doc:a' RETURNING _version");
+        try unchanged(ctx, before);
         var opened = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/sql/connections", .POST, "{}", 15_000);
         defer opened.deinit(ctx.alloc);
         try std.testing.expectEqual(@as(u16, 200), opened.status);
         var connection = try std.json.parseFromSlice(wire.SQLConnectionResponse, ctx.alloc, opened.body, .{});
         defer connection.deinit();
         const id = connection.value.connection_id;
-        const old = try version(ctx, null, "SELECT _version FROM docs WHERE _id='doc:a'");
         var began = try client.executeConnected(ctx, null, id, "BEGIN ISOLATION LEVEL READ COMMITTED", .never);
         defer began.deinit(ctx.alloc);
         try std.testing.expectEqual(@as(u16, 200), began.status);
-        const stamp = try version(ctx, id, "UPDATE docs SET title='staged' WHERE _id='doc:a' RETURNING _version");
-        try std.testing.expect(stamp != old and stamp != 0);
-        try std.testing.expectEqual(stamp, try version(ctx, id, "SELECT _version FROM docs WHERE _id='doc:a'"));
-        // A second mutation must retain the original primary fence, rather
-        // than mistakenly testing the projected stamp against committed data.
-        try std.testing.expectEqual(stamp, try version(ctx, id, "UPDATE docs SET title='staged_again' WHERE _id='doc:a' RETURNING _version"));
-        try std.testing.expectEqual(old, try version(ctx, null, "SELECT _version FROM docs WHERE _id='doc:a'"));
+        try expectTitle(ctx, id, "UPDATE docs SET title='staged' WHERE _id='doc:a' RETURNING title", "staged");
+        try expectTitle(ctx, id, "SELECT title FROM docs WHERE _id='doc:a'", "staged");
+        // A second mutation still uses the original primary/content fence.
+        try expectTitle(ctx, id, "UPDATE docs SET title='staged_again' WHERE _id='doc:a' RETURNING title", "staged_again");
+        try expectTitle(ctx, id, "SELECT title FROM docs WHERE _id='doc:a'", "staged_again");
+        // DELETE of an updated overlay has only its original OCC fence, not
+        // a durable revision for that staged postimage.
+        try unsupportedVersion(ctx, id, "DELETE FROM docs WHERE _id='doc:a' RETURNING _version");
+        try unchanged(ctx, before);
         var rolled_back = try client.executeConnected(ctx, null, id, "ROLLBACK", .never);
         defer rolled_back.deinit(ctx.alloc);
         try std.testing.expectEqual(@as(u16, 200), rolled_back.status);
-        try std.testing.expectEqual(old, try version(ctx, null, "SELECT _version FROM docs WHERE _id='doc:a'"));
+        try unchanged(ctx, before);
+        try std.testing.expectEqual(before.version, try version(ctx, id, "SELECT _version FROM docs WHERE _id='doc:a'"));
+        var select_begin = try client.executeConnected(ctx, null, id, "BEGIN ISOLATION LEVEL READ COMMITTED", .never);
+        defer select_begin.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), select_begin.status);
+        try expectTitle(ctx, id, "UPDATE docs SET title='staged_select' WHERE _id='doc:a' RETURNING title", "staged_select");
+        try unsupportedVersion(ctx, id, "SELECT _version FROM docs WHERE _id='doc:a'");
+        var select_rollback = try client.executeConnected(ctx, null, id, "ROLLBACK", .never);
+        defer select_rollback.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), select_rollback.status);
+        try unchanged(ctx, before);
+        var delete_begin = try client.executeConnected(ctx, null, id, "BEGIN ISOLATION LEVEL READ COMMITTED", .never);
+        defer delete_begin.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), delete_begin.status);
+        try std.testing.expectEqual(before.version, try version(ctx, id, "DELETE FROM docs WHERE _id='doc:a' RETURNING _version"));
+        try unchanged(ctx, before);
+        var delete_rollback = try client.executeConnected(ctx, null, id, "ROLLBACK", .never);
+        defer delete_rollback.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), delete_rollback.status);
+        try unchanged(ctx, before);
+        var insert_begin = try client.executeConnected(ctx, null, id, "BEGIN ISOLATION LEVEL READ COMMITTED", .never);
+        defer insert_begin.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), insert_begin.status);
+        try expectTitle(ctx, id, "INSERT INTO docs(_id,title) VALUES('doc:unassigned','new') RETURNING title", "new");
+        try expectTitle(ctx, id, "SELECT title FROM docs WHERE _id='doc:unassigned'", "new");
+        try unsupportedVersion(ctx, id, "DELETE FROM docs WHERE _id='doc:unassigned' RETURNING _version");
+        var insert_rollback = try client.executeConnected(ctx, null, id, "ROLLBACK", .never);
+        defer insert_rollback.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), insert_rollback.status);
+        const reads = ctx.data.http_server.?.table_reads orelse return error.MissingDocumentReader;
+        var absent = try reads.lookup(ctx.alloc, physical, "doc:unassigned", .{ .include_primary_digest = true }, .read_index);
+        defer if (absent) |*value| value.deinit(ctx.alloc);
+        try std.testing.expect(absent == null);
+        try unchanged(ctx, before);
         const suffix = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/connections/{s}", .{id});
         defer ctx.alloc.free(suffix);
         var closed = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, suffix, .DELETE, null, 15_000);
@@ -900,6 +978,69 @@ test "mounted SQL original document identities enforce create only conflicts ret
         errdefer std.debug.print("document identity original={s} occupied={any}\n", .{ entry.id, entry.occupied });
         try fixture.runWithState(Campaign, .{ .state = &state });
     }
+}
+
+test "mounted SQL document revision contract rejects unassigned previews and retains cold committed versions" {
+    // Supplemental storage/SQL contract only; no original parity case credit.
+    const Revision = struct {
+        pub const native_sessions = true;
+        credentials: client.ApiKeyHeaders = .{},
+        retained_version: u64 = 0,
+        retained_digest: [32]u8 = undefined,
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.credentials.activate(ctx);
+            const body = "{\"schema\":{\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}}";
+            var created = try fixture.request(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.metadata_uri, "/db/v1/tables/docs", .POST, body);
+            defer created.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), created.status);
+            const serving = try fixture.waitServingSchema(ctx, "docs", 0);
+            try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
+            try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "docs");
+            const physical = try physicalName(ctx);
+            defer ctx.alloc.free(physical);
+            const writer = ctx.data.http_server.?.table_writes orelse return error.MissingDocumentWriter;
+            // Genuine Raft mutation establishes a watermark above the HLC,
+            // still representable as SQL int8. A caller HLC cannot predict it.
+            const high: u64 = @as(u64, std.math.maxInt(i64)) - 1024;
+            _ = (try writer.batch(ctx.alloc, physical, .{ .sync_level = .write, .document_version_scheme = .revision_v1, .timestamp_ns = high, .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"initial\"}" }} })) orelse return error.MissingDocumentOwner;
+            try Campaign.expectTitle(ctx, null, "UPDATE docs SET title='committed' WHERE _id='doc:a' RETURNING title", "committed");
+            const observed = try Campaign.primaryFingerprint(ctx, physical);
+            try std.testing.expect(observed.version > high);
+            try Campaign.verifyStagedVersions(ctx);
+            try Campaign.expectTitle(ctx, null, "SELECT title FROM docs WHERE _id='doc:a'", "committed");
+            self.retained_version = observed.version;
+            self.retained_digest = observed.digest;
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            _ = try fixture.waitServingSchema(ctx, "docs", 0);
+            const physical = try physicalName(ctx);
+            defer ctx.alloc.free(physical);
+            const observed = try Campaign.primaryFingerprint(ctx, physical);
+            try std.testing.expectEqual(self.retained_version, observed.version);
+            try std.testing.expectEqual(self.retained_digest, observed.digest);
+            try std.testing.expectEqual(observed.version, try Campaign.version(ctx, null, "SELECT _version FROM docs WHERE _id='doc:a'"));
+            try Campaign.expectTitle(ctx, null, "SELECT title FROM docs WHERE _id='doc:a'", "committed");
+        }
+    };
+    try fixture.runWithState(Revision, .{});
+}
+
+test "mounted SQL original self source document identity preserves empty returning duplicate refusal and cold rows" {
+    // sql-0935 keeps the unchanged original and its independent PostgreSQL
+    // empty-source/23505 witnesses; it never asserts an unassigned revision.
+    const a = std.testing.allocator;
+    var golden = try std.json.parseFromSlice(Golden, a, local.sql_parity_fixtures.document_identity_reference, .{ .ignore_unknown_fields = true });
+    defer golden.deinit();
+    var count: usize = 0;
+    for (golden.value.entries) |entry| {
+        if (!std.mem.eql(u8, entry.id, "sql-0935")) continue;
+        var state: State = .{ .golden = golden.value, .entry = entry };
+        defer state.versions.deinit(a);
+        defer state.digests.deinit(a);
+        try fixture.runWithState(Campaign, .{ .state = &state });
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
 }
 
 test "mounted SQL original document MERGE retains native session fences postimages and cold versions" {

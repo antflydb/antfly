@@ -77,6 +77,15 @@ pub fn finishWithReuseDigest(a: A, io: std.Io, root: []const u8, request: Reques
 pub fn validate(a: A, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation) !void {
     _ = try validateWithSourceProof(a, io, root, request, namespace, cancellation);
 }
+/// Validate committed metadata without touching payload files. Callers first
+/// validate the request; readers separately validate the physical inventory.
+/// Transport deadlines do not belong to an immutable generation's identity.
+pub fn validateManifestBinding(manifest: Manifest, request: Request, namespace: Namespace) !void {
+    if (manifest.version != 1 or !manifest.namespace.eql(namespace) or manifest.request.table_id != request.table_id or manifest.request.expires_ms != request.expires_ms or !std.mem.eql(u8, manifest.request.id, request.id)) return error.CatalogGenerationChanged;
+    if (!manifest.request.indexesEqual(request)) return error.CatalogGenerationChanged;
+    if (manifest.files.len > seal.max_files) return error.CatalogGenerationChanged;
+}
+
 /// Return the already-fenced owner proof only after validating this cut's
 /// complete physical manifest. Legacy cuts deliberately return null.
 pub fn validateWithSourceProof(a: A, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation) !?[32]u8 {
@@ -94,14 +103,7 @@ pub fn validateWithSourceProof(a: A, io: std.Io, root: []const u8, request: Requ
     };
     defer parsed.deinit();
     const manifest = parsed.value;
-    if (manifest.version != 1 or !manifest.namespace.eql(namespace) or manifest.request.table_id != request.table_id or manifest.request.expires_ms != request.expires_ms or !std.mem.eql(u8, manifest.request.id, request.id)) return error.CatalogGenerationChanged;
-    if ((manifest.request.indexes == null) != (request.indexes == null)) return error.CatalogGenerationChanged;
-    if (request.indexes) |expected| {
-        const actual = manifest.request.indexes.?;
-        if (expected.len != actual.len) return error.CatalogGenerationChanged;
-        for (expected, actual) |lhs, rhs| if (!std.mem.eql(u8, lhs, rhs)) return error.CatalogGenerationChanged;
-    }
-    if (manifest.files.len > seal.max_files) return error.CatalogGenerationChanged;
+    try validateManifestBinding(manifest, request, namespace);
     for (manifest.files) |file| {
         try cancellation.check();
         if (std.fs.path.isAbsolute(file.path) or std.mem.indexOf(u8, file.path, "..") != null or std.mem.indexOfAny(u8, file.path, "\\\x00") != null) return error.CatalogGenerationChanged;
@@ -522,4 +524,20 @@ test "logical value source reuse proof requires a validated complete cut" {
     try std.testing.expectError(error.CatalogGenerationChanged, validateWithSourceProof(a, io, directory.path(), request, namespace, .{}));
     try finish(a, io, directory.path(), request, namespace, 11, .{});
     try std.testing.expect(try validateWithSourceProof(a, io, directory.path(), request, namespace, .{}) == null);
+}
+
+test "time series manifest binds indexes independently of transport deadline" {
+    const id: [64]u8 = @splat('a');
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const request: Request = .{ .id = &id, .table_id = 7, .expires_ms = 300000, .timeout_ms = 100, .indexes = &.{ "a", "b" } };
+    const manifest: Manifest = .{ .request = request, .namespace = namespace, .sequence = 1, .files = &.{} };
+    var retry = request;
+    retry.timeout_ms = 10;
+    try validateManifestBinding(manifest, retry, namespace);
+    retry.indexes = null;
+    try std.testing.expectError(error.CatalogGenerationChanged, validateManifestBinding(manifest, retry, namespace));
+    retry.indexes = &.{};
+    try std.testing.expectError(error.CatalogGenerationChanged, validateManifestBinding(manifest, retry, namespace));
+    retry.indexes = &.{ "b", "a" };
+    try std.testing.expectError(error.CatalogGenerationChanged, validateManifestBinding(manifest, retry, namespace));
 }

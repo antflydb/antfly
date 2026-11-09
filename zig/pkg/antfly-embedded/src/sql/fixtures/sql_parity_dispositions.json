@@ -21460,8 +21460,8 @@
     },
     {
       "id": "sql-0883",
-      "status": "implemented",
-      "reason": "The unchanged root-document INSERT enforces create-only identity, returns the exact native transaction write version on a fresh target, rejects an occupied identity with PostgreSQL 23505, and preserves complete primary bytes, digests and versions across cold owner restart.",
+      "status": "unresolved",
+      "reason": "Reopened after main document revisions were integrated: durable document versions are allocated under the primary apply/resolve fence from the persisted watermark and affected legacy versions, independently of TTL or the SQL transaction HLC. The unchanged original requires a fresh INSERT RETURNING _version, but the current API has no actual per-participant durable revision receipt or precommit reservation; truthful precommit demand is explicitly unsupported rather than returning a fabricated stamp. Historical original/golden witnesses are retained below; they do not establish current merged support. Actual durable receipt/reservation integration remains required.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
@@ -22313,8 +22313,8 @@
     },
     {
       "id": "sql-0927",
-      "status": "implemented",
-      "reason": "The unchanged physical-identity ON CONFLICT DO NOTHING returns the actual committed native version only for a fresh insertion. An occupied identity yields no RETURNING row and leaves all primary postimages, versions and digests unchanged through cold restart.",
+      "status": "unresolved",
+      "reason": "Reopened after main document revisions were integrated: durable document versions are allocated under the primary apply/resolve fence from the persisted watermark and affected legacy versions, independently of TTL or the SQL transaction HLC. The unchanged original requires a fresh INSERT RETURNING _version, but the current API has no actual per-participant durable revision receipt or precommit reservation; truthful precommit demand is explicitly unsupported rather than returning a fabricated stamp. Historical original/golden witnesses are retained below; they do not establish current merged support. Actual durable receipt/reservation integration remains required.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",

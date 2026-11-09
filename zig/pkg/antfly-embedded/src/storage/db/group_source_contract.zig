@@ -195,7 +195,7 @@ pub fn validateRequest(req: anytype) !void {
         if (comptime !std.mem.eql(u8, name, "group_source") and !std.mem.eql(u8, name, "sync_level")) {
             if (comptime @typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice) {
                 if (@field(req, name).len != 0) return error.InvalidGroupedSourceCommand;
-            } else if (!std.meta.eql(@field(req, name), @field(empty, name))) return error.InvalidGroupedSourceCommand;
+            } else if (!@import("../control_field_defaults.zig").isolatedFieldMatchesDefault(name, @field(req, name), @field(empty, name))) return error.InvalidGroupedSourceCommand;
         }
     }
 }

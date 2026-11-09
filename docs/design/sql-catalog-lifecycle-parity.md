@@ -5,6 +5,28 @@ at `2c0905501d` (2026-11-03). This is an implementation and qualification
 backlog, not a completion claim. PostgreSQL is the SQL standard and independent
 oracle.
 
+## Document revision integration correction (2026-11-09)
+
+The merged ledger records **958 implemented / 133 rejected / 465 superseded /
+30 unresolved**. Only `sql-0883` and `sql-0927` reopen: their unchanged fresh
+INSERT originals demand `RETURNING _version`, while main now allocates the
+actual document revision under the durable primary apply fence. A SQL HLC or
+TTL field cannot predict that revision. The bounded integration rejects only
+demanded precommit document versions, retaining committed reads, DELETE
+preimages, original concurrency fences and other staged/RETURNING fields.
+Actual per-participant durable revision receipts and a truthful precommit
+reservation contract remain unfinished. Original SQL, independent goldens and
+historical evidence remain unchanged. The earlier counts below describe their
+recorded checkpoints; this correction assigns no new case credit.
+
+`sql-0935` has a separate unchanged-source witness for empty RETURNING and
+23505 duplicate refusal; it does not require a newly assigned version.
+The new mounted revision-contract campaign also checks a genuine Raft-seeded
+high watermark, unchanged physical bytes/version after unsupported demands,
+ordinary staged fields and rollback, DELETE preimages, and cold committed
+versions. Current merged runtime qualification of these regression gates is
+pending; this paragraph does not claim that run passed.
+
 ## Current original-case qualification (2026-11-04)
 
 The ledger records **927 implemented / 138 rejected / 449 superseded /

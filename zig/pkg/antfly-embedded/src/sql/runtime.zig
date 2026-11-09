@@ -2510,7 +2510,7 @@ pub const Context = struct {
                 mutation.conflict_guard != original.conflict_guard or mutation.predicate_only != original.predicate_only or
                 (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
             const datum = mutation.row orelse return (original.previous orelse return error.InvalidSqlBackendResponse).*;
-            if (self.write_version == null) for (self.projection.columns) |column| {
+            if (self.table.storage_mode == .document) for (self.projection.columns) |column| {
                 if (self.table.isDocumentVersion(column.name)) return error.UnsupportedSqlExecution;
             };
             if (datum != .object) return error.InvalidSqlBackendResponse;
@@ -2521,7 +2521,7 @@ pub const Context = struct {
                 if (!nulls[index] or (try self.table.column(name)).type != .json) return error.InvalidSqlBackendResponse;
                 nulls[index] = false;
             }
-            return self.projection.adaptBorrowed(a, self.layout, .{ .id = mutation.key, .version = try self.table.preparedVersion(datum, self.write_version orelse mutation.expected_version), .value = datum, .sql_nulls = nulls, .document = if (self.table.storage_mode == .document) datum else null });
+            return self.projection.adaptBorrowed(a, self.layout, .{ .id = mutation.key, .version = if (self.table.storage_mode == .document) mutation.expected_version else try self.table.preparedVersion(datum, self.write_version orelse mutation.expected_version), .document_version_state = if (self.table.storage_mode == .document) .unassigned else .assigned, .value = datum, .sql_nulls = nulls, .document = if (self.table.storage_mode == .document) datum else null });
         }
     };
 
@@ -2716,7 +2716,7 @@ fn jsonSize(value: Json) usize {
     };
 }
 
-test "SQL RETURNING write versions require the durable stamp and preserve delete preimages" {
+test "SQL RETURNING rejects unassigned document revisions while preserving other fields and delete preimages" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2726,27 +2726,36 @@ test "SQL RETURNING write versions require the durable stamp and preserve delete
     try std.testing.expectError(error.UnsupportedSqlExecution, unstamped.row(a, mutation, mutation));
     const stamp: u64 = 9007199254740994;
     const stamped = try Context.ReturningImages.initAtVersion(a, table, &.{"_version"}, stamp);
-    const image = try stamped.row(a, mutation, mutation);
-    try std.testing.expectEqual(stamp, image.version);
-    try std.testing.expectEqual(@as(i64, stamp), (try image.cell("_version")).value.integer);
+    try std.testing.expectError(error.UnsupportedSqlExecution, stamped.row(a, mutation, mutation));
+    const key_only = try Context.ReturningImages.initAtVersion(a, table, &.{"_id"}, stamp);
+    const image = try key_only.row(a, mutation, mutation);
+    try std.testing.expectEqual(@as(u64, 42), image.version);
+    try std.testing.expectEqualStrings("doc:a", (try image.cell("_id")).value.string);
     const previous = try a.create(catalog.Row);
     previous.* = .{ .id = "doc:a", .version = 42, .value = .{ .object = .empty }, .document_envelope = true };
     const deletion: catalog.Mutation = .{ .key = "doc:a", .expected_version = 42, .row = null, .previous = previous };
     const deleted = try stamped.row(a, deletion, deletion);
     try std.testing.expectEqual(@as(i64, 42), (try deleted.cell("_version")).value.integer);
+    const provisional = try a.create(catalog.Row);
+    provisional.* = try image.cloneOwned(a);
+    var staged_deletion = deletion;
+    staged_deletion.previous = provisional;
+    const staged_deleted = try stamped.row(a, staged_deletion, staged_deletion);
+    try std.testing.expectEqual(@as(u64, 42), staged_deleted.version);
+    try std.testing.expectError(error.UnsupportedSqlExecution, staged_deleted.cell("_version"));
+    previous.version = 0;
+    var zero_deletion = deletion;
+    zero_deletion.expected_version = 0;
+    const committed_zero = try stamped.row(a, zero_deletion, zero_deletion);
+    try std.testing.expectEqual(@as(i64, 0), (try committed_zero.cell("_version")).value.integer);
     var custom = table;
     custom.version_field = "expires";
     var root: std.json.ObjectMap = .empty;
+    try root.put(a, "expires", .{ .string = "1969-12-31T23:59:59Z" });
     var with_ttl = mutation;
     with_ttl.row = .{ .object = root };
     const custom_images = try Context.ReturningImages.initAtVersion(a, custom, &.{"_version"}, stamp);
-    try std.testing.expectEqual(stamp, (try custom_images.row(a, with_ttl, with_ttl)).version);
-    for ([_]Json{ .null, .{ .integer = 0 }, .{ .number_string = "9007199254740993" }, .{ .string = "2090-01-01T00:00:00Z" } }, [_]u64{ stamp, 0, 9007199254740993, 3786912000000000000 }) |value, wanted| {
-        try root.put(a, "expires", value);
-        with_ttl.row = .{ .object = root };
-        const result = try custom_images.row(a, with_ttl, with_ttl);
-        try std.testing.expectEqual(wanted, result.version);
-    }
+    try std.testing.expectError(error.UnsupportedSqlExecution, custom_images.row(a, with_ttl, with_ttl));
 }
 
 test "SQL RETURNING write stamp demand follows typed expressions without treating strings as columns" {

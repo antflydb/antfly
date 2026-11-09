@@ -554,8 +554,8 @@ pub const Table = struct {
     physical_name: []const u8,
     schema_version: u32,
     storage_mode: enum { relational, document } = .relational,
-    /// A pinned custom TTL field owns the physical version when present.
-    /// Its absence/null falls back to the retained transaction write stamp.
+    /// Relational legacy TTL/version source only. Document revisions are
+    /// allocated under the durable apply fence independently of TTL and HLC.
     version_field: ?[]const u8 = null,
     /// External bindings are read-only and pinned by the serving cursor.
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
@@ -614,9 +614,10 @@ pub const Table = struct {
     }
 
     pub fn preparedVersion(self: Table, row: std.json.Value, fallback: u64) !u64 {
+        if (self.storage_mode == .document) return error.UnsupportedSqlExecution;
         if (self.version_field) |field| if (row == .object) {
             if (row.object.get(field)) |value| if (value != .null)
-                return @import("../schema/table_schema_impl.zig").parseTtlTimestampNs(value);
+                return std.math.cast(u64, try @import("../schema/table_schema_impl.zig").parseTtlTimestampNs(value)) orelse error.InvalidTimestamp;
         };
         return fallback;
     }
@@ -927,10 +928,13 @@ pub const Scan = struct {
 pub const Row = struct {
     id: []const u8,
     version: u64,
-    /// A staged document exposes its prepared write stamp to SQL, while
-    /// version and expected_content_digest still fence the observed primary.
-    /// Never use the projected stamp as an optimistic concurrency predicate.
+    /// An explicitly assigned document-envelope version may differ from its
+    /// physical OCC fence. Availability below must be preserved independently;
+    /// a transaction HLC or TTL value never assigns a document revision.
     document_version: ?u64 = null,
+    /// Availability of the virtual document version, independent of the OCC
+    /// fence above. Committed legacy version zero remains genuinely assigned.
+    document_version_state: enum { assigned, unassigned } = .assigned,
     value: std.json.Value,
     index_cursor: ?[]const u8 = null,
     /// Digest of the exact primary bytes in this snapshot. Timestamps alone
@@ -1052,9 +1056,13 @@ pub const Row = struct {
         const ordinal = cells.layout.ordinals.get(name) orelse return null;
         return cells.encodedJson(ordinal);
     }
+    pub fn virtualVersion(self: Row) !u64 {
+        if (self.document_version_state == .unassigned) return error.UnsupportedSqlExecution;
+        return self.document_version orelse self.version;
+    }
     pub fn cell(self: Row, name: []const u8) !Cell {
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = self.id }, .sql_null = false };
-        if (self.document_envelope and std.mem.eql(u8, name, "_version")) return Cell.json(.{ .integer = std.math.cast(i64, self.document_version orelse self.version) orelse return error.SqlNumericOutOfRange });
+        if (self.document_envelope and std.mem.eql(u8, name, "_version")) return Cell.json(.{ .integer = std.math.cast(i64, try self.virtualVersion()) orelse return error.SqlNumericOutOfRange });
         if (std.mem.eql(u8, name, "_doc")) if (self.document) |document| {
             if (document != .object) return error.InvalidSqlBackendResponse;
             return Cell.json(document);

@@ -1327,3 +1327,24 @@ test "SQL document epoch projection preparation stays bounded as declared schema
     try std.testing.expect(measurements[1].rebuilt_bytes > measurements[0].rebuilt_bytes * 4);
     try std.testing.expect(measurements[1].cached_bytes <= measurements[0].cached_bytes * 2 + 4096);
 }
+
+test "SQL document version availability survives scalar typed projection and owned row cloning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{.{ .name = "title", .path = "title", .type = .string }} };
+    var object: std.json.ObjectMap = .empty;
+    try object.put(a, "title", .{ .string = "staged" });
+    const input: catalog.Row = .{ .id = "a", .version = 0, .document_envelope = true, .document_version = 99, .document_version_state = .unassigned, .value = .{ .object = object } };
+    for ([_]bool{ false, true }) |typed| {
+        const projection = if (typed) try Projection.initPrepared(a, table, &.{"title"}) else try Projection.init(a, table, &.{"title"});
+        const projected = try projection.adaptBorrowed(a, try projection.pageLayout(a), input);
+        const owned = try projected.cloneOwned(a);
+        try std.testing.expectEqualStrings("staged", (try owned.cell("title")).value.string);
+        try std.testing.expectEqual(@as(u64, 0), owned.version);
+        try std.testing.expect(owned.document_version_state == .unassigned);
+        try std.testing.expectError(error.UnsupportedSqlExecution, owned.cell("_version"));
+    }
+    const committed_zero: catalog.Row = .{ .id = "legacy", .version = 0, .document_envelope = true, .value = .{ .object = .empty } };
+    try std.testing.expectEqual(@as(i64, 0), (try committed_zero.cell("_version")).value.integer);
+}

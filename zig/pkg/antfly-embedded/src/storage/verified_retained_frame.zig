@@ -71,7 +71,12 @@ pub const Frame = struct {
         return if (self.stream) |view| view.total else self.reader.encoded_frame.len;
     }
 
+    pub fn hasTtlSources(self: *const Frame) bool {
+        return if (self.stream) |view| view.ttl_sources else streamed.hasSources(self.reader.bytes[0..4]);
+    }
+
     pub const Effect = struct {
+        ttl_source: ?[16]u8 = null,
         key: []const u8,
         timestamp: u64,
         value_len: ?usize,
@@ -106,7 +111,7 @@ pub const Frame = struct {
                 const effect = try reader.next() orelse return null;
                 self.pos = @intCast(reader.pos);
                 self.remaining = reader.remaining;
-                return .{ .key = effect.key, .timestamp = effect.timestamp, .value_len = if (effect.value) |value| value.len else null, .inline_value = effect.value };
+                return .{ .key = effect.key, .timestamp = effect.timestamp, .ttl_source = effect.ttl_source, .value_len = if (effect.value) |value| value.len else null, .inline_value = effect.value };
             }
             if (self.remaining == 0) return null;
             const view = self.frame.stream.?;
@@ -139,7 +144,7 @@ pub const Frame = struct {
             }
             self.pos = effect.next_offset;
             self.remaining -= 1;
-            return .{ .key = key, .timestamp = effect.timestamp, .value_len = if (effect.value_len) |len| @as(usize, len) else null, .frame = self.frame, .value_offset = effect.value_offset };
+            return .{ .key = key, .timestamp = effect.timestamp, .ttl_source = effect.ttl_source, .value_len = if (effect.value_len) |len| @as(usize, len) else null, .frame = self.frame, .value_offset = effect.value_offset };
         }
     };
 
@@ -173,3 +178,62 @@ pub const Frame = struct {
         return reader;
     }
 };
+
+test "time series verified cursors preserve signed sources for inline and chunked frames" {
+    const a = std.testing.allocator;
+    const key = try @import("internal_keys.zig").documentKeyAlloc(a, "reading");
+    defer a.free(key);
+    for ([_]bool{ false, true }) |sources| {
+        const header: usize = if (sources) 32 else 16;
+        const payload_end = 16 + header + key.len + 2;
+        const bytes = try a.alloc(u8, payload_end + 32);
+        defer a.free(bytes);
+        @memcpy(bytes[0..4], streamed.frameMagic(false, false, sources));
+        std.mem.writeInt(u64, bytes[4..12], 7, .little);
+        std.mem.writeInt(u32, bytes[12..16], 1, .little);
+        std.mem.writeInt(u32, bytes[16..20], @intCast(key.len), .little);
+        std.mem.writeInt(u32, bytes[20..24], @as(u32, 2) | (if (sources) streamed.source_flag else 0), .little);
+        std.mem.writeInt(u64, bytes[24..32], 9007199254740993, .little);
+        if (sources) std.mem.writeInt(i128, bytes[32..48], -253402300799999999999, .little);
+        @memcpy(bytes[16 + header ..][0..key.len], key);
+        @memcpy(bytes[payload_end - 2 .. payload_end], "{}");
+        var checksum: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes[0..payload_end], &checksum, .{});
+        @memcpy(bytes[payload_end..], &checksum);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        const descriptor = try (streamed.Descriptor{ .ttl_sources = sources, .sequence = 7, .total = @intCast(bytes.len), .direct_vectors = false, .logical_digest = digest, .payload_checksum = checksum, .chunk_hashes = &.{digest}, .effect_offsets = &.{16} }).encodeAlloc(a);
+        defer a.free(descriptor);
+        const Holder = struct {
+            bytes: []const u8,
+            fn read(raw: *anyopaque, _: u64, ordinal: u32, out: []u8) !usize {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (ordinal != 0 or out.len != self.bytes.len) return error.RetainedEffectsCorrupt;
+                @memcpy(out, self.bytes);
+                return out.len;
+            }
+        };
+        var holder: Holder = .{ .bytes = bytes };
+        const scratch = try a.alloc(u8, streamed.chunk_bytes);
+        defer a.free(scratch);
+        var cache: streamed.View.ChunkCache = .{ .bytes = scratch };
+        const view = try streamed.View.init(descriptor, 7, .{ .context = &holder, .read_chunk = Holder.read }, &cache);
+        for ([_]bool{ false, true }) |chunked| {
+            var frame = if (chunked) try Frame.fromStream(view, &cache) else try Frame.init(a, bytes, 7);
+            defer frame.deinit();
+            try std.testing.expectEqual(sources, frame.hasTtlSources());
+            var cursor = try frame.cursorAt(0, 0);
+            const effect = (try cursor.next(a)).?;
+            defer if (chunked) a.free(effect.key);
+            try std.testing.expectEqualStrings(key, effect.key);
+            try std.testing.expectEqual(@as(u64, 9007199254740993), effect.timestamp);
+            if (sources) {
+                try std.testing.expectEqual(@as(i128, -253402300799999999999), std.mem.readInt(i128, &effect.ttl_source.?, .little));
+            } else try std.testing.expect(effect.ttl_source == null);
+            const value = (try effect.valueAlloc(a)).?;
+            defer if (chunked) a.free(value);
+            try std.testing.expectEqualStrings("{}", value);
+            try std.testing.expect((try cursor.next(a)) == null);
+        }
+    }
+}

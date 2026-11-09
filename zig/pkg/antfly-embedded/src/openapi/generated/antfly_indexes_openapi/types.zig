@@ -17,6 +17,10 @@ pub const AlgebraicAggregateConfig = struct {
     name: []const u8,
     op: []const u8,
     group_by: ?[]const []const u8 = null,
+    /// Schema datetime column used for temporal grouping. Requires bucket.
+    time: ?[]const u8 = null,
+    /// UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch.
+    bucket: ?[]const u8 = null,
     /// Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values.
     measure: ?[]const u8 = null,
 
@@ -25,6 +29,8 @@ pub const AlgebraicAggregateConfig = struct {
         .{ "name", "name", false },
         .{ "op", "op", false },
         .{ "group_by", "group_by", true },
+        .{ "time", "time", true },
+        .{ "bucket", "bucket", true },
         .{ "measure", "measure", true },
     };
 
@@ -44,6 +50,14 @@ pub const AlgebraicAggregateConfig = struct {
         try jw.write(self.op);
         if (self.group_by) |value| {
             try jw.objectField("group_by");
+            try jw.write(value);
+        }
+        if (self.time) |value| {
+            try jw.objectField("time");
+            try jw.write(value);
+        }
+        if (self.bucket) |value| {
+            try jw.objectField("bucket");
             try jw.write(value);
         }
         if (self.measure) |value| {

@@ -24,11 +24,36 @@ fn parseExternalDecisionOwner(a: std.mem.Allocator, value: std.json.Value) !Exte
     return parsed.value;
 }
 
+/// Actual control codec replay must remain neutral across local defaults and
+/// untagged historical decode. Rows and an explicit revision mode stay closed.
+fn expectIsolatedControlModes(a: std.mem.Allocator, request: db_types.BatchRequest, rejection: anyerror) !void {
+    for ([_]db_types.DocumentVersionScheme{ .legacy, .admit_current }) |mode| {
+        var selected = request;
+        selected.document_version_scheme = mode;
+        const bytes = try encodeBatchRequest(a, selected);
+        defer a.free(bytes);
+        try std.testing.expect(!std.mem.startsWith(u8, bytes, "[\"document-revisions-batch-v1\","));
+        var decoded = try parseInternalBatchRequest(a, bytes);
+        defer decoded.deinit(a);
+        try std.testing.expectEqual(db_types.DocumentVersionScheme.legacy, decoded.req.document_version_scheme);
+        const replay = try encodeBatchRequest(a, decoded.req);
+        defer a.free(replay);
+        try std.testing.expectEqualSlices(u8, bytes, replay);
+        var mixed = selected;
+        mixed.writes = &.{.{ .key = "forbidden-row", .value = "{}" }};
+        try std.testing.expectError(rejection, encodeBatchRequest(a, mixed));
+    }
+    var explicit = request;
+    explicit.document_version_scheme = .revision_v1;
+    try std.testing.expectError(rejection, encodeBatchRequest(a, explicit));
+}
+
 test "ordered artifact inventory private batch roundtrip rejects public and mixed requests" {
     const alloc = std.testing.allocator;
     const inventory = @import("../storage/db/artifact_inventory.zig");
     const catalogs: inventory.Catalogs = .{ .indexes = "AIDX\x02\x00\x00\x00\x00\x00\x00\x00", .enrichments = "[]", .resolvers = "[]" };
     const request: db_types.BatchRequest = .{ .artifact_catalog = .{ .namespace = @splat(1), .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc) }, .catalogs = catalogs } };
+    try expectIsolatedControlModes(alloc, request, error.InvalidArtifactCatalogCommand);
     const encoded = try encodeBatchRequest(alloc, request);
     defer alloc.free(encoded);
     try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
@@ -74,6 +99,7 @@ test "artifact publication upload control is private, bounded, and single purpos
     const hash = transport.chunkDigest(0, "data");
     const hashes = [_]transport.Digest{hash};
     const request: db_types.BatchRequest = .{ .artifact_publication_transport = .{ .action = .begin, .namespace = @splat(1), .publication_digest = @splat(2), .command_digest = @splat(3), .encoded_len = 4, .chunk_hashes = &hashes } };
+    try expectIsolatedControlModes(alloc, request, error.InvalidBatchRequest);
     const encoded = try encodeBatchRequest(alloc, request);
     defer alloc.free(encoded);
     try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
@@ -715,14 +741,15 @@ pub fn parseInternalBatchValue(alloc: std.mem.Allocator, value: std.json.Value) 
 
 fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_internal: bool, local_owner: bool) !OwnedBatchRequest {
     const versioned = input_value == .array;
+    const document_versions_envelope = versioned and input_value.array.items.len == 2 and input_value.array.items[0] == .string and (std.mem.eql(u8, input_value.array.items[0].string, "document-revisions-batch-v1") or std.mem.eql(u8, input_value.array.items[0].string, "row-semantics-batch-v4"));
     var domain_envelope = false;
     var trigger_envelope = false;
     const root_value = if (versioned) blk: {
         const entries = input_value.array.items;
         if (!allow_internal or entries.len != 2 or entries[0] != .string) return error.InvalidBatchRequest;
-        trigger_envelope = std.mem.eql(u8, entries[0].string, "row-semantics-batch-v3");
-        domain_envelope = std.mem.eql(u8, entries[0].string, "row-semantics-batch-v2") or (trigger_envelope and entries[1] == .object and entries[1].object.contains("_prepared_domain_rows"));
-        if (!trigger_envelope and !domain_envelope and !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1")) return error.InvalidBatchRequest;
+        trigger_envelope = std.mem.eql(u8, entries[0].string, "row-semantics-batch-v3") or (document_versions_envelope and entries[1] == .object and entries[1].object.contains("_trigger_receipts"));
+        domain_envelope = std.mem.eql(u8, entries[0].string, "row-semantics-batch-v2") or ((trigger_envelope or document_versions_envelope) and entries[1] == .object and entries[1].object.contains("_prepared_domain_rows"));
+        if (!document_versions_envelope and !trigger_envelope and !domain_envelope and !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1")) return error.InvalidBatchRequest;
         break :blk entries[1];
     } else input_value;
     if (root_value != .object) return error.InvalidBatchRequest;
@@ -740,8 +767,9 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
     errdefer out.deinit(alloc);
     try parseBatchRowsAndControls(alloc, root, allow_internal, versioned, domain_envelope, &out);
     try parseTriggerPreparation(alloc, root, trigger_envelope, &out);
-    try parseBatchTransitions(alloc, root, allow_internal, &out);
+    try parseBatchTransitions(alloc, root, allow_internal, local_owner, document_versions_envelope, &out);
     try finishBatchRequest(root, allow_internal, local_owner, versioned, &out);
+    if (allow_internal and requiresDocumentVersionsEnvelope(out.req) != document_versions_envelope) return error.InvalidBatchRequest;
     return out;
 }
 
@@ -1170,7 +1198,7 @@ noinline fn parseBatchRowsAndControls(alloc: std.mem.Allocator, root: std.json.O
     };
 }
 
-noinline fn parseBatchTransitions(alloc: std.mem.Allocator, root: std.json.ObjectMap, allow_internal: bool, out: *OwnedBatchRequest) !void {
+noinline fn parseBatchTransitions(alloc: std.mem.Allocator, root: std.json.ObjectMap, allow_internal: bool, local_owner: bool, document_versions_envelope: bool, out: *OwnedBatchRequest) !void {
     out.req.sync_level = sync_level: {
         if (root.get("sync_level")) |sync_level_value| {
             if (sync_level_value == .null) break :sync_level db_types.SyncLevel.propose;
@@ -1179,8 +1207,21 @@ noinline fn parseBatchTransitions(alloc: std.mem.Allocator, root: std.json.Objec
         break :sync_level db_types.SyncLevel.propose;
     };
 
+    out.req.document_version_scheme = scheme: {
+        const value = root.get("_document_version_scheme") orelse break :scheme if (!allow_internal or local_owner) .admit_current else .legacy;
+        if (!allow_internal or !document_versions_envelope) return error.InvalidBatchRequest;
+        const version = try parseInternalU64(value);
+        break :scheme switch (version) {
+            0 => .legacy,
+            1 => .revision_v1,
+            else => return error.InvalidBatchRequest,
+        };
+    };
     out.req.timestamp_ns = timestamp: {
-        const value = root.get("_timestamp_ns") orelse break :timestamp 0;
+        const value = root.get("_timestamp_ns") orelse {
+            if (out.req.document_version_scheme == .revision_v1) return error.InvalidBatchRequest;
+            break :timestamp 0;
+        };
         if (!allow_internal) return error.InvalidBatchRequest;
         break :timestamp try parseInternalU64(value);
     };
@@ -1814,8 +1855,22 @@ pub fn validateRowPolicyPublicationRequest(req: db_types.BatchRequest) !void {
         if (comptime info == .pointer and info.pointer.size == .slice) {
             if (comptime @field(defaults, name).len != 0) @compileError("review nonempty row-policy control default: " ++ name);
             if (value.len != 0) return error.InvalidBatchRequest;
-        } else if (!std.meta.eql(value, @field(defaults, name))) return error.InvalidBatchRequest;
+        } else if (!@import("../storage/control_field_defaults.zig").isolatedFieldMatchesDefault(name, value, @field(defaults, name))) return error.InvalidBatchRequest;
     }
+}
+
+pub fn requiresDocumentVersionsEnvelope(req: db_types.BatchRequest) bool {
+    if (req.document_version_scheme == .revision_v1) return true;
+    if (req.online_source) |command| if (command == .admit and command.admit.ttl_sources) return true;
+    if (req.merge_page) |page| if (page.document_version_floor != 0 or page.ttl_sources.len != 0 or (if (page.chunk) |chunk| chunk.ttl_source != null else false)) return true;
+    if (req.restore_staging) |control| switch (control) {
+        .import_page, .rewrite_page => |page| {
+            if (page.document_timestamps != null) return true;
+            for (page.timestamps) |timestamp| if (timestamp.ttl_source_ns != null) return true;
+        },
+        else => {},
+    };
+    return false;
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_types.BatchRequest) ![]u8 {
@@ -1926,11 +1981,12 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
     errdefer out.deinit();
     const writer = &out.writer;
     const triggers = req.trigger_receipts.len != 0;
-    const versioned = triggers or requiresRowSemanticsEnvelope(req.writes, req.predicates);
+    const document_versions = requiresDocumentVersionsEnvelope(req);
+    const versioned = document_versions or triggers or requiresRowSemanticsEnvelope(req.writes, req.predicates);
     const domains = @import("../schema/domain_handoff.zig").present(req.writes);
     try DomainHandoff.requireUniqueKeys(alloc, req.writes);
     if (domains and req.merge_page != null) return error.InvalidBatchRequest;
-    if (triggers) try writer.writeAll("[\"row-semantics-batch-v3\",") else if (domains) try writer.writeAll("[\"row-semantics-batch-v2\",") else if (versioned) try writer.writeAll("[\"row-semantics-batch-v1\",");
+    if (document_versions) try writer.writeAll(if (triggers or domains) "[\"row-semantics-batch-v4\"," else "[\"document-revisions-batch-v1\",") else if (triggers) try writer.writeAll("[\"row-semantics-batch-v3\",") else if (domains) try writer.writeAll("[\"row-semantics-batch-v2\",") else if (versioned) try writer.writeAll("[\"row-semantics-batch-v1\",");
 
     try writer.writeAll("{\"inserts\":{");
     for (if (req.merge_page != null) &.{} else req.writes, 0..) |write, i| {
@@ -2290,9 +2346,10 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
             std.json.fmt(transition.split_key, .{}),
         });
     }
-    if (req.timestamp_ns != 0) {
+    if (req.timestamp_ns != 0 or req.document_version_scheme == .revision_v1) {
         try writer.print(",\"_timestamp_ns\":\"{d}\"", .{req.timestamp_ns});
     }
+    if (req.document_version_scheme == .revision_v1) try writer.writeAll(",\"_document_version_scheme\":1");
     if (req.reject_graph_transform_projections) {
         try writer.writeAll(",\"_reject_graph_transform_projections\":true");
     }
@@ -2824,6 +2881,26 @@ fn consumerTests() type {
                 .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 },
                 .catalog_digest = @splat(255),
             };
+            var drop_fence = fence;
+            drop_fence.role = .document_retirement_source;
+            const drop_request: db_types.BatchRequest = .{ .relational_topology = .{ .fence = drop_fence, .action = .begin, .sql_drop_control = true, .document_schema_digest = @splat(9) } };
+            for ([_]db_types.DocumentVersionScheme{ .legacy, .admit_current }) |mode| {
+                var selected = drop_request;
+                selected.document_version_scheme = mode;
+                try topology.validateSqlDropBatch(selected);
+                const body = try encodeBatchRequest(alloc, selected);
+                defer alloc.free(body);
+                var decoded = try parseInternalBatchRequest(alloc, body);
+                defer decoded.deinit(alloc);
+                try topology.validateSqlDropBatch(decoded.req);
+                try std.testing.expect(decoded.req.relational_topology.?.isSqlDropControl());
+                var mixed = selected;
+                mixed.deletes = &.{"forbidden-row"};
+                try std.testing.expectError(error.InvalidBatchRequest, topology.validateSqlDropBatch(mixed));
+            }
+            var revision_drop = drop_request;
+            revision_drop.document_version_scheme = .revision_v1;
+            try std.testing.expectError(error.InvalidBatchRequest, topology.validateSqlDropBatch(revision_drop));
             const encoded = try encodeBatchRequest(alloc, .{ .relational_topology = .{ .fence = fence, .action = .begin } });
             defer alloc.free(encoded);
             try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
@@ -3690,6 +3767,17 @@ test "SQL domain internal preparation handoffs round trip shared contracts and r
     try std.testing.expect(restored.writes[0].prepared_domain == restored.writes[2].prepared_domain);
     try std.testing.expect(restored.writes[1].prepared_domain == null);
     try std.testing.expect(contract.eql(restored.writes[0].prepared_domain.?.*));
+    // Revision admission and SQL domain provenance must survive the same wire
+    // round trip; neither envelope may erase the other protocol's authority.
+    const combined = try encodeBatchRequest(a, .{ .writes = &writes, .relational_schema_version = 3, .document_version_scheme = .revision_v1, .timestamp_ns = 10 });
+    defer a.free(combined);
+    try std.testing.expect(std.mem.startsWith(u8, combined, "[\"row-semantics-batch-v4\","));
+    var combined_restored = try parseInternalBatchRequest(a, combined);
+    defer combined_restored.deinit(a);
+    try std.testing.expectEqual(db_types.DocumentVersionScheme.revision_v1, combined_restored.req.document_version_scheme);
+    try std.testing.expectEqual(@as(u64, 10), combined_restored.req.timestamp_ns);
+    try std.testing.expect(contract.eql(combined_restored.writes[0].prepared_domain.?.*));
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, combined));
     // The owned handle can move; row pointers still refer to its heap contract.
     const pointer = restored.writes[0].prepared_domain.?;
     var moved = restored;
@@ -3793,4 +3881,100 @@ test "distributed txn public mutation promotion borrows exact values and transfe
     try std.testing.expect(internal.req.online_source == null);
     try std.testing.expectEqualStrings("", internal.req.row_policy_principal_proof);
     try std.testing.expectEqualStrings("{\"n\":9007199254740993}", internal.req.writes[0].value);
+}
+
+test "time series document revision wire discriminates legacy replay and epoch admission" {
+    const a = std.testing.allocator;
+    var legacy = try parseInternalBatchRequest(a, "{\"inserts\":{},\"_timestamp_ns\":\"123\"}");
+    defer legacy.deinit(a);
+    try std.testing.expectEqual(db_types.DocumentVersionScheme.legacy, legacy.req.document_version_scheme);
+    for ([_]db_types.DocumentVersionScheme{.revision_v1}) |scheme| {
+        const bytes = try encodeBatchRequest(a, .{ .document_version_scheme = scheme, .timestamp_ns = 0, .writes = &.{.{ .key = "event", .value = "{}" }} });
+        defer a.free(bytes);
+        try std.testing.expect(std.mem.startsWith(u8, bytes, "[\"document-revisions-batch-v1\","));
+        try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, bytes));
+        var decoded = try parseInternalBatchRequest(a, bytes);
+        defer decoded.deinit(a);
+        try std.testing.expectEqual(scheme, decoded.req.document_version_scheme);
+        try std.testing.expectEqual(@as(u64, 0), decoded.req.timestamp_ns);
+    }
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, "{\"_timestamp_ns\":\"1\",\"_document_version_scheme\":1}"));
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, "[\"document-revisions-batch-v1\",{\"_document_version_scheme\":1}]"));
+}
+
+test "time series merge revision floor requires versioned wire and authenticates full u64" {
+    const a = std.testing.allocator;
+    var req: db_types.BatchRequest = .{
+        .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } },
+        .merge_page = .{ .source = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .pin_digest = @splat(7), .applied_index = 10 }, .sequence = 1, .phase = .rows, .exhausted = true, .digest = @splat(0), .document_version_floor = 9007199254740993 },
+    };
+    req.merge_page.?.digest = merge_pages.commandDigest(req);
+    try std.testing.expect(requiresDocumentVersionsEnvelope(req));
+    const wire = try encodeBatchRequest(a, req);
+    defer a.free(wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "document-revisions-batch-v1") != null);
+    var parsed = try parseInternalBatchRequest(a, wire);
+    defer parsed.deinit(a);
+    try std.testing.expectEqual(req.merge_page.?.document_version_floor, parsed.req.merge_page.?.document_version_floor);
+    var tampered = req;
+    tampered.merge_page.?.document_version_floor += 1;
+    try std.testing.expectError(error.InvalidMergePage, merge_pages.validateRequest(tampered));
+    req.merge_page.?.document_version_floor = 0;
+    req.merge_page.?.digest = merge_pages.commandDigest(req);
+    try std.testing.expect(!requiresDocumentVersionsEnvelope(req));
+    const legacy = try encodeBatchRequest(a, req);
+    defer a.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "document_version_floor") == null);
+}
+
+test "time series staged timestamp wire protects exact sources and retains legacy commands" {
+    const a = std.testing.allocator;
+    const staging = @import("../storage/db/restore_staging_contract.zig");
+    const timestamps = [_]staging.Timestamp{
+        .{ .key = "historical", .timestamp = 9007199254740993, .ttl_source_ns = -1 },
+        .{ .key = "wide", .timestamp = 9007199254740993, .ttl_source_ns = 253402300799999999999 },
+        .{ .key = "epoch", .timestamp = 0, .ttl_source_ns = 0 },
+        .{ .key = "missing", .timestamp = 0 },
+    };
+    for ([_]bool{ false, true }) |rewrite| {
+        const page: staging.ImportPage = .{ .expected = @splat(1), .next = "progress", .scope = @splat(2), .timestamps = &timestamps, .document_timestamps = .{ .version_floor = 9007199254740995 } };
+        const req: db_types.BatchRequest = .{ .restore_staging = if (rewrite) .{ .rewrite_page = page } else .{ .import_page = page } };
+        try std.testing.expect(requiresDocumentVersionsEnvelope(req));
+        const wire = try encodeBatchRequest(a, req);
+        defer a.free(wire);
+        try std.testing.expect(std.mem.startsWith(u8, wire, "[\"document-revisions-batch-v1\","));
+        var parsed = try parseInternalBatchRequest(a, wire);
+        defer parsed.deinit(a);
+        const decoded = if (rewrite) parsed.req.restore_staging.?.rewrite_page else parsed.req.restore_staging.?.import_page;
+        try std.testing.expectEqualDeep(page, decoded);
+        // Removing the mandatory envelope must never downgrade these effects.
+        const unwrapped = wire["[\"document-revisions-batch-v1\",".len .. wire.len - 1];
+        try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, unwrapped));
+    }
+    const legacy: db_types.BatchRequest = .{ .restore_staging = .{ .import_page = .{ .expected = @splat(1), .next = "progress", .scope = @splat(2), .timestamps = &.{.{ .key = "a", .timestamp = 1 }} } } };
+    try std.testing.expect(!requiresDocumentVersionsEnvelope(legacy));
+    const wire = try encodeBatchRequest(a, legacy);
+    defer a.free(wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "document_timestamps") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "ttl_source_ns") == null);
+    var parsed = try parseInternalBatchRequest(a, wire);
+    defer parsed.deinit(a);
+    try std.testing.expectEqualDeep(legacy.restore_staging, parsed.req.restore_staging);
+}
+
+test "range tracking activation codec preserves isolated control across revision admission" {
+    const a = std.testing.allocator;
+    var request: db_types.BatchRequest = .{ .activate_range_tracking = true, .timestamp_ns = 1 };
+    request.document_version_scheme = request.admittedDocumentVersionScheme(true);
+    const bytes = try encodeBatchRequest(a, request);
+    defer a.free(bytes);
+    var restored = try parseInternalBatchRequest(a, bytes);
+    defer restored.deinit(a);
+    try std.testing.expect(restored.req.activate_range_tracking);
+    try std.testing.expectEqual(db_types.DocumentVersionScheme.legacy, restored.req.document_version_scheme);
+    request.document_version_scheme = .revision_v1;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, request));
+    request.document_version_scheme = .admit_current;
+    request.writes = &.{.{ .key = "a", .value = "{}" }};
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, request));
 }

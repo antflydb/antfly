@@ -2178,6 +2178,8 @@ pub const TableSchema = struct {
     named_types: ?[]const SQLNamedTypeLayout = null,
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?u32 = null,
+    /// Physical document index order. Fields must have sortable scalar mappings. Changing the order requires rebuilding physical coverage. Relational tables use relational_indexes instead.
+    index_sort: ?[]const std.json.Value = null,
     storage_mode: ?TableStorageMode = null,
     /// External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables.
     base_source: ?ExternalLakeTableSource = null,
@@ -2212,6 +2214,7 @@ pub const TableSchema = struct {
     pub const openApiFieldMetadata = .{
         .{ "named_types", "named_types", true },
         .{ "version", "version", true },
+        .{ "index_sort", "index_sort", true },
         .{ "storage_mode", "storage_mode", true },
         .{ "base_source", "base_source", true },
         .{ "column_defaults", "column_defaults", true },
@@ -2245,6 +2248,10 @@ pub const TableSchema = struct {
         }
         if (self.version) |value| {
             try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.index_sort) |value| {
+            try jw.objectField("index_sort");
             try jw.write(value);
         }
         if (self.storage_mode) |value| {

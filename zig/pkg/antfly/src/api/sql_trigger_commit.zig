@@ -654,7 +654,7 @@ pub const Broker = struct {
         const event: @FieldType(preparation.Input, "event") = if (mutation.row == null) .delete else if (mutation.unique_absence) .insert else .update;
         try self.begin(record, event, updated);
         const stage = try self.a.create(Stage);
-        stage.* = .{ .entry = entry, .row = .{ .key = try self.a.dupe(u8, mutation.key), .event = event, .old = if (mutation.previous) |row| try entry.owner.sourceTypedRow(row.*) else null, .new = if (mutation.row) |row| try entry.owner.sourceRow(mutation.key, row, mutation.json_null_fields, 0, null) else null, .value = null, .json_null_fields = mutation.json_null_fields, .update_columns = try self.updateIds(entry, updated) }, .output_digest = try mutationDigest(self.a, mutation), .preimage_version = mutation.expected_version, .preimage_digest = mutation.expected_content_digest };
+        stage.* = .{ .entry = entry, .row = .{ .key = try self.a.dupe(u8, mutation.key), .event = event, .old = if (mutation.previous) |row| try entry.owner.sourceTypedRow(row.*) else null, .new = if (mutation.row) |row| try entry.owner.stagedRow(mutation.key, row, mutation.json_null_fields) else null, .value = null, .json_null_fields = mutation.json_null_fields, .update_columns = try self.updateIds(entry, updated) }, .output_digest = try mutationDigest(self.a, mutation), .preimage_version = mutation.expected_version, .preimage_digest = mutation.expected_content_digest };
         try self.stage_tokens.put(self.a, stage, stage);
         try self.stages.append(self.a, stage);
         try self.selectStage(stage);

@@ -66,6 +66,8 @@ pub fn openWithProjection(alloc: std.mem.Allocator, native: catalog.Cursor, stag
 }
 
 fn openWithGuards(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const transactions.OwnedTransactionCommitRequest, table: catalog.Table, request: catalog.Scan, row_filter_json: ?[]const u8, policy: ?Policy, projection: ?Projection, write_version: ?u64) !catalog.Cursor {
+    // HLC/TTL are not reservations of the storage-assigned document revision.
+    _ = write_version;
     const cursor = try alloc.create(Cursor);
     cursor.* = .{ .alloc = alloc, .native = native, .arena = std.heap.ArenaAllocator.init(alloc), .page_arena = std.heap.ArenaAllocator.init(alloc) };
     errdefer {
@@ -119,7 +121,10 @@ fn openWithGuards(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *con
             const observed = for (entry.predicates.items) |predicate| {
                 if (std.mem.eql(u8, predicate.key, write.key)) break predicate;
             } else return error.InvalidSqlBackendResponse;
-            const row = try full_projection.adaptBorrowed(arena, full_layout, catalog.Row{ .id = write.key, .version = observed.expected_version, .document_version = if (write_version) |stamp| try table.preparedVersion(value, stamp) else null, .value = .{ .object = object }, .sql_nulls = nulls.items, .expected_content_digest = observed.expected_content_digest, .document = if (request.include_document) value else null });
+            if (table.storage_mode == .document) for (full_projection.columns) |column| {
+                if (table.isDocumentVersion(column.name)) return error.UnsupportedSqlExecution;
+            };
+            const row = try full_projection.adaptBorrowed(arena, full_layout, catalog.Row{ .id = write.key, .version = observed.expected_version, .document_version_state = if (table.storage_mode == .document) .unassigned else .assigned, .value = .{ .object = object }, .sql_nulls = nulls.items, .expected_content_digest = observed.expected_content_digest, .document = if (request.include_document) value else null });
             if (try matches(row, conditions, &numeric_context)) {
                 if (selected_projection.has_typed_cells) {
                     try rows.append(arena, try selected_projection.adaptBorrowed(arena, selected_layout, row));
@@ -585,7 +590,8 @@ test "SQL session overlay staged versions retain original fences through project
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const table: catalog.Table = .{ .id = 1, .physical_name = "t", .schema_version = 1, .storage_mode = .document, .version_field = if (ttl) "ttl" else null, .columns = &.{.{ .name = "n", .path = "n", .type = if (typed) .number else .integer, .element_type = if (typed) .numeric else null }} };
-        const cursor = try openAtVersion(a, .{ .ptr = &state, .next = Empty.next, .close = Empty.close }, &staged, table, .{ .fields = &.{ "n", "_version" }, .limit = 1 }, null, null, stamp);
+        try std.testing.expectError(error.UnsupportedSqlExecution, openAtVersion(a, .{ .ptr = &state, .next = Empty.next, .close = Empty.close }, &staged, table, .{ .fields = &.{ "n", "_version" }, .limit = 1 }, null, null, stamp));
+        const cursor = try openAtVersion(a, .{ .ptr = &state, .next = Empty.next, .close = Empty.close }, &staged, table, .{ .fields = &.{"n"}, .limit = 1 }, null, null, stamp);
         const page = cursor.next(cursor.ptr, arena.allocator(), 1) catch |err| {
             cursor.close(cursor.ptr);
             return err;
@@ -595,7 +601,11 @@ test "SQL session overlay staged versions retain original fences through project
         const row = page.rows[0];
         try std.testing.expectEqual(@as(u64, 7), row.version);
         try std.testing.expectEqual(@as([32]u8, @splat(42)), row.expected_content_digest.?);
-        try std.testing.expectEqual(@as(i64, if (ttl) 123 else stamp), (try row.cell("_version")).value.integer);
+        try std.testing.expectEqual(@as(?u64, null), row.document_version);
+        try std.testing.expect(row.document_version_state == .unassigned);
+        try std.testing.expectError(error.UnsupportedSqlExecution, row.cell("_version"));
+        const n = try row.cell("n");
+        if (!typed) try std.testing.expectEqual(@as(i64, 11), n.value.integer);
         try std.testing.expectEqual(typed, row.typed_cells != null);
         try std.testing.expectEqual(@as(u64, 7), staged.tables[0].predicates.items[0].expected_version);
     };

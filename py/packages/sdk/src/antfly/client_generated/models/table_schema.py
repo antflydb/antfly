@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..models.relational_unique_constraint import RelationalUniqueConstraint
     from ..models.sql_named_type_layout import SQLNamedTypeLayout
     from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
+    from ..models.table_schema_index_sort_item import TableSchemaIndexSortItem
     from ..models.ttl_config import TtlConfig
 
 
@@ -35,6 +36,9 @@ class TableSchema:
             active definition. Retained by backups and schema epochs for deterministic cold decoding.
         version (int | Unset): Backend-managed schema generation used for migrations. Omit it from create and update
             requests.
+        index_sort (list[TableSchemaIndexSortItem] | Unset): Physical document index order. Fields must have sortable
+            scalar mappings. Changing the order requires rebuilding physical coverage. Relational tables use
+            relational_indexes instead.
         storage_mode (TableStorageMode | Unset): Storage representation for the table. Omission selects "document".
             "relational" stores schema-bound typed rows and requires exactly one
             closed document schema with declared properties. It implies
@@ -108,6 +112,7 @@ class TableSchema:
 
     named_types: list[SQLNamedTypeLayout] | Unset = UNSET
     version: int | Unset = UNSET
+    index_sort: list[TableSchemaIndexSortItem] | Unset = UNSET
     storage_mode: TableStorageMode | Unset = UNSET
     base_source: ExternalLakeTableSource | Unset = UNSET
     column_defaults: list[RelationalColumnExpression] | Unset = UNSET
@@ -136,6 +141,13 @@ class TableSchema:
                 named_types.append(named_types_item)
 
         version = self.version
+
+        index_sort: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.index_sort, Unset):
+            index_sort = []
+            for index_sort_item_data in self.index_sort:
+                index_sort_item = index_sort_item_data.to_dict()
+                index_sort.append(index_sort_item)
 
         storage_mode: str | Unset = UNSET
         if not isinstance(self.storage_mode, Unset):
@@ -221,6 +233,8 @@ class TableSchema:
             field_dict["named_types"] = named_types
         if version is not UNSET:
             field_dict["version"] = version
+        if index_sort is not UNSET:
+            field_dict["index_sort"] = index_sort
         if storage_mode is not UNSET:
             field_dict["storage_mode"] = storage_mode
         if base_source is not UNSET:
@@ -265,6 +279,7 @@ class TableSchema:
         from ..models.relational_unique_constraint import RelationalUniqueConstraint
         from ..models.sql_named_type_layout import SQLNamedTypeLayout
         from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
+        from ..models.table_schema_index_sort_item import TableSchemaIndexSortItem
         from ..models.ttl_config import TtlConfig
 
         d = dict(src_dict)
@@ -278,6 +293,15 @@ class TableSchema:
                 named_types.append(named_types_item)
 
         version = d.pop("version", UNSET)
+
+        _index_sort = d.pop("index_sort", UNSET)
+        index_sort: list[TableSchemaIndexSortItem] | Unset = UNSET
+        if _index_sort is not UNSET:
+            index_sort = []
+            for index_sort_item_data in _index_sort:
+                index_sort_item = TableSchemaIndexSortItem.from_dict(index_sort_item_data)
+
+                index_sort.append(index_sort_item)
 
         _storage_mode = d.pop("storage_mode", UNSET)
         storage_mode: TableStorageMode | Unset
@@ -391,6 +415,7 @@ class TableSchema:
         table_schema = cls(
             named_types=named_types,
             version=version,
+            index_sort=index_sort,
             storage_mode=storage_mode,
             base_source=base_source,
             column_defaults=column_defaults,

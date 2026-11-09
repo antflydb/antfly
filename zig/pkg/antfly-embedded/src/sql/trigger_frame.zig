@@ -104,6 +104,8 @@ pub const Owned = struct {
                 row.version = source.version;
                 row.expected_content_digest = source.expected_content_digest;
                 row.document_version = source.document_version;
+                row.document_version_state = source.document_version_state;
+                row.document_envelope = source.document_envelope;
             }
             self.candidates[index] = row;
         }
@@ -150,10 +152,15 @@ test "trigger frames preserve MVCC inputs reset local records and expose zero-ba
     defer arena.deinit();
     const a = arena.allocator();
     const layout = try Layout.init(a, &.{.{ .name = "n", .path = "n", .type = .integer, .element_type = .int64 }}, 7, "usage_records", "public");
-    const original = try catalog.Row.fromDatums(a, "row", layout.row, &.{.json(.{ .integer = 10 })});
+    var original = try catalog.Row.fromDatums(a, "row", layout.row, &.{.json(.{ .integer = 10 })});
+    original.document_envelope = true;
+    original.document_version_state = .unassigned;
+    original.version = 17;
     const owned = try layout.frame(a, &original, null);
     const candidate = try owned.frame.assign(owned.frame.ptr, a, .new, 0, .json(.{ .integer = 42 }));
     try std.testing.expectEqual(@as(i64, 42), (try candidate.cell("n")).value.integer);
+    try std.testing.expectEqual(@as(u64, 17), candidate.version);
+    try std.testing.expectError(error.UnsupportedSqlExecution, candidate.cell("_version"));
     try std.testing.expectEqual(@as(i64, 10), (try original.cell("n")).value.integer);
     // An ignored return or a local statement record does not become the next
     // trigger's image or leave its old candidate cache writable.

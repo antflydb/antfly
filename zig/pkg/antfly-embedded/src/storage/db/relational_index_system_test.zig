@@ -3384,13 +3384,15 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         }
         fn roundtrip(backing: std.mem.Allocator, command: raft.Command) !void {
             const codec = @import("../../api/batch_internal.zig");
-            const request: db_mod.types.BatchRequest = .{ .relational_index_owner_control = .{ .control = command }, .timestamp_ns = 18446744073709551600 };
-            const encoded = try codec.encodeBatchRequest(backing, request);
-            defer backing.free(encoded);
-            var decoded = try codec.parseInternalBatchRequest(backing, encoded);
-            defer decoded.deinit(backing);
-            try std.testing.expectEqualDeep(command, decoded.req.relational_index_owner_control.?.control);
-            try std.testing.expectEqual(request.timestamp_ns, decoded.req.timestamp_ns);
+            for ([_]db_mod.types.DocumentVersionScheme{ .legacy, .admit_current }) |mode| {
+                const request: db_mod.types.BatchRequest = .{ .relational_index_owner_control = .{ .control = command }, .timestamp_ns = 18446744073709551600, .document_version_scheme = mode };
+                const encoded = try codec.encodeBatchRequest(backing, request);
+                defer backing.free(encoded);
+                var decoded = try codec.parseInternalBatchRequest(backing, encoded);
+                defer decoded.deinit(backing);
+                try std.testing.expectEqualDeep(command, decoded.req.relational_index_owner_control.?.control);
+                try std.testing.expectEqual(request.timestamp_ns, decoded.req.timestamp_ns);
+            }
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Wire.roundtrip, .{admission.command});
@@ -3407,7 +3409,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try std.testing.expectError(error.InvalidBatchRequest, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 10 }, false));
         try std.testing.expectError(error.InvalidBatchRequest, server_test_adapter.applyOrdered(&db, request, .{ .term = 1, .index = 10 }));
         try std.testing.expectError(error.InvalidBatchRequest, db.applyReplicatedBatch(.{ .request = request, .receipt = .{ .ordered = .{ .term = 1, .index = 10 } } }, 1));
-        for (0..7) |variant| {
+        for (0..8) |variant| {
             var mixed = request;
             switch (variant) {
                 0 => mixed.writes = &.{.{ .key = "smuggled", .value = "{}" }},
@@ -3417,6 +3419,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
                 4 => mixed.schema_version = 1,
                 5 => mixed.row_policy_principal_proof = "smuggled",
                 6 => mixed.sync_level = .full_index,
+                7 => mixed.document_version_scheme = .revision_v1,
                 else => unreachable,
             }
             try std.testing.expectError(error.InvalidBatchRequest, codec.encodeBatchRequest(alloc, mixed));
