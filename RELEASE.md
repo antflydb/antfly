@@ -57,6 +57,24 @@ platform archive, and run `./install.sh --prefix "$HOME/.local"`. The installer
 copies only grep and its supporting assets; no Antfly server or libantfly is
 required. Add the selected prefix's `bin` directory to `PATH`.
 
+### Native Apple providers in Mac archives
+
+Source build contract 7 enables Vision OCR, speech transcription, and generation
+as one default macOS capability. The ARM64 Swift bridge and its metadata are
+committed under `zig/lib/apple_native/prebuilt/arm64`. Existing Linux cross-build
+jobs verify its source hash, binary hash, architecture and ABI, then include it
+in both server and embedded archives. No Mac CI builder is needed. `make generate` rebuilds the
+bridge on Apple Silicon Macs; `make apple-bridge-generate` runs only that step.
+Commit the binary
+and metadata together (commands in the Apple provider guide).
+Older source contracts keep their previous packaging behavior.
+
+The CLI and library retain their macOS 15 deployment target. The bridge is lazy
+loaded only on macOS 26+, and actual model/locale/Apple Intelligence readiness
+remains independent of build inclusion. `-Dapple-providers=false` disables OCR,
+transcription and generation together; `-Dapple-ocr` is no longer a separate knob.
+See the [Apple provider guide](docs/guides/providers/apple.mdx).
+
 ## Independent dictation app releases
 
 The macOS dictation app has independent `dictation/vX.Y.Z` and
@@ -69,6 +87,7 @@ on `releases.antfly.io/antfly-dictation` after immutable R2 downloads exist.
 App updates replace the bundled runtime but do not update user-selected external
 servers, model weights, or the repository-wide Latest release. See
 [dictation updates and release setup](examples/dictation/UPDATES.md).
+
 
 ## Release Artifacts
 

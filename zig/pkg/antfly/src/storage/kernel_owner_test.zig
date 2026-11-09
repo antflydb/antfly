@@ -4745,3 +4745,20 @@ test "privacy indexed metadata reads cross the compiled owner boundary" {
     try std.testing.expect(try store.nextPrivacyTable(a, group, 1000) == null);
     try std.testing.expect(try store.tableByName(a, group, "private") == null);
 }
+
+test "opaque storage pipeline metrics snapshot versions and ownership" {
+    var context: client.Context = .{};
+    defer context.deinit();
+    var response = try context.pipelineMetricsJson();
+    defer response.deinit();
+    const Metrics = @import("antfly_platform").document_pipeline_metrics;
+    const parsed = try std.json.parseFromSlice(Metrics.Snapshot, std.testing.allocator, response.bytes(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.version);
+    try std.testing.expectEqual(@typeInfo(Metrics.Phase).@"enum".field_names.len, parsed.value.counts.len);
+    var rejected: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_context_pipeline_metrics_json(null, 1, &rejected));
+    try std.testing.expect(rejected.ptr == null);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_context_pipeline_metrics_json(context.handle, 2, &rejected));
+    try std.testing.expect(rejected.ptr == null);
+}

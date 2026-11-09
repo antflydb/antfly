@@ -17,6 +17,7 @@
 //! sizes; only consumers that actually retain cells need an allocation budget.
 const std = @import("std");
 const v = @import("value.zig");
+const arithmetic_series = @import("arithmetic_series.zig");
 pub const Range = struct {
     start: i64,
     step: i64,
@@ -189,9 +190,9 @@ const WideMeasure = struct {
         const n: i256 = @intCast(run.length());
         const low: i256 = run.low;
         const step: i256 = run.step;
-        const total = @divExact(n * (2 * low + (n - 1) * step), 2);
+        const total = arithmetic_series.sum(@intCast(n), run.low, run.step);
         const negatives = if (low >= 0) 0 else @min(n, @divFloor(-low + step - 1, step));
-        const negative = @divExact(negatives * (2 * low + (negatives - 1) * step), 2);
+        const negative = arithmetic_series.sum(@intCast(negatives), run.low, run.step);
         self.count += n * coefficient;
         self.negative += negative * coefficient;
         self.positive += (total - negative) * coefficient;

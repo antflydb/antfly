@@ -13,6 +13,18 @@
       "workflow": "sdks-ci.yml"
     },
     {
+      "id": "dictation",
+      "workflow": "dictation-example.yml",
+      "paths": [
+        "^examples/dictation/(Sources/|Tests/|Assets/|presets/|[^/]+\\.(swift|sh)$|Package\\.resolved$|Info\\.plist$|antfly\\.yaml$)",
+        "^\\.github/workflows/dictation-example\\.yml$",
+        "^examples/dictation/release/",
+        "^scripts/release/(objectstore_channel|publish_objectstorage|download_objectstorage|verify_release_ledger|create_github_release|release_channels|release_lines)\\.py$",
+        "^scripts/release/requirements\\.lock$",
+        "^\\.github/workflows/dictation-release.*\\.yml$"
+      ]
+    },
+    {
       "id": "scale",
       "workflow": "zig-scale-tests.yml",
       "label": "ci:scale-tests"

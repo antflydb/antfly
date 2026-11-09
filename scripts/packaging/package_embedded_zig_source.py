@@ -51,6 +51,7 @@ BUILD_INPUTS = {
     "zig/tools/build_support.zig",
     "zig/tools/check_files_equal.zig",
     "scripts/yaml_to_json.py",
+    "scripts/packaging/apple_bridge.py",
     "scripts/pyproject.toml",
     "scripts/uv.lock",
     "scripts/apache_engine_files.txt",

@@ -217,7 +217,7 @@ pub const Assertion = struct {
     embedding_model: ?Model = null,
     reconciliation_reason: ?[]const u8 = null,
 };
-pub const ObservationRequest = struct { origin: ?provenance.Origin = null, context_evidence_ids: []const []const u8 = &.{}, evidence: []const Evidence, assertions: []const Assertion = &.{}, entities: []const Entity = &.{}, mentions: []const EntityMention = &.{} };
+pub const ObservationRequest = struct { scoped_evidence_ids: bool = false, origin: ?provenance.Origin = null, context_evidence_ids: []const []const u8 = &.{}, evidence: []const Evidence, assertions: []const Assertion = &.{}, entities: []const Entity = &.{}, mentions: []const EntityMention = &.{} };
 pub const AssertionRequest = struct { assertions: []const Assertion };
 pub const Correction = struct {
     id: []const u8,
@@ -239,6 +239,86 @@ pub const Outcome = struct {
     success: bool,
     used_memory_ids: []const []const u8,
     detail: []const u8 = "",
+};
+/// Outcome-derived usefulness, counted only from outcomes the caller may read.
+/// `score` is (successes - failures) / (successes + failures + 2), in (-1, 1).
+pub const Access = struct { memory_ids: []const []const u8 };
+pub const Usage = struct { recalls: u64 = 0, last_recalled_at: ?i64 = null, last_verified_at: ?i64 = null, utility: Utility = .{} };
+pub const Utility = struct { successes: u32 = 0, failures: u32 = 0, score: f64 = 0, complete: bool = true };
+pub const max_utility_outcomes = 64;
+/// Brief pins promote a memory into the session-start brief of one branch.
+pub const Pin = struct { id: []const u8, pinned: bool = true, reason: []const u8 = "" };
+pub const StoredPin = struct { id: []const u8, branch: []const u8 = "", principal: []const u8, reason: []const u8 = "", recorded_at: i64, revision: u64 };
+pub const max_brief_pins = 256;
+/// Session-start context: a small, bounded set of high-signal memories that a
+/// harness can inject every session, with ids that link to deeper recall.
+pub const BriefRequest = struct {
+    scope: ?[]const u8 = null,
+    task: ?[]const u8 = null,
+    environment: ?[]const u8 = null,
+    include_provisional: bool = false,
+    limit: u16 = 16,
+    token_budget: u32 = 1024,
+};
+pub const max_brief_items = 64;
+pub const BriefItem = struct {
+    id: []const u8,
+    statement: []const u8,
+    kind: Kind,
+    subject: []const u8,
+    predicate: []const u8,
+    scope: []const u8,
+    stability: Stability,
+    valid_from: ?i64,
+    pinned: bool,
+    score: f64,
+    utility: Utility,
+};
+pub const SubjectCount = struct { subject: []const u8, memories: u32 };
+pub const Brief = struct {
+    items: []const BriefItem,
+    subjects: []const SubjectCount,
+    guidance: []const u8,
+    scanned: usize,
+    omitted: usize,
+    complete: bool,
+    token_upper_bound: usize,
+    revision: u64,
+    config_generation: u64,
+};
+/// Read-only consolidation ("dreaming") review. Findings are suggestions for
+/// existing reviewed write paths; similarity never authorizes a change.
+pub const ConsolidationRequest = struct { limit: u16 = 32, stale_after_ms: ?u64 = null, cursor: ?[]const u8 = null };
+pub const max_consolidation_findings = 256;
+pub const FindingKind = enum { duplicate, dispute, unordered, unverified, harmful, stale, dangling_link, orphan_entity, promote };
+pub const SuggestedAction = enum { propose_supersession, review_supersession, correct, add_valid_from, verify, fix_link, curate_entity, pin };
+pub const Finding = struct {
+    kind: FindingKind,
+    memory_ids: []const []const u8 = &.{},
+    entity_id: ?[]const u8 = null,
+    target_id: ?[]const u8 = null,
+    reason: []const u8,
+    suggested_action: SuggestedAction,
+};
+pub const Count = struct { name: []const u8, memories: u32 };
+pub const SpaceStats = struct {
+    memories: u32 = 0,
+    by_kind: []const Count = &.{},
+    by_lifecycle: []const Count = &.{},
+    by_stability: []const Count = &.{},
+    by_producer: []const Count = &.{},
+    pinned: u32 = 0,
+    entities: u32 = 0,
+};
+pub const Consolidation = struct {
+    next_cursor: ?[]const u8 = null,
+    findings: []const Finding,
+    stats: SpaceStats,
+    scanned: usize,
+    omitted: usize,
+    complete: bool,
+    revision: u64,
+    config_generation: u64,
 };
 pub const Relationship = enum { depends_on, supersedes, motivates, rejected_in_favor_of };
 pub const Recall = struct {
@@ -262,6 +342,21 @@ pub const Recall = struct {
     cursor: ?[]const u8 = null,
     embedding: ?[]const f32 = null,
     embedding_model: ?Model = null,
+    /// Opt-in bounded boost from outcome feedback: score += weight * utility,
+    /// with weight in [0, 1]. Zero (the default) leaves ranking unchanged and
+    /// is omitted from encodings, so pinned evaluation inputs keep their bytes.
+    utility_weight: f64 = 0,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            const include = if (comptime std.mem.eql(u8, field, "utility_weight")) self.utility_weight != 0 else true;
+            if (include) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 pub const State = struct {
     /// Omitted for legacy spaces. Indexed identity publication sets this fence;
@@ -271,6 +366,11 @@ pub const State = struct {
     input_digest_key: []const u8 = &.{},
     persistent_roots: bool = false,
     knowledge_revision: u64 = 0,
+    feedback_revision: u64 = 0,
+    utility_owner_ready: bool = false,
+    utility_owner_cursor: ?[]const u8 = null,
+    restates_ready: bool = false,
+    restates_cursor: ?[]const u8 = null,
     change_floor: []const u8 = "",
     next_change_expiry_at: ?i64 = null,
     change_min_recorded_at: i64 = std.math.minInt(i64),
@@ -329,6 +429,7 @@ pub const StoredAssertion = struct {
     owner: []const u8,
     recorded_from: i64,
     recorded_at: i64 = 0,
+    last_verified_at: ?i64 = null,
     revision: u64,
     lifecycle: Lifecycle = .active,
     // Explicit semantic invalidation of a derived artifact. Time-qualified
@@ -341,6 +442,20 @@ pub const StoredAssertion = struct {
     /// Accepted replacement boundary; null means business time is unknown.
     superseded_valid_at: ?i64 = null,
     config_generation: u64,
+
+    // Keep historical claim-view fingerprints stable until verification is
+    // actually recorded. An additive null field must not stale pending pins.
+    pub fn jsonStringify(self: StoredAssertion, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(StoredAssertion).@"struct".field_names) |field| {
+            const skip = if (comptime std.mem.eql(u8, field, "last_verified_at")) self.last_verified_at == null else false;
+            if (!skip) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 pub const Stage = enum { pending, running, succeeded, failed, cancelled };
 pub const RequiredGrant = enum { write, curator, admin };
@@ -369,6 +484,11 @@ pub const Operation = struct {
     next_retry_at: ?i64 = null,
     inputs: []const []const u8 = &.{},
     context_inputs: []const []const u8 = &.{},
+    evidence_ids: []const []const u8 = &.{},
+    duplicate_ids: []const []const u8 = &.{},
+    near_duplicate_ids: []const []const u8 = &.{},
+    proposal_ids: []const []const u8 = &.{},
+    review_cursor: ?[]const u8 = null,
     cursor: ?[]const u8 = null,
 };
 pub const Entity = struct { visibility: Visibility = .private, evidence: []const EvidenceRef = &.{}, id: []const u8, name: []const u8, type: []const u8 = "concept", aliases: []const []const u8 = &.{}, distinct_from: []const []const u8 = &.{} };
@@ -407,6 +527,11 @@ pub const EmbeddingBatch = struct {
 
 /// Public receipts contain no durable execution grants or worker cursors.
 pub const OperationStatus = struct {
+    evidence_ids: []const []const u8 = &.{},
+    duplicate_ids: []const []const u8 = &.{},
+    near_duplicate_ids: []const []const u8 = &.{},
+    proposal_ids: []const []const u8 = &.{},
+    review_cursor: ?[]const u8 = null,
     evaluation_id: ?[]const u8 = null,
     branch: []const u8 = "",
     intake_screening: IntakeScreeningReport = .{},
@@ -444,6 +569,8 @@ pub const RecallResult = struct {
 pub const RecordPage = struct { items: []const StoredAssertion, next_cursor: ?[]const u8, complete: bool, revision: u64 };
 pub const EntityRecord = struct { entity: Entity, owner: []const u8, revision: u64 = 0, recorded_at: ?i64 = null };
 pub const EntityPage = struct { items: []const EntityRecord, next_cursor: ?[]const u8, complete: bool };
+/// Canonical resolution of an entity id. Names and aliases are not identity.
+pub const ResolvedEntity = struct { entity: Entity, resource_ref: provenance.Resource, canonical_id: []const u8, requested_id: []const u8, revision: u64, identity: []const u8, uncertainty: []const u8 };
 pub const SpaceInfo = struct {
     table_id: u64 = 0,
     database: []const u8,
@@ -455,7 +582,9 @@ pub const SpaceInfo = struct {
     owner: []const u8,
     created_at: i64,
 };
+pub const Statistics = struct { stats: SpaceStats = .{}, next_cursor: ?[]const u8 = null, complete: bool = true, scanned: usize = 0 };
 pub const Inspection = struct {
+    statistics: Statistics = .{},
     state: SpaceInfo,
     capabilities: struct { native: bool, model_free: bool, generator_available: bool, embedder_available: bool },
 };

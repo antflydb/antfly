@@ -387,7 +387,9 @@ test('large diffs select all standard suites; renamed paths are considered', asy
   const g=fixture();
   const target=config.suites.find(s=>s.paths);
   if (target) {
-    const filename=target.paths.some(p=>new RegExp(p).test('go/pkg/old.go'))?'go/pkg/old.go':'docs/moved.txt';
+    const filename = ['go/pkg/old.go', 'docs/moved.txt', 'examples/dictation/Sources/App.swift']
+      .find(file => target.paths.some(pattern => new RegExp(pattern).test(file)));
+    assert.ok(filename, `missing rename fixture for ${target.id}`);
     g.files([{filename:'docs/moved.txt',previous_filename:filename}]); await g.call();
     assert.ok(JSON.parse(g.checks[0].output.text).suites.includes(target.id));
   }
@@ -404,6 +406,27 @@ test('path selection matches repository CI owners and does not enable optional t
     assert.deepEqual(selectSuites(['ts/apps/dashboard/test.ts'],f.pr,config),['policy','vitest','playwright']);
     assert.ok(selectSuites(['ts/apps/www-antfly/app/page.tsx'],f.pr,config).includes('www'));
     assert.deepEqual(selectSuites(['README.md'],f.pr,config),['policy']);
+  }
+});
+
+test('dictation source checks require admission and retain narrow path selection', () => {
+  if (!config.suites.some(s => s.id === 'dictation')) return;
+  const f = fixture();
+  for (const file of ['examples/dictation/Sources/App.swift',
+    'examples/dictation/Tests/ClientTests.swift', 'examples/dictation/Assets/icon.png',
+    'examples/dictation/presets/default.json', 'examples/dictation/Package.swift',
+    'examples/dictation/test.sh', 'examples/dictation/Package.resolved',
+    'examples/dictation/Info.plist', 'examples/dictation/antfly.yaml',
+    '.github/workflows/dictation-example.yml',
+    'examples/dictation/release/policy.json',
+    'scripts/release/objectstore_channel.py',
+    'scripts/release/requirements.lock',
+    '.github/workflows/dictation-release.yml']) {
+    assert.ok(selectSuites([file], f.pr, config).includes('dictation'), file);
+  }
+  for (const file of ['examples/dictation/README.md', 'docs/guides/inference.mdx',
+    'zig/build.zig', 'examples/another-app/Package.swift']) {
+    assert.ok(!selectSuites([file], f.pr, config).includes('dictation'), file);
   }
 });
 

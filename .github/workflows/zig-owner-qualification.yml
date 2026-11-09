@@ -39,7 +39,7 @@ on:
         default: ''
   push:
     branches: [main]
-    paths: ['zig/**', 'scripts/test-lake-s3-integration.sh', '.github/workflows/zig-owner-qualification.yml', '.github/workflows/pr-ci.yml']
+    paths: ['zig/**', '.github/actions/setup-native-build-tools/**', 'scripts/test-lake-s3-integration.sh', '.github/workflows/zig-owner-qualification.yml', '.github/workflows/pr-ci.yml']
   merge_group:
     types: [checks_requested]
   schedule:
@@ -90,7 +90,7 @@ jobs:
           else
             git fetch --no-tags --depth=1 origin "$BASE_SHA"
             git diff --name-only FETCH_HEAD HEAD > changed-paths.txt
-            if grep -Eq '^(zig/|scripts/test-lake-s3-integration.sh|.github/workflows/(zig-owner-qualification|pr-ci).yml)' changed-paths.txt; then
+            if grep -Eq '^(zig/|.github/actions/setup-native-build-tools/|scripts/test-lake-s3-integration.sh|.github/workflows/(zig-owner-qualification|pr-ci).yml)' changed-paths.txt; then
               echo 'owners=true' >> "$GITHUB_OUTPUT"
             else
               echo 'owners=false' >> "$GITHUB_OUTPUT"
@@ -119,6 +119,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -174,6 +176,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -228,7 +232,7 @@ jobs:
         working-directory: zig
         run: python3 tools/check_lake_execution_runtime.py --report ../.benchmark-results/owner-qualification/lake-runtime.json --rows 1024 --rounds 4
       - name: Qualify optimized image equivalence and lake attempts
-        if: inputs.full_validation || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        if: inputs.full_validation || github.event_name == 'schedule' || inputs.cache_matrices
         working-directory: zig
         run: |
           python3 tools/check_image_owner_transport.py --optimize fast --report ../.benchmark-results/owner-qualification/image-releasefast.json --timeout 1800
@@ -246,10 +250,12 @@ jobs:
           name: operation-owner-linux-x86_64
           path: .benchmark-results/owner-qualification/
 
+  # The PR orchestrator itself uses workflow_dispatch. Its event name is not
+  # an opt-in to expensive cache matrices; use the admitted input instead.
   media-cache:
     name: Native media cache matrix / Linux x86_64
     needs: [admission, changes]
-    if: needs.changes.outputs.owners == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || inputs.cache_matrices)
+    if: needs.changes.outputs.owners == 'true' && (github.event_name == 'schedule' || inputs.cache_matrices)
     runs-on: arc-antfly-heavy-runtime
     permissions:
       contents: read
@@ -266,6 +272,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -323,6 +331,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -355,7 +365,7 @@ jobs:
           python3 tools/run_bounded_zig_build.py -- build antfly runtime-archives capi capi-smoke opaque-read-session-test -Dshared-image-operations=true -Dshared-lake-execution=true -Doptimize=debug -Dstrip=false -Dcpu=baseline -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all -j1 2>&1 | tee ../.benchmark-results/production-owners/build.log
           python3 tools/check_owner_archive_symbols.py --report ../.benchmark-results/production-owners/symbols.json
       - name: Production lake owner/client/contract cache matrix
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || inputs.cache_matrices
+        if: github.event_name == 'schedule' || inputs.cache_matrices
         working-directory: zig
         run: |
           python3 tools/check_lake_execution_cache.py --report ../.benchmark-results/production-owners/lake-cache.json --timeout 1800
@@ -387,6 +397,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      - name: Prepare native build tools
+        uses: ./.github/actions/setup-native-build-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}

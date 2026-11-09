@@ -488,6 +488,16 @@ pub fn create(config: Config) Graph {
         const pdf = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/mod.zig")), .target = target, .optimize = optimize });
         const values = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/values.zig")), .target = target, .optimize = optimize });
         pdf.addImport("pdf_values", values);
+        // Match the canonical PDF module's shared namespaces. Standalone
+        // inference builds construct this module without the Antfly graph.
+        const syntax = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/syntax.zig")), .target = target, .optimize = optimize });
+        const text = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/text_encoding.zig")), .target = target, .optimize = optimize });
+        text.addImport("pdf_standard_fonts", fonts);
+        const structure = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/text_structure.zig")), .target = target, .optimize = optimize });
+        structure.addImport("pdf_values", values);
+        pdf.addImport("pdf_syntax", syntax);
+        pdf.addImport("pdf_text_encoding", text);
+        pdf.addImport("pdf_text_structure", structure);
         pdf.addImport("antfly_image", image_mod);
         pdf.addImport("antfly_hash", hash_mod);
         pdf.addImport("antfly_font", font);

@@ -119,11 +119,26 @@ class RuntimeCacheTest(unittest.TestCase):
                 "-Dsystem-blas=false",
             ]
         )
+        # Only the production runtime fixture owns this archive-probe
+        # namespace. Alternate tiny fixtures keep their own normal build API.
+        # Audits still visit every production target before roots are pruned.
+        execution_roots = targets[: targets.index("--")] if "--" in targets else targets
+        select_roots = (
+            any(
+                target == "cache-probe" or target.startswith("runtime-unit-")
+                for target in execution_roots
+            )
+            and "--help" not in execution_roots
+        )
+        fixture_flags = (
+            ["-Dcache-steps=" + ",".join(execution_roots)] if select_roots else []
+        )
         result = subprocess.run(
             [
                 "zig",
                 "build",
                 *targets,
+                *fixture_flags,
                 *native_flags,
                 f"-Dantfly-version={version}",
                 *settings,
@@ -408,32 +423,39 @@ class RuntimeCacheTest(unittest.TestCase):
                     )
 
     def test_compute_owner_ignores_storage_abi_changes(self):
+        # Both owners have storage-independent contracts. Local query dispatch
+        # depends on its opaque operation ABI, not physical DB/Raft layouts.
+        units = ("enrichment_compute", "local_query")
+        targets = tuple(f"runtime-unit-{unit}" for unit in units)
         contract = self.own("zig/pkg/antfly-embedded/src/storage/kernel_owner_abi.zig")
-        self.assert_compile(
-            self.build("runtime-unit-enrichment_compute"),
-            "enrichment_compute",
-            "success",
-        )
-        self.assert_compile(
-            self.build("runtime-unit-enrichment_compute"),
-            "enrichment_compute",
-            "cached",
-        )
+        for status in ("success", "cached"):
+            output = self.build(*targets)
+            for unit in units:
+                self.assert_compile(output, unit, status)
         contract.write_bytes(
             contract.read_bytes() + b"\n// storage ABI cache regression\n"
         )
-        self.assert_compile(
-            self.build("runtime-unit-enrichment_compute"),
-            "enrichment_compute",
-            "cached",
+        for missing in (False, True):
+            if missing:
+                contract.unlink()
+            output = self.build(*targets)
+            for unit in units:
+                self.assert_compile(output, unit, "cached")
+
+        # Positive control: changing the opaque query ABI rebuilds its dispatcher
+        # while leaving the independent compute owner cached.
+        query = self.own("zig/pkg/antfly-embedded/src/storage/local_query_abi.zig")
+        query.write_bytes(
+            query.read_bytes() + b"\npub const cache_test_owner_revision: u8 = 1;\n"
         )
-        # Compute must remain buildable without declaring this storage-only
-        # contract, rather than merely avoiding semantic use of its types.
-        contract.unlink()
-        self.assert_compile(
-            self.build("runtime-unit-enrichment_compute"),
-            "enrichment_compute",
-            "cached",
+        output = self.build(*targets)
+        self.assert_compile(output, "local_query", "success")
+        self.assert_compile(output, "enrichment_compute", "cached")
+        # The tiny storage probe does not read its physical ABI. Check a real
+        # consumed input instead: dispatch must fail without its opaque ABI.
+        query.unlink()
+        self.assertIn(
+            "FileNotFound", self.build("runtime-unit-local_query", succeeds=False)
         )
 
     def test_control_consumers_ignore_physical_db_implementation(self):
@@ -454,7 +476,7 @@ class RuntimeCacheTest(unittest.TestCase):
             ("zig/lib/a2a/src/root.zig", ("api_kernel",)),
             (
                 "zig/lib/raft/src/root.zig",
-                ("distributed", "storage_kernel", "local_query", "api_kernel"),
+                ("distributed", "storage_kernel", "api_kernel"),
             ),
         )
         for relative, _ in owners:
@@ -480,19 +502,23 @@ class RuntimeCacheTest(unittest.TestCase):
                 self.assertNotEqual(after, before)
                 before = after
                 self.assert_archives(self.build("cache-probe"))
-                source.unlink()
-                # Unrelated owners keep compiling without the dependency. Its
-                # real consumers must fail instead of silently dropping it.
-                unrelated = [unit for unit in UNITS if unit not in consumers]
-                output = self.build(*(f"runtime-unit-{unit}" for unit in unrelated))
-                for unit in unrelated:
-                    self.assert_compile(output, unit, "cached")
-                for unit in consumers:
-                    self.assertIn(
-                        "FileNotFound",
-                        self.build(f"runtime-unit-{unit}", succeeds=False),
-                    )
-                source.write_bytes(contents)
+                hidden = source.with_name(source.name + ".cache-test-hidden")
+                source.rename(hidden)
+                try:
+                    # Unrelated owners remain buildable; actual consumers must
+                    # fail. Preserve the source inode when restoring it so this
+                    # availability probe does not also change file identity.
+                    unrelated = [unit for unit in UNITS if unit not in consumers]
+                    output = self.build(*(f"runtime-unit-{unit}" for unit in unrelated))
+                    for unit in unrelated:
+                        self.assert_compile(output, unit, "cached")
+                    for unit in consumers:
+                        self.assertIn(
+                            "FileNotFound",
+                            self.build(f"runtime-unit-{unit}", succeeds=False),
+                        )
+                finally:
+                    hidden.rename(source)
                 self.assert_archives(self.build("cache-probe"))
 
     def test_lite_capability_options(self):
@@ -503,9 +529,7 @@ class RuntimeCacheTest(unittest.TestCase):
         baseline = self.build("cache-probe", settings=enabled)
         self.assert_archives(self.build("cache-probe", settings=enabled))
         changed = self.build("cache-probe", settings=disabled)
-        self.assert_archives(
-            changed, rebuilt=("distributed", "storage_kernel", "local_query")
-        )
+        self.assert_archives(changed, rebuilt=("distributed", "storage_kernel"))
         # The actual capability implementation must still report the new value.
         self.assertNotEqual(self.probe(baseline), self.probe(changed))
         self.assert_archives(self.build("cache-probe", settings=disabled))
@@ -519,14 +543,20 @@ class RuntimeCacheTest(unittest.TestCase):
             audio.read_bytes()
             + b'\npub const cache_test_profile = @import("builtin").mode;\n'
         )
+        baseline_sources = {}
         for name in ("prometheus", "structlog"):
             source = self.own(f"zig/lib/{name}/src/root.zig")
             source.write_bytes(
                 source.read_bytes()
                 + b"\npub const cache_test_observability_revision: u8 = 1;\n"
             )
+            baseline_sources[name] = source.read_bytes()
         for standalone in (False, True):
             with self.subTest(standalone=standalone):
+                # Each composition starts from the same fixture revision,
+                # even if the other composition failed before its edit probes.
+                for name, baseline in baseline_sources.items():
+                    self.own(f"zig/lib/{name}/src/root.zig").write_bytes(baseline)
                 if standalone:
                     self.use_standalone()
                 target = "cache-inference" if standalone else "runtime-unit-inference"
@@ -556,7 +586,7 @@ class RuntimeCacheTest(unittest.TestCase):
                         source = self.own(f"zig/lib/{name}/src/root.zig")
                         # Change a value consumed by the tiny entry bodies;
                         # comments and unused declarations need not recompile.
-                        before = 1 + int(standalone)
+                        before = 1
                         contents = source.read_bytes().replace(
                             f"cache_test_observability_revision: u8 = {before};".encode(),
                             f"cache_test_observability_revision: u8 = {before + 1};".encode(),
@@ -575,19 +605,52 @@ class RuntimeCacheTest(unittest.TestCase):
                                 f"OBSERVABILITY_REVISION {before + 1} {structlog_revision}",
                                 changed,
                             )
-                        source.unlink()
-                        self.build("--help")
-                        self.assertIn(
-                            "BENCH_PROFILE debug debug",
-                            self.build("cache-antfly-inference-audio-bench"),
-                        )
-                        failure = self.build(target, succeeds=False)
-                        self.assertIn("FileNotFound", failure)
-                        self.assertNotIn("panic:", failure)
-                        source.write_bytes(contents)
+                        # Temporarily hide the source without replacing its
+                        # inode on restore. This probes dependency availability,
+                        # independently of file-identity cache invalidation.
+                        hidden = source.with_name(source.name + ".cache-test-hidden")
+                        source.rename(hidden)
+                        try:
+                            self.build("--help")
+                            self.assertIn(
+                                "BENCH_PROFILE debug debug",
+                                self.build("cache-antfly-inference-audio-bench"),
+                            )
+                            failure = self.build(target, succeeds=False)
+                            self.assertIn("FileNotFound", failure)
+                            self.assertNotIn("panic:", failure)
+                        finally:
+                            hidden.rename(source)
                         self.assertRegex(
                             self.build(target), rf"compile {artifact} debug \S+ cached"
                         )
+
+    def test_graph_audit_precedes_fixture_target_pruning(self):
+        help_output = self.build("--help")
+        for target in (
+            "cache-probe",
+            "lib-hash-test",
+            "sql-grammar-generated-check",
+            "regen-sql-grammar",
+            "check-snowball",
+            "regen-snowball",
+        ):
+            self.assertIn(target, help_output)
+        self.assertNotIn("lib-image-webp-bench", help_output)
+        # The WebP product target is absent from serialized fixture roots, but
+        # its entire graph must still be audited before it is discarded.
+        support = self.own("zig/lib/image/build_support.zig")
+        source = support.read_text()
+        original = "createWorkControlModule(b, root, target, .fast)"
+        self.assertEqual(source.count(original), 1)
+        support.write_text(
+            source.replace(original, "createWorkControlModule(b, root, target, .debug)")
+        )
+        failure = self.build("--help", succeeds=False)
+        self.assertIn(
+            "lib-image-webp-bench: runtime dependency uses debug, expected fast",
+            failure,
+        )
 
     def test_native_artifact_profiles(self):
         for source in ("zig/lib/audio/src/mod.zig", "zig/lib/linalg/src/mod.zig"):
@@ -1552,7 +1615,9 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assert_archives(
             output,
             rebuilt=tuple(
-                unit for unit in UNITS if unit not in ("cli", "enrichment_compute")
+                unit
+                for unit in UNITS
+                if unit not in ("cli", "enrichment_compute", "local_query")
             ),
         )
         self.assertNotEqual(self.probe(output, "TOKENIZER_PROBE"), tokenizer_before)
@@ -1573,7 +1638,9 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assert_archives(
             output,
             rebuilt=tuple(
-                unit for unit in UNITS if unit not in ("cli", "enrichment_compute")
+                unit
+                for unit in UNITS
+                if unit not in ("cli", "enrichment_compute", "local_query")
             ),
         )
 
@@ -1591,7 +1658,9 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assertIn("state: u32 = 1,", text)
         shared.write_text(text.replace("state: u32 = 1,", "state: u32 = 2,"))
         changed = self.build("cache-probe", version="cache-after")
-        self.assert_archives(changed, rebuilt=UNITS)
+        self.assert_archives(
+            changed, rebuilt=tuple(unit for unit in UNITS if unit != "local_query")
+        )
         self.assertNotEqual(
             self.probe(changed).split()[1:5], self.probe(versioned).split()[1:5]
         )
@@ -1753,7 +1822,11 @@ class RuntimeCacheTest(unittest.TestCase):
                         "src/backends/metal_compile_options.h",
                     ]
                     if backend == "metal"
-                    else ["src/ops/cuda/kernels.zig"]
+                    else [
+                        "src/ops/cuda/kernels.zig",
+                        "src/ops/cuda/kernels/rms_q8_1_2560.cuh",
+                        "src/ops/cuda/kernels/gemma4_e4b_prefetch.cuh",
+                    ]
                 ) + ["src/graph/kernel_jit.zig", "src/graph/quant_kernel_compiler.zig"]
                 if backend == "cuda":
                     qualifier.append("src/graph/quant_kernel_cuda_renderer.zig")
@@ -1769,6 +1842,8 @@ class RuntimeCacheTest(unittest.TestCase):
                         self.bundle_digest(
                             [
                                 "src/ops/cuda/cuda_compute.zig",
+                                "src/ops/cuda/kernels/rms_q8_1_2560.cuh",
+                                "src/ops/cuda/kernels/gemma4_e4b_prefetch.cuh",
                                 "src/graph/quant_kernel_compiler.zig",
                                 "src/graph/quant_matmul.zig",
                                 "src/gguf/tensor_types.zig",

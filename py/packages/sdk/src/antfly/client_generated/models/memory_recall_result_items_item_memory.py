@@ -31,6 +31,7 @@ class MemoryRecallResultItemsItemMemory:
         asserted_valid_to (int | None | Unset):
         explicit_disposition (MemoryRecallResultItemsItemMemoryExplicitDispositionType0 | None | Unset):
         recorded_at (int | Unset):  Default: 0.
+        last_verified_at (int | None | Unset):
         lifecycle (MemoryRecallResultItemsItemMemoryLifecycle | Unset):  Default:
             MemoryRecallResultItemsItemMemoryLifecycle.ACTIVE.
         stale (bool | Unset):  Default: False.
@@ -50,6 +51,7 @@ class MemoryRecallResultItemsItemMemory:
     asserted_valid_to: int | None | Unset = UNSET
     explicit_disposition: MemoryRecallResultItemsItemMemoryExplicitDispositionType0 | None | Unset = UNSET
     recorded_at: int | Unset = 0
+    last_verified_at: int | None | Unset = UNSET
     lifecycle: MemoryRecallResultItemsItemMemoryLifecycle | Unset = MemoryRecallResultItemsItemMemoryLifecycle.ACTIVE
     stale: bool | Unset = False
     reason: None | str | Unset = UNSET
@@ -90,6 +92,12 @@ class MemoryRecallResultItemsItemMemory:
             explicit_disposition = self.explicit_disposition
 
         recorded_at = self.recorded_at
+
+        last_verified_at: int | None | Unset
+        if isinstance(self.last_verified_at, Unset):
+            last_verified_at = UNSET
+        else:
+            last_verified_at = self.last_verified_at
 
         lifecycle: str | Unset = UNSET
         if not isinstance(self.lifecycle, Unset):
@@ -144,6 +152,8 @@ class MemoryRecallResultItemsItemMemory:
             field_dict["explicit_disposition"] = explicit_disposition
         if recorded_at is not UNSET:
             field_dict["recorded_at"] = recorded_at
+        if last_verified_at is not UNSET:
+            field_dict["last_verified_at"] = last_verified_at
         if lifecycle is not UNSET:
             field_dict["lifecycle"] = lifecycle
         if stale is not UNSET:
@@ -211,6 +221,15 @@ class MemoryRecallResultItemsItemMemory:
 
         recorded_at = d.pop("recorded_at", UNSET)
 
+        def _parse_last_verified_at(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        last_verified_at = _parse_last_verified_at(d.pop("last_verified_at", UNSET))
+
         _lifecycle = d.pop("lifecycle", UNSET)
         lifecycle: MemoryRecallResultItemsItemMemoryLifecycle | Unset
         if isinstance(_lifecycle, Unset):
@@ -268,6 +287,7 @@ class MemoryRecallResultItemsItemMemory:
             asserted_valid_to=asserted_valid_to,
             explicit_disposition=explicit_disposition,
             recorded_at=recorded_at,
+            last_verified_at=last_verified_at,
             lifecycle=lifecycle,
             stale=stale,
             reason=reason,

@@ -2050,6 +2050,7 @@ def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_
     ), f"slot loss was not surfaced explicitly\n{failed_statuses!r}"
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_standalone_accepts_postgres_replication_sources(pg_cdc_source):
     # Standalone runs the CDC coordinators: a source is accepted, reports
     # cdc_supported, and its snapshot row arrives. The parametrized
