@@ -473,6 +473,10 @@ pub fn create(b: *std.Build) ?Artifacts {
     const cloudflare_tests = b.addTest(.{ .root_module = cloudflare_test_module });
     b.step("lib-cloudflare-test", "Run Cloudflare wire and response validation tests").dependOn(&b.addRunArtifact(cloudflare_tests).step);
 
+    const chat_context_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("lib/chat_context/root.zig"), .target = target, .optimize = optimize }) });
+    const run_chat_context_tests = b.addRunArtifact(chat_context_tests);
+    b.step("lib-chat-context-test", "Run provider-neutral context planning and transactional preparation tests").dependOn(&run_chat_context_tests.step);
+
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
     });
@@ -837,6 +841,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_raft_library_tests.step);
     lib_test_step.dependOn(&run_lib_jsonschema_tests.step);
     lib_test_step.dependOn(&run_lib_generating_tests.step);
+    lib_test_step.dependOn(&run_chat_context_tests.step);
     lib_test_step.dependOn(&run_structured_tests.step);
     lib_test_step.dependOn(&run_group_source_tests.step);
     lib_test_step.dependOn(&run_decisions_unit_tests.step);

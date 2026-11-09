@@ -108,6 +108,7 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-server-api/src/openapi/generated/antfly_usermgr_server_openapi/root.zig",
     ),
     "antfly_cancellation": ("zig/lib/runtime/src/cancellation.zig",),
+    "antfly_chat_context": ("zig/lib/chat_context/root.zig",),
     "antfly_cache_budget": ("zig/lib/runtime/src/cache_budget.zig",),
     "antfly_runtime_abi": ("zig/lib/runtime/src/root.zig",),
     "antfly_private_error_diagnostics": (

@@ -80,6 +80,8 @@ pub const Conversation = struct {
 pub const Budget = struct {
     /// Tool calls across every round, including delegated planning.
     max_tool_calls: i64 = default_max_tool_calls,
+    /// Total destination and summary calls lent by a composite agent.
+    max_model_calls: ?i64 = null,
     /// Retained model history, see Conversation.limit_bytes.
     max_history_bytes: usize = Conversation.max_bytes,
 

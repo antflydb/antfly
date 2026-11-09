@@ -5,6 +5,10 @@ from .administer_sql_settings_response_200 import AdministerSqlSettingsResponse2
 from .advance_table_storage_migration_body import AdvanceTableStorageMigrationBody
 from .advance_table_storage_migration_body_action import AdvanceTableStorageMigrationBodyAction
 from .advance_table_storage_migration_response_200 import AdvanceTableStorageMigrationResponse200
+from .agent_context_diagnostics import AgentContextDiagnostics
+from .agent_context_event import AgentContextEvent
+from .agent_context_management import AgentContextManagement
+from .agent_context_management_mode import AgentContextManagementMode
 from .agent_decision import AgentDecision
 from .agent_question import AgentQuestion
 from .agent_question_kind import AgentQuestionKind
@@ -2697,6 +2701,10 @@ __all__ = (
     "AdvanceTableStorageMigrationBody",
     "AdvanceTableStorageMigrationBodyAction",
     "AdvanceTableStorageMigrationResponse200",
+    "AgentContextDiagnostics",
+    "AgentContextEvent",
+    "AgentContextManagement",
+    "AgentContextManagementMode",
     "AgentDecision",
     "AgentQuestion",
     "AgentQuestionKind",
