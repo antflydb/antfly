@@ -223,7 +223,10 @@ class LiveRuntimeTests(unittest.TestCase):
                             with urllib.request.urlopen(request, timeout=1) as response:
                                 body = json.load(response)
                             break
-                        except (OSError, urllib.error.HTTPError):
+                        except urllib.error.HTTPError as error:
+                            error.close()
+                            time.sleep(0.2)
+                        except OSError:
                             time.sleep(0.2)
                     self.assertIsNotNone(
                         body,
@@ -233,7 +236,10 @@ class LiveRuntimeTests(unittest.TestCase):
                     )
                     with self.assertRaises(urllib.error.HTTPError) as unauthenticated:
                         urllib.request.urlopen(url, timeout=2)
-                    self.assertIn(unauthenticated.exception.code, (401, 403))
+                    try:
+                        self.assertIn(unauthenticated.exception.code, (401, 403))
+                    finally:
+                        unauthenticated.exception.close()
                     self.assertTrue((root / "data").is_dir())
                 finally:
                     process.stdin.close()
