@@ -12688,9 +12688,9 @@ pub const DataServer = struct {
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
         const revisions = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
-        if (req.document_version_scheme == .revision_v1) return revisions;
-        if (req.online_source) |command| if (command == .admit and command.admit.ttl_sources) return revisions;
-        if (req.merge_page) |page| if (page.ttl_sources.len != 0 or (if (page.chunk) |chunk| chunk.ttl_source != null else false)) return revisions;
+        // Keep proposal admission and the encoded envelope in lockstep as
+        // the private document-version effect language evolves.
+        if (@import("antfly_local_sources").api_internal_batch.requiresDocumentVersionsEnvelope(req)) return revisions;
         const execution = @import("../common/data_raft_protocol.zig").batch_execution_identity_protocol_version;
         if (req.group_source) |command| if (command.action == .activate_catalog) return execution;
         if (req.artifact_publication) |command| if (command.execution_identity != null) return execution;
@@ -34515,6 +34515,16 @@ fn consumerTests() type {
             var req: antfly.db.types.BatchRequest = .{ .document_version_scheme = .revision_v1, .writes = &.{.{ .key = "row", .value = "{}" }} };
             try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
             req.document_version_scheme = .legacy;
+            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+            // A copy can carry only a floor, with no signed TTL source or
+            // current-write marker. It still requires every applying replica
+            // to understand the versioned envelope before proposal.
+            req.merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
+            req.merge_page = .{ .source = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .pin_digest = @splat(7), .applied_index = 1 }, .sequence = 1, .phase = .rows, .next = "row", .exhausted = true, .digest = @splat(0), .timestamps = &.{1}, .document_version_floor = 1 };
+            req.merge_page.?.digest = @import("antfly_local_sources").storage_db_merge_page_contract.commandDigest(req);
+            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+            req.merge_page.?.document_version_floor = 0;
+            req.merge_page.?.digest = @import("antfly_local_sources").storage_db_merge_page_contract.commandDigest(req);
             try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
         }
 
