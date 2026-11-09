@@ -51,3 +51,58 @@ shard RPC adapter. Compact observations include standby durable/apply frontiers 
 Raft progress rather than native paths or addresses. The production fixture's
 ancillary restore-job LMDB remains inside its established unique native temp
 namespace and is not exercised as a modeled crash store by this history.
+
+## Shadow-index-repair activation pacing (outside the first metadata world)
+
+The full-cluster VOPR's `history-completes` liveness fix (fixing
+`writeReadyForPhysicalFormatWithStorage` and `catchUpShadowReplacementUntil`'s
+yield accounting) let `full-cluster.clean` and `full-cluster.resource-pressure`
+run shadow-index-repair catch-up/activation to completion for the first time.
+That exposed a second, previously-latent bug in the same code: the
+activation/convergence pacing loop in
+`pkg/antfly-embedded/src/storage/db/db.zig` measured elapsed time with the
+module-local `monotonicTimeNs()`/`elapsedSince()` helpers, which call
+`antfly_platform`'s `time.monotonicNs()` directly — the real OS monotonic
+clock, unconditionally, with no `std.Io` indirection and therefore no way for
+VOPR to control it. Before the liveness fix this code rarely ran long enough
+to matter; after it, the pacing loop runs on every repair and reads real
+wall-clock jitter into what VOPR's `choose`/replay machinery treats as
+reproducible state, matching this file's long-standing "Real time fallback"
+and "Sleep" risk categories for code outside the first metadata world.
+
+| Function / call site | Old time source | New time source |
+|---|---|---|
+| `DB.repairPacingNowNs` / `DB.repairPacingClock` (new helpers) | n/a | `self.repair_pacing_clock orelse self.backend_runtime.monotonicClock()` — an injectable `platform.clock.Clock`, defaulting to `BackendRuntime.monotonicClock()`, which reads `std.Io.Clock.now(.awake, io)` when an `Io` is borrowed (VOPR's `VoprIo`, deterministic) and the real OS monotonic clock otherwise (`io() == null`, same value `platform_time.monotonicNs()` gave before) |
+| `rebuildIndexWithShadowReplacementOwned`: `catch_up_start_ns`, `elapsedSince(catch_up_start_ns)` (initial and convergence-round catch-up), `activation_started_ns`, `activation_pause_ns`, `recordIndexRepairActivation`'s elapsed arg, `repairActivationReplayDeadline`'s `now_ns` arg | bare `monotonicTimeNs()` / `elapsedSince()` | `self.repairPacingNowNs()` / `self.repairPacingElapsedNs()` |
+| `DB.ensureRepairActivationDeadline` (now takes `self`), `DB.lockApplyUntil`, `DB.beginIndexCatalogBarrierUntil` | bare `monotonicTimeNs()` | `self.repairPacingNowNs()` |
+| `DB.catchUpShadowReplacementUntil`'s three deadline checks | bare `monotonicTimeNs()` | `self.repairPacingNowNs()`; also passes `.clock = self.repairPacingClock()` into `derived_worker.CatchUpOptions` so the window below observes the same clock |
+| `derived/derived_worker.zig`: `catchUpIndexFromMatchingCursor`'s `call_started_ns` and its three `options.deadline_ns`/`max_call_ns` admission checks; `applyBatchBounded`'s `yield_deadline` check | bare module-local `monotonicTimeNs()` (`platform_time.monotonicNs()`) | new `CatchUpOptions.clock: ?platform_clock.Clock`, resolved through `catchUpNowNs(options.clock)` (falls back to the same bare `monotonicTimeNs()` when unset, so every caller besides shadow-index repair is unchanged) |
+
+Left unconverted, deliberately: `collect_started_ns`/`stats.window_collect_ns`
+and `apply_started_ns`/`stats.apply_ns` in `derived_worker.zig` (pure
+telemetry, never compared against a deadline or fed into a decision), and the
+many other `monotonicTimeNs()`/`platform_time.monotonicNs()` call sites in
+`db.zig` and `catalog/index_manager.zig` used purely for logging or exported
+metrics (e.g. `index_manager.zig`'s `metrics_enabled`/`debug_timing`-gated
+profiling blocks). `index_manager.zig`'s quarantined-index-reopen backoff
+(`graphMetricStatusHasRunnableWorkerPage`'s `platform_clock.Clock.real()`
+fallback) is a related but distinct, still-real-time-backed mechanism outside
+the shadow-index-repair activation path this change addresses; it was left
+alone.
+
+Verification: a new deterministic unit test,
+`"repair activation pacing decisions follow the injected clock, not wall
+time"` in `db.zig`, opens a `DB` with `repair_pacing_clock` set to a
+`platform.clock.ManualClock`, and asserts `repairPacingNowNs()` reads exactly
+the injected value and that `ensureRepairActivationDeadline` flips
+deterministically and reproducibly at the exact nanosecond boundary, with no
+dependence on real elapsed wall time. Independently, a temporary diagnostic
+added while isolating this fix (reading `repairPacingNowNs()` under
+`full-cluster-resource-pressure-vopr-test`, removed before committing)
+confirmed the fix: the clock values recorded during VOPR's record pass and
+its exact replay of the same choice sequence were bit-identical in order,
+right up to the point of an unrelated, still-open `ReplaySelectedTransitionDiverged`
+failure in that same scenario (a `vopr-io.packet_deliver` payload mismatch) —
+proving this conversion closes the specific real-time leak it targets, while
+that scenario's remaining divergence has a different, not-yet-identified
+cause.

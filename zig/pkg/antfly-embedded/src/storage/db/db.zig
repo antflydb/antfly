@@ -667,6 +667,14 @@ pub const OpenOptions = struct {
     /// Borrowed realtime clock for durable repair retry scheduling. Defaults to
     /// the backend runtime clock; the caller must keep an override alive until close.
     index_repair_clock: ?platform_clock.Clock = null,
+    /// Borrowed monotonic clock for shadow-index-repair activation pacing
+    /// (repairActivationAdmissible / observeRepairCatchUpCost and the
+    /// catch-up/activation deadlines they feed). Defaults to the backend
+    /// runtime's monotonic clock, which resolves through std.Io when one is
+    /// borrowed (so VOPR's deterministic clock applies) and through the real
+    /// OS monotonic clock otherwise. The caller must keep an override alive
+    /// until close.
+    repair_pacing_clock: ?platform_clock.Clock = null,
     /// Private proof installed only by a validated `NativeRestoreOpenPlan`.
     /// A path-bound proof prevents a copied option set from silently skipping
     /// configuration for a different DB namespace.
@@ -3227,6 +3235,7 @@ pub const DB = struct {
     async_context: *AsyncContext,
     backend_runtime: *background_runtime_mod.BackendRuntime,
     index_repair_clock: ?platform_clock.Clock = null,
+    repair_pacing_clock: ?platform_clock.Clock = null,
     backend_owner_id: u64,
     status_owner_epoch: u64 = 0,
     status_publication_mutex: std.atomic.Mutex = .unlocked,
@@ -4190,6 +4199,7 @@ pub const DB = struct {
                 .owned_backend_runtime = owned_backend_runtime,
                 .owned_resource_manager = owned_resource_manager,
                 .index_repair_clock = opts.index_repair_clock,
+                .repair_pacing_clock = opts.repair_pacing_clock,
                 .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
                 .executor = executor,
                 .start_index_workers = start_index_workers,
@@ -12534,6 +12544,26 @@ pub const DB = struct {
         return (self.index_repair_clock orelse self.backend_runtime.clock()).nowRealtimeMs();
     }
 
+    /// Clock for shadow-index-repair activation pacing decisions
+    /// (repairActivationAdmissible / observeRepairCatchUpCost, and the
+    /// catch-up/activation deadlines in rebuildIndexWithShadowReplacementOwned).
+    /// Defaults to the backend runtime's monotonic clock: in production that
+    /// resolves to the real OS monotonic clock (bit-identical to the former
+    /// bare platform_time.monotonicNs() call), while under VOPR it resolves
+    /// through the borrowed std.Io, which VOPR already controls
+    /// deterministically. See DETERMINISM_AUDIT.md.
+    fn repairPacingClock(self: *const DB) platform_clock.Clock {
+        return self.repair_pacing_clock orelse self.backend_runtime.monotonicClock();
+    }
+
+    fn repairPacingNowNs(self: *const DB) u64 {
+        return self.repairPacingClock().nowRealtimeNs();
+    }
+
+    fn repairPacingElapsedNs(self: *const DB, start_ns: u64) u64 {
+        return self.repairPacingNowNs() - start_ns;
+    }
+
     const progressive_index_repair_audit_interval_ms: u64 = 5 * std.time.ms_per_s;
 
     fn deferIndexRepairForProgress(
@@ -18242,7 +18272,7 @@ pub const DB = struct {
         }
         var observed_ns_per_sequence: u64 = 0;
         var catch_up_start_sequence = build_floor_sequence;
-        var catch_up_start_ns = monotonicTimeNs();
+        var catch_up_start_ns = self.repairPacingNowNs();
         const initial_catch_up_target = self.core.nextDerivedSequence();
         const initial_catch_up = try self.catchUpShadowReplacementUntil(
             alloc,
@@ -18261,7 +18291,7 @@ pub const DB = struct {
             observed_ns_per_sequence,
             catch_up_start_sequence,
             converged_sequence,
-            elapsedSince(catch_up_start_ns),
+            self.repairPacingElapsedNs(catch_up_start_ns),
         );
         if (initial_catch_up.yielded) {
             if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
@@ -18332,7 +18362,7 @@ pub const DB = struct {
                 .target_sequence = convergence_target,
             });
             catch_up_start_sequence = converged_sequence;
-            catch_up_start_ns = monotonicTimeNs();
+            catch_up_start_ns = self.repairPacingNowNs();
             const convergence_catch_up = try self.catchUpShadowReplacementUntil(
                 alloc,
                 &shadow_manager,
@@ -18350,7 +18380,7 @@ pub const DB = struct {
                 observed_ns_per_sequence,
                 catch_up_start_sequence,
                 converged_sequence,
-                elapsedSince(catch_up_start_ns),
+                self.repairPacingElapsedNs(catch_up_start_ns),
             );
             if (convergence_catch_up.yielded) {
                 if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
@@ -18469,7 +18499,7 @@ pub const DB = struct {
             cfg.name,
         );
         defer structural_guard.deinit();
-        const activation_started_ns = monotonicTimeNs();
+        const activation_started_ns = self.repairPacingNowNs();
         const activation_deadline_ns = activation_started_ns +| max_activation_pause_ns;
         if (!structural_guard.acquireCatalogBarrierUntil(activation_deadline_ns)) {
             return error.RepairActivationBudgetExhausted;
@@ -18485,7 +18515,7 @@ pub const DB = struct {
         var activation_metric_recorded = false;
         defer if (!activation_metric_recorded) {
             if (self.core.index_manager.resource_manager) |manager| {
-                manager.recordIndexRepairActivation(monotonicTimeNs() -| activation_started_ns, max_activation_pause_ns);
+                manager.recordIndexRepairActivation(self.repairPacingNowNs() -| activation_started_ns, max_activation_pause_ns);
             }
         };
         try checkArtifactRepairCancelled(options);
@@ -18503,7 +18533,7 @@ pub const DB = struct {
             return error.RepairActivationBudgetExhausted;
         }
         const activation_replay_deadline_ns = repairActivationReplayDeadline(
-            monotonicTimeNs(),
+            self.repairPacingNowNs(),
             activation_deadline_ns,
             max_activation_pause_ns,
         ) orelse return error.RepairActivationBudgetExhausted;
@@ -18568,12 +18598,12 @@ pub const DB = struct {
         );
         try checkArtifactRepairCancelled(options);
         try checkArtifactRepairActivationOwner(options);
-        try ensureRepairActivationDeadline(activation_deadline_ns);
+        try self.ensureRepairActivationDeadline(activation_deadline_ns);
         if (durable_repair_id) |repair_id| try self.validateIndexRepairActivationState(alloc, repair_id, options.owner_epoch);
-        try ensureRepairActivationDeadline(activation_deadline_ns);
+        try self.ensureRepairActivationDeadline(activation_deadline_ns);
         const previous_active_pointer = try self.core.index_manager.captureActiveIndexRootPointer(cfg.name);
         defer if (previous_active_pointer) |value| self.core.index_manager.alloc.free(value);
-        try ensureRepairActivationDeadline(activation_deadline_ns);
+        try self.ensureRepairActivationDeadline(activation_deadline_ns);
         if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
             .phase = .activating,
             .candidate_applied_sequence = reached_target,
@@ -18582,7 +18612,7 @@ pub const DB = struct {
             .previous_active_relative_path = previous_active_pointer,
             .replace_previous_active_path = true,
         });
-        try ensureRepairActivationDeadline(activation_deadline_ns);
+        try self.ensureRepairActivationDeadline(activation_deadline_ns);
 
         // Final replay may advance beyond the preliminary ready marker. Make
         // readiness describe the exact durable generation installed by the
@@ -18597,7 +18627,7 @@ pub const DB = struct {
                 .applied_sequence = reached_target,
                 .baseline = guard,
             });
-            try ensureRepairActivationDeadline(activation_deadline_ns);
+            try self.ensureRepairActivationDeadline(activation_deadline_ns);
         };
         try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
             self.core.index_manager.generation_storage,
@@ -18609,7 +18639,7 @@ pub const DB = struct {
             reached_target,
             try shadowIndexPhysicalFormat(&shadow_manager, index_ref),
         );
-        try ensureRepairActivationDeadline(activation_deadline_ns);
+        try self.ensureRepairActivationDeadline(activation_deadline_ns);
         const manifest_sequence = try index_generation_manifest.validateReadyWithStorage(
             self.core.index_manager.generation_storage,
             alloc,
@@ -18619,7 +18649,7 @@ pub const DB = struct {
             types.indexConfigHash(cfg),
         );
         if (manifest_sequence != reached_target) return error.IndexGenerationManifestMismatch;
-        try ensureRepairActivationDeadline(activation_deadline_ns);
+        try self.ensureRepairActivationDeadline(activation_deadline_ns);
 
         if (cfg.kind == .algebraic) {
             // Certify this physical projection only after the final replay has
@@ -18627,7 +18657,7 @@ pub const DB = struct {
             // namespace, so a crash before pointer publication cannot release
             // the active generation's lifecycle gate.
             try shadow_manager.persistAlgebraicProjectionConfigReady(self.core.store, cfg.name);
-            try ensureRepairActivationDeadline(activation_deadline_ns);
+            try self.ensureRepairActivationDeadline(activation_deadline_ns);
         }
 
         // Transfer the already-open runtime for every index family. Pointer
@@ -18676,7 +18706,7 @@ pub const DB = struct {
         // actual service pause before releasing it.
         // Generation teardown and other post-commit work are measured
         // separately and cannot produce false pause-budget alarms.
-        const activation_pause_ns = monotonicTimeNs() -| activation_started_ns;
+        const activation_pause_ns = self.repairPacingNowNs() -| activation_started_ns;
         self.core.unlockApply();
         apply_lock_held = false;
         structural_guard.releaseCatalogBarrier();
@@ -18773,7 +18803,7 @@ pub const DB = struct {
                 }
             }
             if (deadline_ns) |deadline| {
-                if (monotonicTimeNs() >= deadline) return error.RepairActivationBudgetExhausted;
+                if (self.repairPacingNowNs() >= deadline) return error.RepairActivationBudgetExhausted;
             }
             var replay_ctx = ReplayApplyContextBatch{
                 .batch = &batch_ctx,
@@ -18786,7 +18816,7 @@ pub const DB = struct {
                 derived_worker.catch_up_max_records_per_window_default;
             var max_items_per_window: usize = 0;
             if (deadline_ns) |deadline| {
-                const now = monotonicTimeNs();
+                const now = self.repairPacingNowNs();
                 if (now >= deadline) return error.CatchUpDeadlineExceeded;
                 const per_sequence_ns = @max(@as(u64, 1), observed_ns_per_sequence);
                 const affordable_sequences = (deadline - now) / per_sequence_ns;
@@ -18820,6 +18850,7 @@ pub const DB = struct {
                     // applied sequence while budget remains.
                     .max_windows_per_call = if (cooperative) 1 else 0,
                     .deadline_ns = deadline_ns,
+                    .clock = self.repairPacingClock(),
                 },
             );
             if (index_ref.kind == .algebraic) {
@@ -18842,7 +18873,7 @@ pub const DB = struct {
                 return .{ .applied_sequence = applied, .yielded = true };
             }
             if (deadline_ns) |deadline| {
-                if (applied < target_sequence and monotonicTimeNs() >= deadline) {
+                if (applied < target_sequence and self.repairPacingNowNs() >= deadline) {
                     return error.RepairActivationBudgetExhausted;
                 }
             }
@@ -47812,7 +47843,7 @@ pub const DB = struct {
 
         var spins: usize = 0;
         while (self.core.index_manager.published_dense_admission.load(.acquire) & published_dense_reader_mask != 0) : (spins += 1) {
-            if (monotonicTimeNs() >= deadline_ns) {
+            if (self.repairPacingNowNs() >= deadline_ns) {
                 const timed_out = self.core.index_manager.published_dense_admission.fetchAnd(published_dense_reader_mask, .release);
                 std.debug.assert(timed_out & published_dense_catalog_closed != 0);
                 return false;
@@ -47878,7 +47909,7 @@ pub const DB = struct {
     fn lockApplyUntil(self: *DB, deadline_ns: u64) bool {
         var spins: usize = 0;
         while (!self.core.tryLockApplyExclusive()) : (spins += 1) {
-            if (monotonicTimeNs() >= deadline_ns) return false;
+            if (self.repairPacingNowNs() >= deadline_ns) return false;
             if (spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
@@ -47888,8 +47919,8 @@ pub const DB = struct {
         return true;
     }
 
-    fn ensureRepairActivationDeadline(deadline_ns: u64) !void {
-        if (monotonicTimeNs() >= deadline_ns) return error.RepairActivationBudgetExhausted;
+    fn ensureRepairActivationDeadline(self: *const DB, deadline_ns: u64) !void {
+        if (self.repairPacingNowNs() >= deadline_ns) return error.RepairActivationBudgetExhausted;
     }
 
     fn denseDocKeyCallback(
@@ -109509,6 +109540,57 @@ test "db repair activation admission is time and sequence bounded" {
         @as(?u64, null),
         DB.repairActivationReplayDeadline(998 * std.time.ns_per_ms, deadline, 10 * std.time.ns_per_ms),
     );
+}
+
+test "repair activation pacing decisions follow the injected clock, not wall time" {
+    // repairActivationAdmissible/observeRepairCatchUpCost are pure functions
+    // of their numeric inputs (covered above); this proves the *clock reads*
+    // that feed those inputs and the activation deadline checks
+    // (repairPacingNowNs/ensureRepairActivationDeadline) follow whatever
+    // clock DB was given, not the real OS monotonic clock. Under VOPR that
+    // clock is the deterministic std.Io clock VOPR controls; here it is a
+    // ManualClock, frozen until this test advances it explicitly.
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var manual = platform_clock.ManualClock{};
+    manual.setRealtimeNs(1_000 * std.time.ns_per_ms);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .repair_pacing_clock = manual.clock() });
+    defer db.close();
+
+    // repairPacingNowNs reads exactly the injected clock's value. The real
+    // OS monotonic clock has certainly advanced past 1_000ms-since-its-own-
+    // epoch by the time this test runs; DB must not see that.
+    try std.testing.expectEqual(@as(u64, 1_000 * std.time.ns_per_ms), db.repairPacingNowNs());
+
+    const activation_deadline_ns: u64 = 1_500 * std.time.ns_per_ms;
+
+    // Scenario A: the injected clock has not reached the activation
+    // deadline. The budget is still admissible.
+    try db.ensureRepairActivationDeadline(activation_deadline_ns);
+
+    // Scenario B: advance only the injected clock past the deadline. The
+    // decision flips purely because the controlled clock crossed the
+    // boundary, reproducibly, with no dependence on real elapsed time.
+    manual.setRealtimeNs(activation_deadline_ns + 1);
+    try std.testing.expectError(
+        error.RepairActivationBudgetExhausted,
+        db.ensureRepairActivationDeadline(activation_deadline_ns),
+    );
+
+    // The flip is exact and reproducible at the boundary itself: >= trips,
+    // one nanosecond short does not.
+    manual.setRealtimeNs(activation_deadline_ns);
+    try std.testing.expectError(
+        error.RepairActivationBudgetExhausted,
+        db.ensureRepairActivationDeadline(activation_deadline_ns),
+    );
+    manual.setRealtimeNs(activation_deadline_ns - 1);
+    try db.ensureRepairActivationDeadline(activation_deadline_ns);
 }
 
 test "db automatic dense repair bootstraps missing coverage metadata" {
