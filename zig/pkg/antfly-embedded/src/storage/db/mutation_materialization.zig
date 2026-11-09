@@ -3509,7 +3509,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const mutations = try self.mutationsAlloc(self.alloc);
                 defer self.alloc.free(mutations);
                 if (mutations.len != 0) try view.putIndexCatalog(scope, mutations);
-                try apply_state.contributeProgressTxn(view, self.progress);
+                _ = try apply_state.contributeProgressTxn(view, self.progress);
             }
 
             /// `commit_participant.Participant.stage` is called BEFORE the
@@ -3749,7 +3749,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (forward_mutations.len != 0) try view.putIndexCatalog(self.forward_scope, forward_mutations);
                 const reverse_mutations = self.publication.reverseMutations();
                 if (reverse_mutations.len != 0) try view.putIndexCatalog(self.reverse_scope, reverse_mutations);
-                try apply_state.contributeProgressTxn(view, self.progress);
+                _ = try apply_state.contributeProgressTxn(view, self.progress);
             }
 
             /// Call only once the host transaction's commit has actually
@@ -4040,7 +4040,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
                 const mutations = self.publication.pendingMutations();
                 if (mutations.len != 0) try view.putIndexCatalog(self.scope, mutations);
-                try apply_state.contributeProgressTxn(view, self.progress);
+                _ = try apply_state.contributeProgressTxn(view, self.progress);
                 if (self.coverage_plan) |*plan| try plan.stage(view);
             }
 
@@ -4229,7 +4229,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try view.putIndexCatalog(self.scope, converted);
                 }
                 try self.index_manager.writeDenseVectorMappingForInlinePublicationTxn(view, self.index_name, self.doc_key, self.vector_id, self.vector);
-                try apply_state.contributeProgressTxn(view, self.progress);
+                _ = try apply_state.contributeProgressTxn(view, self.progress);
                 if (self.coverage_plan) |*plan| try plan.stage(view);
             }
 
@@ -4388,7 +4388,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     self.apply_guard = null;
                 }
                 try self.entry.index.applyBatchWithOptionsView(view, self.batch, self.options);
-                try apply_state.contributeProgressTxn(view, self.progress);
+                _ = try apply_state.contributeProgressTxn(view, self.progress);
             }
 
             /// `commit_participant.Participant.stage` runs before the

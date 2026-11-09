@@ -34,6 +34,8 @@ const io_threaded_runtime_mod = @import("io_threaded_runtime.zig");
 
 pub const ApplyFn = runtime_types.ApplyFn;
 pub const PersistFn = runtime_types.PersistFn;
+pub const PersistBatchFn = runtime_types.PersistBatchFn;
+pub const PersistSnapshotArg = runtime_types.PersistSnapshotArg;
 pub const TruncateFn = runtime_types.TruncateFn;
 pub const BeginCatchUpFn = runtime_types.BeginCatchUpFn;
 pub const FinishCatchUpFn = runtime_types.FinishCatchUpFn;
@@ -214,11 +216,12 @@ pub fn init(
     applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*background_runtime_mod.BackendRuntime,
+    persist_batch_fn: ?runtime_types.PersistBatchFn,
 ) !Executor {
     try runtime_backend.ensureExecutorBackendAvailable(config.backend);
     return switch (config.backend) {
-        .manual => try initManual(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager),
-        .io_threaded => try initIoThreaded(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, backend_runtime),
+        .manual => try initManual(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, persist_batch_fn),
+        .io_threaded => try initIoThreaded(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, backend_runtime, persist_batch_fn),
     };
 }
 
@@ -549,7 +552,14 @@ fn initManual(
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
     applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
+    persist_batch_fn: ?runtime_types.PersistBatchFn,
 ) !Executor {
+    // ManualRuntime interleaves each worker's own persist call with that
+    // worker's catch-up work (see `waitForIndexes`/`waitForAll` above), so
+    // there is no "collect every consumer, then flush once" point to hook
+    // a batch variant into the way `io_threaded_runtime.zig`'s wait loops
+    // have -- unused here on purpose.
+    _ = persist_batch_fn;
     const runtime = try alloc.create(ManualRuntime);
     errdefer alloc.destroy(runtime);
     runtime.* = .{
@@ -717,6 +727,7 @@ fn initIoThreaded(
     applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*background_runtime_mod.BackendRuntime,
+    persist_batch_fn: ?runtime_types.PersistBatchFn,
 ) !Executor {
     if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
 
@@ -724,10 +735,10 @@ fn initIoThreaded(
     errdefer alloc.destroy(runtime);
     if (backend_runtime) |bg| {
         const io_impl = bg.io_impl orelse return error.MissingBackendRuntimeIo;
-        runtime.* = io_threaded_runtime_mod.DerivedRuntime.initBorrowed(alloc, io_impl, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
+        runtime.* = io_threaded_runtime_mod.DerivedRuntime.initBorrowed(alloc, io_impl, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, persist_batch_fn);
         runtime.scheduler = try bg.maintenanceScheduler();
     } else {
-        runtime.* = try io_threaded_runtime_mod.DerivedRuntime.init(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
+        runtime.* = try io_threaded_runtime_mod.DerivedRuntime.init(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, persist_batch_fn);
     }
     return .{
         .ptr = runtime,

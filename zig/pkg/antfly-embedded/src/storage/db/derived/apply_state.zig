@@ -293,7 +293,20 @@ fn readProgressInt(raw: []const u8, pos: *usize, comptime T: type) T {
 /// (see `commit_participant.View`) — `contributeProgress` below is a thin
 /// convenience wrapper around exactly this for callers that do not yet have
 /// an open plan/batch of their own.
-pub fn contributeProgressTxn(txn: anytype, progress: Progress) !void {
+/// Returns whether this call actually wrote a new record: `false` means
+/// the durable record already covered `progress` exactly (byte-for-byte,
+/// after the never-regress merge below) and `put` was skipped. A caller
+/// that is itself free to skip its whole commit when every consumer it
+/// touches turns out to be a no-op -- `flushPendingAppliedSequencesLocked`'s
+/// forced-flush path, in particular, which can otherwise race an inline
+/// publication that already wrote this exact progress inside the primary
+/// write's own commit (WS4 phase 2's `contributeProgressTxn` call from
+/// `mutation_materialization.zig`) -- uses this to avoid a redundant
+/// native commit for progress that is already durable. A caller that is
+/// itself already inside a commit it cannot skip (every other caller here)
+/// is unaffected: writing the identical bytes again is harmless, just as
+/// it always was before this return value existed.
+pub fn contributeProgressTxn(txn: anytype, progress: Progress) !bool {
     var key_buf: [256]u8 = undefined;
     const key = try progressKeyV2(&key_buf, progress.consumer);
     var mutable_txn = txn;
@@ -320,7 +333,13 @@ pub fn contributeProgressTxn(txn: anytype, progress: Progress) !void {
         .published_count = progress.published_count,
         .lsm_wal_checkpointed_through = progress.lsm_wal_checkpointed_through,
     });
+    // Byte-exact, not just a sequence comparison: an identity field
+    // (status/generation/config_hash/published_count/lsm_wal_checkpointed_
+    // through) can change without the sequence advancing, and that is
+    // still a real write this consumer's own reader needs to observe.
+    if (existing != null and std.mem.eql(u8, &encodeProgressRecord(existing.?), &encoded)) return false;
     try mutable_txn.put(key, &encoded);
+    return true;
 }
 
 /// The one authoritative progress commit for a publication: every consumer
@@ -377,8 +396,26 @@ fn contributeProgressWithOptions(alloc: Allocator, store: anytype, updates: []co
     defer runtime.deinit();
     var batch = try runtime.store.beginBatchWithOptions(options);
     errdefer batch.abort();
-    for (updates) |progress| try contributeProgressTxn(&batch, progress);
+    // `status_writes` are explicit, caller-requested writes piggybacked
+    // onto this commit (not merge-checked the way `Progress` is) -- their
+    // mere presence means this call must commit regardless of whether any
+    // `Progress` update turns out to be a no-op.
+    var any_write = status_writes.len != 0;
+    for (updates) |progress| any_write = try contributeProgressTxn(&batch, progress) or any_write;
     for (status_writes) |write| try batch.put(write.key, write.value);
+    // Every consumer this call touched was already covered by its durable
+    // progress record (most commonly: an inline publication already wrote
+    // the identical record inside the primary write's own commit -- see
+    // `contributeProgressTxn`'s doc comment). Committing an empty batch
+    // would still be correct (the backend has nothing pending to apply),
+    // but it is not free: it still forms a group, in the group-commit
+    // queue sense, and on the Lite backend specifically still leads one if
+    // nothing else is queued to ride along with. Abort instead so a
+    // forced flush whose target is already durable costs nothing.
+    if (!any_write) {
+        batch.abort();
+        return;
+    }
     try batch.commit();
     _ = progress_commit_count.fetchAdd(1, .monotonic);
 }
@@ -597,7 +634,7 @@ fn applyProgressUpdateTxn(txn: anytype, update: AppliedSequenceUpdate, mode: Met
     next = next.withCheckpoint(checkpoint);
     if (mode == .replace or invalidatesCompletion(previous_checkpoint, checkpoint)) try artifact_projection_epoch.revoke(txn);
     if (mode == .replace) try clearPartialReplayCursorTxn(txn, update.index_name);
-    try contributeProgressTxn(txn, .{
+    _ = try contributeProgressTxn(txn, .{
         .consumer = update.index_name,
         .sequence = next.applied_sequence,
         .status = next.status,
