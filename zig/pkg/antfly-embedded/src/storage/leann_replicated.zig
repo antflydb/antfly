@@ -965,6 +965,10 @@ test "leann replicated state: derived replay plus committed records converge" {
     var res2 = try leader.search(alloc, .{ .query = &vecs[77], .k = 3, .exclude_ids = &.{78} });
     defer res2.deinit();
     for (res2.items.items) |item| try testing.expect(item.vector_id != 78);
+    var filtered = try leader.search(alloc, .{ .query = &vecs[77], .k = 3, .filter_ids = &.{ 78, 79, 80, 80 }, .exclude_ids = &.{ 78, 78 } });
+    defer filtered.deinit();
+    try testing.expectEqual(@as(usize, 2), filtered.items.items.len);
+    for (filtered.items.items) |item| try testing.expect(item.vector_id == 79 or item.vector_id == 80);
 
     // Deletes replicate too; persistence round-trips.
     try leader.noteWrites(&[_]TestItem{}, &.{ 10, 11 });
