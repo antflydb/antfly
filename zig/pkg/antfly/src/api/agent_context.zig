@@ -42,8 +42,23 @@ fn positive(value: anytype) !usize {
 pub const Prepared = struct { messages: []const g.ChatMessage, next: context.State, event: api.AgentContextEvent };
 
 pub fn prepare(a: std.mem.Allocator, runner: anytype, config: api.AgentContextManagement, chain: []const g.ChainLink, messages: []const g.ChatMessage, previous: context.State, control: context.preparation.Control) !Prepared {
+    return prepareWithSources(a, runner, config, chain, messages, previous, control, &.{});
+}
+
+pub fn prepareWithSources(a: std.mem.Allocator, runner: anytype, config: api.AgentContextManagement, chain: []const g.ChainLink, messages: []const g.ChatMessage, previous: context.State, control: context.preparation.Control, explicit: []const context.SourceBinding) !Prepared {
     const started = time.monotonicNs();
-    const result = try context.prepare(a, runner, try configFromPublic(a, config), chain, messages, previous, control);
+    var resolved = try configFromPublic(a, config);
+    var sources: std.ArrayListUnmanaged(context.SourceBinding) = .empty;
+    for (try toolSources(a, messages)) |binding| {
+        var overridden = false;
+        for (explicit) |owner| if (std.mem.eql(u8, owner.tool_call_id, binding.tool_call_id)) {
+            overridden = true;
+        };
+        if (!overridden) try sources.append(a, binding);
+    }
+    try sources.appendSlice(a, explicit);
+    resolved.sources = sources.items;
+    const result = try context.prepare(a, runner, resolved, chain, messages, previous, control);
     const encoded = try std.json.Stringify.valueAlloc(a, .{
         .diagnostics = result.event.diagnostics,
         .counting_method = result.event.counting_method,
@@ -67,20 +82,13 @@ pub fn completedEvidence(a: std.mem.Allocator, system: g.ChatMessage, evidence: 
     });
 }
 
-pub fn requireHitIds(a: std.mem.Allocator, config: api.AgentContextManagement, hits: []const api.QueryHit, source: []const g.ChatMessage, messages: []const g.ChatMessage) !void {
-    if (config.mode != null and !std.mem.eql(u8, config.mode.?, "compact")) return;
-    for (hits) |hit| {
-        if (try hasIdentifier(a, source, hit._id) and !try hasIdentifier(a, messages, hit._id)) return error.ContextSummaryMissingCitation;
-    }
-}
-
 pub const Failure = struct { status: u16, message: []const u8 };
 pub fn failure(err: anyerror) ?Failure {
     return switch (err) {
         error.InvalidContextRequest => .{ .status = 400, .message = "context_management requires positive, bounded input/output budgets within the destination and summarizer context windows" },
         error.ContextOutputReservationTooSmall => .{ .status = 400, .message = "increase context_management.reserved_output_tokens to cover every destination generator output limit" },
         error.UnsupportedContextMedia, error.UnsupportedContextHistoryMetadata => .{ .status = 400, .message = "agent context management requires text-only public history; opaque provider metadata cannot be imported through this agent API" },
-        error.AgentContextBudgetExceeded, error.InsufficientContextReduction => .{ .status = 413, .message = "protected context and validated memory exceed target_input_tokens; increase the destination budget or reduce evidence/history" },
+        error.AgentContextBudgetExceeded, error.InsufficientContextReduction, error.MemoryLimitExceeded => .{ .status = 413, .message = "protected context and validated memory exceed target_input_tokens; increase the destination budget or reduce evidence/history" },
         error.CompactionUnitTooLarge => .{ .status = 413, .message = "one complete exchange plus memory, instructions and schema exceeds the summarizer input budget; increase summarizer_context_window_tokens or reduce tool output" },
         error.ContextCompactionBatchLimitExceeded => .{ .status = 422, .message = "max_summary_batches exhausted before context fit; increase the bounded limit or reduce history" },
         error.InvalidContextSummary, error.ContextSummaryMissingCitation, error.ContextSummaryTruncated => .{ .status = 502, .message = "summarizer returned invalid, incomplete or unattributed memory; authoritative history was preserved; select a suitable summarizer or increase summary_output_tokens" },
@@ -103,30 +111,62 @@ pub fn publicHistory(a: std.mem.Allocator, messages: ?[]const @import("antfly_ge
     return out;
 }
 
-/// Compare identifier tokens, including JSON-escaped identifiers inside a
-/// rendered evidence record. E1 must not be satisfied by E10.
-pub fn hasIdentifier(a: std.mem.Allocator, messages: []const g.ChatMessage, id: []const u8) !bool {
-    if (id.len == 0) return false;
-    var needle = id;
-    for (0..3) |_| {
-        for (messages) |message| if (message.content) |content| {
-            if (content != .text) continue;
-            var start: usize = 0;
-            while (std.mem.indexOfPos(u8, content.text, start, needle)) |index| {
-                const end = index + needle.len;
-                const left = index == 0 or !identifierByte(content.text[index - 1]);
-                const right = end == content.text.len or !identifierByte(content.text[end]);
-                if (left and right) return true;
-                start = end;
-            }
-        };
-        const encoded = try std.json.Stringify.valueAlloc(a, needle, .{});
-        const next = encoded[1 .. encoded.len - 1];
-        if (std.mem.eql(u8, needle, next)) break;
-        needle = next;
+/// Request-owned exact IDs. Comparisons and deduplication use complete UTF-8
+/// strings; punctuation and escaping never define identity boundaries.
+pub const SourceIds = struct {
+    items: std.ArrayListUnmanaged([]const u8) = .empty,
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    bytes: usize = 0,
+    pub fn add(self: *@This(), a: std.mem.Allocator, id: []const u8) !void {
+        if (id.len == 0 or self.seen.contains(id)) return;
+        const limits = context.planner.Limits{};
+        if (self.items.items.len >= limits.max_source_ids or id.len > limits.max_source_id_bytes -| self.bytes) return error.MemoryLimitExceeded;
+        const owned = try a.dupe(u8, id);
+        try self.seen.put(a, owned, {});
+        try self.items.append(a, owned);
+        self.bytes += id.len;
     }
-    return false;
+};
+
+pub fn hitIds(a: std.mem.Allocator, hits: []const api.QueryHit) ![]const []const u8 {
+    var ids = SourceIds{};
+    for (hits) |hit| try ids.add(a, hit._id);
+    return ids.items.toOwnedSlice(a);
 }
-fn identifierByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_';
+
+/// Read only server-authored result envelope fields. Never walk `_source`,
+/// document text, argument strings or arbitrary nested user data looking for
+/// something that resembles a citation.
+fn toolSources(a: std.mem.Allocator, messages: []const g.ChatMessage) ![]const context.SourceBinding {
+    var bindings: std.ArrayListUnmanaged(context.SourceBinding) = .empty;
+    for (messages) |message| {
+        if (message.role != .tool or message.tool_call_id == null or message.content == null or message.content.? != .text) continue;
+        const payload = std.json.parseFromSliceLeaky(std.json.Value, a, message.content.?.text, .{}) catch continue;
+        if (payload != .object) continue;
+        var ids = SourceIds{};
+        if (payload.object.get("hits")) |hits| if (hits == .array) for (hits.array.items) |hit| {
+            if (hit == .object) if (hit.object.get("_id")) |id| if (id == .string) try ids.add(a, id.string);
+        };
+        if (payload.object.get("current")) |hit| if (hit == .object) if (hit.object.get("_id")) |id| if (id == .string) try ids.add(a, id.string);
+        if (payload.object.get("neighbors")) |nodes| if (nodes == .array) for (nodes.array.items) |node| {
+            if (node == .object) if (node.object.get("key")) |id| if (id == .string) try ids.add(a, id.string);
+        };
+        if (payload.object.get("url")) |url| if (url == .string) try ids.add(a, url.string);
+        if (ids.items.items.len > 0) try bindings.append(a, .{ .tool_call_id = message.tool_call_id.?, .source_ids = try ids.items.toOwnedSlice(a) });
+    }
+    return bindings.toOwnedSlice(a);
+}
+
+test "source collection reads exact envelope IDs and ignores document prose and nested impostors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const messages = [_]g.ChatMessage{.{ .role = .tool, .tool_call_id = "c", .content = .{ .text =
+        \\{"hits":[{"_id":"doc:1","_source":{"_id":"invented","body":"doc:missing","hits":[{"_id":"also-invented"}]}},{"_id":"doc:1-extra"},{"_id":"doc:1"},{"_id":"doc:\"quoted\""},{"_id":"資料"}]}
+    } }};
+    const bindings = try toolSources(a, &messages);
+    try std.testing.expectEqual(@as(usize, 1), bindings.len);
+    const expected = [_][]const u8{ "doc:1", "doc:1-extra", "doc:\"quoted\"", "資料" };
+    try std.testing.expectEqual(@as(usize, expected.len), bindings[0].source_ids.len);
+    for (expected, bindings[0].source_ids) |want, got| try std.testing.expectEqualStrings(want, got);
 }

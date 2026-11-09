@@ -71,7 +71,12 @@ Each summary batch includes previous memory and one complete exchange; an
 exchange is never split to fit. Every completed tool call must retain its original
 ID and name. Small tool results are copied verbatim. Pipeline retrieval and
 research evidence is represented as a completed `assembled_evidence` exchange;
-citation identifiers are checked before a candidate is used. Memory is framed as
+source identities are carried separately from document text. Summary contract v2
+requires each tool evidence entry to return its exact `source_ids` array. Missing,
+invented, duplicate, or cross-tool identities reject the candidate before dispatch;
+mentioning an ID in prose does not satisfy the contract. IDs remain opaque strings,
+including punctuation, URLs, Unicode, and JSON escapes. Existing v1 checkpoints
+without this optional field remain readable; new checkpoints preserve its presence. Memory is framed as
 untrusted data in user context and cannot authorize tools or change instructions.
 These checks protect structure and attribution; they cannot prove factual quality.
 Evaluate retention of task-specific facts and downstream answer quality when

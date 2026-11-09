@@ -52,7 +52,7 @@ pub const State = struct {
     memory: ?p.StructuredMemory = null,
 };
 pub const Diagnostics = struct {
-    contract_version: usize = 1,
+    contract_version: usize = p.summary_contract_version,
     original_input_tokens: usize = 0,
     effective_input_tokens: usize = 0,
     retained_messages: usize = 0,
@@ -189,7 +189,7 @@ const Fake = struct {
     fail: bool = false,
     cancelled: bool = false,
     cancel_after_output: bool = false,
-    summary: []const u8 = "{\"conversation\":\"deadline Friday; cite doc:42\",\"tool_evidence\":[{\"tool_call_id\":\"c1\",\"tool_name\":\"search\",\"facts\":\"doc:42 deadline Friday\"}],\"unresolved_tool_calls\":[]}",
+    summary: []const u8 = "{\"conversation\":\"deadline Friday; cite doc:42\",\"tool_evidence\":[{\"tool_call_id\":\"c1\",\"tool_name\":\"search\",\"facts\":\"doc:42 deadline Friday\",\"source_ids\":[\"doc:42\"]}],\"unresolved_tool_calls\":[]}",
     fn count(_: *anyopaque, input: p.CountInput) !usize {
         var total: usize = if (input.rendered_memory) |m| m.len else 0;
         for (input.messages, input.keep) |message, keep| if (keep) {
@@ -223,6 +223,7 @@ fn history(a: std.mem.Allocator) ![]const p.MessageView {
         .{ .role = .tool, .tool_call_id = "c1" },
         .{ .role = .assistant, .content = "Need to confirm" },
     });
+    messages[3].source_ids = &.{"doc:42"};
     messages[3].content = try a.alloc(u8, 3000);
     @memset(@constCast(messages[3].content), 'x');
     return messages;
@@ -332,17 +333,24 @@ test "repeated agent compaction preserves previous evidence and validates cumula
     const source = try history(a);
     var first_runner = Fake{};
     const first = try first_runner.prepare(a, source, .{}, .compact, 1000);
+    // Provenance is part of authoritative history even when rendered text is unchanged.
+    const altered = try a.dupe(p.MessageView, source);
+    for (altered) |*message| if (message.source_ids != null) {
+        message.source_ids = &.{"doc:42-alias"};
+        break;
+    };
+    try std.testing.expectError(error.CheckpointHistoryMismatch, first_runner.prepare(a, altered, first.next, .compact, 1000));
     const more = try a.alloc(u8, 3000);
     @memset(more, 'y');
     const continued = try std.mem.concat(a, p.MessageView, &.{ source, &.{
         .{ .role = .assistant, .tool_calls = &.{.{ .id = "c2", .name = "fetch" }} },
-        .{ .role = .tool, .tool_call_id = "c2", .content = more },
+        .{ .role = .tool, .tool_call_id = "c2", .content = more, .source_ids = &.{"doc:43"} },
         .{ .role = .assistant, .content = "current" },
     } });
     const Repeat = struct {
         fn run(_: *anyopaque, _: std.mem.Allocator, frame: []const u8, _: usize) !Summary {
             return .{ .text = if (std.mem.indexOf(u8, frame, "\"id\":\"c2\"") != null)
-                "{\"conversation\":\"doc:42 deadline Friday; fetched confirmation\",\"tool_evidence\":[{\"tool_call_id\":\"c1\",\"tool_name\":\"search\",\"facts\":\"doc:42 deadline Friday\"},{\"tool_call_id\":\"c2\",\"tool_name\":\"fetch\",\"facts\":\"confirmed Friday\"}],\"unresolved_tool_calls\":[]}"
+                "{\"conversation\":\"doc:42 deadline Friday; fetched confirmation\",\"tool_evidence\":[{\"tool_call_id\":\"c1\",\"tool_name\":\"search\",\"facts\":\"doc:42 deadline Friday\",\"source_ids\":[\"doc:42\"]},{\"tool_call_id\":\"c2\",\"tool_name\":\"fetch\",\"facts\":\"confirmed Friday\",\"source_ids\":[\"doc:43\"]}],\"unresolved_tool_calls\":[]}"
             else
                 (Fake{}).summary };
         }

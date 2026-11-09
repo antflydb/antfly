@@ -1621,7 +1621,8 @@ fn executeInternal(
 
     if (if (!model_directed) generation_cfg else null) |cfg| {
         const exec = generation_runner orelse return error.UnsupportedRetrievalAgentRequest;
-        var messages = try buildGenerationMessages(arena, request.query, hit_list.items, cfg);
+        var selected_source_ids: []const []const u8 = &.{};
+        var messages = try buildGenerationMessagesWithSources(arena, request.query, hit_list.items, cfg, if (request.context_management != null) &selected_source_ids else null);
         var generation_calls: i64 = 1;
         if (request.context_management) |config| {
             // The assembled retrieved context is data from completed retrieval.
@@ -1632,8 +1633,7 @@ fn executeInternal(
             const summary_limit = config.max_summary_batches orelse 8;
             if (summary_limit < 1 or summary_limit > 32) return error.InvalidContextRequest;
             var budget = AgentGenerationBudget{ .runner = exec, .used = 1, .limit = exec_options.budget.max_model_calls orelse (summary_limit + 1) };
-            const prepared = try agent_context.prepare(arena, &budget, config, cfg.chain, source, .{}, exec.control());
-            try agent_context.requireHitIds(arena, config, hit_list.items, source, prepared.messages);
+            const prepared = try agent_context.prepareWithSources(arena, &budget, config, cfg.chain, source, .{}, exec.control(), &.{.{ .tool_call_id = "antfly_context_evidence", .source_ids = selected_source_ids }});
             messages = prepared.messages;
             generation_calls = budget.used;
             try context_events.append(arena, prepared.event);
@@ -2180,7 +2180,6 @@ fn executeModelTools(
                 else => return err,
             };
             budget.reserved_destination_calls = 0;
-            try agent_context.requireHitIds(arena, config, hits.items, history.messages.items, prepared.messages);
             if ((prepared.event.diagnostics.compacted_messages orelse 0) > 0) {
                 // Reclaim the accumulated tool allowance only after validated
                 // preparation. Authoritative results stay in history/hits.
@@ -4171,6 +4170,16 @@ fn buildGenerationMessages(
     hits: []const QueryHit,
     cfg: ParsedGenerationConfig,
 ) ![]const generating.ChatMessage {
+    return buildGenerationMessagesWithSources(alloc, query, hits, cfg, null);
+}
+
+fn buildGenerationMessagesWithSources(
+    alloc: std.mem.Allocator,
+    query: []const u8,
+    hits: []const QueryHit,
+    cfg: ParsedGenerationConfig,
+    source_ids: ?*[]const []const u8,
+) ![]const generating.ChatMessage {
     const system_prompt = if (cfg.system_prompt) |prompt|
         prompt
     else if (cfg.generation_context) |context|
@@ -4184,6 +4193,7 @@ fn buildGenerationMessages(
     defer context_arena.deinit();
     const selected_hits = try selectHitsForGenerationContext(context_arena.allocator(), query, ordered_hits);
     try trimSelectedTreeBranches(context_arena.allocator(), selected_hits, ordered_hits);
+    if (source_ids) |out| out.* = try agent_context.hitIds(alloc, selected_hits);
     const documents_context = try buildGenerationDocumentsContext(alloc, query, selected_hits, cfg.document_renderer);
     defer alloc.free(documents_context);
 
@@ -12939,7 +12949,7 @@ test "retrieval agent context compacts pipeline evidence through independent gen
                 try std.testing.expectEqual(generating.Provider.anthropic, chain[0].generator.provider);
                 try std.testing.expect(chain[0].generator.tools_json == null);
                 return .{ .allocator = a, .finish_reason = .stop, .content = try a.dupe(u8,
-                    \\{"conversation":"doc:42 deadline Friday","tool_evidence":[{"tool_call_id":"antfly_context_evidence","tool_name":"assembled_evidence","facts":"doc:42 deadline Friday"}],"unresolved_tool_calls":[]}
+                    \\{"conversation":"doc:42 deadline Friday","tool_evidence":[{"tool_call_id":"antfly_context_evidence","tool_name":"assembled_evidence","facts":"doc:42 deadline Friday","source_ids":["doc:42"]}],"unresolved_tool_calls":[]}
                 ), .usage = .{ .input_tokens = 900, .output_tokens = 70 } };
             }
             self.generations += 1;
@@ -12997,17 +13007,6 @@ test "retrieval agent context absent and fitting policies avoid summarization" {
     }
 }
 
-test "retrieval agent context citation checks distinguish E1 from E10 and escaped identifiers" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const escaped_id = try std.json.Stringify.valueAlloc(a, "doc:\"quoted\"", .{});
-    const messages = [_]generating.ChatMessage{.{ .role = .user, .content = .{ .text = try std.fmt.allocPrint(a, "Evidence [E10] and {s}.", .{escaped_id}) } }};
-    try std.testing.expect(!try agent_context.hasIdentifier(a, &messages, "E1"));
-    try std.testing.expect(try agent_context.hasIdentifier(a, &messages, "E10"));
-    try std.testing.expect(try agent_context.hasIdentifier(a, &messages, "doc:\"quoted\""));
-}
-
 test "retrieval agent context compacts older tool exchanges before the next model call" {
     const Fake = struct {
         searches: usize = 0,
@@ -13025,7 +13024,7 @@ test "retrieval agent context compacts older tool exchanges before the next mode
             if (std.mem.eql(u8, chain[0].generator.model, "summary")) {
                 self.summaries += 1;
                 return .{ .allocator = a, .content = try a.dupe(u8,
-                    \\{"conversation":"doc:1 is due Friday","tool_evidence":[{"tool_call_id":"search-1","tool_name":"search","facts":"doc:1 is due Friday"}],"unresolved_tool_calls":[]}
+                    \\{"conversation":"doc:1 is due Friday","tool_evidence":[{"tool_call_id":"search-1","tool_name":"search","facts":"doc:1 is due Friday","source_ids":["doc:1"]}],"unresolved_tool_calls":[]}
                 ) };
             }
             if (self.searches < 2) {
@@ -13034,8 +13033,10 @@ test "retrieval agent context compacts older tool exchanges before the next mode
                 return .{ .allocator = a, .content = try a.dupe(u8, ""), .tool_calls = calls };
             }
             try std.testing.expect(self.summaries > 0);
-            try std.testing.expect(try agent_context.hasIdentifier(a, messages, "doc:1"));
-            try std.testing.expect(try agent_context.hasIdentifier(a, messages, "doc:2"));
+            const context_text = try std.json.Stringify.valueAlloc(a, messages, .{});
+            defer a.free(context_text);
+            try std.testing.expect(std.mem.indexOf(u8, context_text, "doc:1") != null);
+            try std.testing.expect(std.mem.indexOf(u8, context_text, "doc:2") != null);
             return .{ .allocator = a, .content = try a.dupe(u8, "doc:1 and doc:2 are due Friday") };
         }
     };
@@ -13061,5 +13062,48 @@ test "retrieval agent context compacts older tool exchanges before the next mode
         try std.testing.expectEqual(@as(usize, 2), fake.searches);
         try std.testing.expectEqual(@as(usize, 1), fake.summaries);
         try std.testing.expectEqual(@as(i64, 4), parsed.value.usage.?.llm_calls.?);
+    }
+}
+
+test "retrieval compaction validates exact structured source identities before destination dispatch" {
+    const Fake = struct {
+        ids: ?[]const u8,
+        generations: usize = 0,
+        fn query(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const text = try a.alloc(u8, 4000);
+            defer a.free(text);
+            @memset(text, 'x');
+            return .{ .json = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"status\":200,\"took\":1,\"hits\":{{\"hits\":[{{\"_id\":\"doc:1\",\"_score\":1,\"_source\":{{\"body\":\"{s}\"}}}},{{\"_id\":\"doc:1-extra\",\"_score\":1,\"_source\":{{\"body\":\"{s}\"}}}}]}}}}]}}", .{ text, text }) };
+        }
+        fn generate(raw: *anyopaque, a: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, chain[0].generator.model, "summary")) {
+                try std.testing.expect(std.mem.indexOf(u8, messages[1].content.?.text, "\"source_ids\":[\"doc:1\",\"doc:1-extra\"]") != null);
+                return .{ .allocator = a, .content = try std.fmt.allocPrint(a, "{{\"conversation\":\"doc:1 and doc:1-extra both appear in prose\",\"tool_evidence\":[{{\"tool_call_id\":\"antfly_context_evidence\",\"tool_name\":\"assembled_evidence\",\"facts\":\"doc:1 and doc:1-extra both appear in prose\"{s}{s}}}],\"unresolved_tool_calls\":[]}}", .{ if (self.ids != null) ",\"source_ids\":" else "", self.ids orelse "" }) };
+            }
+            self.generations += 1;
+            return .{ .allocator = a, .content = try a.dupe(u8, "answer") };
+        }
+    };
+    const cases = [_]struct { ids: ?[]const u8, err: ?anyerror }{
+        .{ .ids = null, .err = error.ContextSummaryMissingCitation },
+        .{ .ids = "[\"doc:1-extra\"]", .err = error.ContextSummaryMissingCitation },
+        .{ .ids = "[\"doc:1\",\"doc:1-extra\",\"invented\"]", .err = error.InvalidContextSummary },
+        .{ .ids = "[\"doc:1-extra\",\"doc:1-extra\"]", .err = error.InvalidContextSummary },
+        .{ .ids = "[\"doc:1\",\"doc:1-extra\"]", .err = null },
+    };
+    const body =
+        \\{"query":"deadline","queries":[{"table":"docs","full_text_search":{"match":"deadline"}}],"stream":false,"generator":{"provider":"antfly","model":"main","max_tokens":100},"steps":{"generation":{}},"context_management":{"context_window_tokens":4000,"target_input_tokens":2500,"reserved_output_tokens":1000,"summarizer_context_window_tokens":32000,"summarizer":{"provider":"openai","model":"summary"}}}
+    ;
+    for (cases) |case| {
+        var fake = Fake{ .ids = case.ids };
+        const result = executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
+        if (case.err) |err| {
+            try std.testing.expectError(err, result);
+            try std.testing.expectEqual(@as(usize, 0), fake.generations);
+        } else {
+            std.testing.allocator.free(try result);
+            try std.testing.expectEqual(@as(usize, 1), fake.generations);
+        }
     }
 }

@@ -47,3 +47,30 @@ func TestContextManagementKeepRecentTurnsPresence(t *testing.T) {
 		})
 	}
 }
+
+func TestContextEvidenceSourceIdentityPresence(t *testing.T) {
+	for _, raw := range []string{
+		`{"tool_call_id":"c1","tool_name":"search","facts":"fact"}`,
+		`{"tool_call_id":"c1","tool_name":"search","facts":"fact","source_ids":[]}`,
+		`{"tool_call_id":"c1","tool_name":"search","facts":"fact","source_ids":["doc:1","doc:1-extra","quoted\"id","世界"]}`,
+	} {
+		var value InferenceContextToolEvidence
+		if err := json.Unmarshal([]byte(raw), &value); err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var before, after map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &before); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(encoded, &after); err != nil {
+			t.Fatal(err)
+		}
+		if string(before["source_ids"]) != string(after["source_ids"]) {
+			t.Fatalf("source identity presence/value changed: %s -> %s", raw, encoded)
+		}
+	}
+}

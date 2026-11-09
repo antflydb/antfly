@@ -57349,6 +57349,14 @@ components:
         facts:
           type: string
           description: Compacted evidence attributed to this completed tool call.
+        source_ids:
+          x-go-type-skip-optional-pointer: false
+          maxItems: 4096
+          type: array
+          items:
+            type: string
+          description: Exact source identities attributed to this tool result. Optional for legacy checkpoints;
+            summaries must preserve server-supplied identities without shortening or substitution.
     InferenceContextUnresolvedToolCall:
       type: object
       additionalProperties: false

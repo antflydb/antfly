@@ -25656,6 +25656,8 @@ export interface components {
             tool_name: string;
             /** @description Compacted evidence attributed to this completed tool call. */
             facts: string;
+            /** @description Exact source identities attributed to this tool result. Optional for legacy checkpoints; summaries must preserve server-supplied identities without shortening or substitution. */
+            source_ids?: string[];
         };
         InferenceContextUnresolvedToolCall: {
             tool_call_id: string;

@@ -235,6 +235,12 @@ const Registry = struct {
     }
 };
 
+fn addResearchSourceIds(a: std.mem.Allocator, ids: *agent_context.SourceIds, evidence: Evidence) !void {
+    try ids.add(a, evidence.id);
+    if (evidence.doc_id) |id| try ids.add(a, id);
+    if (evidence.url) |url| try ids.add(a, url);
+}
+
 fn appendUnique(arena: std.mem.Allocator, list: []const []const u8, value: []const u8) ![]const []const u8 {
     for (list) |item| if (std.mem.eql(u8, item, value)) return list;
     return std.mem.concat(arena, []const u8, &.{ list, &.{value} });
@@ -586,13 +592,18 @@ const Run = struct {
             // of the claims it is asked to check.
             if (self.phase == .verify) if (self.report) |report| try constraints.print(self.arena, "Report to verify: {s}\n", .{report.markdown});
             const evidence = try agent_context.completedEvidence(self.arena, source[0], source[1], constraints.items);
-            const prepared = try agent_context.prepare(self.arena, &runner, config, chain, evidence, .{}, .{ .ptr = self, .check_fn = BudgetedRunner.check });
-            if (config.mode == null or std.mem.eql(u8, config.mode.?, "compact")) {
-                for (self.registry.items.items) |item| {
-                    if (try agent_context.hasIdentifier(self.arena, &source, item.id) and
-                        !try agent_context.hasIdentifier(self.arena, prepared.messages, item.id)) return error.ContextSummaryMissingCitation;
-                }
+            var ids = agent_context.SourceIds{};
+            switch (self.phase) {
+                .write => for (self.registry.items.items) |item| try addResearchSourceIds(self.arena, &ids, item),
+                .verify => for (self.citations) |citation| {
+                    if (self.registry.get(citation.evidence_id)) |item| try addResearchSourceIds(self.arena, &ids, item);
+                },
+                .reflect => for (self.findings.items) |finding| {
+                    for (finding.evidence_ids orelse &.{}) |id| if (self.registry.get(id)) |item| try addResearchSourceIds(self.arena, &ids, item);
+                },
+                else => {},
             }
+            const prepared = try agent_context.prepareWithSources(self.arena, &runner, config, chain, evidence, .{}, .{ .ptr = self, .check_fn = BudgetedRunner.check }, &.{.{ .tool_call_id = "antfly_context_evidence", .source_ids = ids.items.items }});
             try self.context_events.append(self.arena, prepared.event);
             try self.live.value("context_management", prepared.event);
             messages = prepared.messages;
@@ -2461,7 +2472,7 @@ test "research agent context compacts resumed evidence with independent summariz
                 try std.testing.expectEqual(generating.Provider.gemini, chain[0].generator.provider);
                 try std.testing.expect(chain[0].generator.response_format_json == null);
                 return .{ .allocator = alloc, .content = try alloc.dupe(u8,
-                    \\{"conversation":"Research hybrid search and reranking. [E1] doc:rrf RRF fuses lists. [E2] doc:rerank rerankers reorder.","tool_evidence":[{"tool_call_id":"antfly_context_evidence","tool_name":"assembled_evidence","facts":"[E1] doc:rrf RRF fuses lists; [E2] doc:rerank rerankers reorder."}],"unresolved_tool_calls":[]}
+                    \\{"conversation":"Research hybrid search and reranking. [E1] doc:rrf RRF fuses lists. [E2] doc:rerank rerankers reorder.","tool_evidence":[{"tool_call_id":"antfly_context_evidence","tool_name":"assembled_evidence","facts":"[E1] doc:rrf RRF fuses lists; [E2] doc:rerank rerankers reorder.","source_ids":["E1","doc:rrf","E2","doc:rerank"]}],"unresolved_tool_calls":[]}
                 ) };
             }
             var joined: std.ArrayListUnmanaged(u8) = .empty;

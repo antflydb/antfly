@@ -813,6 +813,11 @@ fn cloneMemory(allocator: std.mem.Allocator, memory: planner.StructuredMemory) !
         .tool_call_id = try allocator.dupe(u8, item.tool_call_id),
         .tool_name = try allocator.dupe(u8, item.tool_name),
         .facts = try allocator.dupe(u8, item.facts),
+        .source_ids = if (item.source_ids) |ids| blk: {
+            const copy = try allocator.alloc([]const u8, ids.len);
+            for (ids, copy) |id, *owned| owned.* = try allocator.dupe(u8, id);
+            break :blk copy;
+        } else null,
     };
     const unresolved = try allocator.alloc(planner.UnresolvedToolCall, memory.unresolved_tool_calls.len);
     for (unresolved, memory.unresolved_tool_calls) |*out, item| out.* = .{
@@ -879,7 +884,7 @@ fn makeWireCheckpoint(
     }
     const rev = try contextRevisions(context);
     const evidence = try allocator.alloc(api.ContextToolEvidence, memory.tool_evidence.len);
-    for (evidence, memory.tool_evidence) |*out, item| out.* = .{ .tool_call_id = item.tool_call_id, .tool_name = item.tool_name, .facts = item.facts };
+    for (evidence, memory.tool_evidence) |*out, item| out.* = .{ .tool_call_id = item.tool_call_id, .tool_name = item.tool_name, .facts = item.facts, .source_ids = item.source_ids };
     const unresolved = try allocator.alloc(api.ContextUnresolvedToolCall, memory.unresolved_tool_calls.len);
     for (unresolved, memory.unresolved_tool_calls) |*out, item| out.* = .{ .tool_call_id = item.tool_call_id, .tool_name = item.tool_name };
     const wire_memory = api.ContextStructuredMemory{ .conversation = memory.conversation, .tool_evidence = evidence, .unresolved_tool_calls = unresolved };
@@ -1575,4 +1580,32 @@ test "compact skips native summary inference when effective prompt fits" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), runner.calls);
     try std.testing.expect(result.checkpoint == null);
+}
+
+test "checkpoint source identities survive ownership transfer JSON and continuation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var id = [_]u8{ 'E', '1' };
+    const memory = try cloneMemory(a, .{ .tool_evidence = &.{.{ .tool_call_id = "c1", .tool_name = "search", .facts = "fact", .source_ids = &.{ &id, "doc:1-extra", "quoted\"id", "世界" } }} });
+    id[1] = '9';
+    try std.testing.expectEqualStrings("E1", memory.tool_evidence[0].source_ids.?[0]);
+    var counter_state: u8 = 0;
+    var context = testContext(&counter_state);
+    const cp = try makeWireCheckpoint(a, &.{}, 0, memory, null, &context);
+    const json = try std.json.Stringify.valueAlloc(a, cp, .{ .emit_null_optional_fields = false });
+    const parsed = try std.json.parseFromSlice(api.ContextCheckpoint, a, json, .{});
+    try validateWireCheckpoint(parsed.value, &context);
+    try std.testing.expectEqualDeep(memory, memoryView(parsed.value.memory));
+    const extended = try makeWireCheckpoint(a, &.{}, 0, try cloneMemory(a, memoryView(parsed.value.memory)), parsed.value, &context);
+    try validateWireCheckpoint(extended, &context);
+    try std.testing.expectEqualDeep(memory, memoryView(extended.memory));
+    var tampered = parsed.value;
+    tampered.memory.tool_evidence = &.{.{ .tool_call_id = "c1", .tool_name = "search", .facts = "fact", .source_ids = &.{"E10"} }};
+    try std.testing.expectError(error.CheckpointMemoryMismatch, validateWireCheckpoint(tampered, &context));
+    // Omission is retained for old checkpoints; explicit empty arrays stay present.
+    const legacy = try makeWireCheckpoint(a, &.{}, 0, .{ .tool_evidence = &.{.{ .tool_call_id = "c1", .tool_name = "search", .facts = "fact" }} }, null, &context);
+    const old_json = try std.json.Stringify.valueAlloc(a, legacy, .{ .emit_null_optional_fields = false });
+    try std.testing.expect(std.mem.indexOf(u8, old_json, "source_ids") == null);
+    try validateWireCheckpoint(legacy, &context);
 }

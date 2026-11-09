@@ -19,6 +19,7 @@ const g = @import("mod.zig");
 pub const planner = @import("antfly_chat_context");
 pub const preparation = planner.preparation;
 pub const State = preparation.State;
+pub const SourceBinding = planner.SourceBinding;
 pub const Config = struct {
     mode: preparation.Mode = .compact,
     context_window_tokens: usize,
@@ -29,6 +30,8 @@ pub const Config = struct {
     summary_output_tokens: usize = 1024,
     max_summary_batches: usize = 8,
     summarizer: ?g.GeneratorConfig = null,
+    /// Internal, request-owned provenance. This is not a public model option.
+    sources: []const SourceBinding = &.{},
 };
 pub const Event = struct {
     diagnostics: preparation.Diagnostics,
@@ -46,10 +49,11 @@ pub const Counter = struct {
     allocator: std.mem.Allocator,
     source: []const g.ChatMessage,
     chain: []const g.ChainLink,
+    sources: []const SourceBinding = &.{},
 
     pub fn count(raw: *anyopaque, input: planner.CountInput) !usize {
         const self: *Counter = @ptrCast(@alignCast(raw));
-        const messages = try destinationMessages(self.allocator, self.chain, try effectiveMessages(self.allocator, self.source, input.keep, input.rendered_memory));
+        const messages = try destinationMessages(self.allocator, self.chain, try effectiveMessagesWithSources(self.allocator, self.source, input.keep, input.rendered_memory, self.sources));
         const encoded = try std.json.Stringify.valueAlloc(self.allocator, messages, .{});
         var schemas: usize = 0;
         for (self.chain) |link| {
@@ -77,6 +81,17 @@ pub fn effectiveMessages(a: std.mem.Allocator, source: []const g.ChatMessage, ke
     }
     if (memory != null and !inserted) return error.ContextMemoryRequiresUserMessage;
     return out.toOwnedSlice(a);
+}
+
+fn effectiveMessagesWithSources(a: std.mem.Allocator, source: []const g.ChatMessage, keep: []const bool, memory: ?[]const u8, bindings: []const SourceBinding) ![]const g.ChatMessage {
+    var retained: std.ArrayListUnmanaged(SourceBinding) = .empty;
+    for (source, keep) |message, include| {
+        if (!include or message.role != .tool or message.tool_call_id == null) continue;
+        for (bindings) |binding| if (std.mem.eql(u8, binding.tool_call_id, message.tool_call_id.?) and binding.source_ids.len > 0) try retained.append(a, binding);
+    }
+    const manifest = if (retained.items.len > 0) try planner.renderSourceManifest(a, retained.items, .{}) else null;
+    const data = if (memory) |m| if (manifest) |ids| try std.mem.concat(a, u8, &.{ m, "\n", ids }) else m else manifest;
+    return effectiveMessages(a, source, keep, data);
 }
 
 /// Internal tool evidence remains structured for planning and validation. A
@@ -122,7 +137,7 @@ pub fn destinationMessages(a: std.mem.Allocator, chain: []const g.ChainLink, mes
     return instructions.toOwnedSlice(a);
 }
 
-pub fn viewMessages(a: std.mem.Allocator, source: []const g.ChatMessage) ![]const planner.MessageView {
+pub fn viewMessages(a: std.mem.Allocator, source: []const g.ChatMessage) ![]planner.MessageView {
     if (source.len > 4096) return error.ContextMessageLimitExceeded;
     var total_calls: usize = 0;
     for (source) |message| total_calls +|= if (message.tool_calls) |calls| calls.len else 0;
@@ -144,7 +159,7 @@ pub fn viewMessages(a: std.mem.Allocator, source: []const g.ChatMessage) ![]cons
 }
 
 pub const summary_schema =
-    \\{"type":"object","additionalProperties":false,"required":["conversation","tool_evidence","unresolved_tool_calls"],"properties":{"conversation":{"type":"string"},"tool_evidence":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["tool_call_id","tool_name","facts"],"properties":{"tool_call_id":{"type":"string"},"tool_name":{"type":"string"},"facts":{"type":"string"}}}},"unresolved_tool_calls":{"type":"array","maxItems":0,"items":{"type":"object","additionalProperties":false,"required":["tool_call_id","tool_name"],"properties":{"tool_call_id":{"type":"string"},"tool_name":{"type":"string"}}}}}}
+    \\{"type":"object","additionalProperties":false,"required":["conversation","tool_evidence","unresolved_tool_calls"],"properties":{"conversation":{"type":"string"},"tool_evidence":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["tool_call_id","tool_name","facts","source_ids"],"properties":{"tool_call_id":{"type":"string"},"tool_name":{"type":"string"},"facts":{"type":"string"},"source_ids":{"type":"array","items":{"type":"string"}}}}},"unresolved_tool_calls":{"type":"array","maxItems":0,"items":{"type":"object","additionalProperties":false,"required":["tool_call_id","tool_name"],"properties":{"tool_call_id":{"type":"string"},"tool_name":{"type":"string"}}}}}}
 ;
 
 pub fn summaryConfig(a: std.mem.Allocator, base: g.GeneratorConfig, output: usize) !g.GeneratorConfig {
@@ -219,7 +234,23 @@ pub fn prepare(a: std.mem.Allocator, runner: anytype, config: Config, chain: []c
     const cfg = try summaryConfig(a, config.summarizer orelse chain[0].generator, config.summary_output_tokens);
     var adapter = Adapter(@TypeOf(runner)){ .runner = runner, .cfg = cfg, .output_tokens = config.summary_output_tokens };
     const views = try viewMessages(a, source);
-    var counter = Counter{ .allocator = a, .source = source, .chain = chain };
+    for (config.sources) |binding| {
+        var matches: usize = 0;
+        for (views) |view| if (view.role == .tool and view.tool_call_id != null and std.mem.eql(u8, view.tool_call_id.?, binding.tool_call_id)) {
+            matches += 1;
+        };
+        if (binding.tool_call_id.len == 0 or matches != 1) return error.InvalidContextRequest;
+    }
+    for (views) |*view| {
+        if (view.role != .tool or view.tool_call_id == null) continue;
+        var bound = false;
+        for (config.sources) |binding| if (std.mem.eql(u8, binding.tool_call_id, view.tool_call_id.?)) {
+            if (bound) return error.InvalidContextRequest;
+            bound = true;
+            if (binding.source_ids.len > 0) view.source_ids = binding.source_ids;
+        };
+    }
+    var counter = Counter{ .allocator = a, .source = source, .chain = chain, .sources = config.sources };
     const result = try preparation.prepare(a, views, previous, .{
         .mode = config.mode,
         .target_input_tokens = target,
@@ -229,7 +260,7 @@ pub fn prepare(a: std.mem.Allocator, runner: anytype, config: Config, chain: []c
         .summary_output_tokens = config.summary_output_tokens,
         .max_batches = config.max_summary_batches,
     }, .{ .ptr = &counter, .count_fn = Counter.count }, .{ .ptr = &adapter, .count_fn = @TypeOf(adapter).count }, .{ .ptr = &adapter, .run_fn = @TypeOf(adapter).run }, control);
-    return .{ .messages = try destinationMessages(a, chain, try effectiveMessages(a, source, result.next.keep, result.rendered_memory)), .next = result.next, .event = .{ .diagnostics = result.diagnostics, .summary_provider = if (result.diagnostics.batches > 0) @tagName(cfg.provider) else null, .summary_model = if (result.diagnostics.batches > 0) cfg.model else null } };
+    return .{ .messages = try destinationMessages(a, chain, try effectiveMessagesWithSources(a, source, result.next.keep, result.rendered_memory, config.sources)), .next = result.next, .event = .{ .diagnostics = result.diagnostics, .summary_provider = if (result.diagnostics.batches > 0) @tagName(cfg.provider) else null, .summary_model = if (result.diagnostics.batches > 0) cfg.model else null } };
 }
 
 const FakeRunner = struct {
@@ -359,4 +390,28 @@ test "Apple destination text rendering is counted and passes production request 
     @memset(keep, true);
     var counter = Counter{ .allocator = a, .source = result.messages, .chain = &chain };
     try std.testing.expectEqual(result.event.diagnostics.effective_input_tokens, try Counter.count(&counter, .{ .messages = views, .keep = keep }));
+}
+
+test "source manifests are counted and rendered without changing retained tool bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = [_]g.ChatMessage{
+        .{ .role = .user, .content = .{ .text = "question" } },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "c1", .name = "search", .arguments = "{}" }} },
+        .{ .role = .tool, .tool_call_id = "c1", .content = .{ .text = "custom rendering omits source identity" } },
+        .{ .role = .assistant, .content = .{ .text = "answer" } },
+        .{ .role = .user, .content = .{ .text = "next question" } },
+    };
+    const chain = [_]g.ChainLink{.{ .generator = .{ .provider = .openai, .model = "main", .url = "https://example.invalid", .max_tokens = 100 } }};
+    const bindings = [_]SourceBinding{.{ .tool_call_id = "c1", .source_ids = &.{ "doc:1", "doc:1-extra", "quoted\"id" } }};
+    var fake = FakeRunner{ .expected_provider = .openai };
+    const result = try prepare(a, &fake, .{ .context_window_tokens = 16000, .sources = &bindings }, &chain, &source, .{}, .{});
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(std.mem.indexOf(u8, result.messages[0].content.?.text, "context_sources") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.messages[0].content.?.text, "doc:1-extra") != null);
+    try std.testing.expectEqualStrings(source[2].content.?.text, result.messages[2].content.?.text);
+    const encoded = try std.json.Stringify.valueAlloc(a, result.messages, .{});
+    try std.testing.expectEqual(encoded.len + 512 + result.messages.len * 32, result.event.diagnostics.effective_input_tokens);
+    try std.testing.expectError(error.InvalidContextRequest, prepare(a, &fake, .{ .context_window_tokens = 16000, .sources = &.{.{ .tool_call_id = "unknown", .source_ids = &.{"doc:1"} }} }, &chain, &source, .{}, .{}));
 }
