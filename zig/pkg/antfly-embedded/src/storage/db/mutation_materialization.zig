@@ -64,6 +64,7 @@ const graph_state_name = @import("graph_state_name.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const hierarchy_navigation = @import("../hierarchy_navigation.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
+const algebraic_index_mod = @import("algebraic/index.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
 const commit_participant = @import("../commit_participant.zig");
@@ -4330,6 +4331,135 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .consumer = index_ref.name,
                     .sequence = sequence,
                     .generation = entry.config.coverage_generation,
+                    .config_hash = types.indexConfigHash(entry.config),
+                },
+            };
+            return result;
+        }
+
+        /// Single-commit write path, algebraic workstream: an algebraic
+        /// index's facts live entirely in the primary DocStore already
+        /// (under the `\x00\x00__algebraic__:` private-metadata prefix,
+        /// `storage/db/algebraic/index.zig`'s `storagePrefixAlloc`), so --
+        /// unlike full-text/dense/sparse/graph -- there is no separate
+        /// storage backend to migrate here. The only change needed is
+        /// where the commit happens: `Index.applyBatchWithOptionsView`
+        /// (see its doc comment) runs the SAME read-modify-write fact
+        /// maintenance `applyAlgebraicBatchByNameWithOptions` always ran,
+        /// but against a `commit_participant.View` onto the write's own
+        /// host transaction instead of a transaction it opens and commits
+        /// itself.
+        ///
+        /// Unlike `InlineTextPublication`, `apply_guard` is released at the
+        /// end of `stage` itself, not at `install`/`abort`. Text holds its
+        /// guard through `install` because `install` still has real work to
+        /// do there (syncing the `.native_catalog` backend's in-memory
+        /// mirror, publishing segment/delete-tracking state) that must stay
+        /// serialized against the next writer's `prepare`. Algebraic's
+        /// `install` only schedules best-effort HLL maintenance -- nothing
+        /// that depends on `apply_guard` -- so holding it past `stage`
+        /// would only serialize unrelated work for no correctness benefit.
+        /// That matters here specifically because `prepare` (where
+        /// `apply_guard` is acquired) runs under the caller's DB-wide apply
+        /// lock: holding a second, per-index lock across this write's own
+        /// durability wait would park the *next* writer to this same index
+        /// inside that DB-wide lock for this write's entire commit-to-
+        /// durable latency, defeating WS3's "release the apply lock before
+        /// the wait" group-commit concurrency. Releasing at the end of
+        /// `stage` keeps the serialization window to just prepare-through-
+        /// stage (the window `apply_guard` actually needs to protect: the
+        /// `entry` pointer's catalog validity), matching how the DB-wide
+        /// apply lock itself is released before the wait.
+        pub const InlineAlgebraicPublication = struct {
+            alloc: Allocator,
+            entry: *index_manager_mod.IndexManager.AlgebraicIndex,
+            apply_guard: ?index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            store: *docstore_mod.DocStore,
+            batch: derived_types.DerivedBatch,
+            options: algebraic_index_mod.ApplyOptions,
+            progress: apply_state.Progress,
+
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
+                const self: *InlineAlgebraicPublication = @ptrCast(@alignCast(ptr));
+                defer {
+                    if (self.apply_guard) |*guard| guard.unlock();
+                    self.apply_guard = null;
+                }
+                try self.entry.index.applyBatchWithOptionsView(view, self.batch, self.options);
+                try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            /// `commit_participant.Participant.stage` runs before the
+            /// host's native commit, so by the time it returns, `self`'s
+            /// fact writes and progress record are staged into the SAME
+            /// transaction as the write's primary rows -- but not yet
+            /// durable. Call `install` only once that transaction's commit
+            /// has actually returned successfully, never from inside
+            /// `stage` itself.
+            pub fn participant(self: *InlineAlgebraicPublication) commit_participant.Participant {
+                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            }
+
+            pub fn install(self: *InlineAlgebraicPublication) void {
+                std.debug.assert(self.apply_guard == null);
+                // Best-effort, and only after this write's own commit is
+                // durable (see `scheduleHllMaintenanceIfDirty`'s doc
+                // comment): a dirtied HLL sketch still gets picked up by
+                // background maintenance exactly as it would on the
+                // non-inline path.
+                self.entry.index.scheduleHllMaintenanceIfDirty(self.store);
+                self.alloc.destroy(self);
+            }
+
+            /// Either the host transaction's own `stage` never ran (an
+            /// error elsewhere in the caller before the primary write was
+            /// even staged) and `apply_guard` is still held, or it ran and
+            /// already released it; either way this is safe to call
+            /// without knowing which.
+            pub fn abort(self: *InlineAlgebraicPublication) void {
+                if (self.apply_guard) |*guard| guard.unlock();
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// Returns `error.InlineAlgebraicPublicationUnsupported` when
+        /// `index_ref` is not an algebraic index or has no entry (the
+        /// caller falls back to `applyDerivedBatchToIndexContextProfiled`,
+        /// which remains correct -- and is unchanged by any of this -- for
+        /// every case this does not handle).
+        pub fn prepareInlineAlgebraicPublication(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *index_manager_mod.IndexManager,
+            batch: derived_types.DerivedBatch,
+            index_ref: index_manager_mod.ManagedIndexRef,
+        ) !*InlineAlgebraicPublication {
+            if (index_ref.kind != .algebraic) return error.InlineAlgebraicPublicationUnsupported;
+
+            var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
+            errdefer apply_guard.unlock();
+            const entry = index_manager.algebraicIndex(index_ref.name) orelse return error.InlineAlgebraicPublicationUnsupported;
+
+            const result = try alloc.create(InlineAlgebraicPublication);
+            result.* = .{
+                .alloc = alloc,
+                .entry = entry,
+                .apply_guard = apply_guard,
+                .store = store,
+                .batch = batch,
+                // Matches `applyAlgebraicBatchByNameWithOptions`'s existing
+                // non-inline call site (`.algebraic` case below): algebraic
+                // adaptive-materialization tensor-delta bookkeeping is gated
+                // on `.bulk_ingest` mode regardless of batch size (see
+                // `Index.buildBatchMaintenanceContext`), so this must match
+                // to keep that bookkeeping running on every write, exactly
+                // as it does today.
+                .options = .{ .batch_options = .{ .mode = .bulk_ingest } },
+                .progress = .{
+                    .consumer = index_ref.name,
+                    .sequence = batch.sequence,
                     .config_hash = types.indexConfigHash(entry.config),
                 },
             };

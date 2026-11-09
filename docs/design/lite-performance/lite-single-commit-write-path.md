@@ -162,10 +162,14 @@ Each kind of ride-along work is safe to lose in a crash because it can be recomp
 | Merge | Redone. Readers see the inputs until the merged output is durable. |
 | Catch-up progress | Replay restarts from durable progress, and the work is idempotent. |
 | Status | Derived from live state. |
+| Enrichment checkpoint | The media-pass cursor/page records are private worker preparation, never chunk artifacts; a restart re-derives a bounded amount of recompute from the last durable cursor instead of inferring coverage from a partial artifact set. |
+| Recovery-agenda acknowledgement | An un-acknowledged marker just gets re-scanned and re-acknowledged on the next recovery turn. |
 
 **Credits.** A credit release takes effect for producers only once `durableSequence()` covers the transaction that released it. So credits still return only after deletion is durable, with no dedicated fsync.
 
 **Journal.** A consumer whose publication rides in the acknowledgement's commit (a synchronous `full_text` write) needs no journal record for that write.
+
+**Not yet implemented.** The journal/replay payload (`target_hints`, the "all" lane) is built and written in `mutation_commit.zig` *before* `InlineTextPublication`/`InlineGraphPublication`/`InlineSparsePublication`/`InlineDensePublication`/`InlineAlgebraicPublication` are even prepared, so today's code cannot yet know which hints an inline publication is about to service and still writes a full record (at minimum the "all" lane) regardless. `target_hints` is also coarse-grained by consumer *kind* (`.full_text`, `.dense_vector`, ...), not by index name, so a write touching two indexes of the same kind where only one is inline-handled cannot safely drop that kind's hint outright. Closing this needs either reordering so hint-suppression happens after inline-publication prep resolves (which of the write's hints it actually serviced), or threading per-index "already inline-handled" names into hint construction and only dropping a kind's hint when every target of that kind was serviced. Per-hint lanes already skip writing when no consumer is registered for that hint at all (`active_consumer_hint_mask`, §3.6); the "all" lane does not.
 
 **Crash invariant.** Ride-along work may be lost at a crash. Acknowledged work may not, and credits may not leak.
 
@@ -233,8 +237,17 @@ Dense vectors (HBC), sparse vectors and graph indexes follow the same design as 
 
 Algebraic indexes (`storage/db/algebraic/`) are built differently. They write facts straight into the primary DocStore rather than into a nested LSM, so the fix is the commit pattern, not a backend swap:
 
-- **Synchronous apply.** An algebraic apply for a synchronous write becomes a `commit_participant` contributor. Its facts and progress land in the primary write's own native transaction.
+- **Synchronous apply.** An algebraic apply for a synchronous write becomes a `commit_participant` contributor (`InlineAlgebraicPublication`, `mutation_materialization.zig`). Its facts and progress land in the primary write's own native transaction via `Index.applyBatchWithOptionsView` against the host's `commit_participant.View`.
 - **Background work.** HLL maintenance, adaptive backfill and dematerialization, and join-fact upkeep become demand-driven ride-along commits.
+
+**Measured.** `zig build lite-write-amplification`'s `algebraic`/`algebraic_8_writers` modes (one document per transaction, acked at `full_index`, against a representative group-by + HLL-cardinality config) reach 1.0 durable commits/write and 0 background syncs/update, for both 1 and 8 writers. Two fixes were needed beyond the inline-publication wiring itself:
+
+- `InlineAlgebraicPublication`'s gate required `!executor.hasWorkers()`, copied from full-text's own gate before its "Phase 2 round 2" fix removed the same mistake. The default configuration registers a derived worker for every managed index, so this gate blocked inline publication on every write (3.0 commits/write: the slow path's own standalone commit). `Index.applyBatchWithOptionsView` and the worker's own `applyBatchWritesLocked` already serialize on the same `Index.lockWrites()` mutex, so the extra gate was unneeded; dropped, matching text/graph/sparse/dense.
+- With the gate gone, the facts landed inline but the background worker's `applied_sequence` bookkeeping was never advanced to match -- only text/graph/sparse/dense called `Executor.advanceAppliedSequenceIfContiguous` after `install()`. Every later write's notify cycle found the algebraic worker still behind target and ran a redundant catch-up turn that persisted its own applied-sequence advancement as a second durable commit (2.0, not yet 1.0). Algebraic's `install()` loop now calls `advanceAppliedSequenceIfContiguous` too.
+
+The 14 adaptive/join/bulk-finish commit sites that still opened their own `beginWriteTxn` (bulk-ingest session finish, materialized-expression-delta rebuild, and the whole adaptive observation/candidate/progress/backfill/dematerialization family) are now `beginWriteBatchWithOptions(.{ .durability = .ride_along })`, tagged `.algebraic_adaptive` for the harness. `applyBatchWritesLocked`'s own two foreground commits -- the actual durability boundary when a write cannot be inline-published -- are unchanged.
+
+Not exercised by the measured scenario: HLL maintenance only runs when a sketch is marked dirty by a delete or overwrite (`runHllMaintenance`'s own doc comment), and the harness's algebraic mode is insert-only, so `algebraic_hll_maintenance` reads zero in that run. The ride-along wiring (`runHllMaintenance`, `flushPendingHllObservations`, `runHllAdaptiveBackfillTick`) is in place and unit-tested independently; a harness scenario that deletes/overwrites group-by values would be needed to measure it end to end.
 
 ### 3.3c Relational, transactional and auxiliary write surfaces
 
