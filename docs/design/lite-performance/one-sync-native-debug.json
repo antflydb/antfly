@@ -1,0 +1,239 @@
+{
+  "scope": "Bounded one-sync native commit protocol and typed physical text retirement; full architecture remains in progress.",
+  "parent_commit": "b9afa232767129208a2cac82db755ea4e8f95c18",
+  "mode": "Debug",
+  "format_revision": 15,
+  "library_sha256": "027040e6a033768bb7ebe59b18c0c3d033daca3de5411521b7b0fb0e2bc5df06",
+  "source_sha256": {
+    "docs/design/lite-performance/native-commit-proofs.md": "cc3c4c1854e242f98cd119b647368bf2fedeee7bfe25ccb6a5cce08081075de1",
+    "scripts/bench/lite_catalog_accounting.py": "56bb280f3abcfbce00b97382f77a2599dae119adcd4a73819dc5faff4d8ea439",
+    "scripts/bench/test_lite_catalog_accounting.py": "c740a66f4470a0f2d5a2c17dd08d3fe5ea98c2f1ffb7864f45d627bc732809bc",
+    "zig/LITE.md": "414a9ab9ba25f3486e0039f03c2b6876ddddf0d94b86b16bd092a17fa6fdcb9c",
+    "zig/pkg/antfly-embedded/src/source_catalog.zig": "4de14120093203331524d31937f6aea1f72472edf2c2f68022de390d84a00ddb",
+    "zig/pkg/antfly-embedded/src/storage/backend_types.zig": "8d122d40f222f0a702aa3ad58337da429f14276b71af0345135e7488f99d36d3",
+    "zig/pkg/antfly-embedded/src/storage/lite/allocator_v4.zig": "3873085b1917fc7e3f71d193076d4f0ff0da9d7e5d40392d3c0b5329d82ddf43",
+    "zig/pkg/antfly-embedded/src/storage/lite/commit_proof.zig": "d8795a9fe5fd13d10470c6eb14845af747242af4ed8f63268e8770aaa0251345",
+    "zig/pkg/antfly-embedded/src/storage/lite/docstore.zig": "34cb4e39f6bcf540f1ec0e8e893cb894dd6f6c3aca2f8d0f373cb6ead661a0fd",
+    "zig/pkg/antfly-embedded/src/storage/lite/index_storage.zig": "90f0a09e7dab0dabdf71a628f7f0e5ca8562d9b049b6cecf09a41508d86dcf7c",
+    "zig/pkg/antfly-embedded/src/storage/lite/namespace_store.zig": "5633fe86d8942a53b0a77ec52675c642d2d2855d1d3a452f22d09f1c23805478",
+    "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "edd1b625b34f17b580867a9fc78b0c5d9d5b15c13b7685abfc16c5bc53c08654",
+    "zig/pkg/antfly-embedded/src/storage/lite/secret_store.zig": "14c83a9a299baf5393257f15ec7caa25116f6e57e22628ac6dfa2c0af1051b31",
+    "zig/pkg/antfly-embedded/src/storage/lsm_backend/storage_io.zig": "b9ca2e68fb99ae6b2b210334731a9b57f1ea85911b90c7ce6cfd8afaa24e1070",
+    "zig/pkg/antfly-embedded/src/storage/persistent.zig": "bdf922fb02a2a588c2d97c4e428a4ed2393941c7d6548ac9e5d47ee6a587501a",
+    "zig/pkg/antfly/src/storage_batch_contract_test_root.zig": "4d95741d39f6afa9e27341a9b96eb91639d839108e8601a609a91038aab99a42"
+  },
+  "implemented": [
+    "Authenticated physical postimages, exact post-sync durability witnesses, recovered-parent settlement and structural fallback to the prior checked checkpoint.",
+    "One sync for eligible bounded native commits, with safe old barriers on overflow, no_sync/deferred/raw/maintenance compatibility and uncertainty fencing.",
+    "Recovery-slot horizons retain all required postimages; proof frames and continuation pages retire as metadata independently of logical readers.",
+    "Private snapshot copies retire proofs before namespace rebinding, retain added allocator pages and report actual output checkpoint/length.",
+    "Typed retired text deletion verifies current inactive membership and durable retirement markers, then atomically unlinks paths and clears markers without rotating semantic generations.",
+    "Retirement groups remain separate from authored mutations; bounded optional cleanup yields rather than starting unchecked hard-cap graph proof under its lease."
+  ],
+  "validation": {
+    "stable_debug_gate_exit_code": 0,
+    "wall_seconds": 736.129,
+    "native": {
+      "passed": 813,
+      "skipped": 5,
+      "failed": 0,
+      "leaked": 0
+    },
+    "capi_local": {
+      "passed": 362,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0
+    },
+    "capi_owner": {
+      "passed": 87,
+      "failed": 0,
+      "leaked": 0
+    },
+    "persistent": {
+      "passed": 81,
+      "skipped": 1,
+      "failed": 0,
+      "leaked": 0
+    },
+    "wal": {
+      "passed": 110,
+      "failed": 0,
+      "leaked": 0
+    },
+    "wal_portable": {
+      "passed": 4,
+      "failed": 0,
+      "leaked": 0
+    },
+    "focused_recovery_retirement": {
+      "passed": 10,
+      "failed": 0,
+      "leaked": 0
+    },
+    "python_sql_concurrency": {
+      "passed": 209,
+      "seconds": 66.75
+    },
+    "accounting_parity_corruption": {
+      "passed": 1,
+      "seconds": 2.368
+    },
+    "abi_exports": 138
+  },
+  "operation_counts": [
+    {
+      "indexed": false,
+      "writes": 128,
+      "after_mutations": {
+        "reset_thread": {
+          "main": {
+            "fsync_calls": 128,
+            "write_calls": 2581,
+            "write_bytes": 8905856,
+            "read_calls": 5944,
+            "read_bytes": 24346624,
+            "fsync_ns": 46345000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 211,
+            "write_bytes": 13504,
+            "read_calls": 979,
+            "read_bytes": 35424,
+            "fsync_ns": 0
+          }
+        },
+        "other_threads": {
+          "main": {
+            "fsync_calls": 154,
+            "write_calls": 1456,
+            "write_bytes": 3984122,
+            "read_calls": 4010,
+            "read_bytes": 16424960,
+            "fsync_ns": 35214000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 188,
+            "write_bytes": 12032,
+            "read_calls": 732,
+            "read_bytes": 23680,
+            "fsync_ns": 0
+          }
+        }
+      },
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.12278554099611938
+      },
+      "cleanup": {
+        "removed_bytes": 1257472
+      }
+    },
+    {
+      "indexed": true,
+      "writes": 128,
+      "after_mutations": {
+        "reset_thread": {
+          "main": {
+            "fsync_calls": 288,
+            "write_calls": 5942,
+            "write_bytes": 21101456,
+            "read_calls": 12686,
+            "read_bytes": 53153792,
+            "fsync_ns": 212863000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 393,
+            "write_bytes": 25152,
+            "read_calls": 1718,
+            "read_bytes": 68192,
+            "fsync_ns": 0
+          }
+        },
+        "other_threads": {
+          "main": {
+            "fsync_calls": 216,
+            "write_calls": 2891,
+            "write_bytes": 8687234,
+            "read_calls": 18041,
+            "read_bytes": 74674176,
+            "fsync_ns": 47714000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 210,
+            "write_bytes": 161903,
+            "read_calls": 1221,
+            "read_bytes": 431017,
+            "fsync_ns": 0
+          }
+        }
+      },
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.6119658750030794
+      },
+      "cleanup": {
+        "removed_bytes": 3538944
+      }
+    }
+  ],
+  "attribution": {
+    "primary_case": "128 primary syncs on calling thread; 58 replay-truncation syncs and 96 reclamation syncs on background threads.",
+    "indexed_case": "128 primary and 128 index syncs, plus 32 typed-retirement syncs on calling thread; 113 artifact-lease opens, 76 reclamation syncs, 8 staging syncs and other background publications remain.",
+    "measurement_limit": "Synthetic Debug operation counts on a shared local host, with checked latest values/search/integrity. Execution thread does not establish semantic ownership. No throughput or SQLite parity claim."
+  },
+  "retention": "Both synthetic fixtures deleted after verification; 214 successful SDK database fixtures removed (327610368 bytes). No database snapshots archived.",
+  "qualified": false,
+  "remaining": [
+    "Owned text build inputs and late-bound identity/ordinal validation in foreground publication.",
+    "Production join of primary effects and all cheap index activation/progress/receipts in one transaction.",
+    "Ordered cohort preparation before writer gates, same-index composition, and posting buffers independent of RPC boundaries.",
+    "Avoid copied small-artifact sources becoming durable range leases on runtime reopen; defer/batch physical cleanup and replay truncation where safe.",
+    "Finish explicit inspection cancellation/corruption-report edge cases and no-op physical cleanup.",
+    "Candidate-only full SDK/importer comparisons and final optimized wolfspider qualification; retained references are not rerun. Factory qualification belongs to Beads."
+  ]
+}

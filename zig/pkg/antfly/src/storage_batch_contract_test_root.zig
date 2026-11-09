@@ -20,6 +20,24 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 pub const local_test_sources = @import("local_test_sources.zig");
 test {
     _ = antfly_sources.physical_db;
+    // Explicit ownership keeps native publication/repair feedback available
+    // here without compiling the C API's discovery and consumer fixture roots.
+    _ = @import("antfly_local_sources").storage_db_db;
+    _ = @import("antfly_local_sources").storage_persistent;
+    _ = @import("antfly_local_sources").storage_wal;
+    _ = @import("antfly_local_sources").storage_lite_index_storage;
+    _ = @import("antfly_local_sources").storage_lite_docstore;
+    _ = @import("antfly_local_sources").storage_native_publication_value;
+    _ = @import("antfly_local_sources").storage_native_metadata_batch;
+    _ = @import("antfly_local_sources").storage_control_key;
+    _ = @import("antfly_local_sources").storage_db_algebraic_lexical;
+    _ = @import("antfly_local_sources").storage_doc_ordinal_binding;
+    _ = @import("antfly_local_sources").storage_lite_namespace_store;
+    _ = @import("antfly_local_sources").storage_lite_native;
+    _ = @import("antfly_local_sources").storage_lite_commit_proof;
+    _ = @import("antfly_local_sources").storage_db_catalog_index_manager;
+    _ = @import("antfly_local_sources").index;
+    _ = @import("antfly_local_sources").storage_segment_admission;
     _ = @import("antfly_local_sources").storage_db_result_collectors;
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_runtime;
     _ = @import("antfly_local_sources").storage_db_artifact_chunk_vector_publication;

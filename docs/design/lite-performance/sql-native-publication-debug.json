@@ -1,0 +1,117 @@
+{
+  "status": "local_correctness_passed",
+  "qualified": false,
+  "scope": "Unified native SQL text publication and exact replay-capacity wait; fresh importer and final optimized performance remain pending",
+  "runtime_source_commit": "186bc28c435dc4ab964c24b944a184b3ba24c4db",
+  "runtime_diff_base_commit": "4b6e092bb200460e47b9df63de98a41c11195dae",
+  "origin_main_included": "9d92614b296c54007aa2937a1d88e68a6b5af29a",
+  "runtime_diff_sha256": "61e068df1fa4c57461924a6aab9b8b1113edb909ef232fa88959cae5e265e8c0",
+  "library_sha256": "1d6e161a66c398bf5c97a07032fa23c9c87e930c7356873fbe6ed390cf5ebab6",
+  "build": "Debug, strip=true, j1, 32 GiB memory cap",
+  "validation": {
+    "suite_summaries": [
+      {
+        "passed": 850,
+        "skipped": 5,
+        "failed": 0,
+        "leaked": 0
+      },
+      {
+        "passed": 2,
+        "skipped": 0,
+        "failed": 0,
+        "leaked": 0
+      },
+      {
+        "passed": 12,
+        "skipped": 0,
+        "failed": 0,
+        "leaked": 0
+      },
+      {
+        "passed": 394,
+        "skipped": 3,
+        "failed": 0,
+        "leaked": 0
+      },
+      {
+        "passed": 87,
+        "skipped": 0,
+        "failed": 0,
+        "leaked": 0
+      }
+    ],
+    "abi_exports": 138,
+    "executable_and_shared_library_linkage": true,
+    "sdk": {
+      "library_sha256": "1d6e161a66c398bf5c97a07032fa23c9c87e930c7356873fbe6ed390cf5ebab6",
+      "exit_code": 0,
+      "seconds": 66.90788325000904,
+      "summary": "210 passed in 66.34s (0:01:06)",
+      "closed_fixture_bytes_removed": 291774464
+    },
+    "sql_publication_counts": {
+      "scope": "Measure current-library SQL checkpoint counts using disposable synthetic data.\n\nCounts include connection open/close and background service. They are neither\nexact fsync counts nor a throughput qualification. No reference library runs.",
+      "qualified": false,
+      "profile": "native",
+      "library_sha256": "1d6e161a66c398bf5c97a07032fa23c9c87e930c7356873fbe6ed390cf5ebab6",
+      "rows": [
+        {
+          "operation": "open-close",
+          "native_checkpoint_publications": 0,
+          "seconds": 0.031870749982772395
+        },
+        {
+          "operation": "ordinary",
+          "native_checkpoint_publications": 2,
+          "seconds": 0.04880791701725684
+        },
+        {
+          "operation": "foreign-key",
+          "native_checkpoint_publications": 2,
+          "seconds": 0.09772279197932221
+        },
+        {
+          "operation": "session-unconstrained",
+          "native_checkpoint_publications": 3,
+          "seconds": 0.09163124999031425
+        },
+        {
+          "operation": "session-document",
+          "native_checkpoint_publications": 2,
+          "seconds": 0.03822891699383035
+        },
+        {
+          "operation": "session-one-namespace",
+          "native_checkpoint_publications": 3,
+          "seconds": 0.045932000008178875
+        },
+        {
+          "operation": "session-two-namespace",
+          "native_checkpoint_publications": 3,
+          "seconds": 0.06940141701488756
+        }
+      ],
+      "integrity_valid": true,
+      "database_retained": false
+    }
+  },
+  "regressions": [
+    "CHECK-only coverage repairs still reject invalid postimages, and all original 2\u201312 MiB statement cases pass at the unchanged 256 MiB working-memory quota.",
+    "SQL defaults, updates and deletion publish two text indexes and primary data in one checkpoint for autocommit and session COMMIT, with query visibility.",
+    "Normalization retains one exact packed row authority rather than mapping twice.",
+    "An exact post-admission footprint refusal waits outside owner/path admission while another connection returns actual replay credits, without raising quotas.",
+    "A proven precommit capacity timeout preserves staged COMMIT state and retry applies its increment exactly once.",
+    "Canceled capacity sleep returns without another mutation admission.",
+    "Drop/recreate and physical/logical generation replacement cannot silently retarget a capacity retry.",
+    "SQL asynchronous replay retains bounded runtime reuse; stable allocator proofs are captured once across handoffs."
+  ],
+  "outcome_contract": "Only confirmed precommit capacity refusals retry already-owned postimages. Applied or uncertain outcomes never retry. Generic errors retain abort semantics.",
+  "public_sdk_or_format_change": false,
+  "remaining": [
+    "Fresh unchanged original importer and semantic verification.",
+    "Final optimized qualification on wolfspider against retained references.",
+    "Human aggregate CI and Beads-owned full factory."
+  ],
+  "retention": "One reusable importer database; no database archive per candidate/run."
+}

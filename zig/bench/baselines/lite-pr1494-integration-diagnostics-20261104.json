@@ -1,0 +1,528 @@
+{
+  "qualified": false,
+  "scope": "PR1494 integration, selected native/SDK validation, and local unchanged-importer diagnostics. No production timing or end-to-end qualification claim.",
+  "runtime_source_commit": "e243c0ad9cd2fb612dfae09a660daabed50e7489",
+  "upstream_pr": 1494,
+  "upstream_head": "a450cd104658d9cd7d73722f9fa3ad0a5728acf3",
+  "integration_pr": 1454,
+  "integration_decisions": [
+    "Keep the existing generation/configuration/incarnation-bound document-family fragment protocol, including asset families; do not run a second sequence/offset cursor protocol.",
+    "Keep exclusive path-owned allocator loans as the primary path; the copied-ledger API is a cold fallback. Both measured importer runs used zero ledger copies.",
+    "Combine outcome receipts with existing commit/mutation dispositions in all embedded SDKs. Preserve the pre-commit-only batch capacity retry and request-owned response buffer.",
+    "Keep uncertain Lite owners fenced; resolve a receipt through a fresh handle after close/reopen. Named-table receipts carry their durable table id and fail closed after replacement.",
+    "Validate a fresh checkpoint after admission validation that can publish control records. Keep index-read fences.",
+    "Attribute successful and refused writer holds by site under the owner gate. Restore original outermost publication-hold/controller feedback alongside these new counters and verify nested release does not charge twice.",
+    "Preserve per-key changing-word visibility checks when benchmarking multi-document batches."
+  ],
+  "validation": {
+    "mode": "Debug",
+    "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+    "library_sha256": "fe873a5c740011177fc498f765e14d896780d58afcce93ceda40f85e5d70e97b",
+    "library_bytes": 285379152,
+    "selected_native_sql_resolver": {
+      "passed": 180,
+      "failed": 0,
+      "skipped": 0,
+      "leaks": 0,
+      "binary_sha256": "904d3d1e2c885dbfb7019cde0cf6e06e91d46179857afc2efd66bc55c0a4cda9",
+      "log_sha256": "ff59a563d0f996d1c0f0f3dab3dedc085d9efe9b9066fa955dd95395b886926c"
+    },
+    "outcome_cases_included_in_native_suite": 23,
+    "focused_copied_ledger_and_control_accounting": {
+      "passed": 2,
+      "anonymous_import_checks_passed": 11,
+      "source_commit": "aa0610f69a8f7c43c41f3ee43ffb9a367ff3fa7a"
+    },
+    "cabi_public_exports": 138,
+    "cabi_smoke_and_c_consumer_linkage_passed": true,
+    "c_header_copies_match": true,
+    "all_changed_zig_ast_files_passed": 16,
+    "sdk_suite_source_commit": "e243c0ad9cd2fb612dfae09a660daabed50e7489",
+    "sdk_suite_library_sha256": "fe873a5c740011177fc498f765e14d896780d58afcce93ceda40f85e5d70e97b",
+    "sdk_scope_note": "Final SDK suites used the same corrected frozen artifact as both final importer runs. Test checkout 1305f246a1 adds only the diagnostic receipt to runtime source e243c0ad9c.",
+    "python_selected_passed": 209,
+    "python_note": "All 209 selected cases pass in one final run, including the loopback-only HTTP provider mock.",
+    "typescript_selected_passed": 177,
+    "typescript_native_library_required": true,
+    "rust_selected_passed": 23,
+    "go_database_selected_passed": 55,
+    "go_database_skipped": 2,
+    "go_note": "Selected database suite with libantfly and loopback access. Unrelated inference-model tests are explicitly excluded; no full model qualification is claimed.",
+    "python_pure_passed": 24,
+    "benchmark_reporting_passed": 24,
+    "typescript_typecheck_passed": true,
+    "rust_default_feature_check_passed": true,
+    "sdk_test_checkout_commit": "1305f246a1c98d946aa519808d8816fa34b34daf",
+    "go_skipped_tests": [
+      "TestBundledCABIHeaderMatchesSourceTree",
+      "TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity"
+    ]
+  },
+  "unchanged_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+  "fresh_input7": {
+    "input_index": 7,
+    "importer_exit_code": 1,
+    "censored": false,
+    "importer_succeeded": false,
+    "summary": [
+      0,
+      0,
+      1
+    ],
+    "seconds": 255.35926245804876,
+    "peak_native_builds": 5,
+    "metrics_enabled": true,
+    "library_sha256": "fe873a5c740011177fc498f765e14d896780d58afcce93ceda40f85e5d70e97b",
+    "public_errors": [
+      "LiteReplayBacklogExceeded"
+    ],
+    "seed_sha256": null,
+    "seed_copy_method": null,
+    "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution.",
+    "qualification": false,
+    "primary_batch_profiles": 60,
+    "primary_writes": 61440,
+    "full_text_profiles": 191,
+    "full_text_completed_profile_sums": {
+      "documents": 4967,
+      "total_ms": 51115,
+      "full_text_collect_ms": 922,
+      "full_text_plan_ms": 382,
+      "full_text_prepare_ms": 2891,
+      "full_text_apply_lock_held_ms": 5243
+    },
+    "events": {
+      "antfly_bench_replay_refusal": {
+        "bytes_before": 16781220,
+        "bytes_after": 17031400,
+        "records_before": 468,
+        "records_after": 472,
+        "byte_limit": 16777216,
+        "record_limit": 4096
+      },
+      "antfly_bench_native_owner": {
+        "source_turns": 295,
+        "capture_ns": 10989167000,
+        "replay_ns": 120377921000,
+        "artifacts_ns": 53907673000,
+        "storage_ns": 36289737000,
+        "runtime_refreshes": 712,
+        "maintenance_errors": 229,
+        "maintenance_timeouts": 0,
+        "merge_started": 75,
+        "merge_applied": 75,
+        "merge_discarded": 0,
+        "merge_prepare_ns": 1052983000,
+        "merge_staging_ns": 1409950000,
+        "merge_staged_bytes": 3676928,
+        "merge_publication_ns": 15991912000,
+        "sql_overlay_hits": 626,
+        "sql_overlay_scope_extensions": 82,
+        "sql_overlay_rebuilds": 120,
+        "sql_overlay_rebuild_entries": 0,
+        "sql_overlay_evictions": 0,
+        "sql_staged_statements": 414,
+        "replay_waits": 1,
+        "replay_refused_prepare_ns": 482685417
+      },
+      "antfly_bench_native_hold_writer_primary": {
+        "count": 931,
+        "ns": 4360380367,
+        "max_ns": 110812542
+      },
+      "antfly_bench_native_hold_writer_index": {
+        "count": 1068,
+        "ns": 8014055681,
+        "max_ns": 262796209
+      },
+      "antfly_bench_native_hold_writer_index_read": {
+        "count": 606,
+        "ns": 810202123,
+        "max_ns": 33015083
+      },
+      "antfly_bench_native_hold_writer_reclamation": {
+        "count": 364,
+        "ns": 44897407,
+        "max_ns": 1258375
+      },
+      "antfly_bench_native_hold_writer_artifact_lease": {
+        "count": 3,
+        "ns": 4009625,
+        "max_ns": 1707750
+      },
+      "antfly_bench_native_hold_writer_allocator_service": {
+        "count": 832,
+        "ns": 6087332661,
+        "max_ns": 60375000
+      },
+      "antfly_bench_native_hold_publish_replay": {
+        "count": 0,
+        "ns": 0,
+        "max_ns": 0
+      },
+      "antfly_bench_native_hold_generated_commit": {
+        "count": 0,
+        "ns": 0,
+        "max_ns": 0
+      },
+      "antfly_bench_native_hold_generated_store": {
+        "count": 0,
+        "ns": 0,
+        "max_ns": 0
+      },
+      "antfly_bench_native_hold_heartbeat": {
+        "count": 0,
+        "ns": 0,
+        "max_ns": 0
+      },
+      "antfly_bench_native_hold_turn_capture": {
+        "count": 427,
+        "ns": 13070713448,
+        "max_ns": 336537583
+      },
+      "antfly_bench_native_hold_storage_turn": {
+        "count": 377,
+        "ns": 59281208,
+        "max_ns": 1508000
+      },
+      "antfly_bench_native_hold_idle_adopt": {
+        "count": 57,
+        "ns": 17469751,
+        "max_ns": 2721792
+      },
+      "antfly_bench_native_capture_steps": {
+        "refresh_ns": 1661696861,
+        "marker_sweep_ns": 557682716,
+        "recover_ns": 53340255,
+        "catalog_ns": 9314013984,
+        "debt_checks_ns": 156224336,
+        "schedule_ns": 56806965,
+        "snapshot_ns": 9594998,
+        "publication_catalog_ns": 78395511
+      },
+      "antfly_bench_native_runtime_cache_capture_attempts": {
+        "count": 364
+      },
+      "antfly_bench_native_runtime_cache_captured": {
+        "count": 324
+      },
+      "antfly_bench_native_runtime_cache_miss_no_cache": {
+        "count": 36
+      },
+      "antfly_bench_native_runtime_cache_miss_closed": {
+        "count": 83
+      },
+      "antfly_bench_native_runtime_cache_miss_indexes": {
+        "count": 1
+      },
+      "antfly_bench_native_runtime_cache_not_retained_failed": {
+        "count": 23
+      },
+      "antfly_bench_native_runtime_cache_retained_storage_yield": {
+        "count": 81
+      },
+      "antfly_bench_native_runtime_cache_blocked_enrichment": {
+        "count": 38
+      },
+      "antfly_bench_native_runtime_cache_blocked_nontext_indexes": {
+        "count": 2
+      },
+      "antfly_bench_native_allocator": {
+        "full_loads": 1,
+        "full_load_ns": 205208,
+        "digest_rebuilds": 0,
+        "digest_rebuild_ns": 0,
+        "journal_rebases": 0,
+        "journal_rebase_ns": 0,
+        "cache_transfers": 34373,
+        "cache_copies": 0
+      },
+      "antfly_bench_native_artifact_sources": {
+        "opens": 2067,
+        "reuses": 3695
+      },
+      "antfly_bench_native_runtime": {
+        "maintenance_opens": 124,
+        "namespace_opens": 345,
+        "source_reuses": 297
+      },
+      "antfly_bench_native_service": {
+        "refresh_ns": 6030197000,
+        "replay_publication_overhead_ns": 109342750075,
+        "index_admission_ns": 33534348000,
+        "metadata_admission_ns": 20695725000,
+        "publication_hold_ns": 18658119459
+      },
+      "antfly_bench_native_owner_failures": {
+        "capture": 0,
+        "source": 15,
+        "retirement": 11,
+        "artifacts": 0,
+        "storage": 203
+      },
+      "antfly_bench_native_path_leases": {
+        "leases": 5580,
+        "admission_ns": 1006790596,
+        "admission_max_ns": 31483958,
+        "hold_ns": 231131000440,
+        "hold_max_ns": 6656801958
+      }
+    },
+    "maintenance_failure_phases": {
+      "storage": 203,
+      "source": 15,
+      "retirement": 11
+    }
+  },
+  "seeded_input7": {
+    "input_index": 7,
+    "importer_exit_code": 1,
+    "censored": false,
+    "importer_succeeded": false,
+    "summary": [
+      0,
+      0,
+      1
+    ],
+    "seconds": 156.1658455830766,
+    "peak_native_builds": 20,
+    "metrics_enabled": true,
+    "library_sha256": "fe873a5c740011177fc498f765e14d896780d58afcce93ceda40f85e5d70e97b",
+    "public_errors": [
+      "LiteReplayBacklogExceeded"
+    ],
+    "seed_sha256": "27ea0ac6beecde2ca727132143e214c17ef5f38010db3762f605551806673519",
+    "seed_copy_method": "native_stable_snapshot",
+    "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution.",
+    "qualification": false,
+    "primary_batch_profiles": 19,
+    "primary_writes": 19456,
+    "full_text_profiles": 61,
+    "full_text_completed_profile_sums": {
+      "documents": 939,
+      "total_ms": 14881,
+      "full_text_collect_ms": 272,
+      "full_text_plan_ms": 97,
+      "full_text_prepare_ms": 388,
+      "full_text_apply_lock_held_ms": 4221
+    },
+    "events": {
+      "antfly_bench_replay_refusal": {
+        "bytes_before": 16599285,
+        "bytes_after": 16849465,
+        "records_before": 417,
+        "records_after": 421,
+        "byte_limit": 16777216,
+        "record_limit": 4096
+      },
+      "antfly_bench_native_owner": {
+        "source_turns": 89,
+        "capture_ns": 7334508000,
+        "replay_ns": 47308022000,
+        "artifacts_ns": 44587920000,
+        "storage_ns": 22317491000,
+        "runtime_refreshes": 221,
+        "maintenance_errors": 36,
+        "maintenance_timeouts": 0,
+        "merge_started": 23,
+        "merge_applied": 22,
+        "merge_discarded": 1,
+        "merge_prepare_ns": 6980700000,
+        "merge_staging_ns": 898500000,
+        "merge_staged_bytes": 25192576,
+        "merge_publication_ns": 14720892000,
+        "sql_overlay_hits": 208,
+        "sql_overlay_scope_extensions": 22,
+        "sql_overlay_rebuilds": 38,
+        "sql_overlay_rebuild_entries": 0,
+        "sql_overlay_evictions": 0,
+        "sql_staged_statements": 134,
+        "replay_waits": 1,
+        "replay_refused_prepare_ns": 659021250
+      },
+      "antfly_bench_native_hold_writer_primary": {
+        "count": 271,
+        "ns": 3261236506,
+        "max_ns": 448108625
+      },
+      "antfly_bench_native_hold_writer_index": {
+        "count": 347,
+        "ns": 5767721419,
+        "max_ns": 525419958
+      },
+      "antfly_bench_native_hold_writer_index_read": {
+        "count": 269,
+        "ns": 510156575,
+        "max_ns": 120760500
+      },
+      "antfly_bench_native_hold_writer_reclamation": {
+        "count": 112,
+        "ns": 23254707,
+        "max_ns": 1833084
+      },
+      "antfly_bench_native_hold_writer_artifact_lease": {
+        "count": 0,
+        "ns": 0,
+        "max_ns": 0
+      },
+      "antfly_bench_native_hold_writer_allocator_service": {
+        "count": 273,
+        "ns": 4453882752,
+        "max_ns": 119718250
+      },
+      "antfly_bench_native_hold_publish_replay": {
+        "count": 0,
+        "ns": 0,
+        "max_ns": 0
+      },
+      "antfly_bench_native_hold_generated_commit": {
+        "count": 0,
+        "ns": 0,
+        "max_ns": 0
+      },
+      "antfly_bench_native_hold_generated_store": {
+        "count": 0,
+        "ns": 0,
+        "max_ns": 0
+      },
+      "antfly_bench_native_hold_heartbeat": {
+        "count": 0,
+        "ns": 0,
+        "max_ns": 0
+      },
+      "antfly_bench_native_hold_turn_capture": {
+        "count": 126,
+        "ns": 9631922286,
+        "max_ns": 362969084
+      },
+      "antfly_bench_native_hold_storage_turn": {
+        "count": 116,
+        "ns": 22297760,
+        "max_ns": 1127500
+      },
+      "antfly_bench_native_hold_idle_adopt": {
+        "count": 16,
+        "ns": 6079208,
+        "max_ns": 1090250
+      },
+      "antfly_bench_native_capture_steps": {
+        "refresh_ns": 720025995,
+        "marker_sweep_ns": 283662007,
+        "recover_ns": 3970617,
+        "catalog_ns": 7917370629,
+        "debt_checks_ns": 60610709,
+        "schedule_ns": 15955255,
+        "snapshot_ns": 9122527,
+        "publication_catalog_ns": 28996597
+      },
+      "antfly_bench_native_runtime_cache_capture_attempts": {
+        "count": 108
+      },
+      "antfly_bench_native_runtime_cache_captured": {
+        "count": 96
+      },
+      "antfly_bench_native_runtime_cache_miss_no_cache": {
+        "count": 26
+      },
+      "antfly_bench_native_runtime_cache_miss_closed": {
+        "count": 3
+      },
+      "antfly_bench_native_runtime_cache_not_retained_failed": {
+        "count": 1
+      },
+      "antfly_bench_native_runtime_cache_retained_storage_yield": {
+        "count": 15
+      },
+      "antfly_bench_native_runtime_cache_blocked_enrichment": {
+        "count": 11
+      },
+      "antfly_bench_native_runtime_cache_blocked_nontext_indexes": {
+        "count": 1
+      },
+      "antfly_bench_native_allocator": {
+        "full_loads": 1,
+        "full_load_ns": 110141500,
+        "digest_rebuilds": 1,
+        "digest_rebuild_ns": 43663000,
+        "journal_rebases": 0,
+        "journal_rebase_ns": 0,
+        "cache_transfers": 10586,
+        "cache_copies": 0
+      },
+      "antfly_bench_native_artifact_sources": {
+        "opens": 1112,
+        "reuses": 1707
+      },
+      "antfly_bench_native_runtime": {
+        "maintenance_opens": 32,
+        "namespace_opens": 104,
+        "source_reuses": 93
+      },
+      "antfly_bench_native_service": {
+        "refresh_ns": 3379426000,
+        "replay_publication_overhead_ns": 43294185415,
+        "index_admission_ns": 6949168000,
+        "metadata_admission_ns": 10045476000,
+        "publication_hold_ns": 13716015599
+      },
+      "antfly_bench_native_owner_failures": {
+        "capture": 0,
+        "source": 0,
+        "retirement": 0,
+        "artifacts": 2,
+        "storage": 34
+      },
+      "antfly_bench_native_path_leases": {
+        "leases": 1792,
+        "admission_ns": 615345961,
+        "admission_max_ns": 94915250,
+        "hold_ns": 135846389766,
+        "hold_max_ns": 4301610792
+      }
+    },
+    "maintenance_failure_phases": {
+      "storage": 34,
+      "artifacts": 2
+    }
+  },
+  "offline_retained_journal_inventory": {
+    "scope": "Offline local snapshot replay inventory, no reference binary execution or timing qualification.",
+    "leaf_pages": 60974,
+    "indexed_keys": 1623405,
+    "physical_replay_records": 364,
+    "charged_replay_bytes": 16556452,
+    "maximum_changed_doc_keys": 1024,
+    "maximum_items": 1024,
+    "lane_counts": {
+      "1": 100,
+      "5": 100,
+      "254": 100,
+      "0": 64
+    },
+    "seconds": 6.617311374982819
+  },
+  "findings": [
+    "The corrected library fails the same original input on both a fresh database and the preserved prefix-7 seed. Inherited backlog or legacy segments cannot be the sole cause of failure in these Debug diagnostics.",
+    "Ledger reconstruction is small in both runs. No copied-ledger fallback was used. This fixture does not support treating allocator copying as the remaining root-cause fix.",
+    "Fresh-run replay publication overhead is approximately 109 seconds within approximately 120 seconds of replay wall time; completed full-text profiles report approximately 2.9 seconds of preparation. These counters overlap and exclude failed-operation profiles; they are not additive wall-time attribution.",
+    "Mixed-index/enrichment eligibility restrictions and repeated runtime/source reconstruction remain relevant. Do not remove safety fences merely to admit those actors into the existing text-only cache.",
+    "Retained journal records contain up to 1024 document keys and projected payloads in several consumer lanes. Bounded service throughput, whole-record quota recovery, and the duplicated lane payload representation warrant separate causal probes."
+  ],
+  "next_architectural_work": [
+    "Measure and reduce repeated publication/admission joins: investigate bounded native output plus progress/fragment publication in one durable transaction, preserving portable backend ordering and crash safety.",
+    "Investigate canonical replay payloads with small lane references while preserving per-lane filtering, quota accounting, retirement, and format compatibility.",
+    "Retain safely reusable immutable source/layout state independently of whole mixed table/provider actors; prove lifetime and pressure bounds with targeted regressions."
+  ],
+  "not_completed": [
+    "Successful unchanged original-importer end-to-end qualification",
+    "Optimized candidate-only wolfspider qualification and sustained active-write soaks",
+    "Repository-wide CI and model qualification",
+    "Full factory qualification owned by Beads"
+  ],
+  "baseline_build_or_execution": false,
+  "wolfspider_workload_run": false,
+  "limitations": [
+    "Local Debug diagnostics have metrics enabled and unrelated compilation on the shared host. Do not use elapsed times as matched performance measurements.",
+    "Passing selected native and SDK tests does not qualify complete repository CI, original imports, sustained visibility/storage bounds, model behavior, or the factory."
+  ]
+}

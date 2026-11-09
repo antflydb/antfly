@@ -39,6 +39,7 @@ const typed_edges = @import("typed_edges.zig");
 const maintenance = @import("maintenance.zig");
 const cancellation_mod = @import("antfly_cancellation");
 const backend_erased = @import("../storage/backend_erased.zig");
+const native_namespace_backend = @import("../storage/namespace_bound_store.zig");
 const backend_scan = @import("../storage/backend_scan.zig");
 const docstore = @import("../storage/docstore.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
@@ -1254,12 +1255,14 @@ pub const GraphIndex = struct {
 
     const ReverseStoreOwner = union(enum) {
         none,
+        native: *native_namespace_backend.Backend,
         mem: *mem_backend.Backend,
         lsm: lsm_backend.BackendHandle,
 
         fn close(self: *ReverseStoreOwner, alloc: Allocator) void {
             switch (self.*) {
                 .none => {},
+                .native => |backend| backend.close(),
                 .mem => |backend| {
                     backend.close();
                     alloc.destroy(backend);
@@ -1272,6 +1275,7 @@ pub const GraphIndex = struct {
         fn abandonAfterCrash(self: *ReverseStoreOwner, alloc: Allocator) void {
             switch (self.*) {
                 .none => {},
+                .native => |backend| backend.close(),
                 .mem => |backend| {
                     backend.close();
                     alloc.destroy(backend);
@@ -1283,14 +1287,14 @@ pub const GraphIndex = struct {
 
         pub fn sync(self: *ReverseStoreOwner, force: bool) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native => {},
                 .lsm => |*handle| try handle.backend.sync(force),
             }
         }
 
         fn ensureDurableEmptyManifest(self: *ReverseStoreOwner) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native => {},
                 .lsm => |*handle| {
                     if (handle.backend.options.backend.read_only) return;
                     if (handle.backend.manifest_backing != null) return;
@@ -1302,7 +1306,7 @@ pub const GraphIndex = struct {
 
         fn checkpointLsmWalAfterDurableBoundary(self: *ReverseStoreOwner) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native => {},
                 .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
             }
         }
@@ -1310,7 +1314,7 @@ pub const GraphIndex = struct {
         fn pinNativeCheckpoint(self: *ReverseStoreOwner) !lsm_backend.Backend.NativeCheckpoint {
             return switch (self.*) {
                 .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
-                .none, .mem => error.Unsupported,
+                .none, .mem, .native => error.Unsupported,
             };
         }
     };
@@ -6822,6 +6826,18 @@ pub const GraphIndex = struct {
                 };
             },
             .lsm => {
+                const native_options = resolvedReverseLsmOptions(opts, false);
+                if (native_options.storage) |storage| {
+                    if (try storage.openNativeNamespaces(alloc, std.mem.span(path), native_options.backend.read_only)) |namespaces_value| {
+                        var namespaces = namespaces_value;
+                        var transferred = false;
+                        defer if (!transferred) namespaces.deinit();
+                        const backend = try native_namespace_backend.Backend.init(alloc, namespaces);
+                        transferred = true;
+                        errdefer backend.close();
+                        return .{ .store = try backend.runtimeStore(alloc), .owner = .{ .native = backend } };
+                    }
+                }
                 var handle = try lsm_backend.BackendHandle.open(alloc, std.mem.span(path), resolvedReverseLsmOptions(opts, false));
                 errdefer handle.close();
 

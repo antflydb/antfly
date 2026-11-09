@@ -373,18 +373,70 @@ pub const BackfillPage = struct {
     }
 };
 
+/// Immutable, request-owned authorities for exact postimages. Building hashes
+/// and JSON field certificates requires no runtime, snapshot or writer lease.
+/// A synchronous batch may borrow them only until its commit/abort returns.
+pub const PreparedValues = struct {
+    const Value = struct {
+        body: []u8,
+        kind: u8,
+        digest: [32]u8,
+        publication: value_identity.Publication,
+        fn deinit(self: *Value, alloc: std.mem.Allocator) void {
+            alloc.free(self.body);
+            if (self.publication.directory) |raw| alloc.free(raw);
+            if (self.publication.identities) |raw| alloc.free(raw);
+        }
+    };
+    values: std.AutoHashMapUnmanaged(Key, Value) = .empty,
+
+    pub fn deinit(self: *PreparedValues, alloc: std.mem.Allocator) void {
+        var values = self.values.valueIterator();
+        while (values.next()) |value| value.deinit(alloc);
+        self.values.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn add(self: *PreparedValues, alloc: std.mem.Allocator, physical: []const u8, body: []const u8) !void {
+        if (!keys.isStoredDocumentRowKey(physical)) return;
+        const key = keyForPhysical(physical).?;
+        const copy = try alloc.dupe(u8, body);
+        errdefer alloc.free(copy);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(copy, &digest, .{});
+        const kind = physical[physical.len - 1];
+        const publication = try value_identity.buildAuthority(alloc, copy, kind, digest);
+        errdefer {
+            if (publication.directory) |raw| alloc.free(raw);
+            if (publication.identities) |raw| alloc.free(raw);
+        }
+        const entry = try self.values.getOrPut(alloc, key);
+        if (entry.found_existing) entry.value_ptr.deinit(alloc);
+        entry.value_ptr.* = .{ .body = copy, .kind = kind, .digest = digest, .publication = publication };
+    }
+
+    fn get(self: *const PreparedValues, physical: []const u8, body: []const u8) ?Value {
+        if (!keys.isStoredDocumentRowKey(physical)) return null;
+        const key = keyForPhysical(physical) orelse return null;
+        const value = self.values.get(key) orelse return null;
+        if (value.kind != physical[physical.len - 1] or !std.mem.eql(u8, value.body, body)) return null;
+        return value;
+    }
+};
+
 /// One revision per affected document per transaction, including artifact-only
 /// commits. Capture fixed keys rather than retaining every artifact key.
 pub const Capture = struct {
-    const Change = union(enum) { unchanged, deleted, written: struct { proof: Content, directory: ?[]u8, identities: ?[]u8 = null } };
+    const Change = union(enum) { unchanged, deleted, written: struct { proof: Content, directory: ?[]u8, identities: ?[]u8 = null, owned: bool = true } };
     documents: std.AutoHashMapUnmanaged(Key, Change) = .empty,
     staged: bool = false,
+    prepared_values: ?*const PreparedValues = null,
     identity_reuse: value_identity.ReuseStats = .{},
     poisoned: bool = false,
 
     pub fn deinit(self: *Capture, alloc: std.mem.Allocator) void {
         var values = self.documents.valueIterator();
-        while (values.next()) |value| if (value.* == .written) {
+        while (values.next()) |value| if (value.* == .written and value.written.owned) {
             if (value.written.directory) |directory| alloc.free(directory);
             if (value.written.identities) |identities| alloc.free(identities);
         };
@@ -402,6 +454,7 @@ pub const Capture = struct {
     /// Hash primary bytes once at the common physical writer boundary. The
     /// fixed map entry coalesces repeated writes and retains no document body.
     pub fn touchValue(self: *Capture, alloc: std.mem.Allocator, physical: []const u8, value: ?[]const u8) !void {
+        if (value) |body| if (try self.touchOwnedValue(alloc, physical, body)) return;
         return self.touchValuePrepared(alloc, physical, value, null);
     }
 
@@ -409,6 +462,7 @@ pub const Capture = struct {
     /// Fresh/unsupported rows require no primary-body read. Repeated writes use
     /// this transaction's most recent publication rather than the older snapshot.
     pub fn touchValueWithReader(self: *Capture, alloc: std.mem.Allocator, reader: anytype, physical: []const u8, value: ?[]const u8) !void {
+        if (value) |body| if (try self.touchOwnedValue(alloc, physical, body)) return;
         try self.touch(alloc, physical);
         if (!keys.isStoredDocumentRowKey(physical) or value == null or value.?.len < projection.minimum_bytes)
             return self.touchValuePrepared(alloc, physical, value, null);
@@ -440,6 +494,24 @@ pub const Capture = struct {
         return self.touchValuePrepared(alloc, physical, value, .{ .bytes = proof.bytes, .kind = proof.kind, .digest = proof.digest, .directory = directory, .identities = raw_certificate });
     }
 
+    fn touchOwnedValue(self: *Capture, alloc: std.mem.Allocator, physical: []const u8, body: []const u8) !bool {
+        const prepared = self.prepared_values orelse return false;
+        const value = prepared.get(physical, body) orelse return false;
+        try self.touch(alloc, physical);
+        const entry = self.documents.getPtr(keyForPhysical(physical).?).?;
+        if (entry.* == .written and entry.written.owned) {
+            if (entry.written.directory) |raw| alloc.free(raw);
+            if (entry.written.identities) |raw| alloc.free(raw);
+        }
+        entry.* = .{ .written = .{
+            .proof = .{ .revision = 0, .bytes = body.len, .kind = value.kind, .digest = value.digest },
+            .directory = value.publication.directory,
+            .identities = value.publication.identities,
+            .owned = false,
+        } };
+        return true;
+    }
+
     fn touchValuePrepared(self: *Capture, alloc: std.mem.Allocator, physical: []const u8, value: ?[]const u8, prior: ?value_identity.Prior) !void {
         try self.touch(alloc, physical);
         if (!keys.isStoredDocumentRowKey(physical)) return;
@@ -460,7 +532,7 @@ pub const Capture = struct {
             self.identity_reuse.canonical_bytes +|= reuse.canonical_bytes;
             break :blk .{ .written = .{ .proof = .{ .revision = 0, .bytes = bytes.len, .kind = kind, .digest = digest }, .directory = publication.directory, .identities = publication.identities } };
         } else .deleted;
-        if (entry.* == .written) {
+        if (entry.* == .written and entry.written.owned) {
             if (entry.written.directory) |directory| alloc.free(directory);
             if (entry.written.identities) |identities| alloc.free(identities);
         }
@@ -1056,6 +1128,69 @@ test "document mutation revision reused publications release every allocation on
             try capture.touchValue(a, physical, first);
             try capture.touchValue(a, physical, second);
             try std.testing.expect(capture.identity_reuse.reused_bytes >= 16 * 1024);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "owned document content authorities bind exact postimages and retain no writer snapshot" {
+    const a = std.testing.allocator;
+    const physical = try keys.documentKeyAlloc(a, "owned-proof");
+    defer a.free(physical);
+    const other = try keys.documentKeyAlloc(a, "different-document");
+    defer a.free(other);
+    const body = "{\"large\":\"" ++ @as([16 * 1024]u8, @splat('x')) ++ "\",\"n\":1}";
+    const changed = "{\"large\":\"" ++ @as([16 * 1024]u8, @splat('x')) ++ "\",\"n\":2}";
+    var prepared: PreparedValues = .{};
+    defer prepared.deinit(a);
+    try prepared.add(a, physical, body);
+    const NoReader = struct {
+        pub fn get(_: @This(), _: []const u8) ![]const u8 {
+            return error.UnexpectedPrimaryRead;
+        }
+    };
+    var capture: Capture = .{ .prepared_values = &prepared };
+    defer capture.deinit(a);
+    try capture.touchValueWithReader(a, NoReader{}, physical, body);
+    const written = capture.documents.get(keyForPhysical(physical).?).?.written;
+    try std.testing.expect(!written.owned);
+    try std.testing.expect(written.directory != null and written.identities != null);
+    var expected: Capture = .{};
+    defer expected.deinit(a);
+    try expected.touchValue(a, physical, body);
+    const computed = expected.documents.get(keyForPhysical(physical).?).?.written;
+    try std.testing.expect(std.meta.eql(computed.proof, written.proof));
+    try std.testing.expectEqualSlices(u8, computed.directory.?, written.directory.?);
+    try std.testing.expectEqualSlices(u8, computed.identities.?, written.identities.?);
+    // Repeated effects must never attach the old proof to changed bytes. A
+    // later matching effect may borrow again, then deletion drops the proof.
+    try capture.touchValue(a, physical, changed);
+    try std.testing.expect(capture.documents.get(keyForPhysical(physical).?).?.written.owned);
+    try capture.touchValue(a, physical, body);
+    try std.testing.expect(!capture.documents.get(keyForPhysical(physical).?).?.written.owned);
+    try capture.touchValue(a, physical, null);
+    try std.testing.expect(capture.documents.get(keyForPhysical(physical).?).? == .deleted);
+    var mismatch: Capture = .{ .prepared_values = &prepared };
+    defer mismatch.deinit(a);
+    try std.testing.expectError(error.UnexpectedPrimaryRead, mismatch.touchValueWithReader(a, NoReader{}, other, body));
+}
+
+test "owned document content authorities release every allocation on failure" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const physical = try keys.documentKeyAlloc(a, "owned-failure");
+            defer a.free(physical);
+            const body = "{\"large\":\"" ++ @as([16 * 1024]u8, @splat('x')) ++ "\"}";
+            var prepared: PreparedValues = .{};
+            defer prepared.deinit(a);
+            try prepared.add(a, physical, body);
+            try prepared.add(a, physical, body);
+            var capture: Capture = .{ .prepared_values = &prepared };
+            defer capture.deinit(a);
+            try capture.touchValue(a, physical, body);
+            try capture.touchValue(a, physical, "{}");
+            try capture.touchValue(a, physical, body);
         }
     };
     try Case.run(std.testing.allocator);

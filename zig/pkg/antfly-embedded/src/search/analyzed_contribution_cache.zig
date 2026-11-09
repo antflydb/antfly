@@ -87,6 +87,7 @@ pub const Cache = struct {
     manager: *resources.ResourceManager,
     metadata: resources.Reservation,
     reclaimer: u64 = 0,
+    owner_references: atomic.Value(usize) = .init(1),
     hits: atomic.Value(u64) = .init(0),
     tokens_reused: atomic.Value(u64) = .init(0),
     entries: [slots]Entry = @splat(.{}),
@@ -264,7 +265,14 @@ pub const Cache = struct {
         }
         return freed;
     }
+    /// An independent preparation capability retains the ResourceManager
+    /// separately; this reference keeps only the immutable compilation cache.
+    pub fn retainOwner(self: *Cache) void {
+        const previous = self.owner_references.fetchAdd(1, .monotonic);
+        std.debug.assert(previous != 0);
+    }
     pub fn deinit(self: *Cache) void {
+        if (self.owner_references.fetchSub(1, .acq_rel) != 1) return;
         self.manager.unregisterReclaimer(self.reclaimer);
         _ = reclaim(self, std.math.maxInt(u64));
         for (self.entries) |slot| std.debug.assert(slot.borrowers == 0);

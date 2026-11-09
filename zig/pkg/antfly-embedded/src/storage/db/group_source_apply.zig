@@ -23,6 +23,28 @@ const snapshot = @import("group_source_snapshot.zig");
 const keys = @import("../internal_keys.zig");
 const A = std.mem.Allocator;
 
+pub fn requireCommandContext(overlay: *mutations.Overlay, plan: *const mutations.Plan, command: contract.Command, table_id: u64, root_incarnation: u128, namespace: [24]u8) !?mutations.Plan.Entry {
+    var selected: ?mutations.Plan.Entry = null;
+    for (plan.entries) |entry| if (std.mem.eql(u8, entry.name, command.artifact) and std.mem.eql(u8, &entry.configuration, &command.definition.configuration)) {
+        selected = entry;
+        break;
+    };
+    if (selected == null and command.action != .retire and !command.isActivation()) return error.PreparedGenerationChanged;
+    if (try mutations.tableIdentity(overlay, table_id, root_incarnation) != command.definition.table_incarnation or
+        !std.mem.eql(u8, &namespace, &command.namespace)) return error.InvalidGroupedSourceCommand;
+    return selected;
+}
+
+/// A local owner has one source contribution. Its lease can remain current
+/// while a newer source event is still waiting in the outbox, so lease CAS
+/// alone cannot authorize fan-in computed before that event. Check the exact
+/// partition revision under the same primary admission as publication.
+pub fn requireLocalSourceCut(a: A, txn: anytype, publication: contract.Publish, expected_owner: state.Owner) !void {
+    if (publication.topology_epoch != 0 or publication.sources.len != 1 or
+        !std.meta.eql(publication.sources[0].owner, expected_owner)) return error.EnrichmentSourceChanged;
+    if (publication.sources[0].revision != try index.partitionRevision(a, txn, publication.held.group.definition, publication.held.partition)) return error.EnrichmentSourceChanged;
+}
+
 pub fn stage(a: A, overlay: *mutations.Overlay, command: contract.Command, next_sequence: u64, horizons: []const u16) !snapshot.Staged {
     try command.validate();
     const empty = snapshot.Staged{ .changed = &.{}, .deleted = &.{}, .sequence = 0 };
@@ -71,4 +93,44 @@ fn decode(a: A, raw: []const u8) ![]u8 {
     const bytes = try a.alloc(u8, decoder.calcSizeForSlice(raw) catch return error.InvalidGroupedSourceCommand);
     decoder.decode(bytes, raw) catch return error.InvalidGroupedSourceCommand;
     return bytes;
+}
+
+test "grouped sources production local publication fences source edits before outbox invalidation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Reader = struct {
+        allocator: A,
+        revision: u64 = 1,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, self.revision, .big);
+            return @import("group_source_queue.zig").encode(self.allocator, key, &bytes);
+        }
+    };
+    var reader: Reader = .{ .allocator = a };
+    const owner: state.Owner = .{ .namespace = @splat(1), .incarnation = 7 };
+    var cut = [_]contract.SourceCut{.{ .owner = owner, .revision = 1 }};
+    var publication: contract.Publish = .{
+        .held = .{ .group = .{ .definition = .{ .table_incarnation = 1, .configuration = @splat(2) }, .key = "thread" }, .partition = .{ .group = "thread", .segment = "turn", .cell = 0 }, .lease = .{ .incarnation = 7, .owner = @splat(3), .partition = @splat(4), .token = 1, .revision = 1, .expires_ms = 100 }, .now_ms = 1 },
+        .topology_epoch = 0,
+        .sources = &cut,
+        .units = &.{},
+        .input_digest = @splat(0),
+    };
+    try requireLocalSourceCut(a, &reader, publication, owner);
+    // The group lease/revision has not changed: only the source's durable
+    // partition contribution advanced while its invalidation is still queued.
+    reader.revision = 2;
+    try std.testing.expectError(error.EnrichmentSourceChanged, requireLocalSourceCut(a, &reader, publication, owner));
+    cut[0].revision = 2;
+    try requireLocalSourceCut(a, &reader, publication, owner);
+    cut[0].owner.incarnation += 1;
+    try std.testing.expectError(error.EnrichmentSourceChanged, requireLocalSourceCut(a, &reader, publication, owner));
+    cut[0].owner = owner;
+    publication.topology_epoch = 1;
+    try std.testing.expectError(error.EnrichmentSourceChanged, requireLocalSourceCut(a, &reader, publication, owner));
+    publication.topology_epoch = 0;
+    publication.sources = &.{};
+    try std.testing.expectError(error.EnrichmentSourceChanged, requireLocalSourceCut(a, &reader, publication, owner));
 }

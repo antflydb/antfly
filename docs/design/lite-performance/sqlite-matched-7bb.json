@@ -1,0 +1,358 @@
+{
+  "source_commit": "7bb05eb2b1f92ce2d447eae39082c768e1161fad",
+  "library_sha256": "5ef9007c2326a474e377c7a7c05e8af1dafba2c5104ea29023427a98d8d96dfe",
+  "harness_sha256": "50529d5fc463270ba322ede423332403a84194a4f0483b7601527b8ed1d95971",
+  "sqlite_version": "3.51.3",
+  "status": "passed",
+  "qualified": false,
+  "measurement_scope": "Shared-host optimized diagnostic, two 30-second rounds in alternating engine order; synchronous durability and index visibility matched. Not production parity or comparison with asynchronous primary acknowledgement.",
+  "sqlite_settings": {
+    "journal_mode": "wal",
+    "synchronous": "FULL",
+    "fullfsync": false,
+    "checkpoint_fullfsync": false,
+    "busy_timeout_ms": 5000,
+    "wal_autocheckpoint_pages": 1000
+  },
+  "antfly_settings": {
+    "no_sync": false,
+    "busy_timeout_seconds": 5.0,
+    "primary_only_sync_level": "write",
+    "indexed_sync_level": "full_index"
+  },
+  "cases": [
+    {
+      "indexed": false,
+      "writers": 1,
+      "median_batches_per_second": {
+        "antfly": 742.665683962765,
+        "sqlite": 17630.063835408415
+      },
+      "sqlite_to_antfly_ratio": 23.73889654001077,
+      "rounds": [
+        {
+          "engine": "antfly",
+          "round": 0,
+          "successful_calls": 22604,
+          "successful_calls_per_second": 753.5758786505222,
+          "busy_calls": 0,
+          "latency_p50_ns": 1188625,
+          "latency_p95_ns": 2049250,
+          "peak_file_bytes": 1179648,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 128,
+            "expected_rows": 128,
+            "latest_and_overwritten_tokens_checked": false,
+            "integrity_passed": true,
+            "seconds": 0.042844667099416256
+          }
+        },
+        {
+          "engine": "sqlite",
+          "round": 0,
+          "successful_calls": 539703,
+          "successful_calls_per_second": 17995.00856344436,
+          "busy_calls": 0,
+          "latency_p50_ns": 50167,
+          "latency_p95_ns": 55042,
+          "peak_file_bytes": 4341216,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 128,
+            "expected_rows": 128,
+            "latest_and_overwritten_tokens_checked": false,
+            "integrity_passed": true,
+            "seconds": 0.0011069998145103455
+          }
+        },
+        {
+          "engine": "sqlite",
+          "round": 1,
+          "successful_calls": 517916,
+          "successful_calls_per_second": 17265.119107372466,
+          "busy_calls": 0,
+          "latency_p50_ns": 50792,
+          "latency_p95_ns": 69959,
+          "peak_file_bytes": 4341216,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 128,
+            "expected_rows": 128,
+            "latest_and_overwritten_tokens_checked": false,
+            "integrity_passed": true,
+            "seconds": 0.0010607503354549408
+          }
+        },
+        {
+          "engine": "antfly",
+          "round": 1,
+          "successful_calls": 21952,
+          "successful_calls_per_second": 731.7554892750078,
+          "busy_calls": 0,
+          "latency_p50_ns": 1232334,
+          "latency_p95_ns": 2048000,
+          "peak_file_bytes": 1179648,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 128,
+            "expected_rows": 128,
+            "latest_and_overwritten_tokens_checked": false,
+            "integrity_passed": true,
+            "seconds": 0.042321749962866306
+          }
+        }
+      ]
+    },
+    {
+      "indexed": false,
+      "writers": 8,
+      "median_batches_per_second": {
+        "antfly": 473.3332938611827,
+        "sqlite": 17255.081361994275
+      },
+      "sqlite_to_antfly_ratio": 36.45440028365039,
+      "rounds": [
+        {
+          "engine": "antfly",
+          "round": 0,
+          "successful_calls": 14409,
+          "successful_calls_per_second": 480.08249862401175,
+          "busy_calls": 0,
+          "latency_p50_ns": 15756458,
+          "latency_p95_ns": 30221708,
+          "peak_file_bytes": 7450624,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 1024,
+            "expected_rows": 1024,
+            "latest_and_overwritten_tokens_checked": false,
+            "integrity_passed": true,
+            "seconds": 0.3270909576676786
+          }
+        },
+        {
+          "engine": "sqlite",
+          "round": 0,
+          "successful_calls": 539551,
+          "successful_calls_per_second": 17714.883403898806,
+          "busy_calls": 0,
+          "latency_p50_ns": 49834,
+          "latency_p95_ns": 55083,
+          "peak_file_bytes": 5611120,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 1024,
+            "expected_rows": 1024,
+            "latest_and_overwritten_tokens_checked": false,
+            "integrity_passed": true,
+            "seconds": 0.009991707745939493
+          }
+        },
+        {
+          "engine": "sqlite",
+          "round": 1,
+          "successful_calls": 508280,
+          "successful_calls_per_second": 16795.279320089743,
+          "busy_calls": 0,
+          "latency_p50_ns": 51500,
+          "latency_p95_ns": 71125,
+          "peak_file_bytes": 5607000,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 1024,
+            "expected_rows": 1024,
+            "latest_and_overwritten_tokens_checked": false,
+            "integrity_passed": true,
+            "seconds": 0.00782195758074522
+          }
+        },
+        {
+          "engine": "antfly",
+          "round": 1,
+          "successful_calls": 14009,
+          "successful_calls_per_second": 466.5840890983537,
+          "busy_calls": 0,
+          "latency_p50_ns": 15977125,
+          "latency_p95_ns": 31247375,
+          "peak_file_bytes": 6586368,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 1024,
+            "expected_rows": 1024,
+            "latest_and_overwritten_tokens_checked": false,
+            "integrity_passed": true,
+            "seconds": 0.32524962490424514
+          }
+        }
+      ]
+    },
+    {
+      "indexed": true,
+      "writers": 1,
+      "median_batches_per_second": {
+        "antfly": 102.2105102477581,
+        "sqlite": 11349.162666700862
+      },
+      "sqlite_to_antfly_ratio": 111.03713932344641,
+      "rounds": [
+        {
+          "engine": "antfly",
+          "round": 0,
+          "successful_calls": 3072,
+          "successful_calls_per_second": 102.39766405348206,
+          "busy_calls": 0,
+          "latency_p50_ns": 8765417,
+          "latency_p95_ns": 16105625,
+          "peak_file_bytes": 6664192,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 128,
+            "expected_rows": 128,
+            "latest_and_overwritten_tokens_checked": true,
+            "integrity_passed": true,
+            "seconds": 0.1365069579333067
+          }
+        },
+        {
+          "engine": "sqlite",
+          "round": 0,
+          "successful_calls": 340754,
+          "successful_calls_per_second": 11361.142799689445,
+          "busy_calls": 0,
+          "latency_p50_ns": 73958,
+          "latency_p95_ns": 123292,
+          "peak_file_bytes": 4595768,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 128,
+            "expected_rows": 128,
+            "latest_and_overwritten_tokens_checked": true,
+            "integrity_passed": true,
+            "seconds": 0.0018277917988598347
+          }
+        },
+        {
+          "engine": "sqlite",
+          "round": 1,
+          "successful_calls": 340078,
+          "successful_calls_per_second": 11337.18253371228,
+          "busy_calls": 0,
+          "latency_p50_ns": 73959,
+          "latency_p95_ns": 123000,
+          "peak_file_bytes": 4595768,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 128,
+            "expected_rows": 128,
+            "latest_and_overwritten_tokens_checked": true,
+            "integrity_passed": true,
+            "seconds": 0.0019350838847458363
+          }
+        },
+        {
+          "engine": "antfly",
+          "round": 1,
+          "successful_calls": 3061,
+          "successful_calls_per_second": 102.02335644203414,
+          "busy_calls": 0,
+          "latency_p50_ns": 8660291,
+          "latency_p95_ns": 16371250,
+          "peak_file_bytes": 6717440,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 128,
+            "expected_rows": 128,
+            "latest_and_overwritten_tokens_checked": true,
+            "integrity_passed": true,
+            "seconds": 0.1435007923282683
+          }
+        }
+      ]
+    },
+    {
+      "indexed": true,
+      "writers": 8,
+      "median_batches_per_second": {
+        "antfly": 43.38465930076066,
+        "sqlite": 10522.465579037384
+      },
+      "sqlite_to_antfly_ratio": 242.53885471570118,
+      "rounds": [
+        {
+          "engine": "antfly",
+          "round": 0,
+          "successful_calls": 1420,
+          "successful_calls_per_second": 46.928384264910534,
+          "busy_calls": 0,
+          "latency_p50_ns": 152443958,
+          "latency_p95_ns": 291067583,
+          "peak_file_bytes": 13053952,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 1024,
+            "expected_rows": 1024,
+            "latest_and_overwritten_tokens_checked": true,
+            "integrity_passed": true,
+            "seconds": 0.4398516248911619
+          }
+        },
+        {
+          "engine": "sqlite",
+          "round": 0,
+          "successful_calls": 318251,
+          "successful_calls_per_second": 10471.377488456774,
+          "busy_calls": 1,
+          "latency_p50_ns": 75584,
+          "latency_p95_ns": 127291,
+          "peak_file_bytes": 8399256,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 1024,
+            "expected_rows": 1024,
+            "latest_and_overwritten_tokens_checked": true,
+            "integrity_passed": true,
+            "seconds": 0.025513832923024893
+          }
+        },
+        {
+          "engine": "sqlite",
+          "round": 1,
+          "successful_calls": 318707,
+          "successful_calls_per_second": 10573.553669617993,
+          "busy_calls": 0,
+          "latency_p50_ns": 75417,
+          "latency_p95_ns": 127208,
+          "peak_file_bytes": 8108488,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 1024,
+            "expected_rows": 1024,
+            "latest_and_overwritten_tokens_checked": true,
+            "integrity_passed": true,
+            "seconds": 0.03609570814296603
+          }
+        },
+        {
+          "engine": "antfly",
+          "round": 1,
+          "successful_calls": 1223,
+          "successful_calls_per_second": 39.84093433661078,
+          "busy_calls": 0,
+          "latency_p50_ns": 153447416,
+          "latency_p95_ns": 529916542,
+          "peak_file_bytes": 12951552,
+          "verification": {
+            "every_latest_value_checked": true,
+            "primary_rows_checked": 1024,
+            "expected_rows": 1024,
+            "latest_and_overwritten_tokens_checked": true,
+            "integrity_passed": true,
+            "seconds": 0.43502987502142787
+          }
+        }
+      ]
+    }
+  ],
+  "qualification_limitation": "SQLite returned one Busy in one eight-writer indexed case; every case passed final-value, index visibility, overwrite and integrity verification. Antfly returned zero Busy throughout."
+}

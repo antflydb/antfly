@@ -37,8 +37,11 @@ pub const Lease = struct {
 
 const Namespace = struct {
     canonical: [:0]u8,
+    directory_path: []u8,
     directory: std.Io.Dir,
     guard: std.Io.File,
+    directory_inode: u64,
+    guard_inode: u64,
     digest: [32]u8,
     fn open(a: Allocator, io: std.Io, path: []const u8, publication: bool, no_sync: bool) !Namespace {
         const canonical = if (publication) blk: {
@@ -85,19 +88,103 @@ const Namespace = struct {
             guard.unlock(io);
         }
         var id: [8]u8 = undefined;
-        std.mem.writeInt(u64, &id, @intCast((try directory.stat(io)).inode), .little);
+        const directory_inode: u64 = @intCast((try directory.stat(io)).inode);
+        std.mem.writeInt(u64, &id, directory_inode, .little);
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("AFLITE reader namespace v6");
         hash.update(&seed);
         hash.update(&id);
         var digest: [32]u8 = undefined;
         hash.final(&digest);
-        return .{ .canonical = canonical, .directory = directory, .guard = guard, .digest = digest };
+        const directory_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(canonical).?, directory_name });
+        return .{ .canonical = canonical, .directory_path = directory_path, .directory = directory, .guard = guard, .directory_inode = directory_inode, .guard_inode = @intCast(stat.inode), .digest = digest };
+    }
+
+    /// Descriptor reuse never makes a replaced pathname or identity file an
+    /// authority. Validate both directory entries and the immutable seed before
+    /// every operation, without reopening and resolving the entire namespace.
+    fn stillBound(self: *const Namespace, io: std.Io) !bool {
+        const dir = std.Io.Dir.cwd().statFile(io, self.directory_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        if (dir.kind != .directory or dir.inode != self.directory_inode) return false;
+        const identity = self.directory.statFile(io, "identity", .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        if (identity.kind != .file or identity.inode != self.guard_inode or identity.size != 32) return false;
+        var seed: [32]u8 = undefined;
+        if (try self.guard.readPositionalAll(io, &seed, 0) != seed.len) return false;
+        var id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &id, self.directory_inode, .little);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("AFLITE reader namespace v6");
+        hash.update(&seed);
+        hash.update(&id);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return std.mem.eql(u8, &digest, &self.digest);
     }
     fn close(self: Namespace, a: Allocator, io: std.Io) void {
         self.guard.close(io);
         self.directory.close(io);
+        a.free(self.directory_path);
         a.free(self.canonical);
+    }
+};
+
+/// One bounded descriptor bundle per coordinator. The coordinator serializes
+/// access: directory iteration and namespace replacement never race locally.
+/// Leases own separate directory descriptors and outlive cache replacement.
+pub const NamespaceCache = struct {
+    namespace: ?Namespace = null,
+    path: ?[]u8 = null,
+    process_id: ?u32 = null,
+    opens: u64 = 0,
+    validations: u64 = 0,
+
+    pub fn deinit(self: *@This(), a: Allocator, io: std.Io) void {
+        if (self.namespace) |namespace| namespace.close(a, io);
+        if (self.path) |path| a.free(path);
+        self.namespace = null;
+        self.path = null;
+        self.process_id = null;
+    }
+
+    fn get(self: *@This(), a: Allocator, io: std.Io, path: []const u8, binding: [32]u8) !*Namespace {
+        const process_id = @import("antfly_platform").process.currentId();
+        if (self.namespace) |*namespace| {
+            self.validations +|= 1;
+            // flock belongs to an open file description. A forked process
+            // must reopen the guard, never share its parent's lock ownership.
+            if (self.process_id == process_id and std.mem.eql(u8, self.path.?, path) and std.mem.eql(u8, &namespace.digest, &binding) and try namespace.stillBound(io)) return namespace;
+        }
+        self.deinit(a, io);
+        const namespace = try Namespace.open(a, io, path, false, true);
+        errdefer namespace.close(a, io);
+        if (!std.mem.eql(u8, &namespace.digest, &binding)) return error.UnsafeNativeReaderAlias;
+        self.path = try a.dupe(u8, path);
+        self.namespace = namespace;
+        self.process_id = process_id;
+        self.opens +|= 1;
+        return &self.namespace.?;
+    }
+
+    pub fn register(self: *@This(), a: Allocator, io: std.Io, path: []const u8, binding: [32]u8, inode: u64, sequence: u64, metadata: bool) !Lease {
+        const namespace = self.get(a, io, path, binding) catch |err| switch (err) {
+            error.FileNotFound => return error.UnsafeNativeReaderAlias,
+            else => return err,
+        };
+        return registerInNamespace(a, io, namespace, inode, sequence, metadata);
+    }
+
+    pub fn scan(self: *@This(), a: Allocator, io: std.Io, path: []const u8, binding: [32]u8, inode: u64) !Frontier {
+        const namespace = self.get(a, io, path, binding) catch |err| switch (err) {
+            error.FileNotFound, error.UnsafeNativeReaderAlias => return error.WouldBlock,
+            else => return err,
+        };
+        return scanInNamespace(io, namespace, inode);
     }
 };
 
@@ -113,6 +200,18 @@ pub fn namespaceForPublicationWithDurability(a: Allocator, io: std.Io, path: []c
     return namespace.digest;
 }
 
+/// A path may publish fine-grained leases only in the immutable namespace
+/// bound to this file. Unsafe aliases must retain ordinary inode protection.
+pub fn namespaceMatches(a: Allocator, io: std.Io, path: []const u8, binding: [32]u8) !bool {
+    if (std.mem.allEqual(u8, &binding, 0)) return false;
+    const namespace = Namespace.open(a, io, path, false, true) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidNativeReaderEpoch => return false,
+        else => return err,
+    };
+    defer namespace.close(a, io);
+    return std.mem.eql(u8, &binding, &namespace.digest);
+}
+
 pub fn register(a: Allocator, io: std.Io, path: []const u8, binding: [32]u8, inode: u64, sequence: u64, metadata: bool) !Lease {
     const namespace = Namespace.open(a, io, path, false, true) catch |err| switch (err) {
         error.FileNotFound => return error.UnsafeNativeReaderAlias,
@@ -120,6 +219,10 @@ pub fn register(a: Allocator, io: std.Io, path: []const u8, binding: [32]u8, ino
     };
     defer namespace.close(a, io);
     if (!std.mem.eql(u8, &binding, &namespace.digest)) return error.UnsafeNativeReaderAlias;
+    return registerInNamespace(a, io, &namespace, inode, sequence, metadata);
+}
+
+fn registerInNamespace(a: Allocator, io: std.Io, namespace: *const Namespace, inode: u64, sequence: u64, metadata: bool) !Lease {
     // Different file generations share this directory but have different data
     // locks. A shared guard covers create-to-flock, so a scanner for an older
     // generation cannot reap an incompletely registered new marker.
@@ -131,9 +234,7 @@ pub fn register(a: Allocator, io: std.Io, path: []const u8, binding: [32]u8, ino
     try io.randomSecure(&nonce);
     var name: [32]u8 = undefined;
     _ = try std.fmt.bufPrint(&name, "{x}", .{nonce});
-    const directory_path = try namespace.directory.realPathFileAlloc(io, ".", a);
-    defer a.free(directory_path);
-    const marker_path = try std.fs.path.join(a, &.{ directory_path, &name });
+    const marker_path = try std.fs.path.join(a, &.{ namespace.directory_path, &name });
     errdefer a.free(marker_path);
     const marker = try directory.createFile(io, &name, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
     errdefer {
@@ -160,6 +261,10 @@ pub fn scan(a: Allocator, io: std.Io, path: []const u8, binding: [32]u8, inode: 
     };
     defer namespace.close(a, io);
     if (!std.mem.eql(u8, &binding, &namespace.digest)) return error.WouldBlock;
+    return scanInNamespace(io, &namespace, inode);
+}
+
+fn scanInNamespace(io: std.Io, namespace: *const Namespace, inode: u64) !Frontier {
     if (!try namespace.guard.tryLock(io, .exclusive)) return error.WouldBlock;
     defer namespace.guard.unlock(io);
     const dir = namespace.directory;
@@ -306,4 +411,110 @@ test "lite reader epochs guard cross-generation registration and reject replaced
     try std.testing.expectError(error.UnsafeNativeReaderAlias, register(a, io, path, binding, inode, 1, true));
     try std.testing.expectError(error.WouldBlock, scan(a, io, path, binding, inode));
     try std.testing.expectError(error.FileNotFound, namespace.directory.access(io, "identity", .{}));
+}
+
+test "lite reader epochs cache descriptors without caching reader frontiers" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cached.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    const data = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true });
+    defer data.close(io);
+    const inode = (try data.stat(io)).inode;
+    const binding = try namespaceForPublication(a, io, path);
+    var cache: NamespaceCache = .{};
+    defer cache.deinit(a, io);
+    for (0..16) |i| {
+        const lease = try cache.register(a, io, path, binding, inode, i + 1, i % 2 == 0);
+        const frontier = try cache.scan(a, io, path, binding, inode);
+        try std.testing.expectEqual(@as(?u64, i + 1), frontier.data);
+        try std.testing.expectEqual(if (i % 2 == 0) @as(?u64, i + 1) else null, frontier.metadata);
+        lease.close(a, io);
+        try std.testing.expectEqual(Frontier{}, try cache.scan(a, io, path, binding, inode));
+    }
+    try std.testing.expectEqual(@as(u64, 1), cache.opens);
+    try std.testing.expectEqual(@as(u64, 47), cache.validations);
+    // A different alias cannot inherit a cached path's authority.
+    const alias = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/different.aflite", .{tmp.sub_path});
+    defer a.free(alias);
+    try std.testing.expectError(error.UnsafeNativeReaderAlias, cache.register(a, io, alias, binding, inode, 99, false));
+}
+
+test "lite reader epochs cache revalidates identity and directory replacement" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cached.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    const data = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true });
+    defer data.close(io);
+    const inode = (try data.stat(io)).inode;
+    const binding = try namespaceForPublication(a, io, path);
+    var cache: NamespaceCache = .{};
+    defer cache.deinit(a, io);
+    const reader = try cache.register(a, io, path, binding, inode, 7, true);
+    var reader_open = true;
+    defer if (reader_open) reader.close(a, io);
+    var seed: [32]u8 = undefined;
+    try std.testing.expectEqual(seed.len, try cache.namespace.?.guard.readPositionalAll(io, &seed, 0));
+    const old_guard = cache.namespace.?.guard_inode;
+    try cache.namespace.?.directory.deleteFile(io, "identity");
+    const replacement = try cache.namespace.?.directory.createFile(io, "identity", .{ .read = true, .exclusive = true });
+    try replacement.writePositionalAll(io, &seed, 0);
+    replacement.close(io);
+    try std.testing.expectEqual(@as(?u64, 7), (try cache.scan(a, io, path, binding, inode)).metadata);
+    try std.testing.expect(cache.namespace.?.guard_inode != old_guard);
+    try std.testing.expectEqual(@as(u64, 2), cache.opens);
+    // Changed identity bytes cannot be hidden behind the still-open descriptor.
+    var changed = seed;
+    changed[0] ^= 1;
+    try cache.namespace.?.guard.writePositionalAll(io, &changed, 0);
+    try std.testing.expectError(error.WouldBlock, cache.scan(a, io, path, binding, inode));
+    try std.testing.expectError(error.UnsafeNativeReaderAlias, cache.register(a, io, path, binding, inode, 8, false));
+    const namespace = try Namespace.open(a, io, path, false, true);
+    defer namespace.close(a, io);
+    try namespace.guard.writePositionalAll(io, &seed, 0);
+    try std.testing.expectEqual(@as(?u64, 7), (try cache.scan(a, io, path, binding, inode)).data);
+    reader.close(a, io);
+    reader_open = false;
+    const directory_path = try a.dupe(u8, cache.namespace.?.directory_path);
+    defer a.free(directory_path);
+    try std.Io.Dir.cwd().deleteTree(io, directory_path);
+    const new_binding = try namespaceForPublication(a, io, path);
+    try std.testing.expect(!std.mem.eql(u8, &binding, &new_binding));
+    try std.testing.expectError(error.WouldBlock, cache.scan(a, io, path, binding, inode));
+    try std.testing.expectError(error.UnsafeNativeReaderAlias, cache.register(a, io, path, binding, inode, 8, false));
+}
+
+test "lite reader epochs cache reopens inherited guard lock ownership" {
+    const builtin = @import("builtin");
+    if (comptime !builtin.link_libc or builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/inherited.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    const data = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true });
+    defer data.close(io);
+    const inode = (try data.stat(io)).inode;
+    const binding = try namespaceForPublication(a, io, path);
+    var cache: NamespaceCache = .{};
+    defer cache.deinit(a, io);
+    _ = try cache.scan(a, io, path, binding, inode);
+    // dup preserves the exact open-file-description ownership inherited by a
+    // child. Keep the parent's guard locked while the cache changes process.
+    const descriptor = std.c.dup(cache.namespace.?.guard.handle);
+    if (descriptor < 0) return error.TestDuplicateFailed;
+    const parent: std.Io.File = .{ .handle = descriptor, .flags = cache.namespace.?.guard.flags };
+    defer parent.close(io);
+    try std.testing.expect(try parent.tryLock(io, .exclusive));
+    cache.process_id = 0;
+    try std.testing.expectError(error.WouldBlock, cache.scan(a, io, path, binding, inode));
+    try std.testing.expectEqual(@as(u64, 2), cache.opens);
+    parent.unlock(io);
+    try std.testing.expectEqual(Frontier{}, try cache.scan(a, io, path, binding, inode));
 }

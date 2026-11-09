@@ -3828,6 +3828,57 @@ test "native member ancestry ignores payload source and unit identities" {
     try std.testing.expect(scalar.unit_key == null);
 }
 
+test "externalizeSearchResultArtifactIds validates embedding source aliases and preserves ordinals" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            const chunk = types.ArtifactRef{
+                .document_id = @constCast("doc:你好"),
+                .name = @constCast("chunks_v1"),
+                .kind = .chunk,
+                .chunk_id = 3,
+                .unit_id = @constCast("page:000001"),
+                .window_index = 2,
+            };
+            const embedding = types.ArtifactRef{
+                .document_id = chunk.document_id,
+                .name = @constCast("embeddings_v1"),
+                .kind = .embedding,
+                .source = .{ .name = chunk.name, .kind = .chunk, .chunk_id = chunk.chunk_id, .unit_id = chunk.unit_id, .window_index = chunk.window_index },
+            };
+            var hit: types.SearchHit = .{ .id = try artifact_ids.internalKeyForArtifactRefAlloc(a, chunk), .doc_ordinal = 17 };
+            defer hit.deinit(a);
+            hit.artifact_ref = try embedding.clone(a);
+            try externalizeSearchHitIdentity(a, &hit);
+            const expected = try artifact_ids.artifactPublicIdAlloc(a, chunk);
+            defer a.free(expected);
+            try std.testing.expectEqualStrings(expected, hit.id);
+            try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 17), hit.doc_ordinal);
+            try std.testing.expectEqual(types.ArtifactKind.chunk, hit.artifact_ref.?.kind);
+            try std.testing.expectEqualStrings(chunk.name, hit.artifact_ref.?.name);
+            try std.testing.expect(hit.artifact_ref.?.source == null);
+            // Every component of the alias binding is authoritative.
+            for (0..5) |variant| {
+                var wrong = embedding;
+                switch (variant) {
+                    0 => wrong.document_id = @constCast("another-document"),
+                    1 => wrong.source.?.name = @constCast("another-producer"),
+                    2 => wrong.source.?.chunk_id = 4,
+                    3 => wrong.source.?.unit_id = @constCast("page:000002"),
+                    4 => wrong.source.?.window_index = 3,
+                    else => unreachable,
+                }
+                _ = verifyArtifactIdentity(a, wrong, chunk) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    try std.testing.expectEqual(error.InvalidChunkArtifact, err);
+                    continue;
+                };
+                return error.TestExpectedError;
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
 test "artifact identity reports the source of a dense hit's embedding and keeps its revisions" {
     const alloc = std.testing.allocator;
     const chunk = struct {

@@ -3276,7 +3276,14 @@ const StreamedDescriptor = struct {
 };
 
 /// Parsed posting data for a single term (zero-copy view into section data).
+const NormalizedPostingView = struct {
+    docs: []const u32,
+    metas: []const PostingMeta,
+    positions: []const u32,
+};
+
 pub const TermPostings = struct {
+    normalized_postings: ?NormalizedPostingView = null,
     doc_freq: u32,
     metadata_owner: ?@import("../segment_source.zig").SharedOwner = null,
     serialized_data: []const u8,
@@ -3351,6 +3358,20 @@ pub const TermPostings = struct {
     }
 
     fn iteratorWithScratch(self: *const TermPostings, alloc: Allocator, previous: ?*PostingsIterator) !PostingsIterator {
+        if (self.normalized_postings) |normal| {
+            var direct: PostingsIterator = .{
+                .alloc = alloc,
+                .normalized_postings = normal,
+                .metadata_owner = self.metadata_owner,
+                .norms_data = self.norms_data,
+                .doc_freq = self.doc_freq,
+                .version = self.version,
+                .chunk_size = @import("posting_delta.zig").maximum_documents,
+            };
+            if (self.metadata_owner) |owner| owner.retain(owner.ptr);
+            adoptMergeIteratorBuffers(&direct, previous);
+            return direct;
+        }
         if (self.inline_single_doc) {
             var inline_iterator = try PostingsIterator.initInlineSingleDoc(self, alloc);
             if (self.metadata_owner) |owner| {
@@ -3652,6 +3673,10 @@ fn nextPackedHit(iterator: *PostingsIterator, cache: ?*PackedReadCache) !?Packed
 // Early-filtered merge callers already loaded and positioned the current hit.
 // Avoid repeating chunk readiness checks on the all-surviving hot path.
 fn packedHit(iterator: *PostingsIterator, cache: ?*PackedReadCache, comptime prepared: bool) !?PackedHit {
+    if (iterator.normalized_postings != null) {
+        const hit = if (prepared) try iterator.takeCurrentWithPositions() else (try iterator.next()) orelse return null;
+        return .{ .hit = hit, .positions = .{ .unpacked = hit.positions, .count = hit.positions.len, .bits = decodedPositionWidth(hit.positions) } };
+    }
     if (iterator.is_one_hit) {
         const hit = (try iterator.takeOneHit(false)) orelse return null;
         const view = PackedPositionView{
@@ -3997,6 +4022,9 @@ fn appendPackedPositionsToSink(allocator: Allocator, sink: anytype, views: []con
 
 /// Iterates over (doc_id, freq, norm, positions) for a term's posting list.
 pub const PostingsIterator = struct {
+    normalized_postings: ?NormalizedPostingView = null,
+    normalized_position_doc: usize = 0,
+    normalized_position_offset: usize = 0,
     alloc: Allocator,
     metadata_owner: ?@import("../segment_source.zig").SharedOwner = null,
     doc_freq: u32 = 0,
@@ -4138,6 +4166,7 @@ pub const PostingsIterator = struct {
     }
 
     fn chunkCount(self: *const PostingsIterator) usize {
+        if (self.normalized_postings) |normal| return @intFromBool(normal.docs.len != 0);
         return self.chunk_meta_count;
     }
 
@@ -4300,6 +4329,10 @@ pub const PostingsIterator = struct {
     }
 
     fn chunkMeta(self: *PostingsIterator, index: usize) !V7ChunkMeta {
+        if (self.normalized_postings) |normal| {
+            if (index != 0 or normal.docs.len == 0) return error.InvalidData;
+            return .{ .chunk_id = 0, .max_doc = normal.docs[normal.docs.len - 1], .doc_count = @intCast(normal.docs.len), .doc_ctrl_off = 0, .doc_ctrl_len = 0, .doc_data_off = 0, .doc_data_len = 0, .freq_ctrl_off = 0, .freq_ctrl_len = 0, .freq_data_off = 0, .freq_data_len = 0 };
+        }
         if (self.hasStreamedRecords()) {
             const bytes = try self.streamedRecord(index);
             const count = std.mem.readInt(u32, bytes[4..8], .little);
@@ -4424,6 +4457,20 @@ pub const PostingsIterator = struct {
     }
 
     fn loadChunkMode(self: *PostingsIterator, index: usize, comptime decode_documents: bool) !void {
+        if (self.normalized_postings) |normal| {
+            const meta = try self.chunkMeta(index);
+            try self.doc_values.resize(self.alloc, normal.docs.len);
+            @memcpy(self.doc_values.items, normal.docs);
+            self.freq_values.clearRetainingCapacity();
+            self.normalized_position_doc = 0;
+            self.normalized_position_offset = 0;
+            self.current_chunk_meta = meta;
+            self.current_chunk_index = 0;
+            self.current_chunk_min_doc = normal.docs[0];
+            self.next_chunk_index = 1;
+            self.chunk_doc_pos = 0;
+            return;
+        }
         const meta = if (!self.hasStreamedRecords() and self.version >= wire_version_checkpoints and
             self.current_chunk_meta != null and
             self.current_chunk_index != std.math.maxInt(usize) and
@@ -4626,6 +4673,7 @@ pub const PostingsIterator = struct {
     }
 
     fn enterPositionChunk(self: *PostingsIterator, chunk_index: usize) !void {
+        if (self.normalized_postings != null) return;
         if (self.version < wire_version_chunk_framed_positions or self.positionLength() == null) return;
         if (self.positions_chunk_index == chunk_index) return;
         const pd_len = self.positionLength().?;
@@ -4655,6 +4703,7 @@ pub const PostingsIterator = struct {
     }
 
     fn skipPositionChunk(self: *PostingsIterator) !void {
+        if (self.normalized_postings != null) return;
         const pd_len = self.positionLength() orelse return;
         if (self.version < wire_version_chunk_framed_positions) return error.InvalidData;
         if (self.positions_cursor >= pd_len) return error.InvalidData;
@@ -4703,6 +4752,7 @@ pub const PostingsIterator = struct {
     }
 
     fn skipPositionRecord(self: *PostingsIterator) !void {
+        if (self.normalized_postings != null) return;
         const pd_len = self.positionLength() orelse return;
         if (self.version >= wire_version_chunk_framed_positions) {
             const decoded = decodeFreqHasLocs(self.freq_values.items[self.chunk_doc_pos]);
@@ -4804,6 +4854,23 @@ pub const PostingsIterator = struct {
     }
 
     fn takeCurrentWithPositions(self: *PostingsIterator) !Hit {
+        if (self.normalized_postings) |normal| {
+            const doc = self.chunk_doc_pos;
+            if (doc >= normal.docs.len) return error.InvalidData;
+            if (doc < self.normalized_position_doc) {
+                self.normalized_position_doc = 0;
+                self.normalized_position_offset = 0;
+            }
+            for (normal.metas[self.normalized_position_doc..doc]) |posting| self.normalized_position_offset += posting.position_count;
+            const offset = self.normalized_position_offset;
+            const posting = normal.metas[doc];
+            if (offset > normal.positions.len or posting.position_count > normal.positions.len - offset) return error.InvalidData;
+            self.chunk_doc_pos += 1;
+            self.normalized_position_doc = doc + 1;
+            self.normalized_position_offset = offset + posting.position_count;
+            self.position_records_decoded +|= 1;
+            return .{ .doc_id = normal.docs[doc], .freq = posting.freq, .norm = try self.readNorm(normal.docs[doc]), .positions = normal.positions[offset..][0..posting.position_count] };
+        }
         const doc_pos = self.chunk_doc_pos;
         const doc_id = self.doc_values.items[self.chunk_doc_pos];
         const freq_has_locs_val = self.freq_values.items[self.chunk_doc_pos];
@@ -4816,6 +4883,12 @@ pub const PostingsIterator = struct {
     }
 
     inline fn takeCurrentScoring(self: *PostingsIterator) !Hit {
+        if (self.normalized_postings) |normal| {
+            const doc = self.chunk_doc_pos;
+            if (doc >= normal.docs.len) return error.InvalidData;
+            self.chunk_doc_pos += 1;
+            return .{ .doc_id = normal.docs[doc], .freq = normal.metas[doc].freq, .norm = try self.readNorm(normal.docs[doc]) };
+        }
         const doc_id = self.doc_values.items[self.chunk_doc_pos];
         const freq_has_locs_val = self.freq_values.items[self.chunk_doc_pos];
         const norm_val = try self.readNorm(doc_id);
@@ -4954,6 +5027,7 @@ pub const PostingsIterator = struct {
 
     fn currentDeferredHit(self: *PostingsIterator) !Hit {
         if (!self.deferred_position_pending or self.chunk_doc_pos >= self.doc_values.items.len) return error.InvalidData;
+        if (self.normalized_postings) |normal| return .{ .doc_id = normal.docs[self.chunk_doc_pos], .freq = normal.metas[self.chunk_doc_pos].freq, .norm = try self.readNorm(normal.docs[self.chunk_doc_pos]) };
         const doc_id = self.doc_values.items[self.chunk_doc_pos];
         const decoded = decodeFreqHasLocs(self.freq_values.items[self.chunk_doc_pos]);
         return .{
@@ -6196,8 +6270,25 @@ fn writeMappedInvertedSection(
             }
         }
         var reader = switch (section.source) {
-            .contiguous => |bytes| try ScopedInvertedIndexReader.initContiguous(alloc, bytes[@intCast(section.offset)..][0..@intCast(section.length)]),
-            .ranges => try ScopedInvertedIndexReader.initRangesWithBacking(alloc, section, backing, .{}),
+            .contiguous => |bytes| contiguous: {
+                const input = bytes[@intCast(section.offset)..][0..@intCast(section.length)];
+                if (@import("posting_delta.zig").isDelta(input)) break :contiguous try ScopedInvertedIndexReader.initMergeDeltaBytes(alloc, input, .{}, null);
+                break :contiguous try ScopedInvertedIndexReader.initContiguous(alloc, input);
+            },
+            .ranges => ranged: {
+                var prefix: [8]u8 = undefined;
+                if (section.length >= prefix.len) {
+                    try section.readInto(0, &prefix);
+                    if (@import("posting_delta.zig").isDelta(&prefix)) {
+                        if (backing.length != section.length) return error.InvalidPostingDelta;
+                        const input = try alloc.alloc(u8, @intCast(section.length));
+                        defer alloc.free(input);
+                        try section.readInto(0, input);
+                        break :ranged try ScopedInvertedIndexReader.initMergeDeltaBytes(alloc, input, .{}, section.source);
+                    }
+                }
+                break :ranged try ScopedInvertedIndexReader.initRangesWithBacking(alloc, section, backing, .{});
+            },
         };
         errdefer reader.deinit();
         if (initial_runs and backing.length != section.length) effective_maps[i].ids = try reader.backingView(section.length, backing.length - section.length);
@@ -9639,6 +9730,9 @@ pub const ScopedInvertedIndexReader = struct {
     version: u8,
 
     pub const Options = struct {
+        /// Authenticated segment routing identifies normalized hot-tail fields.
+        normalized_delta: bool = false,
+        normalized_doc_space: ?u32 = null,
         /// Prepare dictionaries/navigation on one lane, then share immutable
         /// lookups and the backing range cache across independent iterators.
         concurrent: bool = false,
@@ -9652,13 +9746,69 @@ pub const ScopedInvertedIndexReader = struct {
     };
 
     pub fn initContiguous(allocator: Allocator, bytes: []const u8) !ScopedInvertedIndexReader {
+        return initContiguousWithOptions(allocator, bytes, .{});
+    }
+    pub fn initContiguousWithOptions(allocator: Allocator, bytes: []const u8, options: Options) !ScopedInvertedIndexReader {
+        if (@import("posting_delta.zig").isDelta(bytes)) return initDeltaBytes(allocator, bytes, options, null);
         const reader = try InvertedIndexReader.init(allocator, bytes);
         return .{ .contiguous = reader, .doc_count = reader.doc_count, .total_field_len = reader.total_field_len, .chunk_size = reader.chunk_size, .version = reader.version };
     }
 
     pub fn initRanges(allocator: Allocator, view: @import("../segment_source.zig").View, options: Options) !ScopedInvertedIndexReader {
+        if (options.normalized_delta) {
+            const delta = @import("posting_delta.zig");
+            if (view.length < delta.header_size) return error.InvalidPostingDelta;
+            var header: [delta.header_size]u8 = undefined;
+            try view.readInto(0, &header);
+            _ = try delta.Stats.read(&header, view.length);
+            const input = try allocator.alloc(u8, @intCast(view.length));
+            defer allocator.free(input);
+            try view.readInto(0, input);
+            return initDeltaBytes(allocator, input, options, view.source);
+        }
         return initRangesWithBacking(allocator, view, view, options);
     }
+    fn initMergeDeltaBytes(allocator: Allocator, input: []const u8, options: Options, check_source: ?@import("../segment_source.zig").Source) !ScopedInvertedIndexReader {
+        var index = try @import("posting_delta.zig").TermIndex.init(allocator, input, options.navigation_bytes);
+        errdefer index.deinit();
+        const norms = try encodeNormTable(allocator, index.norms);
+        errdefer allocator.free(norms);
+        if (index.retainedBytes() +| norms.len > options.navigation_bytes) return error.SegmentReadBudgetExceeded;
+        const context = try allocator.create(Context);
+        context.* = .{
+            .allocator = allocator,
+            .view = .{ .source = .{ .contiguous = &.{} }, .offset = 0, .length = 0 },
+            .options = options,
+            .navigation = std.heap.ArenaAllocator.init(allocator),
+            .dictionary = @import("../segment_source.zig").Scratch.init(allocator, 0),
+            .check_source = check_source,
+            .merge_delta = .{ .index = index, .norms = norms },
+        };
+        return .{ .context = context, .doc_count = index.stats.doc_count, .total_field_len = index.stats.total_field_len, .chunk_size = @import("posting_delta.zig").maximum_documents, .version = productionIndexConfig().wireVersion() };
+    }
+
+    fn initDeltaBytes(allocator: Allocator, input: []const u8, options: Options, check_source: ?@import("../segment_source.zig").Source) !ScopedInvertedIndexReader {
+        const stats = try @import("posting_delta.zig").Stats.read(input, input.len);
+        if (options.normalized_doc_space) |expected| if (stats.doc_space != expected) return error.InvalidPostingDelta;
+        var builder = try @import("posting_delta.zig").decode(allocator, input);
+        errdefer builder.deinit();
+        if (builder.estimatedMemoryBytes() > options.navigation_bytes) return error.SegmentReadBudgetExceeded;
+        const norms = try encodeNormTable(allocator, builder.doc_norms.items);
+        errdefer allocator.free(norms);
+        if (builder.estimatedMemoryBytes() +| norms.len > options.navigation_bytes) return error.SegmentReadBudgetExceeded;
+        const context = try allocator.create(Context);
+        context.* = .{
+            .allocator = allocator,
+            .view = .{ .source = .{ .contiguous = &.{} }, .offset = 0, .length = 0 },
+            .options = options,
+            .navigation = std.heap.ArenaAllocator.init(allocator),
+            .dictionary = @import("../segment_source.zig").Scratch.init(allocator, 0),
+            .check_source = check_source,
+            .normalized = .{ .builder = builder, .norms = norms, .physical_bytes = input.len },
+        };
+        return .{ .context = context, .doc_count = builder.doc_count, .total_field_len = builder.total_field_len, .chunk_size = builder.config.chunk_size, .version = builder.config.wireVersion() };
+    }
+
     fn initRangesWithBacking(allocator: Allocator, view: @import("../segment_source.zig").View, backing: @import("../segment_source.zig").View, options: Options) !ScopedInvertedIndexReader {
         const context = try allocator.create(Context);
         context.* = .{ .allocator = allocator, .view = backing, .options = options, .navigation = std.heap.ArenaAllocator.init(allocator), .dictionary = @import("../segment_source.zig").Scratch.init(allocator, options.dictionary_retained_bytes) };
@@ -9682,15 +9832,22 @@ pub const ScopedInvertedIndexReader = struct {
     }
 
     fn dictionaryTermUpperBound(self: *const ScopedInvertedIndexReader) usize {
+        if (self.context) |context| {
+            if (context.merge_delta) |*delta| return delta.index.refs.len;
+            if (context.normalized) |*normal| return normal.builder.terms.count();
+        }
         const blocks = if (self.contiguous) |*reader| reader.dict_block_count else self.context.?.native.block_count;
         return @as(usize, blocks) *| term_dict_block_max_entries;
     }
 
     pub fn layoutStats(self: *const ScopedInvertedIndexReader) !InvertedIndexReader.LayoutStats {
         if (self.contiguous) |reader| return reader.layoutStats();
+        if (self.context.?.merge_delta) |delta| return .{ .header_bytes = @import("posting_delta.zig").header_size, .postings_bytes = delta.index.bytes.len - @import("posting_delta.zig").header_size };
+        if (self.context.?.normalized) |normal| return .{ .header_bytes = @import("posting_delta.zig").header_size, .postings_bytes = normal.physical_bytes - @import("posting_delta.zig").header_size, .term_count = normal.builder.terms.count() };
         return self.context.?.native.layoutStats();
     }
     pub fn detailedLayoutStats(self: *const ScopedInvertedIndexReader) !InvertedIndexReader.LayoutStats {
+        if (self.context) |context| if (context.normalized != null) return self.layoutStats();
         var iterator = try self.termIterator();
         defer iterator.deinit();
         return accumulateLayoutStats(try self.layoutStats(), &iterator);
@@ -9703,12 +9860,18 @@ pub const ScopedInvertedIndexReader = struct {
     pub fn docLength(self: *const ScopedInvertedIndexReader, doc: u32) !u32 {
         if (self.contiguous) |reader| return reader.docLength(doc);
         const context = self.context.?;
+        if (context.merge_delta) |delta| return decodeNormValue(delta.norms, doc);
+        if (context.normalized) |normal| return decodeNormValue(normal.norms, doc);
         return context.native.docLength(doc);
     }
 
     pub fn lookup(self: *const ScopedInvertedIndexReader, term: []const u8) !?LookupResult {
         if (self.contiguous) |reader| return reader.lookupChecked(term);
         const context = self.context.?;
+        // Merge-only navigation deliberately exposes term streaming rather
+        // than retaining a posting accumulator for every random lookup.
+        if (context.merge_delta != null) return error.Unsupported;
+        if (context.normalized != null) return context.lookupNormalized(term);
         if (context.over_budget) return error.SegmentReadBudgetExceeded;
         const value = (try context.native.lookupValue(term, &context.dictionary)) orelse return null;
         return try context.lookupValue(value);
@@ -9719,6 +9882,7 @@ pub const ScopedInvertedIndexReader = struct {
     pub fn docFrequency(self: *const ScopedInvertedIndexReader, term: []const u8) !?u32 {
         if (self.contiguous) |reader| return if (try reader.lookupChecked(term)) |value| value.docFreq() else null;
         const context = self.context.?;
+        if (context.normalized) |*normal| return if (normal.builder.terms.getPtr(term)) |acc| @intCast(acc.docIds().len) else null;
         const value = (try context.native.lookupValue(term, &context.dictionary)) orelse return null;
         if (fstValIs1Hit(value)) {
             if (fstValDecode1Hit(value).doc_num >= context.native.norm_count) return error.InvalidData;
@@ -9753,6 +9917,21 @@ pub const ScopedInvertedIndexReader = struct {
     pub fn rangeTermIterator(self: *const ScopedInvertedIndexReader, start: ?[]const u8, end: ?[]const u8) !Iterator {
         if (self.contiguous) |*reader| return .{ .contiguous = try reader.rangeTermIterator(start, end) };
         const context = self.context.?;
+        if (context.merge_delta) |*delta| {
+            Context.retain(context);
+            return .{ .merge_delta = .{ .context = context, .position = if (start) |key| delta.index.lowerBound(key) else 0, .end = end } };
+        }
+        if (context.normalized != null) {
+            const terms = try context.normalizedTerms();
+            var first: usize = 0;
+            var last = terms.len;
+            if (start) |key| while (first < last) {
+                const middle = first + (last - first) / 2;
+                if (std.mem.order(u8, terms[middle], key) == .lt) first = middle + 1 else last = middle;
+            };
+            Context.retain(context);
+            return .{ .normalized = .{ .context = context, .terms = terms, .position = first, .end = end } };
+        }
         const block = if (start) |key| (try context.native.ceilingBlock(key)) orelse context.native.block_count else 0;
         Context.retain(context);
         return .{ .ranges = .{ .context = context, .block = block, .scratch = @import("../segment_source.zig").Scratch.init(context.allocator, context.options.dictionary_retained_bytes), .start = start, .end = end } };
@@ -9761,18 +9940,27 @@ pub const ScopedInvertedIndexReader = struct {
     pub fn fstSearchIterator(self: *const ScopedInvertedIndexReader, automaton: fst.Automaton) !Iterator {
         if (self.contiguous) |*reader| return .{ .contiguous = try reader.fstSearchIterator(automaton) };
         var iterator = try self.termIterator();
-        iterator.ranges.automaton = automaton;
+        switch (iterator) {
+            .normalized => |*normal| normal.automaton = automaton,
+            .merge_delta => |*delta| delta.automaton = automaton,
+            .ranges => |*ranges| ranges.automaton = automaton,
+            .contiguous => unreachable,
+        }
         return iterator;
     }
 
     pub const Iterator = union(enum) {
         contiguous: TermIterator,
         ranges: RangeIterator,
+        normalized: NormalizedIterator,
+        merge_delta: MergeDeltaIterator,
 
         pub fn setControl(self: *Iterator, control: @import("../search/execution_control.zig").ExecutionControl) void {
             switch (self.*) {
                 .contiguous => |*iterator| iterator.control = control,
                 .ranges => |*iterator| iterator.control = control,
+                .normalized => |*iterator| iterator.control = control,
+                .merge_delta => |*iterator| iterator.control = control,
             }
         }
 
@@ -9780,6 +9968,7 @@ pub const ScopedInvertedIndexReader = struct {
             return switch (self.*) {
                 .contiguous => |*iterator| iterator.blocks_pruned,
                 .ranges => |*iterator| iterator.blocks_pruned,
+                .normalized, .merge_delta => 0,
             };
         }
 
@@ -9787,6 +9976,8 @@ pub const ScopedInvertedIndexReader = struct {
             return switch (self.*) {
                 .contiguous => |*iterator| iterator.next(),
                 .ranges => |*iterator| iterator.next(),
+                .normalized => |*iterator| iterator.next(null),
+                .merge_delta => |*iterator| iterator.next(null),
             };
         }
 
@@ -9794,6 +9985,8 @@ pub const ScopedInvertedIndexReader = struct {
             return switch (self.*) {
                 .contiguous => |*iterator| iterator.nextWithDecodedCount(decoded),
                 .ranges => |*iterator| iterator.nextTracked(decoded),
+                .normalized => |*iterator| iterator.next(decoded),
+                .merge_delta => |*iterator| iterator.next(decoded),
             };
         }
 
@@ -9801,8 +9994,121 @@ pub const ScopedInvertedIndexReader = struct {
             switch (self.*) {
                 .contiguous => |*iterator| iterator.deinit(),
                 .ranges => |*iterator| iterator.deinit(),
+                .normalized => |*iterator| Context.release(iterator.context),
+                .merge_delta => |*iterator| iterator.deinit(),
             }
             self.* = undefined;
+        }
+    };
+
+    const MergeDeltaIterator = struct {
+        context: *Context,
+        position: usize,
+        end: ?[]const u8,
+        automaton: ?fst.Automaton = null,
+        control: @import("../search/execution_control.zig").ExecutionControl = .{},
+        current_metadata: ?*TermMetadata = null,
+
+        fn next(self: *@This(), decoded: ?*u64) !?TermIterator.Entry {
+            if (self.current_metadata) |metadata| {
+                if (metadata.references.load(.acquire) == 1) {
+                    _ = metadata.arena.reset(if (metadata.arena.queryCapacity() <= 256 * 1024) .retain_capacity else .free_all);
+                } else {
+                    TermMetadata.release(metadata);
+                    self.current_metadata = null;
+                }
+            }
+            const delta = &self.context.merge_delta.?;
+            const index = &delta.index;
+            while (self.position < index.refs.len) {
+                try self.control.check();
+                try Context.check(self.context);
+                const first = self.position;
+                const term = index.hit(index.refs[first]).term;
+                self.position += 1;
+                while (self.position < index.refs.len and std.mem.eql(u8, index.hit(index.refs[self.position]).term, term)) self.position += 1;
+                if (self.end) |end| if (std.mem.order(u8, term, end) != .lt) {
+                    self.position = index.refs.len;
+                    return null;
+                };
+                if (decoded) |count| count.* += 1;
+                if (self.automaton) |automaton| {
+                    var state = automaton.start();
+                    for (term) |byte| {
+                        if (!automaton.canMatch(state)) break;
+                        state = automaton.accept(state, byte);
+                    }
+                    if (!automaton.canMatch(state) or !automaton.isMatch(state)) continue;
+                }
+                const metadata = self.current_metadata orelse try TermMetadata.create(self.context);
+                self.current_metadata = metadata;
+                const allocator = metadata.arena.allocator();
+                const refs = index.refs[first..self.position];
+                const docs = try allocator.alloc(u32, refs.len);
+                const metas = try allocator.alloc(PostingMeta, refs.len);
+                var position_count: usize = 0;
+                for (refs) |reference| position_count = try std.math.add(usize, position_count, index.hit(reference).position_count);
+                const positions = try allocator.alloc(u32, position_count);
+                var offset: usize = 0;
+                for (refs, docs, metas) |reference, *doc, *meta| {
+                    const hit = index.hit(reference);
+                    doc.* = reference.doc;
+                    meta.* = .{ .freq = hit.frequency, .norm = index.norms[reference.doc], .position_count = hit.position_count };
+                    index.readPositions(reference, positions[offset..][0..hit.position_count]);
+                    offset += hit.position_count;
+                }
+                if (metadata.arena.queryCapacity() > self.context.options.navigation_bytes) return error.SegmentReadBudgetExceeded;
+                return .{ .term = term, .result = .{ .postings = .{
+                    .normalized_postings = .{ .docs = docs, .metas = metas, .positions = positions },
+                    .doc_freq = @intCast(docs.len),
+                    .metadata_owner = .{ .ptr = metadata, .retain = TermMetadata.retain, .release = TermMetadata.release },
+                    .serialized_data = &.{},
+                    .header_len = 0,
+                    .chunk_size = @import("posting_delta.zig").maximum_documents,
+                    .version = productionIndexConfig().wireVersion(),
+                    .doc_range_aligned = false,
+                    .chunk_meta_data = &.{},
+                    .chunk_meta_count = 0,
+                    .payload_data = &.{},
+                    .norms_data = delta.norms,
+                } } };
+            }
+            return null;
+        }
+        fn deinit(self: *@This()) void {
+            if (self.current_metadata) |metadata| TermMetadata.release(metadata);
+            Context.release(self.context);
+        }
+    };
+
+    const NormalizedIterator = struct {
+        context: *Context,
+        terms: []const []const u8,
+        position: usize,
+        end: ?[]const u8,
+        automaton: ?fst.Automaton = null,
+        control: @import("../search/execution_control.zig").ExecutionControl = .{},
+        fn next(self: *@This(), decoded: ?*u64) !?TermIterator.Entry {
+            while (self.position < self.terms.len) {
+                try self.control.check();
+                const term = self.terms[self.position];
+                self.position += 1;
+                if (self.end) |end| if (std.mem.order(u8, term, end) != .lt) {
+                    self.position = self.terms.len;
+                    return null;
+                };
+                if (decoded) |count| count.* += 1;
+                if (self.automaton) |automaton| {
+                    var state = automaton.start();
+                    for (term) |byte| {
+                        if (!automaton.canMatch(state)) break;
+                        state = automaton.accept(state, byte);
+                    }
+                    if (!automaton.canMatch(state) or !automaton.isMatch(state)) continue;
+                }
+                return .{ .term = term, .result = (try self.context.lookupNormalized(term)).? };
+            }
+            return null;
         }
     };
 
@@ -9987,6 +10293,22 @@ pub const ScopedInvertedIndexReader = struct {
         }
     };
 
+    const Normalized = struct {
+        builder: InvertedIndexBuilder,
+        norms: []u8,
+        physical_bytes: usize,
+        sorted: ?[][]const u8 = null,
+        fn retainedBytes(self: *const @This()) u64 {
+            return self.builder.estimatedMemoryBytes() +| self.norms.len +|
+                (if (self.sorted) |terms| terms.len * @sizeOf([]const u8) else @as(usize, 0));
+        }
+        fn deinit(self: *@This(), allocator: Allocator) void {
+            if (self.sorted) |terms| allocator.free(terms);
+            allocator.free(self.norms);
+            self.builder.deinit();
+        }
+    };
+
     const Context = struct {
         allocator: Allocator,
         references: std.atomic.Value(usize) = .init(1),
@@ -9998,13 +10320,64 @@ pub const ScopedInvertedIndexReader = struct {
         shared_cache: ?@import("../segment_source.zig").ConcurrentBlockCache = null,
         native: RangeInvertedIndexReader = undefined,
         over_budget: bool = false,
+        // Decoded normalized-tail bytes share exactly the posting iterator's
+        // context lifetime. Closing a field scope cannot invalidate an iterator.
+        normalized: ?Normalized = null,
+        merge_delta: ?struct { index: @import("posting_delta.zig").TermIndex, norms: []u8 } = null,
+        normalized_mutex: std.atomic.Mutex = .unlocked,
+        check_source: ?@import("../segment_source.zig").Source = null,
 
         fn destroy(self: *Context) void {
             self.navigation.deinit();
             self.dictionary.deinit();
             if (self.cache) |*cache| cache.deinit();
             if (self.shared_cache) |*cache| cache.deinit();
+            if (self.normalized) |*normal| normal.deinit(self.allocator);
+            if (self.merge_delta) |*delta| {
+                delta.index.deinit();
+                self.allocator.free(delta.norms);
+            }
             self.allocator.destroy(self);
+        }
+
+        fn normalizedTerms(self: *Context) ![]const []const u8 {
+            @import("antfly_platform").sync.lockYielding(&self.normalized_mutex);
+            defer self.normalized_mutex.unlock();
+            const normal = &self.normalized.?;
+            if (normal.sorted) |terms| return terms;
+            const terms = try self.allocator.alloc([]const u8, normal.builder.terms.count());
+            var keys = normal.builder.terms.keyIterator();
+            for (terms) |*term| term.* = keys.next().?.*;
+            std.sort.pdq([]const u8, terms, {}, struct {
+                fn less(_: void, left: []const u8, right: []const u8) bool {
+                    return std.mem.order(u8, left, right) == .lt;
+                }
+            }.less);
+            if (normal.retainedBytes() +| terms.len * @sizeOf([]const u8) > self.options.navigation_bytes) {
+                self.allocator.free(terms);
+                return error.SegmentReadBudgetExceeded;
+            }
+            normal.sorted = terms;
+            return terms;
+        }
+
+        fn lookupNormalized(self: *Context, term: []const u8) !?LookupResult {
+            const normal = &self.normalized.?;
+            const acc = normal.builder.terms.getPtr(term) orelse return null;
+            return .{ .postings = .{
+                .normalized_postings = .{ .docs = acc.docIds(), .metas = acc.postingMetas(), .positions = acc.positionData() },
+                .doc_freq = @intCast(acc.docIds().len),
+                .metadata_owner = .{ .ptr = self, .retain = retain, .release = release },
+                .serialized_data = &.{},
+                .header_len = 0,
+                .chunk_size = @import("posting_delta.zig").maximum_documents,
+                .version = normal.builder.config.wireVersion(),
+                .doc_range_aligned = false,
+                .chunk_meta_data = &.{},
+                .chunk_meta_count = 0,
+                .payload_data = &.{},
+                .norms_data = normal.norms,
+            } };
         }
 
         fn cachedSource(self: *Context) @import("../segment_source.zig").Source {
@@ -10023,7 +10396,7 @@ pub const ScopedInvertedIndexReader = struct {
 
         fn check(ptr: *anyopaque) !void {
             const self: *Context = @ptrCast(@alignCast(ptr));
-            try self.view.source.checkReadContext();
+            try (self.check_source orelse self.view.source).checkReadContext();
         }
 
         fn read(ptr: *anyopaque, offset: u64, output: []u8) !void {
@@ -11704,4 +12077,101 @@ test "unique term dictionaries preserve canonical bytes across insertion orders"
             try std.testing.expectEqual(hits.len, count);
         }
     }
+}
+
+test "normalized posting delta merge streams a large vocabulary in half a megabyte and retains escaping postings" {
+    const a = std.testing.allocator;
+    const delta_mod = @import("posting_delta.zig");
+    const count = 16_000;
+    const hits = try a.alloc(InvertedIndexBuilder.TermHit, count);
+    defer a.free(hits);
+    const names = try a.alloc([16]u8, count);
+    defer a.free(names);
+    for (hits, names, 0..) |*hit, *name, i| hit.* = .{
+        .term = try std.fmt.bufPrint(name, "語-{d:0>6}", .{count - i}),
+        .freq = 1,
+        .positions = &.{0},
+    };
+    var delta = delta_mod.Builder.init(a);
+    defer delta.deinit();
+    try delta.add(0, hits);
+    var memory = @import("../segment.zig").MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    try delta.write(&sink, 1);
+    const pool = try a.alloc(u8, 512 * 1024);
+    defer a.free(pool);
+    var fixed = std.heap.FixedBufferAllocator.init(pool);
+    // This was the merge reader: its vocabulary table alone cannot fit.
+    try std.testing.expectError(error.OutOfMemory, ScopedInvertedIndexReader.initContiguousWithOptions(fixed.allocator(), memory.out.items, .{}));
+    fixed.reset();
+    var reader = try ScopedInvertedIndexReader.initMergeDeltaBytes(fixed.allocator(), memory.out.items, .{ .navigation_bytes = pool.len }, null);
+    var reader_live = true;
+    defer if (reader_live) reader.deinit();
+    var terms = try reader.termIterator();
+    var terms_live = true;
+    defer if (terms_live) terms.deinit();
+    const first = (try terms.next()) orelse return error.TestExpectedTerm;
+    var escaped = try first.result.iterator(a);
+    defer escaped.deinit();
+    var seen: usize = 1;
+    while (try terms.next()) |_| seen += 1;
+    try std.testing.expectEqual(@as(usize, count), seen);
+    terms.deinit();
+    terms_live = false;
+    reader.deinit();
+    reader_live = false;
+    const posting = (try escaped.next()) orelse return error.TestExpectedPosting;
+    try std.testing.expectEqual(@as(u32, 0), posting.doc_id);
+    try std.testing.expectEqual(@as(u32, 1), posting.freq);
+    try std.testing.expect((try escaped.next()) == null);
+}
+
+test "normalized posting delta merged sections preserve sparse deletion maps and unicode positions" {
+    const a = std.testing.allocator;
+    const delta_mod = @import("posting_delta.zig");
+    const SegmentMemory = @import("../segment.zig").MemorySegmentSink;
+    var left = delta_mod.Builder.init(a);
+    defer left.deinit();
+    try left.add(1, &[_]InvertedIndexBuilder.TermHit{.{ .term = "日本語", .freq = 2, .positions = &.{ 1, 4 } }});
+    try left.add(4, &[_]InvertedIndexBuilder.TermHit{.{ .term = "résumé", .freq = 2, .positions = &.{ 3, 8 } }});
+    var right = delta_mod.Builder.init(a);
+    defer right.deinit();
+    try right.add(0, &[_]InvertedIndexBuilder.TermHit{.{ .term = "日本語", .freq = 1, .positions = &.{7} }});
+    var left_bytes = SegmentMemory.init(a);
+    defer left_bytes.deinit();
+    var left_sink = left_bytes.sink();
+    try left.write(&left_sink, 6);
+    var right_bytes = SegmentMemory.init(a);
+    defer right_bytes.deinit();
+    var right_sink = right_bytes.sink();
+    try right.write(&right_sink, 2);
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.add(1);
+    const Check = struct {
+        fn run(allocator: Allocator, inputs: []const ?[]const u8, tombstones: []const ?roaring.RoaringBitmap) !void {
+            var output = SegmentMemory.init(allocator);
+            defer output.deinit();
+            var sink = output.sink();
+            try writeMergedInvertedSectionSlotsWithDeletes(allocator, &sink, inputs, &.{ 6, 2 }, tombstones, productionIndexConfig());
+            const reader = try InvertedIndexReader.init(allocator, output.out.items);
+            var resumed = try (reader.lookup("résumé") orelse return error.TestExpectedTerm).iterator(allocator);
+            defer resumed.deinit();
+            const first = (try resumed.advanceToWithPositions(0)) orelse return error.TestExpectedPosting;
+            try std.testing.expectEqual(@as(u32, 3), first.doc_id);
+            try std.testing.expectEqualSlices(u32, &.{ 3, 8 }, first.positions);
+            try std.testing.expect((try resumed.next()) == null);
+            var japanese = try (reader.lookup("日本語") orelse return error.TestExpectedTerm).iterator(allocator);
+            defer japanese.deinit();
+            const second = (try japanese.advanceToWithPositions(0)) orelse return error.TestExpectedPosting;
+            try std.testing.expectEqual(@as(u32, 5), second.doc_id);
+            try std.testing.expectEqualSlices(u32, &.{7}, second.positions);
+            try std.testing.expect((try japanese.next()) == null);
+        }
+    };
+    const inputs = [_]?[]const u8{ left_bytes.out.items, right_bytes.out.items };
+    const tombstones = [_]?roaring.RoaringBitmap{ deleted, null };
+    try Check.run(a, &inputs, &tombstones);
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{ @as([]const ?[]const u8, &inputs), @as([]const ?roaring.RoaringBitmap, &tombstones) });
 }

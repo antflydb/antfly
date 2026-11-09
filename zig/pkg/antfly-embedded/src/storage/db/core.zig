@@ -1152,6 +1152,10 @@ pub const DBCore = struct {
             .{
                 .index_name = index_name,
                 .sequence = sequence,
+                // Full-text physical sealing above uses the durable coverage
+                // incarnation. Preserve that identity in its root checkpoint;
+                // a scalar-compatible zero is not a replacement-generation proof.
+                .generation = if (cfg) |value| if (value.kind == .full_text) value.coverage_generation else 0 else 0,
                 .config_hash = config_hash,
                 .published_count = if (self.index_manager.denseIndex(index_name)) |entry|
                     entry.index.servingActiveCountForCheckpoint()

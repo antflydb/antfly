@@ -30,7 +30,11 @@ pub fn needsMerge(
     if (snap.segments.len < 2) return false;
     // Scheduling and planning must agree about force-drain debt. A policy
     // miss above the tier target still needs a task, including after reopen.
-    if (snap.segments.len > policy.max_segments_per_tier) return true;
+    var frozen: usize = 0;
+    for (snap.segments) |seg| if (!seg.reader.isNormalizedPostingDelta()) {
+        frozen += 1;
+    };
+    if (frozen > policy.max_segments_per_tier) return true;
 
     const infos = try buildSegmentInfosAlloc(alloc, snap);
     defer alloc.free(infos);
@@ -167,6 +171,7 @@ fn buildSegmentInfosAlloc(
         const deletion_summary = seg.deletionSummary();
         infos[i] = .{
             .index = i,
+            .normalized_delta = seg.reader.isNormalizedPostingDelta(),
             .size = seg.data.len(),
             .doc_count = seg.reader.doc_count,
             .deleted_count = deletion_summary.count,

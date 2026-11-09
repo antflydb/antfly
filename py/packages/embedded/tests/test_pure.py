@@ -229,10 +229,15 @@ def test_sql_error_body_carries_receipt(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(_ffi, "_lib", library)
     monkeypatch.setattr(_ffi, "get_lib", lambda: library)
     body = json.dumps(
-        {"error": {"code": "40003", "message": "commit outcome unknown"}, "outcome_receipt": RECEIPT}
+        {
+            "error": {"code": "40003", "message": "commit outcome unknown"},
+            "outcome_receipt": RECEIPT,
+            "commit_outcome": "unknown",
+        }
     ).encode()
     data = (ctypes.c_uint8 * len(body)).from_buffer_copy(body)
     buffer = _ffi.AntflyBuffer(ptr=ctypes.cast(data, ctypes.POINTER(ctypes.c_uint8)), len=len(body))
     with pytest.raises(SQLStateError) as result:
         output(errors.OUTCOME_UNKNOWN, buffer)
     assert result.value.outcome_receipt == RECEIPT
+    assert result.value.commit_outcome == "unknown"

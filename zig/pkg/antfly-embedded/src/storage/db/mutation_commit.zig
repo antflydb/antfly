@@ -429,15 +429,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // predicate into the commit fence; retries rebuild both the effective
             // JSON and every derived artifact from a fresh base.
             const resolve_transforms_start_ns = monotonicTimeNs();
-            var transform_snapshot = try self.captureTransformReadSnapshot(
-                preparation_alloc,
-                types.BatchWrite,
-                req.writes,
-                req.deletes,
-                req.transforms,
-            );
-            defer transform_snapshot.deinit(preparation_alloc);
-            var effective_ops = try coalesceKeyValueRequest(
+            const owned_resolution = if (opts.prepared_documents) |plan| blk: {
+                const resolved = plan.resolvedFor(req) orelse break :blk null;
+                if (!try plan.matches(struct { core: @TypeOf(S.ownerField(self, "core").*), root_incarnation: u128 }{ .core = S.ownerField(self, "core").*, .root_incarnation = S.ownerField(self, "root_incarnation").* })) {
+                    plan.needs_reprepare = true;
+                    return error.OwnedPreparationStale;
+                }
+                break :blk resolved;
+            } else null;
+            var transform_snapshot = if (owned_resolution != null)
+                opts.prepared_documents.?.transform_inputs.?.snapshot
+            else
+                try self.captureTransformReadSnapshot(
+                    preparation_alloc,
+                    types.BatchWrite,
+                    req.writes,
+                    req.deletes,
+                    req.transforms,
+                );
+            defer if (owned_resolution == null) transform_snapshot.deinit(preparation_alloc);
+            var effective_ops = if (owned_resolution) |resolved| resolved.* else try coalesceKeyValueRequest(
                 self,
                 preparation_alloc,
                 types.BatchWrite,
@@ -446,7 +457,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 req.transforms,
                 &transform_snapshot,
             );
-            defer effective_ops.deinit(preparation_alloc);
+            defer if (owned_resolution == null) effective_ops.deinit(preparation_alloc);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.resolve_transforms_ns, resolve_transforms_start_ns);
 
             if (req.reject_graph_transform_projections and
@@ -553,7 +564,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.transaction_resolution == null and !scoped_restore_replication_apply and !live_replication_apply) {
                 for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
                 for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
-                if (!req.graph_endpoint_cleanup_planned and hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
+                if (opts.native_sql_integrity == null and !req.graph_endpoint_cleanup_planned and hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
                     return error.ForeignKeyCoordinationRequired;
             }
             if (req.relational_schema_version) |version| {
@@ -636,7 +647,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const prepare_start_ns = monotonicTimeNs();
                     preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
                     prepared_write_plan_generation = preparation.write_plan.?.generation();
-                    try prepareRelationalRows(
+                    const took_owned_rows = if (opts.prepared_documents) |owned| blk: {
+                        if (opts.durable_rows != null or opts.restore_timestamps != null or opts.restore_staging != null or opts.preserve_logical_values) break :blk false;
+                        if (!try owned.matches(struct { core: @TypeOf(S.ownerField(self, "core").*), root_incarnation: u128 }{ .core = S.ownerField(self, "core").*, .root_incarnation = S.ownerField(self, "root_incarnation").* })) break :blk false;
+                        break :blk try owned.takeRelationalRows(effective_req.writes, view, rows);
+                    } else false;
+                    if (took_owned_rows) {
+                        for (rows) |*row| if (row.*) |*prepared| if (prepared.extracted.prepared_write_plan_generation != 0) {
+                            prepared.extracted.prepared_write_plan_generation = prepared_write_plan_generation.?;
+                        };
+                        if (profile) |active_profile| active_profile.owned_relational_rows_consumed += @intCast(rows.len);
+                    }
+                    if (!took_owned_rows) try prepareRelationalRows(
                         prepared_row_allocator,
                         S.ownerField(self, "backend_runtime").*.io(),
                         self,
@@ -1323,7 +1345,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (effective_req.graph_deletes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.source, .value = "" });
                 try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(graph_sources.items, &.{});
             }
-            try self.validateTransformReadSnapshot(transform_snapshot);
+            if (opts.native_sql_integrity) |integrity_plan| {
+                if (opts.transaction_resolution != null or opts.ordered_apply_receipt != null or
+                    opts.replication_applied_lsn_marker != null or try self.maintenanceRequiresOrderedApply()) return error.InvalidIntegrityOperation;
+                try integrity_plan.validateCore(preparation_alloc, S.ownerField(self, "core").*, S.ownerField(self, "root_incarnation").*, req);
+            }
+            if (owned_resolution != null)
+                try opts.prepared_documents.?.validateOwnedTransforms(S.ownerField(self, "core").*.store)
+            else
+                try self.validateTransformReadSnapshot(transform_snapshot);
             // Catches a concurrent commit to one of this batch's own write keys
             // between the pre-lock precompute read and this lock acquisition --
             // the race the catalog-generation check above cannot see, since it
@@ -1562,6 +1592,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 effective_req.merge_artifacts = filtered_cleanup_replay_writes.?;
             }
 
+            const prepared_documents_current = if (opts.prepared_documents) |plan| try plan.matches(struct { core: @TypeOf(S.ownerField(self, "core").*), root_incarnation: u128 }{ .core = S.ownerField(self, "core").*, .root_incarnation = S.ownerField(self, "root_incarnation").* }) else false;
             const group_plan: ?*const group_mutations.Plan = if (preparation.write_plan) |pinned|
                 if (pinned.plan().group_sources) |*plan| if (plan.entries.len > 0) plan else null else null
             else
@@ -1624,8 +1655,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 const mapper_extract_start_ns = monotonicTimeNs();
                 const semantic_hash = if (prepared_relational) |*prepared| prepared.semantic_hash else null;
+                const prepared_document = if (prepared_relational == null and prepared_documents_current)
+                    opts.prepared_documents.?.take(S.ownerField(self, "alloc").*, write.key, write.value)
+                else
+                    null;
+                if (profile) |active_profile| {
+                    if (prepared_document != null) active_profile.prepared_documents_consumed += 1 else if (prepared_relational == null) active_profile.unprepared_document_rows += 1;
+                }
                 extracted[i] = if (prepared_relational) |*prepared|
                     prepared.takeExtracted()
+                else if (prepared_document) |prepared|
+                    prepared
                 else
                     try mapper.extractWrite(S.ownerField(self, "alloc").*, write.key, write.value);
                 // Ownership has transferred even if a later graph/vector consumer
@@ -1633,7 +1673,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 extracted_initialized += 1;
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_mapper_ns, mapper_extract_start_ns);
                 const graph_field_extract_start_ns = monotonicTimeNs();
-                if (!use_preprepared_rows) {
+                if (!use_preprepared_rows and prepared_document == null) {
                     if (prepared_relational) |*prepared|
                         try augmentExtractedWriteWithGraphFieldEdgesParsed(self, S.ownerField(self, "alloc").*, write.key, prepared.parsedValue(), &extracted[i])
                     else
@@ -1641,7 +1681,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_fields_ns, graph_field_extract_start_ns);
                 const index_field_embeddings_start_ns = monotonicTimeNs();
-                if (!use_preprepared_rows) {
+                if (!use_preprepared_rows and prepared_document == null) {
                     if (prepared_relational) |*prepared|
                         try S.ownerField(self, "core").*.index_manager.appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(S.ownerField(self, "alloc").*, write.key, prepared.parsedValue(), try prepared.typedView(apply_schema_view.?.tableSchema().*, apply_schema_view.?.physicalLayout()), &extracted[i])
                     else
@@ -1718,6 +1758,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const resolved_write_timestamp_ns: ?u64 = if (!use_preprepared_rows and shouldWriteTimestamp(write.key))
                         (if (opts.restore_timestamps) |timestamps| timestamps.get(write.key) else null) orelse if (prepared_relational) |*prepared|
                             try resolveWriteTimestampFromValue(self, batch_timestamp_ns, prepared.parsedValue())
+                        else if (prepared_document != null)
+                            opts.prepared_documents.?.timestampFor(write.key, write.value, batch_timestamp_ns) orelse return error.InvalidDerivedApplyState
                         else
                             try resolveWriteTimestampNs(self, batch_timestamp_ns, write.value)
                     else
@@ -1759,12 +1801,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, packed_row);
                         }
                         break :blk packed_row;
-                    } else try strippedStoredDocumentValueAlloc(
-                        S.ownerField(self, "alloc").*,
-                        cleaned,
-                        write_buffers.vector_store_field_names,
-                        &write_buffers.owned_store_values,
-                    );
+                    } else if (prepared_document != null)
+                        opts.prepared_documents.?.storedValueFor(write.key, write.value) orelse return error.InvalidDerivedApplyState
+                    else
+                        try strippedStoredDocumentValueAlloc(
+                            S.ownerField(self, "alloc").*,
+                            cleaned,
+                            write_buffers.vector_store_field_names,
+                            &write_buffers.owned_store_values,
+                        );
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
                     const store_key = if (use_preprepared_rows) preparation.effects.?[i].store_key.? else try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
                     if (!use_preprepared_rows) try write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, store_key);
@@ -2372,19 +2417,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.group_source_command) |command| {
                 const empty_groups = group_mutations.Plan{ .arena = undefined, .entries = &.{} };
                 const plan = group_plan orelse &empty_groups;
-                var matched = false;
-                var matched_entry: ?group_mutations.Plan.Entry = null;
-                for (plan.entries) |entry| if (std.mem.eql(u8, entry.name, command.artifact) and std.mem.eql(u8, &entry.configuration, &command.definition.configuration)) {
-                    matched = true;
-                    matched_entry = entry;
-                    break;
-                };
-                if (!matched and command.action != .retire and !command.isActivation()) return error.PreparedGenerationChanged;
-                const table = try group_mutations.tableIdentity(&group_overlay, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*);
-                if (table != command.definition.table_incarnation) return error.InvalidGroupedSourceCommand;
                 var namespace: [24]u8 = undefined;
                 doc_identity.encodeNamespace(&namespace, S.ownerField(self, "core").*.identity_namespace);
-                if (!std.mem.eql(u8, &namespace, &command.namespace)) return error.InvalidGroupedSourceCommand;
+                const matched_entry = try @import("group_source_apply.zig").requireCommandContext(&group_overlay, plan, command.*, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*, namespace);
+                const table = command.definition.table_incarnation;
+                if (command.publish) |publication| if (opts.ordered_apply_receipt == null and !try self.maintenanceRequiresOrderedApply()) {
+                    var source_namespace = namespace;
+                    if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], S.ownerField(self, "root_incarnation").*, .big);
+                    try @import("group_source_apply.zig").requireLocalSourceCut(group_alloc, &group_overlay, publication, .{ .namespace = source_namespace, .incarnation = group_overlay.groupIncarnation() });
+                };
                 if (command.finish) |finish| {
                     if (opts.ordered_apply_receipt == null and opts.legacy_group_plan_generation == preparation.write_plan.?.generation() and opts.legacy_group_completed_through != null and opts.legacy_group_completed_through.? >= finish.through_sequence) group_overlay.legacy_completion = true;
                 }
@@ -2441,7 +2482,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
             }
             const group_control_without_replay = opts.group_source_command != null and !group_staged.hasReplay() and changed_graph_artifact_keys.items.len == 0;
-            const elide_semantic_noop_replay = group_control_without_replay or (opts.resolver_review_command == null and group_plan == null and use_thin_replay_fast_path and
+            const default_elide_semantic_noop_replay = group_control_without_replay or (opts.resolver_review_command == null and group_plan == null and use_thin_replay_fast_path and
                 opts.extra_store_writes.len == 0 and
                 opts.transaction_resolution == null and
                 opts.replication_applied_lsn_marker == null and
@@ -2452,7 +2493,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     changed_graph_artifact_keys.items,
                     derived_changed_flags,
                 ));
-            const sequence = if (elide_semantic_noop_replay)
+            const elide_semantic_noop_replay = opts.publication_cohort == null and default_elide_semantic_noop_replay;
+            var cohort_sequences: [@import("publication_cohort.zig").maximum_requests]u64 = undefined;
+            const sequence = if (opts.publication_cohort) |cohort| blk: {
+                if (cohort.requests.len == 0 or cohort.requests.len > cohort_sequences.len) return error.InvalidBatchRequest;
+                for (cohort_sequences[0..cohort.requests.len]) |*logical| logical.* = S.ownerField(self, "core").*.reserveDerivedAppendSequence();
+                break :blk cohort_sequences[cohort.requests.len - 1];
+            } else if (elide_semantic_noop_replay)
                 S.ownerField(self, "core").*.nextDerivedSequence()
             else
                 S.ownerField(self, "core").*.reserveDerivedAppendSequence();
@@ -2684,8 +2731,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             const append_derived_replay = !opts.suppress_derived_replay_append and
                 !elide_semantic_noop_replay;
+            var cohort_journal: ?@import("publication_cohort.zig").Journal = if (opts.publication_cohort) |cohort|
+                try cohort.prepareJournal(S.ownerField(self, "alloc").*, replay_payload, cohort_sequences[0..cohort.requests.len])
+            else
+                null;
+            defer if (cohort_journal) |*prepared| prepared.deinit();
             if (append_derived_replay) {
-                try appendArtifactSourceRevisionWritesFromReplay(
+                if (cohort_journal) |prepared| {
+                    for (prepared.records) |record| try appendArtifactSourceRevisionWritesFromReplay(
+                        S.ownerField(self, "alloc").*,
+                        record.payload,
+                        record.sequence,
+                        &write_buffers.store_writes,
+                        &write_buffers.owned_store_keys,
+                        &write_buffers.owned_store_values,
+                    );
+                } else try appendArtifactSourceRevisionWritesFromReplay(
                     S.ownerField(self, "alloc").*,
                     replay_payload,
                     sequence,
@@ -2749,7 +2810,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const store_write_start_ns = monotonicTimeNs();
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
-            const store_batch_options: backend_types.BatchOptions = if (opts.store_batch_options.mode != .default)
+            const store_batch_options: backend_types.BatchOptions = if (opts.store_batch_options.mode != .default or opts.store_batch_options.native_atomic_member != null)
                 opts.store_batch_options
             else if (self.bulkSessionActive())
                 .{ .mode = .bulk_ingest, .defer_commit_flush = true }
@@ -2993,7 +3054,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &write_buffers.owned_store_values,
             );
             try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_writes);
+            // Constraint controls are not authored documents or independent
+            // replay sources. Their exact guards were validated under this
+            // apply fence and their effects join the same primary commit.
+            if (opts.native_sql_integrity) |integrity_plan| for (integrity_plan.effects.operations) |operation| switch (operation.kind) {
+                .guard => {},
+                .put => try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = operation.key, .value = operation.value orelse return error.InvalidIntegrityOperation }),
+                .delete => try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, operation.key),
+            };
             if (opts.outcome_marker_write) |marker| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, marker);
+            try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.cohort_outcome_marker_writes);
             if (req.merge_page) |page| if (page.integrity.len != 0) {
                 // Private page shape, exact generation/ownership and replay cursor
                 // have been checked under this same apply fence. The physical
@@ -3065,7 +3135,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
             };
             const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (append_derived_replay)
-                .{
+                if (cohort_journal) |prepared| prepared.append() else .{
                     .sequence = sequence,
                     .payload = replay_payload,
                 }
@@ -3077,7 +3147,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // returned before the primary mutation and replay intent commit.
             const backlog_admission_start_ns = monotonicTimeNs();
             var backlog_admission = if (append_derived_replay)
-                try S.ownerField(self, "executor").*.admitBacklogBytes(@intCast(replay_payload.len))
+                try S.ownerField(self, "executor").*.admitBacklogBytes(@intCast(if (cohort_journal) |prepared| prepared.bytes else replay_payload.len))
             else
                 derived_executor_mod.BacklogAdmission{};
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_admission_ns, backlog_admission_start_ns);
@@ -3129,13 +3199,43 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             } else blk: {
                 if (durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null)
                     S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
-                try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipant(
-                    S.ownerField(self, "backend_runtime").*.io(),
-                    write_buffers.store_writes.items,
-                    write_buffers.delete_keys.items,
-                    replay_append,
-                    store_batch_options,
-                    if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
+                const ForegroundPrimary = struct {
+                    store: *docstore_mod.DocStore,
+                    io: ?std.Io,
+                    writes: []const docstore_mod.KVPair,
+                    deletes: []const []const u8,
+                    replay: ?docstore_mod.DocStore.ReplayAppend,
+                    options: backend_types.BatchOptions,
+                    prepared_values: ?*const @import("../document_mutation_revision.zig").PreparedValues,
+                    authored: ?@import("../commit_participant.zig").Participant,
+                    fn commit(raw: *anyopaque, participant: @import("../native_publication.zig").Participant) !void {
+                        const primary: *@This() = @ptrCast(@alignCast(raw));
+                        try primary.store.putBatchWithPreparedPublications(primary.io, primary.writes, primary.deletes, primary.replay, primary.options, primary.authored, participant, primary.prepared_values);
+                    }
+                };
+                var foreground_primary: ForegroundPrimary = .{
+                    .store = S.ownerField(self, "core").*.store,
+                    .io = S.ownerField(self, "backend_runtime").*.io(),
+                    .writes = write_buffers.store_writes.items,
+                    .deletes = write_buffers.delete_keys.items,
+                    .replay = replay_append,
+                    .options = store_batch_options,
+                    .prepared_values = if (prepared_documents_current) &opts.prepared_documents.?.value_authorities else null,
+                    .authored = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
+                };
+                const foreground_committed = if (prepared_documents_current and append_derived_replay)
+                    try opts.prepared_documents.?.commitForegroundText(S.ownerField(self, "core").*.index_manager, S.ownerField(self, "executor").*, sequence, effective_req, S.ownerField(self, "core").*.store, write_buffers.identity_writes.items, .{ .ptr = &foreground_primary, .commit_fn = ForegroundPrimary.commit })
+                else
+                    false;
+                if (!foreground_committed) try S.ownerField(self, "core").*.store.putBatchWithPreparedPublications(
+                    foreground_primary.io,
+                    foreground_primary.writes,
+                    foreground_primary.deletes,
+                    foreground_primary.replay,
+                    foreground_primary.options,
+                    foreground_primary.authored,
+                    null,
+                    foreground_primary.prepared_values,
                 );
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
@@ -3282,7 +3382,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var pressure_ctx = self.batchContext();
                 const backlog_pressure_start_ns = monotonicTimeNs();
                 try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
-                try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
+                // Native intake already owns bounded durable replay credits.
+                // A completion handoff must not drive post-commit replay while
+                // its caller still holds the publisher's writer admission.
+                if (opts.visibility_completion == null or !pressure_ctx.store.runtime_store.capabilities().bounded_replay_admission)
+                    try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_pressure_ns, backlog_pressure_start_ns);
             }
             const wait_sync_start_ns = monotonicTimeNs();
@@ -3300,7 +3404,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
                 }
             } else if (append_derived_replay) {
-                if (opts.wait_for_sync_level and syncLevelRequiresDerivedVisibility(effective_req.sync_level)) {
+                if (opts.visibility_completion == null and opts.wait_for_sync_level and syncLevelRequiresDerivedVisibility(effective_req.sync_level)) {
                     const derived_apply_start_ns = monotonicTimeNs();
                     if (effective_req.sync_level == .full_text) {
                         try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.full_text_indexes, profile);
@@ -5183,16 +5287,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
             if (ctx.repair_replay_mutex) |mutex| mutex.lockUncancelable(ctx.index_manager.checkpointIo());
             defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock(ctx.index_manager.checkpointIo());
-            if (!ctx.index_manager.hasManagedIndexes()) return;
+            const bounded_replay = ctx.store.runtime_store.capabilities().bounded_replay_admission;
+            if (!ctx.index_manager.hasManagedIndexes() and !bounded_replay) return;
 
             const managed_indexes = try ctx.index_manager.managedIndexes(ctx.alloc);
             defer {
                 for (managed_indexes) |index_ref| ctx.alloc.free(@constCast(index_ref.name));
                 ctx.alloc.free(managed_indexes);
             }
-            if (managed_indexes.len == 0) return;
+            if (managed_indexes.len == 0 and (!bounded_replay or ctx.index_manager.failedIndexLoadSummary().total != 0)) return;
 
-            var min_applied: u64 = std.math.maxInt(u64);
+            // A namespace with no managed consumers still has bounded native
+            // journal storage. Its durable head is eligible, subject to the
+            // same enrichment, resolver, replacement and repair-pin clamps.
+            var min_applied: u64 = if (managed_indexes.len == 0) ctx.store.lastReplaySequence(0) else std.math.maxInt(u64);
             for (managed_indexes) |index_ref| {
                 const applied = try loadManagedAppliedSequenceContext(
                     ctx.alloc,

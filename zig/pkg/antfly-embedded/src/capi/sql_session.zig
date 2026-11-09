@@ -14,8 +14,9 @@
 // limitations under the License.
 
 //! Connection-scoped SQL transactions. Statements read a pinned native view
-//! plus their own staged postimages. COMMIT prepares native intents and uses
-//! the durable database coordinator; SQL is never replayed to commit a session.
+//! plus their own staged postimages. Shared-file COMMIT publishes owned row
+//! and constraint plans through one native checkpoint. Other backends retain
+//! the durable coordinator; SQL is never replayed to commit a session.
 const h = @import("handles.zig");
 const api = @import("db.zig");
 const sql = @import("sql.zig");
@@ -50,6 +51,10 @@ const Entry = struct {
     encoded_row: ?[]const u8 = null,
 };
 const Savepoint = struct { name: []const u8, length: usize };
+const MutationFold = @import("../sql/mutation_fold.zig").Accumulator(Entry);
+const Integrity = d.api_relational_integrity_commit;
+const OverlayWitness = struct { inode: u64, primary: [16]u8, metadata: [16]u8, dependencies: ?[32]u8 = null };
+const ConstraintOverlay = struct { witness: OverlayWitness, target: []const u8, entry_count: usize, value: Integrity.StatementOverlay };
 pub const Session = struct {
     handle: *h.Handle,
     budget: d.sql_memory_budget,
@@ -60,9 +65,146 @@ pub const Session = struct {
     failed: bool = false,
     read_only: bool = false,
     bytes: usize = 0,
+    folded: ?MutationFold = null,
+    folded_count: usize = 0,
+    constraint_overlay: ?ConstraintOverlay = null,
+    dependency_tables: std.StringHashMapUnmanaged(void) = .empty,
+    dependency_entries_count: usize = 0,
+    test_overlay_rebuilds: if (h.builtin.is_test) usize else void = if (h.builtin.is_test) 0 else {},
+    test_overlay_extensions: if (h.builtin.is_test) usize else void = if (h.builtin.is_test) 0 else {},
+
+    fn countOverlay(self: *Session, comptime field: []const u8, amount: u64) void {
+        const connection = self.handle.lite_connection_context orelse return;
+        std.debug.assert(connection.attached);
+        @field(connection.owner.publication_stats, field) +|= amount;
+    }
+
+    fn invalidateFold(self: *Session) void {
+        if (self.folded) |*fold| fold.deinit();
+        self.folded = null;
+        self.folded_count = 0;
+    }
+    fn invalidateDependencyTables(self: *Session) void {
+        self.dependency_tables.clearRetainingCapacity();
+        self.dependency_entries_count = 0;
+    }
+    fn invalidateConstraintOverlay(self: *Session) void {
+        if (self.constraint_overlay) |*overlay| {
+            overlay.value.deinit();
+            self.budget.allocator().free(overlay.target);
+        }
+        self.constraint_overlay = null;
+    }
+    pub fn deinit(self: *Session) void {
+        self.invalidateConstraintOverlay();
+        self.invalidateFold();
+        self.dependency_tables.deinit(self.budget.allocator());
+        self.dependency_tables = .empty;
+        self.dependency_entries_count = 0;
+        self.arena.deinit();
+    }
+    fn foldedEntries(self: *Session) !*MutationFold {
+        if (self.folded == null) self.folded = MutationFold.init(self.budget.allocator());
+        errdefer self.invalidateFold();
+        while (self.folded_count < self.entries.items.len) : (self.folded_count += 1)
+            try self.folded.?.append(self.entries.items[self.folded_count]);
+        return &self.folded.?;
+    }
+    fn overlayWitness(self: *Session, metadata: anytype, entry_count: usize, target: []const u8) !?OverlayWitness {
+        const backend = self.handle.owned_lite_backend orelse return null;
+        const store = backend.native_docstore orelse return null;
+        if (!store.file.header.indexed_reclamation or store.file.transaction_header != null or store.file.checkpoint_publication_uncertain) return null;
+        const logical = store.file.activeCheckpoint().logical;
+        if (std.mem.allEqual(u8, &logical.primary, 0) or std.mem.allEqual(u8, &logical.metadata, 0)) return null;
+        if (self.dependency_entries_count > entry_count) {
+            self.dependency_tables.clearRetainingCapacity();
+            self.dependency_entries_count = 0;
+        }
+        // Only newly staged entries discover dependencies. The witness must
+        // never rescan all previous rows merely to discover their table names.
+        // Current-statement entries are already staged at this point; only
+        // completed effects belong to the old scope. The target is explicit.
+        while (self.dependency_entries_count < entry_count) : (self.dependency_entries_count += 1)
+            try self.dependency_tables.put(self.budget.allocator(), self.entries.items[self.dependency_entries_count].table.physical_name, {});
+        if (try @import("sql_dependency_witness.zig").capture(self.handle.alloc, &self.handle.owned_lite_backend.?, metadata, &self.dependency_tables, target)) |dependencies|
+            return .{ .inode = (try store.file.file.stat(store.file.runtime())).inode, .primary = @splat(0), .metadata = @splat(0), .dependencies = dependencies };
+        return .{ .inode = (try store.file.file.stat(store.file.runtime())).inode, .primary = logical.primary, .metadata = logical.metadata };
+    }
+    /// The API/path gate protects the dependency witness. Relevant peer row,
+    /// constraint, DDL and incarnation changes rebuild previous effects;
+    /// unrelated publication does not. Legacy files use the complete file cut.
+    pub fn preparedConstraintOverlay(self: *Session, source: d.api_table_read_source.TableReadSource, metadata: anytype, admission: Integrity.RepairAdmission, entry_count: usize, target: []const u8) !?*const Integrity.StatementOverlay {
+        const witness = (try self.overlayWitness(metadata, entry_count, target)) orelse {
+            self.invalidateConstraintOverlay();
+            return null;
+        };
+        if (self.constraint_overlay) |*cached| {
+            if (cached.entry_count == entry_count) {
+                if (std.meta.eql(cached.witness, witness)) {
+                    self.countOverlay("sql_constraint_overlay_hits", 1);
+                    return &cached.value;
+                }
+                // Adding a disjoint target widens the witness, but does not
+                // invalidate already prepared effects. Validate the old scope
+                // first: peer changes, new FK edges, namespace replacement and
+                // legacy file cuts must still rebuild. Newly discovered effect
+                // tables conservatively widen this check as well.
+                if (cached.witness.dependencies != null and witness.dependencies != null) {
+                    const previous = try self.overlayWitness(metadata, entry_count, cached.target);
+                    if (previous != null and std.meta.eql(cached.witness, previous.?)) {
+                        const owned_target = self.retainOverlayTarget(target) orelse return null;
+                        self.budget.allocator().free(cached.target);
+                        cached.target = owned_target;
+                        cached.witness = witness;
+                        self.countOverlay("sql_constraint_overlay_scope_extensions", 1);
+                        return &cached.value;
+                    }
+                }
+            }
+        }
+        self.invalidateConstraintOverlay();
+        const owned_target = self.retainOverlayTarget(target) orelse return null;
+        if (comptime h.builtin.is_test) self.test_overlay_rebuilds += 1;
+        self.countOverlay("sql_constraint_overlay_rebuilds", 1);
+        self.countOverlay("sql_constraint_overlay_rebuild_entries", @intCast(entry_count));
+        self.constraint_overlay = .{ .witness = witness, .target = owned_target, .entry_count = entry_count, .value = .init(self.budget.allocator()) };
+        errdefer self.invalidateConstraintOverlay();
+        if (entry_count != 0) {
+            var scratch = std.heap.ArenaAllocator.init(self.handle.alloc);
+            defer scratch.deinit();
+            const previous = try self.requestsThrough(scratch.allocator(), entry_count);
+            var prepared = try Integrity.prepareSessionOverlay(self.handle.alloc, source, metadata.table, previous, admission, .{});
+            defer prepared.deinit();
+            const exhausted = self.budget.exhausted;
+            const admission_exhausted = self.budget.admission_exhausted;
+            self.constraint_overlay.?.value.add(prepared.tables) catch |err| {
+                self.invalidateConstraintOverlay();
+                if (err != error.OutOfMemory) return err;
+                self.countOverlay("sql_constraint_overlay_evictions", 1);
+                // Optional retained work must not consume the transaction's
+                // remaining admission. Rebuild through the uncached path.
+                self.budget.exhausted = exhausted;
+                self.budget.admission_exhausted = admission_exhausted;
+                return null;
+            };
+        }
+        return &self.constraint_overlay.?.value;
+    }
+
+    fn retainOverlayTarget(self: *Session, target: []const u8) ?[]const u8 {
+        const exhausted = self.budget.exhausted;
+        const admission_exhausted = self.budget.admission_exhausted;
+        return self.budget.allocator().dupe(u8, target) catch {
+            self.invalidateConstraintOverlay();
+            self.countOverlay("sql_constraint_overlay_evictions", 1);
+            self.budget.exhausted = exhausted;
+            self.budget.admission_exhausted = admission_exhausted;
+            return null;
+        };
+    }
 
     pub fn reset(self: *Session) void {
-        self.arena.deinit();
+        self.deinit();
         self.budget = .{ .backing = self.handle.alloc, .limit = sql.runtime.resource_limits.default_memory_bytes };
         self.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         self.entries = .empty;
@@ -85,7 +227,12 @@ pub const Session = struct {
         if (self.failed) return error.SqlTransactionAborted;
         if (self.read_only) return error.SqlReadOnlyTransaction;
         const before = self.entries.items.len;
-        errdefer self.entries.items.len = before;
+        errdefer {
+            self.entries.items.len = before;
+            self.invalidateDependencyTables();
+            self.invalidateConstraintOverlay();
+            self.invalidateFold();
+        }
         const a = self.arena.allocator();
         for (mutations) |mutation| {
             // Reclaim the serialization builder's excess capacity, retaining
@@ -120,10 +267,12 @@ pub const Session = struct {
         var adapter = sql.Adapter(h.antfly){ .handle = self.handle, .db = try @import("tables.zig").get(self.handle, target.physical_name), .table_name = target.physical_name };
         if (!try adapter.localRequiresCoordination()) return;
         const metadata = try adapter.localCatalog(a, target.schema_version);
-        const requests = try self.commitRequests(a);
-        const previous = try requestsForEntries(a, self.entries.items[0..statement_start]);
+        const overlay = try self.preparedConstraintOverlay(adapter.localSource(), metadata, adapter.repairAdmission(), statement_start, target.physical_name);
         const statement = try requestsForEntries(a, self.entries.items[statement_start..]);
-        var prepared = try d.api_relational_integrity_commit.prepareSessionStatementWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, previous, statement, adapter.repairAdmission(), .{});
+        var prepared = if (overlay) |previous|
+            try Integrity.prepareSessionStatementWithOverlay(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, previous, statement, adapter.repairAdmission(), .{})
+        else
+            try Integrity.prepareSessionStatementWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, try self.requestsThrough(a, statement_start), statement, adapter.repairAdmission(), .{});
         defer prepared.deinit();
         const owned = self.arena.allocator();
         for (prepared.tables) |request| {
@@ -132,14 +281,10 @@ pub const Session = struct {
             saved_table.physical_name = try owned.dupe(u8, request.table_name);
             saved_table.columns = &.{};
             for (request.writes) |write| {
-                var original: ?[]const u8 = null;
-                for (requests) |input| if (std.mem.eql(u8, input.table_name, request.table_name)) {
-                    for (input.writes) |prior| if (std.mem.eql(u8, prior.key, write.key)) {
-                        original = prior.value;
-                        break;
-                    };
-                };
-                if (original) |bytes| if (std.mem.eql(u8, bytes, write.value)) continue;
+                if ((try self.foldedEntries()).lookup(request.table_name, write.key)) |original| {
+                    if (!original.mutation.predicate_only) if (original.encoded_row) |bytes|
+                        if (std.mem.eql(u8, bytes, write.value)) continue;
+                }
                 var mutation: catalog.Mutation = .{ .expected_version = 0, .key = try owned.dupe(u8, write.key), .row = null };
                 mutation.json_null_fields = try owned.alloc([]const u8, write.json_null_fields.len);
                 for (write.json_null_fields, @constCast(mutation.json_null_fields)) |field, *out| out.* = try owned.dupe(u8, field);
@@ -153,11 +298,8 @@ pub const Session = struct {
                 try self.entries.append(owned, .{ .table = saved_table, .mutation = mutation, .encoded_row = try owned.dupe(u8, write.value) });
             }
             for (request.deletes) |key| {
-                const already = outer: for (requests) |input| {
-                    if (!std.mem.eql(u8, input.table_name, request.table_name)) continue;
-                    for (input.deletes) |prior| if (std.mem.eql(u8, prior, key)) break :outer true;
-                } else false;
-                if (already) continue;
+                if ((try self.foldedEntries()).lookup(request.table_name, key)) |original|
+                    if (!original.mutation.predicate_only and original.encoded_row == null) continue;
                 var mutation: catalog.Mutation = .{ .expected_version = 0, .key = try owned.dupe(u8, key), .row = null };
                 for (request.predicates) |predicate| if (std.mem.eql(u8, predicate.key, key)) {
                     mutation.expected_version = predicate.expected_version;
@@ -169,10 +311,43 @@ pub const Session = struct {
                 try self.entries.append(owned, .{ .table = saved_table, .mutation = mutation });
             }
         }
+        self.countOverlay("sql_constraint_staged_statements", 1);
+        if (self.constraint_overlay) |*cached| {
+            const exhausted = self.budget.exhausted;
+            const admission_exhausted = self.budget.admission_exhausted;
+            cached.value.add(prepared.tables) catch |err| {
+                self.invalidateConstraintOverlay();
+                if (err != error.OutOfMemory) return err;
+                self.countOverlay("sql_constraint_overlay_evictions", 1);
+                self.budget.exhausted = exhausted;
+                self.budget.admission_exhausted = admission_exhausted;
+                return;
+            };
+            cached.entry_count = self.entries.items.len;
+            if (comptime h.builtin.is_test) self.test_overlay_extensions += 1;
+        }
     }
 
     pub fn merged(self: *Session, alloc: std.mem.Allocator) ![]Entry {
-        return mergeEntries(alloc, self.entries.items);
+        return alloc.dupe(Entry, (try self.foldedEntries()).entries.items);
+    }
+
+    /// Point reads need only one staged postimage. Building and scanning the
+    /// complete transaction for every upsert would retain quadratic work even
+    /// after constraint effects have become incremental.
+    pub fn stagedForScan(self: *Session, alloc: std.mem.Allocator, table: catalog.Table, key: ?[]const u8) ![]const Entry {
+        const fold = try self.foldedEntries();
+        // Missing-key lookups must still fence other staged rows in a table
+        // that was dropped/recreated or whose physical schema changed.
+        if (fold.tables.get(table.physical_name)) |prior|
+            if (prior.id != table.id or prior.schema_version != table.schema_version or prior.storage_mode != table.storage_mode)
+                return error.PreparedGenerationChanged;
+        if (key) |point| {
+            if (fold.lookup(table.physical_name, point)) |entry|
+                return alloc.dupe(Entry, &.{entry});
+            return &.{};
+        }
+        return self.merged(alloc);
     }
 
     fn mergeEntries(alloc: std.mem.Allocator, entries: []const Entry) ![]Entry {
@@ -180,14 +355,17 @@ pub const Session = struct {
     }
 
     pub fn commitRequests(self: *Session, a: std.mem.Allocator) ![]d.api_distributed_txn_contract.TableCommitRequest {
-        for (self.entries.items) |entry| {
+        return self.requestsThrough(a, self.entries.items.len);
+    }
+    fn requestsThrough(self: *Session, a: std.mem.Allocator, count: usize) ![]d.api_distributed_txn_contract.TableCommitRequest {
+        for (self.entries.items[0..count]) |entry| {
             const database = @import("tables.zig").get(self.handle, entry.table.physical_name) catch |err| switch (err) {
                 error.UndefinedTable => return error.PreparedGenerationChanged,
                 else => return err,
             };
             if (database.core.identity_namespace.table_id != entry.table.id) return error.PreparedGenerationChanged;
         }
-        return requestsForEntries(a, self.entries.items);
+        return requestsForEntries(a, self.entries.items[0..count]);
     }
 
     fn requestsForEntries(a: std.mem.Allocator, input: []const Entry) ![]d.api_distributed_txn_contract.TableCommitRequest {
@@ -248,6 +426,10 @@ pub const Session = struct {
     }
 
     pub fn commit(self: *Session, out_id: *?types.TxnId) !catalog.MutationOutcome {
+        return self.commitWithHandoff(out_id, null);
+    }
+
+    fn commitWithHandoff(self: *Session, out_id: *?types.TxnId, handoff: ?sql.PreparationHandoff) !catalog.MutationOutcome {
         if (!self.active) return .committed;
         if (self.failed) {
             return error.SqlTransactionAborted;
@@ -264,19 +446,32 @@ pub const Session = struct {
             self.reset();
             return .committed;
         }
-        var adapter = sql.Adapter(h.antfly){ .handle = self.handle, .db = @import("tables.zig").get(self.handle, requests[0].table_name) catch |err| return outcomes.notApplied(err), .table_name = requests[0].table_name };
+        var adapter = sql.Adapter(h.antfly){ .preparation_handoff = handoff, .handle = self.handle, .db = @import("tables.zig").get(self.handle, requests[0].table_name) catch |err| return outcomes.notApplied(err), .table_name = requests[0].table_name };
         const metadata = adapter.localCatalog(a, requests[0].schema_version.?) catch |err| return outcomes.notApplied(err);
         var prepared = d.api_relational_integrity_commit.prepareWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, requests, adapter.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
         defer prepared.deinit();
-        const outcome = @import("sql_commit.zig").commit(self.handle, prepared.tables, out_id) catch |err| {
-            self.failed = true;
+        const outcome = commitNativeOrCoordinated(&adapter, a, prepared.tables, out_id) catch |err| {
+            // A proven native capacity refusal preserves the staged owned
+            // postimages so the advertised retryable COMMIT is actually usable.
+            // All other failures retain ordinary transaction-abort semantics.
+            self.failed = err != error.SqlNativeCommitCapacityNotApplied;
             return err;
         };
         self.reset();
         return outcome;
     }
 
+    fn commitNativeOrCoordinated(adapter: anytype, alloc: std.mem.Allocator, requests: []const d.api_distributed_txn_contract.TableCommitRequest, out_id: *?types.TxnId) !catalog.MutationOutcome {
+        out_id.* = null;
+        if (try @import("sql_native_commit.zig").tryCommit(adapter, alloc, requests)) |outcome| return outcome;
+        return @import("sql_commit.zig").commit(adapter.handle.?, requests, out_id);
+    }
+
     pub fn control(self: *Session, statement: d.sql_ast.Statement, out_id: *?types.TxnId) !?sql.runtime.Result {
+        return self.controlWithHandoff(statement, out_id, null);
+    }
+
+    pub fn controlWithHandoff(self: *Session, statement: d.sql_ast.Statement, out_id: *?types.TxnId, handoff: ?sql.PreparationHandoff) !?sql.runtime.Result {
         // An earlier COMMIT's outcome is unresolved: refuse new statements.
         // They were not applied, so this is not itself an unknown outcome.
         if (self.handle.sql_decision_uncertain) return error.SqlReconciliationRequired;
@@ -291,7 +486,7 @@ pub const Session = struct {
             .commit => {
                 var result = try sql.runtime.Result.empty(self.handle.alloc, "COMMIT");
                 errdefer result.deinit();
-                const outcome = try self.commit(out_id);
+                const outcome = try self.commitWithHandoff(out_id, handoff);
                 result.output.mutation_outcome = outcome;
                 return result;
             },
@@ -315,6 +510,9 @@ pub const Session = struct {
                 }
                 if (self.savepoints.items.len == 0 or !std.mem.eql(u8, name, self.savepoints.items[i].name)) return error.InvalidSavepointName;
                 if (statement == .rollback_to_savepoint) {
+                    self.invalidateDependencyTables();
+                    self.invalidateConstraintOverlay();
+                    self.invalidateFold();
                     self.entries.items.len = self.savepoints.items[i].length;
                     self.savepoints.items.len = i + 1;
                     self.failed = false;
@@ -373,10 +571,36 @@ test "capi SQL session fold groups requests in first-table order and owns every 
     try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fault.run, .{entries});
 }
 
+test "mutation fold SQL point reads fence staged table identity even when the key is absent" {
+    const a = std.testing.allocator;
+    const table: catalog.Table = .{ .id = 51, .physical_name = "items", .schema_version = 2, .columns = &.{} };
+    var session: Session = .{ .handle = undefined, .budget = .{ .backing = a, .limit = 1024 * 1024 }, .arena = undefined };
+    session.arena = .init(session.budget.allocator());
+    defer session.deinit();
+    try session.entries.append(session.arena.allocator(), .{ .table = table, .mutation = .{ .key = "staged", .expected_version = 7, .row = null }, .encoded_row = "{}" });
+    const missing = try session.stagedForScan(a, table, "absent");
+    defer a.free(missing);
+    try std.testing.expectEqual(@as(usize, 0), missing.len);
+    const found = try session.stagedForScan(a, table, "staged");
+    defer a.free(found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(@as(u64, 7), found[0].mutation.expected_version);
+    for (0..3) |kind| {
+        var changed = table;
+        switch (kind) {
+            0 => changed.id += 1,
+            1 => changed.schema_version += 1,
+            2 => changed.storage_mode = if (table.storage_mode == .relational) .document else .relational,
+            else => unreachable,
+        }
+        try std.testing.expectError(error.PreparedGenerationChanged, session.stagedForScan(a, changed, "absent"));
+    }
+}
+
 pub fn closeAll(handle: *h.Handle) void {
     var iterator = handle.sql_sessions.valueIterator();
     while (iterator.next()) |session| {
-        session.*.arena.deinit();
+        session.*.deinit();
         handle.alloc.destroy(session.*);
     }
     handle.sql_sessions.deinit(handle.alloc);
@@ -404,7 +628,7 @@ pub fn antfly_db_sql_session_open(ptr: ?*anyopaque, out: *u64) callconv(.c) h.ca
         return h.capi.recordError(.internal, @src().fn_name ++ ": SQL session ID counter overflow");
     };
     handle.sql_sessions.putNoClobber(handle.alloc, id, session) catch |err| {
-        session.arena.deinit();
+        session.deinit();
         handle.alloc.destroy(session);
         return h.capi.mapErrorContext(err, @src().fn_name ++ ": registering the SQL session");
     };
@@ -425,7 +649,7 @@ pub fn antfly_db_sql_session_close(ptr: ?*anyopaque, id: u64) callconv(.c) h.cap
     if (handle.parent_id != null) return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": SQL sessions require a root database handle");
     const entry = handle.sql_sessions.fetchRemove(id) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": SQL session ID is unknown or closed");
     @import("sql_cursor.zig").closeSession(handle, id);
-    entry.value.arena.deinit();
+    entry.value.deinit();
     handle.alloc.destroy(entry.value);
     return .ok;
 }

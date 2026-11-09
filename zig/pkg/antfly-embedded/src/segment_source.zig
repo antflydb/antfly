@@ -89,6 +89,7 @@ pub const DecodeRequest = struct {
     }
 };
 const SourceBoundary = callback_abi.Boundary(struct {
+    retain_owned: ?*const fn (*anyopaque) anyerror!Source,
     read_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
     acquire_decoded: ?*const fn (*anyopaque, DecodeRequest) anyerror!?Decoded,
     lookup_decoded: ?*const fn (*anyopaque, DecodeKey) anyerror!?Decoded,
@@ -112,6 +113,9 @@ pub const Source = union(enum) {
         read_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
         boundary_dispatch: callback_abi.CallbackDispatch = SourceBoundary.local_dispatch,
         close: *const fn (*anyopaque) void,
+        /// Acquire an independent closeable reference to immutable bytes.
+        /// A use lease alone does not transfer descriptor ownership.
+        retain_owned: ?*const fn (*anyopaque) anyerror!Source = null,
         /// Advisory bounded lookahead; errors belong to subsequent required reads.
         prefetch: ?*const fn (*anyopaque, u64, u64) void = null,
         checksum: ?*const fn (*anyopaque, u64, u64) anyerror!u32 = null,
@@ -123,6 +127,12 @@ pub const Source = union(enum) {
         /// Visitor slices are borrowed only for the duration of the callback.
         visit_range: ?*const fn (*anyopaque, u64, u64, SourceVisitor) anyerror!void = null,
         retained_bytes: ?*const fn (*anyopaque) usize = null,
+        /// Conservative additional resident capacity/state for an idle owner
+        /// retaining this source. This is unrelated to its logical file size.
+        retention_overhead_bytes: usize = 0,
+        /// This pin protects only an immutable artifact; it retains no primary
+        /// read epoch, allocator frontier or request/query capability.
+        retention_artifact_only: bool = false,
         /// Bind an independent query capability without changing the shared source.
         bind_read_context: ?*const fn (*anyopaque, std.mem.Allocator, *anyopaque) anyerror!Source = null,
         seal_read_context: ?*const fn (*anyopaque) void = null,
@@ -138,6 +148,9 @@ pub const Source = union(enum) {
         /// protects all source operations until its matching release.
         acquire_use: ?*const fn (*anyopaque) bool = null,
         release_use: ?*const fn (*anyopaque) void = null,
+        /// Stable only while the source owns its immutable backing. Native
+        /// leases include inode and value-root identity, preventing page ABA.
+        immutable_identity: ?[32]u8 = null,
         enable_idle_expiry: ?*const fn (*anyopaque) void = null,
     };
 
@@ -176,6 +189,12 @@ pub const Source = union(enum) {
 
     pub fn acquireUse(self: Source) bool {
         return if (self == .ranges) if (self.ranges.acquire_use) |acquire| acquire(self.ranges.ptr) else true else true;
+    }
+
+    pub fn retainOwned(self: Source) !Source {
+        if (self != .ranges) return error.Unsupported;
+        const retain = self.ranges.retain_owned orelse return error.Unsupported;
+        return SourceBoundary.call("retain_owned", self.ranges.boundary_dispatch, retain, .{self.ranges.ptr});
     }
     pub fn releaseUse(self: Source) void {
         if (self == .ranges) if (self.ranges.release_use) |release| release(self.ranges.ptr);
@@ -483,6 +502,337 @@ pub const BlockCache = struct {
         return oldest;
     }
 };
+
+/// Parsed immutable values belong to the physical source, not a request or a
+/// mutable index wrapper. The caller keeps this owner alive through every lease.
+/// Loaders run outside the cache lock and own all returned bytes in their arena.
+/// Optional admission declines never turn a valid source read into a refusal.
+pub const ImmutableDecodeCache = struct {
+    const Self = @This();
+    const LocalBudget = @import("sql/memory_budget.zig");
+    const Entry = struct {
+        key: DecodeKey,
+        arena: std.heap.ArenaAllocator,
+        value: ?*const anyopaque = null,
+        references: usize = 1,
+        touched: u64,
+    };
+    pub const Lease = struct {
+        cache: *Self,
+        entry: *Entry,
+        pub fn release(self: Lease) void {
+            self.cache.lock();
+            defer self.cache.mutex.unlock();
+            std.debug.assert(self.entry.references != 0 and self.entry.value != null);
+            self.entry.references -= 1;
+        }
+    };
+
+    allocator: std.mem.Allocator,
+    metadata_reservation: ?resources.Reservation,
+    host_budget: ?resources.BudgetedAllocator,
+    budget: LocalBudget,
+    reclaimer: u64 = 0,
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: [16]?*Entry = @splat(null),
+    tick: u64 = 0,
+    pub const metadata_overhead = @sizeOf(Self) + 16 * @sizeOf(Entry);
+
+    pub fn create(a: std.mem.Allocator, manager: ?*resources.ResourceManager, limit: usize) !*Self {
+        var metadata: ?resources.Reservation = if (manager) |rm| try rm.reserveWithoutReclaim(.lite_native_page_cache, metadata_overhead) else null;
+        errdefer if (metadata) |*held| held.release();
+        const self = try a.create(Self);
+        errdefer a.destroy(self);
+        self.* = .{
+            .allocator = a,
+            .metadata_reservation = metadata,
+            .host_budget = if (manager) |rm| resources.BudgetedAllocator.init(rm, .lite_native_page_cache, a, 1) else null,
+            .budget = .{ .backing = undefined, .limit = limit },
+        };
+        self.budget.backing = if (self.host_budget) |*host| host.threadSafeAllocator() else a;
+        errdefer if (self.host_budget) |*host| host.deinit();
+        if (manager) |rm| self.reclaimer = try rm.registerReclaimer(.lite_native_page_cache, self, reclaim);
+        return self;
+    }
+
+    fn lock(self: *Self) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+    }
+
+    fn destroyEntry(self: *Self, slot: *?*Entry) void {
+        const entry = slot.* orelse return;
+        std.debug.assert(entry.references == 0);
+        slot.* = null;
+        entry.arena.deinit();
+        self.allocator.destroy(entry);
+    }
+
+    pub fn deinit(self: *Self) void {
+        // The source's lifetime admission excludes new loads and leases here.
+        if (self.host_budget) |*host| host.reservation.manager.unregisterReclaimer(self.reclaimer);
+        for (&self.entries) |*slot| self.destroyEntry(slot);
+        std.debug.assert(self.budget.live == 0);
+        if (self.host_budget) |*host| host.deinit();
+        if (self.metadata_reservation) |*held| held.release();
+        const a = self.allocator;
+        a.destroy(self);
+    }
+
+    fn reclaim(raw: *anyopaque, target_bytes: u64) u64 {
+        const self: *Self = @ptrCast(@alignCast(raw));
+        if (!self.mutex.tryLock()) return 0;
+        defer self.mutex.unlock();
+        const host = if (self.host_budget) |*budget| budget else return 0;
+        const before = host.liveBytesThreadSafe();
+        var released: u64 = 0;
+        for (&self.entries) |*slot| if (slot.*) |entry| {
+            if (entry.references != 0) continue;
+            self.destroyEntry(slot);
+            released = before -| host.liveBytesThreadSafe();
+            if (released >= target_bytes) break;
+        };
+        // Arena frees can leave amortized reservation credit. Return it too;
+        // concurrent loaders can only make the live-byte delta conservative.
+        return @max(released, host.releaseUnusedCreditThreadSafe());
+    }
+
+    pub fn retainedBytes(self: *Self) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        @import("antfly_platform").sync.lockYielding(&self.budget.mutex);
+        defer self.budget.mutex.unlock();
+        var bytes = @sizeOf(Self) + self.budget.live;
+        for (self.entries) |entry| if (entry != null) {
+            bytes += @sizeOf(Entry);
+        };
+        return bytes;
+    }
+
+    fn find(self: *Self, key: DecodeKey) ?*Entry {
+        for (self.entries) |slot| if (slot) |entry| {
+            if (std.meta.eql(entry.key, key)) return entry;
+        };
+        return null;
+    }
+
+    pub fn lookup(self: *Self, key: DecodeKey) ?Lease {
+        self.lock();
+        defer self.mutex.unlock();
+        const entry = self.find(key) orelse return null;
+        if (entry.value == null) return null;
+        entry.references += 1;
+        self.tick +|= 1;
+        entry.touched = self.tick;
+        return .{ .cache = self, .entry = entry };
+    }
+
+    pub fn acquire(self: *Self, request: DecodeRequest) !?Lease {
+        var retried = false;
+        while (true) {
+            self.lock();
+            if (self.find(request.key())) |entry| {
+                // Never wait for a loader while holding another decode. A
+                // nested or competing miss can use the caller's bounded path.
+                if (entry.value == null) {
+                    self.mutex.unlock();
+                    return null;
+                }
+                entry.references += 1;
+                self.tick +|= 1;
+                entry.touched = self.tick;
+                self.mutex.unlock();
+                return .{ .cache = self, .entry = entry };
+            }
+            var chosen: ?*?*Entry = null;
+            for (&self.entries) |*slot| {
+                if (slot.* == null) {
+                    chosen = slot;
+                    break;
+                }
+                const entry = slot.*.?;
+                if (entry.references == 0 and (chosen == null or entry.touched < chosen.?.*.?.touched)) chosen = slot;
+            }
+            const slot = chosen orelse {
+                self.mutex.unlock();
+                return null;
+            };
+            self.destroyEntry(slot);
+            const entry = self.allocator.create(Entry) catch {
+                self.mutex.unlock();
+                return null;
+            };
+            self.tick +|= 1;
+            entry.* = .{ .key = request.key(), .arena = .init(self.budget.allocator()), .touched = self.tick };
+            slot.* = entry;
+            self.mutex.unlock();
+            const value = request.invoke(entry.arena.allocator()) catch |err| {
+                self.lock();
+                entry.references = 0;
+                self.destroyEntry(slot);
+                var evicted = false;
+                if (err == error.OutOfMemory and !retried) {
+                    for (&self.entries) |*candidate| if (candidate.*) |other| {
+                        if (other.references == 0) {
+                            self.destroyEntry(candidate);
+                            evicted = true;
+                        }
+                    };
+                }
+                self.mutex.unlock();
+                if (err != error.OutOfMemory) return err;
+                if (!evicted) return null;
+                retried = true;
+                continue;
+            };
+            self.lock();
+            entry.value = value;
+            self.mutex.unlock();
+            return .{ .cache = self, .entry = entry };
+        }
+    }
+};
+
+const DecodeCacheProbe = struct {
+    loads: usize = 0,
+    bytes: usize = 8,
+    fail: bool = false,
+    const Value = struct { bytes: []const u8 };
+
+    fn load(raw: *anyopaque, a: std.mem.Allocator) !*const anyopaque {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.loads += 1;
+        const value = try a.create(Value);
+        const bytes = try a.alloc(u8, self.bytes);
+        @memset(bytes, 'r');
+        if (self.fail) return error.InvalidData;
+        value.* = .{ .bytes = bytes };
+        return value;
+    }
+
+    fn request(self: *@This(), ordinal: u64) DecodeRequest {
+        return .{ .offset = ordinal, .length = 8, .interpretation = @splat(1), .context = self, .decode = load };
+    }
+
+    fn allocationProbe(a: std.mem.Allocator) !void {
+        const cache = try ImmutableDecodeCache.create(a, null, 4096);
+        defer cache.deinit();
+        var probe: DecodeCacheProbe = .{};
+        const lease = (try cache.acquire(probe.request(0))) orelse return error.OutOfMemory;
+        defer lease.release();
+        const value: *const Value = @ptrCast(@alignCast(lease.entry.value.?));
+        try std.testing.expectEqualSlices(u8, "rrrrrrrr", value.bytes);
+    }
+};
+
+test "segment.immutable decode cache owns values across caller reconstruction and separates interpretations" {
+    const cache = try ImmutableDecodeCache.create(std.testing.allocator, null, 16 * 1024);
+    defer cache.deinit();
+    var probe: DecodeCacheProbe = .{};
+    const first = (try cache.acquire(probe.request(0))) orelse return error.TestUnexpectedResult;
+    const pointer = first.entry.value.?;
+    first.release();
+    var replacement: DecodeCacheProbe = .{ .fail = true };
+    const reused = (try cache.acquire(replacement.request(0))) orelse return error.TestUnexpectedResult;
+    defer reused.release();
+    try std.testing.expectEqual(pointer, reused.entry.value.?);
+    try std.testing.expectEqual(@as(usize, 0), replacement.loads);
+    var other = probe.request(0);
+    other.class = .text_page;
+    const distinct = (try cache.acquire(other)) orelse return error.TestUnexpectedResult;
+    defer distinct.release();
+    try std.testing.expect(distinct.entry.value.? != pointer);
+    try std.testing.expectEqual(@as(usize, 2), probe.loads);
+}
+
+test "segment.immutable decode cache permits nested loads without waiting on its own flight" {
+    const cache = try ImmutableDecodeCache.create(std.testing.allocator, null, 16 * 1024);
+    defer cache.deinit();
+    const Probe = struct {
+        cache: *ImmutableDecodeCache,
+        inner: DecodeCacheProbe = .{},
+        fn load(raw: *anyopaque, a: std.mem.Allocator) !*const anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect((try self.cache.acquire(.{ .offset = 0, .length = 8, .interpretation = @splat(2), .context = self, .decode = load })) == null);
+            const inner = (try self.cache.acquire(self.inner.request(1))) orelse return error.TestUnexpectedResult;
+            defer inner.release();
+            const copy = try a.create(DecodeCacheProbe.Value);
+            const value: *const DecodeCacheProbe.Value = @ptrCast(@alignCast(inner.entry.value.?));
+            copy.* = .{ .bytes = try a.dupe(u8, value.bytes) };
+            return copy;
+        }
+    };
+    var probe: Probe = .{ .cache = cache };
+    const held = (try cache.acquire(.{ .offset = 0, .length = 8, .interpretation = @splat(2), .context = &probe, .decode = Probe.load })) orelse return error.TestUnexpectedResult;
+    defer held.release();
+    try std.testing.expectEqual(@as(usize, 1), probe.inner.loads);
+}
+
+test "segment.immutable decode cache bounds memory and never evicts pinned values" {
+    const cache = try ImmutableDecodeCache.create(std.testing.allocator, null, 4096);
+    defer cache.deinit();
+    var probe: DecodeCacheProbe = .{};
+    const held = (try cache.acquire(probe.request(0))) orelse return error.TestUnexpectedResult;
+    defer held.release();
+    var too_large: DecodeCacheProbe = .{ .bytes = 8192 };
+    try std.testing.expect((try cache.acquire(too_large.request(1))) == null);
+    const checked = cache.lookup(probe.request(0).key()) orelse return error.TestUnexpectedResult;
+    defer checked.release();
+    try std.testing.expectEqual(held.entry.value.?, checked.entry.value.?);
+    try std.testing.expect(cache.budget.live <= cache.budget.limit);
+}
+
+test "segment.immutable decode cache bounds entries and reclaims only unleased values" {
+    const cache = try ImmutableDecodeCache.create(std.testing.allocator, null, 64 * 1024);
+    defer cache.deinit();
+    var probe: DecodeCacheProbe = .{};
+    var leases: [16]?ImmutableDecodeCache.Lease = @splat(null);
+    defer for (leases) |lease| if (lease) |held| held.release();
+    for (&leases, 0..) |*lease, i| lease.* = (try cache.acquire(probe.request(i))) orelse return error.TestUnexpectedResult;
+    try std.testing.expect((try cache.acquire(probe.request(16))) == null);
+    leases[0].?.release();
+    leases[0] = null;
+    const admitted = (try cache.acquire(probe.request(16))) orelse return error.TestUnexpectedResult;
+    defer admitted.release();
+    try std.testing.expect(cache.lookup(probe.request(0).key()) == null);
+    try std.testing.expectEqual(@as(usize, 17), probe.loads);
+}
+
+test "segment.immutable decode cache discards interrupted loads and cleans allocation failures" {
+    const cache = try ImmutableDecodeCache.create(std.testing.allocator, null, 4096);
+    defer cache.deinit();
+    var probe: DecodeCacheProbe = .{ .fail = true };
+    try std.testing.expectError(error.InvalidData, cache.acquire(probe.request(0)));
+    try std.testing.expectEqual(@as(usize, 0), cache.budget.live);
+    try std.testing.expect(cache.lookup(probe.request(0).key()) == null);
+    probe.fail = false;
+    const held = (try cache.acquire(probe.request(0))) orelse return error.TestUnexpectedResult;
+    held.release();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, DecodeCacheProbe.allocationProbe, .{});
+}
+
+test "segment.immutable decode cache returns host admission without evicting leased metadata" {
+    const a = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 4 * 1024 * 1024 } });
+    defer manager.deinit(a);
+    {
+        const cache = try ImmutableDecodeCache.create(a, &manager, 1024 * 1024);
+        defer cache.deinit();
+        var probe: DecodeCacheProbe = .{ .bytes = 32 * 1024 };
+        const pinned = (try cache.acquire(probe.request(0))) orelse return error.TestUnexpectedResult;
+        defer pinned.release();
+        const cached = (try cache.acquire(probe.request(1))) orelse return error.TestUnexpectedResult;
+        cached.release();
+        const before = manager.snapshot().memory.used_bytes;
+        try std.testing.expect(manager.reclaimForAllocation(.lite_native_page_cache, 4 * 1024 * 1024) != 0);
+        try std.testing.expect(manager.snapshot().memory.used_bytes < before);
+        try std.testing.expect(cache.lookup(probe.request(1).key()) == null);
+        const value: *const DecodeCacheProbe.Value = @ptrCast(@alignCast(pinned.entry.value.?));
+        try std.testing.expectEqual(@as(usize, 32 * 1024), value.bytes.len);
+        try std.testing.expectEqual(@as(u8, 'r'), value.bytes[0]);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
 
 /// Shared immutable range cache. Backend I/O owns a separate bounded fill
 /// buffer; cache hits never wait for a cold read. Closing the adapter does not

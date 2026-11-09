@@ -1,0 +1,1164 @@
+{
+  "kind": "implementation_checkpoint",
+  "qualification": false,
+  "base_commit": "c9ed82860591fa6d061b7fd4f8907b97709dd80a",
+  "components": [
+    {
+      "component": "SQL dependency validity",
+      "implementation": "Revision-9 transactional semantic revisions for schema-bearing namespaces; schema-directory, namespace-incarnation and FK-connected table witnesses. Table discovery extends only over newly staged entries and clears on rollback/reset. Missing revisions retain conservative file-wide validity. COMMIT still revalidates all predicates and constraints. Scope expansion revalidates the prior completed-entry scope before adopting a wider dependency witness, avoiding rebuilding all prior rows solely for an independent new target; target ownership is budgeted and COMMIT remains authoritative."
+    },
+    {
+      "component": "Writer allocator ownership",
+      "implementation": "A path-owned cache exclusively loans checked ledger/digest state to native transactions, page allocation and admitted inspection. Clean state returns after publication; dirty or uncertain state never becomes authority. Existing inode/header/certificate/rebase checks remain. Detached proof capture and publication serialize mutable wrapper bookkeeping under the Store mutex. Generation publication rejects active loans and immediately closes any cached retired descriptor, preserving cumulative work counters. Mutation groups hold that same loan across pre-transaction retirement-pressure service and the caller transaction; standalone pressure checks also borrow it, preventing an allocator-wide load immediately before entering a cached transaction."
+    },
+    {
+      "component": "Resumable full-text replay",
+      "implementation": "Durable index-generation/configuration/namespace-bound continuations split oversized journal records by primary document family. Row, delete, overwrite and asset effects remain together. Index durability precedes continuation publication. Scalar applied progress and completion seals advance only after the record completes. No-op scan progress is retained without certifying corpus completeness."
+    },
+    {
+      "component": "One bounded text projection",
+      "implementation": "Planning retains one source-byte-bounded window with ordinals, owned schema/analyzer dependencies and chunk-local field observations. Producer admission precedes segment allocation; preparation consumes the retained projection. Configuration changes replan only unpublished input. Projection memory is resource-accounted. Planning and preparation have separate numeric timing counters so cost cannot disappear by moving between stages."
+    },
+    {
+      "component": "Detached source and immutable text runtime separation",
+      "implementation": "Eligible text runtimes, including relational text tables, retain immutable index inputs under inode/index/catalog/namespace and table/policy-control witnesses, with a fresh primary epoch and reset replay/source/visibility observations each turn. Durable worker positions and table catalogs reload at rebinding. Residency is bounded to root plus one namespace and ends when work settles. Cache, active turns and immutable merge jobs own independent strong references; starting a merge does not evict a reusable runtime, and retired owners remain alive until their jobs are joined. Unsupported index/provider state reopens conservatively. Named-table maintenance discovers and executes on its detached runtime instead of also opening a serving table."
+    },
+    {
+      "component": "Preparation feedback under contention",
+      "implementation": "Both replay controllers exclude measured admission/publication overhead when sizing preparation windows, while call deadlines and yield decisions continue to include that time."
+    }
+  ],
+  "validation": [
+    {
+      "suite": "Initial SQL dependency C API contracts before allocator/replay integration",
+      "passed": 4,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Full native Debug run before snapshot-test correction",
+      "passed": 760,
+      "skipped": 5,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "New test checked a pinned header against later physical file growth and reported tail_bytes. Corrected to use the length captured with the header; focused rerun passes."
+    },
+    {
+      "suite": "Replay ownership/allocation Debug contracts after fault-log declarations",
+      "passed": 146,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Focused native allocator-loan and semantic-revision Debug regressions",
+      "passed": 5,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Semantic key-family classification",
+      "passed": 1,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Runtime anchor checks accompanying focused run",
+      "passed": 11,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Integrated C API native contracts before cold-fixture corrections",
+      "passed": 94,
+      "skipped": 1,
+      "failed": 6,
+      "leaked": 0,
+      "failure": "Six proof fixtures invalidated only a wrapper hint while leaving valid path authority. Updated fixtures invalidate all quiescent donors and a new regression explicitly checks warm authority reuse. Rerun pending. The model-dependent semantic-quality case skipped."
+    },
+    {
+      "suite": "Embedded Python SQL/concurrency/catalog/outcome contracts",
+      "passed": 209,
+      "failed": 0,
+      "note": "208 passed under sandbox; the HTTP embedder mock test passed with local-listener permission. Library source c827787e7fca9331f1a5c921683713023a6c8d31."
+    },
+    {
+      "suite": "C API ABI, linkage, smoke",
+      "public_exports": 134,
+      "failed": 0,
+      "source_commit": "c827787e7fca9331f1a5c921683713023a6c8d31"
+    },
+    {
+      "suite": "Storage test ownership and embedded source boundary audit",
+      "failed": 0,
+      "sources": 1059,
+      "tool_tests_passed": 21
+    },
+    {
+      "suite": "Integrated model-free native C API contracts after cold-fixture corrections",
+      "source_commit": "805553f930662f1e7b7fa782f7c14225d5e804f3",
+      "passed": 102,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Replay ownership/allocation and preparation-controller Debug contracts",
+      "source_commit": "0579d092c6",
+      "passed": 148,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Bounded text publication, multilingual keyword analyzer, catalog replacement and projection invalidation",
+      "source_commit": "f17ebca50a",
+      "passed": 4,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Native allocator-cache generation replacement and semantic revision regressions",
+      "source_commit": "f17ebca50a",
+      "passed": 6,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Focused retained runtime, detached namespace, durable fragment and immutable merge lifecycle Debug contracts",
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "passed": 36,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "Integrated model-free native C API Debug contracts",
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "passed": 107,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    {
+      "suite": "C API ABI, linkage and smoke",
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "public_exports": 134,
+      "failed": 0,
+      "whole_producing_build_returncode": 0
+    },
+    {
+      "suite": "Embedded Python SQL, concurrency, catalog and outcome contracts",
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "passed": 209,
+      "failed": 0
+    },
+    {
+      "suite": "Storage test ownership and embedded source boundary audit",
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "sources": 1061,
+      "tool_tests_passed": 21,
+      "failed": 0
+    },
+    {
+      "suite": "Main admission integration at 1179bcce49, before SQL scope-extension changes",
+      "passed": 47,
+      "skipped": 0,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "New relational replay diagnostic bypassed required SQL constraint coordination. Corrected diagnostic uses public SQL inserts. Prior uncertainty/proof-budget/outcome regressions all passed."
+    },
+    {
+      "suite": "Cooperative legacy conversion and shrink admission at 1179bcce49",
+      "passed": 6,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "runtime_anchors_passed": 11
+    },
+    {
+      "suite": "SQL scope extension and runtime diagnostics, before conflict-fixture correction",
+      "passed": 51,
+      "skipped": 0,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "Conflict fixture expected rejection while building an unrelated speculative statement; the staged predicates are validated at COMMIT. Corrected fixture asserts COMMIT serialization failure, preservation of the peer row and no staged publication. No production change for this correction."
+    },
+    {
+      "suite": "Integrated Debug producer at 6ab8674668",
+      "whole_build_returncode": 1,
+      "public_exports": 134,
+      "failure": "C signal smoke fixture left the new first/second.aflite.lock.q directories, each containing only tail. Fixture cleanup now explicitly removes its closed known queue files, preserves failure on unexpected contents, and passes a direct C smoke diagnostic. No library from this failed aggregate build was frozen or benchmarked."
+    },
+    {
+      "suite": "Model-free native C API component diagnostic at 6ab8674668 after aggregate failure",
+      "passed": 150,
+      "skipped": 0,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "COMMIT correctly rejected a peer insert with 23505; fixture expected 40001. The duplicate primary-key value has separate generated row identities, so the uniqueness refusal is correct. Corrected expectation rerun pending; no production change for that expectation."
+    },
+    {
+      "suite": "Native C API gate at 57b629209c including storage-yield and foreign-checkpoint regressions",
+      "passed": 150,
+      "skipped": 0,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "The SQL fixture still expected 40001 because its text replacement did not match. COMMIT returned the correct 23505. Exact function-scoped edit now asserts the replacement and adds peer-row preservation; final rerun pending. Both storage-yield/foreign-checkpoint cases, drain, acknowledged rows and integrity passed."
+    },
+    {
+      "suite": "Dedicated writer-admission gate after main-queue fixture port",
+      "whole_build_returncode": 0,
+      "unit_tests_passed": 19,
+      "real_process_cases_passed": 7,
+      "failed": 0,
+      "scope": "Queue ordering, abandoned/dead predecessors and holders, damaged counters, cancellation, FIFO immediate reentry, middle timeout, shared-reader safety, legacy flock safety and bounded history. Replaced obsolete slot-queue fixture API and removed duplicate path_lock_wait module ownership. Queue unit tests are now explicit gate dependencies.",
+      "code_blobs": {
+        "zig/build_support/embedded/embedded.zig": "ff00df33f71eb3718dc44a0c7451a143111cc41d",
+        "zig/pkg/antfly-embedded/src/storage/lite/writer_queue.zig": "421a80da14d53bf28aba07c8fba866b9bd8949cd",
+        "zig/pkg/antfly-embedded/tests/writer_queue_process_fixture.zig": "59eb2f8e311a521d3a9ea193675c17eb5690c63b",
+        "zig/pkg/antfly-embedded/tests/test_writer_queue_process.py": "82667076a39f46e82078f8930248e9d5fe01e9af"
+      }
+    },
+    {
+      "suite": "Integrated Debug producer at 08316e366a9fd3c8c5117c1c63573b783369450c",
+      "whole_build_returncode": 0,
+      "public_exports": 134,
+      "smoke_and_linkage": "passed",
+      "admission_unit_tests_passed": 19,
+      "admission_real_process_cases_passed": 7,
+      "native_api_passed": 151,
+      "native_api_skipped": 0,
+      "native_api_failed": 0,
+      "native_api_leaked": 0,
+      "library_sha256": "09b426e45d16cca46308b51d0f35aa52d3fa5e8f44a4b1977a920fa447def07c",
+      "library_bytes": 285085776,
+      "build_report_sha256": "fff2f28a9a535a3b399e9f69b8050aa68e787b4c38e269ab53705424698b6a0a",
+      "native_tests_log_sha256": "705b2d072e285110628ef1bb24320db7746af428359bfc7fea1f21dbd824a86e"
+    },
+    {
+      "suite": "Embedded SDK SQL/concurrency/catalog/search/outcomes on frozen 083 Debug library",
+      "passed": 209,
+      "failed": 0,
+      "initial_run_passed": 208,
+      "initial_run_failed": 1,
+      "initial_seconds": 104.51,
+      "targeted_corrected_fixture_passed": 1,
+      "targeted_seconds": 0.43,
+      "correction": "A refused writer may create its persistent queue directory before acquiring the safety sidecar. Fixture now permits only that directory, requires the sidecar absent, and requires the second reader to create nothing. Two Busy mutations, snapshot/cursor preservation, post-close write and reopen remain checked. Runtime library unchanged; no recompile or repeated reference run."
+    },
+    {
+      "suite": "Retirement-pressure allocator-loan complete native Debug gate",
+      "whole_build_returncode": 0,
+      "passed": 771,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaked": 0,
+      "backup_checks_passed": 2,
+      "runtime_anchors_passed": 11,
+      "seconds": 430.023
+    },
+    {
+      "suite": "Integrated Debug producer and full SDK gate at d296a057ac6ec27568cffbbe4479c7dc075ffd8d",
+      "whole_build_returncode": 0,
+      "native_api_passed": 151,
+      "native_api_skipped": 0,
+      "native_api_failed": 0,
+      "native_api_leaked": 0,
+      "public_exports": 134,
+      "smoke_and_linkage": "passed",
+      "admission_unit_tests_passed": 19,
+      "admission_real_process_cases_passed": 7,
+      "sdk_passed": 209,
+      "sdk_failed": 0,
+      "sdk_seconds": 122.45,
+      "library_sha256": "896ae1c386cf7ca99e13d8586f3b76248fa6b825489cc8d9fa2e5ffb7c7c32d1",
+      "library_bytes": 285085936,
+      "build_report_sha256": "44dc413cc9b8fe19424a2735234a73f2415f05c808191e5fbffe39620fc7ddd9",
+      "native_tests_log_sha256": "8c7da042c8d2f86662671248c64a9f0d8b2f1f8d766b5d664f567903c5ccd668",
+      "sdk_log_sha256": "bb12b1f763f7dc925d69f54b26cbed946f34bdd06193b11586d54eedb86ceaf6"
+    }
+  ],
+  "remaining": [
+    "Validate the #1479 integration and conversion preemption. Diagnose low runtime reuse and publication amplification from the fresh format-9 failure; require an unchanged-importer pass before optimized qualification.",
+    "Candidate-only optimized final qualification on wolfspider, including full frozen corpus, importer contention, and ten-minute active-write storage/visibility qualification.",
+    "Applicable CI/model gates; full factory qualification remains with Beads."
+  ],
+  "limits": [
+    "This is an implementation checkpoint, not an E2E performance or merge-readiness claim.",
+    "Replay family limits are scheduling bounds; one large family retains existing memory limits and a soft time bound.",
+    "Legacy index configurations lacking a coverage generation retain whole-record replay.",
+    "No baseline/reference binary was rebuilt or rerun; wolfspider was not used for local development.",
+    "Retained source runtime reuse covers eligible text runtimes, including relational tables, without active policies, providers/groups, query leases, replacement, restore or migration state. Other runtimes reopen conservatively. The cache retains root plus one namespace; original-importer counters must establish whether alternating active namespaces still cause significant opens."
+  ],
+  "implementation_source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+  "candidate_debug_library_sha256": "4cffa2602385174036b912bd05926a78af6e99dc7131d3a348dfa4bc6e38d11c",
+  "local_mechanism_diagnostics": {
+    "qualification": false,
+    "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+    "sql_overlay": {
+      "statements": 16,
+      "cases": {
+        "quiet": {
+          "delta": {
+            "sql_constraint_overlay_hits": 15,
+            "sql_constraint_overlay_rebuilds": 1,
+            "sql_constraint_overlay_rebuild_entries": 0,
+            "sql_constraint_overlay_evictions": 0,
+            "sql_constraint_staged_statements": 16
+          },
+          "rows": 16,
+          "integrity_valid": true
+        },
+        "unrelated_primary_writes": {
+          "delta": {
+            "sql_constraint_overlay_hits": 15,
+            "sql_constraint_overlay_rebuilds": 1,
+            "sql_constraint_overlay_rebuild_entries": 0,
+            "sql_constraint_overlay_evictions": 0,
+            "sql_constraint_staged_statements": 16
+          },
+          "rows": 16,
+          "integrity_valid": true
+        }
+      },
+      "scope": "Same-candidate SQL overlay operation counts; no throughput claim"
+    },
+    "synthetic_replay": {
+      "rows": 2176,
+      "fields": 8,
+      "pending_records": 8,
+      "initial_debt": [
+        {
+          "index_name": "full_text_index_v0",
+          "kind": "full_text",
+          "applied_sequence": 2,
+          "target_sequence": 10,
+          "catch_up_required": true,
+          "replay_document_not_visible_skipped": 0
+        }
+      ],
+      "debt_before_explicit_drain": [
+        {
+          "index_name": "full_text_index_v0",
+          "kind": "full_text",
+          "applied_sequence": 10,
+          "target_sequence": 10,
+          "catch_up_required": false,
+          "replay_document_not_visible_skipped": 0
+        }
+      ],
+      "runtime_counters_before_explicit_drain": {
+        "maintenance_runtime_opens": 2,
+        "maintenance_namespace_opens": 0,
+        "maintenance_source_runtime_reuses": 7,
+        "maintenance_source_turns": 8
+      },
+      "explicit_drain_seconds": 0.005303042009472847,
+      "integrity_search_acknowledgement_reopen": true,
+      "peak_native_builds": 3,
+      "scope": "Debug mechanism diagnostic on a shared host with unrelated builds; no throughput or optimized qualification claim. Background replay caught up before explicit drain."
+    },
+    "populated_legacy_import": {
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+      "input_index": 7,
+      "importer_exit_code": 1,
+      "censored": false,
+      "importer_succeeded": false,
+      "summary": [
+        0,
+        0,
+        1
+      ],
+      "seconds": 183.4263500419911,
+      "peak_native_builds": 2,
+      "metrics_enabled": true,
+      "library_sha256": "4cffa2602385174036b912bd05926a78af6e99dc7131d3a348dfa4bc6e38d11c",
+      "public_errors": [
+        "FileBusy"
+      ],
+      "seed_sha256": "2002c183a24efebf17a7bc1d1a0e90658d5b7c9270857b874a7b0528e43fc8d1",
+      "seed_copy_method": "native_stable_snapshot",
+      "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution.",
+      "seed_format_revision": 8,
+      "final_format_revision": 8,
+      "primary_batches": 14,
+      "storage_ns": 152577474000,
+      "storage_failures": 8,
+      "admission_refusals": {
+        "local_gate": 1
+      },
+      "attribution": "Legacy format conversion takes the full-generation vacuum branch before ordinary maintenance; this fixture never adopted revision 9. The failed run is not evidence of current-format replay service capacity. A fresh revision-9 run is in progress."
+    },
+    "fresh_current_format_import": {
+      "source_commit": "a6f3d4afed948bcc35547e86dce8437ebf4d1452",
+      "format_revision": 9,
+      "input_index": 7,
+      "importer_exit_code": 1,
+      "censored": false,
+      "importer_succeeded": false,
+      "summary": [
+        0,
+        0,
+        1
+      ],
+      "seconds": 568.2983196249697,
+      "peak_native_builds": 5,
+      "metrics_enabled": true,
+      "library_sha256": "4cffa2602385174036b912bd05926a78af6e99dc7131d3a348dfa4bc6e38d11c",
+      "public_errors": [
+        "LiteReplayBacklogExceeded"
+      ],
+      "seed_sha256": null,
+      "seed_copy_method": null,
+      "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution.",
+      "numeric_stage_evidence": {
+        "qualification": false,
+        "scope": "Diagnostic counters; completed-operation profiles exclude failed operations; nested/concurrent counters are not additive wall time.",
+        "events": {
+          "antfly_bench_derived_worker": {
+            "count": 101,
+            "sum": {
+              "sequence": 2071,
+              "documents": 27506,
+              "deletes": 0,
+              "overwritten": 54,
+              "dense_embeddings": 0,
+              "sparse_embeddings": 0,
+              "graph_writes": 0,
+              "graph_deletes": 0,
+              "total_ms": 107318,
+              "full_text_apply_ms": 107311,
+              "full_text_plan_ms": 3225,
+              "full_text_prepare_ms": 38350,
+              "full_text_apply_lock_wait_ms": 0,
+              "full_text_apply_lock_held_ms": 28763,
+              "dense_apply_ms": 0,
+              "dense_delete_ms": 0,
+              "dense_doc_index_ms": 0,
+              "dense_embedding_apply_ms": 0,
+              "sparse_apply_ms": 0,
+              "graph_apply_ms": 0,
+              "index_sync_ms": 0
+            },
+            "max": {
+              "sequence": 77,
+              "documents": 1024,
+              "deletes": 0,
+              "overwritten": 3,
+              "dense_embeddings": 0,
+              "sparse_embeddings": 0,
+              "graph_writes": 0,
+              "graph_deletes": 0,
+              "total_ms": 5560,
+              "full_text_apply_ms": 5560,
+              "full_text_plan_ms": 257,
+              "full_text_prepare_ms": 3860,
+              "full_text_apply_lock_wait_ms": 0,
+              "full_text_apply_lock_held_ms": 815,
+              "dense_apply_ms": 0,
+              "dense_delete_ms": 0,
+              "dense_doc_index_ms": 0,
+              "dense_embedding_apply_ms": 0,
+              "sparse_apply_ms": 0,
+              "graph_apply_ms": 0,
+              "index_sync_ms": 0
+            }
+          },
+          "antfly_bench_row_pipeline": {
+            "count": 77,
+            "sum": {
+              "writes": 78848,
+              "prepared_rows": 0,
+              "logical_bytes": 0,
+              "encoded_bytes": 0,
+              "prepare_ms": 0,
+              "apply_lock_wait_ms": 0,
+              "apply_lock_held_ms": 68264
+            },
+            "max": {
+              "writes": 1024,
+              "prepared_rows": 0,
+              "logical_bytes": 0,
+              "encoded_bytes": 0,
+              "prepare_ms": 0,
+              "apply_lock_wait_ms": 0,
+              "apply_lock_held_ms": 1360
+            }
+          },
+          "antfly_bench_batch": {
+            "count": 77,
+            "sum": {
+              "sequence": 3003,
+              "writes": 78848,
+              "deletes": 0,
+              "graph_writes": 0,
+              "graph_deletes": 0,
+              "transforms": 0,
+              "total_ms": 68635,
+              "resolve_ms": 77,
+              "merge_ms": 0,
+              "predicates_ms": 0,
+              "range_ms": 0,
+              "extract_ms": 13802,
+              "delete_artifacts_ms": 0,
+              "precompute_ms": 0,
+              "identity_capacity_ms": 0,
+              "identity_metadata_ms": 4332,
+              "identity_metadata_writes": 394551,
+              "store_ms": 45211,
+              "split_delta_ms": 0,
+              "build_derived_ms": 85,
+              "shadow_ms": 0,
+              "collect_sync_ms": 0,
+              "backlog_admission_ms": 0,
+              "append_replay_journal_ms": 0,
+              "backlog_pressure_ms": 0,
+              "executor_notify_ms": 0,
+              "sync_wait_ms": 0,
+              "wait_sync_ms": 0,
+              "notify_enrichment_ms": 0
+            },
+            "max": {
+              "sequence": 77,
+              "writes": 1024,
+              "deletes": 0,
+              "graph_writes": 0,
+              "graph_deletes": 0,
+              "transforms": 0,
+              "total_ms": 1365,
+              "resolve_ms": 1,
+              "merge_ms": 0,
+              "predicates_ms": 0,
+              "range_ms": 0,
+              "extract_ms": 237,
+              "delete_artifacts_ms": 0,
+              "precompute_ms": 0,
+              "identity_capacity_ms": 0,
+              "identity_metadata_ms": 121,
+              "identity_metadata_writes": 5126,
+              "store_ms": 1055,
+              "split_delta_ms": 0,
+              "build_derived_ms": 2,
+              "shadow_ms": 0,
+              "collect_sync_ms": 0,
+              "backlog_admission_ms": 0,
+              "append_replay_journal_ms": 0,
+              "backlog_pressure_ms": 0,
+              "executor_notify_ms": 0,
+              "sync_wait_ms": 0,
+              "wait_sync_ms": 0,
+              "notify_enrichment_ms": 0
+            }
+          },
+          "antfly_bench_batch_derived": {
+            "count": 77,
+            "sum": {
+              "writes": 78848,
+              "total_ms": 68635,
+              "derived_apply_ms": 0,
+              "full_text_apply_ms": 0,
+              "full_text_plan_ms": 0,
+              "full_text_prepare_ms": 0,
+              "full_text_apply_lock_wait_ms": 0,
+              "full_text_apply_lock_held_ms": 0,
+              "dense_apply_ms": 0,
+              "dense_delete_ms": 0,
+              "dense_doc_index_ms": 0,
+              "dense_embedding_apply_ms": 0,
+              "sparse_apply_ms": 0,
+              "graph_apply_ms": 0,
+              "index_sync_ms": 0,
+              "applied_sequence_save_ms": 0,
+              "replay_journal_truncate_ms": 0
+            },
+            "max": {
+              "writes": 1024,
+              "total_ms": 1365,
+              "derived_apply_ms": 0,
+              "full_text_apply_ms": 0,
+              "full_text_plan_ms": 0,
+              "full_text_prepare_ms": 0,
+              "full_text_apply_lock_wait_ms": 0,
+              "full_text_apply_lock_held_ms": 0,
+              "dense_apply_ms": 0,
+              "dense_delete_ms": 0,
+              "dense_doc_index_ms": 0,
+              "dense_embedding_apply_ms": 0,
+              "sparse_apply_ms": 0,
+              "graph_apply_ms": 0,
+              "index_sync_ms": 0,
+              "applied_sequence_save_ms": 0,
+              "replay_journal_truncate_ms": 0
+            }
+          },
+          "antfly_bench_batch_extract": {
+            "count": 77,
+            "sum": {
+              "writes": 78848,
+              "total_extract_ms": 13802,
+              "vector_field_names_ms": 0,
+              "mapper_ms": 4365,
+              "graph_fields_ms": 3481,
+              "index_field_embeddings_ms": 0,
+              "embedding_artifacts_ms": 0,
+              "graph_artifacts_ms": 0,
+              "strip_store_value_ms": 0,
+              "timestamp_ms": 0,
+              "overwrite_probe_ms": 154,
+              "identity_upserts": 78848,
+              "identity_deletes": 0,
+              "store_writes": 646615,
+              "store_deletes": 78
+            },
+            "max": {
+              "writes": 1024,
+              "total_extract_ms": 237,
+              "vector_field_names_ms": 0,
+              "mapper_ms": 81,
+              "graph_fields_ms": 65,
+              "index_field_embeddings_ms": 0,
+              "embedding_artifacts_ms": 0,
+              "graph_artifacts_ms": 0,
+              "strip_store_value_ms": 0,
+              "timestamp_ms": 0,
+              "overwrite_probe_ms": 2,
+              "identity_upserts": 1024,
+              "identity_deletes": 0,
+              "store_writes": 8580,
+              "store_deletes": 2
+            }
+          },
+          "antfly_bench_replay_refusal": {
+            "count": 2,
+            "sum": {
+              "bytes_before": 33601974,
+              "bytes_after": 34102334,
+              "records_before": 798,
+              "records_after": 806,
+              "byte_limit": 33554432,
+              "record_limit": 8192
+            },
+            "max": {
+              "bytes_before": 16802247,
+              "bytes_after": 17052427,
+              "records_before": 399,
+              "records_after": 403,
+              "byte_limit": 16777216,
+              "record_limit": 4096
+            }
+          },
+          "antfly_bench_native_owner": {
+            "count": 1,
+            "sum": {
+              "source_turns": 160,
+              "capture_ns": 13647092000,
+              "replay_ns": 287674460000,
+              "artifacts_ns": 145140819000,
+              "storage_ns": 76729371000,
+              "runtime_refreshes": 592,
+              "maintenance_errors": 146,
+              "maintenance_timeouts": 0,
+              "merge_started": 37,
+              "merge_applied": 36,
+              "merge_discarded": 1,
+              "merge_prepare_ns": 13763049000,
+              "merge_staging_ns": 1283172000,
+              "merge_staged_bytes": 49363957,
+              "merge_publication_ns": 50367462000,
+              "sql_overlay_hits": 789,
+              "sql_overlay_rebuilds": 259,
+              "sql_overlay_rebuild_entries": 25074,
+              "sql_overlay_evictions": 0,
+              "sql_staged_statements": 524,
+              "replay_waits": 2,
+              "replay_refused_prepare_ns": 1351879958
+            },
+            "max": {
+              "source_turns": 160,
+              "capture_ns": 13647092000,
+              "replay_ns": 287674460000,
+              "artifacts_ns": 145140819000,
+              "storage_ns": 76729371000,
+              "runtime_refreshes": 592,
+              "maintenance_errors": 146,
+              "maintenance_timeouts": 0,
+              "merge_started": 37,
+              "merge_applied": 36,
+              "merge_discarded": 1,
+              "merge_prepare_ns": 13763049000,
+              "merge_staging_ns": 1283172000,
+              "merge_staged_bytes": 49363957,
+              "merge_publication_ns": 50367462000,
+              "sql_overlay_hits": 789,
+              "sql_overlay_rebuilds": 259,
+              "sql_overlay_rebuild_entries": 25074,
+              "sql_overlay_evictions": 0,
+              "sql_staged_statements": 524,
+              "replay_waits": 2,
+              "replay_refused_prepare_ns": 1351879958
+            }
+          },
+          "antfly_bench_native_runtime": {
+            "count": 1,
+            "sum": {
+              "maintenance_opens": 202,
+              "namespace_opens": 216,
+              "source_reuses": 21
+            },
+            "max": {
+              "maintenance_opens": 202,
+              "namespace_opens": 216,
+              "source_reuses": 21
+            }
+          },
+          "antfly_bench_native_service": {
+            "count": 1,
+            "sum": {
+              "refresh_ns": 5560495000,
+              "replay_publication_overhead_ns": 240744559120,
+              "index_admission_ns": 28137479000,
+              "metadata_admission_ns": 43977825000,
+              "publication_hold_ns": 104438158779
+            },
+            "max": {
+              "refresh_ns": 5560495000,
+              "replay_publication_overhead_ns": 240744559120,
+              "index_admission_ns": 28137479000,
+              "metadata_admission_ns": 43977825000,
+              "publication_hold_ns": 104438158779
+            }
+          },
+          "antfly_bench_native_owner_failures": {
+            "count": 1,
+            "sum": {
+              "capture": 0,
+              "source": 13,
+              "retirement": 11,
+              "artifacts": 0,
+              "storage": 122
+            },
+            "max": {
+              "capture": 0,
+              "source": 13,
+              "retirement": 11,
+              "artifacts": 0,
+              "storage": 122
+            }
+          },
+          "antfly_bench_native_path_leases": {
+            "count": 1,
+            "sum": {
+              "leases": 4030,
+              "admission_ns": 463791627,
+              "admission_max_ns": 2364458,
+              "hold_ns": 545913843960,
+              "hold_max_ns": 4233796417
+            },
+            "max": {
+              "leases": 4030,
+              "admission_ns": 463791627,
+              "admission_max_ns": 2364458,
+              "hold_ns": 545913843960,
+              "hold_max_ns": 4233796417
+            }
+          }
+        },
+        "admission_refusals": {},
+        "maintenance_failure_phases": {
+          "storage": 122,
+          "source": 13,
+          "retirement": 11
+        }
+      },
+      "attribution": "Current-format replay progresses but still exhausts the quota. Instrumentation and overlapping compilation prevent a clean throughput comparison. Runtime reuse is low: 202 maintenance opens and 216 namespace opens versus 21 reuses. Publication overhead remains large; this is an unresolved service-capacity failure, not a passing E2E result."
+    }
+  },
+  "integration_pending_validation": {
+    "main_commit": "270057158c",
+    "work": "Use landed writer queue and boundary classification once; preserve cancellation-safe timed local admission, add bounded lease handoff, retain precommit replay-capacity retries and preallocated JSON responses. Automatic format conversion now observes replay/quiet admission and primary-publication preemption. Remove superseded byte-range queue shim.",
+    "component_builds_passed": false,
+    "benchmark_report_tests_passed": 23,
+    "main_admission_source": "270057158c",
+    "main_merge_pushed": true,
+    "status": "Full native771, API151, ABI134, admission19unit/7process and SDK209 pass on d296. Causal allocator fix is verified in the unchanged importer (5883 full loads before, one after). Optimized end-to-end performance and active-write storage qualification remain pending."
+  },
+  "local_runtime_diagnostic": {
+    "qualification": false,
+    "scope": "One current candidate; no reference rebuild or run. Public SQL inserts through coordinated constraint path, eight batches of 256 rows per namespace. Operation counts precede explicit replay drain; acknowledged rows and physical integrity checked after drain. Scheduling and merge completion affect counts; this is not an importer timing comparison.",
+    "observations": [
+      {
+        "namespaces": 1,
+        "maintenance_runtime_opens": 2,
+        "source_runtime_reuses": 1,
+        "cache_diagnostics": {
+          "capture_attempts": 3,
+          "captured": 3,
+          "capture_namespace_limit": 0,
+          "capture_control": 0,
+          "miss_no_cache": 0,
+          "miss_closed": 1,
+          "miss_inode": 0,
+          "miss_binding": 0,
+          "miss_borrow": 0,
+          "miss_namespace": 0,
+          "miss_indexes": 0,
+          "miss_metadata": 0,
+          "miss_config": 0,
+          "miss_control": 0,
+          "not_retained_settled": 1,
+          "not_retained_failed": 0,
+          "blocked_manual": 0,
+          "blocked_enrichment": 0,
+          "blocked_queries": 0,
+          "blocked_policy": 0,
+          "blocked_transition": 0,
+          "blocked_index_loads": 0,
+          "blocked_admission": 0,
+          "blocked_resolver": 0,
+          "blocked_split": 0,
+          "blocked_groups": 0,
+          "blocked_nontext_indexes": 0,
+          "blocked_replacement": 0,
+          "blocked_repairs": 0,
+          "blocked_coalescer": 0
+        }
+      },
+      {
+        "namespaces": 2,
+        "maintenance_runtime_opens": 3,
+        "source_runtime_reuses": 4,
+        "cache_diagnostics": {
+          "capture_attempts": 7,
+          "captured": 7,
+          "capture_namespace_limit": 0,
+          "capture_control": 0,
+          "miss_no_cache": 0,
+          "miss_closed": 2,
+          "miss_inode": 0,
+          "miss_binding": 0,
+          "miss_borrow": 0,
+          "miss_namespace": 0,
+          "miss_indexes": 0,
+          "miss_metadata": 0,
+          "miss_config": 0,
+          "miss_control": 0,
+          "not_retained_settled": 1,
+          "not_retained_failed": 0,
+          "blocked_manual": 0,
+          "blocked_enrichment": 0,
+          "blocked_queries": 0,
+          "blocked_policy": 0,
+          "blocked_transition": 0,
+          "blocked_index_loads": 0,
+          "blocked_admission": 0,
+          "blocked_resolver": 0,
+          "blocked_split": 0,
+          "blocked_groups": 0,
+          "blocked_nontext_indexes": 0,
+          "blocked_replacement": 0,
+          "blocked_repairs": 0,
+          "blocked_coalescer": 0
+        }
+      }
+    ],
+    "passed": true
+  },
+  "sql_scope_expansion_diagnosis": {
+    "qualification": false,
+    "candidate_source": "a6f3d4afed",
+    "previous_candidate_counts": {
+      "staged_a_rows": 16,
+      "first_b_rebuilds": 1,
+      "first_b_prior_entries_revisited": 16
+    },
+    "fix": "Validate previous completed-entry scope and adopt wider witness when unchanged. Regression observed no prior entries revisited with unrelated peer publication; relevant peer or schema publication rebuilt 16 entries. The COMMIT uniqueness-conflict fixture now expects 23505 and checks peer-row preservation; final rerun pending."
+  },
+  "pending_replay_cache_storage_phase": {
+    "qualification": false,
+    "finding": "A later physical-storage yield discarded a successful pending-replay runtime; diagnostics recorded before physical service missed this discard. Post-storage index restamping could also hide a foreign checkpoint adopted by allocator service.",
+    "implementation": "Preserve successful pending-source cache across explicit benign storage-phase yields with no uncertain outcome. Capture index witness before physical service; index_inputs_changed prevents retention. Never stamp old immutable runtime with an adopted foreign index identity. Residency and fresh primary-epoch rules remain unchanged.",
+    "regression": "Passed at 57b629209c: storage admission yields preserve successful source runtimes; foreign checkpoint publication followed by allocator-service adoption preserves the old cache witness and rejects reuse. Both cases drain and verify acknowledged rows and integrity. No importer capacity claim.",
+    "observations": [
+      {
+        "namespaces": 1,
+        "maintenance_runtime_opens": 2,
+        "source_runtime_reuses": 1,
+        "cache_diagnostics": {
+          "capture_attempts": 3,
+          "captured": 3,
+          "capture_namespace_limit": 0,
+          "capture_control": 0,
+          "miss_no_cache": 0,
+          "miss_closed": 1,
+          "miss_inode": 0,
+          "miss_binding": 0,
+          "miss_borrow": 0,
+          "miss_namespace": 0,
+          "miss_indexes": 0,
+          "miss_metadata": 0,
+          "miss_config": 0,
+          "miss_control": 0,
+          "not_retained_settled": 1,
+          "not_retained_failed": 0,
+          "not_retained_index_inputs": 0,
+          "not_retained_storage_error": 0,
+          "retained_storage_yield": 2,
+          "blocked_manual": 0,
+          "blocked_enrichment": 0,
+          "blocked_queries": 0,
+          "blocked_policy": 0,
+          "blocked_transition": 0,
+          "blocked_index_loads": 0,
+          "blocked_admission": 0,
+          "blocked_resolver": 0,
+          "blocked_split": 0,
+          "blocked_groups": 0,
+          "blocked_nontext_indexes": 0,
+          "blocked_replacement": 0,
+          "blocked_repairs": 0,
+          "blocked_coalescer": 0
+        }
+      },
+      {
+        "namespaces": 2,
+        "maintenance_runtime_opens": 4,
+        "source_runtime_reuses": 3,
+        "cache_diagnostics": {
+          "capture_attempts": 7,
+          "captured": 7,
+          "capture_namespace_limit": 0,
+          "capture_control": 0,
+          "miss_no_cache": 0,
+          "miss_closed": 3,
+          "miss_inode": 0,
+          "miss_binding": 0,
+          "miss_borrow": 0,
+          "miss_namespace": 0,
+          "miss_indexes": 0,
+          "miss_metadata": 0,
+          "miss_config": 0,
+          "miss_control": 0,
+          "not_retained_settled": 1,
+          "not_retained_failed": 0,
+          "not_retained_index_inputs": 0,
+          "not_retained_storage_error": 0,
+          "retained_storage_yield": 6,
+          "blocked_manual": 0,
+          "blocked_enrichment": 0,
+          "blocked_queries": 0,
+          "blocked_policy": 0,
+          "blocked_transition": 0,
+          "blocked_index_loads": 0,
+          "blocked_admission": 0,
+          "blocked_resolver": 0,
+          "blocked_split": 0,
+          "blocked_groups": 0,
+          "blocked_nontext_indexes": 0,
+          "blocked_replacement": 0,
+          "blocked_repairs": 0,
+          "blocked_coalescer": 0
+        }
+      }
+    ]
+  },
+  "current_083_original_importer_diagnostic": {
+    "qualification": false,
+    "runtime_source": "08316e366a9fd3c8c5117c1c63573b783369450c",
+    "library_sha256": "09b426e45d16cca46308b51d0f35aa52d3fa5e8f44a4b1977a920fa447def07c",
+    "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+    "input_index": 7,
+    "success": false,
+    "public_errors": [
+      "LiteReplayBacklogExceeded"
+    ],
+    "seconds": 662.6719411669765,
+    "peak_native_builds": 21,
+    "metrics_enabled": true,
+    "two_second_process_stack_sample": true,
+    "scope": "Diagnostic only: unrelated compilation and task-owned focused native tests overlapped; instrumented wall time is not a throughput comparison. No baseline or reference was rebuilt or executed.",
+    "primary_batch_profiles": 77,
+    "replay_profiles": 95,
+    "allocator_work": {
+      "full_loads": 5883,
+      "full_load_ns": 351248149742,
+      "digest_rebuilds": 0,
+      "digest_rebuild_ns": 0,
+      "journal_rebases": 0,
+      "journal_rebase_ns": 0,
+      "cache_transfers": 30293
+    },
+    "owner_counters": {
+      "source_turns": 161,
+      "capture_ns": 19996936000,
+      "replay_ns": 364457643000,
+      "artifacts_ns": 149339115000,
+      "storage_ns": 61051550000,
+      "runtime_refreshes": 581,
+      "maintenance_errors": 160,
+      "maintenance_timeouts": 0,
+      "merge_started": 33,
+      "merge_applied": 33,
+      "merge_discarded": 0,
+      "merge_prepare_ns": 29205034000,
+      "merge_staging_ns": 9740924000,
+      "merge_staged_bytes": 49653092,
+      "merge_publication_ns": 48941658000,
+      "sql_overlay_hits": 789,
+      "sql_overlay_scope_extensions": 105,
+      "sql_overlay_rebuilds": 154,
+      "sql_overlay_rebuild_entries": 0,
+      "sql_overlay_evictions": 0,
+      "sql_staged_statements": 524,
+      "replay_waits": 2,
+      "replay_refused_prepare_ns": 1367829417
+    },
+    "runtime_counters": {
+      "maintenance_opens": 192,
+      "namespace_opens": 219,
+      "source_reuses": 33
+    },
+    "service_counters": {
+      "refresh_ns": 5710286000,
+      "replay_publication_overhead_ns": 312029307695,
+      "index_admission_ns": 40397146000,
+      "metadata_admission_ns": 63677046000,
+      "publication_hold_ns": 127260541193
+    },
+    "cache_counters": {
+      "capture_attempts": 161,
+      "captured": 141,
+      "miss_no_cache": 30,
+      "miss_closed": 158,
+      "not_retained_settled": 83,
+      "not_retained_failed": 25,
+      "retained_storage_yield": 16,
+      "blocked_enrichment": 19,
+      "blocked_nontext_indexes": 1
+    }
+  },
+  "retirement_pressure_ownership_gap": {
+    "qualification": false,
+    "sampled_call_path": "Store.applyMutationGroup -> NativeFile.reclaimRetirementPressure -> loadLedger/loadLedgerForDigest -> State.load and prepareDigest",
+    "cause": "DocStore checked pressure before beginTransaction borrowed the verified path cache. Each warm mutation group loaded a separate full ledger and initial digest, then discarded it when taking the cached ledger at transaction start.",
+    "before_fix_causal_regressions": {
+      "passed": 2,
+      "failed": 2,
+      "skipped": 0,
+      "leaked": 0,
+      "warm_initial_full_loads": 1,
+      "full_loads_after_16_docstore_commits": 17,
+      "wrapper_pretransaction_pressure_retained_local_ledger": true
+    },
+    "fix": "Standalone pressure checks borrow the path cache. beginTransactionWithRetirementPressure holds one outer loan across pressure service and the caller transaction, preserving it across nested reclamation and transferring ownership only on successful caller start. DocStore uses this combined boundary. Cancellation/error returns the loan; ordinary transaction commit/abort releases it once.",
+    "focused_after_fix": {
+      "whole_build_returncode": 0,
+      "passed": 5,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "runtime_anchors_passed": 11,
+      "no_additional_warm_full_loads": true,
+      "no_additional_explicit_digest_rebuilds": true
+    },
+    "full_native_after_fix": {
+      "whole_build_returncode": 0,
+      "passed": 771,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaked": 0,
+      "backup_checks_passed": 2,
+      "runtime_anchors_passed": 11,
+      "seconds": 430.023
+    },
+    "counter_scope": "full_load_ns includes preparing the initial digest of a newly loaded State. The separate explicit digest_rebuilds counter does not count that initial work; its zero is not evidence that loading avoided hashing. Nested service counters are not additive wall time.",
+    "pending": "All native/API/ABI/smoke/admission/SDK gates pass and the real importer performs one initial allocator load. Debug under up to36 unrelated native builds still reaches replay quota after92primarybatches; final optimized capacity/contention/active-write qualification on reserved Wolfspider remains pending.",
+    "real_importer_after_fix": {
+      "full_loads": 1,
+      "full_load_ns": 214042,
+      "prior_sql_entries_revisited": 0,
+      "mechanism_verified": true,
+      "end_to_end_capacity_qualified": false
+    }
+  },
+  "current_d296_original_importer_diagnostic": {
+    "qualification": false,
+    "runtime_source": "d296a057ac6ec27568cffbbe4479c7dc075ffd8d",
+    "library_sha256": "896ae1c386cf7ca99e13d8586f3b76248fa6b825489cc8d9fa2e5ffb7c7c32d1",
+    "input_index": 7,
+    "success": false,
+    "public_errors": [
+      "LiteReplayBacklogExceeded"
+    ],
+    "seconds": 471.61788412497845,
+    "peak_native_builds": 36,
+    "metrics_enabled": true,
+    "scope": "Instrumented Debug diagnosis on a heavily shared host. No task-owned build ran concurrently; unrelated compilation overlapped. Not a throughput comparison, and no baseline/reference was rerun.",
+    "primary_batch_profiles": 92,
+    "replay_profiles": 163,
+    "allocator_work": {
+      "full_loads": 1,
+      "full_load_ns": 214042,
+      "digest_rebuilds": 0,
+      "digest_rebuild_ns": 0,
+      "journal_rebases": 0,
+      "journal_rebase_ns": 0,
+      "cache_transfers": 42169
+    },
+    "owner_counters": {
+      "source_turns": 259,
+      "capture_ns": 15053574000,
+      "replay_ns": 232858494000,
+      "artifacts_ns": 99108839000,
+      "storage_ns": 79447749000,
+      "runtime_refreshes": 751,
+      "maintenance_errors": 211,
+      "maintenance_timeouts": 0,
+      "merge_started": 56,
+      "merge_applied": 55,
+      "merge_discarded": 1,
+      "merge_prepare_ns": 22542785000,
+      "merge_staging_ns": 2370223000,
+      "merge_staged_bytes": 75867827,
+      "merge_publication_ns": 27279225000,
+      "sql_overlay_hits": 953,
+      "sql_overlay_scope_extensions": 127,
+      "sql_overlay_rebuilds": 184,
+      "sql_overlay_rebuild_entries": 0,
+      "sql_overlay_evictions": 0,
+      "sql_staged_statements": 632,
+      "replay_waits": 6,
+      "replay_refused_prepare_ns": 4716237459
+    },
+    "runtime_counters": {
+      "maintenance_opens": 308,
+      "namespace_opens": 355,
+      "source_reuses": 57
+    },
+    "service_counters": {
+      "refresh_ns": 8585629000,
+      "replay_publication_overhead_ns": 127726414834,
+      "index_admission_ns": 31948134000,
+      "metadata_admission_ns": 23003253000,
+      "publication_hold_ns": 30308874112
+    },
+    "cache_counters": {
+      "capture_attempts": 259,
+      "captured": 222,
+      "miss_no_cache": 49,
+      "miss_closed": 256,
+      "not_retained_settled": 140,
+      "not_retained_failed": 25,
+      "retained_storage_yield": 19,
+      "blocked_enrichment": 36,
+      "blocked_nontext_indexes": 1
+    }
+  }
+}

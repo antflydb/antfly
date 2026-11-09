@@ -1,0 +1,224 @@
+{
+  "runtime_commit": "62837aab53987957aed036db6e17b32ad5690e5a",
+  "build_mode": "Debug",
+  "qualification": "native/persistent and focused ownership correctness; foreground command integration and end-to-end performance remain incomplete",
+  "full_gate": {
+    "native": {
+      "passed": 826,
+      "benchmark_skips": 5,
+      "failures": 0,
+      "leaks": 0
+    },
+    "persistent": {
+      "passed": 88,
+      "benchmark_skips": 1,
+      "failures": 0,
+      "leaks": 0
+    },
+    "build": {
+      "status": "completed",
+      "returncode": 0,
+      "wall_seconds": 156.414,
+      "cpu_seconds": 154.091,
+      "cpu_accounting_complete": true,
+      "active_processes": [
+        {
+          "pid": 38950,
+          "parent_pid": 38946,
+          "rss_bytes": 2588672,
+          "elapsed": "02:31",
+          "cpu_time": "0:00.27",
+          "state": "Ss",
+          "executable": "maker",
+          "artifact": null,
+          "source_root": null
+        },
+        {
+          "pid": 40532,
+          "parent_pid": 38950,
+          "rss_bytes": 93257728,
+          "elapsed": "01:05",
+          "cpu_time": "1:02.54",
+          "state": "U",
+          "executable": "test-local",
+          "artifact": null,
+          "source_root": null
+        }
+      ],
+      "cgroup_memory_stat": {},
+      "peak_sampled_cgroup_anon_bytes": null,
+      "peak_sampled_cgroup_file_bytes": null,
+      "cgroup_sample_interval_seconds": 30,
+      "peak_build_tree_rss_bytes": 4706533376,
+      "peak_process_rss_bytes": 4704075776,
+      "rss_samples": 583,
+      "rss_sample_interval_seconds": 0.25,
+      "min_disk_free_bytes": 234210402304,
+      "timed_out": false,
+      "build_timeout_seconds": 7200,
+      "compiler_timeout_seconds": null
+    }
+  },
+  "focused_validation": [
+    {
+      "suite": "owned foreground projection after complete runtime teardown; shared epoch; borrowed manager refusal",
+      "passed": 3,
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 22.367,
+        "cpu_seconds": 25.301,
+        "cpu_accounting_complete": true,
+        "active_processes": [],
+        "cgroup_memory_stat": {},
+        "peak_sampled_cgroup_anon_bytes": null,
+        "peak_sampled_cgroup_file_bytes": null,
+        "cgroup_sample_interval_seconds": 30,
+        "peak_build_tree_rss_bytes": 2289680384,
+        "peak_process_rss_bytes": 2247278592,
+        "rss_samples": 84,
+        "rss_sample_interval_seconds": 0.25,
+        "min_disk_free_bytes": 201467314176,
+        "timed_out": false,
+        "build_timeout_seconds": 7200,
+        "compiler_timeout_seconds": null
+      }
+    },
+    {
+      "suite": "native namespace snapshot identity and cursor/binding lifetime",
+      "passed": 9,
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 23.562,
+        "cpu_seconds": 25.311,
+        "cpu_accounting_complete": true,
+        "active_processes": [],
+        "cgroup_memory_stat": {},
+        "peak_sampled_cgroup_anon_bytes": null,
+        "peak_sampled_cgroup_file_bytes": null,
+        "cgroup_sample_interval_seconds": 30,
+        "peak_build_tree_rss_bytes": 2344681472,
+        "peak_process_rss_bytes": 2302132224,
+        "rss_samples": 88,
+        "rss_sample_interval_seconds": 0.25,
+        "min_disk_free_bytes": 198849712128,
+        "timed_out": false,
+        "build_timeout_seconds": 7200,
+        "compiler_timeout_seconds": null
+      }
+    },
+    {
+      "suite": "snapshot rebinding and retained accounting",
+      "passed": 7,
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 24.85,
+        "cpu_seconds": 25.406,
+        "cpu_accounting_complete": true,
+        "active_processes": [],
+        "cgroup_memory_stat": {},
+        "peak_sampled_cgroup_anon_bytes": null,
+        "peak_sampled_cgroup_file_bytes": null,
+        "cgroup_sample_interval_seconds": 30,
+        "peak_build_tree_rss_bytes": 1251901440,
+        "peak_process_rss_bytes": 1249427456,
+        "rss_samples": 92,
+        "rss_sample_interval_seconds": 0.25,
+        "min_disk_free_bytes": 196257673216,
+        "timed_out": false,
+        "build_timeout_seconds": 7200,
+        "compiler_timeout_seconds": null
+      }
+    },
+    {
+      "suite": "resident and large staged artifact publication after complete backend replacement",
+      "passed": 2,
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 17.859,
+        "cpu_seconds": 18.134,
+        "cpu_accounting_complete": true,
+        "active_processes": [],
+        "cgroup_memory_stat": {},
+        "peak_sampled_cgroup_anon_bytes": null,
+        "peak_sampled_cgroup_file_bytes": null,
+        "cgroup_sample_interval_seconds": 30,
+        "peak_build_tree_rss_bytes": 944324608,
+        "peak_process_rss_bytes": 936755200,
+        "rss_samples": 66,
+        "rss_sample_interval_seconds": 0.25,
+        "min_disk_free_bytes": 191975522304,
+        "timed_out": false,
+        "build_timeout_seconds": 7200,
+        "compiler_timeout_seconds": null
+      }
+    },
+    {
+      "suite": "read-only retention and writable staging refusal",
+      "passed": 4,
+      "note": "storage-batch owner passed; the combined persistent invocation was rejected by its filter-inventory auditor, then the complete persistent suite passed",
+      "build": {
+        "status": "failed",
+        "returncode": 1,
+        "wall_seconds": 28.128,
+        "cpu_seconds": 31.806,
+        "cpu_accounting_complete": true,
+        "active_processes": [],
+        "cgroup_memory_stat": {},
+        "peak_sampled_cgroup_anon_bytes": null,
+        "peak_sampled_cgroup_file_bytes": null,
+        "cgroup_sample_interval_seconds": 30,
+        "peak_build_tree_rss_bytes": 1920778240,
+        "peak_process_rss_bytes": 1909964800,
+        "rss_samples": 105,
+        "rss_sample_interval_seconds": 0.25,
+        "min_disk_free_bytes": 247509983232,
+        "timed_out": false,
+        "build_timeout_seconds": 7200,
+        "compiler_timeout_seconds": null
+      }
+    },
+    {
+      "suite": "preimage validation before primary changes and atomic postimage publication",
+      "passed": 5,
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 16.723,
+        "cpu_seconds": 17.916,
+        "cpu_accounting_complete": true,
+        "active_processes": [],
+        "cgroup_memory_stat": {},
+        "peak_sampled_cgroup_anon_bytes": null,
+        "peak_sampled_cgroup_file_bytes": null,
+        "cgroup_sample_interval_seconds": 30,
+        "peak_build_tree_rss_bytes": 1564901376,
+        "peak_process_rss_bytes": 1522352128,
+        "rss_samples": 63,
+        "rss_sample_interval_seconds": 0.25,
+        "min_disk_free_bytes": 239747198976,
+        "timed_out": false,
+        "build_timeout_seconds": 7200,
+        "compiler_timeout_seconds": null
+      }
+    }
+  ],
+  "correctness_regression_fixed": "Initial broad persistent gate exposed read-only resource retention accidentally requiring writable staging. Added an independent immutable-resource capability; full native and persistent gates now pass.",
+  "public_c_signatures_changed": false,
+  "native_minimum_reader_revision": 16,
+  "sdk_capi_status": "The installed coherent SDK-tested library remains aecea5dd49 (209 SDK tests); no new library was installed for this stage. Final exact-source C API/SDK gates remain required.",
+  "remaining": [
+    "Atomic prepared full-text metadata and ordinary batch/SQL integration",
+    "Exact authoritative ordinal and transformed-input/readset validation in command admission",
+    "Current-runtime artifact alias rebasing for stale retries after origin teardown",
+    "Queue commands before writer gates; compose same-index cohorts and bounded posting deltas independently of RPC size",
+    "Final native/CAPI/SDK/crash and unchanged original importer qualification",
+    "Final optimized wolfspider performance qualification using existing reference evidence"
+  ],
+  "remote_workloads_run": false,
+  "baseline_workloads_rebuilt_or_rerun": false,
+  "database_archives_created": false
+}

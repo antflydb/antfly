@@ -22,6 +22,9 @@ use std::fmt;
 #[derive(Debug, Clone)]
 pub struct SqlError {
     pub native: Error,
+    /// None means the response supplied no authoritative disposition.
+    pub commit_outcome: Option<String>,
+    pub transaction_id: Option<String>,
     pub sqlstate: Option<String>,
     pub message: String,
     pub body: Vec<u8>,
@@ -72,7 +75,7 @@ impl SqlError {
     }
 }
 impl SqlError {
-    /// The outcome receipt of an autocommit write that ended with
+    /// The outcome receipt of a SQL write or native SQL COMMIT that ended with
     /// `OutcomeUnknown`, when the database issued one; resolve it with
     /// `Database::outcome_receipt_status`.
     pub fn outcome_receipt(&self) -> Option<&str> {
@@ -86,6 +89,8 @@ impl From<Error> for SqlError {
         Self {
             native,
             sqlstate: None,
+            commit_outcome: None,
+            transaction_id: None,
             message,
             body: Vec::new(),
         }
@@ -96,11 +101,11 @@ fn output(code: i32, native: Option<Error>, body: Vec<u8>) -> Result<Vec<u8>> {
     if code == sys::ANTFLY_OK {
         return Ok(body);
     }
-    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
-    let diagnostic = parsed.as_ref().and_then(|v| v.get("error").cloned());
+    let envelope = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let diagnostic = envelope.as_ref().and_then(|v| v.get("error"));
     let mut native = native.unwrap_or_else(|| Error::from_code(code));
     if native.outcome_receipt().is_none() {
-        let receipt = parsed
+        let receipt = envelope
             .as_ref()
             .and_then(|v| v["outcome_receipt"].as_str())
             .map(str::to_owned);
@@ -113,6 +118,14 @@ fn output(code: i32, native: Option<Error>, body: Vec<u8>) -> Result<Vec<u8>> {
         .unwrap_or_else(|| native.to_string());
     Err(SqlError {
         native,
+        commit_outcome: envelope
+            .as_ref()
+            .and_then(|v| v["commit_outcome"].as_str())
+            .map(str::to_owned),
+        transaction_id: envelope
+            .as_ref()
+            .and_then(|v| v["transaction_id"].as_str())
+            .map(str::to_owned),
         sqlstate: diagnostic
             .as_ref()
             .and_then(|v| v["code"].as_str())
@@ -190,5 +203,28 @@ impl Database {
     }
     pub fn list_tables_json(&self) -> crate::Result<Vec<u8>> {
         self.read_buffer(|h, out| unsafe { sys::antfly_db_list_tables_json(h, out) })
+    }
+}
+
+#[cfg(all(test, feature = "libantfly"))]
+mod outcome_tests {
+    use super::*;
+
+    #[test]
+    fn sql_commit_errors_keep_disposition_and_reconciliation_token() {
+        for disposition in [Some("applied"), Some("not_applied"), Some("unknown"), None] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "error": {"code": "40003", "message": "Reconcile", "retryable": false},
+                "commit_outcome": disposition,
+                "transaction_id": "abab",
+            }))
+            .unwrap();
+            let error = output(sys::ANTFLY_OUTCOME_UNKNOWN, body)
+                .unwrap_err()
+                .with_statement("COMMIT");
+            assert_eq!(error.commit_outcome.as_deref(), disposition);
+            assert_eq!(error.transaction_id.as_deref(), Some("abab"));
+            assert_eq!(error.sqlstate.as_deref(), Some("40003"));
+        }
     }
 }

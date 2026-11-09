@@ -174,7 +174,38 @@ pub const ReplayPublication = struct {
     ) anyerror!u64,
 };
 
+/// Only bounded metadata publication belongs inside this admission. Index
+/// preparation, provider callbacks and physical checkpoint construction do not.
+pub const ReplayMetadataPublication = struct {
+    ptr: *anyopaque,
+    enter: *const fn (*anyopaque) anyerror!void,
+    leave: *const fn (*anyopaque) void,
+};
+
+/// A prepared index publication depends on one index, not every index in its
+/// namespace. The owner validates that domain under its writer lease.
+pub const ReplayIndexPublication = struct {
+    ptr: *anyopaque,
+    enter: *const fn (*anyopaque, []const u8) anyerror!void,
+    leave: *const fn (*anyopaque) void,
+};
+
+/// The owner guarantees bounded physical retirement service independently of
+/// visibility acknowledgement. A request grants no reusable-byte credits.
+pub const ReplayRetirementService = struct {
+    ptr: *anyopaque,
+    table_id: u64,
+    incarnation: u128,
+    request: *const fn (*anyopaque, u64, u128) void,
+};
+
 pub const AsyncContext = struct {
+    /// Work proportional to prepared text families, excluding cursor setup,
+    /// capacity waits, durable publication and continuation checkpoints.
+    full_text_preparation_ns: std.atomic.Value(u64) = .init(0),
+    replay_index_publication: ?ReplayIndexPublication = null,
+    replay_retirement_service: ?ReplayRetirementService = null,
+    replay_metadata_publication: ?ReplayMetadataPublication = null,
     apply_exclusive_held: bool = false,
     replay_publication: ?ReplayPublication = null,
     alloc: Allocator,
@@ -715,8 +746,11 @@ pub const BatchProfile = struct {
     predicates_ns: u64 = 0,
     validate_range_ns: u64 = 0,
     extract_writes_ns: u64 = 0,
+    prepared_documents_consumed: u64 = 0,
+    unprepared_document_rows: u64 = 0,
     relational_prepare_ns: u64 = 0,
     relational_rows_prepared: u64 = 0,
+    owned_relational_rows_consumed: u64 = 0,
     relational_logical_bytes: u64 = 0,
     relational_encoded_bytes: u64 = 0,
     extract_vector_field_names_ns: u64 = 0,
@@ -750,6 +784,8 @@ pub const BatchProfile = struct {
     derived_apply_ns: u64 = 0,
     sync_wait_ns: u64 = 0,
     full_text_apply_ns: u64 = 0,
+    full_text_collect_ns: u64 = 0,
+    full_text_plan_ns: u64 = 0,
     full_text_prepare_ns: u64 = 0,
     full_text_apply_lock_wait_ns: u64 = 0,
     full_text_apply_lock_held_ns: u64 = 0,
@@ -1015,9 +1051,23 @@ pub const BatchVisibilityCompletion = struct {
     sync_level: types.SyncLevel = .write,
     targets: ManagedSyncTargets = .{},
     enrichment_fully_precomputed: bool = false,
+    graph_cleanup_required: bool = false,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.targets.deinit(alloc);
+    }
+};
+
+/// Per-waiter progress. Immutable completion inputs can be shared by a cohort,
+/// but accepted producer/graph cuts must never be chased anew on every probe.
+pub const BatchVisibilityCursor = struct {
+    publication_cut: ?u64 = null,
+    leann_targets: ?[]index_manager_mod.IndexManager.LeannCoverageTarget = null,
+    leann_allocator: ?Allocator = null,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.leann_targets) |targets| index_manager_mod.IndexManager.freeLeannCoverageTargets(self.leann_allocator.?, targets);
+        self.* = .{};
     }
 };
 
@@ -1038,8 +1088,16 @@ pub const PreparedCommitDisposition = struct {
 };
 
 pub const BatchExecutionOptions = struct {
+    /// Owned local constraint effects, validated under apply and committed with
+    /// primary rows. Never accepted from public JSON or replicated ingress.
+    native_sql_integrity: ?*const @import("native_sql_integrity.zig").Plan = null,
+    prepared_documents: ?*@import("prepared_document_batch.zig").Plan = null,
+    publication_cohort: ?*const @import("publication_cohort.zig").Group = null,
+    cohort_outcome_marker_writes: []const docstore_mod.KVPair = &.{},
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
+    /// Local metadata-only source controls. Never serialized into a Raft request.
+    group_source_controls: []const @import("group_source_contract.zig").Command = &.{},
     /// Native-only completion observation; never encoded in a replicated command.
     legacy_group_completed_through: ?u64 = null,
     legacy_group_plan_generation: ?u64 = null,

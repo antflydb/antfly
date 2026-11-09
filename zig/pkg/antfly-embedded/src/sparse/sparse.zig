@@ -44,6 +44,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../storage/backend_erased.zig");
+const native_namespace_backend = @import("../storage/namespace_bound_store.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
@@ -2436,12 +2437,14 @@ pub const SparseIndex = struct {
 
     const StoreOwner = union(enum) {
         none,
+        native: *native_namespace_backend.Backend,
         mem: *mem_backend.Backend,
         lsm: lsm_backend.BackendHandle,
 
         fn close(self: *StoreOwner, alloc: Allocator) void {
             switch (self.*) {
                 .none => {},
+                .native => |backend| backend.close(),
                 .mem => |backend| {
                     backend.close();
                     alloc.destroy(backend);
@@ -2454,6 +2457,7 @@ pub const SparseIndex = struct {
         fn abandonAfterCrash(self: *StoreOwner, alloc: Allocator) void {
             switch (self.*) {
                 .none => {},
+                .native => |backend| backend.close(),
                 .mem => |backend| {
                     backend.close();
                     alloc.destroy(backend);
@@ -2465,14 +2469,14 @@ pub const SparseIndex = struct {
 
         pub fn sync(self: *StoreOwner, force: bool) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native => {},
                 .lsm => |*handle| try handle.backend.sync(force),
             }
         }
 
         fn checkpointLsmWalAfterDurableBoundary(self: *StoreOwner) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native => {},
                 .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
             }
         }
@@ -2480,7 +2484,7 @@ pub const SparseIndex = struct {
         fn pinNativeCheckpoint(self: *StoreOwner) !lsm_backend.Backend.NativeCheckpoint {
             return switch (self.*) {
                 .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
-                .none, .mem => error.Unsupported,
+                .none, .mem, .native => error.Unsupported,
             };
         }
     };
@@ -2522,6 +2526,18 @@ pub const SparseIndex = struct {
                 return .{ .store = runtime, .owner = .{ .lsm = handle } };
             },
             .lsm => {
+                const native_options = resolvedLsmOptions(opts, false);
+                if (native_options.storage) |storage| {
+                    if (try storage.openNativeNamespaces(alloc, std.mem.span(path), native_options.backend.read_only)) |namespaces_value| {
+                        var namespaces = namespaces_value;
+                        var transferred = false;
+                        defer if (!transferred) namespaces.deinit();
+                        const backend = try native_namespace_backend.Backend.init(alloc, namespaces);
+                        transferred = true;
+                        errdefer backend.close();
+                        return .{ .store = try backend.runtimeStore(alloc), .owner = .{ .native = backend } };
+                    }
+                }
                 var handle = try lsm_backend.BackendHandle.open(alloc, std.mem.span(path), resolvedLsmOptions(opts, false));
                 errdefer handle.close();
 

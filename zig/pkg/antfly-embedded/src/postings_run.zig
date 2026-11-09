@@ -179,6 +179,16 @@ const NativeRun = struct {
         } else try self.buffer.appendSlice(self.allocator, bytes);
         self.length = next;
     }
+    /// Read the still-mutable output for checksum repair after a header patch.
+    /// Sealed sources retain their separate immutable extent coordinates.
+    pub fn readActiveRange(self: *Run, offset: usize, bytes: []u8) !void {
+        if (offset < self.active_logical or offset > self.length or bytes.len > self.length - offset) return error.EndOfStream;
+        try self.flush();
+        self.read_calls += 1;
+        const physical = self.active_physical + offset - self.active_logical;
+        if (try self.file.readPositionalAll(self.io, bytes, physical) != bytes.len) return error.EndOfStream;
+    }
+
     pub fn writeAt(self: *Run, offset: usize, bytes: []const u8) !void {
         if (offset < self.active_logical or offset > self.length or bytes.len > self.length - offset) return error.EndOfStream;
         const physical = self.active_physical + offset - self.active_logical;

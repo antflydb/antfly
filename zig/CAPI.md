@@ -738,8 +738,8 @@ the same database answers `ANTFLY_OUTCOME_RECEIPT_APPLIED` or
 `ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED`, or returns `ANTFLY_STALLED` while the
 uncertain commit is not reconciled:
 
-- Lite connections reconcile on their next call; the status query itself enters
-  the connection, so retrying it settles.
+- Lite connections keep an uncertain owner fenced. Close the issuing handle
+  and open a fresh handle before resolving its receipt.
 - Directory (LSM) databases settle only after the handle that issued the receipt
   is closed and the database reopened (a durable WAL record may still be
   unpublished). A clean close checkpoints and resets the WAL, so such a record
@@ -753,7 +753,7 @@ equal means applied, lower or absent means not applied. A SQL write to a named
 table commits the marker in that table's own database, and its receipt names
 the table and its durable table id, so status and forget read the database the
 write committed to. If that table has since been dropped, or dropped and
-recreated under the same name, status and forget fail with `ANTFLY_NOT_FOUND`:
+recreated under the same name, status and forget fail instead of answering:
 the write's outcome can no longer be read. The
 cost is one small internal key overwrite per exported write. A clean close removes the handle's
 current marker; `antfly_db_outcome_receipt_forget` removes a resolved
@@ -761,8 +761,8 @@ receipt's marker, after which it can no longer be resolved.
 
 While an unknown outcome is unresolved, new statements and calls are refused
 before running, with SQLSTATE 55000 (`ANTFLY_STALLED`): they were not applied,
-and are not themselves of unknown outcome. Lite connections reconcile by
-reopening on their next call; other handles must be reopened.
+and are not themselves of unknown outcome. Close and reopen the database to
+reconcile durable state; existing uncertain owners stay fenced.
 
 XX000 is reserved for internal defects and never reports a commit outcome. Commit responses reserve a fallback buffer
 before mutation, so response allocation cannot erase a committed outcome.

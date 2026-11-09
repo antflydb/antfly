@@ -1,0 +1,42 @@
+{
+  "scope": "Owned relational postimage preparation and transfer; final full architecture qualification remains pending.",
+  "library_sha256": "f415036813e68e2eda65ac6ae7c5860d87a59ae32bc4edd0bfac3dbb1358b42c",
+  "build": "Debug, strip=true, j1",
+  "validation": {
+    "focused_contracts": {
+      "passed": 72,
+      "skipped": 0,
+      "failed": 0,
+      "leaks": 0,
+      "includes": [
+        "every-allocation-failure cleanup",
+        "equivalent independent layout transfer",
+        "exact JSON null provenance",
+        "single-use authority consumed by native commit",
+        "SQL normalization admission and schema fence",
+        "merge/lifecycle and normalized posting window contracts"
+      ]
+    },
+    "sdk_python": {
+      "passed": 209,
+      "seconds": 66.89,
+      "suites": [
+        "SQL",
+        "SQL catalog/search",
+        "SQL outcomes",
+        "concurrency and crash recovery"
+      ],
+      "child_import_environment_explicit": true
+    },
+    "abi_exports": 138
+  },
+  "ownership": "The request retains immutable schema and write-plan views and the backing allocator until transferred regions finish commit cleanup. No live DB is borrowed by row preparation. Namespace/incarnation, schema bytes, layout and exact key/value/null provenance fence consumption.",
+  "current_accelerated_scope": "Native autocommit relational INSERT/UPDATE without coordinated constraints, generated-provider templates or split-shadow work. Existing authoritative paths remain for those cases and active SQL sessions.",
+  "remaining": [
+    "shared prepared authority for normalization/RETURNING to avoid a second pack",
+    "remaining specialized admission paths",
+    "ready merge publication under sustained writes",
+    "unchanged original importer and final optimized host qualification"
+  ],
+  "database_archives_created": false
+}

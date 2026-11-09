@@ -1,0 +1,1369 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-02",
+  "purpose": "Local diagnostic feedback loop; not performance qualification",
+  "host": "local macOS development machine; shared with other builds",
+  "mode": "Debug",
+  "benchmark": "scripts/bench/lite_namespace_replay.py",
+  "benchmark_sha256": "e6975969d5a92ac801235f6ee25de99836abf1531ae0df7426554cffd435f33f",
+  "control_runtime_revision": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
+  "candidate_runtime": "uncommitted diagnostic v4: per-namespace source/artifact scheduling and fresh source captures",
+  "limitations": [
+    "Short synthetic workload, no optimized or sustained-load qualification.",
+    "Shared host and ongoing builds prevent production latency conclusions.",
+    "Candidate runtime is an uncommitted experiment, identified by measured library SHA.",
+    "The first scheduling candidate still failed the fourth original importer input with LiteReplayBacklogExceeded.",
+    "Fresh-source candidate has not completed original-importer qualification."
+  ],
+  "cases": {
+    "control": [
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 0,
+        "order": 0,
+        "library_sha256": "88335f9470b3addb5dd03aa8fcdf82cc932f35321758555e222702229d1bcaa3",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 0.40624891698826104,
+        "startup_settle_seconds": 0.20569779200013727,
+        "measured_seconds": 5.385120915947482,
+        "burst_seconds": 0.3846404579235241,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 47.707375,
+        "p95_ms": 54.705792,
+        "cpu_seconds": 3.2349799999999997,
+        "growth_bytes": 4513792,
+        "initial_bytes": 643072,
+        "final_bytes": 5156864,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 536
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 536
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 536
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 536
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 40,
+          "maintenance_rounds": 20,
+          "maintenance_database_turns": null,
+          "maintenance_source_turns": null,
+          "maintenance_artifact_only_turns": null,
+          "maintenance_idle_namespace_turns": null,
+          "maintenance_capture_ns": null,
+          "maintenance_replay_ns": null,
+          "maintenance_artifacts_ns": null,
+          "maintenance_storage_ns": null,
+          "replay_index_groups": 4,
+          "maintenance_errors": 2,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      },
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 8,
+        "order": 1,
+        "library_sha256": "88335f9470b3addb5dd03aa8fcdf82cc932f35321758555e222702229d1bcaa3",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 1.58527675003279,
+        "startup_settle_seconds": 0.20887904101982713,
+        "measured_seconds": 5.408514666953124,
+        "burst_seconds": 0.40347008302342147,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 45.500458,
+        "p95_ms": 67.177958,
+        "cpu_seconds": 4.420984,
+        "growth_bytes": 3727360,
+        "initial_bytes": 1863680,
+        "final_bytes": 5591040,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 268
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 268
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 268
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 268
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 78,
+          "maintenance_rounds": 7,
+          "maintenance_database_turns": null,
+          "maintenance_source_turns": null,
+          "maintenance_artifact_only_turns": null,
+          "maintenance_idle_namespace_turns": null,
+          "maintenance_capture_ns": null,
+          "maintenance_replay_ns": null,
+          "maintenance_artifacts_ns": null,
+          "maintenance_storage_ns": null,
+          "replay_index_groups": 2,
+          "maintenance_errors": 3,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      },
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 45,
+        "order": 2,
+        "library_sha256": "88335f9470b3addb5dd03aa8fcdf82cc932f35321758555e222702229d1bcaa3",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 16.35067366703879,
+        "startup_settle_seconds": 1.2996628329856321,
+        "measured_seconds": 5.467582874931395,
+        "burst_seconds": 0.46697154093999416,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 52.802,
+        "p95_ms": 79.264292,
+        "cpu_seconds": 4.806777999999998,
+        "growth_bytes": 3338240,
+        "initial_bytes": 7880704,
+        "final_bytes": 11218944,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 268
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 268
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 268
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 268
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 69,
+          "maintenance_rounds": 1,
+          "maintenance_database_turns": null,
+          "maintenance_source_turns": null,
+          "maintenance_artifact_only_turns": null,
+          "maintenance_idle_namespace_turns": null,
+          "maintenance_capture_ns": null,
+          "maintenance_replay_ns": null,
+          "maintenance_artifacts_ns": null,
+          "maintenance_storage_ns": null,
+          "replay_index_groups": 2,
+          "maintenance_errors": 3,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      }
+    ],
+    "candidate_v4": [
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 0,
+        "order": 0,
+        "library_sha256": "08f362aff311c4414693575a508b967d5c52a302b2cf2c2f7dd258969fef31ed",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 2.165130125009455,
+        "startup_settle_seconds": 0.20672012504655868,
+        "measured_seconds": 5.416863542050123,
+        "burst_seconds": 0.41391087509691715,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 49.676667,
+        "p95_ms": 68.298209,
+        "cpu_seconds": 2.497369,
+        "growth_bytes": 5279744,
+        "initial_bytes": 606208,
+        "final_bytes": 5885952,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 11,
+          "maintenance_rounds": 12,
+          "maintenance_database_turns": 9,
+          "maintenance_source_turns": 8,
+          "maintenance_artifact_only_turns": 1,
+          "maintenance_idle_namespace_turns": 17,
+          "maintenance_capture_ns": 353038000,
+          "maintenance_replay_ns": 1837963000,
+          "maintenance_artifacts_ns": 38318000,
+          "maintenance_storage_ns": 92441000,
+          "replay_index_groups": 16,
+          "maintenance_errors": 0,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      },
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 8,
+        "order": 1,
+        "library_sha256": "08f362aff311c4414693575a508b967d5c52a302b2cf2c2f7dd258969fef31ed",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 1.401225792011246,
+        "startup_settle_seconds": 0.20684891694691032,
+        "measured_seconds": 5.4398429580032825,
+        "burst_seconds": 0.43832045793533325,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 46.376,
+        "p95_ms": 78.517167,
+        "cpu_seconds": 3.5284000000000004,
+        "growth_bytes": 3887104,
+        "initial_bytes": 1953792,
+        "final_bytes": 5840896,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 11,
+          "maintenance_rounds": 9,
+          "maintenance_database_turns": 13,
+          "maintenance_source_turns": 11,
+          "maintenance_artifact_only_turns": 2,
+          "maintenance_idle_namespace_turns": 77,
+          "maintenance_capture_ns": 1330819000,
+          "maintenance_replay_ns": 1753210000,
+          "maintenance_artifacts_ns": 221797000,
+          "maintenance_storage_ns": 368402000,
+          "replay_index_groups": 16,
+          "maintenance_errors": 2,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      },
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 45,
+        "order": 2,
+        "library_sha256": "08f362aff311c4414693575a508b967d5c52a302b2cf2c2f7dd258969fef31ed",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 9.872940291068517,
+        "startup_settle_seconds": 0.8288472500862554,
+        "measured_seconds": 5.401304041966796,
+        "burst_seconds": 0.4007988340454176,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 43.40025,
+        "p95_ms": 72.235167,
+        "cpu_seconds": 4.862801000000001,
+        "growth_bytes": 3600384,
+        "initial_bytes": 7630848,
+        "final_bytes": 11231232,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 4,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": true,
+            "doc_count": 512,
+            "term_count": 1072
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 4,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": true,
+            "doc_count": 512,
+            "term_count": 1072
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 1340
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 1340
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 24,
+          "maintenance_rounds": 4,
+          "maintenance_database_turns": 27,
+          "maintenance_source_turns": 24,
+          "maintenance_artifact_only_turns": 3,
+          "maintenance_idle_namespace_turns": 162,
+          "maintenance_capture_ns": 2769663000,
+          "maintenance_replay_ns": 872982000,
+          "maintenance_artifacts_ns": 123179000,
+          "maintenance_storage_ns": 876364000,
+          "replay_index_groups": 8,
+          "maintenance_errors": 4,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 19620,
+          "records": 12,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      },
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 0,
+        "order": 3,
+        "library_sha256": "08f362aff311c4414693575a508b967d5c52a302b2cf2c2f7dd258969fef31ed",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 0.3101319590350613,
+        "startup_settle_seconds": 0.20464616594836116,
+        "measured_seconds": 5.336980791995302,
+        "burst_seconds": 0.3319492080481723,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 40.05175,
+        "p95_ms": 48.489417,
+        "cpu_seconds": 2.283102,
+        "growth_bytes": 5300224,
+        "initial_bytes": 606208,
+        "final_bytes": 5906432,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 10,
+          "maintenance_rounds": 13,
+          "maintenance_database_turns": 9,
+          "maintenance_source_turns": 8,
+          "maintenance_artifact_only_turns": 1,
+          "maintenance_idle_namespace_turns": 17,
+          "maintenance_capture_ns": 311418000,
+          "maintenance_replay_ns": 1645095000,
+          "maintenance_artifacts_ns": 30369000,
+          "maintenance_storage_ns": 76519000,
+          "replay_index_groups": 16,
+          "maintenance_errors": 0,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      }
+    ],
+    "candidate_v4_repeats": [
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 0,
+        "order": 0,
+        "library_sha256": "08f362aff311c4414693575a508b967d5c52a302b2cf2c2f7dd258969fef31ed",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 0.33233074995223433,
+        "startup_settle_seconds": 0.2069291250081733,
+        "measured_seconds": 5.34852600004524,
+        "burst_seconds": 0.345565541065298,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 39.889209,
+        "p95_ms": 54.767375,
+        "cpu_seconds": 2.360332,
+        "growth_bytes": 5152768,
+        "initial_bytes": 606208,
+        "final_bytes": 5758976,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 10,
+          "maintenance_rounds": 13,
+          "maintenance_database_turns": 9,
+          "maintenance_source_turns": 8,
+          "maintenance_artifact_only_turns": 1,
+          "maintenance_idle_namespace_turns": 17,
+          "maintenance_capture_ns": 340522000,
+          "maintenance_replay_ns": 1660279000,
+          "maintenance_artifacts_ns": 32429000,
+          "maintenance_storage_ns": 113339000,
+          "replay_index_groups": 16,
+          "maintenance_errors": 0,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      },
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 0,
+        "order": 1,
+        "library_sha256": "08f362aff311c4414693575a508b967d5c52a302b2cf2c2f7dd258969fef31ed",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 0.2958822079235688,
+        "startup_settle_seconds": 0.2052956250263378,
+        "measured_seconds": 5.404013124993071,
+        "burst_seconds": 0.398963832994923,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 46.75725,
+        "p95_ms": 65.964834,
+        "cpu_seconds": 2.449277,
+        "growth_bytes": 5152768,
+        "initial_bytes": 606208,
+        "final_bytes": 5758976,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 10,
+          "maintenance_rounds": 13,
+          "maintenance_database_turns": 9,
+          "maintenance_source_turns": 8,
+          "maintenance_artifact_only_turns": 1,
+          "maintenance_idle_namespace_turns": 17,
+          "maintenance_capture_ns": 348323000,
+          "maintenance_replay_ns": 1774765000,
+          "maintenance_artifacts_ns": 35779000,
+          "maintenance_storage_ns": 89487000,
+          "replay_index_groups": 16,
+          "maintenance_errors": 0,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      },
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 0,
+        "order": 2,
+        "library_sha256": "08f362aff311c4414693575a508b967d5c52a302b2cf2c2f7dd258969fef31ed",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 0.3021659170044586,
+        "startup_settle_seconds": 0.20506304199807346,
+        "measured_seconds": 5.352964708930813,
+        "burst_seconds": 0.3499368339544162,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 40.910667,
+        "p95_ms": 53.68275,
+        "cpu_seconds": 2.4242999999999997,
+        "growth_bytes": 5152768,
+        "initial_bytes": 606208,
+        "final_bytes": 5758976,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 10,
+          "maintenance_rounds": 13,
+          "maintenance_database_turns": 9,
+          "maintenance_source_turns": 8,
+          "maintenance_artifact_only_turns": 1,
+          "maintenance_idle_namespace_turns": 17,
+          "maintenance_capture_ns": 357175000,
+          "maintenance_replay_ns": 1684578000,
+          "maintenance_artifacts_ns": 36291000,
+          "maintenance_storage_ns": 122162000,
+          "replay_index_groups": 16,
+          "maintenance_errors": 1,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      },
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 8,
+        "order": 3,
+        "library_sha256": "08f362aff311c4414693575a508b967d5c52a302b2cf2c2f7dd258969fef31ed",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 1.2405701250536367,
+        "startup_settle_seconds": 0.20554154191631824,
+        "measured_seconds": 5.433294250047766,
+        "burst_seconds": 0.43041020806413144,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 52.441541,
+        "p95_ms": 69.785292,
+        "cpu_seconds": 3.6394400000000005,
+        "growth_bytes": 3993600,
+        "initial_bytes": 1835008,
+        "final_bytes": 5828608,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 12,
+          "maintenance_rounds": 9,
+          "maintenance_database_turns": 13,
+          "maintenance_source_turns": 12,
+          "maintenance_artifact_only_turns": 1,
+          "maintenance_idle_namespace_turns": 77,
+          "maintenance_capture_ns": 1295057000,
+          "maintenance_replay_ns": 1707811000,
+          "maintenance_artifacts_ns": 159433000,
+          "maintenance_storage_ns": 450588000,
+          "replay_index_groups": 16,
+          "maintenance_errors": 3,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      },
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 0,
+        "order": 4,
+        "library_sha256": "08f362aff311c4414693575a508b967d5c52a302b2cf2c2f7dd258969fef31ed",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 0.3059354580473155,
+        "startup_settle_seconds": 0.20668850000947714,
+        "measured_seconds": 5.352776582934894,
+        "burst_seconds": 0.34773874992970377,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 40.835417,
+        "p95_ms": 54.377958,
+        "cpu_seconds": 2.4044470000000002,
+        "growth_bytes": 5152768,
+        "initial_bytes": 606208,
+        "final_bytes": 5758976,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 10,
+          "maintenance_rounds": 13,
+          "maintenance_database_turns": 9,
+          "maintenance_source_turns": 8,
+          "maintenance_artifact_only_turns": 1,
+          "maintenance_idle_namespace_turns": 17,
+          "maintenance_capture_ns": 347673000,
+          "maintenance_replay_ns": 1681172000,
+          "maintenance_artifacts_ns": 34088000,
+          "maintenance_storage_ns": 119504000,
+          "replay_index_groups": 16,
+          "maintenance_errors": 1,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      },
+      {
+        "status": "ok",
+        "verified": true,
+        "active_table": "active",
+        "idle_namespaces": 8,
+        "order": 5,
+        "library_sha256": "08f362aff311c4414693575a508b967d5c52a302b2cf2c2f7dd258969fef31ed",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 1.194066166994162,
+        "startup_settle_seconds": 0.20675549993757159,
+        "measured_seconds": 5.399715957930312,
+        "burst_seconds": 0.3970967499772087,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 41.408542,
+        "p95_ms": 78.81225,
+        "cpu_seconds": 3.6253919999999997,
+        "growth_bytes": 3792896,
+        "initial_bytes": 1982464,
+        "final_bytes": 5775360,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 1024,
+            "term_count": 2144
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 10,
+          "maintenance_rounds": 9,
+          "maintenance_database_turns": 12,
+          "maintenance_source_turns": 10,
+          "maintenance_artifact_only_turns": 2,
+          "maintenance_idle_namespace_turns": 78,
+          "maintenance_capture_ns": 1374787000,
+          "maintenance_replay_ns": 1732488000,
+          "maintenance_artifacts_ns": 104473000,
+          "maintenance_storage_ns": 404585000,
+          "replay_index_groups": 16,
+          "maintenance_errors": 2,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      }
+    ],
+    "earlier_candidate_incomplete_index": [
+      {
+        "status": "error",
+        "verified": false,
+        "error_type": "RuntimeError",
+        "active_table": "active",
+        "idle_namespaces": 0,
+        "order": 0,
+        "library_sha256": "b61ab5a6c6b822781469c42d3ea7a2f05fa2829180b8ad6412a855e05dfd2af2",
+        "benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 0.3485431669978425,
+        "startup_settle_seconds": 0.20726375002413988,
+        "measured_seconds": 5.513010833994485,
+        "burst_seconds": 0.5127552499761805,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 63.21125,
+        "p95_ms": 80.200917,
+        "cpu_seconds": 2.360357,
+        "growth_bytes": 4284416,
+        "initial_bytes": 606208,
+        "final_bytes": 4890624,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 768,
+            "term_count": 1608
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 768,
+            "term_count": 1608
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 768,
+            "term_count": 1608
+          },
+          {
+            "name": "text",
+            "kind": "full_text",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 768,
+            "term_count": 1608
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 9,
+          "maintenance_rounds": 11,
+          "maintenance_database_turns": 8,
+          "maintenance_source_turns": 7,
+          "maintenance_artifact_only_turns": 1,
+          "maintenance_idle_namespace_turns": 14,
+          "maintenance_capture_ns": 422271000,
+          "maintenance_replay_ns": 1772047000,
+          "maintenance_artifacts_ns": 101817000,
+          "maintenance_storage_ns": 256704000,
+          "replay_index_groups": 12,
+          "maintenance_errors": 3,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      }
+    ],
+    "control_default_namespace_failure": [
+      {
+        "status": "error",
+        "verified": false,
+        "error_type": "RuntimeError",
+        "active_table": "default",
+        "idle_namespaces": 8,
+        "order": 0,
+        "library_sha256": "88335f9470b3addb5dd03aa8fcdf82cc932f35321758555e222702229d1bcaa3",
+        "benchmark_sha256": "9977c7c56f8d40706a63a94e805724bd8bed0326b78b1e66243f4e4236ece97e",
+        "batches": 8,
+        "documents_per_batch": 128,
+        "text_bytes": 1024,
+        "quiet_seconds": 5.0,
+        "no_sync": false,
+        "setup_seconds": 0.9901394170010462,
+        "measured_seconds": 5.305275417049415,
+        "burst_seconds": 0.30197079200297594,
+        "successful_batches": 8,
+        "acknowledged_documents": 1024,
+        "p50_ms": 34.64775,
+        "p95_ms": 54.028166,
+        "cpu_seconds": 3.705496,
+        "growth_bytes": 3153920,
+        "initial_bytes": 1740800,
+        "final_bytes": 4894720,
+        "progress_after": [
+          {
+            "name": "full_text_index_v0",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 0,
+            "term_count": 0
+          }
+        ],
+        "progress_after_drain": [
+          {
+            "name": "full_text_index_v0",
+            "replay_applied_sequence": 8,
+            "replay_target_sequence": 8,
+            "replay_catch_up_required": false,
+            "doc_count": 0,
+            "term_count": 0
+          }
+        ],
+        "counter_deltas": {
+          "serving_runtime_refreshes": 118,
+          "maintenance_rounds": 13,
+          "maintenance_database_turns": null,
+          "maintenance_source_turns": null,
+          "maintenance_artifact_only_turns": null,
+          "maintenance_idle_namespace_turns": null,
+          "maintenance_capture_ns": null,
+          "maintenance_replay_ns": null,
+          "maintenance_artifacts_ns": null,
+          "maintenance_storage_ns": null,
+          "replay_index_groups": 0,
+          "maintenance_errors": 3,
+          "allocator_proof_walks": 0
+        },
+        "replay_backlog_after": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      }
+    ]
+  },
+  "quiet_large_database_diagnostic": {
+    "seconds": 30.71431,
+    "maintenance_storage_seconds": 16.333625,
+    "maintenance_replay_seconds": 10.006221,
+    "history_full_text_applied": 2,
+    "history_full_text_target": 61,
+    "profile": "One-second sample: 350/366 maintenance-thread samples in NativeFile.liveStats, under Store.maintainOnceWithCancel. This is a localized sample, not an e2e cost attribution.",
+    "next_investigation": "Separate bounded allocator/retirement service from optional full-record shrinking assessment; preserve cancellation and storage admission."
+  },
+  "original_importer_diagnostic": {
+    "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+    "candidate": "first scheduling prototype, not v4",
+    "successful_input_ordinals": [
+      0,
+      1,
+      2
+    ],
+    "failed_input_ordinal": 3,
+    "error": "LiteReplayBacklogExceeded",
+    "qualified": false
+  },
+  "measured_benchmark_sha256": "702d06eb8bc839109a3c8c98197ed27b967ffcd60c1e37d5a81f316a618aa30c",
+  "source_note": "Only the required license header and automated formatting changed after measurement; each case preserves the exact measured source hash."
+}

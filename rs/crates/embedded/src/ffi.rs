@@ -101,7 +101,7 @@ pub(crate) fn check(code: antfly_error_code) -> Result<()> {
 }
 
 /// [`check`] for calls that issue outcome receipts (batch exports and
-/// autocommit SQL): an `OutcomeUnknown` failure carries its receipt. Must run
+/// SQL writes and native SQL COMMIT): an `OutcomeUnknown` failure carries its receipt. Must run
 /// on the calling thread right after the native call.
 pub(crate) fn check_outcome(code: antfly_error_code) -> Result<()> {
     if code == ANTFLY_OK {

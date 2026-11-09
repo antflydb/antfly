@@ -1,0 +1,67 @@
+{
+  "scope": "Prepared text merge publication during active writes; shared-host Debug diagnostic, not final qualification.",
+  "build": "Debug,strip=true,j1",
+  "validation": {
+    "focused_contracts": {
+      "passed": 72,
+      "failed": 0,
+      "skipped": 0,
+      "leaked": 0
+    },
+    "file_backed_provenance_regression": {
+      "passed": 25,
+      "failed": 0,
+      "skipped": 0,
+      "leaked": 0
+    }
+  },
+  "diagnostic": {
+    "primary": {
+      "library_sha256": "90058926dd68ac6c5f19e728190de7c9d87cd3e8884ac6536d726cebd558d4d6",
+      "harness_sha256": "10cb401a2d49e3b2064a79b70eb6b00e2ce09c3f101c34396895f8132bd47ca6",
+      "writes": 128,
+      "busy_calls": 0,
+      "mutation_elapsed_ns": 780395750,
+      "p50_ns": 5611209,
+      "p95_ns": 11342625,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.09921412500261795
+      }
+    },
+    "indexed": {
+      "library_sha256": "90058926dd68ac6c5f19e728190de7c9d87cd3e8884ac6536d726cebd558d4d6",
+      "harness_sha256": "10cb401a2d49e3b2064a79b70eb6b00e2ce09c3f101c34396895f8132bd47ca6",
+      "writes": 128,
+      "busy_calls": 0,
+      "mutation_elapsed_ns": 1285468041,
+      "p50_ns": 7061959,
+      "p95_ns": 31483125,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.18139499999233522
+      }
+    }
+  },
+  "indexed_merge_jobs": {
+    "started": 5,
+    "applied": 5,
+    "discarded": 0
+  },
+  "ownership": "Private outputs and file-backed deletion-coordinate resolution stay outside writer admission. Final publication re-adopts current immutable source identities and cumulative deletion witnesses under one fresh admitted checkpoint. Runtime pins outlive prepared linked segments. Previously resolved coordinates are retained across adoption.",
+  "remaining": [
+    "full current native and C API gates",
+    "shared SQL normalization/commit authority",
+    "unchanged original importer qualification",
+    "final optimized host qualification"
+  ],
+  "database_archives_created": false
+}

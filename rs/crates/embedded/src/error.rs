@@ -96,8 +96,8 @@ impl Error {
             _ => None,
         }
     }
-    /// The outcome receipt of an `OutcomeUnknown` batch or autocommit SQL
-    /// write, when the database issued one.
+    /// The outcome receipt of an `OutcomeUnknown` batch, SQL write, or native
+    /// SQL COMMIT, when the database issued one.
     pub fn outcome_receipt(&self) -> Option<&str> {
         match self {
             Error::OutcomeUnknownWithReceipt { receipt, .. } => Some(receipt),

@@ -146,9 +146,11 @@ describe("outcome receipts (pure)", () => {
     const err = new SqlError(
       { code: "40003", message: "commit outcome unknown" },
       undefined,
+      "unknown",
       receipt
     );
     expect(err.outcomeReceipt).toBe(receipt);
+    expect(err.commitOutcome).toBe("unknown");
     expect(new SqlError({ code: "40001", message: "retry" }).outcomeReceipt).toBeUndefined();
   });
 });

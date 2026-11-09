@@ -181,6 +181,7 @@ pub const section_analysis_reuse = @import("section/analysis_reuse.zig");
 pub const section_source_offsets = @import("section/source_offsets.zig");
 pub const section_doc_values = @import("section/doc_values.zig");
 pub const section_inverted = @import("section/inverted.zig");
+pub const section_posting_delta = @import("section/posting_delta.zig");
 pub const section_nested = @import("section/nested.zig");
 pub const section_synonyms = @import("section/synonyms.zig");
 pub const section_typed_doc_values = @import("section/typed_doc_values.zig");
@@ -355,9 +356,11 @@ pub const storage_db_derived_apply_state = @import("storage/db/derived/apply_sta
 pub const storage_db_derived_backlog_tracker = @import("storage/db/derived/backlog_tracker.zig");
 pub const storage_db_derived_catch_up_policy = @import("storage/db/derived/catch_up_policy.zig");
 pub const storage_db_derived_change_journal = @import("storage/db/derived/change_journal.zig");
+pub const storage_db_derived_derived_executor = @import("storage/db/derived/derived_executor.zig");
 pub const storage_db_derived_derived_log = @import("storage/db/derived/derived_log.zig");
 pub const storage_db_derived_derived_types = @import("storage/db/derived/derived_types.zig");
 pub const storage_db_derived_derived_worker = @import("storage/db/derived/derived_worker.zig");
+pub const storage_db_derived_replay_fragment = @import("storage/db/derived/replay_fragment.zig");
 pub const storage_db_derived_index_generation_manifest = @import("storage/db/derived/index_generation_manifest.zig");
 pub const storage_db_derived_index_repair_state = @import("storage/db/derived/index_repair_state.zig");
 pub const storage_db_derived_io_threaded_runtime = @import("storage/db/derived/io_threaded_runtime.zig");
@@ -582,7 +585,9 @@ pub const storage_lite_ledger_digest = @import("storage/lite/ledger_digest.zig")
 pub const storage_lite_mod = @import("storage/lite/mod.zig");
 pub const storage_lite_path_lock_wait = @import("storage/lite/path_lock_wait.zig");
 pub const storage_lite_writer_queue = @import("storage/lite/writer_queue.zig");
+pub const storage_lite_commit_proof = @import("storage/lite/commit_proof.zig");
 pub const storage_lite_native = @import("storage/lite/native.zig");
+pub const storage_lite_semantic_revision = @import("storage/lite/semantic_revision.zig");
 pub const storage_lite_paths = @import("storage/lite/paths.zig");
 pub const storage_lite_portable_restore = @import("storage/lite/portable_restore.zig");
 pub const storage_lite_result_scratch = @import("storage/lite/result_scratch.zig");
@@ -893,3 +898,15 @@ pub const storage_db_enrichment_media_output_counts = @import("storage/db/enrich
 
 pub const storage_db_field_projection_source = @import("storage/db/field_projection_source.zig");
 pub const storage_source_value_identity = @import("storage/source_value_identity.zig");
+pub const storage_lite_path_admission = @import("storage/lite/path_admission.zig");
+pub const storage_lite_replay_admission = @import("storage/lite/replay_admission.zig");
+pub const storage_segment_admission = @import("storage/segment_admission.zig");
+
+pub const storage_native_publication_value = @import("storage/native_publication_value.zig");
+pub const storage_lite_namespace_store = @import("storage/lite/namespace_store.zig");
+
+pub const storage_doc_ordinal_binding = @import("storage/doc_ordinal_binding.zig");
+
+pub const storage_native_metadata_batch = @import("storage/native_metadata_batch.zig");
+
+pub const storage_control_key = @import("storage/control_key.zig");

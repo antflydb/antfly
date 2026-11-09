@@ -112,6 +112,20 @@ pub fn highlightsValueLeaky(a: std.mem.Allocator, items: anytype) !?std.json.Val
     return .{ .object = fields };
 }
 
+/// Optional coordinator handoff for CPU-only row normalization. The caller
+/// owns runtime lifetime pins; normalizeRows uses its captured immutable schema.
+/// Resume always runs, including allocation/validation failure, before SQL can
+/// inspect live catalog state or publish any mutation.
+pub const PreparationHandoff = struct {
+    ptr: *anyopaque,
+    release_admission: *const fn (*anyopaque, []const u8) anyerror!void,
+    reacquire_admission: *const fn (*anyopaque) anyerror!*@import("handles.zig").Handle,
+    /// Only a confirmed precommit native capacity refusal may enter this wait.
+    /// The caller has already destroyed the failed attempt's borrowed state.
+    wait_replay: ?*const fn (*anyopaque, @import("../storage/lite/replay_admission.zig").WaitHint) anyerror!*@import("handles.zig").Handle = null,
+    stage_foreground: ?*const fn (*anyopaque, *@import("../storage/db/prepared_document_batch.zig").Plan) anyerror!void = null,
+};
+
 pub fn Adapter(comptime native: type) type {
     return struct {
         const Self = @This();
@@ -128,6 +142,45 @@ pub fn Adapter(comptime native: type) type {
         read_only: bool = false,
         outcome_transaction_id: ?types.TxnId = null,
         graph_parameters: []const std.json.Value = &.{},
+        preparation_handoff: ?PreparationHandoff = null,
+        preparation_allocator: ?std.mem.Allocator = null,
+        normalized_plans: std.ArrayListUnmanaged(*@import("../storage/db/prepared_document_batch.zig").Plan) = .empty,
+
+        pub fn deinitPreparation(self: *Self) void {
+            const a = self.preparation_allocator orelse return;
+            for (self.normalized_plans.items) |plan| {
+                plan.deinit();
+                a.destroy(plan);
+            }
+            self.normalized_plans.deinit(a);
+        }
+
+        fn normalizePreparedRows(self: *Self, db: *DB, output: std.mem.Allocator, table: catalog.Table, writes: []const types.BatchWrite) !?[]types.BatchWrite {
+            const handoff = self.preparation_handoff orelse return null;
+            const a = self.preparation_allocator orelse return null;
+            // The request budget bounds all retained authorities. Individual
+            // plans also enforce row/byte bounds before doing expensive work.
+            const RowPlan = @import("../storage/db/prepared_document_batch.zig").Plan;
+            var captured = (try RowPlan.captureIncludingRelational(a, db)) orelse return null;
+            var retained = false;
+            defer if (!retained) captured.deinit();
+            if (captured.relational == null) return null;
+            try handoff.release_admission(handoff.ptr, table.physical_name);
+            const normalized: anyerror!?[]types.BatchWrite = blk: {
+                captured.prepareWithIo(.{ .writes = writes }, @import("handles.zig").handleLockIo()) catch |err| break :blk err;
+                break :blk captured.relational.?.normalize(captured.schema.?, output);
+            };
+            const root = try handoff.reacquire_admission(handoff.ptr);
+            self.handle = root;
+            self.db = root.database();
+            const result = (try normalized) orelse return null;
+            const plan = try a.create(RowPlan);
+            errdefer a.destroy(plan);
+            try self.normalized_plans.append(a, plan);
+            plan.* = captured;
+            retained = true;
+            return result;
+        }
 
         pub fn backend(self: *Self) catalog.Backend {
             return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
@@ -491,13 +544,14 @@ pub fn Adapter(comptime native: type) type {
                     return output;
                 }
             }
-            const previous = if (self.transaction) |session| if (session.active) try session.commitRequests(alloc) else &.{} else &.{};
+            const session = if (self.transaction) |value| if (value.active) value else null else null;
+            const has_previous = if (session) |value| value.entries.items.len != 0 else false;
             // Arbiters and their coverage belong to the selected table. Only
             // staged transaction writes need the dependency catalog to replay
             // earlier FK/unique effects. Do not open unrelated namespaces for
             // every standalone ON CONFLICT probe; commit preparation still
             // obtains the complete catalog for inbound/outbound constraints.
-            const metadata = if (previous.len != 0)
+            const metadata = if (has_previous)
                 try self.localCatalog(alloc, table.schema_version)
             else metadata: {
                 const tables = try alloc.alloc(topology.TableRecord, 1);
@@ -509,7 +563,9 @@ pub fn Adapter(comptime native: type) type {
             const writes = try dependencies.sql_mutation_images.writes(types.BatchWrite, alloc, mutations);
             const target_predicates = try dependencies.sql_conflict_predicate.toNative(alloc, target.conditions);
             const keys = try dependencies.sql_conflict_predicate.expressionsToNative(alloc, target.expressions);
-            const owners = try integrity.resolveConflictTargetOwnersWithScratch(alloc, scratch_alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, previous, .{});
+            const overlay = if (session) |value| try value.preparedConstraintOverlay(self.localSource(), metadata, self.repairAdmission(), value.entries.items.len, table.physical_name) else null;
+            const previous = if (overlay == null) (if (session) |value| try value.commitRequests(alloc) else &.{}) else &.{};
+            const owners = try integrity.resolveConflictTargetOwnersWithOverlay(alloc, scratch_alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, previous, overlay, .{});
             const output = try alloc.alloc(catalog.ConflictOwner, owners.len);
             for (owners, output) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };
             return output;
@@ -1095,6 +1151,28 @@ pub fn Adapter(comptime native: type) type {
             return cursor.next(cursor.ptr, alloc, request.limit);
         }
 
+        fn normalizeOwnedRows(self: *Self, session: anytype, alloc: std.mem.Allocator, table: catalog.Table, writes: []const types.BatchWrite) ![]types.BatchWrite {
+            const handoff = self.preparation_handoff orelse {
+                defer session.deinit();
+                return session.normalizeRows(alloc, writes);
+            };
+            handoff.release_admission(handoff.ptr, table.physical_name) catch |err| {
+                session.deinit();
+                return err;
+            };
+            const normalized = session.normalizeRows(alloc, writes);
+            // End the immutable schema/read borrow while the suspended guard
+            // still pins its runtime. Re-entry may retire that runtime.
+            session.deinit();
+            // A failed normalization still resumes admission. Error handling,
+            // cursor teardown and SQL outcome receipts may reference the live
+            // adapter; none may accidentally execute outside its fence.
+            const root = try handoff.reacquire_admission(handoff.ptr);
+            self.handle = root;
+            self.db = root.database();
+            return normalized;
+        }
+
         fn prepareMutations(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
             const adapter_owner: *Self = @ptrCast(@alignCast(ptr));
             var selected_adapter = try adapter_owner.selected(table.physical_name);
@@ -1105,15 +1183,15 @@ pub fn Adapter(comptime native: type) type {
             if (writes.len == 0) return input;
             if (table.storage_mode == .document) {
                 const session = try self.db.openDocumentReadSession(alloc, writes[0].key, writes[0].key, .{ .limit = 1, .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version } });
-                defer session.deinit();
-                return images.merge(alloc, input, try session.normalizeRows(alloc, writes));
+                return images.merge(alloc, input, try adapter_owner.normalizeOwnedRows(session, alloc, table, writes));
             }
+            if (try adapter_owner.normalizePreparedRows(self.db, alloc, table, writes)) |normalized|
+                return images.merge(alloc, input, normalized);
             const session = try self.db.openRelationalReadSession(alloc, writes[0].key, writes[0].key, .{
                 .limit = 1,
                 .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version },
             });
-            defer session.deinit();
-            const normalized = try session.normalizeRows(alloc, writes);
+            const normalized = try adapter_owner.normalizeOwnedRows(session, alloc, table, writes);
             return images.merge(alloc, input, normalized);
         }
 
@@ -1160,17 +1238,54 @@ pub fn Adapter(comptime native: type) type {
                 const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
                 // Preparation only reads: any failure here is not applied.
                 prepared = integrity.prepareWithRepairAdmission(scratch_alloc, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
+                if (try @import("sql_native_commit.zig").tryCommit(adapter_owner, alloc, prepared.?.tables)) |outcome| return outcome;
+                selected_adapter = try adapter_owner.selected(table.physical_name);
                 if (self.handle) |handle| return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
                 if (prepared.?.tables.len != 1 or !std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) return error.UnsupportedSqlExecution;
                 return self.commitCoordinated(prepared.?.tables[0]);
             }
+            if (adapter_owner.handle != null) {
+                const input_writes = try temporary.alloc(types.TransactionWrite, writes.items.len);
+                for (writes.items, input_writes) |write, *out| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
+                const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = request.relational_schema_version };
+                // A single namespace uses the same owned publication and
+                // precommit capacity protocol as explicit session COMMIT.
+                if (try @import("sql_native_commit.zig").tryCommit(adapter_owner, alloc, &.{input})) |outcome| return outcome;
+                selected_adapter = try adapter_owner.selected(table.physical_name);
+            }
+            // Final SQL postimages (including conflict-update results) are now
+            // known. Capture immutable row/schema authority, prepare outside
+            // file admission, then consume it only for these exact bytes/nulls.
+            const RowPlan = @import("../storage/db/prepared_document_batch.zig").Plan;
+            var owned_rows: ?RowPlan = null;
+            defer if (owned_rows) |*plan| plan.deinit();
+            var reused_rows: ?*RowPlan = null;
+            for (adapter_owner.normalized_plans.items) |plan| {
+                if (!std.meta.eql(plan.namespace, self.db.core.identity_namespace) or plan.incarnation != self.db.root_incarnation) continue;
+                if (plan.relational) |*rows| if (rows.matchesWrites(request.writes) and try plan.matches(self.db)) {
+                    reused_rows = plan;
+                    break;
+                };
+            }
+            if (reused_rows == null and table.storage_mode == .relational) if (adapter_owner.preparation_handoff) |handoff| {
+                owned_rows = try RowPlan.captureIncludingRelational(alloc, self.db);
+                if (owned_rows) |*plan| {
+                    try handoff.release_admission(handoff.ptr, table.physical_name);
+                    const preparation = plan.prepareWithIo(request, @import("handles.zig").handleLockIo());
+                    const root = try handoff.reacquire_admission(handoff.ptr);
+                    adapter_owner.handle = root;
+                    adapter_owner.db = root.database();
+                    selected_adapter = try adapter_owner.selected(table.physical_name);
+                    try preparation;
+                }
+            };
             // Classify by the batch's own state, not by error name: whether the
             // primary write became durable, and whether its publication was
             // left uncertain (reported as an unknown outcome).
             var primary_committed = false;
             // Named tables commit to their own database, which holds the marker.
             const receipt_table: ?[]const u8 = if (self.handle != null) self.table_name else null;
-            @import("db.zig").trackedBatch(self.db, request, &primary_committed, receipt_table) catch |err| {
+            @import("db.zig").trackedBatchWithNativeSqlIntegrity(self.db, request, &primary_committed, receipt_table, reused_rows orelse (if (owned_rows) |*plan| plan else null), null, null) catch |err| {
                 // A confirmed primary write wins: later uncertainty in derived
                 // or control publication leaves it committed, not unknown.
                 if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;

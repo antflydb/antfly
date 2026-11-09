@@ -29,6 +29,9 @@ pub const Options = struct {
     chunk_bytes: usize = 256 * 1024,
     chunk_records: usize = 1024,
     fan_in: usize = 4,
+    /// Optional big-endian secondary key at the start of each payload. Only
+    /// this bounded prefix is read during run selection, never the payload.
+    tie_break_prefix_bytes: u4 = 0,
 };
 pub const Record = struct { key: u64, payload: []const u8 };
 pub const Range = struct { start: usize, end: usize, count: usize };
@@ -46,7 +49,7 @@ pub const Sorter = struct {
     merge_passes: usize = 0,
 
     pub fn init(allocator: Allocator, options: Options) !Sorter {
-        if (options.chunk_bytes == 0 or options.chunk_records == 0 or options.fan_in < 2 or options.fan_in > 8) return error.InvalidData;
+        if (options.chunk_bytes == 0 or options.chunk_records == 0 or options.fan_in < 2 or options.fan_in > 8 or options.tie_break_prefix_bytes > 8) return error.InvalidData;
         return .{ .allocator = allocator, .options = options, .run = try Run.createWithResources(allocator, options.io, options.directory, options.resource_manager), .payloads = .init(allocator, options.chunk_bytes) };
     }
     pub fn deinit(self: *Sorter) void {
@@ -60,6 +63,7 @@ pub const Sorter = struct {
     }
     pub fn add(self: *Sorter, key: u64, payload: []const u8) !void {
         try self.check();
+        if (payload.len < self.options.tie_break_prefix_bytes) return error.InvalidData;
         if (payload.len > self.options.max_input_bytes -| self.input_bytes or 16 > self.options.max_input_bytes -| (self.input_bytes +| payload.len)) return error.ResourceBudgetExceeded;
         if (self.chunk.items.len != 0 and (self.chunk.items.len >= self.options.chunk_records or self.chunk_bytes >= self.options.chunk_bytes)) try self.flush();
         const owned = try self.payloads.allocator().dupe(u8, payload);
@@ -74,12 +78,12 @@ pub const Sorter = struct {
         try self.run.appendSlice(&header);
         try self.run.appendSlice(record.payload);
     }
-    fn lessThan(_: void, a: Record, b: Record) bool {
-        return a.key < b.key;
+    fn lessThan(prefix: u4, a: Record, b: Record) bool {
+        return a.key < b.key or (a.key == b.key and std.mem.order(u8, a.payload[0..prefix], b.payload[0..prefix]) == .lt);
     }
     fn flush(self: *Sorter) !void {
         if (self.chunk.items.len == 0) return;
-        std.sort.pdq(Record, self.chunk.items, {}, lessThan);
+        std.sort.pdq(Record, self.chunk.items, self.options.tie_break_prefix_bytes, lessThan);
         const start = self.run.len();
         for (self.chunk.items) |record| try self.append(record);
         try self.run.seal(start);
@@ -108,15 +112,18 @@ pub const Sorter = struct {
         const start = self.run.len();
         var cursors: [8]Cursor = undefined;
         var heads: [8]?RecordView = @splat(null);
+        var ties: [8]u64 = @splat(0);
         for (ranges, 0..) |range, i| cursors[i] = Cursor.init(self.allocator, self.run, range);
         defer for (cursors[0..ranges.len]) |*cursor| cursor.deinit();
         for (cursors[0..ranges.len], 0..) |*cursor, i| heads[i] = try cursor.nextView();
+        for (heads[0..ranges.len], 0..) |head, i| ties[i] = try self.tieKey(head);
         var copied: [16 * 1024]u8 = undefined;
         while (true) {
             try self.check();
             var selected: ?usize = null;
             for (heads[0..ranges.len], 0..) |head, i| if (head) |record| {
-                if (selected == null or record.key < heads[selected.?].?.key) selected = i;
+                if (selected == null or record.key < heads[selected.?].?.key or
+                    (record.key == heads[selected.?].?.key and ties[i] < ties[selected.?])) selected = i;
             };
             const i = selected orelse break;
             const record = heads[i].?;
@@ -132,6 +139,7 @@ pub const Sorter = struct {
                 offset += take;
             }
             heads[i] = try cursors[i].nextView();
+            ties[i] = try self.tieKey(heads[i]);
         }
         try self.run.seal(start);
         var count: usize = 0;
@@ -144,6 +152,15 @@ pub const Sorter = struct {
         self.merge_passes += 1;
         try self.run.compact();
         return result;
+    }
+    fn tieKey(self: *const Sorter, record: ?RecordView) !u64 {
+        const width = self.options.tie_break_prefix_bytes;
+        if (width == 0) return 0;
+        const value = record orelse return 0;
+        if (value.payload.length < width) return error.InvalidData;
+        var bytes: [8]u8 = @splat(0);
+        try value.payload.readInto(0, bytes[0..width]);
+        return std.mem.readInt(u64, &bytes, .big);
     }
     pub fn finish(self: *Sorter) !?Range {
         try self.check();

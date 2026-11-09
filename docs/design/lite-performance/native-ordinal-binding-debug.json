@@ -1,0 +1,232 @@
+{
+  "runtime_commit": "1431fda11bc7fdc9446685643bdc3940e7de9501",
+  "build_mode": "Debug",
+  "qualification": "component correctness; full architecture and performance qualification remain incomplete",
+  "validation": [
+    {
+      "suite": "full native storage",
+      "passed": 822,
+      "benchmark_skips": 5,
+      "failures": 0,
+      "leaks": 0,
+      "scope": "revision-16 storage/proof/snapshot implementation before the subsequent portable-export wrapper and final owner regressions",
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 132.47,
+        "cpu_seconds": 142.135,
+        "cpu_accounting_complete": true,
+        "active_processes": [
+          {
+            "pid": 7459,
+            "parent_pid": 7455,
+            "rss_bytes": 47579136,
+            "elapsed": "02:01",
+            "cpu_time": "0:00.23",
+            "state": "Ss",
+            "executable": "maker",
+            "artifact": null,
+            "source_root": null
+          },
+          {
+            "pid": 8013,
+            "parent_pid": 7459,
+            "rss_bytes": 93011968,
+            "elapsed": "00:54",
+            "cpu_time": "0:51.45",
+            "state": "R",
+            "executable": "test-local",
+            "artifact": null,
+            "source_root": null
+          }
+        ],
+        "cgroup_memory_stat": {},
+        "peak_sampled_cgroup_anon_bytes": null,
+        "peak_sampled_cgroup_file_bytes": null,
+        "cgroup_sample_interval_seconds": 30,
+        "peak_build_tree_rss_bytes": 6270074880,
+        "peak_process_rss_bytes": 6222954496,
+        "rss_samples": 493,
+        "rss_sample_interval_seconds": 0.25,
+        "min_disk_free_bytes": 211458068480,
+        "timed_out": false,
+        "build_timeout_seconds": 7200,
+        "compiler_timeout_seconds": null
+      }
+    },
+    {
+      "suite": "full persistent index at committed runtime",
+      "passed": 86,
+      "skipped": 1,
+      "failures": 0,
+      "leaks": 0,
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 19.523,
+        "cpu_seconds": 25.126,
+        "cpu_accounting_complete": true,
+        "active_processes": [],
+        "cgroup_memory_stat": {},
+        "peak_sampled_cgroup_anon_bytes": null,
+        "peak_sampled_cgroup_file_bytes": null,
+        "cgroup_sample_interval_seconds": 30,
+        "peak_build_tree_rss_bytes": 1815560192,
+        "peak_process_rss_bytes": 1769455616,
+        "rss_samples": 73,
+        "rss_sample_interval_seconds": 0.25,
+        "min_disk_free_bytes": 205985312768,
+        "timed_out": false,
+        "build_timeout_seconds": 7200,
+        "compiler_timeout_seconds": null
+      }
+    },
+    {
+      "suite": "publication, metadata and value contracts",
+      "passed": 21,
+      "skipped": 0,
+      "failures": 0,
+      "leaks": 0,
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 16.629,
+        "cpu_seconds": 22.234,
+        "cpu_accounting_complete": true,
+        "active_processes": [],
+        "cgroup_memory_stat": {},
+        "peak_sampled_cgroup_anon_bytes": null,
+        "peak_sampled_cgroup_file_bytes": null,
+        "cgroup_sample_interval_seconds": 30,
+        "peak_build_tree_rss_bytes": 1717698560,
+        "peak_process_rss_bytes": 1675132928,
+        "rss_samples": 62,
+        "rss_sample_interval_seconds": 0.25,
+        "min_disk_free_bytes": 212556533760,
+        "timed_out": false,
+        "build_timeout_seconds": 7200,
+        "compiler_timeout_seconds": null
+      }
+    },
+    {
+      "suite": "split handoff and bound identity portability",
+      "passed": 47,
+      "skipped": 2,
+      "failures": 0,
+      "leaks": 0,
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 48.1,
+        "cpu_seconds": 51.77,
+        "cpu_accounting_complete": true,
+        "active_processes": [
+          {
+            "pid": 10398,
+            "parent_pid": 10393,
+            "rss_bytes": 42516480,
+            "elapsed": "00:31",
+            "cpu_time": "0:00.16",
+            "state": "Ss",
+            "executable": "maker",
+            "artifact": null,
+            "source_root": null
+          },
+          {
+            "pid": 10701,
+            "parent_pid": 10398,
+            "rss_bytes": 3739893760,
+            "elapsed": "00:22",
+            "cpu_time": "0:23.34",
+            "state": "R",
+            "executable": "zig",
+            "artifact": "storage-batch-contract-tests-local",
+            "source_root": "pkg/antfly-embedded/src/source_catalog.zig"
+          }
+        ],
+        "cgroup_memory_stat": {},
+        "peak_sampled_cgroup_anon_bytes": null,
+        "peak_sampled_cgroup_file_bytes": null,
+        "cgroup_sample_interval_seconds": 30,
+        "peak_build_tree_rss_bytes": 5051858944,
+        "peak_process_rss_bytes": 5009342464,
+        "rss_samples": 180,
+        "rss_sample_interval_seconds": 0.25,
+        "min_disk_free_bytes": 208137437184,
+        "timed_out": false,
+        "build_timeout_seconds": 7200,
+        "compiler_timeout_seconds": null
+      }
+    },
+    {
+      "suite": "real source accounting lifetime and every metadata allocation failure",
+      "passed": 3,
+      "skipped": 0,
+      "failures": 0,
+      "leaks": 0,
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 14.54,
+        "cpu_seconds": 16.124,
+        "cpu_accounting_complete": true,
+        "active_processes": [],
+        "cgroup_memory_stat": {},
+        "peak_sampled_cgroup_anon_bytes": null,
+        "peak_sampled_cgroup_file_bytes": null,
+        "cgroup_sample_interval_seconds": 30,
+        "peak_build_tree_rss_bytes": 1141555200,
+        "peak_process_rss_bytes": 1134182400,
+        "rss_samples": 54,
+        "rss_sample_interval_seconds": 0.25,
+        "min_disk_free_bytes": 207764905984,
+        "timed_out": false,
+        "build_timeout_seconds": 7200,
+        "compiler_timeout_seconds": null
+      }
+    },
+    {
+      "suite": "segment reader/query cursor/merge binding",
+      "passed": 3,
+      "skipped": 0,
+      "failures": 0,
+      "leaks": 0,
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 12.676,
+        "cpu_seconds": 15.02,
+        "cpu_accounting_complete": true,
+        "active_processes": [],
+        "cgroup_memory_stat": {},
+        "peak_sampled_cgroup_anon_bytes": null,
+        "peak_sampled_cgroup_file_bytes": null,
+        "cgroup_sample_interval_seconds": 30,
+        "peak_build_tree_rss_bytes": 1154777088,
+        "peak_process_rss_bytes": 1113505792,
+        "rss_samples": 47,
+        "rss_sample_interval_seconds": 0.25,
+        "min_disk_free_bytes": 223320686592,
+        "timed_out": false,
+        "build_timeout_seconds": 7200,
+        "compiler_timeout_seconds": null
+      }
+    }
+  ],
+  "sdk_abi_changes": {
+    "public_c_signatures_changed": false,
+    "native_minimum_reader_revision": 16,
+    "new_unbound_value_errors": "terminal internal errors; no retryable Busy classification",
+    "sdk_validation": "not rebuilt for this component stage"
+  },
+  "remaining": [
+    "Shared owned foreground projection and exact input/revision validation",
+    "Ordinary batch and SQL integration with atomic primary/index publication",
+    "Pre-admission publication cohorts and bounded posting delta accumulation independent of RPC size",
+    "Final exact-source native/CAPI/SDK/crash gates",
+    "Unchanged original importer and optimized wolfspider qualification with existing references"
+  ],
+  "remote_workloads_run": false,
+  "baseline_workloads_rebuilt_or_rerun": false,
+  "database_archives_created": false
+}

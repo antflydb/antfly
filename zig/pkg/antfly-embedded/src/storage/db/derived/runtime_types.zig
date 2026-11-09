@@ -39,6 +39,16 @@ pub const FinishCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager
 pub const CanAdvanceToTargetFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
 pub const AppliedSequenceAdvancedFn = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;
 
+/// Borrowed for one bounded wait. The owner validates the index generation and
+/// makes fragment output durable before publishing its continuation.
+pub const ReplayFragments = struct {
+    ptr: *anyopaque,
+    apply: ?@import("derived_worker.zig").ApplyFragmentFn = null,
+    supports: *const fn (*anyopaque, []const u8) anyerror!bool,
+    load: *const fn (*anyopaque, []const u8) anyerror!?@import("replay_fragment.zig").Position,
+    save: *const fn (*anyopaque, []const u8, @import("replay_fragment.zig").Position) anyerror!void,
+};
+
 const std = @import("std");
 const types = @import("../types.zig");
 const platform_clock = @import("antfly_platform").clock;
@@ -46,6 +56,13 @@ const platform_time = @import("antfly_platform").time;
 
 /// Deadline and its clock travel together across executor implementations.
 pub const VisibilityWait = struct {
+    fragments: ?ReplayFragments = null,
+    full_text_preparation_ns: ?*const std.atomic.Value(u64) = null,
+    replay_budget: ?*@import("replay_budget.zig").Controller = null,
+    publication_overhead_ns: ?*const std.atomic.Value(u64) = null,
+    replay_record_cap: usize = 2048,
+    /// A producer may publish only a prefix during a cooperative source turn.
+    replay_target_cap: u64 = std.math.maxInt(u64),
     cancellation: types.CancellationToken = .none,
     deadline_ns: ?u64 = null,
     clock: ?platform_clock.Clock = null,

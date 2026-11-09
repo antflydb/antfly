@@ -447,6 +447,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     group_source_tests.root_module.addImport("antfly-json", json_mod);
     const run_group_source_tests = b.addRunArtifact(group_source_tests);
     b.step("group-sources-test", "Run durable grouped-source membership and fencing tests").dependOn(&run_group_source_tests.step);
+    const handoff_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/capi/immutable_text_handoff.zig"), .target = target, .optimize = optimize }) });
+    b.step("lite-text-handoff-test", "Run bounded immutable reader handoff ownership tests").dependOn(&b.addRunArtifact(handoff_tests).step);
     const structured_test_module = b.createModule(.{ .root_source_file = b.path("lib/structured/root.zig"), .target = target, .optimize = optimize });
     var structured_imports = b.modules.get("antfly_structured").?.import_table.iterator();
     while (structured_imports.next()) |entry| structured_test_module.addImport(entry.key_ptr.*, entry.value_ptr.*);

@@ -25,6 +25,9 @@ pub const State = enum { queued, running, succeeded, failed, canceled };
 
 pub const CancelToken = struct {
     requested: std.atomic.Value(bool) = .init(false),
+    /// Borrowed for the synchronous operation. Observers may refuse optional
+    /// work; they never authorize publication or replace its storage fences.
+    observer: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
 
     pub fn request(self: *CancelToken) void {
         self.requested.store(true, .release);
@@ -32,6 +35,7 @@ pub const CancelToken = struct {
 
     pub fn check(self: *const CancelToken) !void {
         if (self.requested.load(.acquire)) return error.MaintenanceCanceled;
+        if (self.observer) |observer| try observer.check(observer.ptr);
     }
 };
 

@@ -21,11 +21,13 @@ const posting_segment_store = @import("posting_segment_store.zig");
 pub const OpenedBackend = union(enum) {
     lsm: lsm_backend.BackendHandle,
     native: *NativeBackend,
+    namespaces: *NativeNamespaces,
 
     pub fn close(self: *OpenedBackend, alloc: Allocator) void {
         switch (self.*) {
             .lsm => |*handle| handle.close(),
             .native => |backend| backend.close(alloc),
+            .namespaces => |backend| backend.close(alloc),
         }
         self.* = undefined;
     }
@@ -34,6 +36,7 @@ pub const OpenedBackend = union(enum) {
         switch (self.*) {
             .lsm => |*handle| handle.abandonAfterCrash(),
             .native => |backend| backend.close(alloc),
+            .namespaces => |backend| backend.close(alloc),
         }
         self.* = undefined;
     }
@@ -43,14 +46,14 @@ pub const OpenedBackend = union(enum) {
             .lsm => |*handle| try handle.backend.sync(force),
             // HBC WAL appends and CURRENT replacement sync their own files and
             // parent namespace at the publication boundary.
-            .native => {},
+            .native, .namespaces => {},
         }
     }
 
     pub fn syncReplayState(self: *OpenedBackend) !void {
         switch (self.*) {
             .lsm => |*handle| try handle.backend.syncReplayState(),
-            .native => {},
+            .native, .namespaces => {},
         }
     }
 
@@ -58,7 +61,34 @@ pub const OpenedBackend = union(enum) {
         return switch (self) {
             .lsm => |handle| try handle.backend.runtimeNamespaceStore(allocator),
             .native => return error.HbcNativeGenerationRequired,
+            .namespaces => |backend| try backend_erased.namespaceStoreFrom(allocator, backend.store, @import("backend_types.zig").Namespace, NativeNamespaces.mapNamespace),
         };
+    }
+};
+
+/// Native transactional HBC metadata; immutable posting generations keep
+/// their existing representation and ownership independently of this view.
+pub const NativeNamespaces = struct {
+    store: backend_erased.NamespaceStore,
+    storage: lsm_backend.Storage,
+    root_dir: []u8,
+    read_only: bool,
+    fn mapNamespace(namespace: @import("backend_types.zig").Namespace) !@import("backend_types.zig").Namespace {
+        return namespace;
+    }
+    fn close(self: *NativeNamespaces, allocator: Allocator) void {
+        self.store.deinit();
+        allocator.free(self.root_dir);
+        allocator.destroy(self);
+    }
+    fn open(allocator: Allocator, root: []const u8, storage: lsm_backend.Storage, read_only: bool) !?*NativeNamespaces {
+        var store = (try storage.openNativeNamespaces(allocator, root, read_only)) orelse return null;
+        errdefer store.deinit();
+        const owned_root = try allocator.dupe(u8, root);
+        errdefer allocator.free(owned_root);
+        const self = try allocator.create(NativeNamespaces);
+        self.* = .{ .store = store, .root_dir = owned_root, .storage = storage, .read_only = read_only };
+        return self;
     }
 };
 
@@ -77,7 +107,7 @@ pub const NativeBackend = struct {
             owner.deinit();
             alloc.destroy(owner);
         };
-        const storage = options.storage orelse blk: {
+        const storage = options.storage orelse options.backend_options.storage orelse blk: {
             const owner = try alloc.create(lsm_backend.NativeStorage);
             errdefer alloc.destroy(owner);
             owner.* = try lsm_backend.NativeStorage.initWithPool(
@@ -167,6 +197,11 @@ pub fn openBackendWithLsmOptions(alloc: Allocator, path: [*:0]const u8, config: 
         .lsm => blk: {
             if (try NativeBackend.openIfAuthoritative(alloc, std.mem.span(path), lsm_options)) |native| {
                 break :blk .{ .native = native };
+            }
+            if (lsm_options.storage orelse lsm_options.backend_options.storage) |storage| {
+                if (try NativeNamespaces.open(alloc, std.mem.span(path), storage, lsm_options.backend_options.backend.read_only)) |native| {
+                    break :blk .{ .namespaces = native };
+                }
             }
             var backend_options = lsm_options.backend_options;
             backend_options.backend.durability = if (config.no_sync) .none else backend_options.backend.durability;

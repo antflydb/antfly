@@ -32,12 +32,14 @@ pub const SourceStamp = struct {
         return self.incarnation == other.incarnation and std.mem.eql(u8, &self.digest, &other.digest);
     }
 };
-const header_magic = "ESQ2";
-const empty_cursor_header_magic = "ESQ3";
+const fragment_mod = @import("../derived/replay_fragment.zig");
+const header_magic = "ESQ4";
+const version_three_header_magic = "ESQ3";
+const legacy_header_magic = "ESQ2";
 const snapshot_magic = "ESR2";
 const ticket_magic = "EST2";
 pub const max_ticket_bytes = 4 + 4 + max_document_key_bytes + 8 + 1 + 32 + 1 + 48 + 8 + 8 + 2 + max_budgets * 40;
-const max_header_bytes = 4 + 8 + 8 + 4 + max_document_key_bytes + 1 + 2 + max_documents;
+const max_header_bytes = 4 + 8 + 8 + 4 + max_document_key_bytes + 3 + max_documents + 57;
 comptime {
     // Every admitted combination fits, including maximum opaque keys, every
     // producer budget, both source identities, and a partial-record cursor.
@@ -92,6 +94,7 @@ pub const State = struct {
     config_hash: u64 = 0,
     scanned_sequence: u64 = 0,
     scan_document: []const u8 = "",
+    scan_fragment: ?fragment_mod.Position = null,
     empty_scan_document: bool = false,
     tickets: std.ArrayListUnmanaged(Ticket) = .empty,
     persisted_slots: std.StaticBitSet(max_documents) = .empty,
@@ -202,11 +205,27 @@ pub const State = struct {
         return bytes;
     }
     pub fn isHeader(bytes: []const u8) bool {
-        return std.mem.startsWith(u8, bytes, header_magic) or std.mem.startsWith(u8, bytes, empty_cursor_header_magic);
+        return std.mem.startsWith(u8, bytes, header_magic) or std.mem.startsWith(u8, bytes, legacy_header_magic) or std.mem.startsWith(u8, bytes, version_three_header_magic);
     }
     pub const Header = struct { state: State, slots: [max_documents]u8 = undefined, count: usize };
+    // Two unreleased histories used ESQ3 independently: an empty-key cursor
+    // flag before the slot count, and a fragment suffix after the slots. Their
+    // exact lengths and bounded slot counts distinguish them without guessing
+    // at request contents. ESQ4 encodes both capabilities explicitly.
+    fn versionThreeHasEmptyCursor(raw: []const u8) !bool {
+        if (raw.len < 24) return error.InvalidEnrichmentState;
+        const cursor_len = std.mem.readInt(u32, raw[20..24], .little);
+        if (cursor_len > raw.len - 24) return error.InvalidEnrichmentState;
+        const offset = 24 + @as(usize, cursor_len);
+        if (cursor_len != 0 or raw.len - offset < 3 or raw[offset] != 1) return false;
+        const count = std.mem.readInt(u16, raw[offset + 1 ..][0..2], .little);
+        return count <= max_documents and raw.len - offset == 3 + @as(usize, count);
+    }
     pub fn decodeHeader(a: A, raw: []const u8) !Header {
         if (!isHeader(raw) or raw.len > max_header_bytes) return error.InvalidEnrichmentState;
+        const modern = std.mem.startsWith(u8, raw, header_magic);
+        const version_three = std.mem.startsWith(u8, raw, version_three_header_magic);
+        const legacy_empty = version_three and try versionThreeHasEmptyCursor(raw);
         var reader = binary.Reader{ .bytes = raw };
         _ = try reader.take(4);
         var result = Header{ .state = .{}, .count = 0 };
@@ -214,9 +233,10 @@ pub const State = struct {
         result.state.config_hash = try reader.int(u64);
         result.state.scanned_sequence = try reader.int(u64);
         result.state.scan_document = try reader.key(a, max_document_key_bytes);
-        if (std.mem.startsWith(u8, raw, empty_cursor_header_magic)) {
-            if (try reader.int(u8) != 1 or result.state.scan_document.len != 0) return error.InvalidEnrichmentState;
-            result.state.empty_scan_document = true;
+        if (modern or legacy_empty) {
+            const empty = try reader.int(u8);
+            if (empty > 1 or (legacy_empty and empty != 1)) return error.InvalidEnrichmentState;
+            result.state.empty_scan_document = empty == 1;
         }
         result.count = try reader.int(u16);
         if (result.count > max_documents) return error.InvalidEnrichmentState;
@@ -226,28 +246,54 @@ pub const State = struct {
             if (slot.* >= max_documents or used.isSet(slot.*)) return error.InvalidEnrichmentState;
             used.set(slot.*);
         }
+        if (modern or (version_three and !legacy_empty)) {
+            const has_fragment = try reader.int(u8);
+            if (has_fragment > 1) return error.InvalidEnrichmentState;
+            if (has_fragment == 1) {
+                var fragment: fragment_mod.Position = .{ .sequence = try reader.int(u64), .next_item = try reader.int(u64), .total_items = try reader.int(u64), .fingerprint = undefined };
+                @memcpy(&fragment.fingerprint, try reader.take(32));
+                result.state.scan_fragment = fragment;
+            }
+        }
+        try result.state.validateFragment();
         try reader.end();
         return result;
+    }
+    fn validateFragment(self: State) !void {
+        if (self.empty_scan_document and self.scan_document.len != 0) return error.InvalidEnrichmentState;
+        if (self.scan_fragment) |position| {
+            if (self.hasScanDocument() or position.sequence == 0 or position.sequence - 1 != self.scanned_sequence or
+                position.next_item == 0 or position.next_item >= position.total_items or position.applied)
+                return error.InvalidEnrichmentState;
+        }
     }
     fn encodeHeader(self: State, a: A) ![]u8 {
         if (self.tickets.items.len > max_documents) return error.InvalidEnrichmentState;
         const cursor_len = try binary.keyLength(self.scan_document);
         if (cursor_len > max_document_key_bytes) return error.InvalidEnrichmentState;
-        const empty_cursor = self.empty_scan_document and self.scan_document.len == 0;
-        const bytes = try a.alloc(u8, 4 + 8 + 8 + 4 + cursor_len + @intFromBool(empty_cursor) + 2 + self.tickets.items.len);
+        try self.validateFragment();
+        const empty_cursor = self.empty_scan_document;
+        const bytes = try a.alloc(u8, 4 + 8 + 8 + 4 + cursor_len + 1 + 2 + self.tickets.items.len + 1 + @as(usize, if (self.scan_fragment != null) 56 else 0));
         errdefer a.free(bytes);
         var writer = binary.Writer{ .bytes = bytes };
-        writer.put(if (empty_cursor) empty_cursor_header_magic else header_magic);
+        writer.put(header_magic);
         writer.int(u64, self.config_hash);
         writer.int(u64, self.scanned_sequence);
         try writer.key(self.scan_document);
-        if (empty_cursor) writer.int(u8, 1);
+        writer.int(u8, @intFromBool(empty_cursor));
         writer.int(u16, @intCast(self.tickets.items.len));
         var used: std.StaticBitSet(max_documents) = .empty;
         for (self.tickets.items) |ticket| {
             if (ticket.slot >= max_documents or used.isSet(ticket.slot)) return error.InvalidEnrichmentState;
             used.set(ticket.slot);
             writer.int(u8, ticket.slot);
+        }
+        writer.int(u8, @intFromBool(self.scan_fragment != null));
+        if (self.scan_fragment) |fragment| {
+            writer.int(u64, fragment.sequence);
+            writer.int(u64, fragment.next_item);
+            writer.int(u64, fragment.total_items);
+            writer.put(&fragment.fingerprint);
         }
         return bytes;
     }
@@ -773,6 +819,29 @@ test "scoped retry workset indexed budgets survive replacement retirement and al
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
+test "scoped retry workset persists seekable discovery and accepts legacy headers" {
+    const a = std.testing.allocator;
+    var state = State{ .scanned_sequence = 9, .scan_fragment = .{ .sequence = 10, .next_item = 128, .total_items = 1024, .fingerprint = @splat(7) } };
+    const encoded = try state.encode(a);
+    defer a.free(encoded);
+    var restored = try State.decode(a, encoded);
+    defer restored.deinit(a);
+    try std.testing.expectEqualDeep(state.scan_fragment, restored.scan_fragment);
+    try std.testing.expectEqual(@as(u64, 9), restored.completedSequence());
+    var legacy: [26]u8 = @splat(0);
+    @memcpy(legacy[0..4], "ESQ2");
+    std.mem.writeInt(u64, legacy[12..20], 9, .little);
+    var old = try State.decodeHeader(a, &legacy);
+    defer old.state.deinit(a);
+    try std.testing.expect(old.state.scan_fragment == null);
+    try std.testing.expectEqual(@as(u64, 9), old.state.completedSequence());
+    state.scan_fragment.?.sequence = 11;
+    try std.testing.expectError(error.InvalidEnrichmentState, state.encode(a));
+    state.scan_fragment.?.sequence = 10;
+    state.scan_fragment.?.next_item = 1024;
+    try std.testing.expectError(error.InvalidEnrichmentState, state.encode(a));
+}
+
 test "privacy retry workset preserves empty document tickets and exclusive cursors" {
     const a = std.testing.allocator;
     var state = State{};
@@ -799,4 +868,56 @@ test "privacy retry workset preserves empty document tickets and exclusive curso
     var roundtrip = try State.decode(a, legacy);
     defer roundtrip.deinit(a);
     try std.testing.expect(!roundtrip.hasScanDocument());
+}
+
+test "scoped retry workset distinguishes both version three headers and combines cursor capabilities" {
+    const a = std.testing.allocator;
+    // Main's ESQ3 encoded an empty document cursor before the slot count.
+    var empty: [27]u8 = @splat(0);
+    @memcpy(empty[0..4], "ESQ3");
+    std.mem.writeInt(u64, empty[12..20], 9, .little);
+    empty[24] = 1;
+    var old_empty = try State.decodeHeader(a, &empty);
+    defer old_empty.state.deinit(a);
+    try std.testing.expect(old_empty.state.hasScanDocument());
+    try std.testing.expect(old_empty.state.scan_fragment == null);
+    try std.testing.expectEqual(@as(u64, 8), old_empty.state.completedSequence());
+    // The architecture branch's ESQ3 encoded a fragment after the slots.
+    var fragment: [83]u8 = @splat(0);
+    @memcpy(fragment[0..4], "ESQ3");
+    std.mem.writeInt(u64, fragment[12..20], 9, .little);
+    fragment[26] = 1;
+    std.mem.writeInt(u64, fragment[27..35], 10, .little);
+    std.mem.writeInt(u64, fragment[35..43], 128, .little);
+    std.mem.writeInt(u64, fragment[43..51], 1024, .little);
+    @memset(fragment[51..83], 7);
+    var old_fragment = try State.decodeHeader(a, &fragment);
+    defer old_fragment.state.deinit(a);
+    try std.testing.expect(!old_fragment.state.hasScanDocument());
+    try std.testing.expectEqual(@as(u64, 128), old_fragment.state.scan_fragment.?.next_item);
+    try std.testing.expectEqual(@as(u64, 9), old_fragment.state.completedSequence());
+    // A one-slot fragment header begins with the empty-cursor marker byte.
+    // Exact length/count validation must distinguish these layouts.
+    var one_slot: [28]u8 = @splat(0);
+    @memcpy(one_slot[0..4], "ESQ3");
+    one_slot[24] = 1;
+    var old_slot = try State.decodeHeader(a, &one_slot);
+    defer old_slot.state.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), old_slot.count);
+    try std.testing.expect(!old_slot.state.hasScanDocument());
+    one_slot[25] = 1;
+    var empty_slot = try State.decodeHeader(a, &one_slot);
+    defer empty_slot.state.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), empty_slot.count);
+    try std.testing.expect(empty_slot.state.hasScanDocument());
+    // New writes always use the explicit combined format. Each cursor retains
+    // its meaning; claiming both cursors at once is invalid, not a clean cut.
+    const modern = try old_fragment.state.encodeHeader(a);
+    defer a.free(modern);
+    try std.testing.expect(std.mem.startsWith(u8, modern, "ESQ4"));
+    var restored = try State.decodeHeader(a, modern);
+    defer restored.state.deinit(a);
+    try std.testing.expectEqualDeep(old_fragment.state.scan_fragment, restored.state.scan_fragment);
+    restored.state.empty_scan_document = true;
+    try std.testing.expectError(error.InvalidEnrichmentState, restored.state.encodeHeader(a));
 }

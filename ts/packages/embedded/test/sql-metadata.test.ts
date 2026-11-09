@@ -28,6 +28,7 @@ it("preserves write disposition and DDL readiness without changing row decoding"
       rows_affected: 1,
       command_tag: "UPDATE",
       mutation_outcome: "committed_pending",
+      commit_outcome: "applied",
       ddl_receipt: receipt,
     }),
   } as unknown as Database;
@@ -37,9 +38,25 @@ it("preserves write disposition and DDL readiness without changing row decoding"
       rows: [{ n: 12n }],
       rowsAffected: 1n,
       mutationOutcome: "committed_pending",
+      commitOutcome: "applied",
       ddlReceipt: receipt,
     });
   } finally {
     await connection.close();
   }
+});
+
+it("retains an uncertain commit's token and disposition on errors", async () => {
+  const { SqlError } = await import("../src/sql-types.js");
+  const error = new SqlError(
+    { code: "40003", message: "Reconcile", retryable: false },
+    "ab".repeat(16),
+    "unknown"
+  );
+  expect(error).toMatchObject({
+    sqlstate: "40003",
+    transactionId: "ab".repeat(16),
+    commitOutcome: "unknown",
+  });
+  expect(new SqlError({ code: "XX000", message: "Legacy" }).commitOutcome).toBeUndefined();
 });

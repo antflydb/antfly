@@ -1,0 +1,154 @@
+{
+  "scope": "Debug component qualification and diagnostic operation counts; no baseline/reference reruns, no end-to-end or optimized qualification",
+  "base_commit": "b77caf17d69b7091e0aac97fcbb902ee0f71db9f",
+  "library_sha256": "2ba8b2eb8e27878ff56910ae7dace92d257c53014ac30df9a779cfbb4432c5b6",
+  "diagnostic_environment": {
+    "ANTFLY_BENCH_METRICS": "1",
+    "note": "Extra per-batch telemetry and a shared host prevent a controlled latency claim."
+  },
+  "attribution": [
+    {
+      "workload": "primary",
+      "successful_writes": 128,
+      "sync_counts": {
+        "journal_deletion": 63,
+        "allocator_reclamation": 54
+      },
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.11510833300417289
+      },
+      "database_cleanup": {
+        "removed_bytes": 1310720
+      }
+    },
+    {
+      "workload": "indexed",
+      "successful_writes": 128,
+      "sync_counts": {
+        "journal_deletion": 32,
+        "allocator_reclamation": 92
+      },
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.1990730830002576
+      },
+      "database_cleanup": {
+        "removed_bytes": 2609152
+      }
+    }
+  ],
+  "mechanisms": [
+    "One owner-lifetime physical-work batching policy: first-debt age survives new notifications and runtime replacement. Full batches and pressure bypass the delay.",
+    "Journal deletion remains distinct from consumer acknowledgement. Physical records and credits remain charged until the bounded deletion transaction commits.",
+    "A verified maintenance transaction can publish checked postimages with one sync. Unverified maintenance retains conservative barriers and cannot mint a trusted allocator certificate.",
+    "Private epoch-namespace rebinding suppresses proofs while retiring and resealing them."
+  ],
+  "validation": {
+    "native": {
+      "passed": 843,
+      "skipped": 5,
+      "failed": 0,
+      "leaked": 0
+    },
+    "backup_consumers": {
+      "passed": 2,
+      "failed": 0
+    },
+    "full_capi_run": {
+      "passed": 397,
+      "skipped": 3,
+      "failed": 1,
+      "note": "One test assumed immediate journal deletion in its first source turn; source was corrected to advance the coalescing deadline while retaining its zero-credit and no-source-replay assertions."
+    },
+    "corrected_focused_capi_run": {
+      "passed": 27,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    "abi_exports": 138
+  },
+  "comparisons": [
+    {
+      "workload": "primary",
+      "writes": 128,
+      "retained_before": {
+        "foreground_syncs": 128,
+        "background_syncs": 110,
+        "foreground_read_bytes": 23560192,
+        "background_read_bytes": 16412672,
+        "main_write_bytes": 12859165,
+        "observed_p50_ns": 10246458,
+        "observed_elapsed_ns": 1263113583
+      },
+      "current": {
+        "foreground_syncs": 128,
+        "background_syncs": 25,
+        "foreground_read_bytes": 13479936,
+        "background_read_bytes": 10702848,
+        "main_write_bytes": 10322305,
+        "observed_p50_ns": 5553959,
+        "observed_elapsed_ns": 776815083
+      },
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.12973404199874494
+      },
+      "cleanup": {
+        "removed_bytes": 1363968
+      }
+    },
+    {
+      "workload": "indexed",
+      "writes": 128,
+      "retained_before": {
+        "foreground_syncs": 128,
+        "background_syncs": 129,
+        "foreground_read_bytes": 103370752,
+        "background_read_bytes": 148930560,
+        "main_write_bytes": 16406895,
+        "observed_p50_ns": 33633583,
+        "observed_elapsed_ns": 5555440750
+      },
+      "current": {
+        "foreground_syncs": 128,
+        "background_syncs": 66,
+        "foreground_read_bytes": 48242688,
+        "background_read_bytes": 169189376,
+        "main_write_bytes": 15650731,
+        "observed_p50_ns": 26238291,
+        "observed_elapsed_ns": 3674166959
+      },
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.1618376660044305
+      },
+      "cleanup": {
+        "removed_bytes": 2383872
+      }
+    }
+  ],
+  "remaining": [
+    "Indexed diagnostic still spent about 2.07 seconds capturing background snapshots over 95 source turns; attribute and remove unnecessary source/runtime construction without skipping recovery or consumer fences.",
+    "SQL/relational owned preparation outside the C API writer gate.",
+    "Final exact-head aggregate checks, original-importer qualification and optimized wolfspider active-write qualification."
+  ],
+  "qualification_databases_archived": false
+}

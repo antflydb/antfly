@@ -386,6 +386,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const applyDerivedBatchTargetsProfiled = materialization.applyDerivedBatchTargetsProfiled;
         pub const applyDerivedBatchToIndexContext = materialization.applyDerivedBatchToIndexContext;
         pub const applyDerivedBatchToIndexContextProfiled = materialization.applyDerivedBatchToIndexContextProfiled;
+        pub const applyDerivedBatchToIndexContextProfiledWithFragment = materialization.applyDerivedBatchToIndexContextProfiledWithFragment;
         pub const applyGraphArtifactMutationPages = materialization.applyGraphArtifactMutationPages;
         pub const applyGraphDocClearsForIndex = materialization.applyGraphDocClearsForIndex;
         pub const applyPrecomputeAssetProducerOutput = materialization.applyPrecomputeAssetProducerOutput;

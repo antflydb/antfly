@@ -593,10 +593,23 @@ pub fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []con
 /// new replay work; a recursive taxonomy that does not converge fails boundedly.
 pub fn runUntilIdle(handle: *h.Handle) !void {
     const root = handle.parent_handle orelse handle;
+    // An explicit drain is a consumer too. Keep its generated/resolver
+    // publications in the same progress reserve as detached maintenance;
+    // ordinary producers remain fenced by the entry point's admission lease.
+    const native_file: ?*h.lite_backend.native.NativeFile = if (root.owned_lite_backend) |*backend|
+        if (backend.native_docstore) |store| &store.file else null
+    else
+        null;
+    const prior_consumer = if (native_file) |file| file.replay_consumer_admission else false;
+    if (native_file) |file| file.replay_consumer_admission = true;
+    defer if (native_file) |file| {
+        file.replay_consumer_admission = prior_consumer;
+    };
     if (root.embedded_path == null) return drainDatabase(root, handle.database());
     try tables.loadAvailable(root);
     for (0..1024) |_| {
         const before = replaySequence(root);
+        if (native_file != null) try drainNativeReplayCohort(root);
         try drainDatabase(root, &root.db);
         var iterator = root.embedded_tables.valueIterator();
         while (iterator.next()) |table| try drainDatabase(root, &table.*.db);
@@ -606,6 +619,49 @@ pub fn runUntilIdle(handle: *h.Handle) !void {
         }
     }
     return error.RunUntilIdleDidNotConverge;
+}
+
+fn drainNativeReplayCohort(root: *h.Handle) !void {
+    const connection = root.lite_connection_context orelse return;
+    const Entry = struct { database: *h.db_mod.DB, state: *h.db_mod.DB.GroupSourceMaintenanceState, producer_after: u64 };
+    var entries = std.ArrayListUnmanaged(Entry).empty;
+    defer entries.deinit(root.alloc);
+    const Add = struct {
+        fn append(a: std.mem.Allocator, list: *std.ArrayListUnmanaged(Entry), owner: @TypeOf(connection.owner), database: *h.db_mod.DB) !void {
+            try list.append(a, .{
+                .database = database,
+                .state = try owner.groupSourceState(database),
+                .producer_after = if (database.enrichment_runtime) |runtime| runtime.stats().applied_sequence else 0,
+            });
+        }
+    };
+    try Add.append(root.alloc, &entries, connection.owner, &root.db);
+    var iterator = root.embedded_tables.valueIterator();
+    while (iterator.next()) |table| try Add.append(root.alloc, &entries, connection.owner, &table.*.db);
+    var arena = std.heap.ArenaAllocator.init(root.alloc);
+    defer arena.deinit();
+    while (true) {
+        var pending = false;
+        var retrying = false;
+        for (entries.items) |entry| {
+            _ = arena.reset(.retain_capacity);
+            // Resolver pulls share the same fair round as producer/index work.
+            const projected = @import("resolver_authority.zig").pullProjection(root, entry.database, arena.allocator()) catch |err| switch (err) {
+                // Projection is a producer too. Retain its debt while this
+                // same fair round services the consumers which free credits.
+                error.LiteReplayBacklogExceeded => blk: {
+                    pending = true;
+                    break :blk false;
+                },
+                else => return err,
+            };
+            const replay_pending = try entry.database.runExplicitReplayDrainTurn(entry.state, entry.producer_after);
+            pending = pending or projected or replay_pending;
+            if (entry.database.enrichment_runtime) |runtime| retrying = retrying or runtime.stats().retrying;
+        }
+        if (!pending) return;
+        if (retrying) try h.handleLockIo().sleep(.fromMilliseconds(25), .awake);
+    }
 }
 
 fn drainDatabase(root: *h.Handle, database: *h.db_mod.DB) !void {
@@ -797,6 +853,44 @@ test "capi Lite promotion retains writer admission across coordinator and partic
     defer row.deinit(a);
     try @import("antfly-json").testing.expectSubsetJsonText(a, "{\"canonical_name\":\"Ada\"}", row.json);
     try std.testing.expect(!handle.sql_commit_recovery_needed);
+}
+
+test "capi native promotion coordinator uses consumer reserve at full producer quota" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("promotion-consumer-reserve");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .hosted, .externally_locked = true }, true, null, null);
+    defer h.closeHandle(handle);
+    try tables.create(handle, "entities", "{}", false);
+    const entities = try tables.get(handle, "entities");
+    try entities.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    // Real participant journals remain until the text consumer catches up.
+    // Leave enough reserve for one bounded cross-table promotion.
+    for (0..16) |i| {
+        const key = try std.fmt.allocPrint(a, "seed/{d}", .{i});
+        defer a.free(key);
+        try handle.db.entity_sink.?.upsertBatch(a, &.{.{ .table = "entities", .key = key, .doc_json = "{\"canonical_name\":\"Seed\"}" }});
+    }
+    const file = &handle.owned_lite_backend.?.native_docstore.?.file;
+    var debt = (try file.replayAdmission()).?;
+    try std.testing.expect(debt.records >= 16);
+    debt.limits.records = debt.records;
+    try file.putDocument(@import("../storage/lite/replay_admission.zig").key, &debt.encode());
+    const batch = &.{callbacks.EntityUpsert{ .table = "entities", .key = "person/ada", .doc_json = "{\"canonical_name\":\"Ada\"}" }};
+    try std.testing.expectError(error.SqlMutationNotAppliedBusy, handle.db.entity_sink.?.upsertBatch(a, batch));
+    try std.testing.expect((try entities.lookup(a, "person/ada", .{})) == null);
+    file.replay_consumer_admission = true;
+    defer file.replay_consumer_admission = false;
+    try handle.db.entity_sink.?.upsertBatch(a, batch);
+    var row = (try entities.lookup(a, "person/ada", .{})) orelse return error.TestUnexpectedResult;
+    defer row.deinit(a);
+    try @import("antfly-json").testing.expectSubsetJsonText(a, "{\"canonical_name\":\"Ada\"}", row.json);
+    try std.testing.expect(!handle.sql_commit_recovery_needed);
+    try std.testing.expectError(error.LiteReplayBacklogExceeded, file.requireReplayProducerCapacity());
+    try std.testing.expect((try file.replayAdmission()).?.records <= debt.records + debt.records / 2);
 }
 
 test "capi Lite promotion atomically merges across tables and survives reopen" {
@@ -2027,8 +2121,11 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: b
     try std.testing.expectEqual(if (change_config) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, first.code);
     try std.testing.expectEqual(if (change_config) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, second.code);
     {
-        const pinned = api.enterHandle(reader, .read).?;
+        var pinned = api.enterHandle(reader, .read).?;
         defer pinned.leave();
+        // Observe query/cursor pins after ending this observation's own
+        // temporary bridge through default-namespace admission.
+        pinned.finishRefresh();
         // resumeQuery collected while this registry was attached to the new root.
         // A background publication may have refreshed the root between cursor
         // creation and query setup. Pinning follows the cursor's actual root,
@@ -2040,8 +2137,20 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: b
     try std.testing.expect(std.mem.indexOf(u8, sql_output.ptr.?[0..sql_output.len], "7") != null);
     api.antfly_buffer_free(&sql_output);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_close_cursor(reader, cursor));
-    const finished = api.enterHandle(reader, .read).?;
+    // Force the final observation to reconstruct its serving runtime. Without
+    // this cut, a background publication only intermittently exposes the
+    // admission bridge and makes an exact retired-root count timing-dependent.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_create_table_json(writer, .fromSlice("after_cursor_close"), .fromSlice("{}")));
+    var finished = api.enterHandle(reader, .read).?;
     defer finished.leave();
+    try std.testing.expectEqual(@as(?h.capi.ErrorCode, null), finished.entry_error);
+    const predecessor = finished.refresh_predecessor orelse return error.TestUnexpectedResult;
+    try std.testing.expect(predecessor != finished.handle);
+    try std.testing.expectEqual(@as(usize, 0), predecessor.query_borrows);
+    try std.testing.expectEqual(@as(usize, 1), predecessor.refresh_references);
+    try std.testing.expectEqual(@as(usize, 1), finished.connection.?.owner.retired.items.len);
+    try std.testing.expect(finished.connection.?.owner.retired.items[0] == predecessor);
+    finished.finishRefresh();
     try std.testing.expectEqual(@as(usize, 0), finished.connection.?.owner.retired.items.len);
 }
 
@@ -2871,7 +2980,8 @@ test "capi resolver curation connection reads accepted policy and completes appl
     // completion directly without a load-dependent half-deadline threshold.
     var result = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
     defer result.deinit();
-    try std.testing.expect(result.value.object.get("applied").?.bool);
+    const applied = result.value.object.get("applied") orelse return error.TestExpectedAppliedCuration;
+    try std.testing.expect(applied == .bool and applied.bool);
 }
 
 test "capi resolver curation query follows native merge unmerge and suppression before replay" {

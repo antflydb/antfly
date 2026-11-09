@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const antfly_sources = @import("source_owner_physical.zig");
+
 pub const sim_runtime = @import("antfly_local_sources").storage_sim_runtime;
 pub const background_runtime = @import("antfly_local_sources").storage_background_runtime;
 

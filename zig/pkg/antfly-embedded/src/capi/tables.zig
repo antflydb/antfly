@@ -22,7 +22,13 @@ const catalog = @import("../storage/lite/embedded_catalog.zig");
 pub const catalog_key = catalog.key;
 const Record = catalog.Record;
 const Catalog = catalog.Catalog;
-pub const Table = struct { name: []u8, id: u64, namespace: []u8, db: h.db_mod.DB };
+pub const Table = struct {
+    name: []u8,
+    id: u64,
+    namespace: []u8,
+    db: h.db_mod.DB,
+    maintenance_last_use: u64 = 0,
+};
 
 fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     const alloc = handle.alloc;
@@ -51,7 +57,7 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     table.db.local_execution.row_policy_table_name = table.name;
     errdefer table.db.close();
     if (handle.lite_scheduling_owner) |owner|
-        table.db.borrowed_group_source_state = try owner.groupSourceState(&table.db);
+        table.db.borrowed_group_source_state = try owner.groupSourceStateNamed(&table.db, table.name);
     @import("entity_sink.zig").attach(handle, &table.db);
     try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db);
     if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startResidentBackgroundWorkersIfNeeded();
@@ -78,6 +84,18 @@ pub fn closeAll(handle: *h.Handle) void {
     handle.embedded_table_records = .empty;
     handle.embedded_catalog_loaded = false;
     handle.embedded_tables_discovered = false;
+}
+
+/// Evict only a quiescent detached runtime; the durable name directory stays
+/// loaded. The maintenance owner separately excludes retained merge borrows.
+pub fn evictMaintenanceRuntime(handle: *h.Handle, table: *Table) void {
+    std.debug.assert(handle.lease_snapshot);
+    std.debug.assert(handle.maintenance_references == 0 and handle.query_borrows == 0);
+    std.debug.assert(handle.sql_cursors.count() == 0 and handle.table_handles.items.len == 0);
+    const removed = handle.embedded_tables.remove(table.name);
+    std.debug.assert(removed);
+    _ = handle.embedded_table_errors.remove(table.name);
+    destroy(handle, table);
 }
 
 /// Catalog discovery never opens an index/provider belonging to another table.

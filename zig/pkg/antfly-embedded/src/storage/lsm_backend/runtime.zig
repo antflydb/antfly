@@ -467,9 +467,17 @@ fn writePublicationAttempts(backend: anytype) u64 {
 }
 
 fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable) !void {
+    return publishMutableWithWalPublication(backend, allocator, incoming, null);
+}
+
+fn publishMutableWithWalPublication(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable, publication: ?@import("../native_publication.zig").Participant) !void {
     if (incoming.entryCount() == 0) return;
     if (comptime @TypeOf(backend.mutable) == ActiveMemTable) {
-        var candidate = if (@hasDecl(@TypeOf(backend.*), "prepareAndAppendWalForMutable"))
+        var candidate = if (publication) |participant| blk: {
+            if (comptime @hasDecl(@TypeOf(backend.*), "prepareAndAppendWalForPublication")) {
+                break :blk try backend.prepareAndAppendWalForPublication(incoming, participant);
+            } else return error.Unsupported;
+        } else if (@hasDecl(@TypeOf(backend.*), "prepareAndAppendWalForMutable"))
             try backend.prepareAndAppendWalForMutable(incoming)
         else blk: {
             var prepared = try backend.mutable.preparePublication(allocator, incoming);
@@ -483,6 +491,7 @@ fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *Acti
         incoming.deinit(allocator);
         incoming.* = .{ .ordered_enabled = false };
     } else {
+        if (publication != null) return error.Unsupported;
         try backend.appendWalForMutable(incoming);
         if (@hasDecl(@TypeOf(backend.*), "invalidateMutableReadSnapshot")) backend.invalidateMutableReadSnapshot();
         try state_mod.applyMutableMoveToMutable(&backend.mutable, allocator, incoming);
@@ -1066,6 +1075,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         source_key_copies: []?[]u8 = &.{},
         source_blocks: []SourceBlockLease,
         source_run_leases: []?*RunSourceLease = &.{},
+        // Scoped catalog protection is sufficient for synchronous cursor I/O.
+        // Unlike a durable artifact lease per run, this never publishes writes
+        // merely to scan metadata. The pin ends with the cursor, not a cache.
+        storage_snapshot: ?storage_io.Storage.Lease = null,
         source_result_retention: []ResultBlockRetention = &.{},
         source_block_indices: []?usize,
         source_table_indices: []?*const lsm_table_file.TableIndex,
@@ -1246,10 +1259,18 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 run_start = end;
             }
 
+            var storage_snapshot: ?storage_io.Storage.Lease = null;
+            errdefer if (storage_snapshot) |*snapshot| snapshot.deinit();
+            if (comptime @hasField(BackendType, "storage")) {
+                if (namespace.transient_storage_snapshot and source_count > 1 + immutable_memtables.len) {
+                    if (backend.storage) |provider| storage_snapshot = try provider.acquireReadSnapshot();
+                }
+            }
             return .{
                 .allocator = allocator,
                 .backend = backend,
                 .mutable = mutable,
+                .storage_snapshot = storage_snapshot,
                 .immutable_memtables = immutable_memtables,
                 .runs = sequence.runs,
                 .l0_groups = l0_groups,
@@ -1282,6 +1303,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn close(self: *@This()) void {
+            defer if (self.storage_snapshot) |*snapshot| snapshot.deinit();
             defer if (self.cursor_reservation) |*lease| lease.release();
             for (0..self.source_blocks.len) |source_index| self.clearSourceBlock(source_index);
             for (0..self.source_run_leases.len) |source_index| self.clearSourceRunLease(source_index);
@@ -1711,11 +1733,16 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return index;
             }
             const index = if (self.backend.options.cache != null) blk: {
-                var handle = try loadRunTableIndexHandle(self.backend, run);
+                var handle = try loadRunTableIndexHandleWithStorage(self.backend, run, if (self.storage_snapshot) |snapshot| snapshot.view else self.backend.storage.?);
                 errdefer handle.release();
                 const retained_index = handle.runTableIndex();
                 self.source_table_index_handles[source_index] = handle;
                 break :blk retained_index;
+            } else if (self.storage_snapshot != null and @hasDecl(BackendType, "getCachedRunIndexIndexWithStorage")) blk: {
+                const locked = if (self.backend_locked) false else lockBackend(BackendType, self.backend);
+                defer unlockBackend(BackendType, self.backend, locked);
+                const cached = try self.backend.getCachedRunIndexIndexWithStorage(run.path.?, run.id, self.storage_snapshot.?.view);
+                break :blk self.backend.getCachedRunIndexByIndex(cached);
             } else try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
             self.source_table_indices[source_index] = index;
             recordCursorTableIndexMiss(self.backend);
@@ -2332,32 +2359,29 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             }
             self.clearSourceBlock(source_index);
             self.backend.recordCursorBlockLoad();
+            const read_storage: ?storage_io.Storage = if (self.storage_snapshot) |snapshot| snapshot.view else null;
             const bytes = if (self.backend.options.cache != null) blk: {
-                var handle = try loadRunTableBlockHandle(self.backend, run, index, window, self.namespace.retainDataBlocks());
+                var handle = try loadRunTableBlockHandleWithStorage(self.backend, run, index, window, self.namespace.retainDataBlocks(), read_storage);
                 errdefer handle.release();
                 const block = handle.runTableBlock();
                 self.source_blocks[source_index] = .{ .cached = handle };
                 break :blk block;
             } else if (localBlockCacheEnabled(self.backend)) blk: {
-                const payload = try loadLocalBlockLease(self.backend, run, index, window, self.backend_locked, self.namespace.retainDataBlocks());
+                const payload = try loadLocalBlockLeaseWithStorage(self.backend, run, index, window, self.backend_locked, self.namespace.retainDataBlocks(), read_storage);
                 self.source_blocks[source_index] = .{ .local = payload };
                 break :blk payload.bytes;
             } else blk: {
-                const owned = try loadOwnedBlockForWindowAllocMaybeLocked(
-                    self.backend,
-                    self.backend.allocator,
-                    run,
-                    index,
-                    window,
-                    self.backend_locked,
-                );
+                const owned = if (read_storage != null)
+                    try loadDecodedLocalBlockWithStorage(self.backend, self.backend.allocator, run.path.?, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window, read_storage)
+                else
+                    try loadOwnedBlockForWindowAllocMaybeLocked(self.backend, self.backend.allocator, run, index, window, self.backend_locked);
                 self.source_blocks[source_index] = .{ .owned = .{ .allocator = self.backend.allocator, .bytes = owned } };
                 break :blk owned;
             };
             // Retain only sources already opened by real I/O. A fully cached
             // scan needs no extra descriptor or catalog publication.
             if (comptime @hasDecl(BackendType, "retainCachedRunSource")) {
-                if (self.source_run_leases.len != 0 and self.source_run_leases[source_index] == null) self.source_run_leases[source_index] = self.backend.retainCachedRunSource(run.path.?);
+                if (self.storage_snapshot == null and self.source_run_leases.len != 0 and self.source_run_leases[source_index] == null) self.source_run_leases[source_index] = self.backend.retainCachedRunSource(run.path.?);
             }
             self.source_block_indices[source_index] = window.relative_offset;
             try self.prefetchNextSourceBlock(source_index, run, index, block_index);
@@ -2382,7 +2406,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             if (self.source_block_indices[source_index]) |loaded_index| {
                 if (loaded_index == next_window.relative_offset) return;
             }
-            var handle = try loadRunTableBlockHandle(self.backend, run, index, next_window, self.namespace.retainDataBlocks());
+            var handle = try loadRunTableBlockHandleWithStorage(self.backend, run, index, next_window, self.namespace.retainDataBlocks(), if (self.storage_snapshot) |snapshot| snapshot.view else null);
             defer handle.release();
             recordCursorBlockReadahead(self.backend);
         }
@@ -4788,8 +4812,12 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         /// write is already durable or visible; public callers classify such
         /// failures as unknown rather than "not applied".
         pub fn commit(self: *@This()) !void {
+            return self.commitWithPublication(null);
+        }
+
+        pub fn commitWithPublication(self: *@This(), publication: ?@import("../native_publication.zig").Participant) !void {
             var maybe_applied = false;
-            self.commitTracked(&maybe_applied) catch |err| {
+            self.commitTracked(&maybe_applied, publication) catch |err| {
                 if (maybe_applied) {
                     if (backend_types.commit_progress) |progress| progress.maybe_applied = true;
                     noteFailedAppliedCommit(self.backend);
@@ -4798,8 +4826,12 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             };
         }
 
-        fn commitTracked(self: *@This(), maybe_applied: *bool) !void {
+        fn commitTracked(self: *@This(), maybe_applied: *bool, publication: ?@import("../native_publication.zig").Participant) !void {
             if (self.closed) return error.TransactionClosed;
+            if (publication != null) {
+                if (comptime !@hasDecl(BackendType, "prepareAndAppendWalForPublication")) return error.Unsupported;
+                if (self.batch_options.mode == .bulk_ingest or self.bulk_appends.entryCount() != 0 or self.mutable.entryCount() == 0) return error.Unsupported;
+            }
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
                 self.prefix_index.deinit(self.allocator);
@@ -4846,7 +4878,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable);
+                    try publishMutableWithWalPublication(self.backend, self.allocator, &self.mutable, publication);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);
@@ -7801,8 +7833,12 @@ fn loadRunTableIndexWithStats(backend: anytype, allocator: Allocator, path: []co
 }
 
 fn loadRunTableBlockWithStats(backend: anytype, allocator: Allocator, path: []const u8, absolute_offset: u64, len: usize) ![]u8 {
+    return try loadRunTableBlockWithStorage(backend, allocator, path, absolute_offset, len, null);
+}
+
+fn loadRunTableBlockWithStorage(backend: anytype, allocator: Allocator, path: []const u8, absolute_offset: u64, len: usize, read_storage: ?storage_io.Storage) ![]u8 {
     const start_ns = backend.readStatsNowNs();
-    const loaded = if (@hasDecl(@TypeOf(backend.*), "readRunRangeAlloc")) backend.readRunRangeAlloc(allocator, path, absolute_offset, len) else backend.storage.?.readFileRangeAlloc(allocator, path, absolute_offset, len);
+    const loaded = if (read_storage) |provider| provider.readFileRangeAlloc(allocator, path, absolute_offset, len) else if (@hasDecl(@TypeOf(backend.*), "readRunRangeAlloc")) backend.readRunRangeAlloc(allocator, path, absolute_offset, len) else backend.storage.?.readFileRangeAlloc(allocator, path, absolute_offset, len);
     const elapsed_ns = backend.readStatsElapsedNs(start_ns);
     if (loaded) |bytes| backend.recordTableBlockLoad(bytes.len, elapsed_ns) else |_| backend.recordTableBlockLoad(len, elapsed_ns);
     return try loaded;
@@ -7818,7 +7854,11 @@ fn loadRunTableDecodedBlockWithStats(
     logical_len: usize,
     checksum: u32,
 ) ![]u8 {
-    const payload = try loadRunTableBlockWithStats(backend, allocator, path, absolute_offset, physical_len);
+    return try loadRunTableDecodedBlockWithStorage(backend, allocator, path, absolute_offset, physical_len, compression, logical_len, checksum, null);
+}
+
+fn loadRunTableDecodedBlockWithStorage(backend: anytype, allocator: Allocator, path: []const u8, absolute_offset: u64, physical_len: usize, compression: lsm_table_file.BlockCompression, logical_len: usize, checksum: u32, read_storage: ?storage_io.Storage) ![]u8 {
+    const payload = try loadRunTableBlockWithStorage(backend, allocator, path, absolute_offset, physical_len, read_storage);
     defer allocator.free(payload);
     return try lsm_table_file.decodeBlockPayloadAlloc(allocator, compression, payload, logical_len, checksum);
 }
@@ -7936,6 +7976,10 @@ fn getFromRunWithBlockCacheBatchState(
 }
 
 fn loadRunTableIndexHandle(backend: anytype, run: *Run) !cache_mod.Handle {
+    return try loadRunTableIndexHandleWithStorage(backend, run, backend.storage.?);
+}
+
+fn loadRunTableIndexHandleWithStorage(backend: anytype, run: *Run, read_storage: storage_io.Storage) !cache_mod.Handle {
     const cache = backend.options.cache orelse return error.RunStateUnavailable;
     const path = run.path orelse return error.RunStateUnavailable;
     const generation = backend.root_generation;
@@ -7950,7 +7994,10 @@ fn loadRunTableIndexHandle(backend: anytype, run: *Run) !cache_mod.Handle {
             const index = try decodeRunTableIndexWithStats(backend, cache.valueAllocator(), raw_handle.runTableRaw());
             return try cache.putRunTableIndex(path, run.id, generation, index);
         }
-        const index = try loadRunTableIndexWithStats(backend, cache.valueAllocator(), path);
+        const started = backend.readStatsNowNs();
+        const loaded = repository_mod.loadRunTableIndexAllocWithStorage(read_storage, cache.valueAllocator(), path);
+        backend.recordTableIndexLoad(backend.readStatsElapsedNs(started));
+        const index = try loaded;
         return try cache.putRunTableIndex(path, run.id, generation, index);
     }
 }
@@ -7962,8 +8009,12 @@ fn loadRunTableBlockHandle(
     window: lsm_table_file.EntryDataWindow,
     retain_block: bool,
 ) !cache_mod.Handle {
+    return try loadRunTableBlockHandleWithStorage(backend, run, index, window, retain_block, null);
+}
+
+fn loadRunTableBlockHandleWithStorage(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, retain_block: bool, read_storage: ?storage_io.Storage) !cache_mod.Handle {
     const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-    return try loadRunTableBlockHandleAtOffset(
+    return try loadRunTableBlockHandleAtOffsetWithStorage(
         backend,
         run,
         absolute_offset,
@@ -7972,6 +8023,7 @@ fn loadRunTableBlockHandle(
         window.len,
         window.checksum,
         retain_block,
+        read_storage,
     );
 }
 
@@ -7985,6 +8037,10 @@ fn loadRunTableBlockHandleAtOffset(
     checksum: u32,
     retain_block: bool,
 ) !cache_mod.Handle {
+    return try loadRunTableBlockHandleAtOffsetWithStorage(backend, run, absolute_offset, physical_len, compression, logical_len, checksum, retain_block, null);
+}
+
+fn loadRunTableBlockHandleAtOffsetWithStorage(backend: anytype, run: *Run, absolute_offset: u64, physical_len: u32, compression: lsm_table_file.BlockCompression, logical_len: u32, checksum: u32, retain_block: bool, read_storage: ?storage_io.Storage) !cache_mod.Handle {
     const cache = backend.options.cache orelse return error.RunStateUnavailable;
     const path = run.path orelse return error.RunStateUnavailable;
     const generation = backend.root_generation;
@@ -8000,7 +8056,7 @@ fn loadRunTableBlockHandleAtOffset(
             return retained;
         }
         backend.recordSharedBlockCacheMiss();
-        const block = try loadRunTableDecodedBlockWithStats(
+        const block = try loadRunTableDecodedBlockWithStorage(
             backend,
             cache.valueAllocator(),
             path,
@@ -8009,6 +8065,7 @@ fn loadRunTableBlockHandleAtOffset(
             compression,
             logical_len,
             checksum,
+            read_storage,
         );
         return if (retain_block)
             try cache.putRunTableBlock(path, run.id, generation, absolute_offset, physical_len, block)
@@ -8536,25 +8593,29 @@ fn localWorkspace(backend: anytype, window: lsm_table_file.EntryDataWindow, poin
 }
 
 fn loadDecodedLocalBlock(backend: anytype, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow) ![]u8 {
+    return try loadDecodedLocalBlockWithStorage(backend, allocator, path, offset, window, null);
+}
+
+fn loadDecodedLocalBlockWithStorage(backend: anytype, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow, read_storage: ?storage_io.Storage) ![]u8 {
     if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
         var work = try localWorkspace(backend, window, false);
         defer work.release();
         if (window.compression == .none) {
             if (window.physicalLen() != window.len) return error.InvalidTableFile;
-            const payload = try loadRunTableBlockWithStats(backend, allocator, path, offset, window.physicalLen());
+            const payload = try loadRunTableBlockWithStorage(backend, allocator, path, offset, window.physicalLen(), read_storage);
             errdefer allocator.free(payload);
             if (payload.len != window.len) return error.InvalidTableFile;
             try lsm_table_file.validateBlockPayload(payload, window.checksum);
             return payload;
         }
         const scratch = work.allocator();
-        const payload = try loadRunTableBlockWithStats(backend, scratch, path, offset, window.physicalLen());
+        const payload = try loadRunTableBlockWithStorage(backend, scratch, path, offset, window.physicalLen(), read_storage);
         return lsm_table_file.decodeBlockPayloadWithScratchAlloc(allocator, scratch, window.compression, payload, window.len, window.checksum);
     }
-    return loadRunTableDecodedBlockWithStats(backend, allocator, path, offset, window.physicalLen(), window.compression, window.len, window.checksum);
+    return loadRunTableDecodedBlockWithStorage(backend, allocator, path, offset, window.physicalLen(), window.compression, window.len, window.checksum, read_storage);
 }
 
-fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool) !*SharedBytes {
+fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool, read_storage: ?storage_io.Storage) !*SharedBytes {
     const path = run.path orelse return error.RunStateUnavailable;
     const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
     const len = window.physicalLen();
@@ -8567,7 +8628,7 @@ fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_
     else
         null;
     defer if (read_credit) |*credit| credit.release();
-    const bytes = try loadDecodedLocalBlock(backend, backend.allocator, path, offset, window);
+    const bytes = try loadDecodedLocalBlockWithStorage(backend, backend.allocator, path, offset, window, read_storage);
     errdefer backend.allocator.free(bytes);
     const lease = try SharedBytes.create(backend.allocator, bytes);
     lease.reservation = read_credit;
@@ -8595,6 +8656,10 @@ fn joinLocalBlockDecode(backend: anytype, run: *Run, index: *const lsm_table_fil
 }
 
 fn loadLocalBlockLease(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool) !*SharedBytes {
+    return try loadLocalBlockLeaseWithStorage(backend, run, index, window, backend_locked, admit, null);
+}
+
+fn loadLocalBlockLeaseWithStorage(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool, read_storage: ?storage_io.Storage) !*SharedBytes {
     if (retainLocalCachedBlock(backend, run, index, window, backend_locked)) |lease| return lease;
     if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
         // Joining a publisher while holding the writer mutex would deadlock.
@@ -8606,13 +8671,13 @@ fn loadLocalBlockLease(backend: anytype, run: *Run, index: *const lsm_table_file
             if (ticket) |owned| {
                 defer backend.local_reader.releaseFlight(owned.flight);
                 if (!owned.leader) return backend.local_reader.wait(owned.flight);
-                const payload = loadLocalBlockCandidate(backend, run, index, window, false, admit);
+                const payload = loadLocalBlockCandidate(backend, run, index, window, false, admit, read_storage);
                 backend.local_reader.finish(owned.flight, payload);
                 return payload;
             }
         }
     }
-    return loadLocalBlockCandidate(backend, run, index, window, backend_locked, admit);
+    return loadLocalBlockCandidate(backend, run, index, window, backend_locked, admit, read_storage);
 }
 
 fn loadOwnedBlockForWindowAlloc(
@@ -9316,8 +9381,12 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         /// write is already durable or visible; public callers classify such
         /// failures as unknown rather than "not applied".
         pub fn commit(self: *@This()) !void {
+            return self.commitWithPublication(null);
+        }
+
+        pub fn commitWithPublication(self: *@This(), publication: ?@import("../native_publication.zig").Participant) !void {
             var maybe_applied = false;
-            self.commitTracked(&maybe_applied) catch |err| {
+            self.commitTracked(&maybe_applied, publication) catch |err| {
                 if (maybe_applied) {
                     if (backend_types.commit_progress) |progress| progress.maybe_applied = true;
                     noteFailedAppliedCommit(self.backend);
@@ -9326,8 +9395,12 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             };
         }
 
-        fn commitTracked(self: *@This(), maybe_applied: *bool) !void {
+        fn commitTracked(self: *@This(), maybe_applied: *bool, publication: ?@import("../native_publication.zig").Participant) !void {
             if (self.closed) return error.TransactionClosed;
+            if (publication != null) {
+                if (comptime !@hasDecl(BackendType, "prepareAndAppendWalForPublication")) return error.Unsupported;
+                if (self.batch_options.mode == .bulk_ingest or self.bulk_appends.entryCount() != 0 or self.mutable.entryCount() == 0) return error.Unsupported;
+            }
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
                 self.prefix_index.deinit(self.allocator);
@@ -9377,7 +9450,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable);
+                    try publishMutableWithWalPublication(self.backend, self.allocator, &self.mutable, publication);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);

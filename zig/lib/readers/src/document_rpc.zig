@@ -244,3 +244,40 @@ pub const Factory = struct {
         return Boundary.call("bind", self.dispatch, self.bind_fn, .{ self.ptr, a, bytes, extract });
     }
 };
+
+test "document checkpoint reverse RPC preserves native page faults instead of provider recovery fallback" {
+    const a = std.testing.allocator;
+    const Backend = struct {
+        failure: anyerror = error.UnexpectedNativePageKind,
+        fn load(raw: *anyopaque, _: A, _: []const u8, _: []const u8) !?runs.Record {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.failure;
+        }
+        fn cas(_: *anyopaque, _: ?runs.Version, _: runs.Record) !bool {
+            return error.TestUnexpectedCall;
+        }
+        fn nonce(_: *anyopaque, _: []u8) void {}
+        fn put(_: *anyopaque, _: A, _: runs.Scope, _: []const u8) !runs.Ref {
+            return error.TestUnexpectedCall;
+        }
+        fn get(_: *anyopaque, _: A, _: runs.Ref, _: usize) ![]u8 {
+            return error.TestUnexpectedCall;
+        }
+        fn authorize(_: *anyopaque, _: runs.Ref) !void {}
+    };
+    var backend: Backend = .{};
+    const endpoint = try OwnedServer.create(a, .{
+        .store = .{ .ptr = &backend, .load_fn = Backend.load, .cas_fn = Backend.cas, .nonce_fn = Backend.nonce, .put_fn = Backend.put, .get_fn = Backend.get },
+        .id = "native-page-failure",
+        .owner = "checkpoint-owner",
+        .authorization = .{ .ptr = &backend, .reference_fn = Backend.authorize },
+    }, null);
+    defer endpoint.view().release();
+    var client = try Client.initBound(a, endpoint.view(), std.testing.io);
+    defer client.deinit();
+    const store = client.store();
+    for (runtime.error_abi.native_page_failures) |failure| {
+        backend.failure = failure;
+        try std.testing.expectError(failure, store.load_fn(store.ptr, a, client.id, client.owner));
+    }
+}

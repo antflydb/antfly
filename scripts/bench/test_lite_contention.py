@@ -38,10 +38,71 @@ def admission(*samples):
     }
 
 
+class SustainedQualificationTests(unittest.TestCase):
+    def sample(self, sizes, windows=None):
+        return {
+            "status": "ok",
+            "per_worker_success_windows": windows or [[100] * 10] * 8,
+            "visibility_samples": [
+                {
+                    "started_seconds": second,
+                    "ended_seconds": second + 0.1,
+                    "debt": [
+                        {
+                            "index_name": "text",
+                            "applied_sequence": second,
+                            "target_sequence": second + 1,
+                        }
+                    ],
+                }
+                for second in range(5, 600, 5)
+            ],
+            "file_size_samples": [
+                {"elapsed_seconds": second, "file_bytes": size}
+                for second, size in sizes
+            ],
+        }
+
+    def test_rejects_integrity_passing_continuous_growth(self):
+        row = self.sample([(180, 235_139_072), (300, 343_916_544), (599, 625_364_992)])
+        self.assertFalse(bench.sustained_qualification(row, 600)["passed"])
+
+    def test_rejects_throughput_collapse_even_after_storage_plateaus(self):
+        row = self.sample(
+            [(180, 46_300_000), (599, 46_300_000)], [[100] * 7 + [20] * 3] * 8
+        )
+        self.assertFalse(bench.sustained_qualification(row, 600)["passed"])
+
+    def test_accepts_bounded_active_growth_and_stable_throughput(self):
+        row = self.sample([(180, 46_300_000), (400, 47_000_000), (599, 46_300_000)])
+        self.assertTrue(bench.sustained_qualification(row, 600)["passed"])
+
+    def test_primary_throughput_and_integrity_do_not_qualify_a_stalled_index(self):
+        row = self.sample([(180, 46_300_000), (599, 46_300_000)])
+        for sample in row["visibility_samples"]:
+            sample["debt"][0]["applied_sequence"] = 1
+        self.assertFalse(bench.sustained_qualification(row, 600)["passed"])
+
+    def test_visibility_that_only_catches_up_after_the_deadline_cannot_qualify(self):
+        row = self.sample([(180, 46_300_000), (599, 46_300_000)])
+        for sample in row["visibility_samples"]:
+            sample["debt"][0]["applied_sequence"] = max(
+                0, sample["started_seconds"] - 120
+            )
+        self.assertFalse(bench.sustained_qualification(row, 600)["passed"])
+
+    def test_short_or_incomplete_evidence_cannot_qualify(self):
+        row = self.sample([(180, 46_300_000), (599, 46_300_000)])
+        self.assertFalse(bench.sustained_qualification(row, 90)["passed"])
+        row["file_size_samples"] = row["file_size_samples"][:1]
+        self.assertFalse(bench.sustained_qualification(row, 600)["passed"])
+
+
 class ContentionReportTests(unittest.TestCase):
     def test_unequal_worker_windows_and_busy_calls_are_not_successful_throughput(self):
         workers = [
             {
+                "index": 1,
                 "started": 1,
                 "ended": 3,
                 "proof_observed_from": 0,
@@ -59,6 +120,7 @@ class ContentionReportTests(unittest.TestCase):
                 "involuntary_context_switches": 2,
             },
             {
+                "index": 0,
                 "started": 2,
                 "ended": 4,
                 "proof_observed_from": 1,
@@ -77,6 +139,8 @@ class ContentionReportTests(unittest.TestCase):
             },
         ]
         result = bench.aggregate(workers)
+        self.assertEqual(result["per_worker_indices"], [1, 0])
+        self.assertEqual(result["per_worker_successful_calls"], [2, 1])
         self.assertEqual(result["elapsed_seconds"], 3)
         self.assertEqual(result["successful_calls_per_second"], 1)
         self.assertEqual(result["busy_fraction"], 0.4)
@@ -309,6 +373,7 @@ class ContentionReportTests(unittest.TestCase):
             "seconds": 0.03,
             "workload": "churn",
             "batch_docs": 4,
+            "text_payload": "changing-words",
         }
         with (
             patch.object(bench, "sdk", return_value=api),
@@ -324,6 +389,8 @@ class ContentionReportTests(unittest.TestCase):
         written = {write["key"] for write in result["latest_churn_writes"]}
         expected = {key for payload in database.payloads for key in payload["inserts"]}
         self.assertEqual(written, expected)
+        for write in result["latest_churn_writes"]:
+            self.assertTrue(write["text_token"].startswith("churnworker1"))
 
     def test_worker_close_failure_emits_one_error_and_no_success(self):
         class Database:

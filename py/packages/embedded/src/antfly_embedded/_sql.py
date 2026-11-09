@@ -27,7 +27,7 @@ from . import _ffi, errors
 class SQLStateError(RuntimeError):
     """A SQL failure with its SQLSTATE diagnostic.
 
-    `outcome_receipt` is set when an autocommit write ended with
+    `outcome_receipt` is set when a SQL write or native COMMIT ended with
     ANTFLY_OUTCOME_UNKNOWN and the database issued a receipt for it; resolve
     it later with Database.outcome_receipt_status.
     """
@@ -36,11 +36,13 @@ class SQLStateError(RuntimeError):
         self,
         diagnostic: dict[str, Any],
         transaction_id: str | None = None,
+        commit_outcome: str | None = None,
         outcome_receipt: str | None = None,
     ) -> None:
         self.sqlstate = diagnostic["code"]
         self.diagnostic = diagnostic
         self.transaction_id = transaction_id
+        self.commit_outcome = commit_outcome
         self.outcome_receipt = outcome_receipt
         super().__init__(f"{self.sqlstate}: {diagnostic['message']}")
 
@@ -55,6 +57,7 @@ def output(code: int, buffer: _ffi.AntflyBuffer) -> Any:
             raise SQLStateError(
                 result["error"],
                 result.get("transaction_id"),
+                result.get("commit_outcome"),
                 result.get("outcome_receipt") or receipt,
             )
         try:

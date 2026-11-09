@@ -1,0 +1,85 @@
+{
+  "status": "local_correctness_passed",
+  "qualified": false,
+  "scope": "Local Debug native catalog inspection and shared-provider bookkeeping; fresh end-to-end and final optimized acceptance pending",
+  "base_commit": "08c5e27588d521184ad445021eb1aa82adb8a940",
+  "runtime_paths": [
+    "zig/pkg/antfly-embedded/src/capi/lite_connection.zig",
+    "zig/pkg/antfly-embedded/src/storage/lite/docstore.zig"
+  ],
+  "runtime_diff_sha256": "b2414c0490ed1e84887546623ef2e6f0c93261ba8d25e2b76fa5dc96a7f15b92",
+  "library_sha256": "b06a0fa43bde942c9a95097baa7b5789b63617a549fac72d0baf040b713f2f65",
+  "observed_prior_failure": {
+    "source_commit": "08c5e27588d521184ad445021eb1aa82adb8a940",
+    "unchanged_importer_completed_inputs": 3,
+    "failed_input_index": 3,
+    "page_kind_fault_markers": 1,
+    "maintenance_page_fault_markers": 2,
+    "failure_path": [
+      "NativeFile.lookupDocumentIndexPage",
+      "NativeFile.documentFingerprintAtCheckpoint",
+      "PublicationCatalog.verifyNative",
+      "PreparedPublication.acquireCapturedStore",
+      "IndexDocumentCheckpoint.get"
+    ],
+    "cold_integrity_valid": true,
+    "namespaces": 45,
+    "persisted_provider_fatal_namespaces": 1,
+    "qualification_passed": false
+  },
+  "correction": [
+    "Inspect the current mutable native checkpoint under the same physical Store mutex that excludes publication; sharing path admission alone does not exclude another local commit.",
+    "Keep catalog inspection bounded and read-only. Release physical exclusion before any recovery or actor-opening fallback.",
+    "Protect the local index-revision cache with physical publication exclusion.",
+    "Serialize captured provider counters and mutation wake flags with admission bookkeeping, preserving queued commit batching."
+  ],
+  "attribution_limit": "The captured stack identifies the affected unsynchronized catalog-validation path. Fresh whole-import qualification must establish whether this correction resolves the observed failure.",
+  "validation": {
+    "native": {
+      "passed": 850,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaked": 0
+    },
+    "backup": {
+      "passed": 2,
+      "failed": 0
+    },
+    "generic_storage": {
+      "passed": 12,
+      "failed": 0
+    },
+    "capi_embedded": {
+      "passed": 390,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0
+    },
+    "capi_core": {
+      "passed": 87,
+      "failed": 0,
+      "leaked": 0
+    },
+    "abi": {
+      "exports": 138,
+      "executable_linkage": true,
+      "shared_library_linkage": true
+    },
+    "sdk_sql_catalog_outcomes_concurrency": {
+      "passed": 210,
+      "failed": 0,
+      "seconds": 59.2
+    },
+    "regressions": [
+      "Concurrent native publication is excluded during checkpoint inspection and completes after inspection releases.",
+      "An uncertain checkpoint refuses inspection without invoking its callback.",
+      "Captured catalog validation preserves namespace, schema and incarnation fences without opening named index runtimes."
+    ]
+  },
+  "remaining": [
+    "Fresh unchanged-original-importer completion and semantic verification.",
+    "Final optimized wolfspider qualification using retained reference receipts.",
+    "Human aggregate CI and Beads-owned full factory qualification."
+  ],
+  "retention": "One reusable local importer database; no database archive per commit or run. The failed prefix was inspected read-only and its receipts are retained."
+}

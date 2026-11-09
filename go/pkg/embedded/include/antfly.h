@@ -162,11 +162,12 @@ typedef struct antfly_open_options {
     uint32_t inference_combined_budget_mb;
     uint32_t inference_kv_budget_mb;
     uint32_t inference_scratch_budget_mb;
-    /* Milliseconds to retry Lite admission while another process holds the
-     * writer lease or advances the allocator checkpoint (ANTFLY_BUSY), like
-     * sqlite3_busy_timeout. 0 fails immediately. Mutation bodies are never
-     * replayed by this admission retry. A successful proof may admit an
-     * unchanged tip after the timeout if no lease wait is needed. */
+    /* Milliseconds spent waiting for Lite writer admission or replay capacity
+     * (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 fails immediately. Active
+     * batch preparation does not consume the capacity-wait budget. Capacity
+     * refusals before primary commit may retry; committed mutations are never
+     * replayed. A successful proof may admit an unchanged tip after the timeout
+     * if no lease wait is needed. */
     uint64_t busy_timeout_ms;
     uint64_t reserved[6];
     /* Optional model directory for database enrichments; empty uses default. */
@@ -427,9 +428,9 @@ antfly_error_code antfly_db_batch_json(
  * it as "outcome_receipt". antfly_db_outcome_receipt_status later resolves it
  * on any handle for the same database: *out_status is
  * ANTFLY_OUTCOME_RECEIPT_APPLIED or ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED.
- * It returns ANTFLY_STALLED until the uncertain commit is reconciled: a Lite
- * connection reconciles on its next call; a directory database must first be
- * closed by the handle that issued the receipt and reopened. Forget a receipt
+ * It returns ANTFLY_STALLED until the uncertain commit is reconciled: close
+ * the handle that issued the receipt and reopen the database. Existing Lite
+ * owners stay fenced while their outcome is uncertain. Forget a receipt
  * once resolved; afterwards it can no longer be resolved.
  */
 #define ANTFLY_OUTCOME_RECEIPT_APPLIED 1

@@ -273,7 +273,8 @@ pub fn isControlRecordKey(key: []const u8) bool {
     return isInternalMetadataKey(key) or
         (isInternalUserKey(key) and !isStoredDocumentRowKey(key)) or
         std.mem.startsWith(u8, key, "\x00\x00__") or
-        std.mem.startsWith(u8, key, "\x00antfly/");
+        std.mem.startsWith(u8, key, "\x00antfly/") or
+        @import("control_key.zig").isDictionaryRegistry(key);
 }
 
 pub fn isInternalUserKey(key: []const u8) bool {

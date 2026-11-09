@@ -2088,13 +2088,18 @@ fn repairAssetSourceIndexWindow(
         last_scan_key: ?[]u8 = null,
         limit_reached: bool = false,
 
-        fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
-            _ = value;
+        fn consume(ptr: *anyopaque, key: []const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.resume_after) |resume_key_value| {
                 if (std.mem.order(u8, key, resume_key_value) != .gt) return;
             }
-            if (self.scanned >= self.limit or backfillDeadlineReached(self.deadline_ns)) {
+            // Probing an unrelated key does not materialize an artifact.
+            // Spending the candidate budget on metadata made sparse-source
+            // repair require one publication/turn per 32 unrelated records.
+            // Keep discovery independently bounded, including without a clock.
+            if (self.scanned >= 4096 or self.candidates.items.len >= self.limit or
+                backfillDeadlineReached(self.deadline_ns))
+            {
                 self.limit_reached = true;
                 return error.ReresolveWindowFull;
             }
@@ -2123,7 +2128,7 @@ fn repairAssetSourceIndexWindow(
     const root_lower = [_]u8{internal_keys.user_namespace};
     const lower: []const u8 = if (resume_after) |resume_key_value| resume_key_value else root_lower[0..];
     const upper = [_]u8{internal_keys.user_namespace + 1};
-    store.scanPrefix(lower, upper[0..], &collector, Collector.consume) catch |err| switch (err) {
+    store.scanKeys(lower, upper[0..], &collector, Collector.consume) catch |err| switch (err) {
         error.ScanUnsupported => return .{ .repair_complete = true },
         error.ReresolveWindowFull => {},
         else => return err,
@@ -2587,8 +2592,10 @@ fn catchUpWindowWithOrdered(
     var seen_sequences = std.AutoHashMapUnmanaged(u64, void).empty;
     defer seen_sequences.deinit(gpa);
     ctx.seen_sequences = &seen_sequences;
-    _ = try replay_source.forEachMatchingRecord(gpa, from_sequence, .resolution, max_records, &ctx, Ctx.consume);
-    return ctx.max_seen;
+    const scan = try replay_source.forEachMatchingRecord(gpa, from_sequence, .resolution, max_records, &ctx, Ctx.consume);
+    // A bounded fallback page can certify only unrelated records. Preserve
+    // that checked prefix so the driver cannot mistake it for an empty tail.
+    return @max(ctx.max_seen, scan.last_sequence);
 }
 
 /// Erased shard store + ownership, shared with the promotion runtime so both
@@ -2711,6 +2718,7 @@ pub const ResolutionRuntime = struct {
     /// Catalog changes and cursor advancement share catch_up_mutex so an older
     /// window cannot clear a newer configuration's restart cursor.
     backfill_pending: std.atomic.Value(bool) = .init(false),
+    resident_backfill_next: bool = true,
     worker_started: std.atomic.Value(bool),
     worker_mutex: Io.Mutex = .init,
     worker_cond: Io.Condition = .init,
@@ -2861,20 +2869,48 @@ pub const ResolutionRuntime = struct {
 
     /// Cooperative maintenance checks the caller deadline between source
     /// artifacts, preserving all sibling resolver decisions for each source.
-    pub fn catchUpOnce(self: *ResolutionRuntime, deadline_ns: u64) !void {
-        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUpOnce", .{ self, deadline_ns });
+    pub fn catchUpOnce(self: *ResolutionRuntime, deadline_ns: u64, prefer_backfill: bool) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUpOnce", .{ self, deadline_ns, prefer_backfill });
         if (!self.catch_up_mutex.tryLock()) return;
         defer self.catch_up_mutex.unlock();
+        return self.catchUpTurnLocked(deadline_ns, prefer_backfill);
+    }
+
+    /// A dormant manual driver can survive a detached owner's publication.
+    /// Reload its durable continuation under the same catch-up mutex before
+    /// borrowing a record. Preserve decoded inputs when the cut did not move.
+    fn reloadManualProgressLocked(self: *ResolutionRuntime) !void {
+        if (self.worker_started.load(.acquire)) return;
+        const applied = try enrichment_state.loadAppliedSequence(self.alloc, self.store_handle.store, scope_name);
+        if (applied < self.applied_sequence.load(.acquire)) return;
+        const progress = try loadReplayProgress(self.alloc, &self.store_handle.store, applied);
+        const backfill = try hasDurableReresolveBacklog(&self.store_handle.store);
+        // Complete every fallible read before changing the cached cursor.
+        if (applied != self.applied_sequence.load(.acquire) or !std.meta.eql(progress, self.replay_progress)) {
+            self.clearPendingReplayRecord();
+            self.replay_progress = progress;
+            self.applied_sequence.store(applied, .release);
+            self.notifySequence(applied);
+        }
+        self.backfill_pending.store(backfill, .release);
+    }
+
+    fn catchUpTurnLocked(self: *ResolutionRuntime, deadline_ns: u64, prefer_backfill: bool) !void {
         if (replayNowNs() >= deadline_ns) return;
+        try self.reloadManualProgressLocked();
         const applied = self.applied_sequence.load(.acquire);
-        if (applied >= self.target_sequence.load(.acquire)) {
-            if (self.backfill_pending.load(.acquire)) {
-                var tick = try self.runReresolveBacklogWindowLocked(deadline_ns);
-                tick.deinit(self.alloc);
-            }
+        // Waiting for the moving replay head before touching backfill can
+        // leave an accepted curation pending forever. The scheduling owner
+        // alternates these independent durable lanes; each gets one bounded
+        // operation, including when the other lane refuses publication.
+        if (self.backfill_pending.load(.acquire) and
+            (prefer_backfill or applied >= self.target_sequence.load(.acquire)))
+        {
+            var tick = try self.runReresolveBacklogWindowLocked(deadline_ns);
+            tick.deinit(self.alloc);
             return;
         }
-        try self.catchUpRecordPageLocked(deadline_ns);
+        if (applied < self.target_sequence.load(.acquire)) try self.catchUpRecordPageLocked(deadline_ns);
     }
 
     fn clearPendingReplayRecord(self: *ResolutionRuntime) void {
@@ -2902,6 +2938,7 @@ pub const ResolutionRuntime = struct {
         // acknowledged by an earlier empty scan.
         const target = self.target_sequence.load(.acquire);
         const applied = self.applied_sequence.load(.acquire);
+        var checked_prefix = applied;
         if (self.pending_replay_record == null) {
             const Capture = struct {
                 fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
@@ -2913,12 +2950,16 @@ pub const ResolutionRuntime = struct {
                     runtime.pending_replay_record = .{ .sequence = sequence, .raw = raw, .decoded = decoded };
                 }
             };
-            _ = try self.replay_source.forEachMatchingRecord(self.alloc, applied, .resolution, 1, self, Capture.consume);
+            const scan = try self.replay_source.forEachMatchingRecord(self.alloc, applied, .resolution, 1, self, Capture.consume);
+            checked_prefix = scan.last_sequence;
         }
         const record = if (self.pending_replay_record) |*value| value else {
             if (self.replay_progress != null) return error.InvalidResolutionReplayCursor;
-            try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
-            self.applied_sequence.store(target, .release);
+            // No callback does not prove exhaustion: a fallback scan may have
+            // consumed one bounded page of unrelated canonical records.
+            const complete = if (checked_prefix > applied) @min(target, checked_prefix) else target;
+            try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, complete);
+            self.applied_sequence.store(complete, .release);
             return;
         };
         const keys = record.decoded.record.changed_artifact_keys;
@@ -2943,7 +2984,11 @@ pub const ResolutionRuntime = struct {
             if (next < end) try self.processReplayKeys(resolvers, store, keys[next..end]);
             next = end;
         } else while (next < end) {
-            if (replayNowNs() >= deadline_ns.?) break;
+            // Entry checked the deadline before loading the record. Permit one
+            // atomic source even when decoding/catalog setup used the quantum;
+            // otherwise a reopened owner can repeat setup forever without
+            // advancing its durable continuation.
+            if (next > initial and replayNowNs() >= deadline_ns.?) break;
             // A source is the atomic unit, including label routing and sibling
             // dependencies. Ordered publication keeps its read-set validation.
             try self.processReplayKeys(resolvers, store, keys[next .. next + 1]);
@@ -2973,6 +3018,7 @@ pub const ResolutionRuntime = struct {
     }
 
     fn catchUpLocked(self: *ResolutionRuntime, single_window: bool, max_records: usize) !void {
+        try self.reloadManualProgressLocked();
         while (true) {
             const target = self.target_sequence.load(.acquire);
             const applied = self.applied_sequence.load(.acquire);
@@ -3162,7 +3208,9 @@ pub const ResolutionRuntime = struct {
             !self.backfill_pending.load(.acquire)) return null;
         if (!self.catch_up_mutex.tryLock()) return 25;
         defer self.catch_up_mutex.unlock();
-        self.catchUpLocked(true, default_max_records_per_window) catch |err| {
+        const prefer_backfill = self.resident_backfill_next;
+        self.resident_backfill_next = !prefer_backfill;
+        self.catchUpTurnLocked(replayNowNs() +| @import("derived/replay_budget.zig").Controller.quantum_ns, prefer_backfill) catch |err| {
             // Accepted queue admission is not a completed publication. These
             // states keep the replay cursor pending and retry without turning
             // normal Raft/catalog convergence into a warning on every poll.
@@ -3210,6 +3258,7 @@ pub fn DbArtifactStore(comptime Store: type) type {
             .put = putFn,
             .delete = deleteFn,
             .scan_prefix = if (Store == backend_erased.Store) scanPrefixFn else null,
+            .scan_keys = if (Store == backend_erased.Store) scanKeysFn else null,
             .materialize_row = materializeRowFn,
         };
 
@@ -3222,6 +3271,29 @@ pub fn DbArtifactStore(comptime Store: type) type {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (self.index_manager) |manager| return manager.materializeStoredValueAlloc(allocator, key, value);
             return relational_store.materializeStoredValueAlloc(allocator, key, value);
+        }
+
+        fn scanKeysFn(
+            ptr: *anyopaque,
+            lower: []const u8,
+            upper: []const u8,
+            ctx: *anyopaque,
+            consume: *const fn (*anyopaque, []const u8) anyerror!void,
+        ) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            var txn = try self.store.beginRead();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            cursor.setKeysOnly();
+            cursor.setUpperBound(upper);
+            var entry = try cursor.seekAtOrAfter(lower);
+            while (entry) |e| {
+                // Erased cursor range hints are optional for adapters.
+                if (upper.len != 0 and !std.mem.lessThan(u8, e.key, upper)) break;
+                try consume(ctx, e.key);
+                entry = try cursor.next();
+            }
         }
 
         fn scanPrefixFn(
@@ -3239,6 +3311,7 @@ pub fn DbArtifactStore(comptime Store: type) type {
             cursor.setUpperBound(upper);
             var entry = try cursor.seekAtOrAfter(lower);
             while (entry) |e| {
+                if (upper.len != 0 and !std.mem.lessThan(u8, e.key, upper)) break;
                 try consume(ctx, e.key, e.value);
                 entry = try cursor.next();
             }
@@ -5748,4 +5821,117 @@ test "SourceCandidateProvider ANN batches unique vectors and bulk hydrates share
         try testing.expectEqual(@as(usize, 1), list.len);
         try testing.expectEqualStrings("person/ada", list[0].resolved_doc_ref.?.key);
     }
+}
+
+test "inline resolver replacement repair discovers sparse sources without scanning payload values" {
+    const a = testing.allocator;
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc:a", "asset", "kg");
+    defer a.free(key);
+    try map.store().put(key, test_extraction);
+    for (0..5000) |i| {
+        var name: [32]u8 = undefined;
+        const unrelated = try internal_keys.documentKeyAlloc(a, try std.fmt.bufPrint(&name, "a:{d:0>5}", .{i}));
+        defer a.free(unrelated);
+        try map.store().put(unrelated, "payload discovery must not materialize");
+    }
+    const KeyStore = struct {
+        map: *MapStore,
+        scans: usize = 0,
+        fn get(ptr: *anyopaque, allocator: Allocator, k: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.map.store().get(allocator, k);
+        }
+        fn put(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+            return error.TestUnexpectedPut;
+        }
+        fn delete(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.TestUnexpectedDelete;
+        }
+        fn values(_: *anyopaque, _: []const u8, _: []const u8, _: *anyopaque, _: *const fn (*anyopaque, []const u8, []const u8) anyerror!void) anyerror!void {
+            return error.TestUnexpectedValueScan;
+        }
+        fn keys(ptr: *anyopaque, lower: []const u8, upper: []const u8, ctx: *anyopaque, consume: *const fn (*anyopaque, []const u8) anyerror!void) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scans += 1;
+            // MapStore's fallback also exercises scanKeys compatibility.
+            return self.map.store().scanKeys(lower, upper, ctx, consume);
+        }
+    };
+    var adapter = KeyStore{ .map = &map };
+    const store: resolver_lib.ArtifactStore = .{ .ptr = &adapter, .vtable = &.{ .get = KeyStore.get, .put = KeyStore.put, .delete = KeyStore.delete, .scan_prefix = KeyStore.values, .scan_keys = KeyStore.keys } };
+    const configs = [_]ResolverConfig{.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ slug _entity.text }}" }};
+    const subscriptions = [_]SourceSubscription{.{ .kind = .asset, .artifact_name = "kg" }};
+    var output: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (output.items) |k| a.free(@constCast(k));
+        output.deinit(a);
+    }
+    var repairs: std.ArrayListUnmanaged(ArtifactWrite) = .empty;
+    defer {
+        for (repairs.items) |entry| {
+            a.free(entry.key);
+            a.free(entry.value);
+        }
+        repairs.deinit(a);
+    }
+    var result = try repairAssetSourceIndexWindow(a, store, &subscriptions, "", 32, &output, &configs, null, &repairs);
+    defer result.deinit(a);
+    // A hard probe bound yields even when none of the keys is a candidate.
+    try testing.expect(!result.repair_complete);
+    try testing.expect(result.repair_resume_after != null);
+    try testing.expectEqual(@as(usize, 0), output.items.len);
+    // The candidate budget still admits the source after thousands of cheap
+    // unrelated probes, without requiring hundreds of durable empty turns.
+    var resumed = try repairAssetSourceIndexWindow(a, store, &subscriptions, result.repair_resume_after, 32, &output, &configs, null, &repairs);
+    defer resumed.deinit(a);
+    try testing.expect(resumed.repair_complete);
+    try testing.expectEqual(@as(usize, 2), adapter.scans);
+    try testing.expectEqual(@as(usize, 1), output.items.len);
+    try testing.expectEqualStrings(key, output.items[0]);
+}
+
+test "catchUpWindow preserves a bounded fallback prefix before a late match" {
+    const a = testing.allocator;
+    var memory = @import("../mem_backend.zig").Backend.init(a, .{});
+    defer memory.close();
+    var journal = try @import("../docstore.zig").DocStore.openRuntime(a, try memory.runtimeStore(a, .{}));
+    defer journal.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var artifacts = FakeStore{ .alloc = a };
+    defer artifacts.deinit();
+    var das = DbArtifactStore(FakeStore){ .store = &artifacts };
+    const artifact_store = das.artifactStore();
+    const key = try internal_keys.artifactNamedPrefixAlloc(scratch, "late", "asset", "relations_v1");
+    try artifact_store.put(key, test_extraction);
+    const resolvers = [_]ResolverConfig{.{ .name = "kg", .table = "entities", .source_artifact = "relations_v1", .resolution_artifact = "resolution_v1", .key_template = "{{ slug _entity.text }}", .config_generation = 1 }};
+    var writer = CaptureWriter{ .alloc = a, .store = artifact_store };
+    defer writer.deinit();
+    // Model a legacy canonical journal whose hint side index is absent.
+    // Two complete unrelated pages precede the one record with useful work.
+    var batch = try journal.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    for (1..515) |sequence| {
+        const payload = try change_journal_mod.encodeRecord(scratch, .{
+            .sequence = @intCast(sequence),
+            .changed_artifact_keys = if (sequence == 514) &.{key} else &.{},
+            .target_hints = if (sequence == 514) &.{.resolution} else &.{.full_text},
+        });
+        const record_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, @intCast(sequence));
+        try batch.put(&record_key, payload);
+    }
+    try batch.commit();
+    const source = replay_source_mod.Source.fromPrimaryStore(&journal, null, null);
+    var applied: u64 = 0;
+    for ([_]u64{ 256, 512, 514 }) |expected| {
+        applied = try catchUpWindow(a, source, &resolvers, artifact_store, null, applied, 1, &writer, CaptureWriter.writeFn, null, null);
+        try testing.expectEqual(expected, applied);
+    }
+    const output_key = try internal_keys.resolutionArtifactKeyAlloc(scratch, "late", "resolution_v1");
+    try testing.expect(artifacts.map.contains(output_key));
+    try testing.expectEqual(@as(u64, 1), writer.calls);
 }

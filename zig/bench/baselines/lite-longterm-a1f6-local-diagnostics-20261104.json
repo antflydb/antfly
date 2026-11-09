@@ -1,0 +1,243 @@
+{
+  "qualified": false,
+  "runtime_source_commit": "a1f66ef02ad6359ec5c298d76187db3453dea2f2",
+  "test_source_commit": "081fe18b9cb9d8ea15616925a5aacf21eed470b2",
+  "mode": "Debug",
+  "validation": {
+    "runtime_source_commit": "a1f66ef02ad6359ec5c298d76187db3453dea2f2",
+    "test_source_commit": "081fe18b9cb9d8ea15616925a5aacf21eed470b2",
+    "mode": "Debug",
+    "library_sha256": "0ff9fdf63518446cbcfc6609e0a623a20779ec07d6e9d8ee48a7a24e05f35729",
+    "library_bytes": 285222784,
+    "qualified": false,
+    "full_selected_capi_sql_resolver_passed": 165,
+    "sdk_sql_catalog_concurrency_outcomes_passed": 209,
+    "index_segment_passed": 197,
+    "focused_cache_routing_passed": 13,
+    "handoff_passed": 7,
+    "executor_budget_passed": 8,
+    "persistence_delete_passed": 3,
+    "catalog_accounting_passed": 1,
+    "cabi_exports": 134,
+    "skips": 0,
+    "leaks": 0,
+    "test_only_diff": {
+      "paths": [
+        "zig/pkg/antfly-embedded/src/capi/entity_sink.zig"
+      ],
+      "sha256": "1078ff83d05d7d3c27c93dd50d5e17732a6e8efeba8d9298f75966fdecd9fd44",
+      "reviewed": "Only testNativeTextQueryConcurrentCommit changed; its four callers are test wrappers. No production changes. Reuse frozen runtime rather than rebuild solely for fixture correction."
+    },
+    "scope": "Selected model-free contracts and SDK subset; not repository-wide CI or end-to-end qualification."
+  },
+  "result": {
+    "input_index": 7,
+    "importer_exit_code": 1,
+    "censored": false,
+    "importer_succeeded": false,
+    "summary": [
+      0,
+      0,
+      1
+    ],
+    "seconds": 153.50632979196962,
+    "peak_native_builds": 8,
+    "metrics_enabled": true,
+    "library_sha256": "0ff9fdf63518446cbcfc6609e0a623a20779ec07d6e9d8ee48a7a24e05f35729",
+    "public_errors": [
+      "LiteReplayBacklogExceeded"
+    ],
+    "seed_sha256": "27ea0ac6beecde2ca727132143e214c17ef5f38010db3762f605551806673519",
+    "seed_copy_method": "native_stable_snapshot",
+    "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution."
+  },
+  "primary_batch_profiles": 19,
+  "primary_writes": 19456,
+  "full_text_profiles": 67,
+  "full_text_sums": {
+    "documents": 1156,
+    "total_ms": 13242,
+    "full_text_collect_ms": 370,
+    "full_text_plan_ms": 132,
+    "full_text_prepare_ms": 511,
+    "full_text_apply_lock_held_ms": 3560
+  },
+  "events": {
+    "antfly_bench_native_allocator": {
+      "count": 1,
+      "sum": {
+        "full_loads": 1,
+        "full_load_ns": 157301042,
+        "digest_rebuilds": 1,
+        "digest_rebuild_ns": 52214458,
+        "journal_rebases": 0,
+        "journal_rebase_ns": 0,
+        "cache_transfers": 11602
+      },
+      "max": {
+        "full_loads": 1,
+        "full_load_ns": 157301042,
+        "digest_rebuilds": 1,
+        "digest_rebuild_ns": 52214458,
+        "journal_rebases": 0,
+        "journal_rebase_ns": 0,
+        "cache_transfers": 11602
+      }
+    },
+    "antfly_bench_native_artifact_sources": {
+      "count": 1,
+      "sum": {
+        "opens": 1293,
+        "reuses": 1772
+      },
+      "max": {
+        "opens": 1293,
+        "reuses": 1772
+      }
+    },
+    "antfly_bench_native_runtime": {
+      "count": 1,
+      "sum": {
+        "maintenance_opens": 41,
+        "namespace_opens": 118,
+        "source_reuses": 101
+      },
+      "max": {
+        "maintenance_opens": 41,
+        "namespace_opens": 118,
+        "source_reuses": 101
+      }
+    },
+    "antfly_bench_native_service": {
+      "count": 1,
+      "sum": {
+        "refresh_ns": 2895474000,
+        "replay_publication_overhead_ns": 41602916510,
+        "index_admission_ns": 7079899000,
+        "metadata_admission_ns": 8590674000,
+        "publication_hold_ns": 15862504414
+      },
+      "max": {
+        "refresh_ns": 2895474000,
+        "replay_publication_overhead_ns": 41602916510,
+        "index_admission_ns": 7079899000,
+        "metadata_admission_ns": 8590674000,
+        "publication_hold_ns": 15862504414
+      }
+    },
+    "antfly_bench_native_owner": {
+      "count": 1,
+      "sum": {
+        "source_turns": 97,
+        "capture_ns": 8139462000,
+        "replay_ns": 45740120000,
+        "artifacts_ns": 33097459000,
+        "storage_ns": 21342272000,
+        "runtime_refreshes": 227,
+        "maintenance_errors": 42,
+        "maintenance_timeouts": 0,
+        "merge_started": 27,
+        "merge_applied": 26,
+        "merge_discarded": 1,
+        "merge_prepare_ns": 7420487000,
+        "merge_staging_ns": 1457384000,
+        "merge_staged_bytes": 25187421,
+        "merge_publication_ns": 8462900000,
+        "sql_overlay_hits": 208,
+        "sql_overlay_scope_extensions": 22,
+        "sql_overlay_rebuilds": 38,
+        "sql_overlay_rebuild_entries": 0,
+        "sql_overlay_evictions": 0,
+        "sql_staged_statements": 134,
+        "replay_waits": 1,
+        "replay_refused_prepare_ns": 468563083
+      },
+      "max": {
+        "source_turns": 97,
+        "capture_ns": 8139462000,
+        "replay_ns": 45740120000,
+        "artifacts_ns": 33097459000,
+        "storage_ns": 21342272000,
+        "runtime_refreshes": 227,
+        "maintenance_errors": 42,
+        "maintenance_timeouts": 0,
+        "merge_started": 27,
+        "merge_applied": 26,
+        "merge_discarded": 1,
+        "merge_prepare_ns": 7420487000,
+        "merge_staging_ns": 1457384000,
+        "merge_staged_bytes": 25187421,
+        "merge_publication_ns": 8462900000,
+        "sql_overlay_hits": 208,
+        "sql_overlay_scope_extensions": 22,
+        "sql_overlay_rebuilds": 38,
+        "sql_overlay_rebuild_entries": 0,
+        "sql_overlay_evictions": 0,
+        "sql_staged_statements": 134,
+        "replay_waits": 1,
+        "replay_refused_prepare_ns": 468563083
+      }
+    },
+    "antfly_bench_native_owner_failures": {
+      "count": 1,
+      "sum": {
+        "capture": 0,
+        "source": 1,
+        "retirement": 0,
+        "artifacts": 1,
+        "storage": 40
+      },
+      "max": {
+        "capture": 0,
+        "source": 1,
+        "retirement": 0,
+        "artifacts": 1,
+        "storage": 40
+      }
+    },
+    "antfly_bench_replay_refusal": {
+      "count": 1,
+      "sum": {
+        "bytes_before": 16597600,
+        "bytes_after": 16847780,
+        "records_before": 412,
+        "records_after": 416,
+        "byte_limit": 16777216,
+        "record_limit": 4096
+      },
+      "max": {
+        "bytes_before": 16597600,
+        "bytes_after": 16847780,
+        "records_before": 412,
+        "records_after": 416,
+        "byte_limit": 16777216,
+        "record_limit": 4096
+      }
+    }
+  },
+  "sample": {
+    "sample_seconds": 3,
+    "sample_exit": 0,
+    "elapsed_at_sample": 128.24836008402053,
+    "scope": "Sampled local diagnosis, not clean elapsed-time qualification.",
+    "sample_sha256": "d39cb5e80bb3e0be66eaf0ef6b5b697f426124d4e743fb47c2e1b7a99a8184d8"
+  },
+  "sample_findings": {
+    "fsync_inclusive_samples": 2505,
+    "call_site": "persistAppliedSequenceAsync -> flushPendingAppliedSequencesLocked -> saveProjectionMetadataUpdates -> native transaction commit -> syncIfRequired -> fsync",
+    "scope": "One three-second stack sample; occupancy includes blocking I/O and is not additive CPU cost."
+  },
+  "conclusion": "Immutable source-owned routing and admission cleanup pass the selected correctness gates, but the populated-seed original importer still hits the replay quota. No end-to-end fix is claimed. Runtime/source reconstruction and durable publication remain investigation targets.",
+  "next_integration": {
+    "pr": 1494,
+    "head": "7627e3bcdd93f8d56bb91f8e5d2ca7cd124398a8",
+    "scope": "Review and integrate complementary lease-site instrumentation, outcome receipts and allocator rebase improvements. Preserve this branch's exclusive allocator-loan fast path and incarnation/generation-bound fragment protocol.",
+    "evidence": "This run reports one allocator full load (157301042 ns), one digest rebuild (52214458 ns), zero journal rebases and 11602 cache transfers; repeated full-ledger loading is not the measured dominant cost here."
+  },
+  "limitations": [
+    "Metrics, sampling and eight unrelated compiler processes make this local diagnosis, not a clean latency comparison.",
+    "No baseline/reference build or execution.",
+    "No new optimized qualification started on wolfspider after this failure.",
+    "Private inputs, raw logs, stack and database remain under ignored .tools."
+  ]
+}

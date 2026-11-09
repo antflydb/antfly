@@ -102,7 +102,7 @@ pub const Plan = struct {
 const DocStore = @import("../docstore.zig").DocStore;
 pub const OwnedCursor = struct {
     allocator: A,
-    read: *DocStore.Txn,
+    read: ?*DocStore.Txn,
     cursor: DocStore.Txn.CursorAdapter,
     pub fn seekAtOrAfter(self: *@This(), selected: []const u8) !?@import("../backend_erased.zig").Entry {
         return self.cursor.seekAtOrAfter(selected);
@@ -118,14 +118,33 @@ pub const OwnedCursor = struct {
     }
     pub fn close(self: *@This()) void {
         self.cursor.close();
-        self.read.abort();
-        self.allocator.destroy(self.read);
+        if (self.read) |read| {
+            read.abort();
+            self.allocator.destroy(read);
+        }
     }
 };
 pub const Reader = struct {
     ptr: *anyopaque,
     get_fn: *const fn (*anyopaque, A, []const u8) anyerror![]const u8,
     cursor_fn: *const fn (*anyopaque, A) anyerror!OwnedCursor,
+    /// Borrow one transaction for an ordered metadata cohort. Cursors opened
+    /// by later commands see earlier commands' staged writes; closing a cursor
+    /// cannot abort the publication transaction owned by the caller.
+    pub fn fromTxn(txn: *DocStore.Txn) Reader {
+        const Bridge = struct {
+            fn cursor(raw: *anyopaque, a: A) !OwnedCursor {
+                const read: *DocStore.Txn = @ptrCast(@alignCast(raw));
+                return .{ .allocator = a, .read = null, .cursor = try read.openPhysicalCursorAdapter() };
+            }
+            fn get(raw: *anyopaque, _: A, key: []const u8) ![]const u8 {
+                const read: *DocStore.Txn = @ptrCast(@alignCast(raw));
+                return read.get(key);
+            }
+        };
+        return .{ .ptr = txn, .get_fn = Bridge.get, .cursor_fn = Bridge.cursor };
+    }
+
     pub fn fromStore(store: anytype) Reader {
         const T = @TypeOf(store);
         const Bridge = struct {

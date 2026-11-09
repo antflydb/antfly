@@ -1102,7 +1102,44 @@ pub const Detail = enum(c_int) {
     invalid_external_source_inventory,
     invalid_external_source_snapshot,
     external_source_snapshot_too_large,
+    lite_replay_backlog_exceeded,
+    invalid_native_replay_admission,
+    native_publication_value_not_bound,
+    native_publication_value_already_bound,
+    invalid_native_publication_value,
+    unexpected_native_page_kind,
+    invalid_native_page_kind,
+    invalid_native_page_magic,
+    invalid_native_page_length,
+    native_page_checksum_mismatch,
+    invalid_native_value_chain,
+    invalid_native_page_chain,
+    truncated_native_page,
+    truncated_native_value_page,
+    truncated_native_file,
+    invalid_page_id,
 };
+
+/// Page-structure failures belong to storage/recovery, never an isolated
+/// provider request. Keep their identity across reverse RPC and archive calls.
+pub const native_page_failures = [_]anyerror{
+    error.UnexpectedNativePageKind,
+    error.InvalidNativePageKind,
+    error.InvalidNativePageMagic,
+    error.InvalidNativePageLength,
+    error.NativePageChecksumMismatch,
+    error.InvalidNativeValueChain,
+    error.InvalidNativePageChain,
+    error.TruncatedNativePage,
+    error.TruncatedNativeValuePage,
+    error.TruncatedNativeFile,
+    error.InvalidPageId,
+};
+
+pub fn isNativePageFailure(err: anyerror) bool {
+    inline for (native_page_failures) |failure| if (err == failure) return true;
+    return false;
+}
 
 pub const Status = extern struct {
     // Keep the wire fields as integers so a newer peer's enum value can be
@@ -1119,6 +1156,9 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.NativePublicationValueNotBound => status(.internal, .native_publication_value_not_bound),
+        error.NativePublicationValueAlreadyBound => status(.internal, .native_publication_value_already_bound),
+        error.InvalidNativePublicationValue => status(.internal, .invalid_native_publication_value),
         error.SqlStatementReadUnavailable => status(.retryable, .sql_statement_read_unavailable),
         error.UnsupportedSqlExecution => status(.unsupported, .unsupported_sql_execution),
         error.ConflictingPrivacyProducerOptions => status(.invalid_argument, .conflicting_privacy_producer_options),
@@ -2116,6 +2156,19 @@ pub fn statusFromError(err: anyerror) Status {
         // apart by name.
         error.EmbedAdmissionRefused => status(.retryable, .embed_admission_refused),
         error.ReadOutputTruncated => status(.invalid_argument, .read_output_truncated),
+        error.LiteReplayBacklogExceeded => status(.retryable, .lite_replay_backlog_exceeded),
+        error.InvalidNativeReplayAdmission => status(.corrupt, .invalid_native_replay_admission),
+        error.UnexpectedNativePageKind => status(.corrupt, .unexpected_native_page_kind),
+        error.InvalidNativePageKind => status(.corrupt, .invalid_native_page_kind),
+        error.InvalidNativePageMagic => status(.corrupt, .invalid_native_page_magic),
+        error.InvalidNativePageLength => status(.corrupt, .invalid_native_page_length),
+        error.NativePageChecksumMismatch => status(.corrupt, .native_page_checksum_mismatch),
+        error.InvalidNativeValueChain => status(.corrupt, .invalid_native_value_chain),
+        error.InvalidNativePageChain => status(.corrupt, .invalid_native_page_chain),
+        error.TruncatedNativePage => status(.corrupt, .truncated_native_page),
+        error.TruncatedNativeValuePage => status(.corrupt, .truncated_native_value_page),
+        error.TruncatedNativeFile => status(.corrupt, .truncated_native_file),
+        error.InvalidPageId => status(.corrupt, .invalid_page_id),
         else => blk: {
             // Private error identities cannot cross this stable ABI. Retain
             // the owning side's name in diagnostics instead of leaving an
@@ -2166,6 +2219,9 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .native_publication_value_not_bound => "NativePublicationValueNotBound",
+        .native_publication_value_already_bound => "NativePublicationValueAlreadyBound",
+        .invalid_native_publication_value => "InvalidNativePublicationValue",
         .invalid_document_source => "InvalidDocumentSource",
         .unsupported_document_format => "UnsupportedDocumentFormat",
         .document_source_limit_exceeded => "DocumentSourceLimitExceeded",
@@ -3097,6 +3153,19 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .read_output_truncated => "ReadOutputTruncated",
         .invalid_document_extraction_config => "InvalidDocumentExtractionConfig",
         .document_extraction_model_required => "DocumentExtractionModelRequired",
+        .lite_replay_backlog_exceeded => "LiteReplayBacklogExceeded",
+        .invalid_native_replay_admission => "InvalidNativeReplayAdmission",
+        .unexpected_native_page_kind => "UnexpectedNativePageKind",
+        .invalid_native_page_kind => "InvalidNativePageKind",
+        .invalid_native_page_magic => "InvalidNativePageMagic",
+        .invalid_native_page_length => "InvalidNativePageLength",
+        .native_page_checksum_mismatch => "NativePageChecksumMismatch",
+        .invalid_native_value_chain => "InvalidNativeValueChain",
+        .invalid_native_page_chain => "InvalidNativePageChain",
+        .truncated_native_page => "TruncatedNativePage",
+        .truncated_native_value_page => "TruncatedNativeValuePage",
+        .truncated_native_file => "TruncatedNativeFile",
+        .invalid_page_id => "InvalidPageId",
         .index_rebuilding => "IndexRebuilding",
         .sql_statement_read_unavailable => "SqlStatementReadUnavailable",
         .unsupported_sql_execution => "UnsupportedSqlExecution",
@@ -3718,6 +3787,16 @@ test "reader failures preserve retry semantics and GCS failures preserve scope s
     }
 }
 
+test "native replay capacity and damaged admission totals retain distinct boundary outcomes" {
+    const full = statusFromError(error.LiteReplayBacklogExceeded);
+    const corrupt = statusFromError(error.InvalidNativeReplayAdmission);
+    try std.testing.expectEqual(@backingInt(Code.retryable), full.code);
+    try std.testing.expectEqual(@backingInt(Code.corrupt), corrupt.code);
+    try std.testing.expectEqual(error.LiteReplayBacklogExceeded, errorFromStatus(full));
+    try std.testing.expectEqual(error.InvalidNativeReplayAdmission, errorFromStatus(corrupt));
+    try std.testing.expect(full.detail != corrupt.detail);
+}
+
 test "invalid persisted extraction policy retains identity across storage callbacks" {
     inline for (.{ error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired }) |expected| {
         const transported = comptime statusFromError(expected);
@@ -3739,6 +3818,15 @@ test "privacy failures retain identity and retry classes across runtime callback
     try std.testing.expectEqual(@backingInt(Code.corrupt), statusFromError(error.InvalidPrivacyReceipt).code);
 }
 
+test "native publication parameters preserve terminal errors across runtime boundaries" {
+    for ([_]anyerror{ error.NativePublicationValueNotBound, error.NativePublicationValueAlreadyBound, error.InvalidNativePublicationValue }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.internal), transported.code);
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(transported));
+    }
+}
+
 test "manifest client failures append stable details without changing released ordinals" {
     try std.testing.expectEqual(@backingInt(Detail.sql_write_capacity_unavailable) + 1, @backingInt(Detail.invalid_external_source_inventory));
     for ([_]anyerror{ error.InvalidExternalSourceInventory, error.InvalidExternalSourceSnapshot, error.ExternalSourceSnapshotTooLarge }) |err| {
@@ -3746,6 +3834,17 @@ test "manifest client failures append stable details without changing released o
         try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
         try std.testing.expectEqual(err, errorFromStatus(transported));
     }
+}
+
+test "native page failures retain corruption identity through provider fallback" {
+    inline for (native_page_failures) |failure| {
+        const transported = statusFromErrorWithFallback(failure, error.DocumentRunStoreNeedsRecovery);
+        try std.testing.expectEqual(@backingInt(Code.corrupt), transported.code);
+        try std.testing.expectEqual(failure, errorFromStatus(transported));
+        try std.testing.expect(isNativePageFailure(errorFromStatus(transported)));
+    }
+    try std.testing.expect(!isNativePageFailure(error.FileBusy));
+    try std.testing.expect(!isNativePageFailure(error.ResourceBudgetExceeded));
 }
 
 test "latest main error detail prefix remains append only across graph integration" {

@@ -209,9 +209,13 @@ export class Database implements AsyncDisposable {
       const code = await callAsync(fn, handle, ...args, out);
       const body = takeBuffer(this.#native, out);
       const value = body.length ? JSON.parse(body.toString("utf8")) : undefined;
-      if (code && value?.error) {
-        throw new SqlError(value.error, value.transaction_id, value.outcome_receipt);
-      }
+      if (code && value?.error)
+        throw new SqlError(
+          value.error,
+          value.transaction_id,
+          value.commit_outcome,
+          value.outcome_receipt
+        );
       if (code === ErrorCode.OutcomeUnknown && typeof value?.outcome_receipt === "string") {
         throw new OutcomeUnknownError(undefined, value.outcome_receipt);
       }
@@ -835,8 +839,7 @@ export class Database implements AsyncDisposable {
    * Resolves an outcome receipt (`SqlError.outcomeReceipt` or
    * `OutcomeUnknownError.outcomeReceipt`) on any handle for the same
    * database. Rejects with `StalledError` while the uncertain commit is not
-   * reconciled yet: retry on a Lite database; for a directory database,
-   * close the issuing handle and reopen first.
+   * reconciled yet: close the issuing handle and reopen first.
    */
   outcomeReceiptStatus(receipt: string): Promise<OutcomeReceiptStatus> {
     return this.#run(async (handle) => {

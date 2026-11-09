@@ -138,7 +138,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             }
 
             if (std.mem.eql(u8, selected.name, "storage.lmdb.crash_publish_phase")) {
-                const phase: CommitPhase = @fromBackingInt(selected.parameter);
+                const phase: CommitPhase = std.enums.fromInt(CommitPhase, selected.parameter) orelse return error.InvalidTransition;
                 const spec = crashSpec(phase);
                 try state.faults.start(spec, events, allocator);
                 const step: u16 = @intCast(state.actions.items.len);
@@ -242,12 +242,12 @@ fn directTransition(kind: DirectKind, key: u8) vopr.transition.Transition {
 fn actionForTransition(selected: vopr.transition.Transition, step: u16) ?ScheduledAction {
     if (std.mem.eql(u8, selected.name, "storage.lmdb.direct")) {
         const encoded: u64 = @bitCast(selected.parameter);
-        const kind: DirectKind = @fromBackingInt(encoded >> 8);
+        const kind = std.enums.fromInt(DirectKind, encoded >> 8) orelse return null;
         const key: u8 = @truncate(encoded);
         if (selected.id != directTransition(kind, key).id) return null;
         return .{ .direct = differentialAction(kind, key, valueFor(step, key)) };
     }
-    const key: u8 = @intCast(selected.parameter);
+    const key = std.math.cast(u8, selected.parameter) orelse return null;
     if (selected.id == keyedTransition(nested_commit_base, "storage.lmdb.nested_commit", .workload, key).id) return .{
         .nested_commit = .{
             .parent = .{ .put_main = .{ .key_index = key, .value_index = valueFor(step, key) } },

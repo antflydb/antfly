@@ -50,24 +50,39 @@ pub const Store = struct {
     allocator: Allocator,
     docs: *docstore.Store,
     namespace_prefix: []const u8,
+    read_snapshot: ?*docstore.Txn = null,
 
     const vtable: StorageIo.VTable = .{
+        .open_native_namespaces = if (supports_native_artifact_leases) openNativeNamespaces else null,
+        .loaded_content_revision = loadedContentRevision,
+        .loaded_wal_metadata_revision = loadedWalMetadataRevision,
+        .acquire_read_snapshot = acquireReadSnapshot,
+        .recovered_wal_idle_deadline = recoveredWalIdleDeadline,
+        .wal_checkpoint_completed = walCheckpointCompleted,
         .private_scratch_directory = privateScratchDirectory,
         .create_dir_path = createDirPath,
+        .acquire_immutable_stager = if (supports_native_artifact_leases) acquireImmutableStager else null,
+        .acquire_immutable_resources = acquireImmutableResources,
+        .fence_uncertain_publication = fenceUncertainPublication,
         .virtual_directories = true,
         .read_file_alloc = readFileAlloc,
         .read_file_range_alloc = readFileRangeAlloc,
         .open_immutable_source = openImmutableSource,
         // Root leases require hosted file descriptors and lock markers.
         .open_leased_immutable_source = if (supports_native_artifact_leases) openLeasedImmutableSource else null,
+        .open_resident_immutable_source = if (supports_native_artifact_leases) openResidentImmutableSource else null,
         .map_immutable_artifact = if (supports_mapped_artifacts) mapImmutableArtifact else null,
         .file_size = fileSize,
         .read_file_trailer_alloc = readFileTrailerAlloc,
         .write_file_absolute = writeFileAbsolute,
         .append_file_absolute = appendFileAbsolute,
+        .append_publication = appendPublication,
         .begin_atomic_write = beginAtomicWrite,
         .rename_absolute = renameAbsolute,
         .delete_file_absolute = deleteFileAbsolute,
+        .delete_files_absolute = deleteFilesAbsolute,
+        .retire_text_segments = retireTextSegments,
+        .sweep_text_retirements = sweepTextRetirements,
         .delete_tree = deleteTree,
         .list_file_names_alloc = listFileNamesAlloc,
         .list_directory_names_alloc = listDirectoryNamesAlloc,
@@ -91,6 +106,20 @@ pub const Store = struct {
         };
     }
 
+    fn recoveredWalIdleDeadline(ptr: *anyopaque, root: []const u8, max_age_ns: u64) ?u64 {
+        const self: *Store = @ptrCast(@alignCast(ptr));
+        const coordinator = self.docs.file.reader_coordinator orelse return null;
+        const inode = (self.docs.file.file.stat(self.docs.file.runtime()) catch return null).inode;
+        return coordinator.recoveredWalDeadline(root, inode, max_age_ns);
+    }
+
+    fn walCheckpointCompleted(ptr: *anyopaque, root: []const u8, now_ns: u64) void {
+        const self: *Store = @ptrCast(@alignCast(ptr));
+        const coordinator = self.docs.file.reader_coordinator orelse return;
+        const inode = (self.docs.file.file.stat(self.docs.file.runtime()) catch return).inode;
+        coordinator.noteWalCheckpoint(root, inode, now_ns);
+    }
+
     fn privateScratchDirectory(raw: *anyopaque) ?[]const u8 {
         const self: *Store = @ptrCast(@alignCast(raw));
         return std.fs.path.dirname(self.docs.file.path) orelse ".";
@@ -109,14 +138,75 @@ fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
     try validateIndexPath(self, path);
 }
 
+fn openNativeNamespaces(raw: *anyopaque, a: Allocator, root: []const u8, read_only: bool) !?@import("../backend_erased.zig").NamespaceStore {
+    const self: *Store = @ptrCast(@alignCast(raw));
+    try validateIndexPath(self, root);
+    return @import("namespace_store.zig").openIfSupported(a, self.docs, root, read_only);
+}
+
 fn lockStore(store: *docstore.Store) void {
     store.mutex.lock();
 }
 
-fn pinSnapshot(store: *docstore.Store) !docstore.Txn {
-    // Admission pins the inode across replacement, then the reader frontier
-    // fences in-place reuse for the full metadata/value read or traversal.
-    return store.beginRead();
+fn pinSnapshot(store: *docstore.Store, path: []const u8) !docstore.Txn {
+    return store.beginIndexReadForPath(path);
+}
+
+const CatalogRead = struct {
+    owned: ?docstore.Txn = null,
+    borrowed: ?*docstore.Txn = null,
+    checkpoint: native.CheckpointSlot,
+    fn readFile(self: *@This()) !*native.NativeFile {
+        return if (self.borrowed) |snapshot| snapshot.readFile() else self.owned.?.readFile();
+    }
+    fn abort(self: *@This()) void {
+        if (self.owned) |*snapshot| snapshot.abort();
+    }
+};
+
+fn pinCatalogSnapshot(self: *Store, path: []const u8) !CatalogRead {
+    if (self.read_snapshot) |snapshot| return .{ .borrowed = snapshot, .checkpoint = snapshot.checkpoint };
+    const snapshot = try self.docs.beginIndexReadForPath(path);
+    return .{ .owned = snapshot, .checkpoint = snapshot.checkpoint };
+}
+
+fn acquireReadSnapshot(ptr: *anyopaque) !StorageIo.Lease {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    const State = struct {
+        adapter: Store,
+        snapshot: docstore.Txn,
+        const read_vtable: StorageIo.VTable = blk: {
+            var value = Store.vtable;
+            value.acquire_read_snapshot = null;
+            value.recovered_wal_idle_deadline = null;
+            value.wal_checkpoint_completed = null;
+            value.loaded_wal_metadata_revision = null;
+            value.open_immutable_source = null;
+            value.open_leased_immutable_source = null;
+            value.acquire_immutable_stager = null;
+            value.acquire_immutable_resources = null;
+            value.fence_uncertain_publication = null;
+            value.map_immutable_artifact = null;
+            break :blk value;
+        };
+        fn release(view: *anyopaque) void {
+            const adapter: *Store = @ptrCast(@alignCast(view));
+            const state: *@This() = @fieldParentPtr("adapter", adapter);
+            const allocator = adapter.allocator;
+            state.snapshot.abort();
+            allocator.destroy(state);
+        }
+    };
+    const state = try self.allocator.create(State);
+    errdefer self.allocator.destroy(state);
+    state.* = .{ .adapter = self.*, .snapshot = try self.docs.beginIndexRead() };
+    state.adapter.read_snapshot = &state.snapshot;
+    return .{ .view = .{ .ptr = &state.adapter, .vtable = &State.read_vtable }, .release = State.release };
+}
+
+fn validateWritePath(self: *Store, path: []const u8) !void {
+    if (self.read_snapshot != null) return error.ReadOnly;
+    return validateIndexPath(self, path);
 }
 
 fn pathContains(prefix: []const u8, path: []const u8) bool {
@@ -143,7 +233,7 @@ fn validateIndexPath(self: *const Store, path: []const u8) !void {
 fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinCatalogSnapshot(self, path);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -154,7 +244,7 @@ fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_by
 fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinCatalogSnapshot(self, path);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -197,7 +287,7 @@ fn openImmutableSource(ptr: *anyopaque, allocator: Allocator, path: []const u8) 
     };
     const state = try allocator.create(State);
     errdefer allocator.destroy(state);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinSnapshot(self.docs, path);
     errdefer snapshot.abort();
     const value = try snapshot.openIndexValue(allocator, path);
     state.* = .{ .allocator = allocator, .snapshot = snapshot, .value = value };
@@ -205,6 +295,14 @@ fn openImmutableSource(ptr: *anyopaque, allocator: Allocator, path: []const u8) 
 }
 
 // Long-lived sources own their I/O lifetime and lease only immutable roots.
+fn openResidentImmutableSource(ptr: *anyopaque, _: Allocator, path: []const u8) !?SegmentSource {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
+    if (self.read_snapshot != null) return null;
+    const registry = try self.docs.artifactRegistry();
+    return registry.openResident(path);
+}
+
 fn openLeasedImmutableSource(ptr: *anyopaque, _: Allocator, path: []const u8) !SegmentSource {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
@@ -238,7 +336,7 @@ fn mapArtifact(file: std.Io.File, length: usize) ![]align(std.heap.page_size_min
 fn mapImmutableArtifact(ptr: *anyopaque, allocator: Allocator, path: []const u8) !MappedArtifact {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinSnapshot(self.docs, path);
     defer snapshot.abort();
     var value = try snapshot.openIndexValue(allocator, path);
     defer value.deinit(allocator);
@@ -257,7 +355,7 @@ fn mapImmutableArtifact(ptr: *anyopaque, allocator: Allocator, path: []const u8)
 fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinCatalogSnapshot(self, path);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -269,7 +367,7 @@ fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
 fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinCatalogSnapshot(self, path);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -284,7 +382,7 @@ fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8,
 
 fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try validateIndexPath(self, path);
+    try validateWritePath(self, path);
     try writeFileReserved(self, path, contents);
 }
 
@@ -310,37 +408,655 @@ fn writeFileReserved(self: *Store, path: []const u8, contents: []const u8) !void
 
 fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try validateIndexPath(self, path);
+    try validateWritePath(self, path);
     var mutation = CatalogWrite{ .kind = .append, .path = path, .value = contents };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, sync);
 }
 
+const native_publication = @import("../native_publication.zig");
+
+fn appendPublication(raw: *anyopaque, path: []const u8, contents: []const u8, sync: bool, participant: native_publication.Participant) !void {
+    const self: *Store = @ptrCast(@alignCast(raw));
+    try validateWritePath(self, path);
+    const Request = struct {
+        store: *Store,
+        path: []const u8,
+        contents: []const u8,
+        participant: native_publication.Participant,
+        file: ?*native.NativeFile = null,
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const request: *@This() = @ptrCast(@alignCast(ptr));
+            request.file = file;
+            defer request.file = null;
+            var host: @import("publication_host.zig").Host = .{ .file = file, .allocator = request.store.allocator, .index_prefix = request.store.namespace_prefix };
+            try request.participant.validate(host.view());
+            try request.participant.apply(host.view());
+            try file.appendIndexCatalogRecord(request.path, request.contents);
+        }
+    };
+    var request: Request = .{ .store = self, .path = path, .contents = contents, .participant = participant };
+    try self.docs.submitIndexMutation(&request, Request.apply, sync);
+}
+
+const immutable_artifact = @import("../immutable_artifact.zig");
+const artifacts = @import("artifact_source.zig");
+
+const NativeArtifactStager = struct {
+    alloc: Allocator,
+    registry: *artifacts.Registry,
+    prefix: []u8,
+    inode: u64,
+    file_namespace: [32]u8,
+    resources: ?immutable_artifact.BuildResources,
+    no_sync: bool,
+    max_file_bytes: ?u64,
+    const vtable: immutable_artifact.Stager.VTable = .{ .stage = stage, .stage_detached = stageDetached, .stage_detached_with_budget = stageDetachedWithBudget, .acquire_build_resources = acquireBuildResources, .deinit = deinit };
+
+    fn retainBuildResources(raw: *anyopaque) void {
+        const registry: *artifacts.Registry = @ptrCast(@alignCast(raw));
+        registry.retainOwner();
+    }
+    fn releaseBuildResources(raw: *anyopaque) void {
+        const registry: *artifacts.Registry = @ptrCast(@alignCast(raw));
+        registry.releaseOwner();
+    }
+    fn acquireBuildResources(raw: *anyopaque) !?immutable_artifact.BuildResources {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return if (self.resources) |resources| resources.retained() else null;
+    }
+
+    fn captureResources(registry: *artifacts.Registry) !?immutable_artifact.BuildResources {
+        const owner = registry.beginCallback() orelse return error.ReadOnly;
+        defer registry.endCallback();
+        // Keeping the registry alive retains a backend-owned manager after
+        // close. It cannot extend an externally supplied manager's lifetime.
+        if (owner.resource_manager != null and !owner.resource_manager_transfers_on_close) return null;
+        registry.retainOwner();
+        return .{ .native_metadata_revision = if (owner.file.header.indexed_reclamation) owner.file.header.indexed_revision else 3, .ptr = registry, .allocator = registry.allocator, .io = registry.io(), .resource_manager = owner.resource_manager, .release_fn = releaseBuildResources, .retain_fn = retainBuildResources };
+    }
+
+    fn stageDetached(raw: *anyopaque, bytes: []const u8) !immutable_artifact.Prepared {
+        var budget: immutable_artifact.AdmissionBudget = .{ .remaining_ns = 5 * std.time.ns_per_s };
+        return stageDetachedWithBudget(raw, bytes, &budget);
+    }
+
+    fn stageDetachedWithBudget(raw: *anyopaque, bytes: []const u8, budget: *immutable_artifact.AdmissionBudget) !immutable_artifact.Prepared {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (bytes.len == 0) return error.InvalidArtifactConstructionState;
+        const resources = self.resources orelse return error.Unsupported;
+        if (bytes.len <= artifacts.OwnedBytes.maximum_length) {
+            if (InlinePreparedArtifact.createAt(self, bytes, resources.resource_manager, self.inode, self.file_namespace, true)) |artifact| return artifact else |err| switch (err) {
+                error.ResourceBudgetExceeded, error.OutOfMemory => {},
+                else => return err,
+            }
+        }
+        return self.stageOwnedConstruction(bytes, resources, budget);
+    }
+
+    fn stageOwnedConstruction(self: *@This(), bytes: []const u8, resources: immutable_artifact.BuildResources, budget: *immutable_artifact.AdmissionBudget) !immutable_artifact.Prepared {
+        var gate = self.registry.capturePublicationGate() orelse return error.Unsupported;
+        defer gate.deinit();
+        const pending = try self.alloc.create(NativePreparedArtifact);
+        errdefer self.alloc.destroy(pending);
+        const prefix = try self.alloc.dupe(u8, self.prefix);
+        errdefer self.alloc.free(prefix);
+        var construction = try self.registry.beginOwnedConstructionWithBudget(self.inode, budget);
+        errdefer construction.deinit();
+        pending.* = .{ .alloc = self.alloc, .prefix = prefix, .construction = construction };
+        // Ownership moves to pending only after every fallible operation.
+        // Each bounded command acquires both writer gates before opening its
+        // own NativeFile; no Registry callback or mutable runtime is borrowed.
+        var offset: usize = 0;
+        const io = self.registry.io();
+        while (offset < bytes.len) {
+            var lease = blk: {
+                const started = std.Io.Clock.awake.now(io).nanoseconds;
+                defer budget.chargeElapsed(io, started);
+                break :blk try gate.acquire(io, budget.deadline(io));
+            };
+            defer lease.deinit();
+            var file = try native.NativeFile.openWithIo(lease.allocator, lease.io, self.registry.path, .{ .externally_locked = true, .no_sync = self.no_sync, .reader_coordinator = self.registry.coordinator, .resource_manager = resources.resource_manager });
+            defer file.close();
+            if ((try file.file.stat(file.runtime())).inode != self.inode or !std.mem.eql(u8, &file.header.reader_epoch_namespace, &self.file_namespace)) return error.StaleArtifactConstruction;
+            file.writer_allocator_cache = lease.allocator_cache;
+            file.max_file_bytes = self.max_file_bytes;
+            const end = offset + @min(bytes.len - offset, 1024 * 1024);
+            try file.beginArtifactLeaseTransaction();
+            errdefer file.abortTransaction();
+            try file.appendArtifactConstruction(construction.key, offset, bytes[offset..end]);
+            try file.commitTransaction();
+            construction.length = end;
+            offset = end;
+            if (end == bytes.len) {
+                try construction.seal(bytes.len);
+                pending.construction = construction;
+                try pending.freezeOwnedSource(&file, resources.resource_manager);
+                construction = pending.construction;
+            }
+        }
+        return .{ .ptr = pending, .vtable = &NativePreparedArtifact.vtable };
+    }
+
+    fn stage(raw: *anyopaque, bytes: []const u8) !immutable_artifact.Prepared {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (bytes.len == 0) return error.InvalidArtifactConstructionState;
+        if (bytes.len <= artifacts.OwnedBytes.maximum_length) {
+            if (InlinePreparedArtifact.create(self, bytes)) |prepared| return prepared else |err| switch (err) {
+                // Inline residency is optional. Fall back to bounded native
+                // construction when the resource owner cannot retain it.
+                error.ResourceBudgetExceeded, error.OutOfMemory => {},
+                else => return err,
+            }
+        }
+        const pending = try self.alloc.create(NativePreparedArtifact);
+        errdefer self.alloc.destroy(pending);
+        const prefix = try self.alloc.dupe(u8, self.prefix);
+        errdefer self.alloc.free(prefix);
+        var construction = try self.registry.beginConstruction();
+        errdefer construction.deinit();
+        // Each turn publishes only bounded, unreferenced bytes. Foreground
+        // writers can run between appends; no catalog or index apply lock is held.
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const owner = self.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+            defer self.registry.endCallback();
+            const end = offset + @min(bytes.len - offset, 1024 * 1024);
+            try construction.append(owner, bytes[offset..end]);
+            offset = end;
+        }
+        try construction.seal(bytes.len);
+        pending.* = .{ .alloc = self.alloc, .prefix = prefix, .construction = construction };
+        // Freeze the construction's independently owned source while its
+        // staging owner is live. Alias preparation later borrows no Store.
+        try pending.freezeSource();
+        return .{ .ptr = pending, .vtable = &NativePreparedArtifact.vtable };
+    }
+
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.resources) |*resources| resources.deinit();
+        self.registry.releaseOwner();
+        self.alloc.free(self.prefix);
+        self.alloc.destroy(self);
+    }
+};
+
+// Small immutable artifacts remain privately owned memory until activation.
+// Their resident bytes are reported to the same index snapshot accounting as
+// every range-backed source; they retain no primary snapshot or allocator pin.
+const InlinePreparedArtifact = struct {
+    alloc: Allocator,
+    registry: *artifacts.Registry,
+    prefix: []u8,
+    inode: u64,
+    file_namespace: [32]u8,
+    bytes: *Bytes,
+    path: ?[]u8 = null,
+    const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .prepare_link = prepareLink, .prepare_link_at = prepareLinkAt, .stage_link = stageLink, .validate_link = validateLink, .deinit = deinit };
+
+    const Bytes = artifacts.OwnedBytes;
+
+    fn create(stager: *NativeArtifactStager, bytes: []const u8) !immutable_artifact.Prepared {
+        if (stager.resources) |resources|
+            return createAt(stager, bytes, resources.resource_manager, stager.inode, stager.file_namespace, false);
+        const owner = stager.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+        defer stager.registry.endCallback();
+        return createAt(stager, bytes, owner.resource_manager, (try owner.file.file.stat(owner.file.runtime())).inode, owner.file.header.reader_epoch_namespace, false);
+    }
+
+    fn createAt(stager: *NativeArtifactStager, bytes: []const u8, manager: ?*@import("../resource_manager.zig").ResourceManager, inode: u64, file_namespace: [32]u8, comptime allow_reclaim: bool) !immutable_artifact.Prepared {
+        const state = try stager.alloc.create(@This());
+        errdefer stager.alloc.destroy(state);
+        // Published bytes have an independently retained resource/IO owner.
+        const backing = if (allow_reclaim) try Bytes.copyDetached(stager.registry, manager, bytes) else try Bytes.copy(stager.registry, manager, bytes);
+        errdefer backing.deinit();
+        const prefix = try stager.alloc.dupe(u8, stager.prefix);
+        errdefer stager.alloc.free(prefix);
+        stager.registry.retainOwner(); // Publication callbacks own a separate reference.
+        state.* = .{ .alloc = stager.alloc, .registry = stager.registry, .prefix = prefix, .inode = inode, .file_namespace = file_namespace, .bytes = backing };
+        return .{ .ptr = state, .vtable = &vtable };
+    }
+
+    fn prepareLink(raw: *anyopaque, path: []const u8) !SegmentSource {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const owner = self.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+        defer self.registry.endCallback();
+        var adapter: Store = .{ .allocator = self.alloc, .docs = owner, .namespace_prefix = self.prefix };
+        try validateWritePath(&adapter, path);
+        if ((try owner.file.file.stat(owner.file.runtime())).inode != self.inode) return error.StaleArtifactConstruction;
+        if (try owner.file.getIndexCatalogRecordSizeAtCheckpoint(path, owner.file.activeCheckpoint()) != null) return error.PathAlreadyExists;
+        const owned = try self.alloc.dupe(u8, path);
+        if (self.path) |old| self.alloc.free(old);
+        self.path = owned;
+        return self.bytes.source().retainOwned();
+    }
+
+    fn prepareLinkAt(raw: *anyopaque, target: immutable_artifact.AliasTarget, path: []const u8) !SegmentSource {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.prefix.len != 0 or target.prefix.len != 0) try native_publication.requireDestination(self.prefix, target.prefix);
+        try target.require(self.inode, self.file_namespace, path);
+        const destination = try self.alloc.dupe(u8, path);
+        errdefer self.alloc.free(destination);
+        const source = try self.bytes.source().retainOwned();
+        if (self.path) |previous| self.alloc.free(previous);
+        self.path = destination;
+        return source;
+    }
+
+    fn validateLink(raw: *anyopaque, view: native_publication.View) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try view.requireAbsent(self.inode, self.path orelse return error.InvalidArtifactConstructionState);
+    }
+
+    fn stageLink(raw: *anyopaque, view: native_publication.View) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try view.put(self.inode, self.path orelse return error.InvalidArtifactConstructionState, self.bytes.data);
+    }
+
+    fn link(raw: *anyopaque, path: []const u8) !SegmentSource {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var source = try prepareLink(raw, path);
+        errdefer source.close();
+        const owner = self.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+        defer self.registry.endCallback();
+        const Request = struct {
+            prepared: *InlinePreparedArtifact,
+            fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+                const request: *@This() = @ptrCast(@alignCast(ptr));
+                const p = request.prepared;
+                if ((try file.file.stat(file.runtime())).inode != p.inode) return error.StaleArtifactConstruction;
+                if (try file.getIndexCatalogRecordSize(p.path.?) != null) return error.PathAlreadyExists;
+                try file.putIndexCatalogRecord(p.path.?, p.bytes.data);
+            }
+        };
+        var request: Request = .{ .prepared = self };
+        try owner.submitIndexMutation(&request, Request.apply, true);
+        return source;
+    }
+
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const alloc = self.alloc;
+        if (self.path) |path| alloc.free(path);
+        var source = self.bytes.source();
+        source.close();
+        self.registry.releaseOwner();
+        alloc.free(self.prefix);
+        alloc.destroy(self);
+    }
+};
+
+const NativePreparedArtifact = struct {
+    alloc: Allocator,
+    prefix: []u8,
+    construction: artifacts.Construction,
+    file_namespace: [32]u8 = @splat(0),
+    pending_link: ?struct { key: []u8, path: []u8, inode: u64, length: usize, source: SegmentSource, registry: *artifacts.Registry } = null,
+    const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .prepare_link = prepareLink, .prepare_link_at = prepareLinkAt, .stage_link = stageLink, .validate_link = validateLink, .deinit = deinit };
+
+    fn freezeSource(self: *@This()) !void {
+        if (self.pending_link != null) return;
+        const registry = self.construction.registry orelse return error.InvalidArtifactConstructionState;
+        const owner = registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+        defer registry.endCallback();
+        const key = try self.alloc.dupe(u8, self.construction.key);
+        errdefer self.alloc.free(key);
+        const path = try self.alloc.dupe(u8, "");
+        errdefer self.alloc.free(path);
+        const inode = self.construction.inode;
+        const length = self.construction.length;
+        const file_namespace = owner.file.header.reader_epoch_namespace;
+        // Transfer happens only after the final fallible operation succeeds.
+        const source = try self.construction.prepareSource(owner, self.construction.key, false);
+        self.pending_link = .{ .key = key, .path = path, .inode = inode, .length = length, .source = source, .registry = registry };
+        self.file_namespace = file_namespace;
+    }
+
+    fn freezeOwnedSource(self: *@This(), file: *native.NativeFile, manager: ?*@import("../resource_manager.zig").ResourceManager) !void {
+        if (self.pending_link != null) return;
+        const registry = self.construction.registry orelse return error.InvalidArtifactConstructionState;
+        const key = try self.alloc.dupe(u8, self.construction.key);
+        errdefer self.alloc.free(key);
+        const path = try self.alloc.dupe(u8, "");
+        errdefer self.alloc.free(path);
+        const inode = self.construction.inode;
+        const length = self.construction.length;
+        const file_namespace = file.header.reader_epoch_namespace;
+        const source = try self.construction.prepareOwnedSource(file, manager);
+        self.pending_link = .{ .key = key, .path = path, .inode = inode, .length = length, .source = source, .registry = registry };
+        self.file_namespace = file_namespace;
+    }
+
+    fn prepareLinkAt(raw: *anyopaque, target: immutable_artifact.AliasTarget, path: []const u8) !SegmentSource {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const pending = if (self.pending_link) |*value| value else return error.InvalidArtifactConstructionState;
+        if (self.prefix.len != 0 or target.prefix.len != 0) try native_publication.requireDestination(self.prefix, target.prefix);
+        try target.require(pending.inode, self.file_namespace, path);
+        const destination = try self.alloc.dupe(u8, path);
+        errdefer self.alloc.free(destination);
+        const source = try pending.source.retainOwned();
+        self.alloc.free(pending.path);
+        pending.path = destination;
+        return source;
+    }
+
+    fn prepareLink(raw: *anyopaque, path: []const u8) !SegmentSource {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const pending = self.pending_link orelse return error.InvalidArtifactConstructionState;
+        const owner = pending.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+        defer pending.registry.endCallback();
+        if (try owner.file.getIndexCatalogRecordSize(path) != null) return error.PathAlreadyExists;
+        return prepareLinkAt(raw, .{ .inode = (try owner.file.file.stat(owner.file.runtime())).inode, .file_namespace = owner.file.header.reader_epoch_namespace, .prefix = self.prefix }, path);
+    }
+
+    fn validateLink(raw: *anyopaque, view: native_publication.View) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const pending = self.pending_link orelse return error.InvalidArtifactConstructionState;
+        if (pending.path.len == 0) return error.InvalidArtifactConstructionState;
+        try view.requireAbsent(pending.inode, pending.path);
+    }
+
+    fn stageLink(raw: *anyopaque, view: native_publication.View) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const pending = self.pending_link orelse return error.InvalidArtifactConstructionState;
+        if (pending.path.len == 0) return error.InvalidArtifactConstructionState;
+        try view.link(pending.inode, pending.key, pending.path, pending.length);
+    }
+
+    fn link(raw: *anyopaque, path: []const u8) !SegmentSource {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var source = try prepareLink(raw, path);
+        errdefer source.close();
+        const pending = self.pending_link orelse return error.InvalidArtifactConstructionState;
+        const owner = pending.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+        defer pending.registry.endCallback();
+        const Request = struct {
+            artifact: *NativePreparedArtifact,
+            fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+                const request: *@This() = @ptrCast(@alignCast(ptr));
+                var host: @import("publication_host.zig").Host = .{ .file = file, .allocator = request.artifact.alloc, .index_prefix = request.artifact.prefix };
+                try stageLink(request.artifact, host.view());
+            }
+        };
+        var request: Request = .{ .artifact = self };
+        try owner.submitIndexMutation(&request, Request.apply, true);
+        return source;
+    }
+
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.pending_link) |*pending| {
+            pending.source.close();
+            self.alloc.free(pending.key);
+            self.alloc.free(pending.path);
+        }
+        self.construction.deinit();
+        self.alloc.free(self.prefix);
+        self.alloc.destroy(self);
+    }
+};
+
+fn acquireImmutableResources(raw: *anyopaque) !?immutable_artifact.BuildResources {
+    const self: *Store = @ptrCast(@alignCast(raw));
+    return NativeArtifactStager.captureResources(try self.docs.artifactRegistry());
+}
+
+fn acquireImmutableStager(raw: *anyopaque, alloc: Allocator) !?immutable_artifact.Stager {
+    const self: *Store = @ptrCast(@alignCast(raw));
+    if (self.docs.read_only or self.read_snapshot != null) return error.ReadOnly;
+    const registry = try self.docs.artifactRegistry();
+    if (!registry.marker_namespace_safe) return null;
+    const state = try alloc.create(NativeArtifactStager);
+    errdefer alloc.destroy(state);
+    const prefix = try alloc.dupe(u8, self.namespace_prefix);
+    errdefer alloc.free(prefix);
+    var resources = try NativeArtifactStager.captureResources(registry);
+    errdefer if (resources) |*owned| owned.deinit();
+    const inode = (try self.docs.file.file.stat(self.docs.file.runtime())).inode;
+    registry.retainOwner();
+    state.* = .{ .alloc = alloc, .registry = registry, .prefix = prefix, .inode = inode, .file_namespace = self.docs.file.header.reader_epoch_namespace, .resources = resources, .no_sync = self.docs.file.no_sync, .max_file_bytes = self.docs.file.max_file_bytes };
+    return .{ .ptr = state, .vtable = &NativeArtifactStager.vtable };
+}
+
+fn fenceUncertainPublication(raw: *anyopaque) void {
+    const self: *Store = @ptrCast(@alignCast(raw));
+    self.docs.fenceUncertainPublication();
+}
+
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try validateIndexPath(self, path);
+    try validateWritePath(self, path);
     if (self.docs.read_only) return error.ReadOnly;
     return try NativeAtomicWriteSink.create(allocator, self, path);
 }
 
 fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try validateIndexPath(self, old_path);
-    try validateIndexPath(self, new_path);
+    try validateWritePath(self, old_path);
+    try validateWritePath(self, new_path);
     var mutation = CatalogWrite{ .kind = .rename, .path = old_path, .value = new_path };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
+    if (self.docs.file.reader_coordinator) |coordinator| {
+        coordinator.forgetWalCheckpoints(old_path);
+        coordinator.forgetWalCheckpoints(new_path);
+    }
+}
+
+/// The marker and active membership are checked against the current native
+/// transaction, not a detached runtime. This remains safe when a stale cleanup
+/// callback races index replacement or an ID is reused in a newer generation.
+fn retireTextSegments(ptr: *anyopaque, root: []const u8, ids: []const u64) !bool {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    if (ids.len > StorageIo.max_atomic_file_deletions) return error.FileDeletionBatchTooLarge;
+    try validateWritePath(self, root);
+    const Retirement = struct {
+        allocator: Allocator,
+        root: []const u8,
+        ids: []const u64,
+        handled: bool = false,
+        fn apply(raw: *anyopaque, file: *native.NativeFile) !void {
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            var arena = std.heap.ArenaAllocator.init(request.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            // Optional cleanup must not move a detached allocator proof under
+            // its short writer lease. At a hard cap, yield to a checked owner;
+            // otherwise the ordinary append-only allocator is sufficient.
+            if (file.max_file_bytes != null and !file.free_pages_verified) return error.EnrichmentWaitCanceled;
+            const namespaces = @import("namespace_store.zig");
+            const main = try std.mem.concat(a, u8, &.{ request.root, "/index" });
+            const generation_key = try std.mem.concat(a, u8, &.{ main, "/.native-state/generation" });
+            const generation = (try file.getIndexCatalogRecordAlloc(a, generation_key)) orelse return;
+            if (generation.len != 21 or !std.mem.startsWith(u8, generation, "AFNS1")) return error.InvalidNativeIndexGeneration;
+            const legacy = try namespaces.catalogKey(a, main, .{ .name = "meta" }, "active_segments");
+            if (try file.getIndexCatalogRecordSize(legacy) != null) return;
+            var mutations = std.ArrayListUnmanaged(native.CatalogMutation).empty;
+            try mutations.ensureTotalCapacity(a, request.ids.len * 2);
+            for (request.ids) |id| {
+                const suffix = std.mem.toBytes(std.mem.nativeToBig(u64, id));
+                const active = try namespaces.catalogKey(a, main, .{ .name = "meta" }, try std.mem.concat(a, u8, &.{ "active_segment:", &suffix }));
+                if (try file.getIndexCatalogRecordSize(active) != null) return error.ArtifactStillActive;
+                const retired = try namespaces.catalogKey(a, main, .{ .name = "meta" }, try std.mem.concat(a, u8, &.{ "retired_segment:", &suffix }));
+                const marker = try file.getIndexCatalogRecordAlloc(a, retired);
+                const path = try std.fmt.allocPrint(a, "{s}/segments/{d}.seg", .{ request.root, id });
+                if (marker) |value| {
+                    if (!std.mem.eql(u8, value, &.{1})) return error.InvalidRetiredSegmentMetadata;
+                } else {
+                    if (try file.getIndexCatalogRecordSize(path) != null) return error.UnprovenArtifactRetirement;
+                    continue;
+                }
+                mutations.appendAssumeCapacity(.{ .key = path, .is_delete = true });
+                mutations.appendAssumeCapacity(.{ .key = retired, .is_delete = true });
+            }
+            // Verify the entire cohort before staging any unlink. Neither the
+            // namespace generation nor the scoped semantic identity changes.
+            try file.retireIndexCatalogRecords(mutations.items);
+            request.handled = true;
+        }
+    };
+    var request: Retirement = .{ .allocator = self.allocator, .root = root, .ids = ids };
+    try self.docs.submitArtifactRetirement(&request, Retirement.apply);
+    return request.handled;
+}
+
+/// Native cleanup owns discovery and publication together. It never borrows
+/// an IndexWriter snapshot, changes a semantic namespace, or deletes an active
+/// alias. Range readers retain exact source roots independently of these names.
+fn sweepTextRetirements(ptr: *anyopaque, root: []const u8, after: ?u64) !?StorageIo.TextRetirementSweep {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateWritePath(self, root);
+    const Sweep = struct {
+        allocator: Allocator,
+        root: []const u8,
+        after: ?u64,
+        result: ?StorageIo.TextRetirementSweep = null,
+        fn apply(raw: *anyopaque, file: *native.NativeFile) !void {
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            if (file.max_file_bytes != null and !file.free_pages_verified) return error.EnrichmentWaitCanceled;
+            var arena = std.heap.ArenaAllocator.init(request.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const namespaces = @import("namespace_store.zig");
+            const main = try std.mem.concat(a, u8, &.{ request.root, "/index" });
+            const generation_key = try std.mem.concat(a, u8, &.{ main, "/.native-state/generation" });
+            const generation = (try file.getIndexCatalogRecordAlloc(a, generation_key)) orelse return;
+            if (generation.len != 21 or !std.mem.startsWith(u8, generation, "AFNS1")) return error.InvalidNativeIndexGeneration;
+            const meta: @import("../backend_types.zig").Namespace = .{ .name = "meta" };
+            const legacy = try namespaces.catalogKey(a, main, meta, "active_segments");
+            if (try file.getIndexCatalogRecordSize(legacy) != null) return;
+            const prefix = try namespaces.catalogKey(a, main, meta, "retired_segment:");
+            var result: StorageIo.TextRetirementSweep = .{};
+            var mutations: [StorageIo.max_atomic_file_deletions * 2]native.CatalogMutation = undefined;
+            var count: usize = 0;
+            // Destroy the discovery cursor before editing its catalog root.
+            {
+                var cursor = try file.indexCatalogCursor(file.activeCheckpoint(), prefix);
+                defer cursor.deinit();
+                if (request.after) |id| {
+                    const suffix = std.mem.toBytes(std.mem.nativeToBig(u64, id));
+                    cursor.restartAfter(try namespaces.catalogKey(a, main, meta, try std.mem.concat(a, u8, &.{ "retired_segment:", &suffix })));
+                }
+                while (try cursor.nextRecordAlloc(a)) |marker| {
+                    if (marker.key.len != prefix.len + 16 or !std.mem.eql(u8, marker.value, &.{1})) return error.InvalidRetiredSegmentMetadata;
+                    if (result.count == result.ids.len) break;
+                    var suffix: [8]u8 = undefined;
+                    _ = std.fmt.hexToBytes(&suffix, marker.key[prefix.len..]) catch return error.InvalidRetiredSegmentMetadata;
+                    const id = std.mem.readInt(u64, &suffix, .big);
+                    const active = try namespaces.catalogKey(a, main, meta, try std.mem.concat(a, u8, &.{ "active_segment:", &suffix }));
+                    if (try file.getIndexCatalogRecordSize(active) == null) {
+                        const path = try std.fmt.allocPrint(a, "{s}/segments/{d}.seg", .{ request.root, id });
+                        mutations[count] = .{ .key = path, .is_delete = true };
+                        count += 1;
+                    }
+                    mutations[count] = .{ .key = marker.key, .is_delete = true };
+                    count += 1;
+                    result.ids[result.count] = id;
+                    result.count += 1;
+                } else {
+                    result.complete = true;
+                }
+            }
+            // No partial cohort can escape: malformed markers or IO failures
+            // leave both aliases and markers intact, and the caller's cursor
+            // advances only after submitArtifactRetirement returns success.
+            if (count != 0) try file.retireIndexCatalogRecords(mutations[0..count]);
+            request.result = result;
+        }
+    };
+    var request: Sweep = .{ .allocator = self.allocator, .root = root, .after = after };
+    try self.docs.submitArtifactRetirement(&request, Sweep.apply);
+    return request.result;
 }
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try validateIndexPath(self, path);
+    try validateWritePath(self, path);
     var mutation = CatalogWrite{ .kind = .delete, .path = path };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
+}
+
+fn deleteFilesAbsolute(ptr: *anyopaque, paths: []const []const u8) !void {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    if (paths.len > StorageIo.max_atomic_file_deletions) return error.FileDeletionBatchTooLarge;
+    // Validate the entire request before opening a transaction. In particular,
+    // a later foreign path must not leave earlier deletions committed.
+    for (paths) |path| try validateWritePath(self, path);
+    if (paths.len == 0) return;
+    const Delete = struct {
+        paths: []const []const u8,
+        fn apply(context: *anyopaque, file: *native.NativeFile) !void {
+            const request: *@This() = @ptrCast(@alignCast(context));
+            var mutations: [StorageIo.max_atomic_file_deletions]native.CatalogMutation = undefined;
+            for (request.paths, mutations[0..request.paths.len]) |path, *mutation|
+                mutation.* = .{ .key = path, .is_delete = true };
+            // Native catalog tombstones already accept missing keys. Keep all
+            // other failures authoritative, and edit the catalog once rather
+            // than rebuilding it separately for each retired file.
+            try file.putIndexCatalogBatch(mutations[0..request.paths.len]);
+        }
+    };
+    var request: Delete = .{ .paths = paths };
+    try self.docs.submitIndexMutation(&request, Delete.apply, true);
+}
+
+test "lite native retired file batches use one admission and roll back together" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "retired-files-batch.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .exclusive = true, .no_sync = true });
+    defer docs.close();
+    docs.maintenance_cancel.request();
+    var indexes = Store.initWithNamespace(a, &docs, "/scope");
+    const storage = indexes.storage();
+    try storage.writeFileAbsolute("/scope/a", "first");
+    try storage.writeFileAbsolute("/scope/b", "second");
+    const Probe = struct {
+        enters: usize = 0,
+        leaves: usize = 0,
+        fn enter(ptr: *anyopaque, scope: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(docstore.PublicationScope.index, scope);
+            self.enters += 1;
+        }
+        fn leave(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.leaves += 1;
+        }
+    };
+    var probe: Probe = .{};
+    docs.writer_admission = .{ .ptr = &probe, .enter = Probe.enter, .leave = Probe.leave };
+    defer docs.writer_admission = null;
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.deleteFilesAbsolute(&.{ "/scope/a", "/foreign/b" }));
+    const too_many: [StorageIo.max_atomic_file_deletions + 1][]const u8 = @splat("/scope/a");
+    try std.testing.expectError(error.FileDeletionBatchTooLarge, storage.deleteFilesAbsolute(&too_many));
+    try std.testing.expectEqual(@as(usize, 0), probe.enters);
+    docs.file.test_page_write_fail_after = 0;
+    const failed = storage.deleteFilesAbsolute(&.{ "/scope/a", "/scope/b" });
+    docs.file.test_page_write_fail_after = null;
+    try std.testing.expectError(error.TestPageWriteFailure, failed);
+    try std.testing.expectEqual(@as(usize, 1), probe.enters);
+    {
+        const first = try storage.readFileAlloc(a, "/scope/a", 64);
+        defer a.free(first);
+        const second = try storage.readFileAlloc(a, "/scope/b", 64);
+        defer a.free(second);
+        try std.testing.expectEqualStrings("first", first);
+        try std.testing.expectEqualStrings("second", second);
+    }
+    try storage.deleteFilesAbsolute(&.{ "/scope/a", "/scope/missing", "/scope/b", "/scope/a" });
+    try std.testing.expectEqual(@as(usize, 2), probe.enters);
+    try std.testing.expectEqual(probe.enters, probe.leaves);
+    try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(a, "/scope/a", 64));
+    try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(a, "/scope/b", 64));
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
 }
 
 fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
-    try validateIndexPath(self, directory);
+    try validateWritePath(self, directory);
     const Context = struct {
         store: *Store,
         path: []const u8,
@@ -351,6 +1067,7 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     };
     var request = Context{ .store = self, .path = directory };
     try self.docs.submitIndexMutation(&request, Context.apply, true);
+    if (self.docs.file.reader_coordinator) |coordinator| coordinator.forgetWalCheckpoints(directory);
 }
 
 // Subtree deletion stays one atomic native transaction. Each private flush
@@ -420,7 +1137,7 @@ fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const 
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinCatalogSnapshot(self, path);
     defer snapshot.abort();
     const file = try snapshot.readFile();
     const prefix = if (std.mem.eql(u8, directory, "/"))
@@ -430,6 +1147,8 @@ fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const 
     defer allocator.free(prefix);
     var cursor = try file.indexCatalogCursor(snapshot.checkpoint, prefix);
     defer cursor.deinit();
+    var subtree_end: ?[]u8 = null;
+    defer if (subtree_end) |bound| allocator.free(bound);
     var names = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (names.items) |name| allocator.free(name);
@@ -441,6 +1160,15 @@ fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const 
         const separator = std.mem.indexOfScalar(u8, relative, '/') orelse continue;
         if (separator == 0) continue;
         const name = relative[0..separator];
+        // A directory needs one live descendant, not a visit to every SST or
+        // segment under it. '/' increments to the exact exclusive subtree end.
+        const bound = try allocator.dupe(u8, record.key[0 .. prefix.len + separator + 1]);
+        if (subtree_end) |previous| allocator.free(previous);
+        subtree_end = bound;
+        bound[bound.len - 1] += 1;
+        cursor.restartAfter(bound);
+        // The strict seek may skip a file exactly equal to the boundary, which
+        // has no child separator and cannot itself name a directory here.
         // The catalog cursor is ordered; every child directory is contiguous.
         if (names.items.len != 0 and std.mem.eql(u8, names.items[names.items.len - 1], name)) continue;
         const owned = try allocator.dupe(u8, name);
@@ -454,7 +1182,7 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinCatalogSnapshot(self, path);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -495,10 +1223,52 @@ fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
 }
 
 fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
-    // A logical rename and its namespace update publish through one native
-    // checkpoint. Syncing the container is therefore both the file-content
-    // and logical-parent durability barrier.
-    return try syncContentsAbsolute(ptr, path);
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
+    // Directories are virtual. Native file creation and rename already publish
+    // their namespace and bytes in one durable checkpoint; they create no
+    // separate parent dentry to flush. Explicit content barriers still use
+    // syncContentsAbsolute, including after an unsynced append.
+}
+
+fn loadedWalMetadataRevision(ptr: *anyopaque, root_dir: []const u8) ?StorageIo.ContentRevision {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    if (self.read_snapshot != null) return null;
+    // Logical roots are short in normal use. A longer valid path safely falls
+    // back to TTL accounting rather than allocating scratch on every hot hit.
+    var buffer: [8192]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&buffer);
+    const wal_root = std.fs.path.join(scratch.allocator(), &.{ root_dir, "wal" }) catch return null;
+    const prefix = std.fmt.allocPrint(scratch.allocator(), "{s}{c}", .{ wal_root, std.fs.path.sep }) catch return null;
+    const legacy = std.fs.path.join(scratch.allocator(), &.{ root_dir, "wal.log" }) catch return null;
+    platform_sync.lockYielding(&self.docs.mutex);
+    defer self.docs.mutex.unlock();
+    const directory_revision = self.docs.file.loadedIndexPathRevision(prefix) orelse return null;
+    const legacy_revision = self.docs.file.loadedIndexPathRevision(legacy) orelse return null;
+    var input: [32]u8 = undefined;
+    @memcpy(input[0..16], &directory_revision);
+    @memcpy(input[16..32], &legacy_revision);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&input, &digest, .{});
+    return digest[0..16].*;
+}
+
+fn loadedContentRevision(ptr: *anyopaque) ?StorageIo.ContentRevision {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    if (self.read_snapshot) |snapshot| {
+        const identity = snapshot.checkpoint.logical.indexes;
+        return if (std.mem.allEqual(u8, &identity, 0)) null else identity;
+    }
+    // Copy only the loaded no-ABA identity; inspecting old unretained catalog
+    // pages or reacquiring path admission here would turn a cache hit into I/O.
+    self.docs.mutex.lock();
+    defer self.docs.mutex.unlock();
+    // Private staged roots are not a published logical view. Preserve the
+    // ordinary mutation/TTL rules until their enclosing transaction finishes.
+    if (self.docs.file.transaction_header != null) return null;
+    const identity = self.docs.file.activeCheckpoint().logical.indexes;
+    if (std.mem.allEqual(u8, &identity, 0)) return null;
+    return identity;
 }
 
 fn nowNs(ptr: *anyopaque) u64 {
@@ -568,6 +1338,7 @@ const NativeAtomicWriteSink = struct {
         .finish_mapped = if (supports_mapped_artifacts) finishMapped else null,
         .abort = abort,
         .set_cache_intent = setCacheIntent,
+        .finish_with_publication_state = finishWithPublicationState,
     };
 
     fn create(allocator: Allocator, storage: *Store, path: []const u8) !AtomicWriteSink {
@@ -734,11 +1505,17 @@ const NativeAtomicWriteSink = struct {
     }
 
     fn finish(ptr: *anyopaque) !void {
+        var publication_possible = true;
+        return finishWithPublicationState(ptr, &publication_possible);
+    }
+
+    fn finishWithPublicationState(ptr: *anyopaque, publication_possible: *bool) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
+        publication_possible.* = false;
         if (self.failure) |err| return err;
         if (self.file != null) try self.flush();
-        try self.storage.docs.submitIndexMutation(self, publish, true);
+        try self.storage.docs.submitIndexMutationWithPublicationState(self, publish, true, publication_possible);
     }
 
     fn finishSource(ptr: *anyopaque) !@import("../../segment_source.zig").Source {
@@ -849,7 +1626,12 @@ test "lite native index storage persists logical files across reopen" {
         try std.testing.expect(checkpoint.index_catalog_root_page != 0);
         const records = try docs.file.snapshotIndexCatalogRecordsAlloc(allocator);
         defer native.NativeFile.freeSnapshotCatalogRecords(allocator, records);
-        try std.testing.expectEqual(@as(usize, 2), records.len);
+        var logical_files: usize = 0;
+        for (records) |record| if (std.mem.startsWith(u8, record.key, "/indexes/ft/")) {
+            logical_files += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 2), logical_files);
+        try std.testing.expect(try docs.file.indexScopeIdentity("/indexes/ft") != null);
     }
 
     {
@@ -943,6 +1725,97 @@ test "lite native index storage root identity is physical and namespaced" {
     );
     defer allocator.free(reopened_identity);
     try std.testing.expectEqualStrings(first_identity, reopened_identity);
+}
+
+test "lite native index storage content identity ignores primary writes and changes on index publication" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "index-content-identity.aflite");
+    defer allocator.free(path);
+    var docs = try docstore.Store.createWithOptions(allocator, path, .{ .exclusive = true, .no_sync = true, .reclamation = .{ .page_reuse = true } });
+    defer docs.close();
+    // This fixture deliberately manipulates NativeFile transactions directly.
+    // A Store worker must not inspect its allocator outside the Store mutex
+    // while those raw mutations bypass the ordinary transaction facade.
+    docs.maintenance_start_suppressed = true;
+    var indexes = Store.init(allocator, &docs);
+    const io = indexes.storage();
+    try writeFileAbsolute(&indexes, "segments/current", "one");
+    const first = io.loadedContentRevision() orelse return error.TestUnexpectedResult;
+    try docs.file.putDocument("row", "primary-only change");
+    try std.testing.expectEqualDeep(first, io.loadedContentRevision().?);
+    try writeFileAbsolute(&indexes, "segments/current", "two");
+    const second = io.loadedContentRevision().?;
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+    try writeFileAbsolute(&indexes, "segments/current", "one");
+    const third = io.loadedContentRevision().?;
+    try std.testing.expect(!std.mem.eql(u8, &first, &third));
+    try docs.file.beginTransaction();
+    try std.testing.expect(io.loadedContentRevision() == null);
+    docs.file.abortTransaction();
+    try std.testing.expectEqualDeep(third, io.loadedContentRevision().?);
+}
+
+test "lite native index storage batches consistent metadata reads under one admission" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "index-metadata-batch.aflite");
+    defer allocator.free(path);
+    var docs = try docstore.Store.createWithOptions(allocator, path, .{ .exclusive = true, .no_sync = true });
+    defer docs.close();
+    // This probe owns admission; unrelated storage service must not call it.
+    docs.maintenance_cancel.request();
+    var indexes = Store.initWithNamespace(allocator, &docs, "/scope");
+    const io = indexes.storage();
+    try io.writeFileAbsolute("/scope/a", "old");
+    try io.writeFileAbsolute("/scope/b", "other");
+    const Probe = struct {
+        enters: usize = 0,
+        leaves: usize = 0,
+        refuse: bool = false,
+        fn enter(ptr: *anyopaque, scope: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(docstore.PublicationScope.index_read, scope);
+            if (self.refuse) return error.EnrichmentWaitCanceled;
+            self.enters += 1;
+        }
+        fn leave(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.leaves += 1;
+        }
+    };
+    var probe: Probe = .{};
+    docs.writer_admission = .{ .ptr = &probe, .enter = Probe.enter, .leave = Probe.leave };
+    docs.index_reads_require_admission = true;
+    defer {
+        docs.index_reads_require_admission = false;
+        docs.writer_admission = null;
+    }
+    var scope = (try io.acquireReadSnapshot()).?;
+    defer scope.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.enters);
+    try std.testing.expectEqual(probe.enters, probe.leaves);
+    try std.testing.expectEqual(@as(u64, 3), try scope.view.fileSize("/scope/a"));
+    try docs.file.putIndexCatalogRecord("/scope/a", "new value");
+    const old = try scope.view.readFileAlloc(allocator, "/scope/a", 100);
+    defer allocator.free(old);
+    try std.testing.expectEqualStrings("old", old);
+    const part = try scope.view.readFileRangeAlloc(allocator, "/scope/a", 1, 2);
+    defer allocator.free(part);
+    try std.testing.expectEqualStrings("ld", part);
+    const names = try scope.view.listFileNamesAlloc(allocator, "/scope");
+    defer StorageIo.freeFileNames(allocator, names);
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqual(@as(usize, 1), probe.enters);
+    try std.testing.expectError(error.ReadOnly, scope.view.writeFileAbsolute("/scope/a", "bad"));
+    const current = try io.readFileAlloc(allocator, "/scope/a", 100);
+    defer allocator.free(current);
+    try std.testing.expectEqualStrings("new value", current);
+    try std.testing.expectEqual(@as(usize, 2), probe.enters);
+    probe.refuse = true;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, io.acquireReadSnapshot());
 }
 
 test "lite native index reads remain pinned while newer checkpoints publish" {
@@ -1097,6 +1970,94 @@ test "lite native index storage aborts atomic writes without publishing partial 
         try std.testing.expectEqualStrings("stable", stable);
         try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/indexes/ft/new.tbl", 64));
     }
+}
+
+test "lite native control publication refusals preserve a retryable posting generation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "control-admission-refusal.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var indexes = Store.init(a, &docs);
+    const Posting = @import("../posting_segment_store.zig").Store;
+    var posting = try Posting.open(a, indexes.storage(), "/postings");
+    defer posting.deinit();
+    var segment = @import("antfly_vectorindex").posting_segment.Writer.init(a);
+    defer segment.deinit();
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    try posting.publishCheckpoint(1, 0, bytes);
+    var prepared = try posting.prepareCheckpoint(2, 0, bytes);
+    defer prepared.deinit();
+    const previous = docs.file.activeCheckpoint();
+    const Admission = struct {
+        refuse: bool = true,
+        fn enter(ptr: *anyopaque, _: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.refuse) return error.EnrichmentWaitCanceled;
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    var admission: Admission = .{};
+    docs.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer docs.writer_admission = null;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, posting.commitPrepared(&prepared));
+    try std.testing.expect(!posting.poisoned and !prepared.committed);
+    try std.testing.expectEqual(@as(?u64, 1), posting.latestSegmentGeneration());
+    try std.testing.expect(std.meta.eql(previous, docs.file.activeCheckpoint()));
+    try std.testing.expectError(error.EnrichmentWaitCanceled, posting.markAuthoritative());
+    try std.testing.expect(!posting.poisoned);
+    admission.refuse = false;
+    try posting.commitPrepared(&prepared);
+    try posting.markAuthoritative();
+    try std.testing.expectEqual(@as(?u64, 2), posting.latestSegmentGeneration());
+    try std.testing.expect(prepared.committed);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+test "lite native control publication retains uncertainty after a lost checkpoint acknowledgement" {
+    const a = std.testing.allocator;
+    const Fault = struct {
+        var armed = false;
+        fn write(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            const count = try std.testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+            if (armed and offset == 20) {
+                armed = false;
+                return error.Canceled;
+            }
+            return count;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "control-lost-ack.aflite");
+    defer a.free(path);
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileWritePositional = Fault.write;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    {
+        var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = io, .reclamation = .{ .enabled = false } });
+        defer docs.close();
+        docs.maintenance_start_suppressed = true;
+        var indexes = Store.init(a, &docs);
+        const publication = @import("../generation_publication.zig");
+        try publication.publishControlFile(a, indexes.storage(), "/CURRENT", "generation-one");
+        Fault.armed = true;
+        defer Fault.armed = false;
+        @import("antfly_test_error_logs").expectErrorLogs(1);
+        try std.testing.expectError(error.GenerationPublicationDurabilityUncertain, publication.publishControlFile(a, indexes.storage(), "/CURRENT", "generation-two"));
+        try std.testing.expect(!Fault.armed);
+        try std.testing.expect(docs.file.checkpoint_publication_uncertain);
+    }
+    var reopened = try docstore.Store.openWithOptions(a, path, .{ .read_only = true, .io = std.testing.io });
+    defer reopened.close();
+    const current = (try reopened.file.getIndexCatalogRecordAlloc(a, "/CURRENT")).?;
+    defer a.free(current);
+    try std.testing.expectEqualStrings("generation-two", current);
+    try std.testing.expect((try reopened.checkWithCancel(null)).valid);
 }
 
 test "lite native staged abort removes staging despite pending cancellation" {
@@ -2329,6 +3290,78 @@ test "lite artifact leases share immutable inputs across serving owners without 
     try std.testing.expectEqualSlices(u8, payload[123..][0..out.len], &out);
 }
 
+test "lite detached artifact read admission also fences pooled sources" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "detached-pooled-admission.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = Store.init(a, &docs);
+    const storage = store.storage();
+    try storage.writeFileAbsolute("/leased", "immutable payload");
+    var original = try storage.openLeasedImmutableSource(a, "/leased");
+    defer original.close();
+    const Admission = struct {
+        reads: usize = 0,
+        fn enter(ptr: *anyopaque, scope: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (scope == .index_read) {
+                self.reads += 1;
+                return error.EnrichmentWaitCanceled;
+            }
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    var admission: Admission = .{};
+    docs.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer docs.writer_admission = null;
+    docs.index_reads_require_admission = true;
+    defer docs.index_reads_require_admission = false;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, storage.readFileAlloc(a, "/leased", 100));
+    // A matching pooled input must not bypass validation of the current
+    // catalog. Lease publication alone is too late to fence this lookup.
+    try std.testing.expectError(error.EnrichmentWaitCanceled, storage.openLeasedImmutableSource(a, "/leased"));
+    try std.testing.expectEqual(@as(usize, 2), admission.reads);
+    var actual: [17]u8 = undefined;
+    try original.readInto(0, &actual);
+    try std.testing.expectEqualStrings("immutable payload", &actual);
+}
+
+test "lite virtual parent sync has no independent publication or writer admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "virtual-parent-sync.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const Admission = struct {
+        calls: usize = 0,
+        fn enter(ptr: *anyopaque, _: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.FileBusy;
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    var admission: Admission = .{};
+    docs.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer docs.writer_admission = null;
+    docs.file.last_synced_header = null;
+    const before = docs.file.header;
+    try adapter.storage().syncParentAbsolute("/indexes/text");
+    try std.testing.expectEqual(@as(usize, 0), admission.calls);
+    try std.testing.expectEqualDeep(before, docs.file.header);
+    try std.testing.expect(!docs.file.syncAlreadyComplete());
+    try std.testing.expectError(error.FileBusy, adapter.storage().syncFileContentsAbsolute("/indexes/text/wal"));
+    try std.testing.expectEqual(@as(usize, 1), admission.calls);
+}
+
 test "lite artifact leases transfer retired inode accounting between readers" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2547,51 +3580,130 @@ test "lite lsm artifact sources reuse navigation without checkpoint pins and sur
     try std.testing.expectEqual(@as(u64, 0), (try docs.reclamationStatus()).retired_file_bytes);
 }
 
-test "lite lsm merge cursor retains active run sources and trims idle leases on close" {
+test "lite lsm ordinary merge cursor retains artifact sources without a checkpoint snapshot" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try testPath(a, tmp, "lsm-cursor-leases.aflite");
+    const path = try testPath(a, tmp, "lsm-cursor-artifacts.aflite");
     defer a.free(path);
     var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
     defer docs.close();
     docs.maintenance_start_suppressed = true;
     var indexes = Store.init(a, &docs);
-    const Backend = @import("../lsm_backend.zig").Backend;
-    const options = @import("../lsm_backend.zig").Options{ .storage = indexes.storage(), .flush_threshold = 1, .compact_threshold_runs = 100, .l0_overlap_compact_threshold_runs = 100, .l0_hard_limit_runs = 100, .table_block_compression = .none };
+    const lsm = @import("../lsm_backend.zig");
+    const options = lsm.Options{ .storage = indexes.storage(), .flush_threshold = 1, .compact_threshold_runs = 100, .l0_overlap_compact_threshold_runs = 100, .l0_hard_limit_runs = 100, .table_block_compression = .none };
     {
-        var backend = try Backend.open(a, "/cursor-runs", options);
+        var backend = try lsm.Backend.open(a, "/cursor-runs", options);
         defer backend.close();
         var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
         defer runtime.deinit();
         for (0..24) |i| {
             var first: [32]u8 = undefined;
             var last: [32]u8 = undefined;
-            var txn = try runtime.beginWrite();
-            errdefer txn.abort();
-            try txn.put(try std.fmt.bufPrint(&first, "a{d:0>2}", .{i}), "first");
-            try txn.put(try std.fmt.bufPrint(&last, "z{d:0>2}", .{i}), "last");
-            try txn.commit();
+            var write = try runtime.beginWrite();
+            errdefer write.abort();
+            try write.put(try std.fmt.bufPrint(&first, "a{d:0>2}", .{i}), "first");
+            try write.put(try std.fmt.bufPrint(&last, "z{d:0>2}", .{i}), "last");
+            try write.commit();
         }
     }
-    var backend = try Backend.open(a, "/cursor-runs", options);
-    defer backend.close();
+    var backend = try lsm.Backend.open(a, "/cursor-runs", options);
+    defer backend.closePreservingWal();
     var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
     defer runtime.deinit();
     var read = try runtime.beginRead();
     defer read.abort();
     var cursor = try read.openCursor();
-    var cursor_open = true;
-    defer if (cursor_open) cursor.close();
+    var opened = true;
+    defer if (opened) cursor.close();
     _ = (try cursor.first()).?;
     try std.testing.expect(backend.run_sources.items.len > 16);
+    var runs = backend.runs.cursor();
+    while (runs.next()) |run| try indexes.storage().deleteFileAbsolute(run.path.?);
     var count: usize = 1;
     while (try cursor.next()) |_| count += 1;
     try std.testing.expectEqual(@as(usize, 48), count);
     cursor.close();
-    cursor_open = false;
+    opened = false;
     try std.testing.expect(backend.run_sources.items.len <= 16);
-    try std.testing.expectEqualStrings("first", try read.get("a00"));
+}
+
+test "lite lsm merge cursor scans through one catalog snapshot without durable source leases" {
+    const a = std.testing.allocator;
+    // Exercise uncached, local-cache and shared-cache readers, including
+    // compressed blocks. Every mode must preserve both lazy metadata and data.
+    for (0..3) |cache_mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "lsm-cursor-leases.aflite");
+        defer a.free(path);
+        var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+        defer docs.close();
+        docs.maintenance_start_suppressed = true;
+        var indexes = Store.init(a, &docs);
+        const lsm = @import("../lsm_backend.zig");
+        var cache = lsm.Cache.init(a, 4 * 1024 * 1024);
+        defer cache.deinit();
+        const options = lsm.Options{ .storage = indexes.storage(), .flush_threshold = 1, .compact_threshold_runs = 100, .l0_overlap_compact_threshold_runs = 100, .l0_hard_limit_runs = 100, .table_block_compression = if (cache_mode == 0) .none else .snappy_adaptive, .local_block_cache_enabled = cache_mode == 1, .cache = if (cache_mode == 2) &cache else null };
+        {
+            var backend = try lsm.Backend.open(a, "/cursor-runs", options);
+            defer backend.close();
+            var runtime = try backend.runtimeStore(a, .{ .name = "meta", .transient_storage_snapshot = true });
+            defer runtime.deinit();
+            for (0..24) |i| {
+                var first: [32]u8 = undefined;
+                var last: [32]u8 = undefined;
+                var txn = try runtime.beginWrite();
+                errdefer txn.abort();
+                try txn.put(try std.fmt.bufPrint(&first, "a{d:0>2}", .{i}), "first");
+                try txn.put(try std.fmt.bufPrint(&last, "z{d:0>2}", .{i}), "last");
+                try txn.commit();
+            }
+        }
+        {
+            var backend = try lsm.Backend.open(a, "/cursor-runs", options);
+            defer backend.close();
+            var runtime = try backend.runtimeStore(a, .{ .name = "meta", .transient_storage_snapshot = true });
+            defer runtime.deinit();
+            var read = try runtime.beginRead();
+            defer read.abort();
+            const checkpoint = docs.file.activeCheckpoint();
+            const opens = docs.file.allocator_work.artifact_source_opens;
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var count: usize = 0;
+            var entry = try cursor.first();
+            while (entry != null) : (entry = try cursor.next()) count += 1;
+            try std.testing.expectEqual(@as(usize, 48), count);
+            try std.testing.expectEqual(@as(usize, 0), backend.run_sources.items.len);
+            try std.testing.expectEqualDeep(checkpoint, docs.file.activeCheckpoint());
+            try std.testing.expectEqual(opens, docs.file.allocator_work.artifact_source_opens);
+        }
+        // Drop all cached metadata before testing lazy reads after deletion.
+        cache.deinit();
+        cache = lsm.Cache.init(a, 4 * 1024 * 1024);
+        var backend = try lsm.Backend.open(a, "/cursor-runs", options);
+        defer backend.closePreservingWal();
+        var runtime = try backend.runtimeStore(a, .{ .name = "meta", .transient_storage_snapshot = true });
+        defer runtime.deinit();
+        var read = try runtime.beginRead();
+        defer read.abort();
+        var captured = try read.openCursor();
+        defer captured.close();
+        var runs = backend.runs.cursor();
+        while (runs.next()) |run| try indexes.storage().deleteFileAbsolute(run.path.?);
+        for (0..32) |i| {
+            var key: [32]u8 = undefined;
+            var write = try docs.beginWrite();
+            errdefer write.abort();
+            try write.put(try std.fmt.bufPrint(&key, "reuse-{d}", .{i}), "replacement");
+            try write.commit();
+        }
+        var count: usize = 0;
+        var entry = try captured.first();
+        while (entry != null) : (entry = try captured.next()) count += 1;
+        try std.testing.expectEqual(@as(usize, 48), count);
+    }
 }
 
 test "lite lsm idle run source releases retired inode during vacuum" {
@@ -2704,4 +3816,1357 @@ test "lite atomic publication returns owned immutable source without requiring m
     var bytes: [8]u8 = undefined;
     try source.readInto(0, &bytes);
     try std.testing.expectEqualStrings("original", &bytes);
+}
+
+test "lite wal accounting ignores unrelated immutable file churn" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "wal-accounting-churn.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    var indexes = Store.init(a, &docs);
+    const storage = indexes.storage();
+    var backend = try @import("../lsm_backend.zig").Backend.open(a, "/wal-accounting", .{ .storage = storage, .flush_threshold = 1024, .wal_soft_limit_segments = 1000 });
+    defer backend.closePreservingWal();
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "document", "value");
+        try write.commit();
+    }
+    const Probe = struct {
+        reads: usize = 0,
+        fn enter(ptr: *anyopaque, scope: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (scope == .index_read) self.reads += 1;
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    var probe: Probe = .{};
+    docs.writer_admission = .{ .ptr = &probe, .enter = Probe.enter, .leave = Probe.leave };
+    defer docs.writer_admission = null;
+    docs.index_reads_require_admission = true;
+    defer docs.index_reads_require_admission = false;
+    {
+        var read = (try storage.acquireReadSnapshot()).?;
+        read.deinit();
+        try std.testing.expectEqual(@as(usize, 1), probe.reads);
+    }
+    _ = backend.maintenanceScore();
+    const warm_reads = probe.reads;
+    for (0..8) |i| {
+        var name: [96]u8 = undefined;
+        const file = try std.fmt.bufPrint(&name, "/wal-accounting/runs/unrelated-{d}.tbl", .{i});
+        try storage.writeFileAbsolute(file, "unrelated immutable table");
+        _ = backend.maintenanceScore();
+        try storage.deleteFileAbsolute(file);
+        _ = backend.maintenanceScore();
+    }
+    try std.testing.expectEqual(warm_reads, probe.reads);
+}
+
+test "lite wal metadata revisions invalidate mutations and foreign adoption" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "wal-revisions.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    var indexes = Store.init(a, &docs);
+    const storage = indexes.storage();
+    try storage.writeFileAbsolute("/one/wal/index", "original");
+    try storage.writeFileAbsolute("/two/wal/index", "other");
+    const initial = storage.loadedWalMetadataRevision("/one").?;
+    const other = storage.loadedWalMetadataRevision("/two").?;
+    try storage.appendFileAbsolute(a, "/one/wal/index", "-append", false);
+    const appended = storage.loadedWalMetadataRevision("/one").?;
+    try std.testing.expect(!std.meta.eql(initial, appended));
+    try std.testing.expectEqualDeep(other, storage.loadedWalMetadataRevision("/two").?);
+    try storage.renameAbsolute("/one/wal/index", "/one/renamed");
+    const renamed = storage.loadedWalMetadataRevision("/one").?;
+    try std.testing.expect(!std.meta.eql(appended, renamed));
+    try storage.renameAbsolute("/one/renamed", "/one/wal/index");
+    try storage.deleteFileAbsolute("/one/wal/index");
+    try storage.writeFileAbsolute("/one/wal/index", "original");
+    const recreated = storage.loadedWalMetadataRevision("/one").?;
+    try std.testing.expect(!std.meta.eql(initial, recreated));
+    try storage.writeFileAbsolute("/one/wal.log", "legacy WAL");
+    const legacy = storage.loadedWalMetadataRevision("/one").?;
+    try std.testing.expect(!std.meta.eql(recreated, legacy));
+    try docs.file.beginTransaction();
+    try std.testing.expect(storage.loadedWalMetadataRevision("/one") == null);
+    try docs.file.putIndexCatalogRecord("/one/wal/index", "aborted");
+    docs.file.abortTransaction();
+    try std.testing.expect(storage.loadedWalMetadataRevision("/one") != null);
+    const restored = try storage.readFileAlloc(a, "/one/wal/index", 128);
+    defer a.free(restored);
+    try std.testing.expectEqualStrings("original", restored);
+    // A separate handle adopts unknown physical index changes conservatively,
+    // including changes outside its watched paths. It never reuses old tokens.
+    var captured = try native.NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+    defer captured.close();
+    const watched = captured.loadedIndexPathRevision("/one/wal/").?;
+    try storage.writeFileAbsolute("/unrelated/foreign", "changed");
+    try captured.adoptIndexPublicationHeader(docs.file.header);
+    try std.testing.expect(!std.meta.eql(watched, captured.loadedIndexPathRevision("/one/wal/").?));
+    const after_primary = storage.loadedWalMetadataRevision("/one").?;
+    try docs.file.putDocument("primary", "changed");
+    try std.testing.expectEqualDeep(after_primary, storage.loadedWalMetadataRevision("/one").?);
+}
+
+test "lite artifact closed leases retire with the next publication across registry refresh" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "release-queue.aflite");
+    defer a.free(path);
+    const coordinator = try native.ReaderCoordinator.create(a, std.testing.io);
+    defer coordinator.release();
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.file.reader_coordinator = coordinator;
+    docs.maintenance_start_suppressed = true;
+    var indexes = Store.init(a, &docs);
+    try indexes.storage().writeFileAbsolute("/runs/churn", "immutable body");
+    for (0..192) |_| {
+        var source = try docs.openArtifactSource("/runs/churn");
+        var bytes: [9]u8 = undefined;
+        try source.readInto(0, &bytes);
+        try std.testing.expectEqualStrings("immutable", &bytes);
+        source.close();
+        try std.testing.expect(coordinator.hasArtifactReleases());
+        // No writer admission is acquired by close. The next source publishes
+        // its alias and the exact closed aliases in one transaction.
+        var cursor = try docs.file.metadataCatalogCursor(docs.file.activeCheckpoint(), native.NativeFile.artifact_lease_key_prefix);
+        defer cursor.deinit();
+        var count: usize = 0;
+        while (try cursor.next()) |record| {
+            a.free(record.key);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), count);
+    }
+    const before_failure = docs.file.header;
+    docs.file.test_page_write_fail_after = 0;
+    try std.testing.expectError(error.TestPageWriteFailure, docs.openArtifactSource("/runs/churn"));
+    docs.file.test_page_write_fail_after = null;
+    try std.testing.expectEqualDeep(before_failure, docs.file.header);
+    try std.testing.expect(coordinator.hasArtifactReleases());
+    try std.testing.expect((try docs.file.check()).valid);
+
+    // A late release from an old inode must not delete a replacement alias.
+    var active = try docs.openArtifactSource("/runs/churn");
+    var active_open = true;
+    defer if (active_open) active.close();
+    const live_key = blk: {
+        var cursor = try docs.file.metadataCatalogCursor(docs.file.activeCheckpoint(), native.NativeFile.artifact_lease_key_prefix);
+        defer cursor.deinit();
+        const record = (try cursor.next()) orelse return error.TestUnexpectedResult;
+        break :blk record.key;
+    };
+    defer a.free(live_key);
+    const inode = (try docs.file.file.stat(docs.file.runtime())).inode;
+    coordinator.enqueueArtifactReleases(try coordinator.reserveArtifactRelease(inode + 1, live_key));
+    try indexes.storage().writeFileAbsolute("/runs/other", "other immutable body");
+    var other = try docs.openArtifactSource("/runs/other");
+    var bytes: [9]u8 = undefined;
+    try active.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("immutable", &bytes);
+    other.close();
+    active.close();
+    active_open = false;
+    // A new registry on the same file adopts releases from the old one.
+    var replacement = try docstore.Store.openWithOptions(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer replacement.close();
+    replacement.file.reader_coordinator = coordinator;
+    replacement.maintenance_start_suppressed = true;
+    var source = try replacement.openArtifactSource("/runs/churn");
+    source.close();
+    try std.testing.expect((try replacement.file.check()).valid);
+}
+
+test "lite WAL checkpoint ages bound repeated cache recovery without tiny flushes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "wal-cache-age.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    const coordinator = try native.ReaderCoordinator.create(a, std.testing.io);
+    defer coordinator.release();
+    docs.file.reader_coordinator = coordinator;
+    defer docs.file.reader_coordinator = null;
+    var indexes = Store.init(a, &docs);
+    const Clock = struct {
+        var tick: u64 = 100;
+        fn now(_: *anyopaque) u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 100;
+    var callbacks = Store.vtable;
+    callbacks.now_ns = Clock.now;
+    const storage = StorageIo{ .ptr = &indexes, .vtable = &callbacks };
+    const lsm = @import("../lsm_backend.zig");
+    const root = "/cache-age";
+    const options = lsm.Options{ .storage = storage, .flush_threshold_bytes = 1024 * 1024, .mutable_idle_flush_after_ns = 10, .mutable_idle_flush_min_bytes = 1024 * 1024, .mutable_idle_flush_max_age_ns = 100, .compact_threshold_runs = 100, .l0_soft_limit_runs = 100, .l0_hard_limit_runs = 100 };
+    {
+        var backend = try lsm.Backend.open(a, root, options);
+        defer backend.closePreservingWal();
+        var runtime = try backend.runtimeStore(a, .{ .name = "meta", .transient_storage_snapshot = true });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        errdefer write.abort();
+        try write.put("a", "checkpointed");
+        try write.commit();
+        try backend.checkpointWalAfterDurableBoundary();
+        const inode = (try docs.file.file.stat(std.testing.io)).inode;
+        try std.testing.expectEqual(@as(?u64, 200), coordinator.recoveredWalDeadline(root, inode, 100));
+        Clock.tick = 110;
+        var dirty = try runtime.beginWrite();
+        errdefer dirty.abort();
+        try dirty.put("b", "durable in WAL");
+        try dirty.commit();
+    }
+    // Reopening reconstructible caches must neither force a fresh SST for
+    // these few records nor renew their maximum-age deadline indefinitely.
+    for (111..131) |tick| {
+        Clock.tick = tick;
+        var backend = try lsm.Backend.open(a, root, options);
+        defer backend.closePreservingWal();
+        try std.testing.expect(backend.mutable.entryCount() > 0);
+        _ = try backend.runMaintenanceStep();
+        try std.testing.expectEqual(@as(u64, 0), backend.snapshotWriteStats().flushes);
+        try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    }
+    Clock.tick = 200;
+    {
+        var backend = try lsm.Backend.open(a, root, options);
+        defer backend.closePreservingWal();
+        _ = try backend.runMaintenanceStep();
+        try std.testing.expectEqual(@as(u64, 1), backend.snapshotWriteStats().flushes);
+        var runtime = try backend.runtimeStore(a, .{ .name = "meta" });
+        defer runtime.deinit();
+        var read = try runtime.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("durable in WAL", try read.get("b"));
+    }
+    // A fresh owner (or forgotten/deleted generation) still has no evidence
+    // of the original age and must retain conservative restart checkpointing.
+    coordinator.forgetWalCheckpoints(root);
+    Clock.tick = 210;
+    {
+        var backend = try lsm.Backend.open(a, root, options);
+        defer backend.closePreservingWal();
+        var runtime = try backend.runtimeStore(a, .{ .name = "meta" });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        errdefer write.abort();
+        try write.put("c", "unknown age");
+        try write.commit();
+    }
+    Clock.tick = 211;
+    {
+        var backend = try lsm.Backend.open(a, root, options);
+        defer backend.closePreservingWal();
+        _ = try backend.runMaintenanceStep();
+        try std.testing.expectEqual(@as(u64, 1), backend.snapshotWriteStats().flushes);
+    }
+}
+
+test "lite native directory listing skips descendant artifacts with bounded reads" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 128, 4096 }) |per_directory| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "directory-seek.aflite");
+        defer a.free(path);
+        var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+        defer docs.close();
+        docs.maintenance_start_suppressed = true;
+        const mutations = try a.alloc(native.CatalogMutation, per_directory * 2 + 2);
+        defer a.free(mutations);
+        var initialized: usize = 0;
+        defer for (mutations[0..initialized]) |mutation| a.free(mutation.key);
+        for (mutations[0 .. per_directory * 2], 0..) |*mutation, i| {
+            mutation.* = .{ .key = try std.fmt.allocPrint(a, "/scope/{s}/nested/segment-{d:0>8}.sst", .{ if (i < per_directory) "a" else "a0", i }), .value = "immutable artifact payload" };
+            initialized += 1;
+        }
+        for ([_][]const u8{ "/scope/a0", "/scope/root-file" }, mutations[per_directory * 2 ..]) |key, *mutation| {
+            mutation.* = .{ .key = try a.dupe(u8, key), .value = "immediate file" };
+            initialized += 1;
+        }
+        try docs.file.putIndexCatalogBatch(mutations);
+        var snapshot = try docs.beginIndexRead();
+        defer snapshot.abort();
+        const file = try snapshot.readFile();
+        file.page_cache_enabled.store(false, .monotonic);
+        const before = file.test_page_reads.load(.monotonic);
+        var store = Store.initWithNamespace(a, &docs, "/scope");
+        store.read_snapshot = &snapshot;
+        const names = try store.storage().listDirectoryNamesAlloc(a, "/scope");
+        defer StorageIo.freeFileNames(a, names);
+        try std.testing.expectEqual(@as(usize, 2), names.len);
+        try std.testing.expectEqualStrings("a", names[0]);
+        // The exact seek boundary is also an immediate file. Skipping that
+        // file must still discover the adjacent directory of the same name.
+        try std.testing.expectEqualStrings("a0", names[1]);
+        try std.testing.expect(file.test_page_reads.load(.monotonic) - before <= 64);
+    }
+}
+
+test "lite native replay publication joins artifacts metadata and WAL and rolls back participant refusal" {
+    const alloc = std.testing.allocator;
+    const Stage = struct {
+        artifact: *immutable_artifact.Prepared,
+        scope: native_publication.Scope,
+        fail: bool = true,
+        fn apply(raw: *anyopaque, view: native_publication.View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.artifact.stageLink(view);
+            var txn: native_publication.MetadataTxn = .{ .alloc = std.testing.allocator, .scope = self.scope, .view = view };
+            defer txn.deinit();
+            try txn.put("\x00\x00publication-test", "complete");
+            try std.testing.expectEqualStrings("complete", try txn.get("\x00\x00publication-test"));
+            if (self.fail) return error.TestPublicationRefused;
+        }
+    };
+    for ([_]usize{ 128, 256 * 1024 + 1 }) |length| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(alloc, tmp, "joined-publication.aflite");
+        defer alloc.free(path);
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true });
+        defer docs.close();
+        docs.maintenance_start_suppressed = true;
+        docs.file.externally_locked = true;
+        var indexes = Store.initWithNamespace(alloc, &docs, "/index");
+        const storage = indexes.storage();
+        try storage.writeFileAbsolute("/index/wal/1", "before");
+        var stager = (try storage.acquireImmutableStager(alloc)).?;
+        defer stager.deinit();
+        const bytes = try alloc.alloc(u8, length);
+        defer alloc.free(bytes);
+        @memset(bytes, 'x');
+        const before_staging = docs.file.activeCheckpoint().commit_sequence;
+        var prepared = try stager.stage(bytes);
+        defer prepared.deinit();
+        try std.testing.expectEqual(before_staging + @intFromBool(length > 256 * 1024), docs.file.activeCheckpoint().commit_sequence);
+        var source = try prepared.prepareLink("/index/segment");
+        defer source.close();
+        var primary = try docs.runtimeStoreWithPrefix(alloc, "table\x00");
+        defer primary.deinit();
+        var scope = (try primary.nativePublicationScope(alloc)).?;
+        defer scope.deinit(alloc);
+        var stage: Stage = .{ .artifact = &prepared, .scope = scope };
+        const participant: native_publication.Participant = .{ .ptr = &stage, .stage = Stage.apply };
+        const before = docs.file.activeCheckpoint().commit_sequence;
+        try std.testing.expectError(error.TestPublicationRefused, storage.appendPublication("/index/wal/1", "after", true, participant));
+        try std.testing.expectEqual(before, docs.file.activeCheckpoint().commit_sequence);
+        try std.testing.expectError(error.FileNotFound, storage.fileSize("/index/segment"));
+        try std.testing.expect((try docs.file.getDocumentAlloc(alloc, "table\x00\x00\x00publication-test")) == null);
+        const old_wal = try storage.readFileAlloc(alloc, "/index/wal/1", 1024);
+        defer alloc.free(old_wal);
+        try std.testing.expectEqualStrings("before", old_wal);
+        // A retried prepared artifact must not replace a foreign alias.
+        try storage.writeFileAbsolute("/index/segment", "foreign");
+        stage.fail = false;
+        const collision_checkpoint = docs.file.activeCheckpoint().commit_sequence;
+        try std.testing.expectError(error.PathAlreadyExists, storage.appendPublication("/index/wal/1", "after", true, participant));
+        try std.testing.expectEqual(collision_checkpoint, docs.file.activeCheckpoint().commit_sequence);
+        var retry_source = try prepared.prepareLink("/index/retry-segment");
+        defer retry_source.close();
+        const before_success = docs.file.activeCheckpoint().commit_sequence;
+        try storage.appendPublication("/index/wal/1", "after", true, participant);
+        try std.testing.expectEqual(before_success + 1, docs.file.activeCheckpoint().commit_sequence);
+        const wal = try storage.readFileAlloc(alloc, "/index/wal/1", 1024);
+        defer alloc.free(wal);
+        try std.testing.expectEqualStrings("beforeafter", wal);
+        const published = try storage.readFileAlloc(alloc, "/index/retry-segment", length);
+        defer alloc.free(published);
+        try std.testing.expectEqualSlices(u8, bytes, published);
+        const foreign = try storage.readFileAlloc(alloc, "/index/segment", 1024);
+        defer alloc.free(foreign);
+        try std.testing.expectEqualStrings("foreign", foreign);
+        var read = try primary.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("complete", try read.get("\x00\x00publication-test"));
+        var sample: [16]u8 = undefined;
+        try source.readInto(0, &sample);
+        try std.testing.expectEqualSlices(u8, bytes[0..16], &sample);
+        try std.testing.expect((try docs.file.check()).valid);
+    }
+}
+
+test "lite native replay publication sync failures recover one metadata artifact and WAL decision" {
+    const a = std.testing.allocator;
+    const Fault = struct {
+        var target: ?std.Io.File.Handle = null;
+        var remaining: usize = 0;
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (target) |fd| if (file.handle == fd and remaining != 0) {
+                remaining -= 1;
+                if (remaining == 0) return error.InputOutput;
+            };
+            return std.testing.io.vtable.fileSync(userdata, file);
+        }
+    };
+    const Stage = struct {
+        artifact: *immutable_artifact.Prepared,
+        scope: native_publication.Scope,
+        fn apply(raw: *anyopaque, view: native_publication.View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.artifact.stageLink(view);
+            try view.putMetadata(self.scope, "\x00\x00publication-sync-test", "complete");
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileSync = Fault.sync;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    for ([_]bool{ false, true }) |proof| for ([_]usize{ 128, 256 * 1024 + 1 }) |length| for (1..@as(usize, if (proof) 2 else 3)) |fail_sync| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "publication-sync.aflite");
+        defer a.free(path);
+        {
+            var docs = try docstore.Store.createWithOptions(a, path, .{ .exclusive = true, .io = io });
+            defer docs.close();
+            docs.file.test_force_two_barrier_commit = !proof;
+            docs.maintenance_start_suppressed = true;
+            var indexes = Store.initWithNamespace(a, &docs, "/index");
+            const storage = indexes.storage();
+            try storage.writeFileAbsolute("/index/wal/1", "before");
+            var stager = (try storage.acquireImmutableStager(a)).?;
+            defer stager.deinit();
+            const bytes = try a.alloc(u8, length);
+            defer a.free(bytes);
+            @memset(bytes, 'z');
+            var prepared = try stager.stage(bytes);
+            defer prepared.deinit();
+            var source = try prepared.prepareLink("/index/committed");
+            defer source.close();
+            var primary = try docs.runtimeStore(a);
+            defer primary.deinit();
+            var scope = (try primary.nativePublicationScope(a)).?;
+            defer scope.deinit(a);
+            var stage: Stage = .{ .artifact = &prepared, .scope = scope };
+            const participant: native_publication.Participant = .{ .ptr = &stage, .stage = Stage.apply };
+            Fault.target = docs.file.file.handle;
+            defer Fault.target = null;
+            Fault.remaining = fail_sync;
+            defer Fault.remaining = 0;
+            try std.testing.expectError(if (!proof and fail_sync == 1) error.InputOutput else error.OutcomeUnknown, storage.appendPublication("/index/wal/1", "after", true, participant));
+            try std.testing.expectEqual(@as(usize, 0), Fault.remaining);
+            if (proof or fail_sync == 2) try std.testing.expectError(error.OutcomeReconciliationRequired, storage.appendPublication("/index/wal/1", "again", true, participant));
+        }
+        var reopened = try native.NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+        defer reopened.close();
+        const wal = (try reopened.getIndexCatalogRecordAlloc(a, "/index/wal/1")).?;
+        defer a.free(wal);
+        const alias = try reopened.getIndexCatalogRecordAlloc(a, "/index/committed");
+        defer if (alias) |bytes| a.free(bytes);
+        const metadata = try reopened.getDocumentAlloc(a, "\x00\x00publication-sync-test");
+        defer if (metadata) |bytes| a.free(bytes);
+        const committed = std.mem.eql(u8, wal, "beforeafter");
+        try std.testing.expect(committed or std.mem.eql(u8, wal, "before"));
+        if (!proof and fail_sync == 1) try std.testing.expect(!committed);
+        try std.testing.expectEqual(committed, alias != null);
+        try std.testing.expectEqual(committed, metadata != null);
+        if (committed) {
+            try std.testing.expectEqual(length, alias.?.len);
+            for (alias.?) |byte| try std.testing.expectEqual(@as(u8, 'z'), byte);
+            try std.testing.expectEqualStrings("complete", metadata.?);
+        }
+        try std.testing.expect((try reopened.check()).valid);
+    };
+}
+
+test "lite native inline publication source outlives request scratch and its storage owner" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "inline-lifetime.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    var docs_live = true;
+    defer if (docs_live) docs.close();
+    docs.maintenance_start_suppressed = true;
+    var indexes = Store.initWithNamespace(a, &docs, "/index");
+    const storage = indexes.storage();
+    try storage.writeFileAbsolute("/index/wal", "before");
+    var scratch: [64 * 1024]u8 = undefined;
+    var source: SegmentSource = undefined;
+    var source_live = false;
+    defer if (source_live) source.close();
+    const input = "immutable bytes independent of request lifetime";
+    {
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        var stager = (try storage.acquireImmutableStager(fixed.allocator())).?;
+        defer stager.deinit();
+        var prepared = try stager.stage(input);
+        defer prepared.deinit();
+        source = try prepared.prepareLink("/index/segment");
+        source_live = true;
+        const Stage = struct {
+            fn apply(raw: *anyopaque, view: native_publication.View) !void {
+                const artifact: *immutable_artifact.Prepared = @ptrCast(@alignCast(raw));
+                try artifact.stageLink(view);
+            }
+        };
+        try storage.appendPublication("/index/wal", "after", true, .{ .ptr = &prepared, .stage = Stage.apply });
+    }
+    // Deliberately overwrite every descriptor/scratch byte. None may back the
+    // immutable source now held by the published snapshot.
+    @memset(&scratch, 0xa5);
+    docs.close();
+    docs_live = false;
+    var output: [input.len]u8 = undefined;
+    try source.readInto(0, &output);
+    try std.testing.expectEqualStrings(input, &output);
+    try std.testing.expect(source.ranges.retention_artifact_only);
+    try std.testing.expectEqual(input.len, source.ranges.retained_bytes.?(source.ranges.ptr));
+    try std.testing.expect(source.ranges.retention_overhead_bytes >= input.len);
+}
+
+test "lite native namespaces ordered overlay snapshots and semantic conflict" {
+    const backend = @import("namespace_store.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-namespaces.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = try backend.Backend.open(a, &docs, "/indexes/text/index", false);
+    defer store.deinit();
+    const ns: @import("../backend_types.zig").Namespace = .{ .name = "meta" };
+    var seed = try store.beginWrite();
+    errdefer seed.abort();
+    try seed.put(.{ .name = "binary\x00/ns" }, "\x00/\xff", "binary record");
+    const long_key: [300]u8 = @splat(0xff);
+    try seed.put(.{ .name = "binary\x00/ns" }, &long_key, "long binary key");
+    try seed.put(ns, "a", "one");
+    try seed.put(ns, "c", "three");
+    try seed.put(.{}, "a", "unnamed");
+    try seed.put(.{ .name = "" }, "a", "empty");
+    try seed.commit();
+    var old = try store.beginRead();
+    defer old.abort();
+    var write = try store.beginWrite();
+    errdefer write.abort();
+    try write.delete(ns, "a");
+    try write.put(ns, "b", "two");
+    try write.put(ns, "c", "replaced");
+    {
+        var cursor = try write.openCursor(ns);
+        defer cursor.close();
+        try std.testing.expectEqualStrings("b", (try cursor.first()).?.key);
+        try std.testing.expectEqualStrings("replaced", (try cursor.next()).?.value);
+        try std.testing.expect((try cursor.next()) == null);
+        try std.testing.expectEqualStrings("c", (try cursor.last()).?.key);
+        try std.testing.expectEqualStrings("b", (try cursor.prev()).?.key);
+        try std.testing.expect((try cursor.prev()) == null);
+        try std.testing.expectEqualStrings("b", (try cursor.seekAtOrAfter("a")).?.key);
+        try std.testing.expectEqualStrings("b", (try cursor.seekAtOrBefore("bb")).?.key);
+        try std.testing.expectError(error.TransactionCursorActive, write.commit());
+    }
+    // Artifact bookkeeping does not change semantic namespace authority.
+    var adapter = Store.init(a, &docs);
+    try adapter.storage().writeFileAbsolute("/indexes/text/obsolete", "garbage");
+    try adapter.storage().deleteFileAbsolute("/indexes/text/obsolete");
+    try write.commit();
+    try std.testing.expectEqualStrings("one", try old.get(ns, "a"));
+    try std.testing.expectEqualStrings("binary record", try old.get(.{ .name = "binary\x00/ns" }, "\x00/\xff"));
+    {
+        var binary = try old.openCursor(.{ .name = "binary\x00/ns" });
+        defer binary.close();
+        try std.testing.expectEqualStrings("\x00/\xff", (try binary.first()).?.key);
+        try std.testing.expectEqualSlices(u8, &long_key, (try binary.last()).?.key);
+        try std.testing.expectEqualSlices(u8, &long_key, (try binary.seekAtOrAfter(&long_key)).?.key);
+    }
+    try std.testing.expectEqualStrings("unnamed", try old.get(.{}, "a"));
+    try std.testing.expectEqualStrings("empty", try old.get(.{ .name = "" }, "a"));
+    var first = try store.beginWrite();
+    errdefer first.abort();
+    var stale = try store.beginWrite();
+    defer stale.abort();
+    try first.put(ns, "d", "winner");
+    try stale.put(ns, "d", "stale");
+    try first.commit();
+    try std.testing.expectError(error.FileBusy, stale.commit());
+    var check = try store.beginRead();
+    defer check.abort();
+    try std.testing.expectEqualStrings("winner", try check.get(ns, "d"));
+    try std.testing.expectError(error.NotFound, check.get(ns, "a"));
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+test "lite native namespaces share artifact and progress rollback" {
+    const backend = @import("namespace_store.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-namespace-publication.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = try backend.Backend.open(a, &docs, "/standalone/index", false);
+    defer store.deinit();
+    const Participant = struct {
+        inode: u64,
+        fail: bool = true,
+        fn stage(raw: *anyopaque, view: native_publication.View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try view.put(self.inode, "/standalone/segment", "postings");
+            if (self.fail) return error.InjectedFailure;
+        }
+    };
+    var participant: Participant = .{ .inode = (try docs.file.file.stat(docs.file.runtime())).inode };
+    {
+        var txn = try store.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "meta" }, "progress", "one");
+        try std.testing.expectError(error.InjectedFailure, txn.commitWithPublication(.{ .ptr = &participant, .stage = Participant.stage }));
+    }
+    try std.testing.expect((try docs.file.getIndexCatalogRecordSize("/standalone/segment")) == null);
+    var check = try store.beginRead();
+    defer check.abort();
+    try std.testing.expectError(error.NotFound, check.get(.{ .name = "meta" }, "progress"));
+    participant.fail = false;
+    const before = docs.file.activeCheckpoint().commit_sequence;
+    var txn = try store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(.{ .name = "meta" }, "progress", "one");
+    try txn.commitWithPublication(.{ .ptr = &participant, .stage = Participant.stage });
+    try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(?usize, 8), try docs.file.getIndexCatalogRecordSize("/standalone/segment"));
+    var latest = try store.beginRead();
+    defer latest.abort();
+    try std.testing.expectEqualStrings("one", try latest.get(.{ .name = "meta" }, "progress"));
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+test "lite native namespace readers retain backend and IO after owner close" {
+    const backend = @import("namespace_store.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-namespace-reader.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    var docs_open = true;
+    defer if (docs_open) docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = try backend.Backend.open(a, &docs, "/indexes/text/index", false);
+    var store_open = true;
+    defer if (store_open) store.deinit();
+    var txn = try store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(.{}, "a", "survives");
+    try txn.commit();
+    var read = try store.beginRead();
+    defer read.abort();
+    store.deinit();
+    store_open = false;
+    docs.close();
+    docs_open = false;
+    try std.testing.expectEqualStrings("survives", try read.get(.{}, "a"));
+    var cursor = try read.openCursor(.{});
+    defer cursor.close();
+    try std.testing.expectEqualStrings("survives", (try cursor.first()).?.value);
+}
+
+test "lite native namespace capability preserves legacy authority and reopens native roots" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-namespace-selection.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const storage = adapter.storage();
+    try storage.writeFileAbsolute("/indexes/legacy/index/manifest.bin", "legacy authority");
+    try std.testing.expect((try storage.openNativeNamespaces(a, "/indexes/legacy/index", false)) == null);
+    var direct = (try storage.openNativeNamespaces(a, "/indexes/text/index", false)).?;
+    var direct_open = true;
+    defer if (direct_open) direct.deinit();
+    var txn = try direct.beginWrite();
+    errdefer txn.abort();
+    try txn.put(.{ .name = "meta" }, "active", "native authority");
+    try txn.commit();
+    direct.deinit();
+    direct_open = false;
+    var reopened = (try storage.openNativeNamespaces(a, "/indexes/text/index", true)).?;
+    defer reopened.deinit();
+    try std.testing.expectError(error.ReadOnly, reopened.beginWrite());
+    var read = try reopened.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("native authority", try read.get(.{ .name = "meta" }, "active"));
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+test "lite native prepared namespace joins primary publication and rejects stale plans" {
+    const backend = @import("namespace_store.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-primary-publication.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = try backend.Backend.open(a, &docs, "/indexes/text/index", false);
+    defer store.deinit();
+    const ns: @import("../backend_types.zig").Namespace = .{ .name = "meta" };
+    var staged = try store.beginWrite();
+    var staged_open = true;
+    defer if (staged_open) staged.abort();
+    try staged.put(ns, "active", "generation-one");
+    {
+        var cursor = try staged.openCursor(ns);
+        defer cursor.close();
+        try std.testing.expectError(error.TransactionCursorActive, staged.prepareNativePublication());
+    }
+    var prepared = try staged.prepareNativePublication();
+    staged_open = false;
+    defer prepared.deinit();
+    const Participant = struct {
+        namespace: native_publication.Participant,
+        inode: u64,
+        fail: bool = true,
+        fn stage(raw: *anyopaque, view: native_publication.View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.namespace.apply(view);
+            try view.put(self.inode, "/indexes/text/segment", "postings");
+            if (self.fail) return error.InjectedFailure;
+        }
+    };
+    var participant: Participant = .{ .namespace = prepared.participant, .inode = (try docs.file.file.stat(docs.file.runtime())).inode };
+    const before = docs.file.activeCheckpoint().commit_sequence;
+    {
+        var txn = try docs.beginBatch();
+        defer txn.abort();
+        try txn.put("document", "value");
+        try txn.setNativePublication(.{ .ptr = &participant, .stage = Participant.stage });
+        try std.testing.expectError(error.InjectedFailure, txn.commit());
+    }
+    try std.testing.expectEqual(before, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expect((try docs.file.getDocumentAlloc(a, "document")) == null);
+    try std.testing.expect((try docs.file.getIndexCatalogRecordSize("/indexes/text/segment")) == null);
+    {
+        var check = try store.beginRead();
+        defer check.abort();
+        try std.testing.expectError(error.NotFound, check.get(ns, "active"));
+    }
+    participant.fail = false;
+    {
+        var txn = try docs.beginBatch();
+        errdefer txn.abort();
+        try txn.put("document", "value");
+        try txn.setNativePublication(.{ .ptr = &participant, .stage = Participant.stage });
+        try txn.commit();
+    }
+    try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+    {
+        var check = try store.beginRead();
+        defer check.abort();
+        try std.testing.expectEqualStrings("generation-one", try check.get(ns, "active"));
+    }
+    {
+        var txn = try docs.beginBatch();
+        defer txn.abort();
+        try txn.put("document", "must roll back");
+        try txn.setNativePublication(prepared.participant);
+        try std.testing.expectError(error.FileBusy, txn.commit());
+    }
+    const value = (try docs.file.getDocumentAlloc(a, "document")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("value", value);
+    try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+test "lite native primary publication preserves group uncertainty on the calling thread" {
+    const backend = @import("namespace_store.zig");
+    const types = @import("../backend_types.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-primary-uncertainty.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = try backend.Backend.open(a, &docs, "/indexes/text/index", false);
+    defer store.deinit();
+    var staged = try store.beginWrite();
+    var staged_open = true;
+    defer if (staged_open) staged.abort();
+    try staged.put(.{}, "active", "new metadata");
+    var prepared = try staged.prepareNativePublication();
+    staged_open = false;
+    defer prepared.deinit();
+    var txn = try docs.beginBatch();
+    defer txn.abort();
+    try txn.put("document", "new value");
+    try txn.setNativePublication(prepared.participant);
+    var progress: types.CommitProgress = .{};
+    const parent = types.commit_progress;
+    types.commit_progress = &progress;
+    defer types.commit_progress = parent;
+    docs.file.test_fail_checkpoint_publication = error.InputOutput;
+    try std.testing.expectError(error.OutcomeUnknown, txn.commit());
+    try std.testing.expect(progress.maybe_applied);
+    try std.testing.expect(docs.file.checkpoint_publication_uncertain);
+}
+
+test "lite native graph and sparse metadata reopen without inner LSM files" {
+    const graph_mod = @import("../../graph/graph.zig");
+    const sparse_mod = @import("../../sparse/sparse.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-other-indexes.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const storage = adapter.storage();
+    const graph_opts: graph_mod.GraphIndexOptions = .{ .no_sync = true, .reverse_lsm_storage = storage };
+    const sparse_opts: sparse_mod.SparseIndexOptions = .{ .no_sync = true, .lsm_storage = storage };
+    {
+        var graph = try graph_mod.GraphIndex.open(a, {}, "/indexes/graph", "g", graph_opts);
+        defer graph.close();
+        try graph.addEdge("a", "b", "link", 1, 0, 0, "");
+        var sparse = try sparse_mod.SparseIndex.open(a, "/indexes/sparse", sparse_opts);
+        defer sparse.close();
+        try sparse.batch(&.{.{ .doc_id = "a", .vec = .{ .indices = &.{3}, .values = &.{0.75} } }}, &.{});
+    }
+    {
+        var graph = try graph_mod.GraphIndex.open(a, {}, "/indexes/graph", "g", graph_opts);
+        defer graph.close();
+        const edges = try graph.getEdges(a, "b", "link", .in);
+        defer graph_mod.GraphIndex.freeEdges(a, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        var sparse = try sparse_mod.SparseIndex.open(a, "/indexes/sparse", sparse_opts);
+        defer sparse.close();
+        const query: sparse_mod.SparseVector = .{ .indices = &.{3}, .values = &.{1} };
+        const hits = try sparse.search(a, &query, 10);
+        defer sparse_mod.SparseIndex.freeResults(a, hits);
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("a", hits[0].doc_id);
+    }
+    var cursor = try docs.file.indexCatalogCursor(docs.file.activeCheckpoint(), "/indexes/");
+    defer cursor.deinit();
+    while (try cursor.next()) |entry| {
+        defer a.free(entry.key);
+        try std.testing.expect(std.mem.indexOf(u8, entry.key, "/.native-state/") != null);
+    }
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite native scalar namespace forks retain one snapshot after owner close" {
+    const namespaces = @import("namespace_store.zig");
+    const bound = @import("../namespace_bound_store.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-scalar-fork.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    var docs_open = true;
+    defer if (docs_open) docs.close();
+    docs.maintenance_start_suppressed = true;
+    var namespace_store = try namespaces.Backend.open(a, &docs, "/indexes/scalar", false);
+    var namespace_open = true;
+    defer if (namespace_open) namespace_store.deinit();
+    const backend = try bound.Backend.init(a, namespace_store);
+    namespace_open = false;
+    var backend_open = true;
+    defer if (backend_open) backend.close();
+    var scalar = try backend.runtimeStore(a);
+    var scalar_open = true;
+    defer if (scalar_open) scalar.deinit();
+    {
+        var txn = try scalar.beginBatch();
+        errdefer txn.abort();
+        try txn.put("\x00binary\xff", "original");
+        try txn.commit();
+    }
+    var original = try scalar.beginRead();
+    var original_open = true;
+    defer if (original_open) original.abort();
+    var fork = try original.forkRead();
+    var fork_open = true;
+    defer if (fork_open) fork.abort();
+    original.abort();
+    original_open = false;
+    {
+        var txn = try scalar.beginBatch();
+        errdefer txn.abort();
+        try txn.put("\x00binary\xff", "replacement");
+        try txn.commit();
+    }
+    var last = try fork.forkRead();
+    defer last.abort();
+    fork.abort();
+    fork_open = false;
+    scalar.deinit();
+    scalar_open = false;
+    backend.close();
+    backend_open = false;
+    docs.close();
+    docs_open = false;
+    try std.testing.expectEqualStrings("original", try last.get("\x00binary\xff"));
+    var cursor = try last.openCursor();
+    defer cursor.close();
+    try std.testing.expectEqualStrings("original", (try cursor.first()).?.value);
+}
+
+test "lite native namespace logical snapshots retain data without allocator fences" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-logical-namespace.aflite");
+    defer a.free(path);
+    var coordinator = native.ReaderCoordinator.init(a, std.testing.io);
+    defer coordinator.deinit();
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    docs.file.reader_coordinator = &coordinator;
+    try docs.file.putIndexCatalogRecord("/indexes/text/value", "old");
+    var snapshot = try docs.file.captureLogicalReadSnapshot();
+    defer snapshot.close();
+    try std.testing.expect(snapshot.logical_snapshot);
+    const inode = (try docs.file.file.stat(docs.file.runtime())).inode;
+    const readers = coordinator.readerStats(inode);
+    try std.testing.expect(readers.frontier.data != null);
+    try std.testing.expect(readers.frontier.metadata == null);
+    try std.testing.expectError(error.NativeSnapshotMetadataUnavailable, snapshot.check());
+    try std.testing.expectError(error.NativeSnapshotMetadataUnavailable, snapshot.captureFullReadSnapshot());
+    for (0..64) |_| try docs.file.putIndexCatalogRecord("/indexes/text/value", "new");
+    const old = (try snapshot.getIndexCatalogRecordAlloc(a, "/indexes/text/value")).?;
+    defer a.free(old);
+    try std.testing.expectEqualStrings("old", old);
+    var full = try docs.file.captureFullReadSnapshot();
+    defer full.close();
+    try std.testing.expect(coordinator.readerStats(inode).frontier.metadata != null);
+    try std.testing.expect((try full.checkAtFileSizeWithCancel((try full.file.stat(full.runtime())).size, null)).valid);
+}
+
+test "lite native vector metadata reopens without an inner LSM" {
+    const hbc = @import("../hbc_adapter.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-vector-metadata.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const options: @import("../hbc_backend.zig").LsmOptions = .{ .storage = adapter.storage() };
+    {
+        var index = try hbc.HBCIndex.openWithLsmOptions(a, "/indexes/vector", .{ .dims = 3, .storage_backend = .lsm, .no_sync = true }, options);
+        defer index.close();
+        try std.testing.expect(index.snapshotLsmWriteStats() == null);
+        try index.insert(1, &.{ 1, 0, 0 });
+        try index.insert(2, &.{ 0, 1, 0 });
+    }
+    {
+        var index = try hbc.HBCIndex.openWithLsmOptions(a, "/indexes/vector", .{ .dims = 3, .storage_backend = .lsm, .no_sync = true }, options);
+        defer index.close();
+        try std.testing.expect(index.snapshotLsmWriteStats() == null);
+        var results = try index.search(&.{ 1, 0, 0 }, 2);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(usize, 2), results.getHits().len);
+        try std.testing.expectEqual(@as(u64, 1), results.getHits()[0].vector_id);
+    }
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite typed text retirement preserves semantic plans and refuses active aliases atomically" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "typed-retirement.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const storage = adapter.storage();
+    var namespaces = try @import("namespace_store.zig").Backend.open(a, &docs, "/indexes/text/index", false);
+    defer namespaces.deinit();
+    const ns: @import("../backend_types.zig").Namespace = .{ .name = "meta" };
+    const one = std.mem.toBytes(std.mem.nativeToBig(u64, 1));
+    const two = std.mem.toBytes(std.mem.nativeToBig(u64, 2));
+    const retired_one = "retired_segment:" ++ one;
+    const retired_two = "retired_segment:" ++ two;
+    const active_two = "active_segment:" ++ two;
+    {
+        var seed = try namespaces.beginWrite();
+        errdefer seed.abort();
+        try seed.put(ns, retired_one, &.{1});
+        try seed.put(ns, active_two, &.{1});
+        try seed.commit();
+    }
+    try storage.writeFileAbsolute("/indexes/text/segments/1.seg", "retired");
+    try storage.writeFileAbsolute("/indexes/text/segments/2.seg", "active");
+    const before = docs.file.activeCheckpoint();
+    try std.testing.expectError(error.ArtifactStillActive, storage.retireTextSegments("/indexes/text", &.{ 1, 2 }));
+    try std.testing.expectEqualDeep(before, docs.file.activeCheckpoint());
+    try std.testing.expectEqual(@as(?u64, 7), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/1.seg"));
+    var prepared = try namespaces.beginWrite();
+    errdefer prepared.abort();
+    try prepared.put(ns, "unrelated-semantic-update", "ready");
+    const identity = (try docs.file.indexScopeIdentity("/indexes/text")).?;
+    try std.testing.expect(try storage.retireTextSegments("/indexes/text", &.{1}));
+    try std.testing.expectEqual(identity, (try docs.file.indexScopeIdentity("/indexes/text")).?);
+    try std.testing.expectEqualDeep(before.logical, docs.file.activeCheckpoint().logical);
+    try std.testing.expectEqual(@as(?u64, null), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/1.seg"));
+    try std.testing.expectEqual(@as(?u64, 6), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/2.seg"));
+    // The exact namespace generation remains current through physical cleanup.
+    try prepared.commit();
+    var read = try namespaces.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(ns, retired_one));
+    try std.testing.expectEqualStrings("ready", try read.get(ns, "unrelated-semantic-update"));
+    // Missing path+marker is an idempotent completed retirement. A bare
+    // unreferenced file is not sufficient authority for another unlink.
+    const completed = docs.file.activeCheckpoint();
+    try std.testing.expect(try storage.retireTextSegments("/indexes/text", &.{1}));
+    try std.testing.expectEqualDeep(completed, docs.file.activeCheckpoint());
+    try storage.writeFileAbsolute("/indexes/text/segments/3.seg", "unproven");
+    try std.testing.expectError(error.UnprovenArtifactRetirement, storage.retireTextSegments("/indexes/text", &.{3}));
+    {
+        var retire = try namespaces.beginWrite();
+        errdefer retire.abort();
+        try retire.delete(ns, active_two);
+        try retire.put(ns, retired_two, &.{1});
+        try retire.commit();
+    }
+    try std.testing.expect(try storage.retireTextSegments("/indexes/text", &.{2}));
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite native retirement sweep bounds pages and survives stale index snapshots" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "retirement-sweep.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const storage = adapter.storage();
+    var namespaces = try @import("namespace_store.zig").Backend.open(a, &docs, "/indexes/text/index", false);
+    defer namespaces.deinit();
+    const ns: @import("../backend_types.zig").Namespace = .{ .name = "meta" };
+    const active_id: u64 = 2;
+    {
+        var seed = try namespaces.beginWrite();
+        errdefer seed.abort();
+        for (1..71) |id| {
+            const suffix = std.mem.toBytes(std.mem.nativeToBig(u64, id));
+            const marker = "retired_segment:" ++ suffix;
+            try seed.put(ns, marker, &.{1});
+            if (id == active_id) {
+                const active = "active_segment:" ++ suffix;
+                try seed.put(ns, active, &.{1});
+            }
+        }
+        try seed.commit();
+    }
+    const SeedAliases = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            for (1..71) |id| {
+                var buffer: [128]u8 = undefined;
+                const alias = try std.fmt.bufPrint(&buffer, "/indexes/text/segments/{d}.seg", .{id});
+                try file.putIndexCatalogRecord(alias, "immutable artifact");
+            }
+        }
+    };
+    try docs.submitIndexMutation(&docs, SeedAliases.apply, true);
+    var source = try storage.openLeasedImmutableSource(a, "/indexes/text/segments/1.seg");
+    defer source.close();
+    var stale = try namespaces.beginRead();
+    defer stale.abort();
+    // A later semantic edit invalidates the detached index snapshot. Physical
+    // cleanup still proceeds against fresh current metadata and leaves this
+    // newer semantic generation untouched.
+    {
+        var edit = try namespaces.beginWrite();
+        errdefer edit.abort();
+        try edit.put(ns, "new-semantic-state", "current");
+        try edit.commit();
+    }
+    var prepared = try namespaces.beginWrite();
+    errdefer prepared.abort();
+    try prepared.put(ns, "prepared-after-cleanup", "ready");
+    const before = docs.file.activeCheckpoint();
+    const identity = (try docs.file.indexScopeIdentity("/indexes/text")).?;
+    const first = (try storage.sweepTextRetirements("/indexes/text", null)).?;
+    try std.testing.expectEqual(@as(usize, 64), first.count);
+    try std.testing.expect(!first.complete);
+    try std.testing.expectEqual(@as(u64, 64), first.ids[first.count - 1]);
+    try std.testing.expectEqualDeep(before.logical, docs.file.activeCheckpoint().logical);
+    try std.testing.expectEqual(identity, (try docs.file.indexScopeIdentity("/indexes/text")).?);
+    try std.testing.expectEqual(@as(?u64, null), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/1.seg"));
+    try std.testing.expectEqual(@as(?u64, 18), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/2.seg"));
+    var bytes: [18]u8 = undefined;
+    try source.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("immutable artifact", &bytes);
+    const last = (try storage.sweepTextRetirements("/indexes/text", first.ids[first.count - 1])).?;
+    try std.testing.expectEqual(@as(usize, 6), last.count);
+    try std.testing.expect(last.complete);
+    const settled = docs.file.activeCheckpoint();
+    const empty = (try storage.sweepTextRetirements("/indexes/text", null)).?;
+    try std.testing.expectEqual(@as(usize, 0), empty.count);
+    try std.testing.expect(empty.complete);
+    try std.testing.expectEqualDeep(settled, docs.file.activeCheckpoint());
+    try prepared.commit();
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite native retirement sweep rolls back a malformed page and respects namespace scopes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "retirement-sweep-refusal.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const storage = adapter.storage();
+    var namespaces = try @import("namespace_store.zig").Backend.open(a, &docs, "/indexes/text/index", false);
+    defer namespaces.deinit();
+    const ns: @import("../backend_types.zig").Namespace = .{ .name = "meta" };
+    const one = std.mem.toBytes(std.mem.nativeToBig(u64, 1));
+    const two = std.mem.toBytes(std.mem.nativeToBig(u64, 2));
+    {
+        var seed = try namespaces.beginWrite();
+        errdefer seed.abort();
+        try seed.put(ns, "retired_segment:" ++ one, &.{1});
+        try seed.put(ns, "retired_segment:" ++ two, "invalid");
+        try seed.commit();
+    }
+    try storage.writeFileAbsolute("/indexes/text/segments/1.seg", "keep");
+    const before = docs.file.activeCheckpoint();
+    try std.testing.expectError(error.InvalidRetiredSegmentMetadata, storage.sweepTextRetirements("/indexes/text", null));
+    try std.testing.expectEqualDeep(before, docs.file.activeCheckpoint());
+    try std.testing.expectEqual(@as(?u64, 4), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/1.seg"));
+    var scoped = Store.initWithNamespace(a, &docs, "/other");
+    try std.testing.expectError(error.InvalidNativeIndexPath, scoped.storage().sweepTextRetirements("/indexes/text", null));
+}
+
+test "lite detached artifact staging survives backend close without live callbacks" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "detached-resident-stage.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    docs.maintenance_start_suppressed = true;
+    var live = true;
+    defer if (live) docs.close();
+    var adapter = Store.init(a, &docs);
+    var stager = (try adapter.storage().acquireImmutableStager(a)).?;
+    defer stager.deinit();
+    const registry = docs.artifact_registry.?;
+    const target: immutable_artifact.AliasTarget = .{ .inode = (try docs.file.file.stat(docs.file.runtime())).inode, .file_namespace = docs.file.header.reader_epoch_namespace, .prefix = "/indexes/text" };
+    docs.close();
+    live = false;
+    try std.testing.expect(registry.store == null);
+    var resources = (try stager.acquireBuildResources()).?;
+    defer resources.deinit();
+    var artifact = try stager.stageDetached("owned after close");
+    defer artifact.deinit();
+    var source = try artifact.prepareLinkAt(target, "/indexes/text/segments/1.seg");
+    defer source.close();
+    var bytes: [17]u8 = undefined;
+    try source.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("owned after close", &bytes);
+    try std.testing.expectEqual(@as(usize, 0), registry.callbacks);
+    const large = try a.alloc(u8, artifacts.OwnedBytes.maximum_length + 1);
+    defer a.free(large);
+    @memset(large, 'x');
+    try std.testing.expectError(error.Unsupported, stager.stageDetached(large));
+    try std.testing.expectEqual(@as(usize, 0), registry.callbacks);
+}
+
+test "lite resident immutable sources retain owned bytes without durable range leases" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "resident-source.aflite");
+    defer a.free(path);
+    const original = try a.alloc(u8, 8192);
+    defer a.free(original);
+    @memset(original, 'a');
+    var store = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    var store_open = true;
+    defer if (store_open) store.close();
+    store.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &store);
+    const storage = adapter.storage();
+    try storage.writeFileAbsolute("/indexes/text/segments/1.seg", original);
+    const checkpoint = store.file.activeCheckpoint();
+    const barriers = store.file.test_durability_syncs.load(.monotonic);
+    var first = (try storage.openResidentImmutableSource(a, "/indexes/text/segments/1.seg")).?;
+    defer first.close();
+    try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
+    try std.testing.expectEqual(barriers, store.file.test_durability_syncs.load(.monotonic));
+    try std.testing.expect(store.artifact_registry.?.first == null);
+    var retained = try first.retainOwned();
+    defer retained.close();
+    @memset(original, 'b');
+    try storage.writeFileAbsolute("/indexes/text/segments/1.seg", original);
+    var second = (try storage.openResidentImmutableSource(a, "/indexes/text/segments/1.seg")).?;
+    defer second.close();
+    try std.testing.expect(!std.mem.eql(u8, &first.ranges.immutable_identity.?, &second.ranges.immutable_identity.?));
+    try storage.deleteFileAbsolute("/indexes/text/segments/1.seg");
+    const large = try a.alloc(u8, artifacts.OwnedBytes.maximum_length + 1);
+    defer a.free(large);
+    @memset(large, 'z');
+    try storage.writeFileAbsolute("/indexes/text/segments/large.seg", large);
+    const before_large = store.file.activeCheckpoint();
+    try std.testing.expect(try storage.openResidentImmutableSource(a, "/indexes/text/segments/large.seg") == null);
+    try std.testing.expectEqualDeep(before_large, store.file.activeCheckpoint());
+    for (0..8) |_| _ = try store.file.reclaimPages(64);
+    try std.testing.expect((try store.file.check()).valid);
+    store.close();
+    store_open = false;
+    var bytes: [8192]u8 = undefined;
+    try first.readInto(0, &bytes);
+    for (bytes) |byte| try std.testing.expectEqual(@as(u8, 'a'), byte);
+    try retained.readInto(0, &bytes);
+    for (bytes) |byte| try std.testing.expectEqual(@as(u8, 'a'), byte);
+    try second.readInto(0, &bytes);
+    for (bytes) |byte| try std.testing.expectEqual(@as(u8, 'b'), byte);
+}
+
+test "native publication values retain real backend accounting after every producer closes" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("backend.zig");
+    const values = @import("../native_publication_value.zig");
+    const resources_mod = @import("../resource_manager.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-bound-resources.aflite");
+    defer a.free(path);
+    var backend = try backend_mod.Handle.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .exclusive = true, .reclamation = .{ .enabled = false } });
+    var backend_live = true;
+    defer if (backend_live) backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, backend.native_docstore.?);
+    var stager = (try adapter.storage().acquireImmutableStager(a)).?;
+    var stager_live = true;
+    defer if (stager_live) stager.deinit();
+    var resources = (try stager.acquireBuildResources()).?;
+    var resources_live = true;
+    defer if (resources_live) resources.deinit();
+    const manager = resources.resource_manager.?;
+    const before = manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes;
+    var builder = try resources.createPublicationValue(8);
+    var builder_live = true;
+    defer if (builder_live) builder.deinit();
+    var value = builder.value();
+    defer value.deinit();
+    const charge = try values.Builder.budgetedBytes(resources_mod.Reservation, 8);
+    try std.testing.expectEqual(before + charge, manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes);
+    resources.deinit();
+    resources_live = false;
+    stager.deinit();
+    stager_live = false;
+    backend.deinit();
+    backend_live = false;
+    // The value's own owner retains the registry, transferred ResourceManager
+    // and reservation. No live Store, backend or preparation resource remains.
+    try builder.write(0, "identity");
+    try builder.seal();
+    builder.deinit();
+    builder_live = false;
+    try std.testing.expectEqual(@as(u64, @intCast(charge)), manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes);
+    try std.testing.expectEqualStrings("identity", try value.read());
+}
+
+test "native ordinal column keeps the actual source accounting owner after backend teardown" {
+    const a = std.testing.allocator;
+    const bindings = @import("../doc_ordinal_binding.zig");
+    const backend_mod = @import("backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-ordinal-owner.aflite");
+    defer a.free(path);
+    var backend = try backend_mod.Handle.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .exclusive = true, .reclamation = .{ .enabled = false } });
+    var backend_live = true;
+    defer if (backend_live) backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, backend.native_docstore.?);
+    const storage = adapter.storage();
+    var bytes: [13]u8 = undefined;
+    try bindings.encodeInto(&bytes, &.{ 47, 91 });
+    try storage.writeFileAbsolute("/indexes/text/segments/identity.seg", &bytes);
+    var source = (try storage.openResidentImmutableSource(a, "/indexes/text/segments/identity.seg")).?;
+    var source_live = true;
+    defer if (source_live) source.close();
+    const manager = source.resourceManager().?;
+    const before = manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes;
+    var binding = try bindings.copySealed(a, source, &bytes, 2);
+    defer binding.deinit();
+    try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes > before);
+    source.close();
+    source_live = false;
+    backend.deinit();
+    backend_live = false;
+    try std.testing.expectEqual(@as(?u32, 47), try binding.ordinal(0));
+    try std.testing.expectEqual(@as(?u32, 91), try binding.ordinal(1));
+    try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes > 0);
+}
+
+test "native read only resources retain accounting without granting artifact staging" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "readonly-native-resources.aflite");
+    defer a.free(path);
+    {
+        var created = try backend_mod.Handle.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .exclusive = true, .reclamation = .{ .enabled = false } });
+        created.native_docstore.?.maintenance_start_suppressed = true;
+        created.deinit();
+    }
+    var backend = try backend_mod.Handle.open(a, path, .{ .io = std.testing.io, .read_only = true, .reclamation = .{ .enabled = false } });
+    var backend_live = true;
+    defer if (backend_live) backend.deinit();
+    var adapter = Store.init(a, backend.native_docstore.?);
+    const storage = adapter.storage();
+    try std.testing.expectError(error.ReadOnly, storage.acquireImmutableStager(a));
+    var resources = (try storage.acquireImmutableResources()).?;
+    defer resources.deinit();
+    const manager = resources.resource_manager.?;
+    backend.deinit();
+    backend_live = false;
+    var builder = try resources.createPublicationValue(8);
+    defer builder.deinit();
+    try builder.write(0, "snapshot");
+    try builder.seal();
+    var value = builder.value();
+    defer value.deinit();
+    try std.testing.expectEqualStrings("snapshot", try value.read());
+    try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes > 0);
 }

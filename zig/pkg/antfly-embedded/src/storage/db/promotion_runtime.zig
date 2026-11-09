@@ -613,14 +613,14 @@ fn catchUpWindowMaybeSink(
         for (configs) |*cfg| cfg.deinit(gpa);
         gpa.free(configs);
     };
-    _ = replay_source.forEachMatchingRecord(gpa, from_sequence, .promotion, max_records, &ctx, Ctx.consume) catch |err| switch (err) {
+    const scan = replay_source.forEachMatchingRecord(gpa, from_sequence, .promotion, max_records, &ctx, Ctx.consume) catch |err| switch (err) {
         error.PromotionSinkUnavailable => return .{
             .max_seen = ctx.max_seen,
             .blocked_missing_sink = true,
         },
         else => return err,
     };
-    return .{ .max_seen = ctx.max_seen };
+    return .{ .max_seen = @max(ctx.max_seen, scan.last_sequence) };
 }
 
 /// Managed worker that catches the promoter up on changed resolution artifacts.
@@ -844,8 +844,32 @@ pub const PromotionRuntime = struct {
         return self.catchUpLocked(false);
     }
 
+    /// One atomic replay record is the cooperative publication unit. A
+    /// bounded caller cannot drain an arbitrarily growing sequence of records.
+    pub fn catchUpOnce(self: *PromotionRuntime, deadline_ns: u64) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionCatchUpOnce", .{ self, deadline_ns });
+        if (!self.catch_up_mutex.tryLock()) return;
+        defer self.catch_up_mutex.unlock();
+        if (@import("antfly_platform").time.monotonicNs() >= deadline_ns) return;
+        return self.catchUpLockedWithLimit(true, 1);
+    }
+
     fn catchUpLocked(self: *PromotionRuntime, single_window: bool) !void {
+        return self.catchUpLockedWithLimit(single_window, default_max_records_per_window);
+    }
+
+    fn catchUpLockedWithLimit(self: *PromotionRuntime, single_window: bool, max_records: usize) !void {
         errdefer _ = self.error_count.fetchAdd(1, .monotonic);
+        if (!self.worker_started.load(.acquire)) {
+            // A different manual owner may have completed this cut while the
+            // serving driver remained dormant. Never replay or overwrite an
+            // older applied watermark when taking that driver over again.
+            const applied = try enrichment_state.loadAppliedSequence(self.alloc, self.store_handle.store, scope_name);
+            if (applied > self.applied_sequence.load(.acquire)) {
+                self.applied_sequence.store(applied, .release);
+                self.notifySequence(applied);
+            }
+        }
 
         while (true) {
             const target = self.target_sequence.load(.acquire);
@@ -870,7 +894,7 @@ pub const PromotionRuntime = struct {
                     // from_sequence is exclusive (records with seq > from), matching
                     // the derived workers, which pass their applied_sequence.
                     applied,
-                    default_max_records_per_window,
+                    max_records,
                     self.catalog,
                 );
             } else result: {
@@ -886,7 +910,7 @@ pub const PromotionRuntime = struct {
                     das.artifactStore(),
                     null,
                     applied,
-                    default_max_records_per_window,
+                    max_records,
                     self.catalog,
                 );
             };
@@ -1479,6 +1503,7 @@ test "processResolutionArtifact fails closed on malformed resolution artifacts" 
 const FakeSource = struct {
     const Rec = struct { sequence: u64, payload: []const u8 };
     records: []const Rec,
+    scan_calls: std.atomic.Value(usize) = .init(0),
 
     fn source(self: *FakeSource) replay_source_mod.Source {
         return .{ .ptr = self, .vtable = &vtable };
@@ -1504,6 +1529,7 @@ const FakeSource = struct {
         _ = alloc;
         _ = hint;
         const self: *FakeSource = @ptrCast(@alignCast(ptr));
+        _ = self.scan_calls.fetchAdd(1, .monotonic);
         var matched: usize = 0;
         var last: u64 = 0;
         for (self.records) |rec| {
@@ -1903,4 +1929,80 @@ test "catchUpWindow with no matching records returns from_sequence" {
 
 test "PromotionRuntime compiles end-to-end" {
     testing.refAllDecls(PromotionRuntime);
+}
+
+test "inline resolver replacement promotion bounded turns commit one record and resume" {
+    const a = testing.allocator;
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    const key = try internal_keys.resolutionArtifactKeyAlloc(a, "doc:a", "resolved");
+    defer a.free(key);
+    try map.put(key, sample_resolution);
+    const first = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_artifact_keys = &.{key}, .target_hints = &.{.promotion} });
+    defer a.free(first);
+    const second = try change_journal_mod.encodeRecord(a, .{ .sequence = 2, .changed_artifact_keys = &.{key}, .target_hints = &.{.promotion} });
+    defer a.free(second);
+    var source = FakeSource{ .records = &.{ .{ .sequence = 1, .payload = first }, .{ .sequence = 2, .payload = second } } };
+    var capture = CaptureSink{ .alloc = a };
+    defer capture.deinit();
+    var store = try resolution_runtime.initRuntimeStore(a, map.backendStore());
+    defer store.deinit();
+    var runtime: PromotionRuntime = .{ .alloc = a, .store_handle = store, .replay_source = source.source(), .owner = null, .sink = capture.sink(), .sink_available = .init(true), .missing_sink_blocked = .init(false), .missing_sink_policy = .wait, .applied_sequence = .init(0), .target_sequence = .init(2), .error_count = .init(0), .shutdown_flag = .init(false), .io = null, .future = null };
+    try runtime.catchUpOnce(0);
+    try testing.expectEqual(@as(u64, 0), runtime.applied_sequence.load(.acquire));
+    try runtime.catchUpOnce(std.math.maxInt(u64));
+    try testing.expectEqual(@as(u64, 1), runtime.applied_sequence.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var peer = try PromotionRuntime.init(a, store.store, source.source(), host.ptr(), null, capture.sink(), .wait);
+    defer peer.deinit();
+    try peer.catchUpOnce(std.math.maxInt(u64));
+    try testing.expectEqual(@as(u64, 2), peer.applied_sequence.load(.acquire));
+    const scans = source.scan_calls.load(.monotonic);
+    try runtime.catchUpOnce(std.math.maxInt(u64));
+    try testing.expectEqual(scans, source.scan_calls.load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), runtime.applied_sequence.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
+    try runtime.catchUp();
+    try testing.expectEqual(@as(u64, 2), runtime.applied_sequence.load(.acquire));
+}
+
+test "catchUpWindow preserves a bounded fallback prefix before a late match" {
+    const a = testing.allocator;
+    var memory = @import("../mem_backend.zig").Backend.init(a, .{});
+    defer memory.close();
+    var journal = try @import("../docstore.zig").DocStore.openRuntime(a, try memory.runtimeStore(a, .{}));
+    defer journal.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var artifacts = MapStore{ .alloc = a };
+    defer artifacts.deinit();
+    const key = try internal_keys.resolutionArtifactKeyAlloc(scratch, "late", "resolution_v1");
+    try artifacts.put(key, sample_resolution);
+    var sink = CaptureSink{ .alloc = a };
+    defer sink.deinit();
+    // Model a legacy canonical journal whose hint side index is absent.
+    // Two complete unrelated pages precede the one record with useful work.
+    var batch = try journal.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    for (1..515) |sequence| {
+        const payload = try change_journal_mod.encodeRecord(scratch, .{
+            .sequence = @intCast(sequence),
+            .changed_artifact_keys = if (sequence == 514) &.{key} else &.{},
+            .target_hints = if (sequence == 514) &.{.promotion} else &.{.full_text},
+        });
+        const record_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, @intCast(sequence));
+        try batch.put(&record_key, payload);
+    }
+    try batch.commit();
+    const source = replay_source_mod.Source.fromPrimaryStore(&journal, null, null);
+    var applied: u64 = 0;
+    for ([_]u64{ 256, 512, 514 }) |expected| {
+        applied = try catchUpWindow(a, source, artifacts.store(), sink.sink(), applied, 1);
+        try testing.expectEqual(expected, applied);
+    }
+    try testing.expectEqual(@as(usize, 2), sink.keys.items.len);
 }

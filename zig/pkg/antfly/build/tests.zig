@@ -558,6 +558,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, introducer_test_mod, true, true);
 
+    const replay_executor_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/replay_executor_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, replay_executor_test_mod, true, true);
+    const replay_executor_tests = b.addTest(.{
+        .root_module = replay_executor_test_mod,
+        .filters = selectTestFilters(b, &.{ "manual replay", "replay budget" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const replay_executor_test_step = b.step("replay-executor-test", "Verify bounded manual replay and adaptive budgets");
+    replay_executor_test_step.dependOn(&addFilteredTestRunArtifact(b, replay_executor_tests).step);
+
     const data_consumer_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_runtime_test_root.zig"),
         .target = target,
@@ -2507,7 +2521,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lite_native_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lite_native_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
-        .filters = selectTestFilters(b, &.{ "storage.lite.", "standalone.backup_inspection." }),
+        .filters = selectTestFilters(b, &.{ "storage.lite.", "standalone.backup_inspection.", "physical maintenance batching" }),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -2530,9 +2544,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, lite_reader_test_mod, true, true);
     const lite_reader_tests = b.addTest(.{
         .root_module = lite_reader_test_mod,
-        .filters = selectTestFilters(b, &.{ "search.search.", "search.query.", "search.scorer.", "search.aggregation.", "datetime.", "index.", "merger.", "segment.", "section.inverted.", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." }),
+        .filters = selectTestFilters(b, &.{ "search.search.", "search.query.", "search.scorer.", "search.aggregation.", "datetime.", "index.", "merger.", "segment.", "section.inverted.", "section.posting_delta.", "introducer normalized hot tail", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const posting_delta_tests = b.addTest(.{
+        .root_module = lite_reader_test_mod,
+        .filters = &.{"normalized posting delta"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("posting-delta-test", "Verify normalized posting contributions and query iterator ownership")
+        .dependOn(&addFilteredTestRunArtifact(b, posting_delta_tests).step);
     b.step("lite-bounded-reader-test", "Verify segment scratch reuse and stored search result ownership")
         .dependOn(&addFilteredTestRunArtifact(b, lite_reader_tests).step);
     const lite_storage_tests = b.addTest(.{
@@ -3030,6 +3051,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
 
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
+    unit_test_step.dependOn(replay_executor_test_step);
     unit_test_step.dependOn(&b.top_level_steps.get("aws-credentials-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("antfly-google-embedding-catalog-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("embedded-package-test").?.step);
@@ -3545,6 +3567,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");
+    // Keep control publication's fault/retry contract independently runnable
+    // without unrelated server and format-upgrade qualification.
+    const generation_publication_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "storage.generation_publication.", "storage.posting_segment_store." },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-generation-publication-test", "Verify generation-control decisions, posting recovery and retry ownership")
+        .dependOn(&addFilteredTestRunArtifact(b, generation_publication_tests).step);
     const graph_ttl_migration_tests = b.addTest(.{
         .name = "graph-ttl-migration-tests",
         .root_module = antfly_test_mod,
@@ -5896,12 +5927,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configureRuntimeContracts(storage_vopr_runtime_test_mod);
-    storage_vopr_runtime_test_mod.addImport("antfly_platform", platform_mod);
-    storage_vopr_runtime_test_mod.addImport("antfly_hash", hash_mod);
-    storage_vopr_runtime_test_mod.addImport("antfly_pdf", pdf_mod);
+    @import("../../../build_support/embedded/source_owner.zig").attach(storage_vopr_runtime_test_mod);
+    const storage_runtime_test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{
+        .runtime = antfly_imports,
+        .vopr = vopr_mod,
+        .lmdb_engine = lmdb_engine_mod,
+    };
+    storage_runtime_test_imports.configure(b, storage_vopr_runtime_test_mod, true, true);
     const storage_vopr_runtime_tests = b.addTest(.{
         .root_module = storage_vopr_runtime_test_mod,
+        .filters = &.{ "storage_sim_runtime_root.test_", "storage.sim_runtime.", "storage.background_runtime." },
     });
     const run_storage_vopr_runtime_tests = b.addRunArtifact(storage_vopr_runtime_tests);
     const storage_vopr_runtime_test_step = b.step("storage-vopr-runtime-test", "Run storage VOPR runtime and modeled-device tests");
@@ -6117,7 +6152,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const persistent_unit_tests = b.addTest(.{
         .root_module = persistent_test_mod,
-        .filters = &.{"storage.persistent."},
+        .filters = &.{ "storage.persistent.", "storage.segment_admission." },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -6300,6 +6335,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
     db_test_mod.addImport("vopr", vopr_mod);
 
+    const lite_replay_control_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "db blocked graph maintenance cannot starve later control services", "db detached replay leaves optional maintenance to its retained continuation" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lite-replay-control-test", "Verify bounded replay and independent parked control services")
+        .dependOn(&addFilteredTestRunArtifact(b, lite_replay_control_tests).step);
+
     const opaque_read_session_step = b.step("opaque-read-session-test", "Run source and independently compiled statement and read-session lifetime regressions");
     if (b.top_level_steps.get("opaque-read-session-abi-integration-test")) |integration|
         opaque_read_session_step.dependOn(&integration.step);
@@ -6308,7 +6351,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "mutation-resource-frame-tests",
         .root_module = db_test_mod,
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("mutation-resource-frame-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024),
-        .filters = &.{"prepared commit disposition"},
+        .filters = &.{ "prepared commit disposition", "owned request coalescing", "owned transform inputs", "db owned transform preparation" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("mutation-resource-frame-test", "Verify committed disposition, partial preparation cleanup and durable replay")
@@ -7047,7 +7090,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const producer_maintenance_tests = b.addTest(.{
         .name = "producer-maintenance-tests",
         .root_module = db_test_mod,
-        .filters = &.{ "artifact projection construction releases", "overwritten document keys release", "db lookup includes unified artifact projection", "db enrichment reconfigure", "async dense catch-up", "async context dense catch-up", "dense target advance is not blocked", "target advance maintenance handoff", "target advance stuck tracking", "target advance debt logging", "db bulk ingest write commits", "db bulk ingest resolves transforms", "db bulk ingest applies pure-doc", "db bulk ingest keeps direct writes visible", "db relational mode stores authoritative", "relational initial storage mode cannot strand schemaless transaction intents", "owned db reconciles published schema indexes", "db ordered artifact inventory producer", "storage.db.artifact_completion_progress.", "storage.hot_standby durable outbox recovery", "db coordinated ttl", "db ttl cleanup rechecks", "db ttl cleanup defers", "portable activation retry", "db portable activation gate", "db quarantined index self-heals", "db targeted quarantine retry", "db dispatches generated document child range", "document child range partition preserves", "db retries remote document child range", "db managed visibility hook rehydrates", "db dense auto bulk finish wakes weak-sync", "db searches fail fast without joining portable", "db enrichment status changes notify", "relational columnar maintenance survives", "relational columnar artifact backoff", "owned DB open starts self-retaining workers", "resident index repair scheduler", "db enrichment restart supervisor", "db structural mutation autonomously retries", "db graph endpoint cleanup pages", "db dense target reads atomic", "document collectors release", "db computeEnrichments", "db extractEnrichments", "materialized preserved sources", "db managed admission", "db graph ownership restore", "db restore graph ownership replay", "native publication finalization forwards raced source completion", "db runtime-only status overlay preserves a resident enrichment worker" },
+        .filters = &.{ "artifact projection construction releases", "overwritten document keys release", "db lookup includes unified artifact projection", "db enrichment reconfigure", "async dense catch-up", "async context dense catch-up", "dense target advance is not blocked", "target advance maintenance handoff", "target advance stuck tracking", "target advance debt logging", "db bulk ingest write commits", "db bulk ingest resolves transforms", "db bulk ingest applies pure-doc", "db bulk ingest keeps direct writes visible", "db relational mode stores authoritative", "relational initial storage mode cannot strand schemaless transaction intents", "owned db reconciles published schema indexes", "db ordered artifact inventory producer", "storage.db.artifact_completion_progress.", "storage.hot_standby durable outbox recovery", "db coordinated ttl", "db ttl cleanup rechecks", "db ttl cleanup defers", "portable activation retry", "db portable activation gate", "db quarantined index self-heals", "db targeted quarantine retry", "db dispatches generated document child range", "document child range partition preserves", "db retries remote document child range", "db managed visibility hook rehydrates", "db dense auto bulk finish wakes weak-sync", "db searches fail fast without joining portable", "db enrichment status changes notify", "relational columnar maintenance survives", "relational columnar artifact backoff", "owned DB open starts self-retaining workers", "resident index repair scheduler", "db enrichment restart supervisor", "db structural mutation autonomously retries", "db graph endpoint cleanup pages", "db dense target reads atomic", "document collectors release", "db computeEnrichments", "db extractEnrichments", "materialized preserved sources", "db managed admission", "db graph ownership restore", "db restore graph ownership replay", "native publication finalization forwards raced source completion", "db runtime-only status overlay preserves a resident enrichment worker", "native vector block cold opens", "optional dense posting cold opens" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-producer-maintenance-test", "Run durable producer, publication recovery, and TTL observation regressions").dependOn(&addCuratedTestRunArtifact(b, producer_maintenance_tests, producer_maintenance_tests.filters).step);
@@ -7645,6 +7688,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.portable_wal.",
             "storage.posting_segment_store.",
             "storage.resource_manager.",
+            "storage.segment_admission.",
             "storage.retained_effects.",
             "storage.rewrite_program_cache.",
             "storage.rewrite_tail_spool.",

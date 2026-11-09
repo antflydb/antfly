@@ -259,6 +259,7 @@ def seed(
                     ]
                 }
             )
+        db.run_until_idle()
         compact = db.compact()
         measurement_stats(db)
         print(
@@ -327,9 +328,17 @@ def native_worker(config, index, ready, start, results, finish=None):
             thread_successes = [0] * threads
             thread_windows = [[0] * len(success_windows) for _ in range(threads)]
             thread_errors = []
+            visibility_samples = []
+            visibility_interval = config.get("visibility_interval", 0)
+            next_visibility = began + visibility_interval
+            text_payload = (
+                ("searchable churn alpha beta gamma delta " * 28)[:1024]
+                if config.get("text_payload") in ("words", "changing-words")
+                else "v" * 1024
+            )
 
             def write_loop(thread_index):
-                nonlocal last_write
+                nonlocal last_write, next_visibility
                 handle = handles[thread_index]
                 last_progress = 0.0
                 max_gap = 0.0
@@ -341,8 +350,6 @@ def native_worker(config, index, ready, start, results, finish=None):
                 )
                 try:
                     while time.monotonic() < deadline:
-                        # Several documents per call make one large journal record,
-                        # the shape that stresses background full-text replay.
                         batch_docs = config.get("batch_docs", 1)
                         keyspace = max(128, batch_docs)
                         keys = [
@@ -350,9 +357,19 @@ def native_worker(config, index, ready, start, results, finish=None):
                             for j in range(batch_docs)
                         ]
                         key = keys[-1]
+                        token = (
+                            f"churnworker{index}thread{thread_index}sequence{sequence}"
+                            if config.get("text_payload") == "changing-words"
+                            else None
+                        )
                         payload = {
                             "inserts": {
-                                k: {"text": "v" * 1024, "sequence": sequence}
+                                k: {
+                                    "text": f"{token} {text_payload}"
+                                    if token
+                                    else text_payload,
+                                    "sequence": sequence,
+                                }
                                 for k in keys
                             }
                         }
@@ -371,19 +388,53 @@ def native_worker(config, index, ready, start, results, finish=None):
                                 success_windows[window] += 1
                                 thread_windows[thread_index][window] += 1
                                 thread_successes[thread_index] += 1
-                                last_write = write
-                                if config["workload"] == "churn":
-                                    for k in keys:
-                                        latest_churn_writes[k] = {
-                                            "key": k,
-                                            "sequence": sequence,
-                                        }
+                                for k in keys:
+                                    item = {"key": k, "sequence": sequence}
+                                    if token:
+                                        item["text_token"] = token
+                                        previous = latest_churn_writes.get(k)
+                                        if previous is not None:
+                                            item["replaced_text_token"] = previous[
+                                                "text_token"
+                                            ]
+                                    if config["workload"] == "churn":
+                                        latest_churn_writes[k] = item
+                                    if k == key:
+                                        last_write = item
                             max_gap = max(max_gap, elapsed - last_progress)
                             last_progress = elapsed
                         except af.BusyError:
                             with lock:
                                 busy.append(time.perf_counter_ns() - began_call)
                         sequence += 1
+                        if (
+                            index == 0
+                            and thread_index == 0
+                            and visibility_interval > 0
+                            and time.monotonic() >= next_visibility
+                        ):
+                            observed = time.monotonic()
+                            try:
+                                state = handle.pending_work_stats()
+                                visibility_samples.append(
+                                    {
+                                        "started_seconds": observed - began,
+                                        "ended_seconds": time.monotonic() - began,
+                                        "debt": state.get("index_replay_debt", []),
+                                        "backlog": state.get(
+                                            "background_publications", {}
+                                        ).get("replay_backlog"),
+                                    }
+                                )
+                            except af.BusyError:
+                                visibility_samples.append(
+                                    {
+                                        "started_seconds": observed - began,
+                                        "ended_seconds": time.monotonic() - began,
+                                        "error": "Busy",
+                                    }
+                                )
+                            next_visibility = time.monotonic() + visibility_interval
                 except BaseException:  # noqa: BLE001 - surfaced as a worker failure below
                     thread_errors.append(traceback.format_exc())
                 thread_gaps[thread_index] = max_gap
@@ -487,11 +538,13 @@ def native_worker(config, index, ready, start, results, finish=None):
                 "proof_observed_until": proof_observed_until,
                 "admission": admission,
                 "last_write": last_write,
+                "visibility_samples": visibility_samples,
                 # At most 128 keys per worker, including holes left by Busy.
                 "latest_churn_writes": list(latest_churn_writes.values()),
                 **usage,
             }
             if config.get("allocator_diagnostics", False):
+                result["background_publication_snapshot"] = final_stats
                 # Admission/status reads can perturb storage. Collect only
                 # after every timed worker and proof snapshot has finished.
                 result["allocator_diagnostics"] = (
@@ -599,7 +652,11 @@ def verify(library: str, database: Path, expected: list[dict]) -> None:
     af = sdk(library)
     with af.open(database, busy_timeout=5.0) as db:
         for write in expected:
-            if db.lookup(write["key"])["sequence"] != write["sequence"]:
+            document = db.lookup(write["key"])
+            if document["sequence"] != write["sequence"] or (
+                write.get("text_token")
+                and not document["text"].startswith(write["text_token"] + " ")
+            ):
                 raise RuntimeError(
                     f"last successful write was not retained: {write['key']}"
                 )
@@ -762,6 +819,10 @@ def aggregate(workers: list[dict]) -> dict:
             row["proofs"]["allocator_proof_walks"] for row in workers
         ],
     }
+    # Workers arrive in completion order. Preserve identity alongside every
+    # parallel per-worker array; array position is never a worker ID.
+    if all("index" in row for row in workers):
+        result["per_worker_indices"] = [row["index"] for row in workers]
     for name, values in (("success", successful), ("busy", busy)):
         for percent in (50, 95, 99):
             result[f"{name}_p{percent}_ns"] = percentile(values, percent)
@@ -804,10 +865,17 @@ def aggregate(workers: list[dict]) -> dict:
     ):
         result[field] = sum(row[field] for row in workers)
     if any("allocator_diagnostics" in row for row in workers):
+        result["per_worker_background_publication_snapshots"] = [
+            {"index": row["index"], **row.get("background_publication_snapshot", {})}
+            for row in workers
+        ]
         result["allocator_diagnostics_after_workload"] = [
             {"index": row["index"], **row.get("allocator_diagnostics", {})}
             for row in workers
         ]
+    result["visibility_samples"] = [
+        sample for row in workers for sample in row.get("visibility_samples", [])
+    ]
     return result
 
 
@@ -873,6 +941,8 @@ def native_cases(args):
                 "watchdog": args.watchdog,
                 "workload": args.workload,
                 "allocator_diagnostics": args.allocator_diagnostics,
+                "visibility_interval": getattr(args, "visibility_interval", 0),
+                "text_payload": getattr(args, "text_payload", "opaque"),
                 "progress_window_seconds": args.progress_window,
                 "status_interval": args.status_interval,
                 "threads_per_worker": args.threads_per_worker,
@@ -1063,9 +1133,114 @@ def native_cases(args):
                         row["verification"] = json.loads(checked.stdout)
                 except subprocess.TimeoutExpired:
                     row.update(status="verification_watchdog_timeout", censored=True)
+            if getattr(args, "require_sustained", False):
+                row["sustained_qualification"] = sustained_qualification(
+                    row, args.seconds
+                )
+                if (
+                    row["status"] == "ok"
+                    and not row["sustained_qualification"]["passed"]
+                ):
+                    row["status"] = "sustained_qualification_failed"
             yield row
             if row["status"] not in ("ok", "no_progress", "starved_workers"):
                 return
+
+
+def active_visibility_qualification(
+    samples: list[dict], seconds: float, maximum_seconds: float = 60
+) -> dict:
+    observed = [s for s in samples if "error" not in s and s.get("debt")]
+    if len(observed) < 2 or observed[-1]["ended_seconds"] < seconds - 15:
+        return {"passed": False, "reason": "insufficient_active_visibility_evidence"}
+    maximum_observed = 0.0
+    for sample in observed:
+        if sample["started_seconds"] > seconds - maximum_seconds:
+            continue  # Right-censored targets are checked by final catch-up.
+        for debt in sample["debt"]:
+            completed = next(
+                (
+                    later
+                    for later in observed
+                    if later["ended_seconds"] >= sample["ended_seconds"]
+                    and any(
+                        row["index_name"] == debt["index_name"]
+                        and row["applied_sequence"] >= debt["target_sequence"]
+                        for row in later["debt"]
+                    )
+                ),
+                None,
+            )
+            if completed is None:
+                return {
+                    "passed": False,
+                    "reason": "active_visibility_did_not_reach_prior_target",
+                }
+            upper_seconds = completed["ended_seconds"] - sample["started_seconds"]
+            maximum_observed = max(maximum_observed, upper_seconds)
+    return {
+        "passed": maximum_observed <= maximum_seconds,
+        "maximum_watermark_visibility_upper_seconds": maximum_observed,
+        "maximum_allowed_seconds": maximum_seconds,
+        "samples": len(observed),
+    }
+
+
+def sustained_qualification(row: dict, seconds: float) -> dict:
+    """A surviving short run cannot qualify active-write storage or throughput.
+
+    Compare complete minute windows and sample active file size after a
+    three-minute warmup. These declared tolerances are a regression gate for
+    this bounded churn workload, not a general database space guarantee.
+    """
+    policy = {
+        "warmup_seconds": 180,
+        "maximum_tail_growth_fraction": 0.25,
+        "minimum_growth_allowance_bytes": 16 * 1024 * 1024,
+        "minimum_late_throughput_fraction": 0.75,
+    }
+    windows = row.get("per_worker_success_windows", [])
+    samples = row.get("file_size_samples", [])
+    tail = [s for s in samples if 180 <= s["elapsed_seconds"] <= seconds]
+    complete_minutes = int(seconds // 60)
+    if (
+        seconds < 600
+        or not windows
+        or any(len(w) < complete_minutes for w in windows)
+        or not tail
+        or tail[-1]["elapsed_seconds"] < seconds - 5
+    ):
+        return {
+            "passed": False,
+            "reason": "insufficient_sustained_evidence",
+            "policy": policy,
+        }
+    totals = [sum(w[i] for w in windows) for i in range(complete_minutes)]
+    early, late = sum(totals[1:4]), sum(totals[-3:])
+    fraction = late / early if early else None
+    initial = tail[0]["file_bytes"]
+    growth = max(s["file_bytes"] for s in tail) - initial
+    allowance = max(
+        policy["minimum_growth_allowance_bytes"],
+        initial * policy["maximum_tail_growth_fraction"],
+    )
+    visibility = active_visibility_qualification(
+        row.get("visibility_samples", []), seconds
+    )
+    return {
+        "passed": row.get("status") == "ok"
+        and visibility["passed"]
+        and growth <= allowance
+        and fraction is not None
+        and fraction >= policy["minimum_late_throughput_fraction"],
+        "policy": policy,
+        "minute_successful_calls": totals,
+        "late_to_early_throughput_fraction": fraction,
+        "active_visibility": visibility,
+        "tail_initial_file_bytes": initial,
+        "tail_growth_bytes": growth,
+        "tail_growth_allowance_bytes": allowance,
+    }
 
 
 def main():
@@ -1092,6 +1267,17 @@ def main():
     parser.add_argument("--timeout-ms", type=int, default=1000)
     parser.add_argument("--seed-records", type=int, default=1024)
     parser.add_argument("--workload", choices=("append", "churn"), default="churn")
+    parser.add_argument(
+        "--visibility-interval",
+        type=float,
+        default=0,
+        help="sample index progress during writes; observations consume measured wall time",
+    )
+    parser.add_argument(
+        "--text-payload",
+        choices=("opaque", "words", "changing-words"),
+        default="opaque",
+    )
     parser.add_argument("--no-sync", action="store_true")
     parser.add_argument(
         "--allocator-diagnostics",
@@ -1102,6 +1288,11 @@ def main():
         "--no-index",
         action="store_true",
         help="native control: remove the default full-text index before seeding",
+    )
+    parser.add_argument(
+        "--require-sustained",
+        action="store_true",
+        help="require >=10 minutes of bounded active-write growth and stable throughput",
     )
     parser.add_argument("--watchdog", type=float, default=30)
     parser.add_argument(
@@ -1148,6 +1339,16 @@ def main():
         )
     if args.mode == "native" and not args.library:
         parser.error("native mode requires --library")
+    if args.require_sustained and args.visibility_interval <= 0:
+        parser.error(
+            "--require-sustained requires --visibility-interval for active index progress evidence"
+        )
+    if args.require_sustained and (
+        args.mode != "native" or args.seconds < 600 or args.workload != "churn"
+    ):
+        parser.error(
+            "--require-sustained requires native churn lasting at least 600 seconds"
+        )
     output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("x"):

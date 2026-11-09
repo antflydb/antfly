@@ -29,12 +29,14 @@ import (
 
 // SQLError includes the engine's SQLSTATE diagnostic.
 type SQLError struct {
+	// Empty means a legacy response supplied no authoritative disposition.
+	CommitOutcome string `json:"commit_outcome,omitempty"`
 	TransactionID string `json:"transaction_id,omitempty"`
 	Code          string `json:"code"`
 	Message       string `json:"message"`
 	Hint          string `json:"hint"`
 	Retryable     bool   `json:"retryable"`
-	// OutcomeReceipt is set when an autocommit SQL write ended with
+	// OutcomeReceipt is set when a SQL write or native SQL COMMIT ended with
 	// OutcomeUnknown and the database issued a receipt for it. Resolve it
 	// later with DB.OutcomeReceiptStatus.
 	OutcomeReceipt string `json:"-"`
@@ -50,10 +52,12 @@ func sqlError(body []byte, err error) error {
 	var envelope struct {
 		Error          *SQLError `json:"error"`
 		TransactionID  string    `json:"transaction_id"`
+		CommitOutcome  string    `json:"commit_outcome"`
 		OutcomeReceipt string    `json:"outcome_receipt"`
 	}
 	if json.Unmarshal(body, &envelope) == nil && envelope.Error != nil {
 		envelope.Error.TransactionID = envelope.TransactionID
+		envelope.Error.CommitOutcome = envelope.CommitOutcome
 		envelope.Error.OutcomeReceipt = envelope.OutcomeReceipt
 		if envelope.Error.OutcomeReceipt == "" {
 			envelope.Error.OutcomeReceipt, _ = OutcomeReceiptOf(err)

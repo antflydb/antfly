@@ -156,6 +156,7 @@ fn CollectorMap(comptime T: type) type {
         pending_bytes: u64 = 0,
         pending: std.ArrayListUnmanaged([]const u8) = .empty,
         staging: ?struct { options: BuildTextOptions, owner: *?*PostingRun } = null,
+        normalized_delta: bool = false,
         pub const empty: @This() = .{};
         fn iterator(self: *@This()) Map.Iterator {
             return self.map.iterator();
@@ -184,10 +185,12 @@ fn CollectorMap(comptime T: type) type {
         }
     };
 }
+const posting_delta = @import("section/posting_delta.zig");
 const FieldPostingsBuilders = CollectorMap(FieldPostingsBuilder);
 const TypedFieldCollectors = CollectorMap(TypedFieldCollector);
 
 const FieldPostingsBuilder = struct {
+    delta: ?posting_delta.Builder = null,
     active: bool = false,
     builder: inverted.InvertedIndexBuilder = undefined,
     runs: std.ArrayListUnmanaged(PostingRunRange) = .empty,
@@ -209,6 +212,7 @@ const FieldPostingsBuilder = struct {
         if (!self.active) return;
         if (self.memory_tracker) |bytes| bytes.* -= self.estimatedMemoryBytes();
         if (self.spillable_tracker) |bytes| bytes.* -= self.estimatedMemoryBytes();
+        if (self.delta) |*delta| delta.deinit();
         self.builder.deinit();
         self.dense_ids.deinit(alloc);
         for (self.runs.items) |run| run.spool.releaseRange(run.offset);
@@ -222,6 +226,11 @@ const FieldPostingsBuilder = struct {
         defer {
             if (self.memory_tracker) |bytes| bytes.* = bytes.* - before + self.estimatedMemoryBytes();
             if (self.spillable_tracker) |bytes| bytes.* = bytes.* - before + self.estimatedMemoryBytes();
+        }
+        if (self.delta) |*delta| {
+            try delta.add(doc_idx, hits);
+            self.field_doc_count = try std.math.add(u32, self.field_doc_count, 1);
+            return;
         }
         if (self.doc_base == null) self.doc_base = doc_idx;
         const local = self.builder.doc_count;
@@ -351,6 +360,7 @@ const FieldPostingsBuilder = struct {
     }
 
     fn writeUnspilled(self: *FieldPostingsBuilder, alloc: Allocator, sink: anytype, count: u32, profile: ?*inverted.InvertedIndexBuildProfile) !void {
+        if (self.delta) |*delta| return delta.write(sink, count);
         if (self.builder.terms.count() == 0) return;
         if ((self.doc_base orelse 0) == 0 and self.dense_ids.items.len == 0) return self.builder.writeToSinkProfile(alloc, sink, profile);
         // Expand sparse local coordinates only in the final artifact.
@@ -384,7 +394,7 @@ const FieldPostingsBuilder = struct {
 
     pub fn estimatedMemoryBytes(self: *const FieldPostingsBuilder) u64 {
         if (!self.active) return 0;
-        return self.builder.estimatedMemoryBytes() + self.dense_ids.capacity * @sizeOf(u32);
+        return self.builder.estimatedMemoryBytes() + self.dense_ids.capacity * @sizeOf(u32) + if (self.delta) |delta| delta.body.capacity else @as(usize, 0);
     }
 };
 
@@ -406,6 +416,7 @@ fn ensureFieldPostingsBuilder(
     if (!gop.found_existing) {
         gop.key_ptr.* = field_name;
         gop.value_ptr.* = try FieldPostingsBuilder.init(alloc);
+        if (builders.normalized_delta) gop.value_ptr.delta = posting_delta.Builder.init(alloc);
         gop.value_ptr.memory_tracker = &builders.memory_bytes;
         gop.value_ptr.spillable_tracker = &builders.pending_bytes;
         builders.pending_bytes += gop.value_ptr.estimatedMemoryBytes();
@@ -550,6 +561,8 @@ pub const TextField = struct {
 };
 
 pub const BuildTextOptions = struct {
+    /// Durable normalized contributions; freezing is scheduled by window size.
+    normalized_postings: bool = false,
     contribution_cache: ?*AnalyzedContributionCache = null,
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
@@ -931,10 +944,35 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
     text_analysis: TextAnalysisConfig,
     options: BuildTextOptions,
 ) ![]u8 {
+    return buildMemorySegmentFromTextWithAnalysisOptions(alloc, alloc, docs, default_analyzer, text_analysis, options);
+}
+
+pub fn buildMemorySegmentFromTextWithAnalysisOptions(
+    alloc: Allocator,
+    scratch_alloc: Allocator,
+    docs: []const TextDocument,
+    default_analyzer: *const analysis_mod.Analyzer,
+    text_analysis: TextAnalysisConfig,
+    options: BuildTextOptions,
+) ![]u8 {
+    var effective = options;
+    effective.normalized_postings = options.normalized_postings and docs.len < posting_delta.maximum_documents;
     var sink_impl = segment_mod.MemorySegmentSink.init(alloc);
     errdefer sink_impl.deinit();
     var sink = sink_impl.sink();
-    try writeSegmentFromTextWithAnalysisOptions(alloc, docs, default_analyzer, text_analysis, options, &sink);
+    writeSegmentFromTextWithAnalysisOptions(scratch_alloc, docs, default_analyzer, text_analysis, effective, &sink) catch |err| {
+        if (!effective.normalized_postings or err != error.PostingDeltaTooLarge) return err;
+        // The private memory sink has not escaped to an artifact or transaction.
+        // Oversized rows retain the proven spillable frozen-segment path.
+        sink_impl.out.items.len = 0;
+        effective.normalized_postings = false;
+        try writeSegmentFromTextWithAnalysisOptions(scratch_alloc, docs, default_analyzer, text_analysis, effective, &sink);
+    };
+    if (effective.normalized_postings and sink_impl.out.items.len > posting_delta.maximum_bytes) {
+        sink_impl.out.items.len = 0;
+        effective.normalized_postings = false;
+        try writeSegmentFromTextWithAnalysisOptions(scratch_alloc, docs, default_analyzer, text_analysis, effective, &sink);
+    }
     return try sink_impl.finishOwned();
 }
 
@@ -987,7 +1025,7 @@ fn postingsRunTarget(options: BuildTextOptions, pending: u64) u64 {
 }
 
 fn spillPendingFields(alloc: Allocator, builders: *FieldPostingsBuilders, options: BuildTextOptions, count: u32, spool: *?*PostingRun) !void {
-    if (options.postings_run_io == null or builders.pending_bytes < options.postings_run_target_bytes) return;
+    if (builders.normalized_delta or options.postings_run_io == null or builders.pending_bytes < options.postings_run_target_bytes) return;
     const target = postingsRunTarget(options, builders.pending_bytes);
     if (builders.pending_bytes < target) return;
     // Spill largest fields first. Tiny companion fields retain their builders
@@ -1040,9 +1078,11 @@ fn writeTextSegmentWithScratch(
 
     var field_builders = FieldPostingsBuilders.empty;
     defer deinitFieldPostingsBuilders(alloc, &field_builders);
+    field_builders.normalized_delta = options.normalized_postings and docs.len < posting_delta.maximum_documents;
 
     var seg_writer = segment_mod.SegmentWriter.init(alloc);
     defer seg_writer.deinit();
+    seg_writer.normalized_postings = field_builders.normalized_delta;
 
     var field_indices = std.StringHashMapUnmanaged(u16).empty;
     defer field_indices.deinit(alloc);
@@ -5743,4 +5783,117 @@ test "highlight compact alias indexing fits a bounded working set with one analy
         try std.testing.expectEqual(@as(usize, 1), result.hits.len);
         std.debug.print("ALIAS_INDEX_BUDGET input={d} tokens={d} peak={d} quota={d} analyses={d} reuses={d}\n", .{ text.len, profile.token_count, budget.peak, budget.limit, profile.shared_analysis_runs, profile.shared_analysis_reuses });
     }
+}
+
+test "introducer normalized hot tail stays query visible and freezes without source analysis" {
+    const a = std.testing.allocator;
+    var phase: []const u8 = "build";
+    errdefer std.debug.print("normalized tail phase={s}\n", .{phase});
+    const docs = [_]TextDocument{
+        .{ .id = "first", .stored_data = "{\"rank\":2}", .text_fields = &.{.{ .field_name = "body", .text = "résumé 日本語 résumé" }} },
+        .{ .id = "second", .stored_data = "{\"rank\":1}", .text_fields = &.{.{ .field_name = "title", .text = "κόσμος" }} },
+        .{ .id = "third", .stored_data = "{\"rank\":3}", .text_fields = &.{.{ .field_name = "body", .text = "日本語 αλφα" }} },
+    };
+    const bytes = try buildSegmentFromTextWithAnalysisOptions(a, &docs, &analysis_mod.default_analyzer, .{}, .{ .normalized_postings = true });
+    defer a.free(bytes);
+    const control = try buildSegmentFromTextWithAnalysisOptions(a, &docs, &analysis_mod.default_analyzer, .{}, .{});
+    defer a.free(control);
+    phase = "contiguous admission";
+    var reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    try std.testing.expect(reader.isNormalizedPostingDelta());
+    phase = "native admission";
+    var native = try segment_mod.SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer native.deinit();
+    try std.testing.expect(native.isNormalizedPostingDelta());
+    phase = "catalog navigation capture";
+    const admission = try native.admission(a);
+    defer admission.deinit(a);
+    phase = "catalog reader admission";
+    var admitted = try segment_mod.SegmentReader.initNativeCatalogAdmission(a, .{ .contiguous = bytes }, admission, try segment_mod.SegmentReader.nativeCatalogFooter(.{ .contiguous = bytes }));
+    defer admitted.deinit();
+    try std.testing.expect(admitted.isNormalizedPostingDelta());
+    var normal = try segment_mod.SegmentReader.init(a, control);
+    defer normal.deinit();
+    phase = "query comparison";
+    for ([_]*segment_mod.SegmentReader{ &reader, &native, &admitted }) |candidate| {
+        for ([_][]const u8{ "body", "title" }) |field| {
+            try std.testing.expectEqualDeep(try normal.invertedFieldStats(field), try candidate.invertedFieldStats(field));
+            var expected = (try normal.invertedIndexScoped(a, field)).?;
+            defer expected.deinit();
+            var actual = (try candidate.invertedIndexScoped(a, field)).?;
+            defer actual.deinit();
+            var terms = try expected.termIterator();
+            defer terms.deinit();
+            while (try terms.next()) |entry| {
+                const found = (try actual.lookup(entry.term)).?;
+                try std.testing.expectEqual(entry.result.docFreq(), found.docFreq());
+                var left = try entry.result.iterator(a);
+                defer left.deinit();
+                var right = try found.iterator(a);
+                defer right.deinit();
+                while (try left.next()) |hit| {
+                    const value = (try right.next()).?;
+                    try std.testing.expectEqual(hit.doc_id, value.doc_id);
+                    try std.testing.expectEqual(hit.freq, value.freq);
+                    try std.testing.expectEqual(hit.norm, value.norm);
+                    try std.testing.expectEqualSlices(u32, hit.positions, value.positions);
+                }
+                try std.testing.expect((try right.next()) == null);
+            }
+        }
+    }
+    phase = "scored phrase and pattern queries";
+    {
+        const search = @import("search/search.zig");
+        var tail_writer = try index_mod.IndexWriter.init(a);
+        defer tail_writer.deinit();
+        try tail_writer.addSegment(bytes);
+        var frozen_writer = try index_mod.IndexWriter.init(a);
+        defer frozen_writer.deinit();
+        try frozen_writer.addSegment(control);
+        const tail_snapshot = tail_writer.snapshot();
+        const frozen_snapshot = frozen_writer.snapshot();
+        for ([_]search.SearchQuery{
+            .{ .match = .{ .field = "body", .text = "日本語" } },
+            .{ .phrase = .{ .field = "body", .text = "résumé 日本語" } },
+            .{ .prefix = .{ .field = "body", .prefix = "日" } },
+            .{ .wildcard = .{ .field = "body", .pattern = "日*" } },
+            .{ .regexp = .{ .field = "body", .pattern = "日.*" } },
+        }) |query| {
+            var expected = try search.execute(a, frozen_snapshot, .{ .query = query, .k = 10 });
+            defer expected.deinit();
+            var actual = try search.execute(a, tail_snapshot, .{ .query = query, .k = 10 });
+            defer actual.deinit();
+            try std.testing.expect(expected.hits.len != 0);
+            try std.testing.expectEqual(expected.total_hits, actual.total_hits);
+            try std.testing.expectEqual(expected.hits.len, actual.hits.len);
+            for (expected.hits, actual.hits) |left, right| {
+                try std.testing.expectEqual(left.doc_id, right.doc_id);
+                try std.testing.expectApproxEqAbs(left.score, right.score, 0.00001);
+            }
+        }
+    }
+    phase = "legacy reader";
+    // The legacy contiguous helper also owns its lazy compiled navigation.
+    _ = (try reader.invertedIndex("body")).?;
+    _ = (try reader.invertedIndex("body")).?;
+    phase = "freeze";
+    const frozen = try segment_mod.mergeSegments(a, &.{ bytes, bytes });
+    defer a.free(frozen);
+    const expected_frozen = try segment_mod.mergeSegments(a, &.{ control, control });
+    defer a.free(expected_frozen);
+    try std.testing.expectEqualSlices(u8, expected_frozen, frozen);
+    phase = "frozen admission";
+    var merged = try segment_mod.SegmentReader.init(a, frozen);
+    defer merged.deinit();
+    try std.testing.expect(!merged.isNormalizedPostingDelta());
+    try std.testing.expectEqual(@as(u32, 6), merged.doc_count);
+    var body = (try merged.invertedIndexScoped(a, "body")).?;
+    defer body.deinit();
+    var terms = try body.termIterator();
+    defer terms.deinit();
+    while (try terms.next()) |entry| try std.testing.expectEqual(@as(u32, 0), entry.result.docFreq() % 2);
+    var rank = (try merged.typedDocValuesScoped(a, "rank")).?;
+    defer rank.deinit();
 }

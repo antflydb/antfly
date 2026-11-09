@@ -111,7 +111,7 @@ pub fn notApplied(err: anyerror) anyerror {
     if (isUnknownOutcome(err)) return error.SqlReconciliationRequired;
     if (!std.mem.eql(u8, describe(err).code, "XX000")) return err;
     return switch (err) {
-        error.Busy, error.WriterLocked, error.ConcurrencyUnavailable, error.CapacityUnavailable, error.CapacityObservationStale, error.LiteRetirementBacklogExceeded, error.TextMergeBackpressureTimeout, error.SourceFileChanged, error.GenerationTransitionActive, error.IndexArtifactCleanupPending, error.EmbeddingProbeUnavailable, error.InferenceProviderCallCapacityExhausted, error.IntegrityCatalogUnavailable, error.ResourceTemporarilyUnavailable, error.StorageReadTemporarilyUnavailable => error.SqlMutationNotAppliedBusy,
+        error.Busy, error.WriterLocked, error.ConcurrencyUnavailable, error.CapacityUnavailable, error.CapacityObservationStale, error.LiteRetirementBacklogExceeded, error.LiteReplayBacklogExceeded, error.TextMergeBackpressureTimeout, error.SourceFileChanged, error.GenerationTransitionActive, error.IndexArtifactCleanupPending, error.EmbeddingProbeUnavailable, error.InferenceProviderCallCapacityExhausted, error.IntegrityCatalogUnavailable, error.ResourceTemporarilyUnavailable, error.StorageReadTemporarilyUnavailable => error.SqlMutationNotAppliedBusy,
         error.LiteStorageBudgetExceeded, error.LiteInsufficientDiskSpace, error.NoSpaceLeft, error.DiskQuota => error.SqlMutationNotAppliedNoSpace,
         else => error.SqlMutationNotApplied,
     };
@@ -267,7 +267,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.FileBusy, error.WouldBlock => .{ .code = "55P03", .message = "The database resource is temporarily locked.", .hint = "Retry the complete statement after the competing operation finishes.", .retryable = true },
         // These identities are assigned only at a commit boundary that has
         // proved the statement was not applied (see `notApplied`).
-        error.SqlMutationNotAppliedBusy => .{ .code = "55P03", .message = "The database was busy with competing work; the statement was not applied.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
+        error.SqlMutationNotAppliedBusy, error.SqlNativeCommitCapacityNotApplied => .{ .code = "55P03", .message = "The database was busy with competing work; the statement was not applied.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
         error.SqlMutationNotAppliedNoSpace => .{ .code = "53100", .message = "The database has no storage capacity left for this statement; it was not applied.", .hint = "Free disk space or raise the storage budget, then retry.", .retryable = false },
         error.SqlMutationNotApplied => .{ .code = "58000", .message = "The statement failed before it committed; it was not applied.", .hint = "It is safe to retry; if the failure repeats, contact the operator.", .retryable = true },
         error.PreDecisionDeadlineExceeded => .{ .code = "57014", .message = "The statement's deadline expired before it committed; nothing was applied.", .hint = "Retry with a longer deadline.", .retryable = true },
@@ -313,6 +313,7 @@ test "SQL diagnostics retain definite constraints conflicts and unknown outcomes
         .{ .err = error.RowPolicyDenied, .code = "42501", .retryable = false },
         .{ .err = error.RowPolicyAuthenticationRequired, .code = "42501", .retryable = false },
         .{ .err = error.FileBusy, .code = "55P03", .retryable = true },
+        .{ .err = error.SqlNativeCommitCapacityNotApplied, .code = "55P03", .retryable = true },
         .{ .err = error.WouldBlock, .code = "55P03", .retryable = true },
         .{ .err = error.SqlStatementReadUnavailable, .code = "53300", .retryable = true },
         .{ .err = error.PrivacyStale, .code = "53300", .retryable = true },

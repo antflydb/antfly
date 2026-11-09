@@ -1,0 +1,113 @@
+{
+  "scope": "Debug shared-host operation-count diagnostics, telemetry enabled; no baseline/reference reruns and no final performance qualification.",
+  "validation": {
+    "full_owner_intermediate": {
+      "passed": 396,
+      "skipped": 3,
+      "failed": 4,
+      "leaks": 0,
+      "failures": "Three changed scheduling/probe expectations and one probe transaction cleanup error; corrected thereafter."
+    },
+    "focused_final": {
+      "passed": 70,
+      "skipped": 0,
+      "failed": 0,
+      "leaks": 0
+    },
+    "sql_normalization_traced": "All three scenarios passed; source probe stack confirmed abort-after-commit cleanup in the test.",
+    "abi_public_exports": 138
+  },
+  "measurements": {
+    "coalesced-physical-service-debug-counts/primary": {
+      "p50_ns": 5553959,
+      "elapsed_ns": 776815083,
+      "foreground_syncs": 128,
+      "background_syncs": 25,
+      "library_sha256": "2ba8b2eb8e27878ff56910ae7dace92d257c53014ac30df9a779cfbb4432c5b6",
+      "checks_passed": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.12973404199874494
+      }
+    },
+    "coalesced-physical-service-debug-counts/indexed": {
+      "p50_ns": 26238291,
+      "elapsed_ns": 3674166959,
+      "foreground_syncs": 128,
+      "background_syncs": 66,
+      "library_sha256": "2ba8b2eb8e27878ff56910ae7dace92d257c53014ac30df9a779cfbb4432c5b6",
+      "checks_passed": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.1618376660044305
+      }
+    },
+    "covered-source-debug-counts/primary": {
+      "p50_ns": 5751750,
+      "elapsed_ns": 803086209,
+      "foreground_syncs": 128,
+      "background_syncs": 26,
+      "library_sha256": "97195eb5a0e402e929418033c43df1ed4a76386e1c2f1f7a6fbbcd21ea86f93c",
+      "checks_passed": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.1056912909989478
+      }
+    },
+    "covered-source-debug-counts/indexed": {
+      "p50_ns": 15521500,
+      "elapsed_ns": 3338842041,
+      "foreground_syncs": 128,
+      "background_syncs": 69,
+      "library_sha256": "97195eb5a0e402e929418033c43df1ed4a76386e1c2f1f7a6fbbcd21ea86f93c",
+      "checks_passed": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.2027117090037791
+      }
+    },
+    "serving-physical-merge-debug-counts/primary": {
+      "p50_ns": 5967000,
+      "elapsed_ns": 835564250,
+      "foreground_syncs": 128,
+      "background_syncs": 26,
+      "library_sha256": "9634e6c37fb807a90619b21016229019fc69b2535ba2430170c0f9fe19de5774",
+      "checks_passed": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.11644549999618903
+      }
+    },
+    "serving-physical-merge-debug-counts/indexed": {
+      "p50_ns": 11184250,
+      "elapsed_ns": 3182449208,
+      "foreground_syncs": 128,
+      "background_syncs": 75,
+      "library_sha256": "9634e6c37fb807a90619b21016229019fc69b2535ba2430170c0f9fe19de5774",
+      "checks_passed": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.16561666699999478
+      }
+    }
+  },
+  "remaining": "Merge task capture still needs admission before detached work: final diagnostic starts one merge but repeatedly cancels other artifact captures. Ordinary SQL commit preparation, unchanged-importer and final optimized host qualification remain outstanding."
+}
