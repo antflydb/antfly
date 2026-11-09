@@ -7,6 +7,9 @@ on:
         description: "Antfly version to publish, with or without v prefix"
         required: true
         type: string
+      build_controller_commit:
+        required: true
+        type: string
       source_commit:
         description: "Immutable source commit that produced the native archives"
         required: true
@@ -32,12 +35,26 @@ env:
 
 jobs:
   package:
+    permissions:
+      contents: read
+      id-token: write
     name: Build CLI package artifacts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.source_commit }}
+
+      - name: Check out pinned CI artifact exchange tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.build_controller_commit }}
+          path: release-controller
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/upload-ci-artifact
+            scripts/ci/artifact_exchange.py
+          sparse-checkout-cone-mode: false
 
       - name: Resolve version
         id: version
@@ -119,8 +136,8 @@ jobs:
             --commit "${{ inputs.source_commit }}"
 
       - name: Upload immutable CLI snapshot
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: ./release-controller/.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           name: antfly-cli-snapshot
           path: dist/cli-snapshot/
-          if-no-files-found: error
