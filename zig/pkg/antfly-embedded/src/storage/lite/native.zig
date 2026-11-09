@@ -6440,10 +6440,24 @@ pub const NativeFile = struct {
 
     fn ledgerRead(context: *anyopaque, a: Allocator, page: u64) ![]u8 {
         const file: *NativeFile = @ptrCast(@alignCast(context));
+        const expected_kind: PageKind = if (page == file.activeCheckpoint().free_map_root_page) .free_map else .allocator;
+        // A cache hit already holds a CRC-validated page; borrow its payload
+        // directly instead of duplicating the whole page just to decode and
+        // immediately discard the full-page copy. allocator_v4's ledger load
+        // calls this once per ledger page per commit, so this was the single
+        // largest allocation site in the write path.
+        const use_cache = file.page_cache_enabled.load(.monotonic) and file.page_cache_bypass.load(.monotonic) == 0;
+        if (use_cache) {
+            const physical = physicalPage(page);
+            if (try file.page_cache.acquirePayload(file.allocator, physical, @intCast(file.header.page_size))) |view| {
+                defer file.page_cache.releaseRaw(file.allocator, view);
+                if (view.validation.?.kind != expected_kind) return error.UnexpectedNativePageKind;
+                return try a.dupe(u8, view.bytes[page_header_size..][0..view.validation.?.payload_len]);
+            }
+        }
         const raw = try file.readPageAlloc(a, page);
         defer a.free(raw);
-        const kind: PageKind = if (page == file.activeCheckpoint().free_map_root_page) .free_map else .allocator;
-        return try a.dupe(u8, try decodePagePayload(raw, kind));
+        return try a.dupe(u8, try decodePagePayload(raw, expected_kind));
     }
     fn ledgerReadOnlyAllocate(_: *anyopaque) !u64 {
         return error.ReadOnly;
