@@ -1,6 +1,6 @@
 """Control the optional antfly-source companion at its own base URL."""
 
-from typing import Any
+from typing import Any, Self
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -46,7 +46,7 @@ class _SourceTransport:
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self) -> "SourcesClient":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: Any) -> None:
