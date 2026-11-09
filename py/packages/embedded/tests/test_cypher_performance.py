@@ -8739,6 +8739,12 @@ def test_grouped_domain_seeks_preserve_null_keys_and_non_distinct_counts(graph_d
                 assert result["stats"]["scanned_anchors"] < 256
 
 
+# These fixed-domain observers must beat a 256-anchor work ceiling and cross
+# native pages. Keep 64 times that ceiling; the separate 64,000-distinct-key
+# and 50,000-offset cases retain the large retained-memory scaling coverage.
+OBSERVER_DOMAIN_ROWS = 16384
+
+
 def scope_domains(db, count):
     with db.open_table("docs") as table:
         table.batch(
@@ -8754,7 +8760,7 @@ def scope_domains(db, count):
 
 
 def test_group_observers_survive_output_filters_wrappers_and_later_order(graph_db):
-    scope_domains(graph_db, 64000)
+    scope_domains(graph_db, OBSERVER_DOMAIN_ROWS)
     groups = [[f"g{i}", "3"] for i in range(8)]
     for query, expected in (
         ("MATCH(n:D) RETURN n.id,count(DISTINCT n.score)+0 AS c ORDER BY n.id", groups),
@@ -8865,7 +8871,10 @@ def test_total_group_wrappers_preserve_bounded_high_cardinality_windows(graph_db
 def test_bounded_group_obligations_stop_after_accepted_groups(graph_db):
     with graph_db.open_table("docs") as table:
         table.batch(
-            [af.WriteIntent(key=f"u{i:06}", value={"id": f"u{i:06}", "score": i % 3}) for i in range(64000)],
+            [
+                af.WriteIntent(key=f"u{i:06}", value={"id": f"u{i:06}", "score": i % 3})
+                for i in range(OBSERVER_DOMAIN_ROWS)
+            ],
             timestamp=1,
         )
     graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
@@ -8889,7 +8898,7 @@ def test_bounded_group_obligations_stop_after_accepted_groups(graph_db):
 
 
 def test_sql_group_and_filter_observers_scale_with_index_domains(graph_db):
-    scope_domains(graph_db, 64000)
+    scope_domains(graph_db, OBSERVER_DOMAIN_ROWS)
     membership = graph_db.cypher_json(
         "g",
         {
@@ -8970,7 +8979,7 @@ def test_group_observer_proofs_preserve_nulls_ordinals_and_late_errors(graph_db)
 
 
 def test_sql_filtered_observers_and_constant_admission_have_bounded_work(graph_db):
-    scope_domains(graph_db, 64000)
+    scope_domains(graph_db, OBSERVER_DOMAIN_ROWS)
     source = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
     reducers = "count(DISTINCT score),min(score),max(score)"
     filtered = "count(DISTINCT score) FILTER(WHERE score>=1),min(score) FILTER(WHERE score>=1),max(score) FILTER(WHERE score>=1)"
@@ -9120,7 +9129,7 @@ def test_sql_filtered_observer_group_presence_and_windows_match_exhaustive_contr
 
 
 def test_duplicate_membership_inputs_preserve_indexed_domains(graph_db):
-    scope_domains(graph_db, 64000)
+    scope_domains(graph_db, OBSERVER_DOMAIN_ROWS)
     # The two scalar domains are identical across the old 256-input threshold.
     for length in (2, 256, 258, 1000):
         values = [1, 2] * (length // 2)

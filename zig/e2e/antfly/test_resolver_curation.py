@@ -663,16 +663,30 @@ def test_runtime_entity_curation_preserves_future_promotion(
 
     expected_nodes = {"note-0", "note-1"} if action == "merge" else {"note-0"}
 
+    last_graph = None
+
     def graph_published():
+        nonlocal last_graph
         # Entity promotion and graph publication are independent consumers.
         # A write-level acknowledgement plus promoted rows does not fence graph
         # visibility, particularly with independently applied Raft publications.
         reached = traversal(qualified)
         assert reached.ok, reached.text
-        nodes = reached.json()["responses"][0]["graph_results"]["incoming"]["nodes"]
+        last_graph = reached.json()
+        nodes = last_graph["responses"][0]["graph_results"]["incoming"]["nodes"]
         return nodes if {node["key"] for node in nodes} == expected_nodes else None
 
-    assert wait_until(graph_published, timeout_s=30), api.debug_logs()[-16000:]
+    assert wait_until(graph_published, timeout_s=30), (
+        json.dumps(
+            {
+                "last_query": last_graph,
+                "index": api.get(f"/tables/{source}/indexes/knowledge"),
+            },
+            sort_keys=True,
+        )
+        + "\n"
+        + api.debug_logs()[-16000:]
+    )
     multiple_seeds = {"identities": list(qualified["identities"])}
     expected_paths = [(seed, "note-0")]
     if action == "merge":
