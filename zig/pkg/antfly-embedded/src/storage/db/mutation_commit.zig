@@ -3108,13 +3108,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     transaction_replication_replay_payload = payload;
                 };
             };
-            const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (append_derived_replay)
+            // Mutable: the journal-suppression block below (after every
+            // inline publication has resolved which indexes it actually
+            // serviced) may repoint `.payload` at a hint-filtered re-
+            // encoding for the LOCAL journal write only. `replay_payload`
+            // itself is never touched -- it already fed the full-hint
+            // bytes to the replication-mirror outbox above, and a
+            // replica's own inline-publication state is independent of
+            // this node's, so replication must keep every hint.
+            var replay_append: ?docstore_mod.DocStore.ReplayAppend = if (append_derived_replay)
                 .{
                     .sequence = sequence,
                     .payload = replay_payload,
                 }
             else
                 null;
+            var suppressed_replay_payload: ?[]u8 = null;
+            defer if (suppressed_replay_payload) |payload| S.ownerField(self, "alloc").*.free(payload);
             // This is the final fallible replay-retention boundary. It is an
             // immediate node-wide reservation: no reclamation, disk I/O, or wait
             // occurs while the apply fence is held. A hard-limit failure is
@@ -3786,6 +3796,92 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     inline_algebraic_publications[inline_algebraic_publication_count] = prepared;
                     inline_algebraic_handled_names[inline_algebraic_publication_count] = target_name;
                     inline_algebraic_publication_count += 1;
+                }
+            }
+            // Journal suppression (lite-single-commit-write-path.md §3.2a
+            // "Journal"): an inline-published index's facts and progress
+            // are already proven by THIS SAME native transaction, so
+            // recovery never needs its journal hint for this write. Must
+            // run only now, after every inline publication above has
+            // resolved which indexes it actually serviced -- never pre-
+            // guessed from the gate conditions alone, since a publication
+            // that failed to prepare or lost its `commit_participants`
+            // slot to an earlier one falls through to the non-inline path
+            // and still needs its hint kept. A kind's hint is dropped only
+            // when EVERY target of that kind in this write was serviced
+            // inline; a mixed batch (two indexes of the same kind, only
+            // one inline-handled) keeps the hint for the other.
+            if (replay_append) |entry| {
+                // text/graph/sparse/dense's own blocks above already strip
+                // their handled name(s) out of `sync_targets.all_indexes`
+                // (and, for text, `full_text_indexes` too) on success, so
+                // what's left in those lists at this point is already the
+                // REMAINING, non-inline-serviced set for those four kinds
+                // -- "fully serviced" is exactly "nothing of that kind is
+                // left". Algebraic's own block does NOT strip (its targets
+                // stay in `all_indexes` whether handled or not), so its
+                // remaining count needs the handled ones subtracted back
+                // out explicitly.
+                const suppress_full_text = inline_text_publication_count != 0 and
+                    sync_targets.full_text_indexes.len == 0;
+                var suppress_graph = false;
+                var suppress_sparse = false;
+                var suppress_dense = false;
+                var suppress_algebraic = false;
+                if (inline_graph_publication != null or inline_sparse_publication != null or
+                    inline_dense_publication != null or inline_algebraic_publication_count != 0)
+                {
+                    // No dedicated per-kind target list exists for these
+                    // four kinds the way `full_text_indexes` does, so count
+                    // them out of the (already-filtered) `all_indexes` by
+                    // looking each remaining name's kind up in the catalog.
+                    var graph_remaining: usize = 0;
+                    var sparse_remaining: usize = 0;
+                    var dense_remaining: usize = 0;
+                    var algebraic_remaining: usize = 0;
+                    for (sync_targets.all_indexes) |target_name| {
+                        const cfg = S.ownerField(self, "core").*.index_manager.get(target_name) orelse continue;
+                        switch (cfg.kind) {
+                            .full_text => {},
+                            .graph => graph_remaining += 1,
+                            .sparse_vector => sparse_remaining += 1,
+                            .dense_vector => dense_remaining += 1,
+                            .algebraic => algebraic_remaining += 1,
+                        }
+                    }
+                    // Algebraic's handled targets are still counted above
+                    // (its block never strips `all_indexes`); back them out
+                    // so `algebraic_remaining` means the same thing the
+                    // other three kinds' counts already do: how many
+                    // targets of this kind still need the slow path.
+                    algebraic_remaining -|= inline_algebraic_publication_count;
+                    suppress_graph = inline_graph_publication != null and graph_remaining == 0;
+                    suppress_sparse = inline_sparse_publication != null and sparse_remaining == 0;
+                    suppress_dense = inline_dense_publication != null and dense_remaining == 0;
+                    suppress_algebraic = inline_algebraic_publication_count != 0 and algebraic_remaining == 0;
+                }
+                if (suppress_full_text or suppress_graph or suppress_sparse or suppress_dense or suppress_algebraic) {
+                    var decoded = try change_journal_mod.decodeRecord(group_alloc, entry.payload);
+                    defer decoded.deinit();
+                    var kept_hints: std.ArrayListUnmanaged(change_journal_mod.TargetHint) = .empty;
+                    for (decoded.record.target_hints) |hint| {
+                        const drop = switch (hint) {
+                            .full_text => suppress_full_text,
+                            .graph => suppress_graph,
+                            .sparse_vector => suppress_sparse,
+                            .dense_vector => suppress_dense,
+                            .algebraic => suppress_algebraic,
+                            .enrichment, .resolution, .promotion => false,
+                        };
+                        if (!drop) try kept_hints.append(group_alloc, hint);
+                    }
+                    if (kept_hints.items.len != decoded.record.target_hints.len) {
+                        var suppressed_record = decoded.record;
+                        suppressed_record.target_hints = kept_hints.items;
+                        const encoded = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, suppressed_record);
+                        suppressed_replay_payload = encoded;
+                        replay_append = .{ .sequence = entry.sequence, .payload = encoded };
+                    }
                 }
             }
             const combined_commit_participant: ?@import("../commit_participant.zig").Participant =
