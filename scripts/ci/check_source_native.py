@@ -152,7 +152,7 @@ def main():
                         "-count=1",
                         "-v",
                         "-run",
-                        "^TestNative(SourceSearchStreams|TranscriptSearchEvidence)$",
+                        "^TestNative(SourceSearchStreams|TranscriptSearchEvidence|PDFInputAdmission)$",
                         "-timeout",
                         "4m",
                     ],

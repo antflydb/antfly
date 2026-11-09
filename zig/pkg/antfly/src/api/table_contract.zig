@@ -2671,3 +2671,29 @@ test "PDF embedding input public contract rejects conflicting producer modes and
     pdf.kind = .asset;
     try std.testing.expectError(error.InvalidEnrichmentConfig, local.validateArtifactEnrichmentConfigDefinitions(a, &.{pdf}));
 }
+
+test "PDF embedding input public contract rejects upstream producers before publication" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources").api_local_indexes;
+    const types = @import("antfly_local_sources").storage_db_types;
+    const links = types.EnrichmentConfig{ .name = "links", .kind = .chunk, .field = "body", .chunk_size = 512 };
+    var pages = types.EnrichmentConfig{ .name = "pages", .kind = .embedding, .field = "text", .source_artifact_name = "links", .embedding_input = .pdf_page_images, .expected_dims = 3 };
+    for ([_][]const u8{ "links", "turns", "missing" }) |upstream| {
+        pages.source_artifact_name = upstream;
+        try std.testing.expectError(error.InvalidEnrichmentConfig, local.validateArtifactEnrichmentConfigs(a, &.{ links, pages }));
+    }
+    pages.source_artifact_name = "links";
+    pages.embedding_input = .text;
+    try local.validateArtifactEnrichmentConfigs(a, &.{ links, pages });
+    const request = "{\"type\":\"embeddings\",\"dimension\":3,\"embedder\":{\"provider\":\"ollama\",\"model\":\"fixture\"},\"sources\":[{\"artifact\":\"pages\"}],\"enrichments\":[{\"name\":\"links\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"pages\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"links\",\"embedding_input\":\"pdf_page_images\",\"expected_dims\":3}]}";
+    try std.testing.expectError(error.InvalidCreateIndexRequest, parseCreateIndexRequest(a, "pdf_vectors", request));
+}
+
+test "PDF embedding input public contract rejects sparse consumers" {
+    const a = std.testing.allocator;
+    const pdf = "{\"vectors\":{\"type\":\"embeddings\",\"sparse\":true,\"sources\":[{\"artifact\":\"pages\"}],\"enrichments\":[{\"name\":\"pages\",\"kind\":\"embedding\",\"field\":\"uri\",\"embedding_input\":\"pdf_page_images\"}]}}";
+    try std.testing.expectError(error.InvalidEnrichmentConfig, indexes_api.validateArtifactEnrichmentsForTableIndexesJson(a, pdf));
+    const text = try std.mem.replaceOwned(u8, a, pdf, "pdf_page_images", "text");
+    defer a.free(text);
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(a, text);
+}
