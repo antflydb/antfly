@@ -412,7 +412,17 @@ pub const Repository = struct {
             error.CatalogGenerationChanged => {
                 guard.deinit();
                 guarded = false;
-                return openRead(raw, executor, root, request, namespace, cancellation);
+                const fallback = try openRead(raw, executor, root, request, namespace, cancellation);
+                if (fallback != null or !request.create) return fallback;
+                // Missing publication is a normal create probe. A present but
+                // invalid immutable generation cannot be recaptured from live
+                // state under the same identity.
+                const manifest_path = try std.fs.path.join(a, &.{ physical, "query-cut.json" });
+                std.Io.Dir.cwd().access(io, manifest_path, .{}) catch |access_err| switch (access_err) {
+                    error.FileNotFound => return null,
+                    else => return access_err,
+                };
+                return error.CatalogGenerationChanged;
             },
             else => return err,
         };
@@ -519,6 +529,12 @@ pub const Repository = struct {
         try request.validate(cut.nowMs());
         const manifest = std.json.parseFromSliceLeaky(Manifest, a, bytes, .{ .allocate = .alloc_always }) catch return error.CatalogGenerationChanged;
         if (manifest.version != 1 or !manifest.namespace.eql(namespace) or manifest.request.table_id != request.table_id or manifest.request.expires_ms != request.expires_ms or !std.mem.eql(u8, manifest.request.id, request.id) or manifest.files.len > local.storage_db_native_backup_seal.max_files) return error.CatalogGenerationChanged;
+        if ((manifest.request.indexes == null) != (request.indexes == null)) return error.CatalogGenerationChanged;
+        if (request.indexes) |expected| {
+            const actual = manifest.request.indexes.?;
+            if (expected.len != actual.len) return error.CatalogGenerationChanged;
+            for (expected, actual) |left, right| if (!std.mem.eql(u8, left, right)) return error.CatalogGenerationChanged;
+        }
         var total: u64 = 0;
         for (manifest.files, 0..) |file, i| {
             if (!safePath(file.path) or (std.mem.eql(u8, file.path, "query-cut.json") or std.mem.eql(u8, file.path, "query-remote.json"))) return error.CatalogGenerationChanged;
@@ -1161,6 +1177,7 @@ pub const Repository = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const bytes = self.readManifest(a, request, namespace, cancellation) catch |err| {
+            if (request.create and err == error.CatalogGenerationChanged) return null;
             std.log.warn("retained native manifest lookup failed err={s} table={d} shard={d} range={d} expires={d}", .{ @errorName(err), namespace.table_id, namespace.shard_id, namespace.range_id, request.expires_ms });
             return err;
         };
@@ -1389,6 +1406,9 @@ test "external lake native reuse avoids capture and invalidates writes metadata 
     const scratch = arena.allocator();
     const before = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, first, namespace, .none), first, namespace);
     const reused = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, second, namespace, .none), second, namespace);
+    var different_indexes = second;
+    different_indexes.indexes = &.{"body_text"};
+    try std.testing.expectError(error.CatalogGenerationChanged, db.captureQueryCut(different_indexes, .none));
     try std.testing.expectEqualStrings(before.files[0].chunks[0].artifact_id, reused.files[0].chunks[0].artifact_id);
     var wrong = db.local_execution.native_query_reuse.?.proof();
     wrong.sequence += 1;
@@ -1406,6 +1426,17 @@ test "external lake native reuse avoids capture and invalidates writes metadata 
         const bytes = (try fresh.get(a, "doc")).?;
         defer a.free(bytes);
         try std.testing.expect(std.mem.indexOf(u8, bytes, "\"amount\":2") != null);
+    }
+    // The optional reuse hint now names a different generation and live
+    // writes have advanced. A repeated create must still serve the old cut.
+    {
+        var same_cut = second;
+        same_cut.timeout_ms = 4000;
+        var retained = try db.openQueryCut(same_cut, .none);
+        defer retained.close();
+        const bytes = (try retained.get(a, "doc")).?;
+        defer a.free(bytes);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"amount\":1") != null);
     }
     // A primary metadata commit has no new source replay sequence, but changes
     // the frozen primary state and must invalidate the owner-local generation.
@@ -1470,6 +1501,16 @@ test "external lake native linked renewal reuses immutable files without snapsho
     defer db.snapshot_publication_mutex.unlock();
     try db.captureQueryCut(second, .none);
     try std.testing.expectEqual(proof.digest, db.local_execution.native_query_reuse.?.proof().digest);
+    // A repeated create can arrive with a smaller execution budget. The
+    // published cut is immutable; do not take the snapshot lock or compare a
+    // fresh manifest against the already-retained linked generation.
+    var repeated = second;
+    repeated.timeout_ms = 1000;
+    var reader_again = try db.openQueryCut(repeated, .none);
+    defer reader_again.close();
+    const again = (try reader_again.get(a, "doc")).?;
+    defer a.free(again);
+    try std.testing.expectEqualStrings("{\"amount\":1}", again);
     const path = try cut.pathAlloc(a, root, second.id);
     defer a.free(path);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, path, .{}));
@@ -1484,6 +1525,10 @@ test "external lake native linked renewal reuses immutable files without snapsho
     const value = (try reader.get(a, "doc")).?;
     defer a.free(value);
     try std.testing.expectEqualStrings("{\"amount\":1}", value);
+    const manifest_path = try std.fs.path.join(a, &.{ retained, "query-cut.json" });
+    defer a.free(manifest_path);
+    _ = try local.storage_db_native_backup.writeFileDurable(io, manifest_path, "{}");
+    try std.testing.expectError(error.CatalogGenerationChanged, db.captureQueryCut(repeated, .none));
 }
 
 test "external lake native reuse validates physical retention before extending cursors" {

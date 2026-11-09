@@ -6239,6 +6239,8 @@ pub const DB = struct {
         self.retained_query_lease = null;
         if (self.retained_remote_query_lease) |*lease| lease.deinit();
         self.retained_remote_query_lease = null;
+        if (self.local_execution.native_query_reuse) |*hint| hint.deinit();
+        self.local_execution.native_query_reuse = null;
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
@@ -21193,19 +21195,26 @@ pub const DB = struct {
         defer arena.deinit();
         return self.nativeQueryReuseDigestLocked(arena.allocator());
     }
+    fn rememberNativeQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request, proof: @import("native_query_reuse.zig").Proof) void {
+        // Retention has committed. Optional hint allocation cannot revoke it.
+        const next = @import("native_query_reuse.zig").State.init(self.alloc, request, proof) catch return;
+        if (self.local_execution.native_query_reuse) |*previous| previous.deinit();
+        self.local_execution.native_query_reuse = next;
+    }
     /// Query-pin guard is held. Validate unchanged state at a short read point,
     /// release mutation fences before repository I/O, then rebind exact extents.
     fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !bool {
         const repository = self.backend_runtime.query_cut_repository orelse return false;
         if (repository.vtable.reuse == null) return false;
         const basis = self.local_execution.native_query_reuse orelse return false;
+        if (!basis.matchesSelection(request)) return false;
         if (std.mem.eql(u8, &basis.id, request.id)) return false;
         const digest = (try self.nativeQueryReuseDigest(cancellation)) orelse return false;
         if (!basis.matches(digest, @import("native_query_cut.zig").nowMs())) return false;
         const proof = (try repository.reuse(io, basis.asRequest(), request, self.core.identity_namespace, basis.proof(), cancellation)) orelse return false;
         // Rotate the logical authority, so expiry of the original manifest does
         // not force capture while the authenticated extents still cover readers.
-        self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
+        self.rememberNativeQueryCut(request, proof);
         return true;
     }
     fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
@@ -21219,14 +21228,28 @@ pub const DB = struct {
         const control: @import("native_query_cut.zig").Control = .{ .parent = cancellation, .deadline_ns = deadline };
         const token = control.token();
         try token.check();
-        if (publish) if (self.backend_runtime.query_cut_repository) |repository| if (self.primary_lsm_storage) |storage| {
-            if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
-        };
         var profile = QueryCaptureProfile.init(benchQueryProfileEnabled(), "query_pin_lock");
         defer profile.finish();
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
         profile.next("reuse_and_admission");
+        if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
+            // Statistics, preflight and execution may capture the same cut.
+            // Its first committed generation remains authority even after live
+            // writes or warming rotate the owner's optional reuse hint. Lease
+            // that exact generation before considering any fresh capture.
+            const retained_path = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
+            defer self.alloc.free(retained_path);
+            const existing = try repository.openRead(io, retained_path, request, self.core.identity_namespace, token);
+            if (existing) |opened| {
+                var lease = opened;
+                lease.deinit();
+                return;
+            }
+            if (self.primary_lsm_storage) |storage| {
+                if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
+            }
+        };
         if (publish and try self.tryReuseNativeQueryCut(io, request, token)) return;
         try self.admitQueryCut(io, request.id, token);
         const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
@@ -21249,7 +21272,7 @@ pub const DB = struct {
         try self.admitQueryCut(io, request.id, token);
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
             if (try repository.publishReusable(io, root, request, self.core.identity_namespace, token)) |proof| {
-                self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
+                self.rememberNativeQueryCut(request, proof);
             }
         };
     }
@@ -21327,7 +21350,7 @@ pub const DB = struct {
             try warming.writeState(a, io, state_path, state.?);
             var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
             defer guard.deinit();
-            if (warmed.proof) |proof| self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(state.?.request, proof);
+            if (warmed.proof) |proof| self.rememberNativeQueryCut(state.?.request, proof);
             try std.Io.Dir.cwd().deleteTree(io, root);
         }
         return completed;
@@ -21361,11 +21384,15 @@ pub const DB = struct {
     pub fn openQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !DB {
         if (comptime storage_engine.enabled) return storage_engine.call("openQueryCut", .{ self, request, cancellation });
         const cut = @import("native_query_cut.zig");
+        var stage: []const u8 = "request";
+        errdefer std.log.debug("native query cut open failed stage={s}", .{stage});
         try request.validate(cut.nowMs());
         const origin = try request.namespace(self.core.identity_namespace);
         const cache_id = try request.cacheId(self.alloc, self.core.identity_namespace);
         defer self.alloc.free(cache_id);
+        stage = "capture";
         if (request.create) try self.captureQueryCut(request, cancellation);
+        stage = "local_manifest";
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         const path = try cut.pathAlloc(self.alloc, self.core.path, cache_id);
         defer self.alloc.free(path);
@@ -21387,6 +21414,7 @@ pub const DB = struct {
         } else false;
         if (!local_usable) if (self.backend_runtime.query_cut_repository) |repository| {
             // The read lease retains the caller's token beyond this stack frame.
+            stage = "repository_lease";
             if (try repository.openRead(io, path, request, origin, cancellation)) |opened| {
                 var lease = opened;
                 errdefer lease.deinit();
@@ -21395,6 +21423,7 @@ pub const DB = struct {
                 // the filesystem publication guard across provider I/O.
                 guard.deinit();
                 guarded = false;
+                stage = "repository_database";
                 var readonly = try DB.open(self.alloc, path, .{
                     .open_mode = .query_readonly,
                     .query_indexes = request.indexes,
@@ -21415,16 +21444,19 @@ pub const DB = struct {
             // manifest. Protect active readers before replacing any invalid root.
             if (local_exists) try cut.discardInvalidCache(self.alloc, io, std.fs.path.dirname(path).?, cache_id, path);
             try self.admitQueryCut(io, cache_id, control.token());
+            stage = "repository_recovery";
             try repository.recover(io, path, request, origin, control.token());
             errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
             try self.admitQueryCut(io, cache_id, control.token());
             source_proof = try cut.validateWithSourceProof(self.alloc, io, path, request, origin, control.token());
         } else return error.CatalogGenerationChanged;
+        stage = "local_lease";
         var reader = try cut.readLeaseOwned(self.alloc, io, self.core.path, cache_id, control.token());
         guard.deinit();
         guarded = false;
         var transferred = false;
         defer if (!transferred) reader.deinit() catch unreachable;
+        stage = "local_database";
         var readonly = try DB.open(self.alloc, path, .{
             .open_mode = .query_readonly,
             .query_indexes = request.indexes,
