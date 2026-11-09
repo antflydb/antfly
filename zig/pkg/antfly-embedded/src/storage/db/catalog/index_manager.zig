@@ -6239,6 +6239,12 @@ pub const IndexManager = struct {
             sparse_vec.values = &.{};
         }
 
+        /// Validate against the same immutable catalog used to prepare this row.
+        /// The caller owns scratch allocation and the parsed document lifetime.
+        pub fn validateExternalVectorSpacesParsed(self: WritePlanSnapshot, alloc: Allocator, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
+            try validateExternalVectorSpacesInPlan(&self, alloc, embeddings, document);
+        }
+
         pub fn appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(
             self: WritePlanSnapshot,
             alloc: Allocator,
@@ -19877,24 +19883,24 @@ pub const IndexManager = struct {
         if (plan.plan().external_vector_spaces.count() == 0) return;
         const document = std.json.parseFromSlice(std.json.Value, alloc, document_json, .{}) catch return error.InvalidEmbedding;
         defer document.deinit();
-        try validateExternalVectorSpacesInPlan(plan.plan(), embeddings, document.value);
+        try validateExternalVectorSpacesInPlan(plan.plan(), alloc, embeddings, document.value);
     }
 
     pub fn validateExternalVectorSpacesParsed(self: *IndexManager, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
         var plan = try self.acquireWritePlanSnapshot();
         defer plan.release();
-        try validateExternalVectorSpacesInPlan(plan.plan(), embeddings, document);
+        try validateExternalVectorSpacesInPlan(plan.plan(), plan.plan().alloc, embeddings, document);
     }
 
-    fn validateExternalVectorSpacesInPlan(plan: *const WritePlanSnapshot, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
+    fn validateExternalVectorSpacesInPlan(plan: *const WritePlanSnapshot, alloc: Allocator, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
         if (plan.external_vector_spaces.count() == 0) return;
         // A receipt is an assertion about this authored row. Omitting vectors
         // retains native bytes, but must not retain an assertion for a new row.
         var supplied_names: std.StringHashMapUnmanaged(void) = .empty;
-        defer supplied_names.deinit(plan.alloc);
+        defer supplied_names.deinit(alloc);
         for (embeddings) |embedding| {
             const expected = plan.external_vector_spaces.get(embedding.index_name) orelse continue;
-            try supplied_names.put(plan.alloc, embedding.index_name, {});
+            try supplied_names.put(alloc, embedding.index_name, {});
             if (document != .object) return error.InvalidEmbedding;
             const metadata = document.object.get("metadata") orelse return error.InvalidEmbedding;
             if (metadata != .object) return error.InvalidEmbedding;

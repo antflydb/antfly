@@ -150147,39 +150147,46 @@ test "time series graph repair requires authoritative lifetimes across clock rol
     }
 }
 
-test "external vector compatibility declaration rejects missing and mismatched writer identity" {
-    const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
-    defer alloc.free(path);
-    var db = try DB.open(alloc, path, .{});
-    defer db.close();
-    try db.addIndex(.{
-        .name = "external_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"external_vector_space\":\"recipe-v1\"}",
-    });
-    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
-        .writes = &.{.{ .key = "missing", .value = "{\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
-        .sync_level = .full_index,
-    }));
-    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
-        .writes = &.{.{ .key = "wrong", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"other\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
-        .sync_level = .full_index,
-    }));
-    try db.batch(.{
-        .writes = &.{.{ .key = "matched", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
-        .sync_level = .full_index,
-    });
-    try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
-        .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}}}" }},
-        .sync_level = .full_index,
-    }));
-    // Withdrawing the receipt permits an acquisition update to retain hidden
-    // vector bytes; source search independently requires the exact receipt.
-    try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
+test "external vector compatibility declaration preserves time series prepared validation" {
+    for ([_][]const u8{ "document", "relational" }) |mode| {
+        const alloc = std.testing.allocator;
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+        defer alloc.free(path);
+        var db = try DB.open(alloc, path, .{});
+        defer db.close();
+        const schema = try std.fmt.allocPrint(alloc,
+            \\{{"version":1,"storage_mode":"{s}","default_type":"row","document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"embedding":{{"type":"array","items":{{"type":"number"}}}},"metadata":{{"type":"object"}},"revision":{{"type":"keyword"}}}},"additionalProperties":false}}}}}}}}
+        , .{mode});
+        defer alloc.free(schema);
+        try db.setSchemaJson(alloc, schema);
+        try db.addIndex(.{
+            .name = "external_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"external_vector_space\":\"recipe-v1\"}",
+        });
+        try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+            .writes = &.{.{ .key = "missing", .value = "{\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        }));
+        try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+            .writes = &.{.{ .key = "wrong", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"other\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        }));
+        try db.batch(.{
+            .writes = &.{.{ .key = "matched", .value = "{\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}},\"_embeddings\":{\"external_v1\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        });
+        try std.testing.expectError(error.InvalidEmbedding, db.batch(.{
+            .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{\"embedding_spaces\":{\"external_v1\":\"recipe-v1\"}}}" }},
+            .sync_level = .full_index,
+        }));
+        // Withdrawing the receipt permits an acquisition update to retain hidden
+        // vector bytes; source search independently requires the exact receipt.
+        try db.batch(.{ .writes = &.{.{ .key = "matched", .value = "{\"revision\":\"r2\",\"metadata\":{}}" }}, .sync_level = .full_index });
+    }
 }
 
 test "scalar text asset chunks track parent updates and retirement" {
