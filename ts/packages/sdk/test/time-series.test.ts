@@ -589,10 +589,14 @@ it("applies explicit SQL zero fill after measurement aggregation", () => {
 
 it("excludes null and missing grouping keys from both SQL scans", () => {
   const sql = seriesSQL({ ...options, groupBy: ["device_id", "region"] }).statement;
-  for (const field of ["device_id", "region"]) {
-    expect(sql).toContain(`NOT is_missing("${field}")`);
-    expect(sql).toContain(`"${field}" IS NOT NULL`);
-    expect(sql).toContain(`"__antfly_series_source"."${field}" IS NOT NULL`);
+  const scopes = sql.split(") SELECT ");
+  expect(scopes).toHaveLength(2);
+  for (const scope of scopes) {
+    for (const field of ["device_id", "region"]) {
+      const column = `"__antfly_series_source"."${field}"`;
+      expect(scope).toContain(`NOT is_missing(${column})`);
+      expect(scope).toContain(`${column} IS NOT NULL`);
+    }
   }
 });
 
@@ -739,7 +743,7 @@ describe("time-series empty results and nested SQL", () => {
       `jsonb_extract_path_text("__antfly_series_source"."attrs", 'observed_at')::datetime`
     );
     expect(sql.statement).toContain(
-      `jsonb_extract_path_text("attrs", 'device_id') AS "attrs.device_id"`
+      `jsonb_extract_path_text("__antfly_series_source"."attrs", 'device_id') AS "attrs.device_id"`
     );
     expect(sql.statement).toContain(`"__antfly_series_selected"."attrs.device_id"`);
     expect(sql.statement).toContain(`::double precision`);
@@ -844,7 +848,18 @@ it("shares executable SQL alias fixtures with native API tests", () => {
 
 it("aliases single-segment remapped groups in the CTE and output", () => {
   const sql = seriesSQL(options, { fieldPaths: { device_id: ["bucket"] } });
-  expect(sql.statement).toContain('SELECT "bucket" AS "device_id", COUNT(*)');
+  expect(sql.statement).toContain(
+    'SELECT "__antfly_series_source"."bucket" AS "device_id", COUNT(*)'
+  );
   expect(sql.statement).toContain('"__antfly_series_source"."bucket" AS "device_id"');
   expect(sql.statement).toContain('"__antfly_series_selected"."device_id"');
+});
+
+it("keeps top-series ordering bound to remapped source columns", () => {
+  const sql = seriesSQL(options, {
+    fieldPaths: { device_id: ["__antfly_series_documents"] },
+  });
+  expect(sql.statement).toContain(
+    'ORDER BY COUNT(*) DESC, "__antfly_series_source"."__antfly_series_documents" ASC'
+  );
 });

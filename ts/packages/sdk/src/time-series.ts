@@ -492,10 +492,12 @@ export function seriesSQL(
     fields.length === 1
       ? fields[0]
       : `concat('[', ${fields.map((field) => `COALESCE(to_jsonb(${field})::text, 'null')`).join(", ',', ")}, ']')`;
-  const topDimensions = groupBy.map((field) => column(field));
+  // Qualified CTE keys cannot bind an output alias when a remapped physical
+  // column has the same name as the internal count (especially in ORDER BY).
+  const topDimensions = dimensions;
   const selectedDimensions = groupBy.map((field, i) => `${topDimensions[i]} AS ${quote(field)}`);
   const cte = groupBy.length
-    ? `WITH ${selected} AS (SELECT ${selectedDimensions.join(", ")}, COUNT(*) AS ${selectedCount} FROM ${quote(options.table)} WHERE ${predicates()} GROUP BY ${topDimensions.join(", ")} ORDER BY COUNT(*) DESC, ${key(topDimensions)} ASC LIMIT ${parameter(options.maxSeries ?? 100)}) `
+    ? `WITH ${selected} AS (SELECT ${selectedDimensions.join(", ")}, COUNT(*) AS ${selectedCount} FROM ${quote(options.table)} AS ${source} WHERE ${predicates(`${source}.`)} GROUP BY ${topDimensions.join(", ")} ORDER BY COUNT(*) DESC, ${key(topDimensions)} ASC LIMIT ${parameter(options.maxSeries ?? 100)}) `
     : "";
   const join = groupBy.length
     ? ` JOIN ${selected} ON ${groupBy.map((field) => `${column(field, `${source}.`)} IS NOT DISTINCT FROM ${selected}.${quote(field)}`).join(" AND ")}`
