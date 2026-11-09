@@ -2170,35 +2170,47 @@ fn IndexReadFrameType(comptime batch: bool) type {
         overflow_key: []const u8 = &.{},
 
         working_allocator: if (batch) ?Allocator else void = if (batch) null else {},
-        borrowed: if (batch) ?*PageCache.IndexView else void = if (batch) null else {},
-        borrowed_file: if (batch) ?*NativeFile else void = if (batch) null else {},
+        // Borrowing a cached, already-validated index view is not a
+        // batch-only concern (PageCache.acquireIndex/IndexView are general
+        // infrastructure); every ordinary single-key reader used to always
+        // decode+CRC-validate a fresh scratch-buffer copy instead, even on a
+        // page this process already verified or wrote. Kept as real fields
+        // (not further comptime-gated by `batch`) so `load` below can borrow
+        // for both frame kinds; `working_allocator`'s own batch-only
+        // allocator override is unrelated and untouched.
+        borrowed: ?*PageCache.IndexView = null,
+        borrowed_file: ?*NativeFile = null,
 
         fn workingAllocator(self: *const @This(), file: *NativeFile) Allocator {
             return if (batch) self.working_allocator orelse file.allocator else file.allocator;
         }
 
         fn releaseView(self: *@This()) void {
-            if (batch) {
-                if (self.borrowed) |view| self.borrowed_file.?.page_cache.releaseIndex(self.borrowed_file.?.allocator, view);
-                self.borrowed = null;
-                self.borrowed_file = null;
-            }
+            if (self.borrowed) |view| self.borrowed_file.?.page_cache.releaseIndex(self.borrowed_file.?.allocator, view);
+            self.borrowed = null;
+            self.borrowed_file = null;
             self.payload = &.{};
         }
 
         fn entries(self: *const @This()) []const u16 {
-            if (batch) if (self.borrowed) |view| return view.frame.offsets.items;
+            if (self.borrowed) |view| return view.frame.offsets.items;
             return self.offsets.items;
         }
 
         pub fn deinit(self: *@This(), allocator: Allocator) void {
-            if (batch) self.releaseView();
+            self.releaseView();
             if (self.raw) |raw| allocator.free(raw);
             if (self.overflow) |raw| allocator.free(raw);
             self.offsets.deinit(allocator);
         }
 
+        /// Kept as a name distinct from `load` for existing callers; both
+        /// now do the same thing (try the cache's validated view first).
         fn loadBorrowed(self: *@This(), file: *NativeFile, checkpoint: CheckpointSlot, page: u64) !void {
+            return self.load(file, checkpoint, page);
+        }
+
+        fn load(self: *@This(), file: *NativeFile, checkpoint: CheckpointSlot, page: u64) !void {
             self.releaseView();
             self.overflow_reference = 0;
             self.overflow_key = &.{};
@@ -2214,11 +2226,6 @@ fn IndexReadFrameType(comptime batch: bool) type {
                     return;
                 }
             }
-            return self.load(file, checkpoint, page);
-        }
-
-        fn load(self: *@This(), file: *NativeFile, checkpoint: CheckpointSlot, page: u64) !void {
-            self.releaseView();
             if (self.raw == null or self.raw.?.len < file.header.page_size) {
                 const a = self.workingAllocator(file);
                 const raw = try a.alloc(u8, file.header.page_size);
@@ -7482,9 +7489,38 @@ pub const NativeFile = struct {
     }
 
     fn readPageAllocForCheckpoint(self: *NativeFile, allocator: Allocator, page_id: u64, checkpoint: CheckpointSlot) ![]u8 {
+        if (page_id & packed_record_flag != 0) {
+            // unpackRecordPage used to always re-read and re-validate the
+            // whole shared record_bundle page (even on a repeat access of a
+            // page this process already verified), just to copy out one
+            // packed record. Borrow the cache's already-validated payload
+            // when there is one: validate-via-cache and
+            // repackage-into-owned-buffer are now separate steps, so a
+            // cache hit pays for the repackage copy but not another CRC.
+            const physical = physicalPage(page_id);
+            const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
+            if (physical != 0 and physical < checkpoint.page_count and use_cache) {
+                if (try self.page_cache.acquirePayload(allocator, physical, @intCast(self.header.page_size))) |view| {
+                    defer self.page_cache.releaseRaw(allocator, view);
+                    if (view.validation.?.kind != .record_bundle) return error.UnexpectedNativePageKind;
+                    const payload = view.bytes[page_header_size..][0..view.validation.?.payload_len];
+                    const record = try packedRecordPayload(payload, page_id);
+                    const page_size: usize = @intCast(self.header.page_size);
+                    const page = try allocator.alloc(u8, page_size);
+                    errdefer allocator.free(page);
+                    encodePage(page, record.kind, record.bytes);
+                    return page;
+                }
+            }
+            // Cache miss (or cache disabled/bypassed): read and validate the
+            // whole page, then unpack in place as before.
+            const page = try self.readPhysicalPageAlloc(allocator, physical, checkpoint);
+            errdefer allocator.free(page);
+            try unpackRecordPage(page, page_id);
+            return page;
+        }
         const page = try self.readPhysicalPageAlloc(allocator, physicalPage(page_id), checkpoint);
         errdefer allocator.free(page);
-        if (page_id & packed_record_flag != 0) try unpackRecordPage(page, page_id);
         return page;
     }
 
