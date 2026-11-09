@@ -275,7 +275,9 @@ pub const View = struct {
         var source_bytes: [16]u8 = undefined;
         if (source_present and try self.readAt(start + 16, &source_bytes, cache) != 16) return error.RetainedEffectsCorrupt;
         const required = @as(u64, header_len) + key_len + (value_len orelse 0);
-        if (key_len == 0 or required != end - start or (value_len == null and timestamp != 0))
+        // Only source-aware frames may carry a tombstone revision. The
+        // consumer validates that its decoded key belongs to a document.
+        if (key_len == 0 or required != end - start or (value_len == null and timestamp != 0 and !self.ttl_sources))
             return error.RetainedEffectsCorrupt;
         return .{ .key_offset = start + header_len, .key_len = key_len, .value_offset = start + header_len + key_len, .value_len = value_len, .timestamp = timestamp, .next_offset = end, .ttl_source = if (source_present) source_bytes else null };
     }

@@ -149748,6 +149748,23 @@ test "time series retained afterimages preserve signed sources across restart an
         try target.batchInternal(.{ .writes = &.{.{ .key = "reading", .value = json }} }, null, .{ .restore_timestamps = &versions, .restore_ttl_sources = &sources, .preserve_logical_values = true });
         try std.testing.expectEqual(@as(u64, 100), try target.getTimestamp(a, "reading"));
         try std.testing.expectEqual(@as(?i128, -std.time.ns_per_s), try ttl_mod.readSourceTimestamp(target.core.store, a, "reading"));
+        // The final transaction's allocator floor survives removal of the
+        // live sidecar, in both inline and descriptor-backed retained frames.
+        try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .deletes = &.{"reading"} });
+        var deleted_read = try db.core.store.beginReadTxn();
+        defer deleted_read.abort();
+        var deleted = (try retained.readFrame(&deleted_read, ns, 1, @splat(9), 1, cache)).?;
+        try std.testing.expectEqual(large, deleted == .chunked);
+        const deletion_version = switch (deleted) {
+            .contiguous => |*reader| (try reader.next()).?.timestamp,
+            .chunked => |view| (try view.effectAt(0, cache)).timestamp,
+        };
+        try std.testing.expectEqual(@as(u64, 101), deletion_version);
+        // Restored live versions seed the allocator before any later source
+        // floor arrives, including a delete followed by clock rollback.
+        try target.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .deletes = &.{"reading"} });
+        try target.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "reading", .value = "{}" }} });
+        try std.testing.expect((try target.getTimestamp(a, "reading")) > 100);
     }
 }
 
@@ -149777,5 +149794,40 @@ test "time series portable document codec preserves signed TTL and write version
     }
     for (0..encoded.len) |length| {
         try std.testing.expectError(if (length < 4) error.BatchTooShort else error.Truncated, backup_codec.documentBatchEntryCount(encoded[0..length]));
+    }
+}
+
+test "time series pinned Cypher uses signed source for visibility and revision for version" {
+    const a = std.testing.allocator;
+    var dir = try TestDirectory.init("series-cypher-timestamps");
+    defer dir.cleanup();
+    var db = try DB.open(a, dir.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 5 * std.time.ns_per_s });
+    try db.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 100, .writes = &.{.{ .key = "legacy", .value = "{}" }} });
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 200, .writes = &.{
+        .{ .key = "negative", .value = "{\"at\":\"1969-12-31T23:59:59Z\"}" },
+        .{ .key = "epoch", .value = "{\"at\":\"1970-01-01T00:00:00Z\"}" },
+        .{ .key = "future", .value = "{\"at\":\"1970-01-01T00:00:10Z\"}" },
+    } });
+    for ([_]u64{ 3 * std.time.ns_per_s, 6 * std.time.ns_per_s }) |now| {
+        var fence = (try db.tryStatementReadFence()) orelse return error.CypherSnapshotNotReady;
+        defer fence.release();
+        var cut = try db.captureCypherSelectedSnapshot(a, &fence, &.{}, now, .{});
+        defer cut.deinit();
+        fence.release();
+        const rows = try db.getCypherPinnedDocuments(a, &cut, &.{ "legacy", "negative", "epoch", "future" }, .{});
+        defer {
+            for (rows) |row| if (row) |value| {
+                var owned = value;
+                owned.deinit(a);
+            };
+            a.free(rows);
+        }
+        for (rows, 0..) |row, i| {
+            const visible = now == 3 * std.time.ns_per_s or i == 3;
+            try std.testing.expectEqual(visible, row != null);
+            if (row) |value| try std.testing.expectEqual(@as(u64, if (i == 0) 100 else 200), value.version);
+        }
     }
 }

@@ -67,6 +67,9 @@ reuse a version. Replicated commands activate this behavior only after every
 applying replica crosses protocol 27; historical commands retain their original
 version semantics when replayed. Source-preserving online transfers carry the
 version and signed TTL instant together, independently of recipient TTL settings.
+They also preserve the allocator floor from certified snapshot metadata and retained
+deletes, including empty ranges. The receiver advances that floor atomically with
+copy progress, so migration and restart cannot reintroduce a deleted version.
 Helpers do not automatically replay ambiguous writes. Split large
 imports into bounded batches and preserve the IDs and exact payload for retries.
 `client.writeSeries(table, timestamp, readings, { batchSize: 500 })` consumes an

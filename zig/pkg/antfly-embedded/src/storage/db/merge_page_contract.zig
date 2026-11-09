@@ -155,6 +155,9 @@ pub const Command = struct {
     timestamps: []const u64 = &.{},
     /// Optional aligned source sidecars. Empty preserves the legacy page format.
     ttl_sources: []const ?[16]u8 = &.{},
+    /// Monotonic allocator floor from authenticated snapshot metadata or retained
+    /// document afterimages (including tombstones). Applied atomically with progress.
+    document_version_floor: u64 = 0,
     tail: ?Tail = null,
     chunk: ?Chunk = null,
     /// Native, already-keyed claim/reference/job afterimages. They never pass
@@ -272,6 +275,10 @@ pub fn commandDigest(request: anytype) Digest {
         hash.update(&buffer);
     }
     hash.update(&command.source.pin_digest);
+    if (command.document_version_floor != 0) {
+        bytes(&hash, "document-version-floor-v1");
+        hashCount(&hash, command.document_version_floor);
+    }
     if (command.source.provenance_required) bytes(&hash, "source-provenance-required-v1");
     if (command.source.artifact_catalog) |binding| {
         bytes(&hash, "ordered-artifact-catalog-v1");
@@ -465,6 +472,7 @@ pub fn validateRequest(request: anytype) !void {
         request.relational_index_maintenance != null or request.relational_repair)
         return error.InvalidMergePage;
     try command.source.validate();
+    if (command.document_version_floor != 0 and command.phase != .rows and command.phase != .tail) return error.InvalidMergePage;
     if (command.artifact_effects.len != 0 and !@import("online_vector_artifacts.zig").isEnabled()) return error.InvalidMergePage;
     if (command.artifact_effects.len != 0 and (command.source.artifact_catalog == null or command.source.retention == null or
         (command.phase != .artifacts and command.phase != .tail) or (if (command.chunk) |chunk| chunk.payload != .artifact else false) or request.merge_artifacts.len != 0)) return error.InvalidMergePage;

@@ -516,7 +516,7 @@ pub const Reader = struct {
             value = self.bytes[self.pos..][0..value_len];
             self.pos += value_len;
         }
-        if (value == null and timestamp != 0) return error.RetainedEffectsCorrupt;
+        if (value == null and timestamp != 0 and (!retained_frame.hasSources(self.bytes[0..4]) or !internal_keys.isPrimaryDocumentKey(key))) return error.RetainedEffectsCorrupt;
         self.remaining -= 1;
         return .{ .key = key, .value = value, .timestamp = timestamp, .ttl_source = ttl_source };
     }
@@ -912,12 +912,28 @@ pub const Capture = struct {
         defer alloc.free(ttl_sources);
         @memset(ttl_sources, null);
         var size: usize = 48;
+        var deletion_version_floor: ?u64 = null;
         for (keys, values, timestamps, ttl_sources) |key, *value, *timestamp, *ttl_source| {
             value.* = txn.get(key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
             timestamp.* = 0;
+            // Source-aware document tombstones reuse the authenticated version
+            // word for the final allocator floor. Legacy frames retain zero.
+            if (state.ttl_sources and value.* == null and internal_keys.isPrimaryDocumentKey(key)) {
+                if (deletion_version_floor == null) {
+                    const floor = txn.get(@import("ttl.zig").document_version_watermark_key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    deletion_version_floor = if (floor) |raw| blk: {
+                        if (raw.len != 8) return error.InvalidTimestamp;
+                        break :blk std.mem.readInt(u64, raw[0..8], .little);
+                    } else 0;
+                }
+                timestamp.* = deletion_version_floor.?;
+            }
             if (integrity.isKey(key)) {
                 _ = integrity.parseKey(key) catch return error.RetainedEffectsCorrupt;
                 if (value.*) |raw| _ = integrity.validateTransferRecord(key, raw) catch return error.RetainedEffectsCorrupt;

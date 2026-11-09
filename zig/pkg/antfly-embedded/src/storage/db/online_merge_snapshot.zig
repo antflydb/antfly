@@ -47,6 +47,9 @@ const ProofStream = struct {
 pub const Cache = struct {
     arena: ?std.heap.ArenaAllocator = null,
     sequence: ?u64 = null,
+    // Keep metadata-only verifier slices until a page is acknowledged. On
+    // restart the durable receipt revisits any not-yet-acknowledged metadata.
+    document_version_floor: u64 = 0,
     position: pages.SnapshotPosition = .{ .object = 0, .offset = 0, .remaining = 0 },
     request: ?types.BatchRequest = null,
     chunks: ?pages.RowChunks(types.BatchRequest) = null,
@@ -350,6 +353,36 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     while (receipt.phase == .rows and position.object < reader.objectCount() and writes.items.len < pages.max_rows and work < pages.max_rows) : (work += 1) {
         try cancellation.check();
         const object = try reader.object(position.object);
+        if (object.kind == .metadata_batch) {
+            if (position.offset == 0) {
+                position.remaining = try number(u32, &reader, position.object, 0);
+                position.offset = 4;
+            }
+            if (position.remaining == 0) {
+                if (position.offset != object.size) return error.SourceSnapshotCorrupt;
+                position = .{ .object = position.object + 1, .offset = 0, .remaining = 0 };
+                continue;
+            }
+            const key_len = try number(u32, &reader, position.object, position.offset);
+            const key_offset = try std.math.add(u64, position.offset, 4);
+            const length_offset = try std.math.add(u64, key_offset, key_len);
+            const value_len = try number(u32, &reader, position.object, length_offset);
+            const value_offset = try std.math.add(u64, length_offset, 4);
+            const end = try std.math.add(u64, value_offset, value_len);
+            if (end > object.size) return error.SourceSnapshotCorrupt;
+            const floor_key = @import("../ttl.zig").document_version_watermark_key;
+            if (key_len == floor_key.len) {
+                var key: [floor_key.len]u8 = undefined;
+                try exact(&reader, position.object, key_offset, &key);
+                if (std.mem.eql(u8, &key, floor_key)) {
+                    if (value_len != 8) return error.SourceSnapshotCorrupt;
+                    cache.document_version_floor = @max(cache.document_version_floor, try number(u64, &reader, position.object, value_offset));
+                }
+            }
+            position.offset = end;
+            position.remaining -= 1;
+            continue;
+        }
         if (object.kind != .document_batch) {
             position = .{ .object = position.object + 1, .offset = 0, .remaining = 0 };
             continue;
@@ -417,7 +450,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     var request: types.BatchRequest = .{
         .merge_replication = .{ .transition_id = scope.fence.transition_id, .donor_group_id = scope.fence.owner_group_id, .receiver_group_id = scope.fence.peer_group_id, .identity_namespace = scope.receiver_namespace, .copy_attempt = scope.copy_attempt },
         .writes = writes.items,
-        .merge_page = .{ .source = receipt.source, .sequence = try std.math.add(u64, receipt.sequence, 1), .phase = receipt.phase, .after = try owned.dupe(u8, receipt.cursor), .next = last, .exhausted = writes.items.len == 0 and integrity.items.len == 0 and vectors.items.len == 0 and proofs.items.len == 0, .digest = @splat(0), .timestamps = timestamps.items, .ttl_sources = if (has_ttl_sources) ttl_sources.items else &.{}, .next_snapshot_position = last_row_position, .integrity = integrity.items, .artifact_effects = vectors.items, .provenance_effects = proofs.items },
+        .merge_page = .{ .source = receipt.source, .sequence = try std.math.add(u64, receipt.sequence, 1), .phase = receipt.phase, .after = try owned.dupe(u8, receipt.cursor), .next = last, .exhausted = writes.items.len == 0 and integrity.items.len == 0 and vectors.items.len == 0 and proofs.items.len == 0, .digest = @splat(0), .timestamps = timestamps.items, .ttl_sources = if (has_ttl_sources) ttl_sources.items else &.{}, .document_version_floor = cache.document_version_floor, .next_snapshot_position = last_row_position, .integrity = integrity.items, .artifact_effects = vectors.items, .provenance_effects = proofs.items },
     };
     // Artifact phase is permitted only by the row-derived schema capability
     // admission guard; authoritative graph/vector artifacts are not discarded.
@@ -880,5 +913,112 @@ test "relational index system online snapshot locator resumes immutable rows and
         try std.testing.expectEqual(@as(usize, 1), rows);
         try std.testing.expectEqual(.artifacts, receipt.phase);
         try std.testing.expect(receipt.snapshot_position == null);
+    }
+}
+
+test "time series online copy preserves empty snapshot and retained delete revision floors" {
+    const a = std.testing.allocator;
+    const online_io = @import("online_merge_io.zig");
+    const io_contract = @import("online_merge_io_contract.zig");
+    const ttl = @import("../ttl.zig");
+    for ([_]bool{ false, true }) |empty_snapshot| {
+        var donor_dir = try @import("../../common/test_directory.zig").TestDirectory.init("series-floor-donor");
+        defer donor_dir.cleanup();
+        var receiver_dir = try @import("../../common/test_directory.zig").TestDirectory.init("series-floor-receiver");
+        defer receiver_dir.cleanup();
+        const donor_options: @import("mod.zig").OpenOptions = .{ .identity_namespace = .{ .table_id = 11, .shard_id = 2, .range_id = 2 }, .start_optional_runtimes = false };
+        const receiver_options: @import("mod.zig").OpenOptions = .{ .identity_namespace = .{ .table_id = 11, .shard_id = 3, .range_id = 3 }, .start_optional_runtimes = false };
+        var donor = try DB.open(a, donor_dir.path(), donor_options);
+        defer donor.close();
+        var receiver = try DB.open(a, receiver_dir.path(), receiver_options);
+        defer receiver.close();
+        try donor.setSchemaJson(a, "{}");
+        try receiver.setSchemaJson(a, "{}");
+        try receiver.updateRange(.{ .start = "m", .end = "z" });
+        if (empty_snapshot) try receiver.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 500, .writes = &.{.{ .key = "m", .value = "{}" }} });
+        try server_test_adapter.applyOrdered(&donor, .{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "b", .value = "{}" }} }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&donor, if (empty_snapshot)
+            .{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .deletes = &.{"b"} }
+        else
+            .{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "b", .value = "{}" }} }, .{ .term = 1, .index = 2 });
+        const identity = try donor.relationalTopologyIdentity();
+        const scope: source.Scope = .{ .fence = .{ .role = .merge_source, .transition_id = 77, .attempt = 1, .admission_epoch = identity.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest }, .receiver_namespace = receiver_options.identity_namespace.?, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
+        try server_test_adapter.applyOrdered(&donor, .{ .online_source = .{ .admit = .{ .scope = scope, .ttl_sources = true } } }, .{ .term = 1, .index = 3 });
+        const certificate = try donor.prepareOnlineSourcePublication(scope, .none);
+        try server_test_adapter.applyOrdered(&donor, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 4 });
+        try server_test_adapter.applyOrdered(&donor, .{ .document_version_scheme = .revision_v1, .timestamp_ns = 200, .writes = &.{.{ .key = "c", .value = "{}" }} }, .{ .term = 1, .index = 5 });
+        try server_test_adapter.applyOrdered(&donor, .{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .deletes = &.{"c"} }, .{ .term = 1, .index = 6 });
+        var read = try donor.core.store.beginReadTxn();
+        const retained_head = (try @import("../retained_effects.zig").load(&read)).?.latest;
+        read.abort();
+        try server_test_adapter.applyOrdered(&donor, .{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 7 });
+        try server_test_adapter.applyOrdered(&donor, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = retained_head } } }, .{ .term = 1, .index = 8 });
+        const source_identity: pages.Source = .{ .namespace = identity.namespace, .pin_digest = try certificate.digest(), .applied_index = certificate.cut.applied_index, .retention = .{ .epoch = 1, .after_sequence = certificate.cut.retained_start } };
+        var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 77, .donor_group_id = 2, .receiver_group_id = 3, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z" };
+        try server_test_adapter.applyOrdered(&receiver, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+        checkpoint.kind = .begin_copy;
+        checkpoint.copy_attempt = scope.copy_attempt;
+        checkpoint.page_source = source_identity;
+        checkpoint.page_receiver_namespace = scope.receiver_namespace;
+        try server_test_adapter.applyOrdered(&receiver, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+        var index: u64 = 3;
+        var saw_snapshot_floor = false;
+        var saw_delete_floor = false;
+        for (0..200) |_| {
+            var progress = (try receiver.mergeCopyPageStatus(a)).?;
+            defer progress.deinit();
+            const receipt = progress.value;
+            if (receipt.phase == .complete) break;
+            const operation: io_contract.Request = .{ .scope = scope, .operation = switch (receipt.phase) {
+                .cleanup, .cleanup_integrity => .{ .cleanup = receipt },
+                .rows, .artifacts => .{ .snapshot = .{ .receipt = receipt, .certificate = certificate } },
+                .tail => .{ .tail = receipt },
+                .complete => unreachable,
+            } };
+            const response = try online_io.executeJson(if (receipt.phase == .cleanup or receipt.phase == .cleanup_integrity) &receiver else &donor, a, operation, .none);
+            defer a.free(response);
+            var prepared = try std.json.parseFromSlice(io_contract.Prepared, a, response, .{});
+            defer prepared.deinit();
+            const request = prepared.value.request orelse continue;
+            const page = request.merge_page.?;
+            saw_snapshot_floor = saw_snapshot_floor or (page.phase == .rows and page.document_version_floor == 101);
+            saw_delete_floor = saw_delete_floor or (request.deletes.len != 0 and page.document_version_floor == 201);
+            // Private wire round-trip, lost acknowledgement, and both owners
+            // reopening must preserve the authenticated floor and durable cursor.
+            const encoded = try @import("../../api/batch_internal.zig").encodeBatchRequest(a, request);
+            defer a.free(encoded);
+            var decoded = try @import("../../api/batch_internal.zig").parseInternalBatchRequest(a, encoded);
+            defer decoded.deinit(a);
+            try server_test_adapter.applyOrdered(&receiver, decoded.req, .{ .term = 1, .index = index });
+            index += 1;
+            try server_test_adapter.applyOrdered(&receiver, decoded.req, .{ .term = 1, .index = index });
+            index += 1;
+            if (page.document_version_floor != 0) {
+                const floor = try receiver.core.store.get(a, ttl.document_version_watermark_key);
+                defer a.free(floor);
+                try std.testing.expect(std.mem.readInt(u64, floor[0..8], .little) >= page.document_version_floor);
+                receiver.close();
+                receiver = try DB.open(a, receiver_dir.path(), receiver_options);
+                donor.close();
+                donor = try DB.open(a, donor_dir.path(), donor_options);
+            }
+        } else return error.MergeCopyDidNotComplete;
+        try std.testing.expect(saw_snapshot_floor);
+        try std.testing.expect(saw_delete_floor);
+        try std.testing.expectEqual(@as(u64, 0), try receiver.getTimestamp(a, "c"));
+        // Complete the receiver cutover, then admit a rolled-back clock.
+        checkpoint.page_source = null;
+        checkpoint.page_receiver_namespace = null;
+        var completed = (try receiver.mergeCopyPageStatus(a)).?;
+        defer completed.deinit();
+        checkpoint.bootstrap_applied_index = completed.value.final_applied_index;
+        checkpoint.kind = .bootstrap_complete;
+        try server_test_adapter.applyOrdered(&receiver, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = index });
+        index += 1;
+        checkpoint.kind = .finalize;
+        try server_test_adapter.applyOrdered(&receiver, .{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = index });
+        try receiver.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "c", .value = "{}" }} });
+        try std.testing.expectEqual(@as(u64, if (empty_snapshot) 501 else 202), try receiver.getTimestamp(a, "c"));
+        try std.testing.expectError(error.VersionConflict, receiver.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "c", .value = "{\"stale\":true}" }}, .predicates = &.{.{ .key = "c", .expected_version = 200 }} }));
     }
 }

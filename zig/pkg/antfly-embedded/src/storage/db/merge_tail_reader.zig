@@ -32,6 +32,7 @@ pub const Fragment = struct {
     deletes: []const []const u8,
     timestamps: []const u64,
     ttl_sources: []const ?[16]u8 = &.{},
+    document_version_floor: u64 = 0,
     integrity: []const pages.IntegrityEffect,
     artifact_effects: []const pages.IntegrityEffect,
     tail: pages.Tail,
@@ -123,7 +124,7 @@ pub const Fragment = struct {
             .writes = self.writes,
             .deletes = self.deletes,
             .merge_replication = context,
-            .merge_page = .{ .source = source, .sequence = sequence, .phase = .tail, .exhausted = false, .digest = @splat(0), .timestamps = self.timestamps, .ttl_sources = self.ttl_sources, .tail = self.tail, .integrity = self.integrity, .artifact_effects = self.artifact_effects },
+            .merge_page = .{ .source = source, .sequence = sequence, .phase = .tail, .exhausted = false, .digest = @splat(0), .timestamps = self.timestamps, .ttl_sources = self.ttl_sources, .document_version_floor = self.document_version_floor, .tail = self.tail, .integrity = self.integrity, .artifact_effects = self.artifact_effects },
         };
         result.merge_page.?.digest = pages.commandDigest(result);
         return result;
@@ -259,6 +260,7 @@ pub const Session = struct {
         var timestamps: std.ArrayList(u64) = .empty;
         var ttl_sources: std.ArrayList(?[16]u8) = .empty;
         var has_sources = false;
+        var document_version_floor: u64 = 0;
         var integrity: std.ArrayList(pages.IntegrityEffect) = .empty;
         var artifact_effects: std.ArrayList(pages.IntegrityEffect) = .empty;
         const view = self.chunkView();
@@ -280,12 +282,14 @@ pub const Session = struct {
             const is_artifact = is_vector or is_graph;
             if (!is_integrity and !is_artifact and !internal.isStoredSourceRowKey(key)) return error.RetainedEffectsCorrupt;
             if (effect.ttl_source != null and (!internal.isPrimaryDocumentKey(key) or effect.value_len == null)) return error.RetainedEffectsCorrupt;
+            if (effect.value_len == null and effect.timestamp != 0 and (!view.ttl_sources or !internal.isPrimaryDocumentKey(key))) return error.RetainedEffectsCorrupt;
             if (is_integrity or is_artifact) {
                 if (effect.timestamp != 0 or (is_artifact and !view.direct_vectors) or (is_graph and !view.graph_artifacts)) return error.RetainedEffectsCorrupt;
             }
             const logical = if (is_integrity or is_artifact) key else (try internal.decodeStoredDocumentRowKeyAlloc(owned, key)) orelse return error.RetainedEffectsCorrupt;
             const raw_len: usize = effect.value_len orelse 0;
             if (count != 0 and logical.len +| raw_len > max_bytes -| size) break;
+            if (self.admission.ttl_sources and internal.isPrimaryDocumentKey(key)) document_version_floor = @max(document_version_floor, effect.timestamp);
             if (effect.value_len != null and raw_len +| logical.len > max_bytes and !internal.isRelationalRowKey(key) and !is_integrity) {
                 if (count != 0) break;
                 // A single oversized immutable after-image is streamed through
@@ -357,6 +361,7 @@ pub const Session = struct {
             .deletes = deletes.items,
             .timestamps = timestamps.items,
             .ttl_sources = if (has_sources) ttl_sources.items else &.{},
+            .document_version_floor = document_version_floor,
             .integrity = integrity.items,
             .artifact_effects = artifact_effects.items,
             .tail = .{ .fragment = .{ .sequence = self.sequence, .offset = self.offset, .total_effects = self.total, .frame_digest = self.frameDigest() } },
@@ -384,6 +389,7 @@ pub const Session = struct {
         var timestamps: std.ArrayList(u64) = .empty;
         var ttl_sources: std.ArrayList(?[16]u8) = .empty;
         var has_sources = false;
+        var document_version_floor: u64 = 0;
         var integrity: std.ArrayList(pages.IntegrityEffect) = .empty;
         var artifact_effects: std.ArrayList(pages.IntegrityEffect) = .empty;
         var reader = self.frame.contiguous;
@@ -431,6 +437,7 @@ pub const Session = struct {
                 try ttl_sources.append(owned, effect.ttl_source);
                 has_sources = has_sources or effect.ttl_source != null;
             } else try deletes.append(owned, logical);
+            if (self.admission.ttl_sources and internal.isPrimaryDocumentKey(effect.key)) document_version_floor = @max(document_version_floor, timestamp);
             size +|= bytes;
             count += 1;
             previous = effect.key;
@@ -443,6 +450,7 @@ pub const Session = struct {
             .deletes = deletes.items,
             .timestamps = timestamps.items,
             .ttl_sources = if (has_sources) ttl_sources.items else &.{},
+            .document_version_floor = document_version_floor,
             .integrity = integrity.items,
             .artifact_effects = artifact_effects.items,
             .tail = .{ .fragment = .{ .sequence = self.sequence, .offset = self.offset, .total_effects = self.total, .frame_digest = self.frameDigest() } },

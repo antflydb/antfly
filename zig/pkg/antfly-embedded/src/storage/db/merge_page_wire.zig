@@ -47,6 +47,7 @@ const WireCommand = struct {
     digest: pages.Digest,
     timestamps: []const u64 = &.{},
     ttl_sources: []const ?[16]u8 = &.{},
+    document_version_floor: u64 = 0,
     tail: ?pages.Tail = null,
     chunk: ?WireChunk = null,
     integrity: []const pages.IntegrityEffect = &.{},
@@ -90,6 +91,13 @@ pub fn write(command: pages.Command, stream: anytype) @TypeOf(stream.*).Error!vo
                     try stream.endObject();
                 }
                 try stream.endArray();
+            }
+            continue;
+        }
+        if (comptime std.mem.eql(u8, reflected_name, "document_version_floor")) {
+            if (command.document_version_floor != 0) {
+                try stream.objectField(reflected_name);
+                try binary.write(command.document_version_floor, stream);
             }
             continue;
         }

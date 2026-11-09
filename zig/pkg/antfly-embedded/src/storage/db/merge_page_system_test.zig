@@ -67,6 +67,14 @@ test "time series merge tail streams source-preserving oversized row with bounde
         const ts_value = try @import("../ttl.zig").encodeTimestampAlloc(alloc, 333, -1);
         defer alloc.free(ts_value);
         try txn.put(ts_key, ts_value);
+        // Put a tombstone before the oversized row in the same chunked frame.
+        // The retained timestamp word must carry the final allocator floor.
+        const gone = try internal.documentKeyAlloc(alloc, "a-deleted");
+        defer alloc.free(gone);
+        try txn.delete(gone);
+        var floor_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &floor_bytes, 101, .little);
+        try txn.put(@import("../ttl.zig").document_version_watermark_key, &floor_bytes);
         try txn.put(key, value);
         try txn.commit();
     }
@@ -88,12 +96,17 @@ test "time series merge tail streams source-preserving oversized row with bounde
         .chunk_buffer = scratch,
         .chunk_cache = cache,
         .scope = scope,
-        .admission = .{ .namespace = scope.namespace(), .consumer_epoch = 1, .pin = pin, .start = 0, .acknowledged = 0, .snapshot_certificate = @splat(5), .admitted_applied_index = 1 },
+        .admission = .{ .ttl_sources = true, .namespace = scope.namespace(), .consumer_epoch = 1, .pin = pin, .start = 0, .acknowledged = 0, .snapshot_certificate = @splat(5), .admitted_applied_index = 1 },
         .sequence = 1,
         .total = view.effect_count,
     };
     transferred = true;
     defer session.deinit();
+    var deletion = (try session.next(alloc, pages.max_rows, pages.max_bytes, .none)).?;
+    defer deletion.deinit();
+    try std.testing.expectEqualStrings("a-deleted", deletion.deletes[0]);
+    try std.testing.expectEqual(@as(u64, 101), deletion.document_version_floor);
+    try std.testing.expect(!deletion.frame_complete);
     var fragment = (try session.next(alloc, pages.max_rows, pages.max_bytes, .none)).?;
     defer fragment.deinit();
     try std.testing.expect(fragment.streamed != null);
@@ -104,12 +117,14 @@ test "time series merge tail streams source-preserving oversized row with bounde
     const chunks = try fragment.chunkRequests(source, context, 1);
     const first = try chunks.requestAt(0);
     try std.testing.expectEqual(@as(u64, 333), first.merge_page.?.chunk.?.timestamp);
+    try std.testing.expectEqual(@as(u64, 333), first.merge_page.?.document_version_floor);
     try std.testing.expectEqual(@as(i128, -1), std.mem.readInt(i128, &first.merge_page.?.chunk.?.ttl_source.?, .little));
     const wire = try @import("../../api/batch_internal.zig").encodeBatchRequest(alloc, first);
     defer alloc.free(wire);
     var decoded = try @import("../../api/batch_internal.zig").parseInternalBatchRequest(alloc, wire);
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(first.merge_page.?.chunk.?.ttl_source, decoded.req.merge_page.?.chunk.?.ttl_source);
+    try std.testing.expectEqual(first.merge_page.?.document_version_floor, decoded.req.merge_page.?.document_version_floor);
     try std.testing.expectEqual(@as(u64, value.len), first.merge_page.?.chunk.?.total_bytes);
     try std.testing.expectEqualSlices(u8, value[0..pages.chunk_bytes], first.merge_page.?.chunk.?.data);
     const resumed = try chunks.requestAt(pages.chunk_bytes);

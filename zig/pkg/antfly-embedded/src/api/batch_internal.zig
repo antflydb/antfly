@@ -1713,7 +1713,7 @@ fn validateGraphBatchCommand(req: db_mod.types.BatchRequest) !void {
 pub fn requiresDocumentVersionsEnvelope(req: db_mod.types.BatchRequest) bool {
     if (req.document_version_scheme == .revision_v1) return true;
     if (req.online_source) |command| if (command == .admit and command.admit.ttl_sources) return true;
-    if (req.merge_page) |page| if (page.ttl_sources.len != 0 or (if (page.chunk) |chunk| chunk.ttl_source != null else false)) return true;
+    if (req.merge_page) |page| if (page.document_version_floor != 0 or page.ttl_sources.len != 0 or (if (page.chunk) |chunk| chunk.ttl_source != null else false)) return true;
     return false;
 }
 
@@ -3505,4 +3505,29 @@ test "time series document revision wire discriminates legacy replay and epoch a
     }
     try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, "{\"_timestamp_ns\":\"1\",\"_document_version_scheme\":1}"));
     try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, "[\"document-revisions-batch-v1\",{\"_document_version_scheme\":1}]"));
+}
+
+test "time series merge revision floor requires versioned wire and authenticates full u64" {
+    const a = std.testing.allocator;
+    var req: db_mod.types.BatchRequest = .{
+        .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } },
+        .merge_page = .{ .source = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .pin_digest = @splat(7), .applied_index = 10 }, .sequence = 1, .phase = .rows, .exhausted = true, .digest = @splat(0), .document_version_floor = 9007199254740993 },
+    };
+    req.merge_page.?.digest = merge_pages.commandDigest(req);
+    try std.testing.expect(requiresDocumentVersionsEnvelope(req));
+    const wire = try encodeBatchRequest(a, req);
+    defer a.free(wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "document-revisions-batch-v1") != null);
+    var parsed = try parseInternalBatchRequest(a, wire);
+    defer parsed.deinit(a);
+    try std.testing.expectEqual(req.merge_page.?.document_version_floor, parsed.req.merge_page.?.document_version_floor);
+    var tampered = req;
+    tampered.merge_page.?.document_version_floor += 1;
+    try std.testing.expectError(error.InvalidMergePage, merge_pages.validateRequest(tampered));
+    req.merge_page.?.document_version_floor = 0;
+    req.merge_page.?.digest = merge_pages.commandDigest(req);
+    try std.testing.expect(!requiresDocumentVersionsEnvelope(req));
+    const legacy = try encodeBatchRequest(a, req);
+    defer a.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "document_version_floor") == null);
 }

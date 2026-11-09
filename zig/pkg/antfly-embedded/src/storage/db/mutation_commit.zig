@@ -1403,7 +1403,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .use_preprepared_rows = use_preprepared_rows,
             };
             defer write_buffers.deinit();
-            if (document_version) |version| {
+            // Live rows alone cannot preserve the history of absent keys.
+            // Max-merge the certified source floor with restored versions and
+            // local admission, in the same transaction as the page receipt.
+            var incoming_floor: u64 = if (effective_req.merge_page) |page| page.document_version_floor else 0;
+            if (opts.restore_timestamps) |timestamps| {
+                var versions = timestamps.valueIterator();
+                while (versions.next()) |version| incoming_floor = @max(incoming_floor, version.*);
+            }
+            var persisted_floor = document_version;
+            if (incoming_floor != 0 and relationalColumns(self) == null) {
+                const previous = if (document_version) |version| version else blk: {
+                    const store = S.ownerField(self, "core").*.store;
+                    const raw = store.get(S.ownerField(self, "alloc").*, @import("../ttl.zig").document_version_watermark_key) catch |err| switch (err) {
+                        error.NotFound => break :blk @as(u64, 0),
+                        else => return err,
+                    };
+                    defer S.ownerField(self, "alloc").*.free(raw);
+                    if (raw.len != 8) return error.InvalidTimestamp;
+                    break :blk std.mem.readInt(u64, raw[0..8], .little);
+                };
+                persisted_floor = @max(previous, incoming_floor);
+            }
+            if (persisted_floor) |version| {
                 const bytes = try encodeTimestampValue(S.ownerField(self, "alloc").*, version);
                 write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, bytes) catch |err| {
                     S.ownerField(self, "alloc").*.free(bytes);
