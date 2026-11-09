@@ -15555,6 +15555,198 @@ test "lite native recovery falls back and truncates when a manifest-listed page 
     try std.testing.expectEqualStrings("stable", recovered);
 }
 
+// v9 required test (design doc §3.2a "Manifest coverage" / 37a00f96fd): a
+// torn page in a SECOND (or later) run of a multi-run manifest must still
+// be caught, falling recovery back exactly as a single-run v8 manifest
+// would. Fabricates a higher-sequence slot, in the file's own spare slot
+// page, whose manifest genuinely spans two runs with a real gap between
+// them (not the single `manifest_page_id` gap the one-run encoder already
+// bridged) -- the shape a window with more than one
+// `flushTransactionWrites`/`persistAllocator` cycle commonly produces.
+test "lite native manifest with a torn page in a later run falls back and truncates" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "manifest-second-run-torn.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    try file.putDocument("doc", "stable");
+    const stable_sequence = file.activeCheckpoint().commit_sequence;
+    const base_page_count = file.activeCheckpoint().page_count;
+    const other_slot_index: u8 = 1 - file.header.active_checkpoint;
+    file.close();
+
+    // Never the real active slot -- this must not disturb the already-
+    // durable "stable" document this test later confirms survives intact.
+    const run1_start = base_page_count;
+    const run2_start = base_page_count + 10;
+    const manifest_page_id = base_page_count + 20;
+    const total_pages = base_page_count + 30;
+
+    var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    try raw.setLength(std.testing.io, total_pages * @as(u64, default_page_size));
+
+    var entries: [6]ManifestEntry = undefined;
+    var page_buf: [default_page_size]u8 = undefined;
+    for (0..3) |i| {
+        const page_id = run1_start + i;
+        encodePage(&page_buf, .data, "run1-page");
+        try raw.writePositionalAll(std.testing.io, &page_buf, page_id * @as(u64, default_page_size));
+        entries[i] = .{ .page_id = page_id, .crc = std.mem.readInt(u32, page_buf[page_crc_offset..][0..4], .little) };
+    }
+    for (0..3) |i| {
+        const page_id = run2_start + i;
+        encodePage(&page_buf, .data, "run2-page");
+        try raw.writePositionalAll(std.testing.io, &page_buf, page_id * @as(u64, default_page_size));
+        entries[3 + i] = .{ .page_id = page_id, .crc = std.mem.readInt(u32, page_buf[page_crc_offset..][0..4], .little) };
+    }
+
+    const empty_reused: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    const manifest_payload = try encodeManifestPayloadAlloc(allocator, &entries, &empty_reused, manifest_page_id);
+    defer allocator.free(manifest_payload);
+    // Two genuinely separate runs: a real hole between them, not the single
+    // reserved manifest-page id this window also skips over.
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, manifest_payload[0..4], .little));
+
+    var manifest_buf: [default_page_size]u8 = undefined;
+    encodePage(&manifest_buf, .commit_manifest, manifest_payload);
+    try raw.writePositionalAll(std.testing.io, &manifest_buf, manifest_page_id * @as(u64, default_page_size));
+
+    const fabricated_sequence = stable_sequence + 1;
+    const fabricated_slot = CheckpointSlot{
+        .commit_sequence = fabricated_sequence,
+        .page_count = total_pages,
+        .presynced = false,
+        .manifest_page = manifest_page_id,
+        .manifest_crc = std.mem.readInt(u32, manifest_buf[page_crc_offset..][0..4], .little),
+        .manifest_page_count = entries.len,
+    };
+    var slot_buf: [default_page_size]u8 = undefined;
+    encodeCheckpointSlotPage(&slot_buf, fabricated_slot);
+    try raw.writePositionalAll(std.testing.io, &slot_buf, slotPhysicalPage(other_slot_index) * @as(u64, default_page_size));
+    raw.close(std.testing.io);
+
+    // Sanity: the fabricated two-run manifest verifies and wins on its own
+    // -- confirms the construction above (and encodeManifestPayloadAlloc's
+    // multi-run output) is genuinely valid before the corruption below is
+    // what makes it fail.
+    {
+        const report = try inspect(allocator, std.testing.io, path);
+        try std.testing.expect(report.valid);
+        try std.testing.expectEqual(fabricated_sequence, report.commit_sequence);
+    }
+
+    // Tear one page in the SECOND run only -- the first run (and its own
+    // header/CRC-array bounds) verifies cleanly; only the later run's own
+    // entry must be what catches this.
+    {
+        var writable = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer writable.close(std.testing.io);
+        const damaged = (run2_start + 1) * @as(u64, default_page_size) + page_crc_offset;
+        try writable.writePositionalAll(std.testing.io, "X", damaged);
+    }
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(stable_sequence, report.commit_sequence);
+    try std.testing.expectEqual(base_page_count, report.page_count);
+
+    var reopened = try NativeFile.openWithIo(allocator, std.testing.io, path, .{ .no_sync = true });
+    defer reopened.close();
+    try std.testing.expectEqual(stable_sequence, reopened.activeCheckpoint().commit_sequence);
+    const recovered = (try reopened.getDocumentAlloc(allocator, "doc")).?;
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings("stable", recovered);
+}
+
+// v9 required test: a corrupted run table (not just a corrupted data page)
+// must fail verification safely -- a declared run `count` or `run_count`
+// that overruns the manifest page's own payload must return `false`
+// (an ordinary "fall back" outcome), never read out of bounds or panic.
+// Both payloads below are hand-corrupted: never something
+// `encodeManifestPayloadAlloc` itself would produce.
+test "lite native manifest run table rejects out-of-bounds run entries instead of crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const total_pages = reserved_header_pages + 4;
+    const page_id = reserved_header_pages;
+    var page_buf: [default_page_size]u8 = undefined;
+    encodePage(&page_buf, .data, "ok");
+    const real_crc = std.mem.readInt(u32, page_buf[page_crc_offset..][0..4], .little);
+
+    // Case 1: a run's declared `count` claims far more CRCs than the page
+    // has room for.
+    {
+        const path = try testPath(allocator, tmp, "manifest-run-count-overrun.aflite");
+        defer allocator.free(path);
+        var raw = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+        try raw.setLength(std.testing.io, total_pages * @as(u64, default_page_size));
+        try raw.writePositionalAll(std.testing.io, &page_buf, page_id * @as(u64, default_page_size));
+
+        var payload: [manifest_header_size + manifest_run_header_size]u8 = undefined;
+        std.mem.writeInt(u32, payload[0..4], 1, .little); // run_count
+        std.mem.writeInt(u32, payload[4..8], 0, .little); // reused_count
+        std.mem.writeInt(u64, payload[8..16], page_id, .little); // range_start
+        std.mem.writeInt(u32, payload[16..20], 1000, .little); // count: bogus, no room on the page
+        var manifest_buf: [default_page_size]u8 = undefined;
+        encodePage(&manifest_buf, .commit_manifest, &payload);
+        const manifest_page_id = reserved_header_pages + 1;
+        try raw.writePositionalAll(std.testing.io, &manifest_buf, manifest_page_id * @as(u64, default_page_size));
+        raw.close(std.testing.io);
+
+        const slot = CheckpointSlot{
+            .commit_sequence = 1,
+            .page_count = total_pages,
+            .presynced = false,
+            .manifest_page = manifest_page_id,
+            .manifest_crc = std.mem.readInt(u32, manifest_buf[page_crc_offset..][0..4], .little),
+            .manifest_page_count = 1,
+        };
+        var reader = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+        defer reader.close(std.testing.io);
+        try std.testing.expect(!verifyManifest(reader, std.testing.io, slot, default_page_size));
+    }
+
+    // Case 2: the run table itself claims more runs than fit -- the second
+    // run's own 12-byte header has no room left in the page payload at all,
+    // even though the first run's single entry is genuinely valid.
+    {
+        const path = try testPath(allocator, tmp, "manifest-run-table-overrun.aflite");
+        defer allocator.free(path);
+        var raw = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+        try raw.setLength(std.testing.io, total_pages * @as(u64, default_page_size));
+        try raw.writePositionalAll(std.testing.io, &page_buf, page_id * @as(u64, default_page_size));
+
+        var payload: [manifest_header_size + manifest_run_header_size + 4]u8 = undefined;
+        std.mem.writeInt(u32, payload[0..4], 3, .little); // claims 3 runs
+        std.mem.writeInt(u32, payload[4..8], 0, .little);
+        std.mem.writeInt(u64, payload[8..16], page_id, .little);
+        std.mem.writeInt(u32, payload[16..20], 1, .little); // run 1: one real, valid entry
+        std.mem.writeInt(u32, payload[20..24], real_crc, .little);
+        // No bytes left at all for runs 2 and 3's own headers.
+        var manifest_buf: [default_page_size]u8 = undefined;
+        encodePage(&manifest_buf, .commit_manifest, &payload);
+        const manifest_page_id = reserved_header_pages + 1;
+        try raw.writePositionalAll(std.testing.io, &manifest_buf, manifest_page_id * @as(u64, default_page_size));
+        raw.close(std.testing.io);
+
+        const slot = CheckpointSlot{
+            .commit_sequence = 1,
+            .page_count = total_pages,
+            .presynced = false,
+            .manifest_page = manifest_page_id,
+            .manifest_crc = std.mem.readInt(u32, manifest_buf[page_crc_offset..][0..4], .little),
+            .manifest_page_count = 3,
+        };
+        var reader = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+        defer reader.close(std.testing.io);
+        try std.testing.expect(!verifyManifest(reader, std.testing.io, slot, default_page_size));
+    }
+}
+
 // WS1(b) required test: "a v8 build refuses a v7 file" (design doc §3.1).
 test "lite native indexed open refuses a pre-v8 format version" {
     const allocator = std.testing.allocator;
