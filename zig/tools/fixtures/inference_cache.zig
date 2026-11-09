@@ -92,4 +92,5 @@ pub fn build(b: *std.Build) void {
     profiles.addOnnxTestChecks(b);
     if (!inference_found) @panic("standalone fixture did not find its actual development executable");
     if (!pilot_found or !reporting_found or !pjrt_test_found) @panic("standalone fixture did not find its actual tool consumers");
+    profiles.retainCacheTargets(b, "cache-inference");
 }

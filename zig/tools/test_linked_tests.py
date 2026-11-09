@@ -200,6 +200,26 @@ export fn fixtureValue() u32 {
         self.assertRegex(output, r"compile test_obj fixture-consumer \S+ \S+ cached")
         self.assertRegex(output, r"compile lib fixture-provider \S+ \S+ success")
 
+    def test_provider_metadata_is_stable_and_final_link_has_no_zig_root(self):
+        self.write(
+            "provider.zig",
+            'const std = @import("std");\nconst info = @import("build_info");\n'
+            'export fn fixtureValue() u32 { return if (std.mem.eql(u8, info.version(), "test")) 42 else 0; }\n',
+        )
+        output = self.build("test", "-Dmetadata=true", "-Drelease-version=first")
+        self.assertIn("provider-value=42", output)
+        output = self.build("test", "-Dmetadata=true", "-Drelease-version=second")
+        self.assertIn("provider-value=42", output)
+        self.assert_compile(output, "test_obj", "consumer", "cached")
+        self.assert_compile(output, "lib", "provider", "cached")
+        self.assertNotIn("compile obj antfly-build-info debug", output)
+        # A metadata-only import must never become the executable root. This
+        # reproduces the Linux missing-main/TLS failure even on a Darwin host.
+        if platform.system() != "Linux":
+            # Linux CI performs the native link above. Other hosts inspect the
+            # same Linux graph invariant without rebuilding a foreign libc.
+            self.build("--help", "-Dmetadata=true", "-Dtarget=x86_64-linux-gnu")
+
     def test_selection_and_failure_diagnostics(self):
         output = self.build("test", "--", "consumer")
         self.assertIn("1 passed", output)
