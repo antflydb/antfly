@@ -227,6 +227,45 @@ test "crash sweep: relational unique autocommit two inserts and an update" {
     try reportFailures(&report);
 }
 
+/// An explicit multi-statement session (BEGIN/INSERT/INSERT/COMMIT) on the
+/// fused path (lite-single-commit-write-path.md §3.3c, task 3:
+/// `sql_session.zig`'s `commit` now routes a single-table session COMMIT
+/// through `commitCoordinatedLocal` too). BEGIN and the staged INSERTs do
+/// no native I/O at all (purely in-memory session state), so every
+/// barrier this sweep finds is inside table creation or the COMMIT call
+/// itself -- exactly the fused single native commit this task adds.
+/// Both rows must land together or neither must, at every sync point.
+fn runRelationalSessionCommit(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var handle = try CapiHandle.open(allocator, path, io, true);
+    defer handle.close();
+
+    try sqlOk(handle.id, "{\"statement\":\"CREATE TABLE t (n BIGINT)\"}");
+
+    var session: u64 = 0;
+    const session_code = @import("../../capi/sql_session.zig").antfly_db_sql_session_open(handle.id, &session);
+    if (session_code != .ok) return error.CapiSqlUnexpectedResult;
+
+    try sqlOk(handle.id, "{\"statement\":\"BEGIN\",\"session_id\":1}");
+    try sqlOk(handle.id, "{\"statement\":\"INSERT INTO t (_id,n) VALUES ('row-0',10)\",\"session_id\":1}");
+    try sqlOk(handle.id, "{\"statement\":\"INSERT INTO t (_id,n) VALUES ('row-1',20)\",\"session_id\":1}");
+
+    try checkpoints.append(allocator, .{ .expectations = &.{
+        .{ .key = "row-0", .before = null, .after = "10" },
+        .{ .key = "row-1", .before = null, .after = "20" },
+    } });
+    try sqlOk(handle.id, "{\"statement\":\"COMMIT\",\"session_id\":1}");
+}
+
+test "crash sweep: relational session COMMIT on the fused path" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "relational-session-commit",
+        .run = runRelationalSessionCommit,
+        .custom_check = checkViaSql,
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
 test "crash sweep exhaustive: relational unique autocommit two inserts and an update" {
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "relational-unique-autocommit",

@@ -615,8 +615,29 @@ pub fn Adapter(comptime native: type) type {
                 .relational_integrity_generation_set = request.relational_integrity_generation_set,
                 .integrity_commands = request.integrity_commands,
             };
+            // lite-single-commit-write-path.md §3.3c: this path has no
+            // separate durable decision record to resolve an ambiguous
+            // outcome against (unlike `commitCoordinatedTwoPhase`'s own
+            // `TxnId`), so it reuses `outcome_receipts.zig`'s bounded
+            // writer-keyed scheme instead -- the marker is just one more
+            // key in the same native batch, exactly like the UNIQUE
+            // claims `prepareLocalIntegrityDecision` already writes
+            // there. `Writer.retire` nulls the writer's id the instant it
+            // retires (the next marker gets a fresh random one), so the
+            // retired 16-byte id is already a one-shot token: it can
+            // double as `transaction_id` with no new storage and no
+            // format change, resolved by comparing
+            // `apply_receipts.readOutcomeMarker(writer)` against the
+            // sequence this call used -- see `DB.getTransactionStatus`'s
+            // fallback for an id that is not a recognized two-phase
+            // `TxnId`.
+            const receipts = @import("outcome_receipts.zig");
+            const writer = receipts.activeWriter();
+            const named = if (!std.mem.eql(u8, self.table_name, "default")) self.table_name else null;
+            const marker = if (writer) |w| w.next(named) else null;
+
             var primary_committed = false;
-            self.db.batchLocalCoordinated(req, &primary_committed) catch |err| {
+            self.db.batchLocalCoordinated(req, &primary_committed, marker) catch |err| {
                 // `primary_committed` is authoritative here (and reset by
                 // `batchInternalPreparedOwned` itself if the group-commit
                 // ticket wait ultimately fails): there is no separate
@@ -625,7 +646,33 @@ pub fn Adapter(comptime native: type) type {
                 // `commitCoordinatedTwoPhase`) there is no
                 // `publicationUncertain` check to add here.
                 if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;
-                if (outcomes.isUnknownOutcome(err)) return error.SqlMutationOutcomeUnknown;
+                if (outcomes.isUnknownOutcome(err)) {
+                    if (writer) |w| if (marker) |m| {
+                        w.retire(m, if (named) |name| .{ .name = name, .id = self.db.core.identity_namespace.table_id } else null);
+                        self.outcome_transaction_id = m.writer;
+                        // `antfly_db_get_transaction_status`'s fallback
+                        // needs the exact sequence to disambiguate; kept
+                        // on the Owner, not `self.db`, since it must
+                        // survive this connection's own post-ambiguous-
+                        // commit reconciliation -- see `Owner.
+                        // last_ambiguous_fused_marker`'s doc comment.
+                        // `self.handle` here is the per-generation catalog
+                        // root (what `WriterLane.checkout`/`connection.
+                        // refresh` hand back), not the stable, client-
+                        // facing wrapper that owns `lite_connection` --
+                        // `lite_connection_context` is the root's own
+                        // back-reference to the `Connection` currently
+                        // attached to it (`Connection.attach`/`detach`),
+                        // which every lane-managed write holds attached
+                        // for exactly this duration. Not every backend has
+                        // a Lite connection (a directory/LSM handle does
+                        // not); only Lite's own fused path needs this.
+                        if (self.handle) |handle| if (handle.lite_connection_context) |connection| {
+                            connection.owner.last_ambiguous_fused_marker = m;
+                        };
+                    };
+                    return error.SqlMutationOutcomeUnknown;
+                }
                 if (err == error.VersionConflict) return error.SqlWriteConflict;
                 return outcomes.notApplied(err);
             };
