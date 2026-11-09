@@ -21260,6 +21260,7 @@ pub const DB = struct {
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
         profile.next("reuse_and_admission");
+        var reference_checked = false;
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
             // Statistics, preflight and execution may capture the same cut.
             // Its first committed generation remains authority even after live
@@ -21274,13 +21275,15 @@ pub const DB = struct {
                 return;
             }
             if (self.primary_lsm_storage) |storage| {
+                reference_checked = true;
                 if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
             }
         };
         if (publish and try self.tryReuseNativeQueryCut(io, request, token)) return;
         // A process-local hint is optional. Recover an already committed
         // binding before considering a fresh capture of mutable live state.
-        if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
+        if (publish and !reference_checked) if (self.backend_runtime.query_cut_repository) |repository| {
+            // A custom storage owner already performed this lookup above.
             // Default filesystem owners have no custom Storage override.
             // They still need committed-binding discovery after hint loss;
             // the native view simply has no remote checkpoint reference.
@@ -74737,6 +74740,74 @@ test "db idle dense query captures retain the same immutable runs" {
         try std.testing.expectEqual(sequence, db.core.nextDerivedSequence());
         try std.testing.expectEqualSlices(u64, second.run_ids, next.run_ids);
     }
+}
+
+test "db native checkpoint discovery probes a repository once before capture" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const cut = @import("native_query_cut.zig");
+    const port = @import("native_query_cut_repository.zig");
+    const Namespace = @import("doc_identity_namespace.zig").Namespace;
+    const Fixture = struct {
+        references: usize = 0,
+        publications: usize = 0,
+        committed: bool = false,
+        fn publish(raw: *anyopaque, _: port.Executor, _: []const u8, _: cut.Request, _: Namespace, _: types.CancellationToken) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.publications += 1;
+        }
+        fn recover(_: *anyopaque, _: port.Executor, _: []const u8, _: cut.Request, _: Namespace, _: types.CancellationToken) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn reference(raw: *anyopaque, _: port.Executor, _: cut.Request, _: Namespace, _: port.Storage, _: types.CancellationToken) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+            return self.committed;
+        }
+    };
+    var directory = try TestDirectory.init("native-discovery-once");
+    defer directory.cleanup();
+    const path = directory.path();
+    const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{path});
+    defer a.free(pins);
+    defer std.Io.Dir.cwd().deleteTree(io, pins) catch {};
+    var db = try DB.open(a, path, .{
+        .no_sync = true,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+        .start_index_workers = false,
+        .start_independent_maintenance = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write });
+    var fixture: Fixture = .{};
+    const previous_repository = db.backend_runtime.query_cut_repository;
+    defer db.backend_runtime.query_cut_repository = previous_repository;
+    db.backend_runtime.query_cut_repository = .{ .ptr = &fixture, .vtable = &.{ .publish = Fixture.publish, .recover = Fixture.recover, .reference = Fixture.reference } };
+    const previous_storage = db.primary_lsm_storage;
+    defer db.primary_lsm_storage = previous_storage;
+    var native = try lsm_backend_mod.storage_io.NativeStorage.init(a, .threaded);
+    defer native.deinit();
+    for ([_]bool{ true, false }) |custom_storage| {
+        db.primary_lsm_storage = if (custom_storage) native.storage() else null;
+        const id: [64]u8 = @splat(if (custom_storage) @as(u8, 'a') else @as(u8, 'b'));
+        const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+        fixture.references = 0;
+        fixture.committed = false;
+        try db.captureQueryCut(request, .none);
+        try std.testing.expectEqual(@as(usize, 1), fixture.references);
+        // A committed binding must bypass capture even without open_read or
+        // an owner-local hint. Holding the snapshot lock makes that observable.
+        fixture.references = 0;
+        fixture.committed = true;
+        try std.testing.expect(db.snapshot_publication_mutex.tryLock());
+        defer db.snapshot_publication_mutex.unlock();
+        try db.captureQueryCut(request, .none);
+        try std.testing.expectEqual(@as(usize, 1), fixture.references);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fixture.publications);
 }
 
 test "db native checkpoint warming skips unchanged expired cuts and resumes on content changes" {

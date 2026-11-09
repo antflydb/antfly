@@ -1101,3 +1101,88 @@ test "privacy replay cursor preserves an empty document identifier" {
     try std.testing.expectEqualStrings("", decoded.doc_key);
     try std.testing.expectEqual(@as(u64, 2), decoded.sequence);
 }
+
+test "durable enrichment scoped retry drains configuration replans across bounded pages and restart" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../mem_backend.zig");
+    var backend = backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "retry-replan-pages" });
+    defer store.deinit();
+    const Guard = struct {
+        canceled: bool = false,
+        pub fn validate(self: @This(), _: anytype) !void {
+            if (self.canceled) return error.Canceled;
+        }
+    };
+    const Reader = struct {
+        fn get(_: *anyopaque, _: Allocator, _: [32]u8) ![]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var marker: u8 = 0;
+    const resolver: scoped_retries.DocumentResolver = .{ .ptr = &marker, .get = Reader.get };
+    var state: scoped_retries.State = .{};
+    defer state.deinit(a);
+    // A full queue prevents fresh discovery from masking missed replans.
+    const future = 3_600_000;
+    for (0..scoped_retries.max_documents) |i| {
+        var buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "doc-{d}", .{i});
+        try state.park(a, .{ .doc_key = key, .sequence = i + 1 }, future, .{ .fingerprint = i + 1, .logical_fingerprint = i + 1, .failures = 2, .waits = 3 }, null);
+    }
+    state.config_hash = 2;
+    state.beginReplan();
+    try saveScopedRetryState(a, &store, &state, Guard{});
+    var visited: std.StaticBitSet(scoped_retries.max_documents) = .empty;
+    for (0..scoped_retries.max_documents) |page| {
+        // Reload every page: the new configuration hash and pending work must
+        // survive independently of the original config_changed stack frame.
+        var restored = try loadScopedRetries(a, &store);
+        defer restored.deinit(a);
+        try std.testing.expectEqual(@as(u64, 2), restored.config_hash);
+        try std.testing.expectEqual(@as(u64, 0), restored.deadline());
+        const due = try restored.dueWithReferences(a, 0, resolver, 1);
+        defer due.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), due.groups.len);
+        try std.testing.expectEqual(@as(usize, 0), due.tokens.len);
+        const index: usize = @intCast(due.groups[0].sequence - 1);
+        try std.testing.expect(!visited.isSet(index));
+        visited.set(index);
+        restored.completeReplan(due);
+        // Even an immediately due producer in a completed page cannot starve
+        // the rest of the finite replan inventory.
+        restored.tickets.items[index].deadline_ms = 0;
+        restored.tickets.items[index].budgets.items[0].deadline_ms = 0;
+        restored.tickets.items[index].dirty = true;
+        if (page == 0) {
+            try std.testing.expectError(error.Canceled, saveScopedRetryState(a, &store, &restored, Guard{ .canceled = true }));
+            var unchanged = try loadScopedRetries(a, &store);
+            defer unchanged.deinit(a);
+            try std.testing.expectEqual(@as(usize, scoped_retries.max_documents), unchanged.pending_replan.count());
+        }
+        try saveScopedRetryState(a, &store, &restored, Guard{});
+    }
+    try std.testing.expectEqual(@as(usize, scoped_retries.max_documents), visited.count());
+    var final = try loadScopedRetries(a, &store);
+    defer final.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), final.pending_replan.count());
+    for (final.tickets.items) |*ticket| {
+        ticket.deadline_ms = future;
+        ticket.budgets.items[0].deadline_ms = future;
+    }
+    try std.testing.expectEqual(@as(u64, future), final.deadline());
+    for (final.tickets.items) |ticket| {
+        try std.testing.expectEqual(@as(u32, 2), ticket.budgets.items[0].failures);
+        try std.testing.expectEqual(@as(u32, 3), ticket.budgets.items[0].waits);
+    }
+    const waiting = try final.dueWithReferences(a, 0, resolver, 1);
+    defer waiting.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), waiting.groups.len);
+    // A later change must rearm all slots, including completed earlier pages.
+    final.beginReplan();
+    final.removeTicket(a, 0);
+    try std.testing.expectEqual(@as(usize, scoped_retries.max_documents - 1), final.pending_replan.count());
+    try final.park(a, .{ .doc_key = "new", .sequence = 1000 }, future, .{ .fingerprint = 1000 }, null);
+    try std.testing.expect(!final.pending_replan.isSet(final.tickets.items[final.tickets.items.len - 1].slot));
+}
