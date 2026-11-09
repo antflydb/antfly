@@ -238,7 +238,8 @@ pub const SearchOptions = struct {
     two_level: bool = true,
     /// Descend the upper layers with recomputed exact distances instead of
     /// PQ distances. Costs roughly levels x M recomputations per query but
-    /// avoids starting layer 0 in the wrong region when PQ is coarse.
+    /// avoids starting layer 0 in the wrong region when PQ is coarse. Filtered
+    /// searches use approximate descent to avoid loading rejected vectors.
     exact_descent: bool = false,
     rerank: Rerank = .auto,
     /// Multiplies RaBitQ error bounds in `bounds` mode. Larger is safer and
@@ -739,7 +740,8 @@ pub const Index = struct {
         var approx = try Approx.init(alloc, self, q);
         defer approx.deinit();
 
-        const start = if (eff.exact_descent)
+        // A filtered search must not load rejected upper-layer vectors.
+        const start = if (eff.exact_descent and eff.filter == null)
             try self.greedyDescentRecompute(alloc, source, q, self.entry, self.max_level, &stats)
         else
             try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats);
@@ -3607,7 +3609,7 @@ test "leann: pq filtered search reads only allowed vectors" {
         }
     };
     const dummy: u8 = 0;
-    var result = try index.search(alloc, src.source(), fx.query(0), .{ .k = 1, .filter = .{ .ctx = &dummy, .allows_fn = One.allows } });
+    var result = try index.search(alloc, src.source(), fx.query(0), .{ .k = 1, .exact_descent = true, .filter = .{ .ctx = &dummy, .allows_fn = One.allows } });
     defer result.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), result.results.len);
     try testing.expectEqual(@as(u32, 123), result.results[0].id);
