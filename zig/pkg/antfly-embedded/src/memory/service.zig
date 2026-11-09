@@ -583,6 +583,7 @@ const Run = struct {
     changes: std.ArrayList(Change) = .empty,
     change_positions: std.StringHashMapUnmanaged(usize) = .empty,
     assertion_rows: std.StringHashMapUnmanaged(t.StoredAssertion) = .empty,
+    preparation_full_records: std.StringHashMapUnmanaged(t.StoredAssertion) = .empty,
     evidence_rows: std.StringHashMapUnmanaged(t.StoredEvidence) = .empty,
     entity_rows: std.StringHashMapUnmanaged(t.EntityRecord) = .empty,
     projection_rows: std.StringHashMapUnmanaged(t.EntityProjection) = .empty,
@@ -651,7 +652,7 @@ const Run = struct {
     const MetadataReadBudget = struct { used: usize = 0, limit: usize = 8 * 1024 * 1024 };
     // Scratch readers share request-wide work/utility budgets and the final
     // source fence, while decoded record payloads die after each root.
-    fn scratchReader(self: *Run, allocator: A, budget: ?*MetadataReadBudget) Run {
+    fn scratchReader(self: *Run, allocator: A, budget: *MetadataReadBudget) Run {
         return .{ .service = self.service, .a = allocator, .lexical_allocator = self.lexical_allocator, .state = self.state, .state_row = self.state_row, .explanation_snapshot_scratch = .init(allocator), .lineage_head = self.lineage_head, .metadata_read_budget = budget, .read_owner = self, .support_work = self.support_work, .utility_bytes = self.utility_bytes, .utility_bindings = self.utility_bindings, .utility_inputs = self.utility_inputs, .utility_exhausted = self.utility_exhausted };
     }
     fn bindScratchIndex(self: *Run) void {
@@ -1709,6 +1710,7 @@ const Run = struct {
             self.clearIdentityCaches();
         }
         _ = self.assertion_rows.remove(path);
+        _ = self.preparation_full_records.remove(path);
         _ = self.evidence_rows.remove(path);
         _ = self.entity_rows.remove(path);
         _ = self.projection_rows.remove(path);
@@ -1736,6 +1738,7 @@ const Run = struct {
         self.change_positions.clearRetainingCapacity();
         self.change_ranges = .{};
         self.assertion_rows.clearRetainingCapacity();
+        self.preparation_full_records.clearRetainingCapacity();
         self.evidence_rows.clearRetainingCapacity();
         self.entity_rows.clearRetainingCapacity();
         self.projection_rows.clearRetainingCapacity();
@@ -8417,9 +8420,30 @@ const Run = struct {
         compact.assertion.embedding_model = null;
         return compact;
     }
+    fn preparationFullRecord(self: *Run, requested: []const u8) !?t.StoredAssertion {
+        const path = (try self.snapshotPath(requested)) orelse return null;
+        if (self.preparation_full_records.get(path)) |record| return record;
+        try self.service.context.check();
+        // Pin fingerprints need complete payloads. Bypass the shared metadata
+        // proof cache, including projections already read as dependencies in
+        // this pair. Full payloads stay local and never enter read_proofs.
+        const json = if (self.change_positions.get(path)) |position|
+            self.changes.items[position].json
+        else blk: {
+            const row = try self.service.backend.get(self.service.backend.ptr, self.a, path);
+            const bytes = if (row) |value| value.json else null;
+            try self.backend_rows.put(self.a, try self.a.dupe(u8, path), bytes);
+            break :blk bytes;
+        };
+        _ = self.assertion_rows.remove(path);
+        const bytes = json orelse return null;
+        const record = try self.parseRead(t.StoredAssertion, path, bytes);
+        try self.preparation_full_records.put(self.a, try self.a.dupe(u8, path), record);
+        return record;
+    }
     fn preparationClaim(self: *Run, id: []const u8, cache: *PreparationCache) !?PreparationClaim {
         if (cache.entries.get(id)) |entry| return try parse(PreparationClaim, self.a, entry.json);
-        const record = (try self.assertion(id)) orelse return null;
+        const record = (try self.preparationFullRecord(try key(self.a, "assertion", id))) orelse return null;
         if (record.lifecycle != .active and record.lifecycle != .disputed) return null;
         const view = try self.claimView(record);
         if (!try self.retained(record, 0)) return error.MemoryForgotten;
@@ -8439,7 +8463,7 @@ const Run = struct {
         // The current record's authorization and retention were proved on its
         // first use. Independently validate the actual full frozen record once;
         // matching a current fingerprint alone does not validate history.
-        const frozen = (try self.read(t.StoredAssertion, try historyKey(self.a, pin.id, pin.revision))) orelse return error.MemoryNotFound;
+        const frozen = (try self.preparationFullRecord(try historyKey(self.a, pin.id, pin.revision))) orelse return error.MemoryNotFound;
         _ = try self.validatePinnedRecord(pin, frozen, proof.generation);
         if (cache.entries.getPtr(pin.id)) |entry| entry.frozen_validated = true;
     }
@@ -8521,6 +8545,7 @@ const Run = struct {
         var proposals: std.ArrayList([]const u8) = .empty;
         var seen: ResourceSet = .empty;
         var cache: PreparationCache = .{ .a = self.a };
+        var policy_budget: MetadataReadBudget = .{};
         var scratch: std.heap.ArenaAllocator = .init(self.lexical_allocator);
         defer scratch.deinit();
         for (report.findings) |finding| {
@@ -8528,15 +8553,18 @@ const Run = struct {
             for (finding.memory_ids[1..]) |peer_id| {
                 try self.service.context.check();
                 _ = scratch.reset(.retain_capacity);
-                var reader = self.scratchReader(scratch.allocator(), null);
-                // Unlike review projections, proposal pins require full claims.
-                // Keep decoded payloads only for this pair, sharing work budgets
-                // and compact final source fences with the parent request.
+                var reader = self.scratchReader(scratch.allocator(), &policy_budget);
+                // Dependencies use bounded metadata reads. Only explicit pin
+                // hydration fetches complete current/frozen payloads; those
+                // remain in this pair's scratch, with shared final source fences.
                 reader.bindScratchIndex();
                 defer reader.finishScratch(self);
                 for (self.changes.items) |change| try reader.stageChange(change.key, change.json);
                 var receipt = operation.*;
-                const id = try reader.prepareConsolidationPair(finding.memory_ids[0], peer_id, &receipt, &seen, &cache);
+                const id = reader.prepareConsolidationPair(finding.memory_ids[0], peer_id, &receipt, &seen, &cache) catch |err| switch (err) {
+                    error.MemoryReadLimit => return error.MemoryWorkLimit,
+                    else => return err,
+                };
                 // Only compact proposal/index writes escape scratch storage.
                 for (reader.changes.items) |change| {
                     if (self.change_positions.get(change.key)) |position| {

@@ -9670,3 +9670,154 @@ test "memory preparation caches shared payload fingerprints and frozen pins" {
         try std.testing.expectEqualStrings(pin.fingerprint, shared.fingerprint);
     }
 }
+
+test "memory preparation support traversal avoids fetching common dependency payloads" {
+    const Meter = struct {
+        fn get(ptr: *anyopaque, allocator: A, path: []const u8) !?m.Row {
+            const row = (try Store.get(ptr, allocator, path)) orelse return null;
+            if (std.mem.startsWith(u8, path, "assertion/") or std.mem.startsWith(u8, path, "history/")) {
+                const store: *Store = @ptrCast(@alignCast(ptr));
+                store.document_batches += row.json.len;
+                if (row.json.len > 64 * 1024) store.query_batches += 1;
+            }
+            return row;
+        }
+        fn metadata(ptr: *anyopaque, allocator: A, path: []const u8) !?m.Row {
+            const row = (try Store.get(ptr, allocator, path)) orelse return null;
+            var record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, allocator, row.json, .{});
+            record.assertion.steps = &.{};
+            return .{ .key = row.key, .json = try std.json.Stringify.valueAlloc(allocator, record, .{}), .version = row.version };
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    var svc = store.service("alice", true, 500);
+    const payload = try a.alloc(u8, 64 * 1024);
+    @memset(payload, 'x');
+    const parent: m.types.Assertion = .{ .id = "big-parent", .subject = "foundation", .predicate = "premise", .value = "ready", .statement = "Useful shared premise", .kind = .procedural, .steps = &.{ payload, payload }, .evidence = &.{.{ .id = "e1" }} };
+    _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{parent} }, .{}), "parent");
+    _ = try svc.execute(a, .pin, "", "{\"id\":\"big-parent\"}", "pin-parent");
+    var first_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("\"a\"", &first_digest, .{});
+    var ids: std.ArrayList([]const u8) = .empty;
+    try ids.append(a, "a");
+    for (0..4096) |i| {
+        const id = try std.fmt.allocPrint(a, "z-{d}", .{i});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, id, .{}), &digest, .{});
+        if (!std.mem.lessThan(u8, &first_digest, &digest)) continue;
+        try ids.append(a, id);
+        if (ids.items.len == 32) break;
+    }
+    for (ids.items, 0..) |id, i| {
+        const claim: m.types.Assertion = .{ .id = id, .subject = "s", .predicate = "p", .value = "same", .statement = "Same useful procedure", .kind = .procedural, .depends_on = &.{"big-parent"}, .evidence = &.{.{ .id = "e1" }} };
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{claim} }, .{}), id);
+        _ = try svc.execute(a, .pin, "", try std.json.Stringify.valueAlloc(a, m.types.Pin{ .id = id }, .{}), try std.fmt.allocPrint(a, "pin-{d}", .{i}));
+    }
+    svc.backend.get = Meter.get;
+    svc.backend.get_metadata = Meter.metadata;
+    for (0..2) |attempt| {
+        store.document_batches = 0;
+        store.query_batches = 0;
+        const response = try svc.execute(a, .prepare_consolidation, "", "{}", if (attempt == 0) "prepare" else "reuse");
+        const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, response, .{});
+        std.debug.print("dependency preparation attempt={d} shared payload={d} full hydration={d} heavy reads={d} proposals={d} response={d}\n", .{ attempt, payload.len * 2, store.document_batches, store.query_batches, receipt.proposal_ids.len, response.len });
+        try std.testing.expectEqual(@as(usize, 31), receipt.proposal_ids.len);
+        try std.testing.expectEqual(@as(usize, 0), store.query_batches);
+        try std.testing.expect(store.document_batches < payload.len);
+        const detail = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalDetail, a, try svc.execute(a, .supersession_proposal, receipt.proposal_ids[0], "{}", ""), .{});
+        const shared = if (std.mem.eql(u8, detail.incoming.memory.assertion.id, "a")) detail.incoming else detail.previous;
+        try std.testing.expectEqual(@as(usize, 0), shared.memory.assertion.steps.len);
+        const pin = try SupersessionFixture.pin(svc, a, "a");
+        try std.testing.expectEqualStrings(pin.fingerprint, shared.fingerprint);
+    }
+}
+
+test "memory preparation upgrades dependency metadata to full current and frozen pins" {
+    const Projection = struct {
+        fn get(ptr: *anyopaque, allocator: A, path: []const u8) !?m.Row {
+            const row = (try Store.get(ptr, allocator, path)) orelse return null;
+            var record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, allocator, row.json, .{});
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, record.assertion.id, "z-parent")) store.query_batches += 1;
+            record.assertion.steps = &.{};
+            record.assertion.preconditions = &.{};
+            record.assertion.expected_outcome = null;
+            record.assertion.embedding = null;
+            record.assertion.embedding_model = null;
+            return .{ .key = row.key, .json = try std.json.Stringify.valueAlloc(allocator, record, .{}), .version = row.version };
+        }
+    };
+    for ([_]bool{ false, true }) |lineage| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var svc = store.service("alice", true, 500);
+        _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, m.types.Config{ .features = .{ .lineage = lineage } }, .{}), "create");
+        _ = try svc.execute(a, .observe, "", source, "source");
+        const payload = try a.alloc(u8, 32 * 1024);
+        @memset(payload, 'x');
+        const parent: m.types.Assertion = .{ .id = "z-parent", .subject = "s", .predicate = "p", .value = "same", .statement = "Shared procedure", .kind = .procedural, .steps = &.{ payload, payload }, .preconditions = &.{payload}, .expected_outcome = payload, .evidence = &.{.{ .id = "e1" }} };
+        const child: m.types.Assertion = .{ .id = "a-child", .subject = "s", .predicate = "p", .value = "same", .statement = "Same procedure with a dependency", .kind = .procedural, .steps = &.{"Child step"}, .depends_on = &.{"z-parent"}, .evidence = &.{.{ .id = "e1" }} };
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{parent} }, .{}), "parent");
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{child} }, .{}), "child");
+        if (lineage) {
+            _ = try svc.execute(a, .fork_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageFork{ .id = "fork", .expected_revision = try SupersessionFixture.revision(svc, a) }, .{}), "fork");
+            svc.context.branch = "fork";
+        }
+        for ([_][]const u8{ "a-child", "z-parent" }) |id| _ = try svc.execute(a, .pin, "", try std.json.Stringify.valueAlloc(a, m.types.Pin{ .id = id }, .{}), id);
+        const parent_pin = try SupersessionFixture.pin(svc, a, "z-parent");
+        const child_pin = try SupersessionFixture.pin(svc, a, "a-child");
+        svc.backend.get_metadata = Projection.get;
+        for (0..2) |attempt| {
+            store.query_batches = 0;
+            const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .prepare_consolidation, "", "{}", if (attempt == 0) "prepare" else "reuse"), .{});
+            try std.testing.expectEqual(@as(usize, 1), receipt.proposal_ids.len);
+            try std.testing.expect(store.query_batches > 0);
+            const detail = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalDetail, a, try svc.execute(a, .supersession_proposal, receipt.proposal_ids[0], "{}", ""), .{});
+            for ([_]m.types.ClaimView{ detail.incoming, detail.previous }) |view| {
+                const expected = if (std.mem.eql(u8, view.memory.assertion.id, "z-parent")) parent_pin else child_pin;
+                try std.testing.expectEqualStrings(expected.fingerprint, view.fingerprint);
+                if (std.mem.eql(u8, view.memory.assertion.id, "z-parent")) {
+                    try std.testing.expectEqual(@as(usize, 2), view.memory.assertion.steps.len);
+                    try std.testing.expectEqualStrings(payload, view.memory.assertion.steps[0]);
+                    try std.testing.expectEqualStrings(payload, view.memory.assertion.preconditions[0]);
+                    try std.testing.expectEqualStrings(payload, view.memory.assertion.expected_outcome.?);
+                } else try std.testing.expectEqualStrings("Child step", view.memory.assertion.steps[0]);
+            }
+        }
+    }
+}
+
+test "memory preparation bounds policy support hydration and rejects atomically" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    const svc = store.service("alice", true, 500);
+    const text = try a.alloc(u8, 64 * 1024);
+    @memset(text, 'x');
+    var supports: [128]m.types.Support = undefined;
+    for (&supports, 0..) |*support, i| {
+        const id = try std.fmt.allocPrint(a, "large-source-{d}", .{i});
+        const evidence: m.types.Evidence = .{ .id = id, .source_id = id, .source_version = "1", .text = text };
+        _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, m.types.ObservationRequest{ .evidence = &.{evidence} }, .{}), id);
+        const refs = try a.alloc(m.types.EvidenceRef, 1);
+        refs[0] = .{ .id = id };
+        support.* = .{ .evidence = refs };
+    }
+    // Review uses the short primary support. Fingerprinting the full public
+    // claims also validates every alternative, exceeding the policy byte cap.
+    for ([_][]const u8{ "a", "z" }) |id| {
+        const claim: m.types.Assertion = .{ .id = id, .subject = "s", .predicate = "p", .value = "same", .statement = "Fact with wide support", .evidence = &.{.{ .id = "e1" }}, .support_sets = &supports };
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{claim} }, .{}), id);
+    }
+    const review = try std.json.parseFromSliceLeaky(m.types.Consolidation, a, try svc.execute(a, .consolidate, "", "{}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 1), review.findings.len);
+    const revision = store.revision;
+    try std.testing.expectError(error.MemoryWorkLimit, svc.execute(a, .prepare_consolidation, "", "{}", "prepare"));
+    try std.testing.expectEqual(revision, store.revision);
+    try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "supersession-proposal/", null, 32)).rows.len);
+}
