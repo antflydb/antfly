@@ -25,6 +25,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -61,6 +62,23 @@ def link_children(source, destination):
 
 
 class RuntimeCacheTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.macos_sdk = None
+        if sys.platform == "darwin":
+            # Pin external Xcode selection for this cohort. Automatic discovery
+            # deliberately poisons Zig's configuration cache on every call.
+            # Discovery regressions below use their own subprocess environments.
+            cls.macos_sdk = (
+                os.environ.get("SDK_PATH")
+                or subprocess.check_output(
+                    ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"],
+                    text=True,
+                    timeout=30,
+                ).strip()
+            )
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -133,6 +151,9 @@ class RuntimeCacheTest(unittest.TestCase):
         fixture_flags = (
             ["-Dcache-steps=" + ",".join(execution_roots)] if select_roots else []
         )
+        environment = dict(os.environ)
+        if self.macos_sdk and not environment.get("SDK_PATH"):
+            environment["SDK_PATH"] = self.macos_sdk
         result = subprocess.run(
             [
                 "zig",
@@ -151,6 +172,7 @@ class RuntimeCacheTest(unittest.TestCase):
                 "-j2",
             ],
             cwd=self.build_directory,
+            env=environment,
             text=True,
             capture_output=True,
             check=False,
@@ -651,6 +673,31 @@ class RuntimeCacheTest(unittest.TestCase):
             "lib-image-webp-bench: runtime dependency uses debug, expected fast",
             failure,
         )
+
+    def test_fixture_configuration_reuses_audits_and_runs_template_executable(self):
+        build = self.build_directory / "build.zig"
+        source = build.read_text()
+        anchor = '    profiles.retainCacheTargets(b, "cache-probe");'
+        self.assertIn(anchor, source)
+        build.write_text(
+            source.replace(
+                anchor, '    std.debug.print("FIXTURE_CONFIGURED\\n", .{});\n' + anchor
+            )
+        )
+        settings = ("--cache-poison=disallowed",)
+        first = self.build("cache-unit-tests", settings=settings)
+        self.assertIn("FIXTURE_CONFIGURED", first)
+        self.assertIn("UNIT_METADATA_PROBE test", first)
+        self.assertNotIn("run test_obj", first)
+        warm = self.build("cache-unit-tests", settings=settings)
+        self.assertNotIn("FIXTURE_CONFIGURED", warm)
+        self.assertRegex(warm, r"compile test debug \S+ cached")
+        # Build-policy inputs still invalidate the cached full-graph audit.
+        policy = self.own("zig/build_support/embedded/shared_library.zig")
+        policy.write_bytes(policy.read_bytes() + b"\n// cache audit policy input\n")
+        changed = self.build("cache-unit-tests", settings=settings)
+        self.assertIn("FIXTURE_CONFIGURED", changed)
+        self.assertRegex(changed, r"compile test debug \S+ cached")
 
     def test_native_artifact_profiles(self):
         for source in ("zig/lib/audio/src/mod.zig", "zig/lib/linalg/src/mod.zig"):
