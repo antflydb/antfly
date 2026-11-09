@@ -525,10 +525,10 @@ pub fn Adapter(comptime native: type) type {
             return output;
         }
 
-        /// A single-table, single-process coordinated commit: begin, write
-        /// the intents, and resolve them to real rows, all against `self.db`
-        /// directly. `mutate` below routes a coordinated write here instead
-        /// of `sql_commit.zig`'s cross-database two-phase coordinator
+        /// A single-table, single-process coordinated commit against
+        /// `self.db` directly. `mutate` below (and `sql_session.zig`'s
+        /// `commit`) route a coordinated write here instead of
+        /// `sql_commit.zig`'s cross-database two-phase coordinator
         /// whenever the write touches exactly one table on a Lite single-
         /// file store, which needs no cross-database decision record (every
         /// table there already shares one physical commit domain) --
@@ -536,18 +536,112 @@ pub fn Adapter(comptime native: type) type {
         /// coordinator-role transaction, and the extra per-participant
         /// recovery round trip (lite-single-commit-write-path.md §3.3c).
         ///
-        /// This still pays three separate native commits (begin,
-        /// writeTransaction, commitTransaction): each one's group-commit
-        /// batch is only *applied* -- and so only readable by the next
-        /// step's own read -- once something actually drives/waits its
-        /// group (`lite/docstore.zig`'s `MutationPlan.apply` runs inside
-        /// `driveMutationCoordinator`, not at `enqueue` time), and
-        /// `writeTransaction` must read back the record `beginTransaction`
-        /// just wrote. Collapsing these three into one native commit needs
-        /// a combined batch that skips the durable round trip through
-        /// "intents" entirely, not just deferred waits across them; that is
-        /// follow-up work, not done here.
-        pub fn commitCoordinated(self: *Self, request: contract.TableCommitRequest) !catalog.MutationOutcome {
+        /// `commitCoordinatedLocal` below is the common case: one native
+        /// commit, no begin record, no durable intent record. This falls
+        /// back to the durable three-commit begin/write/commit sequence
+        /// (`commitCoordinatedTwoPhase`) only for requests
+        /// `commitCoordinatedLocal`'s single native batch cannot express --
+        /// row policy, restore staging, graph writes, range guards,
+        /// explicit repair, or the activation/retirement/index-maintenance
+        /// commands -- none of which an ordinary autocommit SQL INSERT/
+        /// UPDATE/DELETE or ordinary multi-statement session COMMIT needs.
+        /// `allow_local_decision` is false only for an explicit multi-
+        /// statement session's COMMIT (`sql_session.zig`): on an unknown
+        /// outcome, that caller's contract exposes a `transaction_id` so a
+        /// client can resolve ambiguity later (`capi SQL outcome COMMIT
+        /// decision failing inside publication is unknown with a
+        /// receipt`), and `commitCoordinatedLocal` has none to give --
+        /// there is no begin record, so there is nothing to resolve
+        /// against. An ordinary autocommit write (`mutate`'s two callers)
+        /// has no such contract (see the passing `capi SQL outcome
+        /// autocommit ...` cases), so it always gets the fused path when
+        /// eligible. Giving the session-COMMIT path the same transaction-
+        /// id-bearing ambiguity resolution as the fused path is follow-up
+        /// work, not done here.
+        pub fn commitCoordinated(self: *Self, alloc: std.mem.Allocator, request: contract.TableCommitRequest, allow_local_decision: bool) !catalog.MutationOutcome {
+            if (allow_local_decision and eligibleForLocalDecision(request)) return self.commitCoordinatedLocal(alloc, request);
+            return self.commitCoordinatedTwoPhase(request);
+        }
+
+        fn eligibleForLocalDecision(request: contract.TableCommitRequest) bool {
+            return request.row_policy_principal_proof.len == 0 and
+                request.restore_staging_scope == null and
+                request.restore_staging_plan_id == null and
+                request.relational_activation == null and
+                request.relational_retirement == null and
+                request.relational_index_maintenance == null and
+                request.integrity.len == 0 and
+                request.graph_writes.len == 0 and
+                request.graph_deletes.len == 0 and
+                !request.normalized_graph_rows and
+                request.range_guards.len == 0 and
+                !request.relational_repair;
+        }
+
+        /// lite-single-commit-write-path.md §3.3c: the primary row(s) plus
+        /// their UNIQUE-constraint integrity-catalog claims, validated and
+        /// written in one native commit (`DB.batchLocalCoordinated`, with
+        /// `BatchExecutionOptions.integrity_authority = .local_decision`).
+        /// No FK command ever reaches here: `eligibleForLocalDecision`
+        /// only lets through requests `prepareWithRepairAdmission` already
+        /// routed to a single physical table, and a `.foreign` generation
+        /// command is refused deeper in by `prepareLocalIntegrityDecision`
+        /// as a defense-in-depth check, never relied on to route correctly.
+        fn commitCoordinatedLocal(self: *Self, alloc: std.mem.Allocator, request: contract.TableCommitRequest) !catalog.MutationOutcome {
+            const outcomes = dependencies.sql_errors;
+            const coordinator = @import("sql_commit.zig");
+            // No separate begin record on this path: both of
+            // `commitCoordinatedTwoPhase`'s pre-decision boundaries
+            // (`test_before_store`, before any participant is admitted;
+            // `test_after_prepare`, after every participant is prepared)
+            // collapse to "before the one native batch below" here, since
+            // validation and the write are the SAME apply-locked call.
+            if (comptime @import("builtin").is_test) if (coordinator.test_before_store) |hook| {
+                coordinator.test_before_store = null;
+                hook.run(hook.ptr) catch |err| return outcomes.notApplied(err);
+            };
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_prepare) |hook| {
+                coordinator.test_after_prepare = null;
+                hook.run(hook.ptr) catch |err| return outcomes.notApplied(err);
+            };
+            const writes = try alloc.alloc(types.BatchWrite, request.writes.len);
+            for (request.writes, writes) |write, *out| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
+            const req: types.BatchRequest = .{
+                .writes = writes,
+                .deletes = request.deletes,
+                .predicates = request.predicates,
+                .schema_version = request.schema_version,
+                .relational_schema_version = request.relational_schema_version,
+                .relational_integrity_generation_set = request.relational_integrity_generation_set,
+                .integrity_commands = request.integrity_commands,
+            };
+            var primary_committed = false;
+            self.db.batchLocalCoordinated(req, &primary_committed) catch |err| {
+                // `primary_committed` is authoritative here (and reset by
+                // `batchInternalPreparedOwned` itself if the group-commit
+                // ticket wait ultimately fails): there is no separate
+                // decision commit whose own publication can be uncertain
+                // independently of the primary write's, so (unlike
+                // `commitCoordinatedTwoPhase`) there is no
+                // `publicationUncertain` check to add here.
+                if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;
+                if (outcomes.isUnknownOutcome(err)) return error.SqlMutationOutcomeUnknown;
+                if (err == error.VersionConflict) return error.SqlWriteConflict;
+                return outcomes.notApplied(err);
+            };
+            // Equivalent of `test_after_decision`: the write is durable;
+            // simulate a post-decision step failing without losing it.
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_decision) |hook| {
+                coordinator.test_after_decision = null;
+                hook.run(hook.ptr) catch return .committed_pending;
+            };
+            return .committed;
+        }
+
+        /// The durable three-commit path (begin, write the intents, resolve
+        /// them to real rows), kept for requests `commitCoordinatedLocal`
+        /// does not cover -- see `eligibleForLocalDecision`.
+        fn commitCoordinatedTwoPhase(self: *Self, request: contract.TableCommitRequest) !catalog.MutationOutcome {
             const io = self.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
             const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
             const outcomes = dependencies.sql_errors;
@@ -1270,12 +1364,12 @@ pub fn Adapter(comptime native: type) type {
                 // general cross-database coordinator.
                 if (self.handle) |handle| {
                     if (handle.owned_lite_backend != null and prepared.?.tables.len == 1 and std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) {
-                        return self.commitCoordinated(prepared.?.tables[0]);
+                        return self.commitCoordinated(temporary, prepared.?.tables[0], true);
                     }
                     return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
                 }
                 if (prepared.?.tables.len != 1 or !std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) return error.UnsupportedSqlExecution;
-                return self.commitCoordinated(prepared.?.tables[0]);
+                return self.commitCoordinated(temporary, prepared.?.tables[0], true);
             }
             // Classify by the batch's own state, not by error name: whether the
             // primary write became durable, and whether its publication was

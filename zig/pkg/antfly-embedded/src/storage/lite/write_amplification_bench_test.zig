@@ -848,6 +848,19 @@ fn openRelationalFixture(alloc: std.mem.Allocator, comptime name: []const u8, ki
             }
         },
     }
+    // DDL (table/index creation) leaves background settle work in flight
+    // on its own worker thread (root-incarnation catalog writes, default
+    // full-text index provisioning/cleanup) that can still be mid-commit
+    // when this returns. Drain it here, before the caller's `wal_trace.reset()`,
+    // so at least those setup-time commits are accounted to setup, not
+    // the measured write loop -- see the enrichment mode above for the
+    // same `runUntilIdle` pattern. This narrows but does not close the
+    // ~0.6-1.5 background commits/write every mode in this harness still
+    // shows (stack-trace attribution during the write loop itself, not
+    // setup, did not land a conclusive cause before time ran out on this
+    // pass; see the design doc changelog for what's known and what a
+    // follow-up pass should check first).
+    _ = api.antfly_db_run_until_idle(fixture.handle);
     return fixture;
 }
 
