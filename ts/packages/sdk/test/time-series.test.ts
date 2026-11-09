@@ -841,3 +841,10 @@ it("shares executable SQL alias fixtures with native API tests", () => {
   for (const item of fixture.cases)
     expect(seriesSQL(item.options, item.sqlOptions)).toEqual(item.sql);
 });
+
+it("aliases single-segment remapped groups in the CTE and output", () => {
+  const sql = seriesSQL(options, { fieldPaths: { device_id: ["bucket"] } });
+  expect(sql.statement).toContain('SELECT "bucket" AS "device_id", COUNT(*)');
+  expect(sql.statement).toContain('"__antfly_series_source"."bucket" AS "device_id"');
+  expect(sql.statement).toContain('"__antfly_series_selected"."device_id"');
+});

@@ -476,7 +476,7 @@ export function seriesSQL(
   const columns = [
     ...groupBy.map((field) => {
       const expression = column(field, `${source}.`);
-      return segments(field).length > 1 ? `${expression} AS ${quote(field)}` : expression;
+      return `${expression} AS ${quote(field)}`;
     }),
     `${bucket} AS ${quote(bucketAlias)}`,
     ...Object.entries(options.measures).map(([name, metric]) => {
@@ -493,9 +493,7 @@ export function seriesSQL(
       ? fields[0]
       : `concat('[', ${fields.map((field) => `COALESCE(to_jsonb(${field})::text, 'null')`).join(", ',', ")}, ']')`;
   const topDimensions = groupBy.map((field) => column(field));
-  const selectedDimensions = groupBy.map((field, i) =>
-    segments(field).length > 1 ? `${topDimensions[i]} AS ${quote(field)}` : topDimensions[i]
-  );
+  const selectedDimensions = groupBy.map((field, i) => `${topDimensions[i]} AS ${quote(field)}`);
   const cte = groupBy.length
     ? `WITH ${selected} AS (SELECT ${selectedDimensions.join(", ")}, COUNT(*) AS ${selectedCount} FROM ${quote(options.table)} WHERE ${predicates()} GROUP BY ${topDimensions.join(", ")} ORDER BY COUNT(*) DESC, ${key(topDimensions)} ASC LIMIT ${parameter(options.maxSeries ?? 100)}) `
     : "";

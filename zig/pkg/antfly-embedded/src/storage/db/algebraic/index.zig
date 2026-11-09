@@ -2854,6 +2854,8 @@ pub const Index = struct {
     /// selected by the active-root pointer.
     storage_namespace: []u8,
     parsed: std.json.Parsed(Config),
+    /// Immutable lookup compiled with the config; keys borrow parsed storage.
+    materialization_by_name: std.StringHashMapUnmanaged(usize) = .empty,
     /// Runtime proof that the active physical generation was completely built
     /// for `parsed`. Restored only from that generation's completion marker
     /// with a matching config hash and reset by every config reload.
@@ -2994,11 +2996,14 @@ pub const Index = struct {
         errdefer alloc.free(owned_name);
         const owned_storage_namespace = try alloc.dupe(u8, storage_namespace);
         errdefer alloc.free(owned_storage_namespace);
+        var materialization_by_name = try materializationNamesAlloc(alloc, parsed.value);
+        errdefer materialization_by_name.deinit(alloc);
         var self: Index = .{
             .alloc = alloc,
             .name = owned_name,
             .storage_namespace = owned_storage_namespace,
             .parsed = parsed,
+            .materialization_by_name = materialization_by_name,
         };
         errdefer self.freeHllRegistry();
         // Seed the runtime registry from the static config; adaptive promotions
@@ -3310,10 +3315,14 @@ pub const Index = struct {
         var parsed = try std.json.parseFromSlice(Config, self.alloc, config_json, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         try validateConfig(parsed.value);
+        var materialization_by_name = try materializationNamesAlloc(self.alloc, parsed.value);
+        errdefer materialization_by_name.deinit(self.alloc);
         // Cached adaptive specs are derived from the old config; drop them so
         // they are recomputed lazily against the new one.
         self.invalidateAdaptiveReadySpecCache();
         const old = self.parsed;
+        self.materialization_by_name.deinit(self.alloc);
+        self.materialization_by_name = materialization_by_name;
         self.parsed = parsed;
         self.projection_config_ready = false;
         old.deinit();
@@ -3364,6 +3373,7 @@ pub const Index = struct {
         self.clearBulkDirtyPathPromotionDictionaries();
         self.clearPendingHllObservations();
         self.freeHllRegistry();
+        self.materialization_by_name.deinit(self.alloc);
         self.parsed.deinit();
         self.* = undefined;
     }
@@ -12471,13 +12481,8 @@ pub const Index = struct {
         if (materializations.len == 0) return null;
         // Resolve catalog names, law IDs and expression identities once. Per-row
         // reads must not scan the catalog or recompile expression identities.
-        var by_name: std.StringHashMapUnmanaged(usize) = .empty;
-        defer by_name.deinit(self.alloc);
-        for (self.config().materializations, 0..) |mat, i| {
-            if (budget) |limit| try limit.control.check();
-            try by_name.put(self.alloc, mat.name, i);
-        }
-        const first_mat_idx = by_name.get(materializations[0]) orelse return null;
+        if (budget) |limit| try limit.control.check();
+        const first_mat_idx = self.materializationIndex(materializations[0]) orelse return null;
         const first_mat = self.config().materializations[first_mat_idx];
         const columns = try self.alloc.alloc(PreparedMaterializedExpressionRead, materializations.len);
         var prepared_count: usize = 0;
@@ -12487,7 +12492,7 @@ pub const Index = struct {
         }
         for (materializations, 0..) |name, i| {
             if (budget) |limit| try limit.control.check();
-            const mat_idx = by_name.get(name) orelse return null;
+            const mat_idx = self.materializationIndex(name) orelse return null;
             const mat = self.config().materializations[mat_idx];
             if (!sameLayoutShape(first_mat, mat)) return null;
             columns[i] = (try self.prepareMaterializedExpressionRead(mat)) orelse return null;
@@ -15755,11 +15760,16 @@ pub const Index = struct {
         return try self.alloc.dupe(u8, raw);
     }
 
+    fn materializationNamesAlloc(a: Allocator, cfg: Config) !std.StringHashMapUnmanaged(usize) {
+        var names: std.StringHashMapUnmanaged(usize) = .empty;
+        errdefer names.deinit(a);
+        try names.ensureTotalCapacity(a, @intCast(cfg.materializations.len));
+        for (cfg.materializations, 0..) |mat, i| names.putAssumeCapacity(mat.name, i);
+        return names;
+    }
+
     fn materializationIndex(self: *const Index, materialization: []const u8) ?usize {
-        for (self.config().materializations, 0..) |mat, i| {
-            if (std.mem.eql(u8, mat.name, materialization)) return i;
-        }
-        return null;
+        return self.materialization_by_name.get(materialization);
     }
 
     fn joinConfigByName(self: *const Index, name: []const u8) ?JoinConfig {
@@ -30639,4 +30649,163 @@ test "time series prepared materialized scans release metadata on every allocati
     };
     var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.run, .{});
+}
+
+test "time series prepared populated scans clean failures and cancellation between columns" {
+    const a = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var index = try Index.open(a, "series",
+        \\{"version":1,"table":"readings","time_fields":[{"name":"ts","path":"ts","type":"timestamp"}],"measure_fields":[{"name":"v","path":"v","type":"number"}],"materializations":[{"name":"rows","op":"count","time":"ts","bucket":"5m"},{"name":"total","op":"sum","measure":"v","time":"ts","bucket":"5m"},{"name":"mean","op":"avg","measure":"v","time":"ts","bucket":"5m"}]}
+    );
+    defer index.close();
+    try index.applyBatch(&store, .{ .documents = &.{
+        .{ .key = "a", .action = .upsert, .cleaned_value = "{\"ts\":\"2026-11-06T12:01:00Z\",\"v\":10}" },
+        .{ .key = "b", .action = .upsert, .cleaned_value = "{\"ts\":\"2026-11-06T12:06:00Z\"}" },
+    } });
+    const Fixture = struct {
+        fn run(alloc: Allocator, idx: *Index, db: *docstore_mod.DocStore) !void {
+            const previous = idx.alloc;
+            idx.alloc = alloc;
+            defer idx.alloc = previous;
+            var budget = TemporalScanBudget{};
+            const rows = (try idx.scanMaterializedExpressionRowsBounded(db, &.{ "rows", "total", "mean" }, &budget)) orelse return error.MissingTemporalResult;
+            defer {
+                for (rows) |*row| row.deinit(alloc);
+                alloc.free(rows);
+            }
+            try std.testing.expectEqual(@as(usize, 2), rows.len);
+            var missing: usize = 0;
+            for (rows) |row| {
+                try std.testing.expectEqualStrings("1", row.values[0].?);
+                if (row.values[1]) |sum| {
+                    try std.testing.expectEqualStrings("10", sum);
+                    try std.testing.expect(row.values[2] != null);
+                } else {
+                    missing += 1;
+                    try std.testing.expect(row.values[2] == null);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 1), missing);
+            try std.testing.expectEqual(@as(usize, 999994), budget.remaining_cells);
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.run, .{ &index, &store });
+    const Counter = struct {
+        remaining: usize,
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining == 0) return true;
+            self.remaining -= 1;
+            return false;
+        }
+    };
+    var cancellations: usize = 0;
+    var in_row_cancellations: usize = 0;
+    var completions: usize = 0;
+    for (0..24) |stop| {
+        var counter = Counter{ .remaining = stop };
+        var budget = TemporalScanBudget{ .control = .{ .cancellation = .{ .ptr = &counter, .is_cancelled_fn = Counter.cancelled } } };
+        const rows = (index.scanMaterializedExpressionRowsBounded(&store, &.{ "rows", "total", "mean" }, &budget) catch |err| {
+            try std.testing.expectEqual(error.Canceled, err);
+            cancellations += 1;
+            if (budget.remaining_cells < 1_000_000) in_row_cancellations += 1;
+            continue;
+        }) orelse return error.MissingTemporalResult;
+        for (rows) |*row| row.deinit(a);
+        a.free(rows);
+        completions += 1;
+    }
+    try std.testing.expect(cancellations > 0 and in_row_cancellations > 0 and completions > 0);
+}
+
+test "time series materialization catalog reload is failure atomic" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var index = try Index.open(a, "series",
+                \\{"version":1,"table":"readings","materializations":[{"name":"old","op":"count"}]}
+            );
+            defer index.close();
+            index.reloadConfigJson(
+                \\{"version":1,"table":"readings","materializations":[{"name":"new","op":"count"}]}
+            ) catch |err| {
+                try std.testing.expectEqual(@as(?usize, 0), index.materializationIndex("old"));
+                try std.testing.expect(index.materializationIndex("new") == null);
+                return err;
+            };
+            try std.testing.expect(index.materializationIndex("old") == null);
+            try std.testing.expectEqual(@as(?usize, 0), index.materializationIndex("new"));
+            index.reloadConfigJson(
+                \\{"version":1,"table":"readings"}
+            ) catch |err| {
+                try std.testing.expectEqual(@as(?usize, 0), index.materializationIndex("new"));
+                return err;
+            };
+            try std.testing.expect(index.materializationIndex("new") == null);
+            try std.testing.expectEqual(@as(usize, 0), index.materialization_by_name.count());
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.run, .{});
+}
+
+test "time series prepared scan benchmark covers narrow and wide catalogs" {
+    for ([_]usize{ 100, 1000, 4000 }) |width| {
+        const a = std.testing.allocator;
+        var config_json = std.Io.Writer.Allocating.init(a);
+        defer config_json.deinit();
+        try config_json.writer.writeAll("{\"version\":1,\"table\":\"readings\",\"group_fields\":[{\"name\":\"device\",\"path\":\"device\",\"type\":\"keyword\"}],\"materializations\":[");
+        const names = try a.alloc([]const u8, width);
+        defer a.free(names);
+        var initialized: usize = 0;
+        defer for (names[0..initialized]) |name| a.free(name);
+        for (names, 0..) |*name, i| {
+            name.* = try std.fmt.allocPrint(a, "rows_{d}", .{i});
+            initialized += 1;
+            if (i > 0) try config_json.writer.writeByte(',');
+            try config_json.writer.print("{{\"name\":\"{s}\",\"op\":\"count\",\"group_by\":[\"device\"]}}", .{name.*});
+        }
+        try config_json.writer.writeAll("]}");
+        var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+        defer backend.close();
+        var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        // Populate only the endpoints through a small catalog. Ingestion and
+        // large-catalog validation are setup, not part of scanner timings.
+        const seed_config = try std.fmt.allocPrint(a, "{{\"version\":1,\"table\":\"readings\",\"group_fields\":[{{\"name\":\"device\",\"path\":\"device\",\"type\":\"keyword\"}}],\"materializations\":[{{\"name\":\"{s}\",\"op\":\"count\",\"group_by\":[\"device\"]}},{{\"name\":\"{s}\",\"op\":\"count\",\"group_by\":[\"device\"]}}]}}", .{ names[0], names[width - 1] });
+        defer a.free(seed_config);
+        {
+            var seed = try Index.open(a, "series", seed_config);
+            defer seed.close();
+            try seed.applyBatch(&store, .{ .documents = &.{
+                .{ .key = "a", .action = .upsert, .cleaned_value = "{\"device\":\"one\"}" },
+                .{ .key = "b", .action = .upsert, .cleaned_value = "{\"device\":\"two\"}" },
+            } });
+        }
+        var index = try Index.open(a, "series", config_json.written());
+        defer index.close();
+        for ([_]usize{ 1, width }) |requested| {
+            var budget = TemporalScanBudget{};
+            const clock = @import("antfly_platform").time;
+            const started = clock.monotonicNs();
+            const selected = if (requested == 1) names[width - 1 ..] else names;
+            const rows = (try index.scanMaterializedExpressionRowsBounded(&store, selected, &budget)) orelse return error.MissingTemporalResult;
+            defer {
+                for (rows) |*row| row.deinit(a);
+                a.free(rows);
+            }
+            std.debug.print("TEMPORAL_SCAN catalog={d} requested={d} rows={d} elapsed_us={d}\n", .{ width, requested, rows.len, (clock.monotonicNs() - started) / std.time.ns_per_us });
+            try std.testing.expectEqual(@as(usize, 2), rows.len);
+            try std.testing.expectEqual(@as(usize, 1_000_000) - requested * rows.len, budget.remaining_cells);
+            for (rows) |row| {
+                try std.testing.expectEqual(requested, row.values.len);
+                try std.testing.expectEqualStrings("1", row.values[0].?);
+                try std.testing.expectEqualStrings("1", row.values[row.values.len - 1].?);
+                for (row.values) |value| if (value) |raw| try std.testing.expectEqualStrings("1", raw);
+            }
+        }
+    }
 }

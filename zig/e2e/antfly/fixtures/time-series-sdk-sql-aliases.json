@@ -192,7 +192,7 @@
         ]
       ],
       "sql": {
-        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket\", \"bucket_\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket\") AND \"bucket\" IS NOT NULL AND NOT is_missing(\"bucket_\") AND \"bucket_\" IS NOT NULL GROUP BY \"bucket\", \"bucket_\" ORDER BY COUNT(*) DESC, concat('[', COALESCE(to_jsonb(\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"bucket_\")::text, 'null'), ']') ASC LIMIT $5) SELECT \"__antfly_series_source\".\"bucket\", \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket__\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"bucket\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket\" AND \"__antfly_series_source\".\"bucket_\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket_\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"bucket\") AND \"__antfly_series_source\".\"bucket\" IS NOT NULL AND NOT is_missing(\"__antfly_series_source\".\"bucket_\") AND \"__antfly_series_source\".\"bucket_\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"bucket\", \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, concat('[', COALESCE(to_jsonb(\"__antfly_series_source\".\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"__antfly_series_source\".\"bucket_\")::text, 'null'), ']') ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket\" AS \"bucket\", \"bucket_\" AS \"bucket_\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket\") AND \"bucket\" IS NOT NULL AND NOT is_missing(\"bucket_\") AND \"bucket_\" IS NOT NULL GROUP BY \"bucket\", \"bucket_\" ORDER BY COUNT(*) DESC, concat('[', COALESCE(to_jsonb(\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"bucket_\")::text, 'null'), ']') ASC LIMIT $5) SELECT \"__antfly_series_source\".\"bucket\" AS \"bucket\", \"__antfly_series_source\".\"bucket_\" AS \"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket__\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"bucket\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket\" AND \"__antfly_series_source\".\"bucket_\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket_\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"bucket\") AND \"__antfly_series_source\".\"bucket\" IS NOT NULL AND NOT is_missing(\"__antfly_series_source\".\"bucket_\") AND \"__antfly_series_source\".\"bucket_\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"bucket\", \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, concat('[', COALESCE(to_jsonb(\"__antfly_series_source\".\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"__antfly_series_source\".\"bucket_\")::text, 'null'), ']') ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
         "parameters": [
           "2026-11-06T12:00:00Z",
           "2026-11-06T13:00:00Z",
@@ -241,7 +241,7 @@
         ]
       ],
       "sql": {
-        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket_\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket_\") AND \"bucket_\" IS NOT NULL GROUP BY \"bucket_\" ORDER BY COUNT(*) DESC, \"bucket_\" ASC LIMIT $5) SELECT \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket__\", AVG(\"__antfly_series_source\".\"temperature\") AS \"bucket\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"bucket_\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket_\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"bucket_\") AND \"__antfly_series_source\".\"bucket_\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, \"__antfly_series_source\".\"bucket_\" ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket_\" AS \"bucket_\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket_\") AND \"bucket_\" IS NOT NULL GROUP BY \"bucket_\" ORDER BY COUNT(*) DESC, \"bucket_\" ASC LIMIT $5) SELECT \"__antfly_series_source\".\"bucket_\" AS \"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket__\", AVG(\"__antfly_series_source\".\"temperature\") AS \"bucket\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"bucket_\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket_\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"bucket_\") AND \"__antfly_series_source\".\"bucket_\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, \"__antfly_series_source\".\"bucket_\" ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
         "parameters": [
           "2026-11-06T12:00:00Z",
           "2026-11-06T13:00:00Z",
@@ -298,7 +298,7 @@
         ]
       ],
       "sql": {
-        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket\") AND \"bucket\" IS NOT NULL GROUP BY \"bucket\" ORDER BY COUNT(*) DESC, \"bucket\" ASC LIMIT $5) SELECT \"__antfly_series_source\".\"bucket\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"at\"\"time\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"bucket\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"bucket\") AND \"__antfly_series_source\".\"bucket\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"bucket\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, \"__antfly_series_source\".\"bucket\" ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket\" AS \"bucket\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket\") AND \"bucket\" IS NOT NULL GROUP BY \"bucket\" ORDER BY COUNT(*) DESC, \"bucket\" ASC LIMIT $5) SELECT \"__antfly_series_source\".\"bucket\" AS \"bucket\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"at\"\"time\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"bucket\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"bucket\") AND \"__antfly_series_source\".\"bucket\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"bucket\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, \"__antfly_series_source\".\"bucket\" ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
         "parameters": [
           "2026-11-06T12:00:00Z",
           "2026-11-06T13:00:00Z",
@@ -348,6 +348,282 @@
           "2026-11-06T13:00:00Z",
           "5m",
           "1970-01-01T00:00:00Z"
+        ]
+      }
+    },
+    {
+      "name": "single segment group remapping",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T13:00:00Z",
+        "bucket": {
+          "every": "5m"
+        },
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          }
+        },
+        "maxSeries": 10,
+        "groupBy": [
+          "device_id",
+          "region"
+        ]
+      },
+      "sqlOptions": {
+        "fieldPaths": {
+          "device_id": [
+            "bucket"
+          ],
+          "region": [
+            "bucket_"
+          ]
+        }
+      },
+      "columns": [
+        "device_id",
+        "region",
+        "bucket",
+        "average"
+      ],
+      "rows": [
+        [
+          "sensor",
+          "west",
+          "2026-11-06T12:00:00.000000000Z",
+          10
+        ],
+        [
+          "sensor",
+          "west",
+          "2026-11-06T12:05:00.000000000Z",
+          20
+        ],
+        [
+          "other",
+          "west",
+          "2026-11-06T12:00:00.000000000Z",
+          5
+        ]
+      ],
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket\" AS \"device_id\", \"bucket_\" AS \"region\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket\") AND \"bucket\" IS NOT NULL AND NOT is_missing(\"bucket_\") AND \"bucket_\" IS NOT NULL GROUP BY \"bucket\", \"bucket_\" ORDER BY COUNT(*) DESC, concat('[', COALESCE(to_jsonb(\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"bucket_\")::text, 'null'), ']') ASC LIMIT $5) SELECT \"__antfly_series_source\".\"bucket\" AS \"device_id\", \"__antfly_series_source\".\"bucket_\" AS \"region\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"bucket\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"device_id\" AND \"__antfly_series_source\".\"bucket_\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"region\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"bucket\") AND \"__antfly_series_source\".\"bucket\" IS NOT NULL AND NOT is_missing(\"__antfly_series_source\".\"bucket_\") AND \"__antfly_series_source\".\"bucket_\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"bucket\", \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, concat('[', COALESCE(to_jsonb(\"__antfly_series_source\".\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"__antfly_series_source\".\"bucket_\")::text, 'null'), ']') ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T13:00:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z",
+          10
+        ]
+      }
+    },
+    {
+      "name": "remapped physical name overlaps measurement",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T13:00:00Z",
+        "bucket": {
+          "every": "5m"
+        },
+        "measures": {
+          "bucket": {
+            "op": "avg",
+            "field": "temperature"
+          }
+        },
+        "maxSeries": 10,
+        "groupBy": [
+          "device_id",
+          "region"
+        ]
+      },
+      "sqlOptions": {
+        "fieldPaths": {
+          "device_id": [
+            "bucket"
+          ],
+          "region": [
+            "bucket_"
+          ]
+        }
+      },
+      "columns": [
+        "device_id",
+        "region",
+        "bucket_",
+        "bucket"
+      ],
+      "rows": [
+        [
+          "sensor",
+          "west",
+          "2026-11-06T12:00:00.000000000Z",
+          10
+        ],
+        [
+          "sensor",
+          "west",
+          "2026-11-06T12:05:00.000000000Z",
+          20
+        ],
+        [
+          "other",
+          "west",
+          "2026-11-06T12:00:00.000000000Z",
+          5
+        ]
+      ],
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket\" AS \"device_id\", \"bucket_\" AS \"region\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket\") AND \"bucket\" IS NOT NULL AND NOT is_missing(\"bucket_\") AND \"bucket_\" IS NOT NULL GROUP BY \"bucket\", \"bucket_\" ORDER BY COUNT(*) DESC, concat('[', COALESCE(to_jsonb(\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"bucket_\")::text, 'null'), ']') ASC LIMIT $5) SELECT \"__antfly_series_source\".\"bucket\" AS \"device_id\", \"__antfly_series_source\".\"bucket_\" AS \"region\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket_\", AVG(\"__antfly_series_source\".\"temperature\") AS \"bucket\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"bucket\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"device_id\" AND \"__antfly_series_source\".\"bucket_\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"region\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"bucket\") AND \"__antfly_series_source\".\"bucket\" IS NOT NULL AND NOT is_missing(\"__antfly_series_source\".\"bucket_\") AND \"__antfly_series_source\".\"bucket_\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"bucket\", \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, concat('[', COALESCE(to_jsonb(\"__antfly_series_source\".\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"__antfly_series_source\".\"bucket_\")::text, 'null'), ']') ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T13:00:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z",
+          10
+        ]
+      }
+    },
+    {
+      "name": "remapped logical names occupy internal aliases",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T13:00:00Z",
+        "bucket": {
+          "every": "5m"
+        },
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          }
+        },
+        "maxSeries": 10,
+        "groupBy": [
+          "__antfly_series_documents",
+          "__antfly_series_source"
+        ]
+      },
+      "sqlOptions": {
+        "fieldPaths": {
+          "__antfly_series_documents": [
+            "bucket"
+          ],
+          "__antfly_series_source": [
+            "bucket_"
+          ]
+        }
+      },
+      "columns": [
+        "__antfly_series_documents",
+        "__antfly_series_source",
+        "bucket",
+        "average"
+      ],
+      "rows": [
+        [
+          "sensor",
+          "west",
+          "2026-11-06T12:00:00.000000000Z",
+          10
+        ],
+        [
+          "sensor",
+          "west",
+          "2026-11-06T12:05:00.000000000Z",
+          20
+        ],
+        [
+          "other",
+          "west",
+          "2026-11-06T12:00:00.000000000Z",
+          5
+        ]
+      ],
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket\" AS \"__antfly_series_documents\", \"bucket_\" AS \"__antfly_series_source\", COUNT(*) AS \"__antfly_series_documents_\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket\") AND \"bucket\" IS NOT NULL AND NOT is_missing(\"bucket_\") AND \"bucket_\" IS NOT NULL GROUP BY \"bucket\", \"bucket_\" ORDER BY COUNT(*) DESC, concat('[', COALESCE(to_jsonb(\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"bucket_\")::text, 'null'), ']') ASC LIMIT $5) SELECT \"__antfly_series_source_\".\"bucket\" AS \"__antfly_series_documents\", \"__antfly_series_source_\".\"bucket_\" AS \"__antfly_series_source\", date_bin($3, \"__antfly_series_source_\".\"observed_at\"::datetime, $4::datetime) AS \"bucket\", AVG(\"__antfly_series_source_\".\"temperature\") AS \"average\" FROM \"fixture\" AS \"__antfly_series_source_\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source_\".\"bucket\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"__antfly_series_documents\" AND \"__antfly_series_source_\".\"bucket_\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"__antfly_series_source\" WHERE \"__antfly_series_source_\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source_\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source_\".\"bucket\") AND \"__antfly_series_source_\".\"bucket\" IS NOT NULL AND NOT is_missing(\"__antfly_series_source_\".\"bucket_\") AND \"__antfly_series_source_\".\"bucket_\" IS NOT NULL GROUP BY \"__antfly_series_source_\".\"bucket\", \"__antfly_series_source_\".\"bucket_\", date_bin($3, \"__antfly_series_source_\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents_\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents_\" DESC, concat('[', COALESCE(to_jsonb(\"__antfly_series_source_\".\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"__antfly_series_source_\".\"bucket_\")::text, 'null'), ']') ASC, date_bin($3, \"__antfly_series_source_\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T13:00:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z",
+          10
+        ]
+      }
+    },
+    {
+      "name": "remapped logical name occupies bucket alias",
+      "options": {
+        "table": "fixture",
+        "timestamp": "observed_at",
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T13:00:00Z",
+        "bucket": {
+          "every": "5m"
+        },
+        "measures": {
+          "average": {
+            "op": "avg",
+            "field": "temperature"
+          }
+        },
+        "maxSeries": 10,
+        "groupBy": [
+          "bucket",
+          "region"
+        ]
+      },
+      "sqlOptions": {
+        "fieldPaths": {
+          "bucket": [
+            "bucket"
+          ],
+          "region": [
+            "bucket_"
+          ]
+        }
+      },
+      "columns": [
+        "bucket",
+        "region",
+        "bucket_",
+        "average"
+      ],
+      "rows": [
+        [
+          "sensor",
+          "west",
+          "2026-11-06T12:00:00.000000000Z",
+          10
+        ],
+        [
+          "sensor",
+          "west",
+          "2026-11-06T12:05:00.000000000Z",
+          20
+        ],
+        [
+          "other",
+          "west",
+          "2026-11-06T12:00:00.000000000Z",
+          5
+        ]
+      ],
+      "sql": {
+        "statement": "WITH \"__antfly_series_selected\" AS (SELECT \"bucket\" AS \"bucket\", \"bucket_\" AS \"region\", COUNT(*) AS \"__antfly_series_documents\" FROM \"fixture\" WHERE \"observed_at\"::datetime >= $1::datetime AND \"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"bucket\") AND \"bucket\" IS NOT NULL AND NOT is_missing(\"bucket_\") AND \"bucket_\" IS NOT NULL GROUP BY \"bucket\", \"bucket_\" ORDER BY COUNT(*) DESC, concat('[', COALESCE(to_jsonb(\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"bucket_\")::text, 'null'), ']') ASC LIMIT $5) SELECT \"__antfly_series_source\".\"bucket\" AS \"bucket\", \"__antfly_series_source\".\"bucket_\" AS \"region\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime) AS \"bucket_\", AVG(\"__antfly_series_source\".\"temperature\") AS \"average\" FROM \"fixture\" AS \"__antfly_series_source\" JOIN \"__antfly_series_selected\" ON \"__antfly_series_source\".\"bucket\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"bucket\" AND \"__antfly_series_source\".\"bucket_\" IS NOT DISTINCT FROM \"__antfly_series_selected\".\"region\" WHERE \"__antfly_series_source\".\"observed_at\"::datetime >= $1::datetime AND \"__antfly_series_source\".\"observed_at\"::datetime < $2::datetime AND NOT is_missing(\"__antfly_series_source\".\"bucket\") AND \"__antfly_series_source\".\"bucket\" IS NOT NULL AND NOT is_missing(\"__antfly_series_source\".\"bucket_\") AND \"__antfly_series_source\".\"bucket_\" IS NOT NULL GROUP BY \"__antfly_series_source\".\"bucket\", \"__antfly_series_source\".\"bucket_\", date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime), \"__antfly_series_selected\".\"__antfly_series_documents\" ORDER BY \"__antfly_series_selected\".\"__antfly_series_documents\" DESC, concat('[', COALESCE(to_jsonb(\"__antfly_series_source\".\"bucket\")::text, 'null'), ',', COALESCE(to_jsonb(\"__antfly_series_source\".\"bucket_\")::text, 'null'), ']') ASC, date_bin($3, \"__antfly_series_source\".\"observed_at\"::datetime, $4::datetime)",
+        "parameters": [
+          "2026-11-06T12:00:00Z",
+          "2026-11-06T13:00:00Z",
+          "5m",
+          "1970-01-01T00:00:00Z",
+          10
         ]
       }
     }
