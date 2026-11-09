@@ -1095,6 +1095,15 @@ pub const BatchExecutionOptions = struct {
     /// section as the commit, so two concurrent `.local_decision` writers
     /// racing the same UNIQUE value can never both win.
     integrity_authority: enum { none, local_decision } = .none,
+    /// lite-single-commit-write-path.md §7.6: only meaningful alongside
+    /// `.local_decision`. Lets `prepareLocalIntegrityDecision`'s own
+    /// RESTRICT check (`relational_integrity.requireEmpty`) tell a
+    /// genuinely live Reference apart from a dangling one left by the
+    /// fused FK multi-table coordinator's own non-atomic ride-along
+    /// `.attach` write, self-healing it (queuing its deletion in this
+    /// same commit) instead of refusing the parent change forever. `null`
+    /// preserves exact today's-behavior: any live Reference blocks.
+    relational_child_existence_check: ?@import("relational_integrity.zig").ChildExistenceCheck = null,
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
     visibility_cancellation: types.CancellationToken = .none,
