@@ -33644,7 +33644,9 @@ pub const IndexManager = struct {
         const hashes = [_]?u64{identity.source_hash};
         const digests = [_]?u64{identity.digest};
         try self.reembedDenseDocuments(alloc, entry, &keys, &hashes, &digests, out, &found);
-        if (!found[0]) return error.NotFound;
+        // A rebuild cannot silently skip an artifact whose source or legacy
+        // vector identity cannot be proven.
+        if (!found[0]) return error.ReembedProvenanceUnavailable;
         return out;
     }
 
