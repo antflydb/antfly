@@ -2120,6 +2120,7 @@ pub fn handleTableQueryRequest(
             error.Timeout => {
                 return try queryDependencyErrorOwnedResponse(alloc, 504, "query_timeout", "query timed out", true);
             },
+            error.ReembedBudgetExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "reembed_budget_exceeded", "re-embedding budget exceeded; increase reembed_budget_ms or set it to zero", false),
             error.IncompletePublishedSnapshot => {
                 std.log.warn("public table query detected incomplete index generation table={s}", .{table_name});
                 return try queryTemporarilyUnavailableOwnedResponse(alloc, .index_rebuilding);
@@ -4473,6 +4474,7 @@ test "public table query handler preserves retryable failure status" {
         .{ .err = error.HierarchyCursorStale, .status = 409, .body = "{\"status\":409,\"error\":\"hierarchy_cursor_stale\",\"message\":\"the source hierarchy changed after this cursor was issued\",\"action\":\"restart_hierarchy_traversal\",\"restart_without\":\"search_after\",\"retryable\":false}", .json = true },
         .{ .err = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
         .{ .err = error.CorruptInput, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"CorruptInput\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
+        .{ .err = error.ReembedBudgetExceeded, .status = 422, .body = "{\"code\":\"reembed_budget_exceeded\",\"error\":\"reembed_budget_exceeded\",\"message\":\"re-embedding budget exceeded; increase reembed_budget_ms or set it to zero\",\"retryable\":false}", .json = true },
         .{ .err = error.IncompletePublishedSnapshot, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
     };
 

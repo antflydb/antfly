@@ -4599,7 +4599,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
                 errdefer alloc.free(key);
                 const text = try alloc.dupe(u8, chunk_text);
-                sources.appendAssumeCapacity(.{ .key = key, .text = text });
+                sources.appendAssumeCapacity(.{ .key = key, .text = text, .has_metadata = chunk.metadata != null });
                 chunks_created.* += 1;
             }
             // Inline chunks are derived from this document revision. An empty set is

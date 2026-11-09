@@ -19,7 +19,7 @@ const types = @import("types.zig");
 const internal_keys = @import("../internal_keys.zig");
 const docstore_mod = @import("../docstore.zig");
 const chunk_artifact_mod = @import("../../chunking/chunk.zig");
-pub const ChunkEmbeddingSource = struct { key: []u8, text: []const u8 };
+pub const ChunkEmbeddingSource = struct { key: []u8, text: []const u8, has_metadata: bool = false };
 pub fn freeChunkEmbeddingSources(alloc: Allocator, sources: []const ChunkEmbeddingSource) void {
     for (sources) |source| {
         alloc.free(source.key);

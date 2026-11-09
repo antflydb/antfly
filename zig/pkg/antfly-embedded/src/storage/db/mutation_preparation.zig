@@ -614,7 +614,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     source.key,
                     // Inline text chunks re-embed by re-chunking the parent;
                     // stored chunk inputs cannot.
-                    if (request.input_kind == .inline_chunks)
+                    if (request.input_kind == .inline_chunks and !source.has_metadata)
                         EmbeddingArtifactOrigin{ .generated_text = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) }
                     else
                         EmbeddingArtifactOrigin{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) },

@@ -1842,14 +1842,14 @@ pub fn reembedDenseDocuments(
         if (request.input_kind != .document) {
             const text = (try reembedChunkTextAlloc(runtime, request, &chunk_cache, &source_cache)) orelse continue;
             if (request.expected_source_hash) |expected| {
-                const actual = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
-                if (actual != expected) {
+                const legacy = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
+                const actual = retainedTextEmbeddingHashAtRevision(request, text, generation.revision);
+                if (actual != expected and legacy != expected) {
                     runtime.alloc.free(text);
                     continue;
                 }
-                // Chunk identities written by older producers did not include
-                // the immutable provider revision; prove those by vector digest.
-                require_digest = true;
+                // Legacy identities do not bind the provider generation.
+                require_digest = generation.revision == null or legacy == expected;
             }
             texts.append(alloc, text) catch |err| {
                 runtime.alloc.free(text);

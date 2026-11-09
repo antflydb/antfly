@@ -713,7 +713,7 @@ pub const LeannStore = struct {
                 .gate = gate.recomputeGate(),
             });
             defer resp.deinit(alloc);
-            if (resp.stats.budget_exhausted) return error.IncompletePublishedSnapshot;
+            if (resp.stats.budget_exhausted) return error.ReembedBudgetExceeded;
             var passed: usize = 0;
             for (resp.results) |r| {
                 const node = self.nodes.items[r.id];
@@ -1140,8 +1140,8 @@ pub const ReembedCache = struct {
 };
 
 /// Per-query gate for re-embedding: the request's cancellation aborts the
-/// search; once the time budget is spent, LEANN stops re-embedding and ranks
-/// the remaining candidates by estimate.
+/// search; once the time budget is spent, the store reports incomplete
+/// scoring rather than returning unverified candidates.
 pub const SearchGate = struct {
     cancellation: ?search_types.CancellationToken,
     budget_ns: u64,
@@ -1389,10 +1389,10 @@ test "leann search forwards reembedding time from batch loader" {
     store.setLoader(.{ .ctx = &source, .load = Timed.load, .load_batch_timed = Timed.batch });
     try addAll(alloc, store, data, dims, 0, 300);
     source.calls = 0;
-    try testing.expectError(error.IncompletePublishedSnapshot, store.search(alloc, .{ .query = data[0..dims], .k = 50 }));
+    try testing.expectError(error.ReembedBudgetExceeded, store.search(alloc, .{ .query = data[0..dims], .k = 50 }));
     try testing.expectEqual(@as(usize, 1), source.calls);
     source.calls = 0;
-    try testing.expectError(error.IncompletePublishedSnapshot, store.search(alloc, .{ .query = data[0..dims], .k = 50, .search_effort = 1 }));
+    try testing.expectError(error.ReembedBudgetExceeded, store.search(alloc, .{ .query = data[0..dims], .k = 50, .search_effort = 1 }));
     try testing.expectEqual(@as(usize, 1), source.calls);
 }
 
