@@ -36,6 +36,7 @@ pub const query = @import("antfly_local_sources").api_query;
 pub const query_contract = @import("antfly_local_sources").api_query_contract;
 pub const runtime_status = @import("antfly_local_sources").api_runtime_status;
 pub const cluster_api_http = @import("cluster_api_http.zig");
+pub const agent_context = @import("agent_context.zig");
 pub const retrieval_agent = @import("retrieval_agent.zig");
 pub const research_agent = @import("research_agent.zig");
 pub const research_jobs = @import("research_jobs.zig");
@@ -260,6 +261,7 @@ test "api module compiles" {
     _ = query;
     _ = query_contract;
     _ = cluster_api_http;
+    _ = agent_context;
     _ = retrieval_agent;
     _ = research_agent;
     _ = research_jobs;

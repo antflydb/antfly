@@ -585,7 +585,12 @@ const RetrievalSseSink = struct {
         try self.writer.?.writeEvent(name, json);
     }
 
-    fn emitError(self: *@This()) !void {
+    fn emitError(self: *@This(), err: anyerror) !void {
+        if (@import("agent_context.zig").failure(err)) |detail| {
+            const json = try std.json.Stringify.valueAlloc(self.context.allocator, detail.payload(err), .{});
+            defer self.context.allocator.free(json);
+            return emitJson(self, self.context.allocator, "error", json);
+        }
         try emitJson(self, self.context.allocator, "error", "{\"error\":\"RetrievalFailed\"}");
     }
 
@@ -876,8 +881,13 @@ const AgentGenerationRunner = struct {
     fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
         return .{
             .ptr = runner,
-            .vtable = &.{ .execute_chain = executeChain },
+            .vtable = &.{ .execute_chain = executeChain, .check = check },
         };
+    }
+
+    fn check(raw: *anyopaque) !void {
+        const runner: *@This() = @ptrCast(@alignCast(raw));
+        try runner.request_context.check();
     }
 
     fn executeChain(
@@ -7579,7 +7589,7 @@ pub const AntflyApiHandler = struct {
                     const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .@"error" = @errorName(err), .manage_usage_url = "https://chatgpt.com/settings/usage", .upstream = generation_runner.chatgpt_failure.summary() }, .{});
                     defer ctx.allocator.free(json);
                     try RetrievalSseSink.emitJson(&sink, ctx.allocator, "error", json);
-                } else try sink.emitError();
+                } else try sink.emitError(err);
                 try sink.close();
                 return ctx.response.build();
             }
@@ -7694,6 +7704,9 @@ pub const AntflyApiHandler = struct {
     }
 
     fn respondGenerationOutputError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
+        if (@import("agent_context.zig").failure(err)) |detail| {
+            return try ctx.status(detail.status).json(detail.payload(err));
+        }
         var response = (try http_server_mod.generationOutputErrorResponse(ctx.allocator, err)) orelse return null;
         return try respondOwnedContextualResponse(ctx, &response, ctx.allocator);
     }
@@ -7766,7 +7779,7 @@ pub const AntflyApiHandler = struct {
                     const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .@"error" = @errorName(err), .manage_usage_url = "https://chatgpt.com/settings/usage", .upstream = runners.generation.chatgpt_failure.summary() }, .{});
                     defer ctx.allocator.free(json);
                     try RetrievalSseSink.emitJson(&sink, ctx.allocator, "error", json);
-                } else try sink.emitError();
+                } else try sink.emitError(err);
                 try sink.close();
                 return ctx.response.build();
             }
@@ -19373,6 +19386,60 @@ test "httpx agent generation output failures preserve terminal upstream status a
         defer parsed.deinit();
         try std.testing.expectEqualStrings("InferenceOutputIncomplete", parsed.value.object.get("error").?.string);
         try std.testing.expect(std.mem.indexOf(u8, parsed.value.object.get("message").?.string, "reasoning effort") != null);
+    }
+}
+
+test "httpx agent generation output failures preserve context errors across stream commit" {
+    const Transport = struct {
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        starts: usize = 0,
+        closed: bool = false,
+        fn start(raw: ?*anyopaque, status: u16, _: []const u8, _: *const httpx.Headers) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(u16, 200), status);
+            self.starts += 1;
+        }
+        fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+        fn close(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.closed = true;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]anyerror{ error.AgentContextBudgetExceeded, error.ContextSummaryMissingCitation, error.InvalidContextRequest, error.TestPrivateProviderFailure }) |err| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/agents/retrieval");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var transport = Transport{};
+        defer transport.bytes.deinit(a);
+        ctx.stream_delegate = .{ .ptr = &transport, .start = Transport.start, .write = Transport.write, .close = Transport.close };
+        var sink = RetrievalSseSink{ .context = &ctx };
+        // Retrieval has committed its headers before preparation fails.
+        try RetrievalSseSink.emitJson(&sink, a, "hit", "{}");
+        try sink.emitError(err);
+        try sink.close();
+        try std.testing.expectEqual(@as(usize, 1), transport.starts);
+        try std.testing.expect(transport.closed);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, transport.bytes.items, "event: error\n"));
+        if (@import("agent_context.zig").failure(err)) |detail| {
+            try std.testing.expect(std.mem.indexOf(u8, transport.bytes.items, @errorName(err)) != null);
+            var json_ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer json_ctx.deinit();
+            var response = (try AntflyApiHandler.respondGenerationOutputError(&json_ctx, err)).?;
+            defer response.deinit();
+            try std.testing.expectEqual(detail.status, response.status.code);
+            const encoded = try std.json.Stringify.valueAlloc(a, detail.payload(err), .{});
+            defer a.free(encoded);
+            try std.testing.expectEqualStrings(encoded, response.body.?);
+            try std.testing.expect(std.mem.indexOf(u8, transport.bytes.items, encoded) != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, transport.bytes.items, "RetrievalFailed") != null);
+            try std.testing.expect(std.mem.indexOf(u8, transport.bytes.items, @errorName(err)) == null);
+        }
     }
 }
 

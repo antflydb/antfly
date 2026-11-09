@@ -513,6 +513,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_apple_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_apple_mod.addImport("httpx", httpx_mod);
     wasm_generating_mod.addImport("antfly_apple_native", wasm_apple_mod);
+    wasm_generating_mod.addAnonymousImport("antfly_chat_context", .{ .root_source_file = b.path("lib/chat_context/root.zig") });
     const wasm_cloudflare_mod = b.createModule(.{ .root_source_file = b.path("lib/cloudflare/root.zig"), .target = wasm_target, .optimize = optimize });
     wasm_cloudflare_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     wasm_decisions_mod.addImport("antfly_cloudflare", wasm_cloudflare_mod);
