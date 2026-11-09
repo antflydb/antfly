@@ -25635,6 +25635,7 @@ pub const IndexManager = struct {
 
     fn validateEnrichmentConfig(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
         if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
+        try enrichment_config_validation.validateEmbeddingInput(internalEnrichmentKindToPublic(cfg.kind), cfg.embedding_input, cfg.chunk_size, cfg.chunker_json);
         if (cfg.group_source_json.len > 0 or cfg.prior_context_json.len > 0) {
             var public = try enrichmentToPublic(self.alloc, cfg);
             defer public.deinit(self.alloc);
@@ -25653,11 +25654,6 @@ pub const IndexManager = struct {
                 }
             },
             .embedding => {
-                if (cfg.embedding_input == .pdf_page_images and
-                    (cfg.source_template.len > 0 or cfg.chunk_size > 0 or cfg.chunker_json.len > 0))
-                {
-                    return error.InvalidEnrichmentConfig;
-                }
                 if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.chunk, cfg.source_artifact_name) == null and self.assetGroupRoot(cfg.source_artifact_name).len == 0) {
                     return error.InvalidEnrichmentConfig;
                 }

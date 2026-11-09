@@ -251,6 +251,7 @@ from .created_embeddings_index import CreatedEmbeddingsIndex
 from .created_embeddings_index_config import CreatedEmbeddingsIndexConfig
 from .created_embeddings_index_type import CreatedEmbeddingsIndexType
 from .created_enrichment_config import CreatedEnrichmentConfig
+from .created_enrichment_config_embedding_input import CreatedEnrichmentConfigEmbeddingInput
 from .created_full_text_index import CreatedFullTextIndex
 from .created_full_text_index_config import CreatedFullTextIndexConfig
 from .created_full_text_index_type import CreatedFullTextIndexType
@@ -438,6 +439,7 @@ from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
+from .enrichment_config_embedding_input import EnrichmentConfigEmbeddingInput
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
@@ -2921,6 +2923,7 @@ __all__ = (
     "CreatedEmbeddingsIndexConfig",
     "CreatedEmbeddingsIndexType",
     "CreatedEnrichmentConfig",
+    "CreatedEnrichmentConfigEmbeddingInput",
     "CreatedFullTextIndex",
     "CreatedFullTextIndexConfig",
     "CreatedFullTextIndexType",
@@ -3125,6 +3128,7 @@ __all__ = (
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
+    "EnrichmentConfigEmbeddingInput",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.enrichment_config_embedding_input import EnrichmentConfigEmbeddingInput
 from ..models.enrichment_kind import EnrichmentKind
 from ..types import UNSET, Unset
 
@@ -38,6 +39,9 @@ class EnrichmentConfig:
                 consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other
                 asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must
                 be omitted and the producer must consume text: copy, generator, or extractor).
+            embedding_input (EnrichmentConfigEmbeddingInput | Unset): pdf_page_images requires kind=embedding, consumes a
+                PDF URI, and embeds its rendered pages. Native field selectors address literal root keys; use a raw template for
+                nested resource URIs. Default: EnrichmentConfigEmbeddingInput.TEXT.
             expected_dims (int | Unset): Expected embedding dimension for embedding enrichments.
             vector_space (str | Unset): Optional stable model/token-space identifier for embedding artifacts. When omitted
                 on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally
@@ -91,6 +95,7 @@ class EnrichmentConfig:
     field: str | Unset = UNSET
     template: str | Unset = UNSET
     source_artifact_name: str | Unset = UNSET
+    embedding_input: EnrichmentConfigEmbeddingInput | Unset = EnrichmentConfigEmbeddingInput.TEXT
     expected_dims: int | Unset = UNSET
     vector_space: str | Unset = UNSET
     chunk_size: int | Unset = UNSET
@@ -124,6 +129,10 @@ class EnrichmentConfig:
         template = self.template
 
         source_artifact_name = self.source_artifact_name
+
+        embedding_input: str | Unset = UNSET
+        if not isinstance(self.embedding_input, Unset):
+            embedding_input = self.embedding_input.value
 
         expected_dims = self.expected_dims
 
@@ -179,6 +188,8 @@ class EnrichmentConfig:
             field_dict["template"] = template
         if source_artifact_name is not UNSET:
             field_dict["source_artifact_name"] = source_artifact_name
+        if embedding_input is not UNSET:
+            field_dict["embedding_input"] = embedding_input
         if expected_dims is not UNSET:
             field_dict["expected_dims"] = expected_dims
         if vector_space is not UNSET:
@@ -243,6 +254,13 @@ class EnrichmentConfig:
 
         source_artifact_name = d.pop("source_artifact_name", UNSET)
 
+        _embedding_input = d.pop("embedding_input", UNSET)
+        embedding_input: EnrichmentConfigEmbeddingInput | Unset
+        if isinstance(_embedding_input, Unset):
+            embedding_input = UNSET
+        else:
+            embedding_input = EnrichmentConfigEmbeddingInput(_embedding_input)
+
         expected_dims = d.pop("expected_dims", UNSET)
 
         vector_space = d.pop("vector_space", UNSET)
@@ -302,6 +320,7 @@ class EnrichmentConfig:
             field=field,
             template=template,
             source_artifact_name=source_artifact_name,
+            embedding_input=embedding_input,
             expected_dims=expected_dims,
             vector_space=vector_space,
             chunk_size=chunk_size,

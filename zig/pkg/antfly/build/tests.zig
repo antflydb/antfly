@@ -251,6 +251,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "public table create index preserves permanent inference budget",
             "public artifact enrichment preserves permanent inference budget",
+            "PDF embedding input public contract",
             "public table query returns hierarchy validation pointers",
             "embedding validation failures share",
             "hierarchy validation body survives",

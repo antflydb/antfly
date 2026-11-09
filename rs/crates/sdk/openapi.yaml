@@ -43180,6 +43180,15 @@ components:
             consume other asset artifacts (the upstream asset''s produced bytes become this producer''s
             source, so field and template must be omitted and the producer must consume text: copy, generator,
             or extractor).'
+        embedding_input:
+          type: string
+          enum:
+            - text
+            - pdf_page_images
+          default: text
+          description: pdf_page_images requires kind=embedding, consumes a PDF URI, and embeds its rendered
+            pages. Native field selectors address literal root keys; use a raw template for nested resource
+            URIs.
         expected_dims:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -46234,6 +46243,12 @@ components:
         expected_dims:
           type: integer
           minimum: 0
+        embedding_input:
+          type: string
+          enum:
+            - text
+            - pdf_page_images
+          description: Effective embedding input mode; PDF pages are rasterized before embedding.
         vector_space:
           type: string
           minLength: 1
