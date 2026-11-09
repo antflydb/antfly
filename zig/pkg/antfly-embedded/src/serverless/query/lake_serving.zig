@@ -449,6 +449,7 @@ pub const ServingSource = struct {
     alloc: std.mem.Allocator,
     snapshot_pin: ?host_store.SnapshotPin = null,
     store: object_store_support.OpenedObjectStore,
+    provider_allocator: ?*@import("../../sql/parallel_scheduler.zig").LockedAllocator = null,
     inventory: external_source_api.Inventory,
     scanner: PinnedExternalObjectStorageLakeRowsScanner,
     iceberg_schema: ?@import("lake_schema.zig").Detected = null,
@@ -607,7 +608,13 @@ pub const ServingSource = struct {
         if (comptime @import("builtin").os.tag == .freestanding) if (cache != null) return error.UnsupportedHostedLakeCache;
         const binding = (schema.external_base_source orelse return error.InvalidExternalTableBinding).binding;
         const identity_version = options.row_identity_version orelse binding.row_identity_version;
-        var store = try options.open(alloc, binding);
+        // HTTP pools/authentication may allocate while admitted column workers
+        // overlap. Never let those clients retain a bare request arena. Keep
+        // the synchronizing allocator at its final address until client drain.
+        const provider_allocator = try alloc.create(@import("../../sql/parallel_scheduler.zig").LockedAllocator);
+        errdefer alloc.destroy(provider_allocator);
+        provider_allocator.* = .{ .backing = @import("../../sql/memory_budget.zig").reclaimingAllocator(alloc) };
+        var store = try options.open(provider_allocator.allocator(), binding);
         errdefer store.deinit();
         const context_store = try alloc.create(@import("lake_read_context.zig").Store);
         errdefer alloc.destroy(context_store);
@@ -817,7 +824,7 @@ pub const ServingSource = struct {
         errdefer if (snapshot_pin) |pin| pin.deinit(pin.ptr);
         if (snapshot_pin) |pin| context_store.extra_checkpoint = .{ .ptr = pin.ptr, .check = pin.check };
         const local_plan = if (plan_lease == null and file_navigation == null) try PreparedPlan.init(alloc, inventory) else null;
-        var result: ServingSource = .{ .file_navigation = file_navigation, .deferred_snapshot = deferred_snapshot, .sealed_manifest = sealed_manifest, .alloc = alloc, .snapshot_pin = snapshot_pin, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_identity = plan_identity, .plan_lease = plan_lease, .local_plan = local_plan, .inventory_owned = plan_lease == null, .attachment_uri = attachment_uri, .catalog_metadata = retained_metadata, .lazy_versions = lazy_versions, .immutable_objects = binding.object_mutability == .immutable, .pinned_files = pinned_files };
+        var result: ServingSource = .{ .file_navigation = file_navigation, .deferred_snapshot = deferred_snapshot, .sealed_manifest = sealed_manifest, .alloc = alloc, .snapshot_pin = snapshot_pin, .store = store, .provider_allocator = provider_allocator, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_identity = plan_identity, .plan_lease = plan_lease, .local_plan = local_plan, .inventory_owned = plan_lease == null, .attachment_uri = attachment_uri, .catalog_metadata = retained_metadata, .lazy_versions = lazy_versions, .immutable_objects = binding.object_mutability == .immutable, .pinned_files = pinned_files };
         errdefer result.freeCatalogFiles();
         try result.ensureDeleteQualification();
         errdefer if (result.delete_qualification_owned) if (result.delete_qualification) |qualification| qualification.destroy();
@@ -1275,7 +1282,9 @@ pub const ServingSource = struct {
         const reader = try self.alloc.create(@import("lake_serving_cache.zig").Reader);
         errdefer self.alloc.destroy(reader);
         const scope = try cacheScope(self.alloc, self.store, binding);
-        reader.* = .{ .base = self.scanner.object_reader, .cache = cache, .scope = scope, .context = self.protectContext(context) };
+        var read_context = self.protectContext(context);
+        read_context.parallel_object_io = self.provider_allocator != null and self.store.client.vtable.supports_concurrent_requests;
+        reader.* = .{ .base = self.scanner.object_reader, .cache = cache, .scope = scope, .context = read_context };
         self.scanner.shared_reader = reader;
     }
 
@@ -1310,6 +1319,7 @@ pub const ServingSource = struct {
             self.alloc.destroy(snapshot);
         };
         self.store.deinit();
+        if (self.provider_allocator) |owned| self.alloc.destroy(owned);
         if (self.context_store) |store| self.alloc.destroy(store);
         self.* = undefined;
     }

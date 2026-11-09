@@ -215,7 +215,11 @@ Cold demand reads also use bounded byte read-ahead. A touched native text pack
 can be fetched and authenticated once (at most 1 MiB, at most 16 times its
 requested block). Parquet data reads can reuse aligned 1 MiB windows across
 headers and payloads, including stitching up to three windows for a bounded
-request. Every source GET still enforces the admitted version/ETag. Footer and
+request. Independent misses overlap through admitted workers only when the
+provider advertises concurrency and its construction allocator is synchronized.
+Source clients own a stable locked, reclaiming allocator until teardown; workers
+use private state and independent result allocators. Cancellation drains every
+window task before releasing its capability or buffers. Every source GET still enforces the admitted version/ETag. Footer and
 page-index interpretations keep their exact ranges. Existing exact disk entries
 are checked first, so upgrading does not discard their restart benefit.
 
@@ -228,7 +232,7 @@ introduced. A failed optional whole-pack checksum falls back to independently
 authenticated required ranges. Parquet page-index discovery runs inside admitted
 header workers instead of serially opening every column before its pipeline.
 Serving header probes can use the existing 64 KiB workspace to combine header
-and payload discovery; single-window shared leases avoid another payload copy.
+and payload discovery; shared byte slices avoid another payload copy.
 
 Request-owned atomic I/O profiles record immutable RAM/disk hits, provider read
 count/bytes/errors, overlapping provider elapsed time, peak active loads, and

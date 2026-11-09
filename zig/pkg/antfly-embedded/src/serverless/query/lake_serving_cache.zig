@@ -1154,6 +1154,28 @@ pub const Reader = struct {
     /// Reuse version-qualified byte windows across header and payload reads.
     /// Only demanded column data participates; footer/index semantics and exact
     /// range fallback are preserved. Text and Parquet share the outer budget.
+    const WindowRead = struct {
+        reader: *Reader,
+        read: ranges.RangeRead,
+        stopped: std.atomic.Value(bool) = .init(false),
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.stopped.load(.acquire)) return true;
+            const context = self.reader.context;
+            if (context.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return true;
+            return if (context.cancellation) |token| token.isCancelled() else false;
+        }
+        fn run(self: *@This()) anyerror!ranges.RangeLease {
+            var worker: Reader = .{ .cache = self.reader.cache, .base = self.reader.base, .scope = self.reader.scope, .context = self.reader.context, .scheduler = self.reader.scheduler };
+            const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
+            worker.context.cancellation = token;
+            worker.base.cancellation = token;
+            return readExactLease(&worker, std.heap.page_allocator, self.read) catch |err| {
+                try self.reader.context.ensureActive();
+                return err;
+            };
+        }
+    };
     fn readAheadLease(self: *Reader, alloc: Allocator, read: ranges.RangeRead) !?ranges.RangeLease {
         const trace = self.context.trace orelse return null;
         const window = 1024 * 1024;
@@ -1168,6 +1190,15 @@ pub const Reader = struct {
         defer admission.release();
         var held: [3]?ranges.RangeLease = @splat(null);
         defer for (held) |lease| if (lease) |value| value.release();
+        var work: [3]WindowRead = undefined;
+        var tasks: [3]?Scheduling.Task(anyerror!ranges.RangeLease) = @splat(null);
+        defer if (self.context.io) |io| {
+            for (&work, &tasks) |*item, *task| if (task.*) |*active| {
+                item.stopped.store(true, .release);
+                if (active.cancel(io)) |lease| lease.release() else |_| {}
+                task.* = null;
+            };
+        };
         var offset = begin;
         var count: usize = 0;
         while (offset < end) : (count += 1) {
@@ -1179,13 +1210,25 @@ pub const Reader = struct {
                 held[count] = lease;
             } else {
                 if (!trace.reserveReadAhead(widened.range.len)) return null;
-                held[count] = readExactLease(self, alloc, widened) catch |err| switch (err) {
+                work[count] = .{ .reader = self, .read = widened };
+                if (self.context.parallel_object_io) if (self.context.io) |io| {
+                    tasks[count] = self.scheduler.submitIoTransient(io, 2 * window, WindowRead.run, .{&work[count]});
+                };
+                if (tasks[count] == null) held[count] = readExactLease(self, alloc, widened) catch |err| switch (err) {
                     error.OutOfMemory => return null,
                     else => return err,
                 };
             }
             offset += widened.range.len;
         }
+        for (tasks[0..count], 0..) |*task, i| if (task.*) |*active| {
+            const outcome = active.await(self.context.io.?);
+            task.* = null;
+            held[i] = outcome catch |err| {
+                try self.context.ensureActive();
+                return err;
+            };
+        };
         try self.context.ensureActive();
         if (count == 1 and held[0].?.owner == .shared) {
             var lease = held[0].?;
@@ -2430,5 +2473,73 @@ test "external lake source read ahead restores exact legacy and widened disk ent
         try std.testing.expectEqual(@as(u64, 0), trace.snapshot().read_ahead_bytes);
         reader.scope = @splat(2);
         try std.testing.expectError(error.ProviderUnavailable, reader.reader().readPlannedLease(a, read));
+    }
+}
+
+test "external lake source read ahead overlaps admitted windows and cancels before releasing their owners" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    const bytes = try a.alloc(u8, 3 * 1024 * 1024);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / 1024);
+    var put = try client.putObject("bucket", "data", bytes, .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        calls: std.atomic.Value(usize) = .init(0),
+        entered: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.calls.fetchAdd(1, .acq_rel) + 1 == 2) self.entered.set(std.testing.io);
+            try self.gate.wait(std.testing.io);
+            if (options.cancellation) |token| try token.check();
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+        fn run(reader: *Reader, read: ranges.RangeRead) anyerror!ranges.RangeLease {
+            return reader.reader().readPlannedLease(std.heap.page_allocator, read);
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+    provider.vtable.get_object = Provider.get;
+    const base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+    const read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "data", .byte_len = bytes.len, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 900 * 1024, .len = 256 * 1024 }, .purpose = .parquet_column_chunk };
+    for ([_]bool{ false, true }) |cancel| {
+        provider.calls.store(0, .release);
+        provider.entered.reset();
+        provider.gate.reset();
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        var trace: @import("lake_read_context.zig").IoTrace = .{};
+        var scheduler: Reader.Scheduling.Scheduler = .{};
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(1), .context = .{ .io = io, .trace = &trace, .parallel_object_io = true }, .scheduler = &scheduler };
+        var future = try io.concurrent(Provider.run, .{ &reader, read });
+        var joined = false;
+        defer if (!joined) {
+            if (future.cancel(io)) |lease| lease.release() else |_| {}
+        };
+        try provider.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } });
+        if (cancel) {
+            const result = future.cancel(io);
+            joined = true;
+            try std.testing.expectError(error.Canceled, result);
+        } else {
+            provider.gate.set(io);
+            const result = future.await(io);
+            joined = true;
+            const lease = try result;
+            defer lease.release();
+            try std.testing.expectEqualSlices(u8, bytes[900 * 1024 ..][0 .. 256 * 1024], lease.bytes);
+        }
+        try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
     }
 }

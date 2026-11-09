@@ -669,12 +669,16 @@ const PhysicalWarm = struct {
         std.heap.page_allocator.destroy(self);
     }
     fn retain(self: @This(), digest: [32]u8) !ServingCache.VerifiedLease {
+        return self.retainValue(.{ .bytes = self.lease.bytes(), .digest = digest });
+    }
+    /// Consume the full owner while returning only its authenticated slice.
+    /// Unit admission copies once; denied residency keeps this shared owner.
+    fn retainValue(self: @This(), value: ServingCache.VerifiedBytes) !ServingCache.VerifiedLease {
         var owned = self.lease;
         errdefer owned.deinit();
         const holder = try std.heap.page_allocator.create(@This());
         holder.* = self;
-        const bytes = owned.bytes();
-        return .{ .value = .{ .bytes = bytes, .digest = digest }, .owner = .{ .bytes = bytes, .owner = .{ .shared = .{ .ptr = holder, .release_fn = release } } } };
+        return .{ .value = value, .owner = .{ .bytes = value.bytes, .owner = .{ .shared = .{ .ptr = holder, .release_fn = release } } } };
     }
 };
 fn requiredRange(a: A, store: stores.ArtifactStore, id: []const u8, offset: u64, length: usize, token: Cancellation, publication: bool) ![]u8 {
@@ -913,13 +917,14 @@ fn readAheadPiece(a: A, store: stores.ArtifactStore, piece: Piece, cancellation:
             else => return err,
         };
     };
-    defer held.deinit();
-    const bytes = try a.dupe(u8, held.bytes()[@intCast(piece.pack_offset)..][0..@intCast(piece.ref.byte_len)]);
-    errdefer a.free(bytes);
+    var owns = true;
+    defer if (owns) held.deinit();
+    const bytes = held.bytes()[@intCast(piece.pack_offset)..][0..@intCast(piece.ref.byte_len)];
     const verified = try ServingCache.VerifiedBytes.authenticate(bytes, try stores.sha256DigestFromChecksum(piece.ref.checksum));
     try cached.context.ensureActive();
     try cancellation.check();
-    return .{ .value = verified, .owner = .{ .bytes = bytes, .owner = .{ .allocation = a } } };
+    owns = false;
+    return (PhysicalWarm{ .lease = held }).retainValue(verified);
 }
 fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead, coalesced: ?*CoalescedRead, publication: bool) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
     if (piece.pack == null) {
