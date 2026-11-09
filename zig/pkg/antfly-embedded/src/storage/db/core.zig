@@ -347,12 +347,21 @@ pub const IndexRepairCheckpoint = struct {
     lock_key: []u8,
     path: []u8,
     storage: ?lsm_backend_mod.Storage = null,
+    /// Borrowed from the DB's own backend_runtime after open (see db.zig's
+    /// DB.open, right after openCoreResourcesFromPrimaryStore returns) when
+    /// one is available, so durable repair-identity generation
+    /// (newReplicaIdentityWithIo) draws from the same Io the rest of the
+    /// repair path already uses instead of the global debug runtime. Left at
+    /// its default for the rare caller that never gets patched; see
+    /// index_repair_state.Location's own doc comment on this field.
+    io: std.Io = std.Options.debug_io,
 
     pub fn location(self: *const @This()) index_repair_state.Location {
         return .{
             .lock_key = self.lock_key,
             .path = self.path,
             .storage = self.storage,
+            .io = self.io,
         };
     }
 

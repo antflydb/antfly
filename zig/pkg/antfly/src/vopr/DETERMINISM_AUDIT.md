@@ -106,3 +106,62 @@ failure in that same scenario (a `vopr-io.packet_deliver` payload mismatch) —
 proving this conversion closes the specific real-time leak it targets, while
 that scenario's remaining divergence has a different, not-yet-identified
 cause.
+
+## Durable repair identity generation (continued investigation, partial)
+
+Following up on the still-open divergence above: `full-cluster.clean` also
+diverges with the identical symptom (`vopr-io.packet_deliver`, same packet
+`parameter` i.e. byte length, different payload digest i.e. different
+content), so the remaining cause is not resource-pressure-specific. One
+contributing source, found and fixed: `index_repair_state.newRepairId`
+(`derived/index_repair_state.zig`) draws its 16 bytes of identity from
+`std.Options.debug_io` unconditionally — the global debug runtime, not
+whatever `Io` the owning `DB` was actually opened with — which is this file's
+"Direct host entropy" risk category. Under VOPR that bypasses `VoprIo`'s
+seeded, replay-deterministic `randomSecure` entirely and draws real host
+entropy instead, so every `IndexRepairIntent.repair_id` (and the dense-
+artifact-counter attempt id, and the shadow generation id) differs between a
+recorded run and its own exact replay. `DB.newDurableRepairId` (new helper
+next to `repairPacingClock`) routes this through
+`self.backend_runtime.io()` when one is borrowed — `VoprIo`'s seeded PRNG
+under VOPR, the same real entropy source in production — and converts the
+six `IndexRepairIntent`/dense-artifact-counter/shadow-generation call sites
+in `db.zig` that have a `DB` receiver available. Left unconverted,
+deliberately: `createUniqueRepairShadowBaseWithStorage`'s and
+`createUniqueRepairShadowBase`'s own identity/nonce-based directory-naming
+schemes (`db.zig`) — these only ever become a local filesystem path
+component (`.repair-shadow-<id>`), never wire-visible content, so their
+nondeterminism cannot by itself produce a replay-visible divergence.
+
+A second, related source, also found and fixed: the durable repair-state
+checkpoint's own `Location.io` (`derived/index_repair_state.zig`, consumed by
+`newReplicaIdentityWithIo` for each DB/replica's own `db_identity`/
+`replica_id`, which becomes part of every `IndexRepairIntent` built from that
+checkpoint) is constructed in `core.zig`'s `openCoreResourcesFromPrimaryStore`
+with no `Io` available to it at all, so it keeps `Location`'s own
+`std.Options.debug_io` default — the same risk category, one level up.
+`openCoreResourcesFromPrimaryStore` has a single caller (`db.zig`'s
+`DB.open`), so rather than threading a new parameter through its already
+long signature, `IndexRepairCheckpoint` gained its own `io` field (mirroring
+`Location`'s) and `DB.open` patches it from `backend_runtime.io()` immediately
+after `core` is constructed, before anything reads it.
+
+**Status: verified not sufficient alone.** Both conversions are real,
+individually-justified fixes (confirmed via `antfly-storage-test` that
+existing checkpoint/repair-identity tests still pass), and the full-cluster
+suite's unit-test prerequisites are unaffected, but `full-cluster.clean` and
+`full-cluster.resource-pressure` still diverge after both are applied
+(`full-cluster-vopr-test`: 23/25 both before and after, same two properties,
+`ReplaySelectedTransitionDiverged` at `vopr-io.packet_deliver`, `parameter`
+unchanged, payload still differs) — the choice index the divergence first
+appears at shifts forward each time a source of nondeterminism earlier in the
+history is removed, which is consistent with these conversions each
+genuinely removing *a* source, just not *the* (or *the only*) remaining one.
+`raft-vopr-test` (4/4) and `lsm-vopr-test` (3/3) stay green throughout. The
+remaining source was not identified before this investigation paused; a
+profitable next step is a temporary diagnostic that hashes/logs every HTTP
+request and response body (not just the repair-pacing clock, which is now
+proven deterministic) during a record pass and its own exact replay of
+`full-cluster.clean`, to find the first byte range that differs and trace it
+back to its source, the same technique that isolated the pacing-clock fix
+above.

@@ -4113,6 +4113,16 @@ pub const DB = struct {
             );
             var core_owned = true;
             errdefer if (core_owned) core.deinit(alloc);
+            // openCoreResourcesFromPrimaryStore has no owning runtime to pass
+            // down to IndexRepairCheckpoint's construction, so it defaults to
+            // the global debug Io. Patch in this DB's own backend_runtime Io
+            // here instead: in production that's still the real OS Io
+            // (unchanged behavior), while under VOPR it's VoprIo's seeded,
+            // replay-deterministic Io, matching repairPacingClock's pattern.
+            // See DETERMINISM_AUDIT.md.
+            if (core.index_repair_checkpoint) |*checkpoint| {
+                if (backend_runtime.io()) |borrowed_io| checkpoint.io = borrowed_io;
+            }
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);
             owned_async_context = async_context;
@@ -12564,6 +12574,25 @@ pub const DB = struct {
         return self.repairPacingNowNs() - start_ns;
     }
 
+    /// Durable repair/shadow-generation identity (IndexRepairIntent.repair_id,
+    /// dense-artifact-counter attempt ids, shadow generation ids). These are
+    /// not security-sensitive, but they are wire-visible: a repair intent's
+    /// repair_id is part of durable, observable state and can surface through
+    /// status/observability responses. index_repair_state.newRepairId draws
+    /// from the global std.Options.debug_io, bypassing whatever Io this DB was
+    /// actually opened with. In production that is still the real OS secure
+    /// entropy source (unchanged behavior), but under VOPR it bypasses
+    /// VoprIo's seeded, replay-deterministic randomSecure entirely and reads
+    /// real host entropy instead -- DETERMINISM_AUDIT.md's "Direct host
+    /// entropy" risk category. Route through the backend runtime's borrowed
+    /// std.Io, which resolves to VoprIo's seeded PRNG under VOPR and to the
+    /// same real entropy source in production, so repair identities become
+    /// exact-replay-deterministic without changing production behavior.
+    fn newDurableRepairId(self: *const DB, alloc: Allocator) !u128 {
+        if (self.backend_runtime.io()) |io| return index_repair_state.newRepairIdWithIo(alloc, io);
+        return index_repair_state.newRepairId(alloc);
+    }
+
     const progressive_index_repair_audit_interval_ms: u64 = 5 * std.time.ms_per_s;
 
     fn deferIndexRepairForProgress(
@@ -13424,7 +13453,7 @@ pub const DB = struct {
                 const now_ms = self.indexRepairNowMs();
                 const target_sequence = self.core.nextDerivedSequence();
                 var replacement_intent = index_repair_state.IndexRepairIntent{
-                    .repair_id = try index_repair_state.newRepairId(alloc),
+                    .repair_id = try self.newDurableRepairId(alloc),
                     .db_identity = state.identity.db_identity,
                     .group_id = self.localRepairGroupId(),
                     .replica_id = state.identity.replica_id,
@@ -14313,7 +14342,7 @@ pub const DB = struct {
             self.core.nextDerivedSequence(),
             minimum_target_sequence orelse 0,
         );
-        const repair_id = try index_repair_state.newRepairId(alloc);
+        const repair_id = try self.newDurableRepairId(alloc);
         const index_name = try alloc.dupe(u8, cfg.name);
         var intent_allocations_transferred = false;
         errdefer if (!intent_allocations_transferred) alloc.free(index_name);
@@ -14720,7 +14749,7 @@ pub const DB = struct {
         if (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name) != null) {
             return error.DenseArtifactCounterAlreadyInitialized;
         }
-        const attempt_id = try index_repair_state.newRepairId(alloc);
+        const attempt_id = try self.newDurableRepairId(alloc);
         const marker_key = try denseArtifactCounterBootstrapKeyAlloc(alloc, index_name);
         defer alloc.free(marker_key);
         var marker_value: [dense_artifact_counter_bootstrap_encoded_len]u8 = undefined;
@@ -15715,7 +15744,7 @@ pub const DB = struct {
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
             const now_ms = self.indexRepairNowMs();
             const target_sequence = self.core.nextDerivedSequence();
-            const repair_id = try index_repair_state.newRepairId(alloc);
+            const repair_id = try self.newDurableRepairId(alloc);
             const index_name = try alloc.dupe(u8, cfg.name);
             var intent = index_repair_state.IndexRepairIntent{
                 .repair_id = repair_id,
@@ -17875,7 +17904,7 @@ pub const DB = struct {
         var persisted_build_reprocessed: u64 = 0;
         var build_resume_key: ?[]u8 = null;
         defer if (build_resume_key) |key| alloc.free(key);
-        const generation_id = durable_repair_id orelse try index_repair_state.newRepairId(alloc);
+        const generation_id = durable_repair_id orelse try self.newDurableRepairId(alloc);
         var shadow_base: []u8 = undefined;
         if (durable_repair_id) |repair_id| {
             var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
@@ -36883,7 +36912,7 @@ pub const DB = struct {
                     var cfg = try types.IndexConfig.clone(self.alloc, entry.config);
                     defer cfg.deinit(self.alloc);
                     if (repair.trigger == .artifact_counter_missing) {
-                        const bootstrap_id = try index_repair_state.newRepairId(self.alloc);
+                        const bootstrap_id = try self.newDurableRepairId(self.alloc);
                         try self.ensureDenseArtifactTargetCounterForRepair(
                             self.alloc,
                             cfg,
