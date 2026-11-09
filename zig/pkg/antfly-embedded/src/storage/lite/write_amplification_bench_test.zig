@@ -2352,11 +2352,28 @@ test "lite write amplification report: relational write surface" {
     try expectAtMost(sql_insert_update.durableCommitsPerWrite(), 2.0, "SQL INSERT/UPDATE via C API durable commits/write");
     // `foreign_key` still spans two physical tables (the child row plus an
     // `.attach` inbound-reference record against the parent -- see
-    // `Plan.expand` in `api/relational_integrity.zig`), so it still takes
-    // the full cross-database protocol and is unchanged by this pass
-    // (~16, not yet ~4). Gated loosely to catch a regression, not to claim
-    // this mode improved.
-    try expectAtMost(foreign_key.durableCommitsPerWrite(), 20.0, "relational foreign-key durable commits/write");
+    // `Plan.expand` in `api/relational_integrity.zig`), but
+    // `capi/sql.zig`'s `commitCoordinatedFusedMultiTable` (lite-single-
+    // commit-write-path.md §7.5's FK multi-table coordinator) now drives
+    // this case too instead of the full cross-database two-phase
+    // protocol: it locks the parent's `core.apply_mutex` directly
+    // (ascending `table_id` order, parent before child), validates and
+    // stages the `.attach` record as a ride-along commit against the
+    // parent's own store, then drives the child's row insert through its
+    // existing, unmodified single-table `commitCoordinatedLocal`. Measured
+    // ~16 -> ~1.9 (1 writer) / ~2.3 (8 writers), down from the untouched
+    // baseline this gate used to allow. The residual above 1.0 is the
+    // same `ride_along_flush` idle-timer dynamic already documented for
+    // the algebraic overwrite case (§3.3b): the parent's ride-along
+    // `.attach` write usually, but not always, gets swept into the SAME
+    // fsync as the child's own foreground commit; when it loses that
+    // race it becomes durable on the next foreground commit or the
+    // idle-flush timer instead, costing close to a second commit. Not
+    // addressed here (closing that gap needs the same cross-cutting
+    // ride-along-timing work §3.3b/§7.5 already flagged as follow-up, not
+    // a change specific to FK).
+    try expectAtMost(foreign_key.durableCommitsPerWrite(), 3.0, "relational foreign-key durable commits/write");
+    try expectAtMost(foreign_key_concurrent.durableCommitsPerWrite(), 3.5, "relational foreign-key 8-writer durable commits/write");
 }
 
 // ---------------------------------------------------------------------------
