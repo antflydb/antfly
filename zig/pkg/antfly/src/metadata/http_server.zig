@@ -2603,7 +2603,7 @@ pub const MetadataHttpServer = struct {
         applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
         const request = requestContext(ctx);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
-        const capture = self.source.vtable.linearizable_routing_token orelse return ctx.status(503).text("routing token unavailable");
+        const capture = self.source.vtable.linearizable_routing_token orelse return ctx.status(404).text("routing token unsupported");
         const token = capture(self.source.ptr, request) catch |err| return metadataReadError(ctx, err);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return ctx.json(token);
