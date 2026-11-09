@@ -910,6 +910,21 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             record_property("query_samples", json.dumps(samples))
             time.sleep(6)
             profile_after = metrics()
+            record_property(
+                "restart_immutable_io",
+                json.dumps(
+                    {
+                        name: value
+                        for name, value in profile_after.items()
+                        if name.startswith("antfly_lake_query_slowest_lake_io_")
+                        or name
+                        in {
+                            "antfly_lake_disk_cache_inventory_checkpoint_hits_total",
+                            "antfly_lake_disk_cache_inventory_scan_entries_total",
+                        }
+                    }
+                ),
+            )
             profile_preparations = (
                 profile_after["antfly_lake_query_source_calls_total"]
                 - profile_before["antfly_lake_query_source_calls_total"]
@@ -975,6 +990,19 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             record_property(
                 "cold_cache_startup_and_query_ms",
                 (time.monotonic() - cold_started) * 1000,
+            )
+            # Preserve only the bounded request-owned diagnostic profile, not
+            # a full process metrics dump or another timing series.
+            time.sleep(6)
+            record_property(
+                "cold_immutable_io",
+                json.dumps(
+                    {
+                        name: value
+                        for name, value in metrics().items()
+                        if name.startswith("antfly_lake_query_slowest_lake_io_")
+                    }
+                ),
             )
             # Separate warm selectivity probes from the restart/cold samples.
             # Common, fixture-rare and absent terms exercise different posting
