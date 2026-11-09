@@ -3394,9 +3394,23 @@ pub const Store = struct {
 
     /// The durable (post-fsync) commit sequence. Blocks only as long as a
     /// group is mid-apply; never waits on a merely-staged mutation.
+    ///
+    /// `self.file.activeCheckpoint()` alone is NOT this: it also advances
+    /// for a ride-along (non-durable) commit (`commitTransactionWithDurability`'s
+    /// `deferred_publication` branch writes `next` straight into
+    /// `self.header.checkpoints[self.header.active_checkpoint]`, with no
+    /// sync at all), with `self.file.durable_header` left holding the last
+    /// checkpoint that *was* actually synced. Whenever `durable_header` is
+    /// set, that -- not the advanced `activeCheckpoint()` -- is the durable
+    /// sequence; `durable_header` is cleared back to `null` exactly when a
+    /// real sync makes `self.header` durable again (see `publishCheckpoint`).
+    /// This had no caller before the regression-B invariant below, so this
+    /// bug (returning the ride-along-advanced sequence, never the durable
+    /// one) was latent rather than itself the cause of any observed loss.
     pub fn durableSequence(self: *Store) u64 {
         lockStore(self);
         defer self.mutex.unlock();
+        if (self.file.durable_header) |durable| return durable.checkpoints[durable.active_checkpoint].commit_sequence;
         return self.file.activeCheckpoint().commit_sequence;
     }
 
@@ -4442,6 +4456,10 @@ pub const Txn = struct {
         // its ticket is stashed on `ride_along_ticket` instead of `staged`
         // (no `drive()` step applies); `StagedCommit.wait()` waits on
         // whichever of the two is set.
+        if (@import("native.zig").recovery_debug_log) {
+            const first_key = if (mutations.len != 0) mutations[0].key else "<none>";
+            std.debug.print("[native-recovery] Txn.commitStaged ride_along={} mutation_count={d} first_key={s} index_catalog_mutation_count={d}\n", .{ self.ride_along, mutations.len, first_key, self.index_catalog_pending.items.len });
+        }
         var ride_along_ticket: ?Store.Ticket = null;
         const staged: ?Store.Staged = if (self.ride_along) staged: {
             ride_along_ticket = try store.stageRideAlong(.{ .context = context, .apply = PrimaryCommitContext.apply, .estimated_bytes = estimated_bytes });

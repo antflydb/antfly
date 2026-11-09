@@ -2864,6 +2864,32 @@ const ride_along_steps: [ride_along_key_count * ride_along_round_count]RideAlong
     break :blk steps;
 };
 
+/// Regression-B permanent invariant (docs/design/lite-performance/
+/// lite-single-commit-write-path.md §3.2a prefix-ordered durability): once
+/// `DB.batch` returns success for a sync level that promises the primary
+/// write (and, for `.full_text`/`.full_index`, the relevant index work) is
+/// durable -- never `.propose`/`.enrichments`, which don't promise that --
+/// the commit that produced the acknowledged state must already be durable:
+/// `Store.durableSequence()` must already cover `activeCheckpoint()`'s
+/// commit_sequence captured at the same instant. This is deterministic and
+/// unconditional, unlike the crash sweep's own barrier sampling, which only
+/// ever observes this gap indirectly (as a lost write after a crash that
+/// happens to land in exactly the right barrier window) and was missing it
+/// entirely in most runs. Call this immediately after every acknowledged
+/// write a via_db scenario makes at a durability-promising sync level.
+fn assertAcknowledgedWriteIsDurable(handle: *DbHandle) !void {
+    const store = handle.backend.native_docstore orelse return;
+    const acked_sequence = store.file.activeCheckpoint().commit_sequence;
+    const durable_sequence = store.durableSequence();
+    if (durable_sequence < acked_sequence) {
+        std.debug.print(
+            "crash-consistency: INVARIANT VIOLATED -- batch() returned success for commit_sequence={d} but Store.durableSequence()={d} (durable_header_set={})\n",
+            .{ acked_sequence, durable_sequence, store.file.durable_header != null },
+        );
+        return error.AcknowledgedWriteNotYetDurable;
+    }
+}
+
 fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
     if (native.recovery_debug_log) std.debug.print("[native-recovery] === subrun start path={s} ===\n", .{path});
     var handle = try openDbWithIo(allocator, path, io, true);
@@ -2895,6 +2921,7 @@ fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const 
                 store.file.durable_header != null,
             });
         };
+        try assertAcknowledgedWriteIsDurable(&handle);
 
         // Mirrors production: a WS5 retirement turn driven explicitly here
         // (this harness bypasses the Owner/pool layer that normally drives
