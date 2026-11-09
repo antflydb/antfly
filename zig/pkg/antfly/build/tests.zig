@@ -6834,6 +6834,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-authority-invalidation-test", "Verify cohort invalidation across schema and policy publication")
         .dependOn(&addFilteredTestRunArtifact(b, authority_invalidation_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const source_vector_contract_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "external vector compatibility declaration", "scalar text asset chunks", "generic scalar chunks reject stale upstream and fence publication", "generic contextual asset publication", "asset producer neighbor context samples", "source semantic media input", "transcript chunk public provenance", "transcript timing stamps", "diarized phrases carry", "transcript spans locate", "grouped artifact text filters use parent ordinals" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("source-vector-contract-test", "Verify authored source vector compatibility and text-asset chunk lifecycle")
+        .dependOn(&addFilteredTestRunArtifact(b, source_vector_contract_tests).step);
+
     const lite_external_dimension_tests = b.addTest(.{
         .root_module = db_test_mod,
         .max_rss = 12 * 1024 * 1024 * 1024,

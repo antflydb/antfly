@@ -42,26 +42,7 @@ func DefaultTextStreams() []TextStream {
 	return []TextStream{{Name: "source", Field: "content.text", Purpose: "source", Default: true, Boundary: "record"}}
 }
 func ValidateTextStreams(streams []TextStream) error {
-	if len(streams) > 64 {
-		return fmt.Errorf("at most 64 text streams are supported")
-	}
-	names := map[string]bool{}
-	for _, stream := range streams {
-		if stream.Name == "" || names[stream.Name] || stream.Field == "" || strings.ContainsAny(stream.Name+stream.Field+stream.Artifact+stream.Index+stream.Purpose+stream.LocationField, "\x00\r\n") {
-			return fmt.Errorf("invalid or duplicate text stream")
-		}
-		names[stream.Name] = true
-		if stream.Artifact == "" && stream.Index != "" {
-			return fmt.Errorf("inline source streams use ordinary source scans; index requires an artifact")
-		}
-		if stream.Artifact != "" && stream.Index == "" {
-			return fmt.Errorf("artifact text streams require a native full-text index binding")
-		}
-		if stream.Boundary != "" && stream.Boundary != "record" && stream.Boundary != "unit" {
-			return fmt.Errorf("unsupported text matching boundary")
-		}
-	}
-	return nil
+	return ValidateSearchBindings(1, streams, nil)
 }
 
 func (fields DocumentFields) Validate() error {
