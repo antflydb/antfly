@@ -36,6 +36,14 @@ cut. A second generic post-batch wait must not reintroduce replay under writer
 admission. Graph coverage targets are also captured once per waiter and owned
 through its completion, rather than recaptured as later vector writes arrive.
 
+Detached full-text metadata reads can use an exact index-domain witness when
+that domain owns the complete source layout. Shared dense-vector and graph
+providers retain catalog-wide read validation: a per-index directory identity
+alone cannot certify their shared mutable inputs. A nested read borrows valid
+broad admission without replacing its capability; a narrow parent cannot lend
+another index or the whole catalog. Changed input and recovery witnesses remain
+mandatory before any publication.
+
 SQL normalization can retain an owned packed relational row authority. The final
 mutation reuses that authority only for exact key/value/JSON-null provenance,
 schema/layout and catalog witnesses. Conflict postimages that change those bytes

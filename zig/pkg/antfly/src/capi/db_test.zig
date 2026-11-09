@@ -4982,6 +4982,10 @@ test "capi SQL detached maintenance publishes through native storage admission" 
             break;
         }
     }
+    if (!idle) {
+        const stats = connection.publication_stats;
+        std.debug.print("detached maintenance stalled last={s} failures={d} index_refusals={d} allocator_refusals={d} phases={f}\n", .{ stats.last_maintenance_error orelse "none", stats.maintenance_errors, stats.index_input_refusals, stats.allocator_refusals, std.json.fmt(stats.maintenance_failures, .{}) });
+    }
     try std.testing.expect(idle);
     const guard = public.enterHandle(handle, .exclusive).?;
     defer guard.leave();

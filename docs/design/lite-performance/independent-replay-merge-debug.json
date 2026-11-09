@@ -158,7 +158,7 @@
         "failed": 2,
         "leaks": 0
       },
-      "cause": "The new main memory test helper encoded empty anonymous tuple request bodies as JSON arrays. Inspect requires an object for its page options.",
+      "cause": "The existing memory helper encoded empty anonymous tuple bodies as JSON arrays. Newly merged inspect page-option parsing exposed that invalid request encoding.",
       "correction": "Encode empty request bodies as explicit objects; API validation remains unchanged.",
       "focused_memory_suite": {
         "passed": 24,
@@ -168,6 +168,45 @@
         "build_steps": 75
       },
       "aggregate_rerun": "pending"
+    },
+    "named_read_admission": {
+      "status": "focused_correctness_passed; full C API and importer qualification pending",
+      "scope": "Exact full-text index domains with complete isolated metadata/source layout witnesses. Dense-vector and graph reads retain catalog-wide validation for their shared mutable dependencies.",
+      "nested_contract": "Reads borrow existing valid broad admission; narrow parents cannot lend other-index or whole-catalog authority. Stale broad inputs and uncertain outcomes remain refused.",
+      "same_binary_causal_control": {
+        "source": "temporary diagnostic binary only; bypass removed from production source",
+        "executable_sha256": "f5677a88cf6099eabaf6186954491f6608e4c0ec68a1440901e5807c6b9fdbea",
+        "named_reads_enabled_owner_failed": 4,
+        "named_reads_disabled_owner_passed": 4,
+        "baseline_build_or_historical_reference_run": false
+      },
+      "corrected_production_focused_tests": {
+        "isolated_domain_and_nested_tests_passed": 2,
+        "public_maintenance_tests_passed": 4,
+        "failed": 0,
+        "leaks": 0,
+        "build_steps": 86
+      },
+      "performance_claim": false
+    },
+    "reused_unchanged_component_gates": {
+      "source": "a579955b8d73c2993a08c53ae3062ca3840f549e",
+      "aggregate_gate": "independent-producer-main-v19-merged-debug",
+      "aggregate_exit_code": 1,
+      "aggregate_failure": "Four public C API maintenance contracts; corrected focused cases now pass.",
+      "component_results": {
+        "native_passed": 851,
+        "native_skipped": 5,
+        "producer_maintenance_passed": 113,
+        "vector_passed": 53,
+        "graph_write_passed": 163,
+        "graph_ha_passed": 5,
+        "pdf_passed": 7,
+        "mutation_frames_passed": 10,
+        "runtime_error_transport_passed": 60,
+        "leaks": 0
+      },
+      "reuse_basis": "Subsequent runtime changes are confined to C API admission; native storage, vector, graph and mutation implementations are unchanged. Full C API, library/CLI, models, SDK and importer validation rerun on the corrected candidate."
     }
   }
 }

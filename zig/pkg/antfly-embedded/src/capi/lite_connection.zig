@@ -511,6 +511,10 @@ pub const PreparedPublication = struct {
         name: []const u8,
         domain: []const u8,
         identity: ?[16]u8,
+        // Text owns its metadata/source layout within this domain. Dense and
+        // graph readers also depend on shared mutable providers and therefore
+        // retain catalog-wide read admission, even when their writes are scoped.
+        isolated_reads: bool = false,
         valid: bool = true,
     };
     const DocumentGuards = struct {
@@ -2555,7 +2559,7 @@ pub const Owner = struct {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         if (comptime h.builtin.is_test) if (root.maintenance_owner.?.test_before_replay_index_publication) |hook| hook.notify(hook.ptr, root);
         const started = @import("antfly_platform").time.monotonicNs();
-        try enterMaintenanceWriterForIndex(root, .index, index_name);
+        try enterMaintenanceWriterForIndex(root, .index, .{ .named = index_name });
         root.maintenance_owner.?.publication_stats.replay_index_admission_ns +|= @import("antfly_platform").time.monotonicNs() -| started;
         root.maintenance_owner.?.publication_stats.replay_index_groups +|= 1;
     }
@@ -2583,16 +2587,19 @@ pub const Owner = struct {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         if (root.maintenance_publication) |publication| {
             for (publication.index_scopes) |scope| {
+                if (!scope.isolated_reads) continue;
                 if (std.mem.eql(u8, path, scope.domain) or
                     (std.mem.startsWith(u8, path, scope.domain) and path.len > scope.domain.len and path[scope.domain.len] == '/'))
-                    return enterMaintenanceWriterForIndex(ptr, .index_read, scope.name);
+                    return enterMaintenanceWriterForIndex(ptr, .index_read, .{ .named = scope.name });
             }
         }
-        return enterMaintenanceWriter(ptr, .index_read);
+        // An explicit unknown path needs catalog-wide authority; it must not
+        // accidentally inherit a narrower parent's index capability.
+        return enterMaintenanceWriterForIndex(ptr, .index_read, .catalog);
     }
 
     fn enterMaintenanceWriter(ptr: *anyopaque, scope: PublicationScope) !void {
-        return enterMaintenanceWriterForIndex(ptr, scope, null);
+        return enterMaintenanceWriterForIndex(ptr, scope, .inherited);
     }
 
     fn refuseMaintenance(scope: PublicationScope, comptime reason: []const u8) error{EnrichmentWaitCanceled} {
@@ -2601,7 +2608,9 @@ pub const Owner = struct {
         return error.EnrichmentWaitCanceled;
     }
 
-    fn enterMaintenanceWriterForIndex(ptr: *anyopaque, scope: PublicationScope, index_name: ?[]const u8) !void {
+    const IndexAdmission = union(enum) { inherited, catalog, named: []const u8 };
+
+    fn enterMaintenanceWriterForIndex(ptr: *anyopaque, scope: PublicationScope, index_request: IndexAdmission) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         const self = root.maintenance_owner.?;
         const admission_started = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
@@ -2612,12 +2621,21 @@ pub const Owner = struct {
         if (self.stopping.load(.acquire)) return error.Canceled;
         if (needsOutcomeReconciliation(root)) return error.OutcomeReconciliationRequired;
         const publication_context = root.maintenance_publication;
-        const scoped_index = if (publication_context) |p|
-            if (index_name) |name| p.findIndexScope(name) else if (root.maintenance_writer_references != 0) p.admitted_index_scope else null
-        else
-            null;
-        // Nested storage writes borrow only the already validated index domain.
-        if (root.maintenance_writer_references != 0 and index_name != null) {
+        const scoped_index = if (publication_context) |p| blk: {
+            // A read nested in broad admission borrows that existing fence.
+            // Installing a new narrow scope here would reject valid primary
+            // publications, or refresh the wrong witness on outer release.
+            // The stale-input check below still refuses an invalid broad fence.
+            if (scope == .index_read and root.maintenance_writer_references != 0 and p.admitted_index_scope == null)
+                break :blk null;
+            break :blk switch (index_request) {
+                .named => |name| p.findIndexScope(name),
+                .catalog => null,
+                .inherited => if (root.maintenance_writer_references != 0) p.admitted_index_scope else null,
+            };
+        } else null;
+        // A narrow parent cannot lend authority over another index or catalog.
+        if (root.maintenance_writer_references != 0 and index_request != .inherited) {
             if (publication_context) |p| if (p.admitted_index_scope != scoped_index) return refuseMaintenance(scope, "nested_index_scope");
         }
         // A primary publication can rebase onto changed index inputs while
@@ -2694,7 +2712,7 @@ pub const Owner = struct {
                         if (qualificationMetricsEnabled()) std.log.info("antfly_bench_native_publication_refusal_context clean={any} indexed={any} named={any} scopes={d} shadows={d} resolver={any} admitted_reads={any} captured_commit={d} latest_commit={d}", .{
                             if (publication.catalog) |proof| proof.recovery_clean else false,
                             file.header.indexed_reclamation,
-                            index_name != null,
+                            index_request == .named,
                             publication.index_scopes.len,
                             publication.shadow_scopes.len,
                             publication.resolver_dependency != null,
@@ -4199,7 +4217,7 @@ pub const Owner = struct {
             const scopes = try turn_alloc.alloc(PreparedPublication.IndexScope, managed.len);
             for (managed, scopes) |index, *scope| {
                 const domain = try std.fmt.allocPrint(turn_alloc, "{s}/indexes/{s}", .{ database.core.index_manager.base_path, index.name });
-                scope.* = .{ .name = index.name, .domain = domain, .identity = try captured_file.indexScopeIdentity(domain) };
+                scope.* = .{ .name = index.name, .domain = domain, .identity = try captured_file.indexScopeIdentity(domain), .isolated_reads = index.kind == .full_text };
             }
             publication.index_scopes = scopes;
         }
@@ -8287,6 +8305,8 @@ test "capi native maintenance nested admission preserves index and outcome fence
     var fixture = try AdmissionFollowupFixture.init("nested-publication-fences", 5000, .batch);
     defer fixture.deinit();
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    var stage: []const u8 = "capture";
+    errdefer std.debug.print("nested admission fixture failed stage={s}\n", .{stage});
     const owner = fixture.connection.owner;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8316,6 +8336,11 @@ test "capi native maintenance nested admission preserves index and outcome fence
         .source_read = null,
         .relational_rows = false,
     };
+    var scopes = [_]PreparedPublication.IndexScope{
+        .{ .name = "nested", .domain = "unused/nested", .identity = null, .isolated_reads = true },
+        .{ .name = "other", .domain = "unused/other", .identity = null, .isolated_reads = true },
+    };
+    publication.index_scopes = &scopes;
     root.maintenance_owner = owner;
     root.maintenance_publication = &publication;
     defer {
@@ -8326,13 +8351,37 @@ test "capi native maintenance nested admission preserves index and outcome fence
     // must fail closed; the valid nesting exercise below supplies a real one.
     try std.testing.expectError(error.EnrichmentWaitCanceled, Owner.enterMaintenanceWriter(root, .primary));
     try std.testing.expectEqual(@as(usize, 0), root.maintenance_writer_references);
+    try std.testing.expect(publication.index_inputs_changed);
     publication.catalog = &catalog;
+    // A real refused publication is discarded. Reinitialize this fixture's
+    // frame with its actual proof before exercising valid nested reads.
+    publication.index_inputs_changed = false;
+    {
+        stage = "narrow parent";
+        try Owner.enterMaintenanceWriterForIndex(root, .index, .{ .named = "nested" });
+        defer Owner.leaveMaintenanceWriter(root);
+        stage = "narrow read";
+        try Owner.enterMaintenanceIndexRead(root, "unused/nested/record");
+        Owner.leaveMaintenanceWriter(root);
+        try std.testing.expectEqual(@as(?usize, 0), publication.admitted_index_scope);
+        try std.testing.expectError(error.EnrichmentWaitCanceled, Owner.enterMaintenanceIndexRead(root, "unused/other/record"));
+        try std.testing.expectError(error.EnrichmentWaitCanceled, Owner.enterMaintenanceIndexRead(root, "unknown/record"));
+        try std.testing.expectEqual(@as(usize, 1), root.maintenance_writer_references);
+    }
     const hold_before = owner.publication_stats.publication_hold_ns;
     const site_before = owner.publication_stats.maintenance_hold_sites.writer_primary.count;
+    stage = "broad parent";
     try Owner.enterMaintenanceWriter(root, .primary);
     var held = true;
     defer if (held) Owner.leaveMaintenanceWriter(root);
+    stage = "broad read";
+    try std.testing.expect(catalog.recovery_clean);
+    try Owner.enterMaintenanceIndexRead(root, "unused/nested/record");
+    try std.testing.expectEqual(@as(usize, 2), root.maintenance_writer_references);
+    Owner.leaveMaintenanceWriter(root);
+    try std.testing.expectEqual(@as(?usize, null), publication.admitted_index_scope);
     publication.index_inputs_changed = true;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, Owner.enterMaintenanceIndexRead(root, "unused/nested/record"));
     for ([_]PublicationScope{ .index, .index_read }) |scope|
         try std.testing.expectError(error.EnrichmentWaitCanceled, Owner.enterMaintenanceWriter(root, scope));
     try std.testing.expectEqual(@as(usize, 1), root.maintenance_writer_references);
