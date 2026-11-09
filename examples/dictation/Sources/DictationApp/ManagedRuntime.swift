@@ -160,7 +160,8 @@ import Security
             (response as? HTTPURLResponse)?.statusCode == 200, child.isRunning
           {
             ready = true
-            status = "Local engine ready. Discover models to check recognition and cleanup readiness."
+            status =
+              "Local engine ready. Discover models to check recognition and cleanup readiness."
             changed?()
             return
           }
@@ -377,12 +378,18 @@ func superviseManagedRuntime(arguments: [String]) -> Int32 {
   }
   let group = -child.processIdentifier
   if kill(group, SIGTERM) != 0, child.isRunning { child.terminate() }
-  for _ in 0..<100 {
-    if kill(group, 0) != 0 { break }
-    Thread.sleep(forTimeInterval: 0.1)
+  // Scheduler delays must not turn the ten-second grace period into an
+  // unbounded count of coalesced sleeps on a busy host.
+  let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+  while kill(group, 0) == 0 && ContinuousClock.now < deadline {
+    Thread.sleep(forTimeInterval: 0.05)
   }
   if kill(group, 0) == 0 { kill(group, SIGKILL) }
   child.waitUntilExit()
+  // Foundation can publish termination before its asynchronous child reaper
+  // finishes. Reap our direct child synchronously, or accept ECHILD if it won.
+  var waitStatus: Int32 = 0
+  while waitpid(child.processIdentifier, &waitStatus, 0) < 0 && errno == EINTR {}
   output.fileHandleForReading.readabilityHandler = nil
   return child.terminationStatus
 }

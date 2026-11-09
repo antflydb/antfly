@@ -666,3 +666,68 @@ lifecycle decision.
 
 Package registries are immutable. If an RC publish reaches npm or PyPI, the same
 version cannot be republished after recreating the tag; cut the next RC instead.
+
+
+## CI transfer storage
+
+R2 remains the durable Antfly release store and channel journal. Promotion jobs
+restore the exact ledger-selected runtime, CLI, or full payload directly from
+its sealed R2 version prefix. They do not upload another full promotion payload,
+runtime subset, or CLI snapshot to Actions. The small ledger and Homebrew formula
+remain Actions handoffs. Restores verify the ledger digest, tag, source commit,
+mirror member set, and each selected file's digest and size. If recovery uses
+GitHub Releases, prepare repairs the immutable R2 mirror from the fully verified
+payload before releasing downstream jobs. Existing conflicting objects fail
+closed; repair never advances a channel alias.
+
+Temporary CLI and Zig-source snapshots and VOPR data use the private
+`antfly-image-artifacts-ci-artifacts` GCS exchange when repository variable
+`CI_ARTIFACT_GCS=true`. GitHub retains a small receipt with producer repository,
+run ID, artifact name, and exact file digests. Consumers validate that identity,
+reject path traversal/collisions, and verify downloaded bytes. Identical files
+share create-only SHA-256 objects within a fourteen-day namespace window.
+Separate release/VOPR service accounts can only read/create their own object
+prefix; neither receives R2 or registry authority. PR VOPR access still requires
+the existing default-branch admission controller. The existing Cloud Build/GAR
+builder federation must also be restricted to trusted publishers before enabling
+source-job OIDC, so staging tokens cannot switch providers to gain publish
+access. Apply and verify that companion IAM change before merging these
+workflows: declaring OIDC permission takes effect even while GCS uploads are
+disabled. GitHub cache writes remain
+restricted by `cache-mode: read` in approved PR runs.
+
+Receipts and ordinary intermediate artifacts expire after fourteen days. Existing
+VOPR replay windows stay at ninety days. GCS short objects expire at thirty days,
+and all objects expire within 120 days, including paths outside known tiers.
+Both tiers include headroom for reuse near the end of
+a fourteen-day namespace window. Native release archives remain Actions handoffs because embedded registry
+preflight deliberately has no OIDC permission: fourteen days for RC/nightly,
+ninety for stable registry retries. Small release identity/ledger records also
+retain ninety days. Embedded publishers verify and consume the original package snapshot
+without uploading another verified copy. Stable embedded registry snapshots
+retain their ninety-day publication/retry window. RC/nightly packaging checks
+still run but do not upload an unused embedded registry snapshot. Historical
+Actions-only inputs remain readable. Published release retention and R2 GC policy are unchanged.
+
+The exchange is provisioned by Colony's `colony-infra-ci` stack. Apply its reviewed
+bucket/WIF/IAM preview before enabling `CI_ARTIFACT_GCS`. Until enabled, upload
+steps retain their original bytes in Actions with explicit retention. Enable the
+variable when no build or VOPR matrix is active; a mixed legacy/receipt matrix
+fails closed. Keep the exchange provisioned while receipts remain live, including
+when disabling new GCS uploads. Approval delays beyond the intermediate retention
+window require rebuilding unpublished inputs or using exact-ledger R2 recovery
+for sealed releases. Never delete active producer inputs during cleanup.
+
+
+After infrastructure approval/apply and enabling the variable during an idle
+window, verify actual federation and object exchange with small probes before
+starting release builds:
+
+```sh
+gh workflow run ci-artifact-exchange-check.yml --ref main
+gh workflow run zig-vopr-soak.yml --ref main -f artifact_probe=true
+```
+
+These probes upload the same small fixture twice and restore it through its
+receipt. They do not compile Antfly, run a campaign, publish a release, or write
+to R2. Both probes must succeed before using the enabled exchange normally.

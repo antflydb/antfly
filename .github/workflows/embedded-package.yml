@@ -3,6 +3,10 @@ name: Package Apache Embedded
 on:
   workflow_call:
     inputs:
+      retain_snapshot:
+        description: Keep registry inputs for stable publication and retries
+        type: boolean
+        default: true
       version:
         required: true
         type: string
@@ -113,7 +117,9 @@ jobs:
             --commit "${{ inputs.source_commit }}"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: inputs.retain_snapshot
         with:
+          retention-days: 90
           name: antfly-embedded-package-snapshot
           path: dist/embedded-snapshot/
           if-no-files-found: error
