@@ -656,6 +656,7 @@ pub const storage_resource_manager = @import("storage/resource_manager.zig");
 pub const storage_restore_decoder_cache = @import("storage/restore_decoder_cache.zig");
 pub const storage_retained_effects = @import("storage/retained_effects.zig");
 pub const storage_retained_frame = @import("storage/retained_frame.zig");
+pub const storage_verified_retained_frame = @import("storage/verified_retained_frame.zig");
 pub const storage_rewrite_program_cache = @import("storage/rewrite_program_cache.zig");
 pub const storage_rewrite_tail_spool = @import("storage/rewrite_tail_spool.zig");
 pub const storage_row_identity = @import("storage/row_identity.zig");

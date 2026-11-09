@@ -7669,6 +7669,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.prepared_score_plan.",
             "storage.projection_seal.",
             "storage.retained_frame.",
+            "storage.verified_retained_frame.",
             "storage.admission_waiter.",
             "storage.dense_work_admission.",
             "storage.maintenance_signal.",

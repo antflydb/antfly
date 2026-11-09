@@ -577,6 +577,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_source_proof_batch;
     _ = @import("antfly_local_sources").storage_projection_seal;
     _ = @import("antfly_local_sources").storage_retained_frame;
+    _ = @import("antfly_local_sources").storage_verified_retained_frame;
     _ = @import("antfly_local_sources").storage_db_native_query_cut;
     _ = @import("antfly_local_sources").storage_db_native_query_cut_contract;
     _ = @import("antfly_local_sources").storage_db_native_query_remote_storage;
