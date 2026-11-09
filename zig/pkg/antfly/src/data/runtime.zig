@@ -34526,6 +34526,17 @@ fn consumerTests() type {
             req.merge_page.?.document_version_floor = 0;
             req.merge_page.?.digest = @import("antfly_local_sources").storage_db_merge_page_contract.commandDigest(req);
             try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+            req = .{ .restore_staging = .{ .import_page = .{
+                .expected = @splat(1),
+                .next = "progress",
+                .scope = @splat(2),
+                .timestamps = &.{},
+                .document_timestamps = .{ .version_floor = 0 },
+            } } };
+            // Even an empty source must explicitly preserve timestamp absence.
+            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+            req.restore_staging.?.import_page.document_timestamps = null;
+            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
         }
 
         test "time series optional revision upgrade preserves a mixed group's mandatory protocol floor" {

@@ -9000,6 +9000,9 @@ pub const DB = struct {
                         (!page.artifact_page and !page.projection_page and !page.source_generation_proof_page and page.artifacts.len != 0)) return error.InvalidRestoreStagingCommand;
                     var timestamps: std.StringHashMapUnmanaged(u64) = .empty;
                     defer timestamps.deinit(self.alloc);
+                    var ttl_sources: std.StringHashMapUnmanaged(i128) = .empty;
+                    defer ttl_sources.deinit(self.alloc);
+                    if (page.document_timestamps != null and (relationalColumns(self) != null or page.artifact_page or page.projection_page or page.source_generation_proof_page)) return error.InvalidRestoreStagingCommand;
                     var input_bytes: usize = 0;
                     var previous_artifact: ?[]const u8 = null;
                     for (page.artifacts) |artifact| {
@@ -9025,7 +9028,12 @@ pub const DB = struct {
                         if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
                     }
                     for (page.timestamps, req.writes) |timestamp, row| {
-                        if (timestamp.timestamp == 0 or !std.mem.eql(u8, timestamp.key, row.key)) return error.InvalidRestoreStagingCommand;
+                        if (!std.mem.eql(u8, timestamp.key, row.key)) return error.InvalidRestoreStagingCommand;
+                        if (page.document_timestamps != null) {
+                            if (timestamp.ttl_source_ns) |source| {
+                                try ttl_sources.put(self.alloc, timestamp.key, source);
+                            } else if (timestamp.timestamp != 0) return error.InvalidRestoreStagingCommand;
+                        } else if (timestamp.timestamp == 0 or timestamp.ttl_source_ns != null) return error.InvalidRestoreStagingCommand;
                         input_bytes = std.math.add(usize, input_bytes, row.key.len +| row.value.len) catch return error.TransactionTooLarge;
                         if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
                         const entry = try timestamps.getOrPut(self.alloc, timestamp.key);
@@ -9046,6 +9054,8 @@ pub const DB = struct {
                     apply_opts.wait_for_sync_level = !page.artifact_page and !page.source_generation_proof_page;
                     apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects, .artifact_page = page.artifact_page, .projection_page = page.projection_page, .source_generation_proof_page = page.source_generation_proof_page };
                     apply_opts.restore_timestamps = &timestamps;
+                    apply_opts.restore_ttl_sources = if (page.document_timestamps != null) &ttl_sources else null;
+                    apply_opts.restore_document_version_floor = if (page.document_timestamps) |metadata| metadata.version_floor else 0;
                     apply_opts.restore_replication_request = req;
                     apply_opts.restore_artifacts = page.artifacts;
                     const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1 + @intFromBool(page.artifacts.len != 0 and !page.source_generation_proof_page));
@@ -40283,6 +40293,18 @@ pub const DB = struct {
         };
         var writes: std.ArrayList(types.BatchWrite) = .empty;
         var timestamps: std.ArrayList(staging.Timestamp) = .empty;
+        const document_timestamps = relationalColumns(source) == null;
+        var version_floor: u64 = 0;
+        if (document_timestamps) {
+            const watermark = source.core.store.get(owned, ttl_mod.document_version_watermark_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (watermark) |bytes| {
+                if (bytes.len != 8) return error.InvalidTimestamp;
+                version_floor = std.mem.readInt(u64, bytes[0..8], .little);
+            }
+        }
         var historical: ?schema_registry_mod.SchemaView = null;
         defer if (historical) |*view| view.release();
         var bytes: usize = 0;
@@ -40314,6 +40336,7 @@ pub const DB = struct {
             };
             if (!self.core.byteRange().contains(document_key)) return error.RestoreStagingScopeChanged;
             var timestamp: u64 = 0;
+            var ttl_source_ns: ?i128 = null;
             var json_null_fields: []const []const u8 = &.{};
             const json = if (internal_keys.isRelationalRowKey(row.key)) logical: {
                 if (program) |rewrite| {
@@ -40333,7 +40356,17 @@ pub const DB = struct {
                 json_null_fields = try typed.jsonNullFieldsAlloc(owned);
                 break :logical try typed.reconstructValueAlloc(owned);
             } else logical: {
-                timestamp = try source.getTimestamp(owned, document_key);
+                const timestamp_key = try internal_keys.ttlKeyAlloc(owned, document_key);
+                const timestamp_raw = source.core.store.get(owned, timestamp_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (timestamp_raw) |timestamp_bytes| {
+                    const metadata = ttl_mod.decodeTimestamp(timestamp_bytes) orelse return error.InvalidTimestamp;
+                    timestamp = metadata.version;
+                    ttl_source_ns = metadata.source;
+                    version_floor = @max(version_floor, timestamp);
+                }
                 if (program) |rewrite| break :logical try rewrite.preserveDocument(owned, row.value);
                 break :logical try owned.dupe(u8, row.value);
             };
@@ -40346,7 +40379,7 @@ pub const DB = struct {
             // not treated as new API input that fills today's defaults or
             // recomputes (and thereby repairs) stored generated results.
             try writes.append(owned, .{ .key = document_key, .value = json, .json_null_fields = json_null_fields });
-            try timestamps.append(owned, .{ .key = document_key, .timestamp = timestamp });
+            try timestamps.append(owned, .{ .key = document_key, .timestamp = timestamp, .ttl_source_ns = ttl_source_ns });
             var hash = std.crypto.hash.Blake3.init(.{});
             hash.update(&next.logical_digest);
             var length: [8]u8 = undefined;
@@ -40370,7 +40403,7 @@ pub const DB = struct {
         }
         next.cursor = try owned.dupe(u8, next.cursor);
         const encoded = try next.encode(owned);
-        const page: staging.ImportPage = .{ .expected = staging.digest(raw), .next = encoded, .scope = scope.digest(), .timestamps = timestamps.items };
+        const page: staging.ImportPage = .{ .expected = staging.digest(raw), .next = encoded, .scope = scope.digest(), .timestamps = timestamps.items, .document_timestamps = if (document_timestamps) .{ .version_floor = version_floor } else null };
         return .{
             .arena = arena,
             .phase = next.phase,
@@ -149830,4 +149863,142 @@ test "time series pinned Cypher uses signed source for visibility and revision f
             if (row) |value| try std.testing.expectEqual(@as(u64, if (i == 0) 100 else 200), value.version);
         }
     }
+}
+
+test "time series graph TTL reconstructs revision lifetimes and validates before mutation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("series-graph-ttl-source");
+    defer directory.cleanup();
+    const options: OpenOptions = .{ .start_index_workers = false, .start_optional_runtimes = false };
+    var db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+    const admitted = currentTimeNs();
+    try db.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = admitted, .writes = &.{.{ .key = "a", .value = "{\"at\":\"1969-12-31T23:59:59Z\",\"ref\":[\"b\",\"c\"]}" }} });
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"},\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}]}" });
+    const writes = [_]types.GraphEdgeWrite{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "link", .ttl_created_ns = admitted }};
+    try db.core.index_manager.applyGraphWrites(&writes);
+    db.close();
+    db = try DB.open(a, directory.path(), options);
+    try db.core.index_manager.applyGraphWrites(&writes);
+    const graph = db.core.index_manager.graphIndex("g").?;
+    const limits: graph_mod.EdgePageLimits = .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 };
+    {
+        var edges = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + 1);
+        defer edges.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), edges.edges.len);
+        try std.testing.expect(edges.edges[0].field_derived);
+    }
+    const timestamp_key = try internal_keys.ttlKeyAlloc(a, "a");
+    defer a.free(timestamp_key);
+    const original = try db.core.store.get(a, timestamp_key);
+    defer a.free(original);
+    try db.core.store.put(timestamp_key, "invalid");
+    try std.testing.expectError(error.GraphEdgeTtlMigrationRequired, db.core.index_manager.applyGraphWrites(&.{.{ .index_name = "g", .source = "a", .target = "c", .edge_type = "link", .ttl_created_ns = admitted }}));
+    {
+        var edges = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + 1);
+        defer edges.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), edges.edges.len);
+        try std.testing.expectEqualStrings("b", edges.edges[0].target);
+    }
+    try db.core.store.put(timestamp_key, original);
+    try db.core.index_manager.applyGraphWrites(&.{.{ .index_name = "g", .source = "a", .target = "c", .edge_type = "link", .ttl_created_ns = admitted }});
+    var live = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + std.time.ns_per_hour - 1);
+    defer live.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), live.edges.len);
+    var expired = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, limits, admitted + std.time.ns_per_hour);
+    defer expired.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), expired.edges.len);
+}
+
+test "time series staged restore preserves timestamp presence sources and deleted revision floor" {
+    const a = std.testing.allocator;
+    const staging = @import("restore_staging.zig");
+    const wire = @import("../../api/batch_internal.zig");
+    const adapter = @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter;
+    var source_dir = try TestDirectory.init("series-staging-source");
+    defer source_dir.cleanup();
+    var target_dir = try TestDirectory.init("series-staging-target");
+    defer target_dir.cleanup();
+    const source_options: OpenOptions = .{ .identity_namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 }, .start_index_workers = false, .start_optional_runtimes = false };
+    const target_options: OpenOptions = .{ .identity_namespace = .{ .table_id = 20, .shard_id = 21, .range_id = 21 }, .start_index_workers = false, .start_optional_runtimes = false };
+    var source = try DB.open(a, source_dir.path(), source_options);
+    defer source.close();
+    var target = try DB.open(a, target_dir.path(), target_options);
+    defer target.close();
+    const schema: schema_mod.TableSchema = .{ .version = 1, .ttl_field = "at", .ttl_duration_ns = 40_000 * std.time.ns_per_day };
+    try source.setSchema(schema);
+    try target.setSchema(schema);
+    for (0..2) |_| try source.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "fallback", .value = "{}" }} });
+    try source.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{
+        .{ .key = "historical", .value = "{\"at\":\"1969-12-31T23:59:59Z\"}" },
+        .{ .key = "epoch", .value = "{\"at\":\"1970-01-01T00:00:00Z\"}" },
+        .{ .key = "wide", .value = "{\"at\":\"9999-12-31T23:59:59.999999999Z\"}" },
+        .{ .key = "missing", .value = "{}" },
+        .{ .key = "legacy_epoch", .value = "{}" },
+    } });
+    try source.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 400, .writes = &.{.{ .key = "legacy", .value = "{}" }} });
+    try source.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 10_000, .writes = &.{.{ .key = "deleted", .value = "{}" }} });
+    try source.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 10_000, .deletes = &.{"deleted"} });
+    for ([_][]const u8{ "missing", "legacy_epoch" }) |key| {
+        const timestamp_key = try internal_keys.ttlKeyAlloc(a, key);
+        defer a.free(timestamp_key);
+        if (std.mem.eql(u8, key, "missing")) try source.core.store.delete(timestamp_key) else try source.core.store.put(timestamp_key, &@as([8]u8, @splat(0)));
+    }
+    const cases = [_]struct { key: []const u8, version: u64, source: ?i128 }{
+        .{ .key = "fallback", .version = 101, .source = 100 },
+        .{ .key = "historical", .version = 102, .source = -std.time.ns_per_s },
+        .{ .key = "epoch", .version = 102, .source = 0 },
+        .{ .key = "wide", .version = 102, .source = 253402300799999999999 },
+        .{ .key = "legacy", .version = 400, .source = 400 },
+        .{ .key = "legacy_epoch", .version = 0, .source = 0 },
+        .{ .key = "missing", .version = 0, .source = null },
+    };
+    source.close();
+    var readonly = source_options;
+    readonly.open_mode = .query_readonly;
+    source = try DB.open(a, source_dir.path(), readonly);
+    const serialized = try schema_mod.serializeSchema(a, target.core.schema orelse .{});
+    defer a.free(serialized);
+    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = source_options.identity_namespace.?, .target_namespace = target_options.identity_namespace.?, .target_schema_digest = staging.digest(serialized) };
+    try target.reserveRestoreStaging(a, scope.plan_id, scope.plan_digest, scope.target_namespace);
+    try target.beginRestoreStaging(a, scope);
+    var index: u64 = 0;
+    for (0..20) |_| {
+        var page = try target.prepareRestoreStagingPage(a, scope, &source, 1, .none);
+        defer page.deinit();
+        if (page.batch) |request| {
+            const encoded = try wire.encodeBatchRequest(a, request);
+            defer a.free(encoded);
+            var decoded = try wire.parseInternalBatchRequest(a, encoded);
+            defer decoded.deinit(a);
+            try std.testing.expect(wire.requiresDocumentVersionsEnvelope(decoded.req));
+            // Missing source with a nonzero version is malformed, not a request
+            // to silently recompute retention under the receiver's schema.
+            if (request.writes.len != 0 and request.restore_staging.?.import_page.timestamps[0].timestamp != 0) {
+                var invalid = decoded.req;
+                var timestamp = invalid.restore_staging.?.import_page.timestamps[0];
+                timestamp.ttl_source_ns = null;
+                invalid.restore_staging.?.import_page.timestamps = &.{timestamp};
+                try std.testing.expectError(error.InvalidRestoreStagingCommand, target.batch(invalid));
+            }
+            index += 1;
+            try adapter.applyOrdered(&target, decoded.req, .{ .term = 1, .index = index });
+            try adapter.applyOrdered(&target, decoded.req, .{ .term = 1, .index = index });
+        }
+        target.close();
+        target = try DB.open(a, target_dir.path(), target_options);
+        if (page.phase == .imported) break;
+    } else return error.TestUnexpectedResult;
+    for (cases) |case| {
+        try std.testing.expectEqual(case.version, try target.getTimestamp(a, case.key));
+        try std.testing.expectEqual(case.source, try ttl_mod.readSourceTimestamp(target.core.store, a, case.key));
+    }
+    const floor = try target.core.store.get(a, ttl_mod.document_version_watermark_key);
+    defer a.free(floor);
+    try std.testing.expectEqual(@as(u64, 10_001), std.mem.readInt(u64, floor[0..8], .little));
+    try target.batch(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } });
+    try target.batch(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } } });
+    try target.batch(.{ .document_version_scheme = .revision_v1, .timestamp_ns = 0, .writes = &.{.{ .key = "deleted", .value = "{}" }} });
+    try std.testing.expectEqual(@as(u64, 10_002), try target.getTimestamp(a, "deleted"));
 }

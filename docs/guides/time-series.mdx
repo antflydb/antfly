@@ -286,6 +286,14 @@ immediately hidden when expired; sufficiently long retention can keep a pre-1970
 observation visible.
 Existing timestamp metadata remains readable without rewriting retained data.
 
+Staged restore and document-preserving rewrites retain the original TTL source,
+including when the configured TTL field is absent. They preserve the distinction
+between an epoch timestamp and missing timestamp metadata, and carry the durable
+revision floor even when its latest document was deleted. Replay does not derive
+retention from the restored write version. These pages require revision-capable
+replicas before proposal. Graph edge TTL continues to use its own unsigned
+admission lifetime, independently of the document's signed event time.
+
 Table TTL expires raw observations and removes their contributions from exact
 aggregate indexes. These indexes are rebuildable accelerators over retained raw
 data. They do **not** preserve historical summaries after source expiration.

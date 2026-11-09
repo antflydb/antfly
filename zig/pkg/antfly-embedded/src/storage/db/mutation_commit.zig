@@ -1406,7 +1406,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Live rows alone cannot preserve the history of absent keys.
             // Max-merge the certified source floor with restored versions and
             // local admission, in the same transaction as the page receipt.
-            var incoming_floor: u64 = if (effective_req.merge_page) |page| page.document_version_floor else 0;
+            var incoming_floor: u64 = @max(opts.restore_document_version_floor, if (effective_req.merge_page) |page| page.document_version_floor else 0);
             // An unversioned legacy apply must not introduce new allocator
             // state on only the upgraded replicas of a rolling deployment.
             // Copy senders carry an explicit protected floor; local/current

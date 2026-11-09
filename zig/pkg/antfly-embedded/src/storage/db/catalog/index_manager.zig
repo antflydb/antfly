@@ -29342,18 +29342,14 @@ pub const IndexManager = struct {
             });
         }
 
-        // Ordinary replay can temporarily withdraw an owner in an older
-        // window before replaying its latest artifacts. A producer must refresh
-        // again rather than treating that intermediate sidecar as current.
-        if (batch_writes.items.len > 0 or batch_deletes.items.len > 0)
-            entry.invalidateNeighborSource();
-        try entry.index.batchApply(batch_writes.items, batch_deletes.items);
+        // Decode and validate authoritative contributions before changing the
+        // graph. A malformed timestamp must not leave a partially applied edge.
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
         if (entry.ttl_duration_ns != 0 or graphEntryHasContributors(entry)) {
             const primary = self.primary_store orelse return error.MissingPrimaryStore;
-            var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
             var field_cache: GraphFieldSnapshotCache = .{};
             for (batch_writes.items) |write| {
                 try self.appendGraphContributionSnapshot(arena, &field_cache, primary, entry, write.source, write.edge_type, write.target, write.owner, write.edge_id, write.owner_document, &snapshots);
@@ -29373,8 +29369,14 @@ pub const IndexManager = struct {
                     try self.appendGraphContributionSnapshot(arena, &field_cache, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, delete.edge_id, delete.owner_document, &snapshots);
                 }
             }
-            try entry.index.replaceContributionSnapshots(snapshots.items);
         }
+        // Ordinary replay can temporarily withdraw an owner in an older
+        // window before replaying its latest artifacts. A producer must refresh
+        // again rather than treating that intermediate sidecar as current.
+        if (batch_writes.items.len > 0 or batch_deletes.items.len > 0)
+            entry.invalidateNeighborSource();
+        try entry.index.batchApply(batch_writes.items, batch_deletes.items);
+        if (snapshots.items.len != 0) try entry.index.replaceContributionSnapshots(snapshots.items);
     }
 
     const GraphFieldSnapshot = struct {
@@ -29419,8 +29421,12 @@ pub const IndexManager = struct {
         if (entry.ttl_duration_ns != 0 and result.value_ptr.targets.count() != 0) {
             const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, source);
             const timestamp = primary.get(alloc, timestamp_key) catch |err| if (err == error.NotFound) return error.GraphEdgeTtlMigrationRequired else return err;
-            if (timestamp.len != 8) return error.GraphEdgeTtlMigrationRequired;
-            result.value_ptr.ttl_created_ns = std.mem.readInt(u64, timestamp[0..8], .little);
+            const metadata = @import("../../ttl.zig").decodeTimestamp(timestamp) orelse return error.GraphEdgeTtlMigrationRequired;
+            // Edge TTL is an unsigned admission lifetime, independent of the
+            // document's possibly negative event-time TTL source. Field-only
+            // legacy rows have no edge artifact, so retain their revision seed.
+            if (metadata.version == 0) return error.GraphEdgeTtlMigrationRequired;
+            result.value_ptr.ttl_created_ns = metadata.version;
         }
         return result.value_ptr;
     }

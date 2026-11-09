@@ -1714,6 +1714,13 @@ pub fn requiresDocumentVersionsEnvelope(req: db_mod.types.BatchRequest) bool {
     if (req.document_version_scheme == .revision_v1) return true;
     if (req.online_source) |command| if (command == .admit and command.admit.ttl_sources) return true;
     if (req.merge_page) |page| if (page.document_version_floor != 0 or page.ttl_sources.len != 0 or (if (page.chunk) |chunk| chunk.ttl_source != null else false)) return true;
+    if (req.restore_staging) |control| switch (control) {
+        .import_page, .rewrite_page => |page| {
+            if (page.document_timestamps != null) return true;
+            for (page.timestamps) |timestamp| if (timestamp.ttl_source_ns != null) return true;
+        },
+        else => {},
+    };
     return false;
 }
 
@@ -3530,4 +3537,39 @@ test "time series merge revision floor requires versioned wire and authenticates
     const legacy = try encodeBatchRequest(a, req);
     defer a.free(legacy);
     try std.testing.expect(std.mem.indexOf(u8, legacy, "document_version_floor") == null);
+}
+
+test "time series staged timestamp wire protects exact sources and retains legacy commands" {
+    const a = std.testing.allocator;
+    const staging = @import("../storage/db/restore_staging_contract.zig");
+    const timestamps = [_]staging.Timestamp{
+        .{ .key = "historical", .timestamp = 9007199254740993, .ttl_source_ns = -1 },
+        .{ .key = "wide", .timestamp = 9007199254740993, .ttl_source_ns = 253402300799999999999 },
+        .{ .key = "epoch", .timestamp = 0, .ttl_source_ns = 0 },
+        .{ .key = "missing", .timestamp = 0 },
+    };
+    for ([_]bool{ false, true }) |rewrite| {
+        const page: staging.ImportPage = .{ .expected = @splat(1), .next = "progress", .scope = @splat(2), .timestamps = &timestamps, .document_timestamps = .{ .version_floor = 9007199254740995 } };
+        const req: db_mod.types.BatchRequest = .{ .restore_staging = if (rewrite) .{ .rewrite_page = page } else .{ .import_page = page } };
+        try std.testing.expect(requiresDocumentVersionsEnvelope(req));
+        const wire = try encodeBatchRequest(a, req);
+        defer a.free(wire);
+        try std.testing.expect(std.mem.startsWith(u8, wire, "[\"document-revisions-batch-v1\","));
+        var parsed = try parseInternalBatchRequest(a, wire);
+        defer parsed.deinit(a);
+        const decoded = if (rewrite) parsed.req.restore_staging.?.rewrite_page else parsed.req.restore_staging.?.import_page;
+        try std.testing.expectEqualDeep(page, decoded);
+        // Removing the mandatory envelope must never downgrade these effects.
+        const unwrapped = wire["[\"document-revisions-batch-v1\",".len .. wire.len - 1];
+        try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, unwrapped));
+    }
+    const legacy: db_mod.types.BatchRequest = .{ .restore_staging = .{ .import_page = .{ .expected = @splat(1), .next = "progress", .scope = @splat(2), .timestamps = &.{.{ .key = "a", .timestamp = 1 }} } } };
+    try std.testing.expect(!requiresDocumentVersionsEnvelope(legacy));
+    const wire = try encodeBatchRequest(a, legacy);
+    defer a.free(wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "document_timestamps") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "ttl_source_ns") == null);
+    var parsed = try parseInternalBatchRequest(a, wire);
+    defer parsed.deinit(a);
+    try std.testing.expectEqualDeep(legacy.restore_staging, parsed.req.restore_staging);
 }

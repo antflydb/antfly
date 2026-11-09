@@ -1049,6 +1049,7 @@ pub const BatchExecutionOptions = struct {
     restore_artifacts: []const @import("restore_staging.zig").Artifact = &.{},
     restore_timestamps: ?*const std.StringHashMapUnmanaged(u64) = null,
     restore_ttl_sources: ?*const std.StringHashMapUnmanaged(i128) = null,
+    restore_document_version_floor: u64 = 0,
     preserve_logical_values: bool = false,
     restore_replication_request: ?types.BatchRequest = null,
     /// Borrowed upload identity. Finalization retires staged bytes in the
