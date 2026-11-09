@@ -1951,14 +1951,23 @@ jobs:
       ${{ always() && !cancelled() && needs.admission.result == 'success' &&
       (inputs.pr_number == '' || github.run_attempt == 1) &&
       (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
-    name: embedded-sdk-native / ${{ matrix.sdk }}
+    name: embedded-sdk-native / ${{ matrix.sdk }}${{ matrix.python_shard && format(' / {0}', matrix.python_shard) || '' }}
     needs: [admission, e2e-base-build, e2e-full-build]
     runs-on: arc-antfly-standard-runtime
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        sdk: [go, rust, python, typescript]
+        include:
+          - sdk: go
+          - sdk: rust
+          - sdk: typescript
+          - sdk: python
+            python_shard: core
+          - sdk: python
+            python_shard: cypher-0
+          - sdk: python
+            python_shard: cypher-1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2009,6 +2018,7 @@ jobs:
           package_json_file: ts/package.json
       - name: Test embedded SDK against the installed C ABI
         env:
+          ANTFLY_SDK_PYTHON_SHARD: ${{ matrix.python_shard }}
           ANTFLY_INFERENCE_MODELS_DIR: ${{ runner.temp }}/embedded-sdk-native-models
           ANTFLY_SDK_NATIVE_REPORT_DIR: ${{ runner.temp }}/embedded-sdk-native-reports
         run: scripts/ci/test-embedded-sdk-native.sh "${RUNNER_TEMP}/native-sdk" "${{ matrix.sdk }}"
@@ -2017,7 +2027,7 @@ jobs:
         if: always() && matrix.sdk == 'python'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: embedded-sdk-python-results-${{ github.run_attempt }}
+          name: embedded-sdk-python-${{ matrix.python_shard }}-results-${{ github.run_attempt }}
           path: ${{ runner.temp }}/embedded-sdk-native-reports
           if-no-files-found: ignore
           retention-days: 14

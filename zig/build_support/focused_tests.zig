@@ -40,7 +40,8 @@ pub fn aggregationModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
     const regex = module(b, "lib/regex/src/mod.zig", target, optimize);
     regex.addImport("antfly_fst", module(b, "lib/fst/src/mod.zig", target, optimize));
     regex.addImport("antfly_grapheme", module(b, "lib/tokenizer/src/grapheme.zig", target, optimize));
-    regex.addImport("antfly_capture_regex", module(b, "lib/regex/src/captures.zig", target, optimize));
+    const captures = module(b, "lib/regex/src/captures.zig", target, optimize);
+    regex.addImport("antfly_capture_regex", captures);
     regex.addImport("antfly_platform", platform);
     root.addImport("antfly_platform", platform);
     root.addImport("antfly_runtime_abi", runtime);
@@ -50,6 +51,9 @@ pub fn aggregationModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
     const cache_budget = module(b, "lib/runtime/src/cache_budget.zig", target, optimize);
     cache_budget.addImport("antfly_platform", platform);
     root.addImport("antfly_cache_budget", cache_budget);
+    const cypher = module(b, "lib/cypher/root.zig", target, optimize);
+    cypher.addImport("cypher_regex_capture", captures);
+    root.addImport("cypher", cypher);
     platform_build.addMacosSdkPaths(b, root, target);
     return root;
 }

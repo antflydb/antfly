@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -114,3 +115,32 @@ def pytest_runtest_logreport(report):
             event["failure"] = report.longreprtext[-65536:]
         with (root / "timings.jsonl").open("a") as output:
             output.write(json.dumps(event) + "\n")
+
+
+def native_test_partition(nodeid):
+    """Keep each physical-work family and every storage parameter together."""
+    module, _, test = nodeid.partition("::")
+    if Path(module).name != "test_cypher_performance.py":
+        return "core"
+    family = test.partition("[")[0]
+    return f"cypher-{hashlib.sha256(family.encode()).digest()[0] % 2}"
+
+
+def pytest_collection_modifyitems(config, items):
+    shard = os.environ.get("ANTFLY_SDK_PYTHON_SHARD", "")
+    if not shard:
+        return
+    if shard not in {"core", "cypher-0", "cypher-1"}:
+        raise pytest.UsageError(f"Unknown native Python shard: {shard}")
+    selected, deselected = [], []
+    for item in items:
+        (selected if native_test_partition(item.nodeid) == shard else deselected).append(item)
+    if not selected:
+        raise pytest.UsageError(f"Native Python shard {shard} selected no tests")
+    config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
+
+
+def pytest_collection_finish(session):
+    if root := _native_report_root():
+        (root / "collection.json").write_text(json.dumps([item.nodeid for item in session.items]) + "\n")
