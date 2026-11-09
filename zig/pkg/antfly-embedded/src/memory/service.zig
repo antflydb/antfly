@@ -267,7 +267,10 @@ pub const Service = struct {
             if (run.state.table_id != 0 and self.context.table_id != 0 and run.state.table_id != self.context.table_id) return error.MemorySpaceBindingChanged;
             if (run.state.space.len > 0 and self.context.space.len > 0 and (!eql(u8, run.state.space, self.context.space) or !eql(u8, run.state.database, self.context.database) or !eql(u8, run.state.namespace, self.context.namespace))) return error.MemorySpaceBindingChanged;
         }
-        if (action == .create) run.state.restates_ready = true;
+        if (action == .create) {
+            run.state.restates_ready = true;
+            run.state.utility_owner_ready = true;
+        }
         try run.prepareLineage(action, id);
         var fingerprint: []const u8 = "";
         var hash_version: u8 = 0;
@@ -2061,7 +2064,7 @@ const Run = struct {
             @field(owned, field) = try self.a.dupe(u8, value);
         };
         try self.resource_states.put(self.a, cache_key, .{ .reference = owned, .snapshot = snapshot, .epoch = self.inference_epoch });
-        if (self.metadata_read_budget != null) if (self.read_owner) |owner| {
+        if (self.read_owner) |owner| {
             try self.chargeRead(snapshot.json.len);
             // Final source fences retain hashes and routing metadata, never
             // the discarded source payload or pointers into scratch memory.
@@ -2080,7 +2083,7 @@ const Run = struct {
                 std.crypto.hash.sha2.Sha256.hash(snapshot.json, &payload_hash, .{});
                 try owner.scratch_resources.put(owner.a, identity, .{ .reference = routing, .snapshot = compact, .epoch = self.inference_epoch, .payload_hash = payload_hash });
             }
-        };
+        }
     }
     fn Captured(comptime handler: anytype) type {
         const Result = @typeInfo(@typeInfo(@TypeOf(handler)).@"fn".return_type.?).error_union.payload;
@@ -5995,7 +5998,46 @@ const Run = struct {
         try self.putOutcomeSignal(stored);
         // Reverse bindings let reads derive per-memory utility without
         // scanning every outcome. Reads recheck the outcome itself.
-        for (request.used_memory_ids) |id| try self.put(try outcomeUseKey(self.a, self.service.context.branch, id, request.id), OutcomeUse{ .outcome_id = request.id, .memory_id = id });
+        try self.indexOutcomeUses(stored);
+    }
+    fn indexOutcomeUses(self: *Run, stored: StoredOutcome) !void {
+        // Legacy branchless feedback belongs to main, matching the original
+        // reverse index. Keep the all-owner lane for administrative reads.
+        const branch = stored.branch orelse "";
+        for (stored.outcome.used_memory_ids) |id| {
+            const binding: OutcomeUse = .{ .outcome_id = stored.outcome.id, .memory_id = id };
+            try self.put(try outcomeUseKey(self.a, branch, id, stored.outcome.id), binding);
+            try self.put(try ownerOutcomeUseKey(self.a, branch, stored.owner, id, stored.outcome.id), binding);
+        }
+    }
+    fn migrateOutcomeUses(self: *Run) !void {
+        // This lane has its own durable cursor: new writes dual-index even if
+        // their keys sort before the cursor. Each quantum handles at most 16
+        // outcomes and 1,024 input bindings, with each outcome bounded by
+        // max_items inputs and max_text_bytes detail.
+        const page = try self.backendScan("outcome/", self.state.utility_owner_cursor, 16);
+        var bindings: usize = 0;
+        var position = self.state.utility_owner_cursor;
+        for (page.rows) |row| {
+            const stored = try parse(StoredOutcome, self.a, row.json);
+            if (stored.outcome.used_memory_ids.len > t.max_items) return error.MemoryCorruptState;
+            if (stored.outcome.used_memory_ids.len > 1024 - bindings) {
+                self.state.utility_owner_cursor = position;
+                return;
+            }
+            bindings += stored.outcome.used_memory_ids.len;
+            try self.putOutcomeSignal(stored);
+            try self.indexOutcomeUses(stored);
+            position = row.key;
+        }
+        self.state.utility_owner_cursor = page.next;
+        self.state.utility_owner_ready = page.next == null;
+        if (self.state.utility_owner_ready) {
+            // Migration can encounter retired outcomes; reads fence them
+            // immediately, and the ordinary cleanup lane removes both indexes.
+            try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
+            self.state.feedback_revision = try std.math.add(u64, self.state.feedback_revision, 1);
+        }
     }
     fn advance(self: *Run, id: []const u8, receipt: *t.Operation) !void {
         if (id.len == 0) return self.maintenance();
@@ -6518,6 +6560,9 @@ const Run = struct {
             if (self.state.restates_ready) try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
             return;
         }
+        // Backfill shares the retention quantum with ordinary expiry/resource
+        // work; a large feedback history must not postpone physical cleanup.
+        if (!self.state.utility_owner_ready) try self.migrateOutcomeUses();
         const kind = try @import("scheduling.zig").maintenanceKind(self.service.backend, self.a, self.service.context.now_ms, self.state);
         if (kind == .recall) return self.recallMaintenance();
         if (kind != .retention) {
@@ -6842,7 +6887,7 @@ const Run = struct {
             const serving = self.state.config.features.semantic_recall and projection.generation == self.state.config.embedding_generation;
             const staging = if (self.state.pending_config) |pending| projection.generation == pending.embedding_generation else false;
             if ((!serving and !staging) or record == null or !try self.retained(record.?, 0)) try self.remove(row.key);
-        } else if (std.mem.startsWith(u8, row.key, "outcome-use/")) {
+        } else if (std.mem.startsWith(u8, row.key, "outcome-use/") or std.mem.startsWith(u8, row.key, "outcome-owner-use/")) {
             const binding = try parse(OutcomeUse, self.a, row.json);
             const stored = try self.read(StoredOutcome, try key(self.a, "outcome", binding.outcome_id));
             if (try self.read(bool, "forgotten-all") != null or stored == null or !try self.outcomeRetained(stored.?)) try self.remove(row.key);
@@ -7929,9 +7974,12 @@ const Run = struct {
             result.complete = false;
             return result;
         }
-        const prefix = try std.fmt.allocPrint(self.a, "outcome-use/{s}/{s}/", .{ try hash(self.a, self.service.context.branch), try hash(self.a, id) });
+        const prefix = if (self.service.context.admin)
+            try std.fmt.allocPrint(self.a, "outcome-use/{s}/{s}/", .{ try hash(self.a, self.service.context.branch), try hash(self.a, id) })
+        else
+            try std.fmt.allocPrint(self.a, "outcome-owner-use/{s}/{s}/{s}/", .{ try hash(self.a, self.service.context.branch), try hash(self.a, self.service.context.principal), try hash(self.a, id) });
         const page = try self.backendScan(prefix, null, t.max_utility_outcomes);
-        result.complete = page.next == null;
+        result.complete = page.next == null and self.state.utility_owner_ready;
         for (page.rows) |row| {
             try self.service.context.check();
             if (self.utility_exhausted or self.utility_bindings >= max_utility_bindings_per_request) {
@@ -7973,7 +8021,11 @@ const Run = struct {
         return result;
     }
     fn anyOutcomeUse(self: *Run) !bool {
-        const prefix = try std.fmt.allocPrint(self.a, "outcome-use/{s}/", .{try hash(self.a, self.service.context.branch)});
+        if (!self.state.utility_owner_ready) return true;
+        const prefix = if (self.service.context.admin)
+            try std.fmt.allocPrint(self.a, "outcome-use/{s}/", .{try hash(self.a, self.service.context.branch)})
+        else
+            try std.fmt.allocPrint(self.a, "outcome-owner-use/{s}/{s}/", .{ try hash(self.a, self.service.context.branch), try hash(self.a, self.service.context.principal) });
         return (try self.backendScan(prefix, null, 1)).rows.len > 0;
     }
     fn pinKey(self: *Run, id: []const u8) ![]const u8 {
@@ -8317,6 +8369,66 @@ const Run = struct {
             eql(u8, proposal.incoming.id, incoming.memory.assertion.id) and proposal.incoming.revision == incoming.memory.revision and eql(u8, proposal.incoming.fingerprint, incoming.fingerprint) and
             eql(u8, proposal.previous.id, previous.memory.assertion.id) and proposal.previous.revision == previous.memory.revision and eql(u8, proposal.previous.fingerprint, previous.fingerprint);
     }
+    fn consolidationProposalReusable(self: *Run, proposal: t.SupersessionProposal, incoming: t.ClaimView, previous: t.ClaimView) !bool {
+        if (!eql(u8, proposal.branch, self.service.context.branch) or !consolidationPinsMatch(proposal, incoming, previous)) return false;
+        if (try self.read(bool, try key(self.a, "forgotten-supersession-proposal", proposal.id)) != null or !try self.supersessionProposalRetained(proposal)) return false;
+        // An explicit ID is never sufficient proof of identity. Validate the
+        // frozen records as well as the current public views on every path.
+        for ([_]t.ClaimPin{ proposal.incoming, proposal.previous }) |pin| {
+            _ = self.pinnedClaim(pin, false, proposal.config_generation) catch |err| switch (err) {
+                error.MemoryNotFound, error.MemoryForgotten, error.MemoryRevisionConflict, error.MemoryResourceChanged => return false,
+                else => return err,
+            };
+        }
+        return true;
+    }
+    fn prepareConsolidationPair(self: *Run, seed_id: []const u8, peer_id: []const u8, operation: *t.Operation, seen: *ResourceSet) !?[]const u8 {
+        const seed = (try self.assertion(seed_id)) orelse return null;
+        if (seed.lifecycle != .active and seed.lifecycle != .disputed) return null;
+        const peer = (try self.consolidationPeer(seed, peer_id)) orelse return null;
+        const ordered = std.mem.lessThan(u8, seed.assertion.id, peer.assertion.id);
+        const left = if (ordered) seed else peer;
+        const right = if (ordered) peer else seed;
+        const left_view = try self.claimView(left);
+        const right_view = try self.claimView(right);
+        const reverse = try self.preferReplacement(right, left);
+        const incoming = if (reverse) right_view else left_view;
+        const previous = if (reverse) left_view else right_view;
+        const base_id = try hash(self.a, .{ "consolidation-proposal/v2", self.service.context.principal, self.service.context.branch, left.assertion.id, left_view.fingerprint, right.assertion.id, right_view.fingerprint, incoming.memory.assertion.id, self.state.config.generation });
+        if (seen.contains(base_id)) return null;
+        const owner = self.read_owner.?;
+        try seen.put(owner.a, try owner.a.dupe(u8, base_id), {});
+        const current_path = try std.fmt.allocPrint(self.a, "consolidation-current/{s}", .{try hash(self.a, .{ self.service.context.principal, self.service.context.branch, left.assertion.id, right.assertion.id })});
+        const current = try self.read(ConsolidationCurrent, current_path);
+        const prior_id = if (current) |value| value.proposal_id else try hash(self.a, .{ "consolidation-proposal/v1", self.service.context.principal, self.service.context.branch, left.assertion.id, left.revision, right.assertion.id, right.revision, self.state.config.generation });
+        if (try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", prior_id))) |prior| {
+            if (try self.consolidationProposalReusable(prior, incoming, previous)) {
+                if (current == null) try self.put(current_path, ConsolidationCurrent{ .proposal_id = prior.id });
+                return if (prior.verdict == null) prior.id else null;
+            }
+            // A colliding foreign ID must not mutate the other branch's index.
+            if (eql(u8, prior.branch, self.service.context.branch)) try self.remove(try self.supersessionOpenKey(prior.id));
+        }
+        var id = base_id;
+        // Explicit IDs share the proposal namespace. Resolve collisions with
+        // receipt-stable alternatives, checking branch, pins and fences each
+        // time. The bound prevents adversarial collision chains from spinning.
+        for (0..32) |attempt| {
+            const proposal = try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", id));
+            const forgotten = try self.read(bool, try key(self.a, "forgotten-supersession-proposal", id)) != null;
+            if (!forgotten and proposal != null and try self.consolidationProposalReusable(proposal.?, incoming, previous)) {
+                try self.put(current_path, ConsolidationCurrent{ .proposal_id = id });
+                return if (proposal.?.verdict == null) id else null;
+            }
+            if (!forgotten and proposal == null) {
+                try self.proposeSupersession(.{ .id = id, .expected_revision = self.state.revision - 1, .incoming = .{ .id = incoming.memory.assertion.id, .revision = incoming.memory.revision, .fingerprint = incoming.fingerprint }, .previous = .{ .id = previous.memory.assertion.id, .revision = previous.memory.revision, .fingerprint = previous.fingerprint } }, operation);
+                try self.put(current_path, ConsolidationCurrent{ .proposal_id = id });
+                return id;
+            }
+            id = if (attempt == 0) try hash(self.a, .{ "consolidation-attempt/v1", base_id, operation.id }) else try hash(self.a, .{ "consolidation-attempt/v2", base_id, operation.id, attempt });
+        }
+        return error.MemoryEntityConflict;
+    }
     fn prepareConsolidation(self: *Run, supplied: t.ConsolidationRequest, operation: *t.Operation) !void {
         var request = supplied;
         request.limit = @min(request.limit, 32);
@@ -8325,54 +8437,35 @@ const Run = struct {
         const report = try parse(t.Consolidation, self.a, try self.consolidate(request));
         var proposals: std.ArrayList([]const u8) = .empty;
         var seen: ResourceSet = .empty;
+        var scratch: std.heap.ArenaAllocator = .init(self.lexical_allocator);
+        defer scratch.deinit();
         for (report.findings) |finding| {
             if ((finding.kind != .duplicate and finding.kind != .dispute) or finding.memory_ids.len < 2) continue;
-            const seed = (try self.assertion(finding.memory_ids[0])) orelse continue;
-            if (seed.lifecycle != .active and seed.lifecycle != .disputed) continue;
-            // Review emits one eligible pair per finding, with cursor support
-            // inside wide disputes. Every reported pair fits this page's cap.
             for (finding.memory_ids[1..]) |peer_id| {
-                const peer = (try self.consolidationPeer(seed, peer_id)) orelse continue;
-                const ordered = std.mem.lessThan(u8, seed.assertion.id, peer.assertion.id);
-                const left = if (ordered) seed else peer;
-                const right = if (ordered) peer else seed;
-                const left_view = try self.claimView(left);
-                const right_view = try self.claimView(right);
-                const reverse = try self.preferReplacement(right, left);
-                const incoming = if (reverse) right_view else left_view;
-                const previous = if (reverse) left_view else right_view;
-                // Public views can change without claim revisions, e.g. when
-                // verification evidence is forgotten or source access changes.
-                var id = try hash(self.a, .{ "consolidation-proposal/v2", self.service.context.principal, self.service.context.branch, left.assertion.id, left_view.fingerprint, right.assertion.id, right_view.fingerprint, incoming.memory.assertion.id, self.state.config.generation });
-                if (seen.contains(id)) continue;
-                try seen.put(self.a, id, {});
-                const current_path = try std.fmt.allocPrint(self.a, "consolidation-current/{s}", .{try hash(self.a, .{ self.service.context.principal, self.service.context.branch, left.assertion.id, right.assertion.id })});
-                const current = try self.read(ConsolidationCurrent, current_path);
-                const prior_id = if (current) |value| value.proposal_id else try hash(self.a, .{ "consolidation-proposal/v1", self.service.context.principal, self.service.context.branch, left.assertion.id, left.revision, right.assertion.id, right.revision, self.state.config.generation });
-                if (try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", prior_id))) |prior| {
-                    // Reuse valid legacy pins and preserve already-reviewed
-                    // decisions. Migration never reopens unchanged work.
-                    if (consolidationPinsMatch(prior, incoming, previous) and try self.supersessionProposalRetained(prior)) {
-                        if (current == null) try self.put(current_path, ConsolidationCurrent{ .proposal_id = prior.id });
-                        if (prior.verdict == null) try proposals.append(self.a, prior.id);
-                        continue;
+                try self.service.context.check();
+                _ = scratch.reset(.retain_capacity);
+                var budget: MetadataReadBudget = .{};
+                var reader = self.scratchReader(scratch.allocator(), &budget);
+                // Unlike review projections, proposal pins require full claims.
+                // Keep decoded payloads only for this pair, sharing work budgets
+                // and compact final source fences with the parent request.
+                reader.metadata_read_budget = null;
+                reader.bindScratchIndex();
+                defer reader.finishScratch(self);
+                for (self.changes.items) |change| try reader.stageChange(change.key, change.json);
+                var receipt = operation.*;
+                const id = try reader.prepareConsolidationPair(finding.memory_ids[0], peer_id, &receipt, &seen);
+                // Only compact proposal/index writes escape scratch storage.
+                for (reader.changes.items) |change| {
+                    if (self.change_positions.get(change.key)) |position| {
+                        if (optionalEqual(self.changes.items[position].json, change.json)) continue;
                     }
-                    try self.remove(try self.supersessionOpenKey(prior.id));
+                    try self.stageChange(change.key, if (change.json) |json| try self.a.dupe(u8, json) else null);
                 }
-                var proposal = try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", id));
-                if ((proposal != null and !try self.supersessionProposalRetained(proposal.?)) or try self.read(bool, try key(self.a, "forgotten-supersession-proposal", id)) != null) {
-                    // A deferred review's extra provenance can retire while
-                    // its claim pins stay unchanged. Allocate one fresh,
-                    // receipt-stable attempt, preserving the forgotten fence.
-                    id = try hash(self.a, .{ "consolidation-attempt/v1", id, operation.id });
-                    proposal = try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", id));
-                }
-                if (proposal == null) {
-                    try self.proposeSupersession(.{ .id = id, .expected_revision = self.state.revision - 1, .incoming = .{ .id = incoming.memory.assertion.id, .revision = incoming.memory.revision, .fingerprint = incoming.fingerprint }, .previous = .{ .id = previous.memory.assertion.id, .revision = previous.memory.revision, .fingerprint = previous.fingerprint } }, operation);
-                    proposal = try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", id));
-                }
-                if (current == null or !eql(u8, current.?.proposal_id, id)) try self.put(current_path, ConsolidationCurrent{ .proposal_id = id });
-                if (proposal.?.verdict == null) try proposals.append(self.a, id);
+                if (receipt.proposal_id) |value| if (!optionalEqual(operation.proposal_id, value)) {
+                    operation.proposal_id = try self.a.dupe(u8, value);
+                };
+                if (id) |value| try proposals.append(self.a, try self.a.dupe(u8, value));
             }
         }
         operation.proposal_ids = proposals.items;
@@ -8773,9 +8866,11 @@ fn textDigest(a: A, bytes: []const u8) ![]const u8 {
     return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
 fn hash(a: A, value: anytype) ![]const u8 {
-    const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    var buffer: [4096]u8 = undefined;
+    var hashing = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).init(&buffer);
+    try std.json.Stringify.value(value, .{}, &hashing.writer);
+    try hashing.writer.flush();
+    const digest = hashing.hasher.finalResult();
     return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
 fn key(a: A, prefix: []const u8, id: []const u8) ![]const u8 {
@@ -8788,6 +8883,10 @@ fn dependencyKey(a: A, kind: []const u8, parent: []const u8, child: []const u8) 
 fn outcomeUseKey(a: A, branch: []const u8, memory_id: []const u8, outcome_id: []const u8) ![]const u8 {
     try t.validateId(memory_id);
     return std.fmt.allocPrint(a, "outcome-use/{s}/{s}/{s}", .{ try hash(a, branch), try hash(a, memory_id), try hash(a, outcome_id) });
+}
+fn ownerOutcomeUseKey(a: A, branch: []const u8, owner: []const u8, memory_id: []const u8, outcome_id: []const u8) ![]const u8 {
+    try t.validateId(memory_id);
+    return std.fmt.allocPrint(a, "outcome-owner-use/{s}/{s}/{s}/{s}", .{ try hash(a, branch), try hash(a, owner), try hash(a, memory_id), try hash(a, outcome_id) });
 }
 fn briefKindWeight(kind: t.Kind) f64 {
     return switch (kind) {
@@ -9387,4 +9486,19 @@ test "memory utility shares decoded outcome arrays across memory bindings and in
     replacement.outcome.success = false;
     try run.put("outcome/key", replacement);
     try std.testing.expect(!(try run.read(StoredOutcome, "outcome/key")).?.outcome.success);
+}
+
+test "memory streaming fingerprints preserve the allocated JSON digest" {
+    const a = std.testing.allocator;
+    const text = try a.alloc(u8, 32768);
+    defer a.free(text);
+    @memset(text, '\\');
+    const value = .{ .payload = text, .escaped = "\"\n\t雪", .integer = @as(u64, std.math.maxInt(u64)), .fraction = @as(f64, 0.125), .optional = @as(?[]const u8, null), .pin = t.ClaimPin{ .id = "claim", .revision = 42, .fingerprint = "fingerprint" } };
+    const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const streamed = try hash(a, value);
+    defer a.free(streamed);
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), streamed);
 }

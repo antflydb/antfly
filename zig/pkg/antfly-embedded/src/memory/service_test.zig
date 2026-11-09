@@ -8191,10 +8191,10 @@ test "memory maintenance reclaims outcome bindings and pins after global forget"
     try discard(&store, .pin, "", "{\"id\":\"z-ticket\"}", "pin", 5);
     var bindings: usize = 0;
     var it = store.values.iterator();
-    while (it.next()) |entry| if (std.mem.startsWith(u8, entry.key_ptr.*, "outcome-use/") or std.mem.startsWith(u8, entry.key_ptr.*, "brief-pin/")) {
+    while (it.next()) |entry| if (std.mem.startsWith(u8, entry.key_ptr.*, "outcome-use/") or std.mem.startsWith(u8, entry.key_ptr.*, "outcome-owner-use/") or std.mem.startsWith(u8, entry.key_ptr.*, "brief-pin/")) {
         bindings += 1;
     };
-    try std.testing.expectEqual(@as(usize, 2), bindings);
+    try std.testing.expectEqual(@as(usize, 3), bindings);
     try discard(&store, .forget, "", "{\"all\":true}", "forget", 6);
     const brief = try store.run(.brief, "", "{}", "", 7);
     defer std.testing.allocator.free(brief);
@@ -8204,6 +8204,7 @@ test "memory maintenance reclaims outcome bindings and pins after global forget"
     it = store.values.iterator();
     while (it.next()) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.key_ptr.*, "outcome-use/"));
+        try std.testing.expect(!std.mem.startsWith(u8, entry.key_ptr.*, "outcome-owner-use/"));
         try std.testing.expect(!std.mem.startsWith(u8, entry.key_ptr.*, "brief-pin/"));
     }
 }
@@ -8882,7 +8883,7 @@ test "memory regression: cleanup must remove reverse bindings for specifically f
     try std.testing.expect(store.values.get("cleanup") == null);
     var it = store.values.keyIterator();
     var bindings: usize = 0;
-    while (it.next()) |path| if (std.mem.startsWith(u8, path.*, "outcome-use/")) {
+    while (it.next()) |path| if (std.mem.startsWith(u8, path.*, "outcome-use/") or std.mem.startsWith(u8, path.*, "outcome-owner-use/")) {
         bindings += 1;
     };
     std.debug.print("THIRD REVIEW remaining outcome bindings={d}\n", .{bindings});
@@ -8959,14 +8960,14 @@ test "memory regression: managed observation receipts must expose duplicate sign
     try std.testing.expect(receipt.duplicate_ids.len > 0);
 }
 
-test "memory streaming brief preserves the final resource payload fence" {
+test "memory streaming reads and proposal preparation preserve the final resource payload fence" {
     const ChangeAtFinish = struct {
         fn finish(ptr: *anyopaque) !void {
             const store: *Store = @ptrCast(@alignCast(ptr));
             store.resource_json = "{\"message\":\"Changed without a revision or digest update\"}";
         }
     };
-    for ([_]m.Action{ .brief, .consolidate, .inspect }) |action| {
+    for ([_]m.Action{ .brief, .consolidate, .inspect, .prepare_consolidation }) |action| {
         var store = Store.init();
         defer store.deinit();
         const a = store.arena.allocator();
@@ -8976,7 +8977,7 @@ test "memory streaming brief preserves the final resource payload fence" {
         _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"external\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"assertions\":[{\"id\":\"fact\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"Approved production policy\",\"evidence\":[{\"id\":\"external\"}]}]}", "external");
         svc.context.final_check_ptr = &store;
         svc.context.final_check_fn = ChangeAtFinish.finish;
-        try std.testing.expectError(error.MemoryResourceChanged, svc.execute(a, action, "", "{}", ""));
+        try std.testing.expectError(error.MemoryResourceChanged, svc.execute(a, action, "", "{}", if (action == .prepare_consolidation) "prepare" else ""));
     }
 }
 
@@ -9243,4 +9244,296 @@ test "memory consolidation retries retired deferred provenance with unchanged cl
     _ = try svc.execute(a, .review_supersession, next.proposal_ids[0], try std.json.Stringify.valueAlloc(a, m.types.SupersessionVerdict{ .expected_revision = try SupersessionFixture.revision(svc, a), .verdict = .restates }, .{}), "review");
     const done = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .prepare_consolidation, "", "{}", "done"), .{});
     try std.testing.expectEqual(@as(usize, 0), done.proposal_ids.len);
+}
+
+test "postmerge review preparation isolates existing proposals from other branches" {
+    for ([_]u8{ 1, 2, 3, 4 }) |collision| {
+        for ([_]bool{ false, true }) |closed| {
+            var store = Store.init();
+            defer store.deinit();
+            const a = store.arena.allocator();
+            const admin = store.service("admin", true, 500);
+            _ = try admin.execute(a, .create, "", "{\"features\":{\"lineage\":true}}", "create");
+            _ = try admin.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"team-source\",\"text\":\"Team fact\",\"visibility\":\"team\"}],\"assertions\":[{\"id\":\"a\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"Same fact\",\"visibility\":\"team\",\"evidence\":[{\"id\":\"team-source\"}]},{\"id\":\"z\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"Same fact\",\"visibility\":\"team\",\"evidence\":[{\"id\":\"team-source\"}]}]}", "source");
+            var alpha = store.service("alpha", false, 500);
+            alpha.context.curator = true;
+            var bob = store.service("bob", false, 500);
+            bob.context.curator = true;
+            _ = try alpha.execute(a, .fork_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageFork{ .id = "alpha", .expected_revision = try SupersessionFixture.revision(admin, a) }, .{}), "fork-alpha");
+            _ = try bob.execute(a, .fork_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageFork{ .id = "beta", .expected_revision = try SupersessionFixture.revision(admin, a) }, .{}), "fork-beta");
+            alpha.context.branch = "alpha";
+            bob.context.branch = "beta";
+            const left = try SupersessionFixture.pin(alpha, a, "a");
+            const right = try SupersessionFixture.pin(alpha, a, "z");
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ "consolidation-proposal/v1", "bob", "beta", "a", left.revision, "z", right.revision, @as(u64, 1) }, .{}), &digest, .{});
+            const legacy_id = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ "consolidation-proposal/v2", "bob", "beta", "a", left.fingerprint, "z", right.fingerprint, "a", @as(u64, 1) }, .{}), &digest, .{});
+            const base_id = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+            const foreign_id = if (collision == 1 or collision == 4) legacy_id else base_id;
+            _ = try alpha.execute(a, .propose_supersession, "", try std.json.Stringify.valueAlloc(a, m.types.SupersessionProposalRequest{ .id = foreign_id, .expected_revision = try SupersessionFixture.revision(alpha, a), .incoming = left, .previous = right }, .{}), "foreign");
+            if (closed) _ = try alpha.execute(a, .review_supersession, foreign_id, try std.json.Stringify.valueAlloc(a, m.types.SupersessionVerdict{ .expected_revision = try SupersessionFixture.revision(alpha, a), .verdict = .restates }, .{}), "close");
+            if (collision == 3) {
+                std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ "bob", "beta", "prepare" }, .{}), &digest, .{});
+                const receipt_id = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+                std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ "consolidation-attempt/v1", base_id, receipt_id }, .{}), &digest, .{});
+                const attempt_id = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+                _ = try alpha.execute(a, .propose_supersession, "", try std.json.Stringify.valueAlloc(a, m.types.SupersessionProposalRequest{ .id = attempt_id, .expected_revision = try SupersessionFixture.revision(alpha, a), .incoming = left, .previous = right }, .{}), "foreign-attempt");
+            }
+            if (collision == 4) {
+                std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ "bob", "beta", "a", "z" }, .{}), &digest, .{});
+                const path = try std.fmt.allocPrint(a, "consolidation-current/{s}", .{std.fmt.bytesToHex(digest, .lower)});
+                try store.values.put(a, path, try std.json.Stringify.valueAlloc(a, .{ .proposal_id = foreign_id }, .{}));
+            }
+            const operation = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try bob.execute(a, .prepare_consolidation, "", "{}", "prepare"), .{});
+            try std.testing.expectEqual(@as(usize, 1), operation.proposal_ids.len);
+            try std.testing.expect(!std.mem.eql(u8, foreign_id, operation.proposal_ids[0]));
+            const detail = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalDetail, a, try bob.execute(a, .supersession_proposal, operation.proposal_ids[0], "{}", ""), .{});
+            try std.testing.expectEqualStrings("beta", detail.proposal.branch);
+            const again = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try bob.execute(a, .prepare_consolidation, "", "{}", "prepare-again"), .{});
+            try std.testing.expectEqualStrings(operation.proposal_ids[0], again.proposal_ids[0]);
+            const foreign = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalDetail, a, try alpha.execute(a, .supersession_proposal, foreign_id, "{}", ""), .{});
+            try std.testing.expectEqualStrings("alpha", foreign.proposal.branch);
+            const foreign_open = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalPage, a, try alpha.execute(a, .supersession_proposals, "", "{}", ""), .{});
+            try std.testing.expectEqual(@as(usize, if (closed) 0 else 1) + @as(usize, if (collision == 3) 1 else 0), foreign_open.items.len);
+            try std.testing.expectError(error.MemoryNotFound, bob.execute(a, .supersession_proposal, foreign_id, "{}", ""));
+        }
+    }
+}
+
+test "postmerge review preparation bounds full procedure payload hydration" {
+    const Metadata = struct {
+        fn get(ptr: *anyopaque, allocator: A, path: []const u8) !?m.Row {
+            const row = (try Store.get(ptr, allocator, path)) orelse return null;
+            var record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, allocator, row.json, .{});
+            record.assertion.steps = &.{};
+            record.assertion.preconditions = &.{};
+            record.assertion.expected_outcome = null;
+            record.assertion.embedding = null;
+            return .{ .key = row.key, .json = try std.json.Stringify.valueAlloc(allocator, record, .{}), .version = row.version };
+        }
+    };
+    var baseline: [2]usize = @splat(0);
+    for ([_]usize{ 0, 32 * 1024 }) |payload_len| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try setup(&store);
+        var svc = store.service("alice", true, 500);
+        svc.backend.get_metadata = Metadata.get;
+        const payload = try a.alloc(u8, payload_len);
+        @memset(payload, 'x');
+        for (0..32) |i| {
+            const id = try std.fmt.allocPrint(a, "claim-{d}", .{i});
+            const claim: m.types.Assertion = .{ .id = id, .subject = "s", .predicate = "p", .value = "same", .statement = "Same useful procedure", .kind = .procedural, .steps = &.{payload}, .evidence = &.{.{ .id = "e1" }} };
+            _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{claim} }, .{}), id);
+            _ = try svc.execute(a, .pin, "", try std.json.Stringify.valueAlloc(a, m.types.Pin{ .id = id }, .{}), try std.fmt.allocPrint(a, "pin-{d}", .{i}));
+        }
+        for (0..2) |attempt| {
+            const storage = try std.testing.allocator.alloc(u8, 32 * 1024 * 1024);
+            defer std.testing.allocator.free(storage);
+            var buffer = std.heap.FixedBufferAllocator.init(storage);
+            const response = try svc.execute(buffer.allocator(), .prepare_consolidation, "", "{}", if (attempt == 0) "prepare" else "reuse");
+            const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, response, .{});
+            std.debug.print("preparation attempt={d} payload={d} response={d} allocation={d} proposals={d}\n", .{ attempt, payload_len * 32, response.len, buffer.end_index, receipt.proposal_ids.len });
+            try std.testing.expectEqual(@as(usize, 31), receipt.proposal_ids.len);
+            if (payload_len == 0) baseline[attempt] = buffer.end_index else try std.testing.expect(buffer.end_index < baseline[attempt] + 1024 * 1024);
+            const detail = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalDetail, a, try svc.execute(a, .supersession_proposal, receipt.proposal_ids[0], "{}", ""), .{});
+            try std.testing.expectEqual(payload_len, detail.incoming.memory.assertion.steps[0].len);
+            try std.testing.expectEqual(payload_len, detail.previous.memory.assertion.steps[0].len);
+            const pin = try SupersessionFixture.pin(svc, a, detail.proposal.incoming.id);
+            try std.testing.expectEqualStrings(pin.fingerprint, detail.proposal.incoming.fingerprint);
+        }
+    }
+}
+
+test "postmerge review private feedback cannot starve another owners bounded utility" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const admin = store.service("admin", true, 500);
+    _ = try admin.execute(a, .create, "", "{}", "create");
+    _ = try admin.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"team-source\",\"text\":\"Team fact\",\"visibility\":\"team\"}],\"assertions\":[{\"id\":\"team-memory\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"Team fact\",\"visibility\":\"team\",\"evidence\":[{\"id\":\"team-source\"}]}]}", "source");
+    const alice = store.service("alice", false, 500);
+    const bob = store.service("bob", false, 500);
+    var alice_digest: [32]u8 = undefined;
+    const alice_id = id: {
+        for (0..1024) |i| {
+            const candidate = try std.fmt.allocPrint(a, "alice-{d}", .{i});
+            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, candidate, .{}), &alice_digest, .{});
+            if (alice_digest[0] >= 240) break :id candidate;
+        }
+        return error.TestUnexpectedResult;
+    };
+    _ = try alice.execute(a, .outcome, "", try std.json.Stringify.valueAlloc(a, m.types.Outcome{ .id = alice_id, .task_id = alice_id, .success = true, .used_memory_ids = &.{"team-memory"} }, .{}), "alice-result");
+    const before = try std.json.parseFromSliceLeaky(m.types.Usage, a, try alice.execute(a, .usage, "team-memory", "{}", ""), .{});
+    try std.testing.expectEqual(@as(u32, 1), before.utility.successes);
+    var count: usize = 0;
+    for (0..4096) |i| {
+        const candidate = try std.fmt.allocPrint(a, "bob-{d}", .{i});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, candidate, .{}), &digest, .{});
+        if (!std.mem.lessThan(u8, &digest, &alice_digest)) continue;
+        _ = try bob.execute(a, .outcome, "", try std.json.Stringify.valueAlloc(a, m.types.Outcome{ .id = candidate, .task_id = candidate, .success = true, .used_memory_ids = &.{"team-memory"} }, .{}), candidate);
+        count += 1;
+        if (count == 64) break;
+    }
+    try std.testing.expectEqual(@as(usize, 64), count);
+    const after = try std.json.parseFromSliceLeaky(m.types.Usage, a, try alice.execute(a, .usage, "team-memory", "{}", ""), .{});
+    std.debug.print("POSTMERGE REVIEW owned successes before={d} after={d} complete={any}\n", .{ before.utility.successes, after.utility.successes, after.utility.complete });
+    try std.testing.expectEqual(before.utility.successes, after.utility.successes);
+    try std.testing.expect(after.utility.complete);
+    const bob_usage = try std.json.parseFromSliceLeaky(m.types.Usage, a, try bob.execute(a, .usage, "team-memory", "{}", ""), .{});
+    try std.testing.expectEqual(@as(u32, 64), bob_usage.utility.successes);
+    try std.testing.expect(bob_usage.utility.complete);
+    const admin_usage = try std.json.parseFromSliceLeaky(m.types.Usage, a, try admin.execute(a, .usage, "team-memory", "{}", ""), .{});
+    try std.testing.expectEqual(@as(u32, 64), admin_usage.utility.successes);
+    try std.testing.expect(!admin_usage.utility.complete);
+}
+
+test "postmerge review owner utility migration resumes atomically across branches and concurrent writes" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const admin = store.service("admin", true, 500);
+    _ = try admin.execute(a, .create, "", "{\"features\":{\"lineage\":true}}", "create");
+    _ = try admin.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"source\",\"text\":\"Team fact\",\"visibility\":\"team\"}],\"assertions\":[{\"id\":\"memory\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"Team fact\",\"visibility\":\"team\",\"evidence\":[{\"id\":\"source\"}]}]}", "source");
+    var alice = store.service("alice", false, 500);
+    alice.context.curator = true;
+    _ = try alice.execute(a, .fork_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageFork{ .id = "fork", .expected_revision = try SupersessionFixture.revision(admin, a) }, .{}), "fork");
+    for (0..20) |i| {
+        alice.context.branch = if (i < 16) "" else "fork";
+        const id = try std.fmt.allocPrint(a, "legacy-{d}", .{i});
+        _ = try alice.execute(a, .outcome, "", try std.json.Stringify.valueAlloc(a, m.types.Outcome{ .id = id, .task_id = id, .success = true, .used_memory_ids = &.{"memory"} }, .{}), id);
+    }
+    alice.context.branch = "";
+    var paths: std.ArrayList([]const u8) = .empty;
+    var it = store.values.keyIterator();
+    while (it.next()) |path| if (std.mem.startsWith(u8, path.*, "outcome-owner-use/") or std.mem.startsWith(u8, path.*, "outcome-signal/")) {
+        try paths.append(a, path.*);
+    };
+    for (paths.items) |path| _ = store.values.remove(path);
+    // Old control rows omit both migration fields; decoding must start at the
+    // beginning. Branchless outcomes from before lineage belong to main.
+    var control = try std.json.parseFromSliceLeaky(std.json.Value, a, store.values.get("control").?, .{});
+    _ = control.object.swapRemove("utility_owner_ready");
+    _ = control.object.swapRemove("utility_owner_cursor");
+    try store.values.put(a, "control", try std.json.Stringify.valueAlloc(a, control, .{}));
+    var values = store.values.iterator();
+    while (values.next()) |entry| if (std.mem.startsWith(u8, entry.key_ptr.*, "outcome/")) {
+        var outcome = try std.json.parseFromSliceLeaky(std.json.Value, a, entry.value_ptr.*, .{});
+        if (std.mem.eql(u8, outcome.object.get("outcome").?.object.get("id").?.string, "legacy-0")) {
+            _ = outcome.object.swapRemove("branch");
+            entry.value_ptr.* = try std.json.Stringify.valueAlloc(a, outcome, .{});
+        }
+    };
+    var state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try std.testing.expect(try @import("scheduling.zig").retentionDue(admin.backend, a, 500, state));
+    const before = try std.json.parseFromSliceLeaky(m.types.Usage, a, try alice.execute(a, .usage, "memory", "{}", ""), .{});
+    try std.testing.expect(!before.utility.complete);
+    _ = try admin.execute(a, .advance, "", "{}", "migration-1");
+    state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try std.testing.expect(!state.utility_owner_ready and state.utility_owner_cursor != null);
+    var migrated: usize = 0;
+    it = store.values.keyIterator();
+    while (it.next()) |path| if (std.mem.startsWith(u8, path.*, "outcome-owner-use/")) {
+        migrated += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 16), migrated);
+    // A new outcome before the saved cursor is still dual-indexed immediately.
+    const new_id = id: {
+        for (0..1024) |i| {
+            const candidate = try std.fmt.allocPrint(a, "concurrent-{d}", .{i});
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, candidate, .{}), &digest, .{});
+            const path = try std.fmt.allocPrint(a, "outcome/{s}", .{std.fmt.bytesToHex(digest, .lower)});
+            if (std.mem.lessThan(u8, path, state.utility_owner_cursor.?)) break :id candidate;
+        }
+        return error.TestUnexpectedResult;
+    };
+    _ = try alice.execute(a, .outcome, "", try std.json.Stringify.valueAlloc(a, m.types.Outcome{ .id = new_id, .task_id = new_id, .success = true, .used_memory_ids = &.{"memory"} }, .{}), new_id);
+    const checkpoint = store.values.get("control").?;
+    store.conflict = true;
+    try std.testing.expectError(error.MemoryRevisionConflict, admin.execute(a, .advance, "", "{}", "migration-2"));
+    try std.testing.expectEqualStrings(checkpoint, store.values.get("control").?);
+    store.conflict = false;
+    _ = try admin.execute(a, .advance, "", "{}", "migration-2");
+    state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try std.testing.expect(state.utility_owner_ready and state.utility_owner_cursor == null);
+    const main = try std.json.parseFromSliceLeaky(m.types.Usage, a, try alice.execute(a, .usage, "memory", "{}", ""), .{});
+    try std.testing.expect(main.utility.complete);
+    try std.testing.expectEqual(@as(u32, 17), main.utility.successes);
+    alice.context.branch = "fork";
+    const fork = try std.json.parseFromSliceLeaky(m.types.Usage, a, try alice.execute(a, .usage, "memory", "{}", ""), .{});
+    try std.testing.expect(fork.utility.complete);
+    try std.testing.expectEqual(@as(u32, 4), fork.utility.successes);
+}
+
+test "postmerge review generated proposal collisions reject mismatched pins in the same branch" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    const svc = store.service("alice", true, 500);
+    for ([_][]const u8{ "a", "z" }) |id| {
+        const claim: m.types.Assertion = .{ .id = id, .subject = "s", .predicate = "p", .value = "same", .statement = "Same fact", .evidence = &.{.{ .id = "e1" }} };
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{claim} }, .{}), id);
+    }
+    const left = try SupersessionFixture.pin(svc, a, "a");
+    const right = try SupersessionFixture.pin(svc, a, "z");
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ "consolidation-proposal/v2", "alice", "", "a", left.fingerprint, "z", right.fingerprint, "a", @as(u64, 1) }, .{}), &digest, .{});
+    const collision = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+    _ = try svc.execute(a, .propose_supersession, "", try std.json.Stringify.valueAlloc(a, m.types.SupersessionProposalRequest{ .id = collision, .expected_revision = try SupersessionFixture.revision(svc, a), .incoming = right, .previous = left }, .{}), "explicit");
+    const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .prepare_consolidation, "", "{}", "prepare"), .{});
+    try std.testing.expectEqual(@as(usize, 1), receipt.proposal_ids.len);
+    try std.testing.expect(!std.mem.eql(u8, collision, receipt.proposal_ids[0]));
+    const detail = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalDetail, a, try svc.execute(a, .supersession_proposal, receipt.proposal_ids[0], "{}", ""), .{});
+    try std.testing.expectEqualStrings("a", detail.proposal.incoming.id);
+    try std.testing.expectEqualStrings("z", detail.proposal.previous.id);
+}
+
+test "postmerge review utility migration bounds wide outcome bindings without skipping outcomes" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    const svc = store.service("alice", true, 500);
+    var claims: [m.types.max_items]m.types.Assertion = undefined;
+    var ids: [m.types.max_items][]const u8 = undefined;
+    for (&claims, &ids, 0..) |*claim, *id, i| {
+        id.* = try std.fmt.allocPrint(a, "input-{d}", .{i});
+        claim.* = .{ .id = id.*, .subject = id.*, .predicate = "p", .value = "v", .statement = "Fact", .evidence = &.{.{ .id = "e1" }} };
+    }
+    for (0..8) |batch| {
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = claims[batch * 32 ..][0..32] }, .{}), try std.fmt.allocPrint(a, "claims-{d}", .{batch}));
+    }
+    for (0..5) |i| {
+        const id = try std.fmt.allocPrint(a, "wide-{d}", .{i});
+        _ = try svc.execute(a, .outcome, "", try std.json.Stringify.valueAlloc(a, m.types.Outcome{ .id = id, .task_id = id, .success = true, .used_memory_ids = &ids }, .{}), id);
+    }
+    var paths: std.ArrayList([]const u8) = .empty;
+    var it = store.values.keyIterator();
+    while (it.next()) |path| if (std.mem.startsWith(u8, path.*, "outcome-owner-use/")) {
+        try paths.append(a, path.*);
+    };
+    for (paths.items) |path| _ = store.values.remove(path);
+    var state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    state.utility_owner_ready = false;
+    try store.values.put(a, "control", try std.json.Stringify.valueAlloc(a, state, .{}));
+    for (0..2) |turn| {
+        _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "migration-{d}", .{turn}));
+        state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        try std.testing.expectEqual(turn == 1, state.utility_owner_ready);
+        var count: usize = 0;
+        it = store.values.keyIterator();
+        while (it.next()) |path| if (std.mem.startsWith(u8, path.*, "outcome-owner-use/")) {
+            count += 1;
+        };
+        try std.testing.expectEqual(@as(usize, if (turn == 0) 1024 else 1280), count);
+    }
+    const alice = store.service("alice", false, 500);
+    const usage = try std.json.parseFromSliceLeaky(m.types.Usage, a, try alice.execute(a, .usage, ids[0], "{}", ""), .{});
+    try std.testing.expect(usage.utility.complete);
+    try std.testing.expectEqual(@as(u32, 5), usage.utility.successes);
 }
