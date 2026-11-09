@@ -405,6 +405,7 @@ pub const Cache = struct {
         defer a.free(key);
         if (comptime @import("builtin").os.tag != .freestanding) if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
             self.recordRead(true, mapped.bytes.len);
+            if (context.trace) |trace| trace.add("disk_hits", 1);
             return .{ .mapped = mapped };
         };
         return .{ .heap = .{ .alloc = a, .bytes = try self.readImmutableKeyAlloc(a, key, length, digest, context, loader) } };
@@ -422,15 +423,18 @@ pub const Cache = struct {
         if (self.pin(key)) |pinned| {
             errdefer pinned.release();
             try context.ensureActive();
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             return .{ .shared = pinned };
         }
         if (self.pinMapping(key)) |mapping| {
             errdefer mapping.release();
             try context.ensureActive();
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             return .{ .mapping = mapping };
         }
         if (comptime @import("builtin").os.tag != .freestanding) if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
             self.recordRead(true, mapped.bytes.len);
+            if (context.trace) |trace| trace.add("disk_hits", 1);
             return self.admitMapping(key, mapped);
         };
         return null;
@@ -443,11 +447,13 @@ pub const Cache = struct {
         if (self.pin(key)) |pinned| {
             errdefer pinned.release();
             try context.ensureActive();
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             return .{ .shared = pinned };
         }
         if (self.pinMapping(key)) |mapping| {
             errdefer mapping.release();
             try context.ensureActive();
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             return .{ .mapping = mapping };
         }
         var lease = try self.readImmutableLease(a, scope, identity, length, digest, context, loader);
@@ -483,11 +489,13 @@ pub const Cache = struct {
         if (self.pin(key)) |value| {
             errdefer value.release();
             try context.ensureActive();
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             return .{ .shared = value };
         }
         if (self.pinMapping(key)) |value| {
             errdefer value.release();
             try context.ensureActive();
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             return .{ .mapping = value };
         }
         if (comptime @import("builtin").os.tag != .freestanding) if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
@@ -631,6 +639,7 @@ pub const Cache = struct {
 
     fn readImmutableKeyAlloc(self: *Cache, a: Allocator, key: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) ![]u8 {
         if (try self.lookup(a, key)) |bytes| {
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             errdefer a.free(bytes);
             try context.ensureActive();
             return bytes;
@@ -666,6 +675,7 @@ pub const Cache = struct {
                 errdefer a.free(bytes);
                 try context.ensureActive();
                 self.recordRead(true, bytes.len);
+                if (context.trace) |trace| trace.add("disk_hits", 1);
                 self.store(key, bytes) catch {};
                 return bytes;
             }
@@ -673,7 +683,15 @@ pub const Cache = struct {
             // immutable provider rather than failing from local disk damage.
             a.free(bytes);
         }
-        const bytes = try loader.load(loader.ptr, a);
+        const io_started = if (context.trace) |trace| trace.begin() else 0;
+        const bytes = loader.load(loader.ptr, a) catch |err| {
+            if (context.trace) |trace| trace.end(io_started, 1, 0, true);
+            return err;
+        };
+        if (context.trace) |trace| {
+            const traffic = if (loader.provider_read) |read| read(loader.ptr) else ProviderRead{ .requests = 1, .bytes = bytes.len };
+            trace.end(io_started, traffic.requests, traffic.bytes, false);
+        }
         errdefer a.free(bytes);
         try context.ensureActive();
         var actual: [32]u8 = undefined;

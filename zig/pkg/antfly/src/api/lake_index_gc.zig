@@ -124,6 +124,7 @@ pub const Collector = struct {
         var binding: ?@import("lake_cloud_publication.zig").Binding = if (self.store.providerStore()) |object| try @import("lake_cloud_publication.zig").Binding.init(std.heap.page_allocator, object, publication, self.cancellation()) else null;
         defer if (binding) |*value| value.deinit();
         var hydrated = publication;
+        for (publication.opening_bundles) |bundle| _ = try self.mark(.{ .artifact_id = bundle.artifact.artifact_id, .checksum = bundle.artifact.checksum, .byte_len = bundle.artifact.byte_len });
         if (hydrated.directory) |directory| {
             _ = try self.mark(.{ .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len });
             try stores.chargeReadBudget(&self.remaining_reads, directory.byte_len);

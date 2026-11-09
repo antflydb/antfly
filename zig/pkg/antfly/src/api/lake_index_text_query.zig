@@ -180,6 +180,7 @@ pub const Scope = struct {
     }
 };
 const Prepared = struct {
+    io_trace: local.serverless_query_lake_read_context.IoTrace = .{},
     backing: A,
     native_owner: ?source_owner.admission.State = null,
     native_cut: ?source_owner.admission.Cut = null,
@@ -261,6 +262,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
         prepared.arena.deinit();
         backing.destroy(prepared);
     };
+    defer if (request_profile) |profile| profile.io.add(prepared.io_trace.snapshot());
     const a = prepared.arena.allocator();
     var schema = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, current_table.schema_json)) orelse return null;
     defer if (!transferred) schema.deinit(a);
@@ -329,7 +331,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     // reject them before selecting a publication rather than dropping clauses.
     if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.aggregations_json.len != 0) return error.UnsupportedQueryRequest;
     if (req.full_text != null and req.query != .match_all) return error.UnsupportedQueryRequest;
-    var context: Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+    var context: Context = .{ .trace = &prepared.io_trace, .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return error.ExternalLakeIndexUnavailable;
     var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
     defer if (!transferred) state.deinit();
@@ -606,6 +608,8 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     const retained_cancellation = retainedCancellation(&prepared.retained_context);
     const table = prepared.table;
     const context = prepared.context;
+    const io_before = prepared.io_trace.snapshot();
+    defer request_profile.io.add(prepared.io_trace.snapshot().since(io_before));
     const publication = prepared.state.value.published.?;
     const cut_expires_ms = prepared.cut_expires_ms;
     const lease = prepared.lease;

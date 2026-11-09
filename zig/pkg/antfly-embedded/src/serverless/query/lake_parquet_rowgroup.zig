@@ -258,6 +258,8 @@ pub const PersistentObjectRangeCachePolicy = struct {
 };
 
 pub const PersistentObjectRangeCacheStats = struct {
+    inventory_checkpoint_hits: usize = 0,
+    inventory_scan_entries: usize = 0,
     read_hits: usize = 0,
     read_misses: usize = 0,
     read_errors: usize = 0,
@@ -372,6 +374,9 @@ pub const PersistentObjectRangeCache = struct {
         state.condition.broadcast(io);
         state.mutex.unlock(io);
         if (state.worker) |*worker| _ = worker.await(io);
+        // Only quiescent, fully drained owners publish a restart hint. The
+        // hint is consumed before serving; a crash always falls back to scan.
+        state.saveInventoryCheckpoint() catch {};
         state.deinitInventory();
         state.pending.deinit(state.alloc);
         state.queue.deinit(state.alloc);
@@ -630,6 +635,8 @@ const PersistentObjectRangeCacheState = struct {
             .permissions = @fromBackingInt(@intCast(0o600)),
         });
 
+        if (try self.restoreInventoryCheckpoint(dir)) return;
+
         var discovered = std.PriorityQueue(
             *PersistentObjectRangeCacheEntry,
             void,
@@ -654,6 +661,7 @@ const PersistentObjectRangeCacheState = struct {
                 continue;
             }
             if (!isPersistentObjectRangeCacheFilename(entry.name)) continue;
+            self.stats.inventory_scan_entries +|= 1;
             const stat = dir.statFile(io, entry.name, .{}) catch |err| switch (err) {
                 // Directory iteration and stat are not atomic. A concurrent
                 // cleanup may legitimately win this race.
@@ -738,6 +746,111 @@ const PersistentObjectRangeCacheState = struct {
             // new ceiling, but ordinary ranges must be removed first.
             if (!self.evictOne(true)) return error.PersistentObjectRangeCacheRecoveryFailed;
         }
+    }
+
+    const InventoryRecord = struct {
+        filename: []const u8,
+        disk_bytes: usize,
+        modified_ns: i128,
+        protected: bool,
+    };
+    const inventory_checkpoint_name = "INVENTORY.clean";
+    const inventory_checkpoint_magic = "AFIC1";
+    const inventory_checkpoint_header = 5 + 8 + 16 + 16 + 32;
+    const inventory_checkpoint_limit = 8 * 1024 * 1024;
+
+    /// The cache root is private and held under OWNER.lock. An unchanged
+    /// directory identity/timestamp plus a clean-shutdown inventory avoids
+    /// opening every cached file on restart. This is never byte authority:
+    /// readMapped/readAlloc still verify exact keys, lengths and digests.
+    fn restoreInventoryCheckpoint(self: *PersistentObjectRangeCacheState, dir: std.Io.Dir) !bool {
+        const io = self.io;
+        const stamp = try dir.statFile(io, ".", .{});
+        const bytes = dir.readFileAlloc(io, inventory_checkpoint_name, self.alloc, .limited(inventory_checkpoint_limit)) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            error.Canceled => return err,
+            else => {
+                dir.deleteFile(io, inventory_checkpoint_name) catch {};
+                return false;
+            },
+        };
+        defer self.alloc.free(bytes);
+        // Consume first. Failure to invalidate prevents the optional fast path
+        // from being enabled; after a crash the full scan remains authoritative.
+        try dir.deleteFile(io, inventory_checkpoint_name);
+        if (bytes.len < inventory_checkpoint_header or !std.mem.eql(u8, bytes[0..5], inventory_checkpoint_magic)) return false;
+        if (std.mem.readInt(u64, bytes[5..13], .little) != @as(u64, @intCast(stamp.inode)) or
+            std.mem.readInt(i128, bytes[13..29], .little) != stamp.mtime.toNanoseconds() or
+            std.mem.readInt(i128, bytes[29..45], .little) != stamp.ctime.toNanoseconds()) return false;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes[inventory_checkpoint_header..], &digest, .{});
+        if (!std.mem.eql(u8, &digest, bytes[45..77])) return false;
+        const parsed = std.json.parseFromSlice([]const InventoryRecord, self.alloc, bytes[inventory_checkpoint_header..], .{}) catch return false;
+        defer parsed.deinit();
+        if (parsed.value.len > self.policy.max_entries or parsed.value.len > 65_536) return false;
+        var total: u64 = 0;
+        var protected_total: u64 = 0;
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(self.alloc);
+        for (parsed.value) |record| {
+            if (!isPersistentObjectRangeCacheFilename(record.filename) or record.disk_bytes == 0 or record.disk_bytes > self.policy.max_total_bytes or names.contains(record.filename)) return false;
+            try names.put(self.alloc, record.filename, {});
+            total = std.math.add(u64, total, record.disk_bytes) catch return false;
+            if (record.protected) protected_total += record.disk_bytes;
+        }
+        // A smaller configuration uses normal recovery/eviction, rather than
+        // trusting an inventory created under a different capacity envelope.
+        if (total > self.policy.max_total_bytes) return false;
+        errdefer self.deinitInventory();
+        try self.entries.ensureTotalCapacity(self.alloc, @intCast(parsed.value.len));
+        for (parsed.value) |record| {
+            const entry = try self.alloc.create(PersistentObjectRangeCacheEntry);
+            errdefer self.alloc.destroy(entry);
+            const filename = try self.alloc.dupe(u8, record.filename);
+            entry.* = .{ .filename = filename, .disk_bytes = record.disk_bytes, .modified_ns = record.modified_ns, .protected = record.protected };
+            self.entries.putAssumeCapacityNoClobber(filename, entry);
+            self.lru.append(&entry.lru_node);
+        }
+        self.stats.entries = parsed.value.len;
+        self.stats.stored_bytes = @intCast(total);
+        self.stats.protected_stored_bytes = @intCast(protected_total);
+        self.stats.inventory_checkpoint_hits = 1;
+        return true;
+    }
+
+    fn saveInventoryCheckpoint(self: *PersistentObjectRangeCacheState) !void {
+        if (self.entries.count() > 65_536) return;
+        const io = self.io;
+        var dir = try std.Io.Dir.cwd().openDir(io, self.root_dir, .{});
+        defer dir.close(io);
+        const records = try self.alloc.alloc(InventoryRecord, self.entries.count());
+        defer self.alloc.free(records);
+        var node = self.lru.first;
+        var count: usize = 0;
+        while (node) |current| : (node = current.next) {
+            const entry: *PersistentObjectRangeCacheEntry = @alignCast(@fieldParentPtr("lru_node", current));
+            if (entry.removing or entry.pin_count != 0) return;
+            records[count] = .{ .filename = entry.filename, .disk_bytes = entry.disk_bytes, .modified_ns = entry.modified_ns, .protected = entry.protected };
+            count += 1;
+        }
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, records[0..count], .{});
+        defer self.alloc.free(payload);
+        if (payload.len > inventory_checkpoint_limit - inventory_checkpoint_header) return;
+        // Creating the file changes directory timestamps. Stamp afterward;
+        // writing its contents does not change its parent directory.
+        const file = try dir.createFile(io, inventory_checkpoint_name, .{ .truncate = true, .permissions = @fromBackingInt(@intCast(0o600)) });
+        defer file.close(io);
+        errdefer dir.deleteFile(io, inventory_checkpoint_name) catch {};
+        const stamp = try dir.statFile(io, ".", .{});
+        var header: [inventory_checkpoint_header]u8 = undefined;
+        header[0..5].* = inventory_checkpoint_magic.*;
+        std.mem.writeInt(u64, header[5..13], @intCast(stamp.inode), .little);
+        std.mem.writeInt(i128, header[13..29], stamp.mtime.toNanoseconds(), .little);
+        std.mem.writeInt(i128, header[29..45], stamp.ctime.toNanoseconds(), .little);
+        std.crypto.hash.sha2.Sha256.hash(payload, header[45..77], .{});
+        try file.writePositionalAll(io, &header, 0);
+        try file.writePositionalAll(io, payload, header.len);
+        if (self.policy.durability == .durable) try file.sync(io);
     }
 
     fn deinitInventory(self: *PersistentObjectRangeCacheState) void {
@@ -11364,4 +11477,57 @@ test "external lake Parquet speculative pull phases preserve CPU headroom and dr
         try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
         try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
     };
+}
+
+test "external lake opening disk inventory checkpoints accelerate clean restart and fail closed" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/checkpoint-cache", .{tmp.sub_path});
+    defer a.free(root);
+    const policy: PersistentObjectRangeCachePolicy = .{ .max_total_bytes = 8192, .max_entries = 4 };
+    {
+        var cache = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+        defer cache.deinit();
+        try std.testing.expectEqual(.enqueued, cache.enqueueWrite("key", "data"));
+        cache.flush();
+    }
+    {
+        var cache = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+        defer cache.deinit();
+        try std.testing.expectEqual(@as(usize, 1), cache.statsSnapshot().inventory_checkpoint_hits);
+        try std.testing.expectEqual(@as(usize, 0), cache.statsSnapshot().inventory_scan_entries);
+        const bytes = (try cache.readAlloc(a, "key", 4)).?;
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("data", bytes);
+        var dir = try std.Io.Dir.cwd().openDir(io, root, .{});
+        defer dir.close(io);
+        try std.testing.expectError(error.FileNotFound, dir.openFile(io, "INVENTORY.clean", .{}));
+    }
+    // New directory entries invalidate the clean image (including interrupted
+    // writes); a corrupt or absent checkpoint never disables demand recovery.
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, root, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "unexpected", .data = "changed" });
+    }
+    {
+        var cache = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+        defer cache.deinit();
+        try std.testing.expectEqual(@as(usize, 0), cache.statsSnapshot().inventory_checkpoint_hits);
+        try std.testing.expectEqual(@as(usize, 1), cache.statsSnapshot().inventory_scan_entries);
+    }
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, root, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "INVENTORY.clean", .data = "corrupt" });
+    }
+    var cache = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+    defer cache.deinit();
+    try std.testing.expectEqual(@as(usize, 0), cache.statsSnapshot().inventory_checkpoint_hits);
+    try std.testing.expectEqual(@as(usize, 1), cache.statsSnapshot().inventory_scan_entries);
+    const bytes = (try cache.readAlloc(a, "key", 4)).?;
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("data", bytes);
 }

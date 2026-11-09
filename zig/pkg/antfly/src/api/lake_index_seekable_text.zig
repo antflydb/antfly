@@ -100,6 +100,12 @@ pub const Read = struct {
 /// Seed a bounded working set through the exact same verified caches used by
 /// demand reads. The rest of the index remains remote and fills on misses.
 pub fn warmBounded(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
+    return warmMode(a, read, ref, maximum_bytes, false);
+}
+pub fn warmOpening(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
+    return warmMode(a, read, ref, maximum_bytes, true);
+}
+fn warmMode(a: A, read: Read, ref: Ref, maximum_bytes: usize, opening_only: bool) !usize {
     if (ref.byte_len > maximum_bytes or ref.byte_len > 512 * 1024) return 0;
     try read.check();
     const directory = try loadDirectory(a, read, ref);
@@ -120,6 +126,7 @@ pub fn warmBounded(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
         spent += @intCast(piece.ref.byte_len);
         held.deinit();
     };
+    if (opening_only) return spent;
     var recent: [16]u32 = undefined;
     const preferred = if (read.cache) |cached| cached.cache.text_demand.recent(@TypeOf(cached.cache.text_demand).identity(cached.scope, ref.artifact_id), &recent) else &.{};
     // Replay actual demand first. No hints is a bounded cold-start fallback;
@@ -746,7 +753,7 @@ const CoalescedRead = struct {
             const start = self.pieces[first].pack_offset;
             const last = self.pieces[end - 1];
             const length: usize = @intCast(last.pack_offset + last.ref.byte_len - start);
-            const bytes = self.store.getRangeAllocWithCancellationUsingAllocator(a, self.pack.artifact_id, start, length, self.cancellation) catch |err| {
+            const bytes = artifacts.readPhysicalRange(a, self.store, self.pack.artifact_id, start, length, self.cancellation, cache) catch |err| {
                 try self.cancellation.check();
                 cache.context.ensureActive() catch return error.Canceled;
                 if (err == error.OutOfMemory) return err;
@@ -754,7 +761,6 @@ const CoalescedRead = struct {
                 first = end;
                 continue;
             };
-            cache.cache.recordPhysicalRead(bytes.len);
             for (self.pieces[first..end]) |piece| {
                 const offset: usize = @intCast(piece.pack_offset - start);
                 const value: anyerror!ServingCache.VerifiedBytes = if (bytes.len != length) error.ArtifactIntegrityMismatch else ServingCache.VerifiedBytes.authenticate(bytes[offset..][0..@intCast(piece.ref.byte_len)], try stores.sha256DigestFromChecksum(piece.ref.checksum));
@@ -864,8 +870,7 @@ const CoalescedRead = struct {
             // A concurrent flight may cover a different requested subset,
             // or this unit became warm while its leader was being planned.
             // A single-unit direct fallback cannot form a flight cycle.
-            const bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(a, self.pack.artifact_id, piece.pack_offset, @intCast(piece.ref.byte_len), self.cancellation);
-            cache.cache.recordPhysicalRead(bytes.len);
+            const bytes = try artifacts.readPhysicalRange(a, self.store, self.pack.artifact_id, piece.pack_offset, @intCast(piece.ref.byte_len), self.cancellation, cache);
             errdefer a.free(bytes);
             const value = try ServingCache.VerifiedBytes.authenticate(bytes, try stores.sha256DigestFromChecksum(piece.ref.checksum));
             return .{ .value = value, .owner = .{ .bytes = bytes, .owner = .{ .allocation = a } } };
@@ -881,7 +886,10 @@ const CoalescedRead = struct {
     }
 };
 fn readPieceLease(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
-    return readPieceLeaseCoalesced(a, store, piece, cancellation, cached, null, false);
+    var lease = try readPieceLeaseCoalesced(a, store, piece, cancellation, cached, null, false);
+    errdefer lease.deinit();
+    if (cached) |cache| if (cache.capture) |capture| try capture.record(capture.ptr, piece.ref.artifact_id, try stores.sha256DigestFromChecksum(piece.ref.checksum), lease.bytes());
+    return lease;
 }
 fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead, coalesced: ?*CoalescedRead, publication: bool) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
     if (piece.pack == null) {
@@ -920,10 +928,8 @@ fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, canc
         const digest = try stores.sha256DigestFromChecksum(piece.ref.checksum);
         if (try cache.cache.lookupImmutableBlockLease(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context)) |lease| return lease;
         const verified = if (coalesced) |group| try group.verifiedLease(a, piece, cache) else direct: {
-            var provider = store;
-            const bytes = try provider.getRangeAllocWithCancellationUsingAllocator(a, piece.pack.?.artifact_id, piece.pack_offset, length, cancellation);
+            const bytes = try artifacts.readPhysicalRange(a, store, piece.pack.?.artifact_id, piece.pack_offset, length, cancellation, cache);
             errdefer a.free(bytes);
-            cache.cache.recordPhysicalRead(bytes.len);
             break :direct ServingCache.VerifiedLease{ .value = try ServingCache.VerifiedBytes.authenticate(bytes, digest), .owner = .{ .bytes = bytes, .owner = .{ .allocation = a } } };
         };
         return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, verified);

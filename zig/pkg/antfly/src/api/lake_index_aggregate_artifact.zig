@@ -24,6 +24,9 @@ const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const CachedRead = struct {
+    /// Publication-time capture of verified opening bytes, never request
+    /// authority. The callback is borrowed for the synchronous read only.
+    capture: ?struct { ptr: *anyopaque, record: *const fn (*anyopaque, []const u8, [32]u8, []const u8) anyerror!void } = null,
     /// Admission mode for field-sort windows; never changes artifact authority.
     lazy_lineage: bool = false,
     metrics: ?*@import("lake_query_metrics.zig").Metrics = null,
@@ -44,7 +47,13 @@ pub fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellati
     }{ .store = store, .ref = ref, .cancellation = cancellation };
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
     try cancellation.check();
-    if (cached) |cache| return cache.cache.readImmutableAlloc(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), cache.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
+    if (cached) |cache| {
+        const digest = try stores.sha256DigestFromChecksum(ref.checksum);
+        const bytes = try cache.cache.readImmutableAlloc(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, digest, cache.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
+        errdefer a.free(bytes);
+        if (cache.capture) |capture| try capture.record(capture.ptr, ref.artifact_id, digest, bytes);
+        return bytes;
+    }
     return @TypeOf(loader).load(&loader, a);
 }
 /// Authenticate a page range independently of its containing immutable object.
@@ -87,7 +96,10 @@ fn readBoundedRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u6
     if (cached) |cache| {
         var identity: [256]u8 = undefined;
         const key = try std.fmt.bufPrint(&identity, "{s}:page:{x}:{x}", .{ ref.artifact_id, offset, length });
-        return cache.cache.readImmutableAlloc(a, cache.scope, key, length, digest, cache.context, .{ .ptr = &loader, .load = Loader.load });
+        const bytes = try cache.cache.readImmutableAlloc(a, cache.scope, key, length, digest, cache.context, .{ .ptr = &loader, .load = Loader.load });
+        errdefer a.free(bytes);
+        if (cache.capture) |capture| try capture.record(capture.ptr, key, digest, bytes);
+        return bytes;
     }
     return Loader.load(&loader, a);
 }
@@ -119,8 +131,30 @@ pub fn readArtifactLease(a: A, store: stores.ArtifactStore, ref: ChunkRef, cance
     var loader: Loader = .{ .store = store, .ref = ref, .cancellation = cancellation };
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
     try cancellation.check();
-    if (cached) |cache| return cache.cache.readImmutableBlockLease(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), cache.context, .{ .ptr = &loader, .load = Loader.load });
+    if (cached) |cache| {
+        const digest = try stores.sha256DigestFromChecksum(ref.checksum);
+        var lease = try cache.cache.readImmutableBlockLease(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, digest, cache.context, .{ .ptr = &loader, .load = Loader.load });
+        errdefer lease.deinit();
+        if (cache.capture) |capture| try capture.record(capture.ptr, ref.artifact_id, digest, lease.bytes());
+        return lease;
+    }
     return .{ .heap = .{ .alloc = a, .bytes = try Loader.load(&loader, a) } };
+}
+
+/// Physical coalesced/unit reads bypass byte-cache loaders. Attribute their
+/// actual I/O here so request diagnostics count one wire operation per miss.
+pub fn readPhysicalRange(a: A, store: stores.ArtifactStore, id: []const u8, offset: u64, length: usize, token: Cancellation, cached: ?CachedRead) ![]u8 {
+    const trace = if (cached) |cache| cache.context.trace else null;
+    if (cached) |cache| try cache.context.ensureActive();
+    const started = if (trace) |value| value.begin() else 0;
+    var provider = store;
+    const bytes = provider.getRangeAllocWithCancellationUsingAllocator(a, id, offset, length, token) catch |err| {
+        if (trace) |value| value.end(started, 1, 0, true);
+        return err;
+    };
+    if (trace) |value| value.end(started, 1, bytes.len, false);
+    if (cached) |cache| cache.cache.recordPhysicalRead(bytes.len);
+    return bytes;
 }
 
 pub const metadata_version: u16 = 2;

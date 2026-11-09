@@ -19,11 +19,66 @@ const std = @import("std");
 const storage = @import("../../storage/object_storage.zig");
 const Allocator = std.mem.Allocator;
 
+/// Request-owned, bounded diagnostics. Workers share atomics, never a request
+/// arena or a callback retained by a cache. Elapsed I/O sums may overlap.
+pub const IoTrace = struct {
+    pub const Snapshot = struct {
+        ram_hits: u64 = 0,
+        disk_hits: u64 = 0,
+        provider_reads: u64 = 0,
+        provider_bytes: u64 = 0,
+        provider_errors: u64 = 0,
+        provider_nanoseconds: u64 = 0,
+        peak_inflight: u64 = 0,
+        opening_nanoseconds: u64 = 0,
+        pub fn add(self: *Snapshot, other: Snapshot) void {
+            inline for (@typeInfo(Snapshot).@"struct".field_names) |field| {
+                if (comptime std.mem.eql(u8, field, "peak_inflight")) @field(self, field) = @max(@field(self, field), @field(other, field)) else @field(self, field) +|= @field(other, field);
+            }
+        }
+        pub fn since(self: Snapshot, before: Snapshot) Snapshot {
+            var result: Snapshot = .{};
+            inline for (@typeInfo(Snapshot).@"struct".field_names) |field| @field(result, field) = if (comptime std.mem.eql(u8, field, "peak_inflight")) @field(self, field) else @field(self, field) -| @field(before, field);
+            return result;
+        }
+    };
+    const fields = @typeInfo(Snapshot).@"struct".field_names.len;
+    values: [fields]std.atomic.Value(u64) = @splat(.init(0)),
+    active: std.atomic.Value(u64) = .init(0),
+    pub fn add(self: *IoTrace, comptime field: []const u8, value: u64) void {
+        inline for (@typeInfo(Snapshot).@"struct".field_names, 0..) |name, i| if (comptime std.mem.eql(u8, field, name)) {
+            _ = self.values[i].fetchAdd(value, .monotonic);
+            return;
+        };
+        @compileError("unknown I/O trace counter");
+    }
+    pub fn snapshot(self: *const IoTrace) Snapshot {
+        var result: Snapshot = .{};
+        inline for (@typeInfo(Snapshot).@"struct".field_names, 0..) |field, i| @field(result, field) = self.values[i].load(.monotonic);
+        return result;
+    }
+    pub fn begin(self: *IoTrace) u64 {
+        const active = self.active.fetchAdd(1, .monotonic) + 1;
+        inline for (@typeInfo(Snapshot).@"struct".field_names, 0..) |field, i| if (comptime std.mem.eql(u8, field, "peak_inflight")) {
+            _ = self.values[i].fetchMax(active, .monotonic);
+        };
+        return @import("antfly_platform").time.monotonicNs();
+    }
+    pub fn end(self: *IoTrace, start: u64, requests: u64, bytes: u64, failed: bool) void {
+        _ = self.active.fetchSub(1, .monotonic);
+        self.add("provider_reads", requests);
+        self.add("provider_bytes", bytes);
+        self.add("provider_errors", @intFromBool(failed));
+        self.add("provider_nanoseconds", @import("antfly_platform").time.monotonicNs() -| start);
+    }
+};
+
 pub const Context = struct {
     io: ?std.Io = null,
     /// The owner has synchronized the construction allocator of every client
     /// used in this scope. Providers must separately advertise concurrency.
     parallel_object_io: bool = false,
+    trace: ?*IoTrace = null,
     deadline_ns: ?u64 = null,
     cancellation: ?storage.CancellationToken = null,
     checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
@@ -179,4 +234,28 @@ test "external lake bounded window profiles deadline identity survives flattened
     try std.testing.expectError(error.DeadlineExceeded, expired.ensureActive());
     const canceled_context: Context = .{ .cancellation = expired.cancellation };
     try std.testing.expectError(error.Canceled, canceled_context.ensureActive());
+}
+
+test "external lake opening I/O traces separate request traffic and overlapping reads" {
+    var first: IoTrace = .{};
+    var second: IoTrace = .{};
+    const left = first.begin();
+    const right = first.begin();
+    first.end(left, 1, 12, false);
+    first.end(right, 1, 0, true);
+    first.add("disk_hits", 1);
+    const before = first.snapshot();
+    try std.testing.expectEqual(@as(u64, 2), before.peak_inflight);
+    try std.testing.expectEqual(@as(u64, 2), before.provider_reads);
+    try std.testing.expectEqual(@as(u64, 1), before.provider_errors);
+    try std.testing.expectEqual(@as(u64, 12), before.provider_bytes);
+    try std.testing.expectEqual(@as(u64, 0), second.snapshot().provider_reads);
+    first.add("ram_hits", 1);
+    const delta = first.snapshot().since(before);
+    try std.testing.expectEqual(@as(u64, 1), delta.ram_hits);
+    try std.testing.expectEqual(@as(u64, 0), delta.provider_reads);
+    var merged: IoTrace.Snapshot = .{};
+    merged.add(before);
+    merged.add(delta);
+    try std.testing.expectEqual(@as(u64, 2), merged.peak_inflight);
 }

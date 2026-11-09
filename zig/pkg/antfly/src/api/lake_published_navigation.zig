@@ -134,11 +134,13 @@ const Factory = struct {
     }
     fn resolveVerified(self: *@This(), a: A, plans: Source.SnapshotPlans, header: local.serverless_external_source_types.Inventory, context: Context) !?Source.FileNavigation {
         const ref = self.publication.source_navigation orelse return null;
-        const held_context = self.lease.readContext();
+        var held_context = self.lease.readContext();
+        held_context.trace = context.trace;
         const token: @import("antfly_cancellation").CancellationToken = if (held_context.cancellation) |value| .{ .ptr = value.ptr, .is_cancelled_fn = value.is_cancelled_fn } else .none;
         try context.ensureActive();
         try self.store.bindPublication(self.publication, token);
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = self.cache, .scope = self.store.cache_identity, .context = held_context };
+        try @import("lake_publication_opening.zig").warm(self.store, self.publication, cached, token);
         const pin = @import("lake_index_decoded_metadata.zig").acquire(nav.Root, cached, self.store.artifactStore(), ref, token, nav.load) catch |err| switch (err) {
             error.OutOfMemory, error.SqlMemoryLimitExceeded, error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeFileState, error.CloudGenerationMapUnavailable => return null,
             else => return err,
@@ -159,7 +161,8 @@ const Factory = struct {
         errdefer owner.lease.deinit();
         owner.store = try self.store.reopenReadOnly(a);
         errdefer owner.store.deinit();
-        const owned_context = owner.lease.readContext();
+        var owned_context = owner.lease.readContext();
+        owned_context.trace = context.trace;
         owner.store.implementation.cloud_io = owned_context.io;
         try owner.store.bindPublication(self.publication, token);
         const oa = owner.arena.allocator();

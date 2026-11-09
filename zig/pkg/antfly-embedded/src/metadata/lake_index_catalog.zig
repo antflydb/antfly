@@ -26,11 +26,12 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 97;
+pub const native_reader_protocol: u16 = 98;
+pub const minimum_reader_protocol: u16 = 97;
 
-// Lake publications and build attempts use one current reader contract.
+// Readers retain the prior contract while new writers publish opening bundles.
 fn validateReaderProtocol(protocol: u16) !void {
-    if (protocol != native_reader_protocol) return error.InvalidLakeIndexCatalog;
+    if (protocol < minimum_reader_protocol or protocol > native_reader_protocol) return error.InvalidLakeIndexCatalog;
 }
 pub const max_contributions: usize = 1024 * 1024;
 pub const max_directory_bytes: usize = 16 * 1024 * 1024;
@@ -106,6 +107,10 @@ pub const CloudGenerations = struct {
     vacuum: CloudVacuumProgress = .{},
     certificate: ?CloudRetentionCertificate = null,
 };
+pub const OpeningBundle = struct {
+    artifact: artifacts.ArtifactRef,
+    decoded_bytes: u32,
+};
 pub const Publication = struct {
     reader_protocol: u16 = native_reader_protocol,
     /// Recovery checkpoints exclude the unavailable serving publication from
@@ -122,6 +127,10 @@ pub const Publication = struct {
     source_navigation: ?artifacts.ArtifactRef = null,
     /// Authenticated logical identity and relocation state, in this publication cut.
     row_identity: ?artifacts.ArtifactRef = null,
+    /// Optional immutable cache seeds. They never replace source, credential,
+    /// generation or reader-retention admission. Missing bundles fall back to
+    /// the original authenticated artifacts.
+    opening_bundles: []const OpeningBundle = &.{},
     declarations: []const manifest.DeclaredArtifact = &.{},
     directory: ?DirectoryRef = null,
     cloud_generations: ?CloudGenerations = null,
@@ -131,14 +140,34 @@ pub const Publication = struct {
     contribution_roots: []const Digest = &.{},
     contribution_ownership_version: u16 = 0,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
-        if (self.directory) |directory| {
-            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .source_navigation = self.source_navigation, .row_identity = self.row_identity, .directory = directory, .cloud_generations = self.cloud_generations });
-        } else {
-            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .source_navigation = self.source_navigation, .row_identity = self.row_identity, .declarations = self.declarations, .cloud_generations = self.cloud_generations });
+        try writer.beginObject();
+        inline for (.{ "reader_protocol", "reuse_published", "store_locator", "namespace", "generation", "token", "signature", "published_at_ms", "base_source", "inventory", "source_navigation", "row_identity" }) |name| {
+            try writer.objectField(name);
+            try writer.write(@field(self, name));
         }
+        if (self.directory) |directory| {
+            try writer.objectField("directory");
+            try writer.write(directory);
+        } else {
+            try writer.objectField("declarations");
+            try writer.write(self.declarations);
+        }
+        try writer.objectField("cloud_generations");
+        try writer.write(self.cloud_generations);
+        // Preserve the legacy wire shape when upgrading a retained old cut.
+        if (self.opening_bundles.len != 0) {
+            try writer.objectField("opening_bundles");
+            try writer.write(self.opening_bundles);
+        }
+        try writer.endObject();
     }
     pub fn validate(self: Publication) !void {
         try validateReaderProtocol(self.reader_protocol);
+        if (self.opening_bundles.len > 4 or (self.opening_bundles.len != 0 and self.reader_protocol < 98)) return error.InvalidLakeIndexCatalog;
+        for (self.opening_bundles) |bundle| {
+            if (bundle.artifact.kind != .doc_values or bundle.artifact.metadata_version != 1 or bundle.artifact.byte_len > 5 * 1024 * 1024 or bundle.decoded_bytes < 5 or bundle.decoded_bytes > 4 * 1024 * 1024) return error.InvalidLakeIndexCatalog;
+            try artifactValid(bundle.artifact);
+        }
         if (self.cloud_generations) |cloud| {
             try cloud.root.validate();
             if (cloud.certificate) |certificate| {
@@ -442,7 +471,7 @@ fn locatorEqual(a: A, left: ?StoreLocator, right: ?StoreLocator) !bool {
     return std.mem.eql(u8, before, after);
 }
 
-test "metadata.lake index publication preserves ready roots and fences changed definitions" {
+test "metadata.lake opening publication preserves ready roots and fences changed definitions" {
     const a = std.testing.allocator;
     const Table = @import("../common/topology_records.zig").TableRecord;
     var table: Table = .{ .table_id = 4, .name = "lake", .schema_json = "{}" };
@@ -459,6 +488,23 @@ test "metadata.lake index publication preserves ready roots and fences changed d
         .inventory = inventory,
         .declarations = &.{},
     };
+    var previous = publication;
+    previous.reader_protocol = minimum_reader_protocol;
+    try previous.validate();
+    const legacy_bytes = try std.json.Stringify.valueAlloc(a, previous, .{});
+    defer a.free(legacy_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_bytes, "opening_bundles") == null);
+    var accelerated = publication;
+    accelerated.opening_bundles = &.{.{ .artifact = .{ .kind = .doc_values, .metadata_version = 1, .artifact_id = "bundle", .checksum = inventory.checksum, .byte_len = 128 }, .decoded_bytes = 1024 }};
+    try accelerated.validate();
+    const accelerated_bytes = try std.json.Stringify.valueAlloc(a, accelerated, .{});
+    defer a.free(accelerated_bytes);
+    const roundtrip = try std.json.parseFromSlice(Publication, a, accelerated_bytes, .{});
+    defer roundtrip.deinit();
+    try roundtrip.value.validate();
+    try std.testing.expectEqual(@as(usize, 1), roundtrip.value.opening_bundles.len);
+    accelerated.reader_protocol = minimum_reader_protocol;
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, accelerated.validate());
     var paged = publication;
     paged.inventory.metadata_version = 1;
     try std.testing.expectError(error.InvalidLakeIndexCatalog, paged.validate());
@@ -467,7 +513,7 @@ test "metadata.lake index publication preserves ready roots and fences changed d
     try paged.validate();
     paged.reader_protocol = 52;
     try std.testing.expectError(error.InvalidLakeIndexCatalog, paged.validate());
-    for (0..native_reader_protocol) |protocol| {
+    for (0..minimum_reader_protocol) |protocol| {
         var invalid_attempt = attempt.pending.?;
         invalid_attempt.reader_protocol = @intCast(protocol);
         try std.testing.expectError(error.InvalidLakeIndexCatalog, invalid_attempt.validate());

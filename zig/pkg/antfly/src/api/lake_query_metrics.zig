@@ -79,6 +79,7 @@ pub const Navigation = struct {
 /// deltas cannot attribute one slow request inside a concurrent/warm burst.
 pub const ComposedProfile = struct {
     nanoseconds: [count]u64 = @splat(0),
+    io: local.serverless_query_lake_read_context.IoTrace.Snapshot = .{},
     pub fn record(self: *ComposedProfile, metrics: *Metrics, phase: Phase, start: u64) void {
         self.add(metrics, phase, @import("antfly_platform").time.monotonicNs() -| start);
     }
@@ -270,7 +271,7 @@ pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: any
         try prom.appendPromMetric(writer, "antfly_lake_cache_" ++ field ++ "_total", "counter", "Lake serving cache " ++ field, @field(memory, field));
     }
     if (disk) |stats| {
-        inline for (.{ "writes_completed", "write_errors", "writes_coalesced", "writes_dropped", "dropped_bytes", "read_errors", "corrupt_entries_removed", "drops_policy", "drops_queue", "drops_memory", "drops_capacity", "drops_allocation", "drops_closing" }) |field| {
+        inline for (.{ "writes_completed", "write_errors", "writes_coalesced", "writes_dropped", "dropped_bytes", "read_errors", "corrupt_entries_removed", "inventory_checkpoint_hits", "inventory_scan_entries", "drops_policy", "drops_queue", "drops_memory", "drops_capacity", "drops_allocation", "drops_closing" }) |field| {
             try prom.appendPromMetric(writer, "antfly_lake_disk_cache_" ++ field ++ "_total", "counter", "Persistent lake cache " ++ field, @field(stats, field));
         }
         inline for (.{ "stored_bytes", "entries", "queued_bytes", "queued_entries" }) |field| {
@@ -295,6 +296,10 @@ pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: any
         try prom.appendPromMetric(writer, "antfly_lake_query_public_oldest_" ++ stage ++ "_nanoseconds", "gauge", "Admission age of oldest live single-table public query currently in this stage", query.public_oldest_ns[i]);
     }
     if (query.slowest_lake) |profile| {
+        inline for (@typeInfo(local.serverless_query_lake_read_context.IoTrace.Snapshot).@"struct".field_names) |field| {
+            try prom.appendPromMetric(writer, "antfly_lake_query_slowest_lake_io_" ++ field, "gauge", "Request-owned immutable I/O profile; parallel elapsed sums overlap", @field(profile.io, field));
+        }
+
         inline for (.{ "total", "admission", "wal_cut", "source", "publication", "ranking", "cursor_retention", "result_delivery" }) |phase| {
             try prom.appendPromMetric(writer, "antfly_lake_query_slowest_lake_" ++ phase ++ "_nanoseconds", "gauge", "Request-local phase of slowest lake request above 750 ms since startup; unlisted setup is part of total", profile.duration(@field(Phase, phase)));
         }

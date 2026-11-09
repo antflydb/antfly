@@ -72,6 +72,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
     artifacts.allocator = a;
     const normalized: @import("antfly_cancellation").CancellationToken = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;
     const cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead = if (cache) |shared| .{ .cache = shared, .scope = store.cache_identity, .context = context } else null;
+    if (cached) |read| try @import("lake_publication_opening.zig").warm(store, published, read, normalized);
     var inventory_lease: ?@import("lake_index_decoded_metadata.zig").Owned(InventoryMetadata) = null;
     errdefer if (inventory_lease) |owned| owned.release();
     var owned_inventory: ?InventoryMetadata = null;
@@ -243,7 +244,7 @@ test "external lake navigation distinguishes stale source cuts from invalid publ
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, validateNavigationIdentity(root, root.domain, changed, 2));
 }
 
-test "external lake inventory coverage proofs bind immutable plans publications and fresh request authority" {
+test "external lake opening inventory coverage proofs bind immutable plans publications and fresh request authority" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("coverage-proof-selection");
     defer directory.cleanup();
@@ -279,6 +280,28 @@ test "external lake inventory coverage proofs bind immutable plans publications 
     defer a.free(published);
     var parsed = try catalog.parse(a, published);
     defer parsed.deinit();
+    try std.testing.expect(parsed.value.published.?.opening_bundles.len > 0);
+    var opening_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer opening_cache.deinit();
+    var opening_trace: local.serverless_query_lake_read_context.IoTrace = .{};
+    const opening_read: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &opening_cache, .scope = @splat(21), .context = .{ .io = std.testing.io, .trace = &opening_trace } };
+    var expired_read = opening_read;
+    expired_read.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, @import("lake_publication_opening.zig").warm(&store, parsed.value.published.?, expired_read, .none));
+    try std.testing.expectEqual(@as(u64, 0), opening_trace.snapshot().provider_reads);
+    try @import("lake_publication_opening.zig").warm(&store, parsed.value.published.?, opening_read, .none);
+    const seed_reads = opening_trace.snapshot().provider_reads;
+    try std.testing.expectEqual(parsed.value.published.?.opening_bundles.len, seed_reads);
+    try @import("lake_publication_opening.zig").warm(&store, parsed.value.published.?, opening_read, .none);
+    try std.testing.expectEqual(seed_reads, opening_trace.snapshot().provider_reads);
+    var damaged = parsed.value.published.?;
+    var bad_bundle = damaged.opening_bundles[0];
+    bad_bundle.decoded_bytes += 1;
+    damaged.opening_bundles = &.{bad_bundle};
+    // Authenticated but invalid optional seed cannot make the original
+    // publication unavailable. The demand paths below remain authoritative.
+    try @import("lake_publication_opening.zig").warm(&store, damaged, opening_read, .none);
+
     // Exercise the current inventory-backed proof memo independently of
     // optional source-navigation admission.
     const legacy_inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, source.inventory);

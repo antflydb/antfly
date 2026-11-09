@@ -167,6 +167,66 @@ External-writer freshness, vector overlays and unsupported cursor shapes keep
 their established paths until separately qualified. Warm fixture latency targets
 do not qualify full-archive performance or scale-to-zero startup.
 
+### Cold opening and restart recovery
+
+Publication reader protocol 98 adds optional `opening_bundles` to the committed
+catalog record. Each bundle contains compressed, individually authenticated
+opening artifacts and page ranges: source and index roots, row-identity paths,
+term statistics/directories, routing, file dictionaries, and a bounded selection
+of segment opening metadata. Their identities and sizes are available from the
+publication itself, so serving can fetch them without first discovering a chain
+of child objects. Original artifacts remain independently rooted; missing or
+invalid bundle contents fall back to verified demand reads. Bundles carry no
+credentials, leases, mutable HEAD, or source authority.
+
+The producer reads at most 32 MiB of opening payloads, visits at most 64 pages
+through three child levels, and opens metadata for at most 16 segments. It emits
+at most four bundles, each at most 4 MiB decoded. These limits prevent archive
+size or index count from turning a publication hint into a corpus download.
+The cold reader coalesces concurrent preparation of the same publication and
+credential scope. Independently owned provider clients fetch bundles in waves
+with at most four workers, a conservative 32 MiB wave reservation, and the shared
+I/O scheduler's admission. Cancellation joins workers before releasing clients
+or scratch memory. Denied optional scheduling falls back to demand reads.
+Cloud generation maps, retention certificates, and collection mark the new
+bundle objects alongside the original closure.
+
+A cleanly drained disk-cache owner writes a bounded inventory checkpoint in its
+private, exclusively locked directory. Restart validates its checksum, directory
+identity and timestamps, consumes it before serving, and reconstructs accounting
+and eviction order without opening every cached file. An interrupted owner,
+changed directory, corrupt checkpoint, or smaller capacity falls back to the
+existing complete scan. Cached payloads still require exact identity, key,
+length, and digest verification. API startup starts optional restoration only
+after the server occupies its final address, before public HTTP admission;
+queries retain the RAM/source fallback while restoration runs.
+
+The admitted native cut remains the authority for committed generation and WAL
+watermark. Restart cache recovery does not relax freshness, reader expiry,
+incarnation, credential rotation, or external-catalog checks. Protocol 97 cuts
+remain readable without bundles; a new publication/rebuild is needed to gain
+publication-level opening bundles. Metadata capability 85 fences older readers
+from new lake catalog writes.
+
+Request-owned atomic I/O profiles record immutable RAM/disk hits, provider read
+count/bytes/errors, overlapping provider elapsed time, peak active loads, and
+bundle-opening time. They attach to the prepared reader's lifetime, not a leaf's
+scratch arena, and survive only through the request's bounded diagnostic
+snapshot. Process counters continue to cover all provider traffic; these request
+profiles specifically attribute immutable index/cache reads. Slow-request health
+metrics expose the profile without table names, object paths, or credentials.
+Disk metrics distinguish checkpoint recovery from scanned inventory entries.
+
+This follows [Lance's upfront metadata size hints and reading strategy](https://lance.org/format/file/#reading-strategy),
+[DuckLake's snapshot/file metadata catalog](https://ducklake.select/docs/stable/specification/queries),
+and [DuckDB's asynchronous I/O and governed readahead](https://duckdb.org/2026/07/31/asynchronous-io).
+The cache follows the same distinction as [Databricks disk caching](https://docs.databricks.com/aws/en/optimizations/disk-cache):
+local restart reuse improves repeated access, while a genuinely empty cache must
+still fetch remote bytes. [Lance's cache and concurrency guidance](https://lance.org/guide/performance/)
+also motivates separate metadata residency and modest, byte-budgeted parallelism
+on small instances. These changes preserve selective posting reads and winning-hit
+hydration; they do not download full archive indexes to make a first query fast.
+
 External lake sidecars retain one metadata authority: a builder first commits a
 pending attempt through definition CAS, renews its fence, uploads immutable
 artifacts, and publishes through the exact admitted CAS. Upload completion is

@@ -30,7 +30,7 @@ fn digestRoot(id: []const u8) [32]u8 {
     return result;
 }
 pub fn certificateBinding(a: A, publication: catalog.Publication, certificate: catalog.CloudRetentionCertificate) ![32]u8 {
-    const encoded = if (publication.row_identity != null) try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-cloud-retention-v3", .reader_protocol = publication.reader_protocol, .namespace = publication.namespace, .generation = publication.generation, .token = publication.token, .signature = publication.signature, .store_locator = publication.store_locator, .base_source = publication.base_source, .inventory = publication.inventory, .source_navigation = publication.source_navigation, .row_identity = publication.row_identity, .directory = publication.directory, .map = publication.cloud_generations.?.root, .complete = publication.cloud_generations.?.complete, .until_ms = certificate.until_ms, .roots = certificate.roots }, .{}) else if (publication.source_navigation == null) try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-cloud-retention-v1", .reader_protocol = publication.reader_protocol, .namespace = publication.namespace, .generation = publication.generation, .token = publication.token, .signature = publication.signature, .store_locator = publication.store_locator, .base_source = publication.base_source, .inventory = publication.inventory, .directory = publication.directory, .map = publication.cloud_generations.?.root, .complete = publication.cloud_generations.?.complete, .until_ms = certificate.until_ms, .roots = certificate.roots }, .{}) else try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-cloud-retention-v2", .reader_protocol = publication.reader_protocol, .namespace = publication.namespace, .generation = publication.generation, .token = publication.token, .signature = publication.signature, .store_locator = publication.store_locator, .base_source = publication.base_source, .inventory = publication.inventory, .source_navigation = publication.source_navigation, .directory = publication.directory, .map = publication.cloud_generations.?.root, .complete = publication.cloud_generations.?.complete, .until_ms = certificate.until_ms, .roots = certificate.roots }, .{});
+    const encoded = if (publication.opening_bundles.len != 0) try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-cloud-retention-v4", .reader_protocol = publication.reader_protocol, .namespace = publication.namespace, .generation = publication.generation, .token = publication.token, .signature = publication.signature, .store_locator = publication.store_locator, .base_source = publication.base_source, .inventory = publication.inventory, .source_navigation = publication.source_navigation, .row_identity = publication.row_identity, .directory = publication.directory, .opening_bundles = publication.opening_bundles, .map = publication.cloud_generations.?.root, .complete = publication.cloud_generations.?.complete, .until_ms = certificate.until_ms, .roots = certificate.roots }, .{}) else if (publication.row_identity != null) try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-cloud-retention-v3", .reader_protocol = publication.reader_protocol, .namespace = publication.namespace, .generation = publication.generation, .token = publication.token, .signature = publication.signature, .store_locator = publication.store_locator, .base_source = publication.base_source, .inventory = publication.inventory, .source_navigation = publication.source_navigation, .row_identity = publication.row_identity, .directory = publication.directory, .map = publication.cloud_generations.?.root, .complete = publication.cloud_generations.?.complete, .until_ms = certificate.until_ms, .roots = certificate.roots }, .{}) else if (publication.source_navigation == null) try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-cloud-retention-v1", .reader_protocol = publication.reader_protocol, .namespace = publication.namespace, .generation = publication.generation, .token = publication.token, .signature = publication.signature, .store_locator = publication.store_locator, .base_source = publication.base_source, .inventory = publication.inventory, .directory = publication.directory, .map = publication.cloud_generations.?.root, .complete = publication.cloud_generations.?.complete, .until_ms = certificate.until_ms, .roots = certificate.roots }, .{}) else try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-cloud-retention-v2", .reader_protocol = publication.reader_protocol, .namespace = publication.namespace, .generation = publication.generation, .token = publication.token, .signature = publication.signature, .store_locator = publication.store_locator, .base_source = publication.base_source, .inventory = publication.inventory, .source_navigation = publication.source_navigation, .directory = publication.directory, .map = publication.cloud_generations.?.root, .complete = publication.cloud_generations.?.complete, .until_ms = certificate.until_ms, .roots = certificate.roots }, .{});
     defer a.free(encoded);
     return digestRoot(encoded);
 }
@@ -140,6 +140,7 @@ pub fn finish(a: A, writer: *maps.Writer, object: *Object, publication: *catalog
     var roots: std.ArrayList([32]u8) = .empty;
     defer roots.deinit(a);
     try roots.append(a, digestRoot(publication.inventory.artifact_id));
+    for (publication.opening_bundles) |bundle| try roots.append(a, digestRoot(bundle.artifact.artifact_id));
     if (publication.source_navigation) |navigation| try roots.append(a, digestRoot(navigation.artifact_id));
     if (publication.row_identity) |row_identity| try roots.append(a, digestRoot(row_identity.artifact_id));
     if (publication.directory) |directory| try roots.append(a, digestRoot(directory.artifact_id));
@@ -407,7 +408,7 @@ test "external lake global frontier cloud GC retains pinned generations and does
     try std.testing.expectEqualStrings("second inventory", live);
 }
 
-test "external lake global frontier wrapped publication builds real Parquet packs durable checkpoints and cloud certificates" {
+test "external lake opening global frontier wrapped publication builds real Parquet packs durable checkpoints and cloud certificates" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("cloud-publication-adapter");
     defer directory.cleanup();
@@ -470,6 +471,7 @@ test "external lake global frontier wrapped publication builds real Parquet pack
     defer published.deinit();
     const selected = published.value.published.?;
     try std.testing.expect(harness.checkpoints != 0);
+    try std.testing.expect(selected.opening_bundles.len > 0);
     try std.testing.expect(selected.cloud_generations.?.complete);
     try std.testing.expect(selected.cloud_generations.?.certificate != null);
     var reopened = try Object.initWithClient(a, client, "bucket", "native");
@@ -478,6 +480,11 @@ test "external lake global frontier wrapped publication builds real Parquet pack
     var binding = (try Binding.init(a, &reopened, selected, .none)).?;
     defer binding.deinit();
     var artifacts = reopened.artifactStore();
+    for (selected.opening_bundles) |bundle| {
+        const bytes = try artifacts.getVerifiedAllocWithCancellation(bundle.artifact.artifact_id, bundle.artifact.byte_len, bundle.artifact.checksum, .none);
+        defer a.free(bytes);
+        try std.testing.expect(try artifacts.retainedClosure(bundle.artifact.artifact_id, .none));
+    }
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
