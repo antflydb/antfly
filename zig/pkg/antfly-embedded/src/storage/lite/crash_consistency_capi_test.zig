@@ -363,6 +363,22 @@ fn checkViaSqlForeignKeyChild(allocator: Allocator, path: []const u8, outcome: ?
             std.debug.print("crash-consistency capi FK: parent DELETE succeeded despite a surviving child reference\n", .{});
             return error.CrashConsistencyAcknowledgedWriteLost;
         }
+    } else {
+        // lite-single-commit-write-path.md §7.6: the inverse of the check
+        // above, and the whole point of the self-healing fix. No child
+        // row is durably present, so if the crash landed in the window
+        // between the follower's ride-along `.attach` commit and the
+        // leader's own row commit -- the non-atomicity gap this
+        // coordinator cannot fully close -- a dangling Reference record
+        // may still be sitting there with no child behind it. RESTRICT's
+        // own existence check (`relational_integrity.zig`'s
+        // `requireEmpty` + `ChildExistenceCheck`) must recognize it as
+        // stale and let the parent go, not block it forever.
+        const code = try execOutcome(allocator, handle.id, "DELETE FROM parents WHERE id = 0");
+        if (code != .ok) {
+            std.debug.print("crash-consistency capi FK: parent DELETE blocked ({s}) with no child row durably present -- a dangling reference was not self-healed\n", .{@tagName(code)});
+            return error.CrashConsistencyAcknowledgedWriteLost;
+        }
     }
 }
 
@@ -393,6 +409,16 @@ test "crash sweep: relational foreign-key child insert, child row and attach rec
         .run = runRelationalForeignKeyChildInsert,
         .custom_check = checkViaSqlForeignKeyChild,
     }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep exhaustive: relational foreign-key child insert, child row and attach record are all-or-nothing" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "relational-fk-child-insert",
+        .run = runRelationalForeignKeyChildInsert,
+        .custom_check = checkViaSqlForeignKeyChild,
+    }, .{ .mode = .exhaustive });
     defer report.deinit();
     try reportFailures(&report);
 }
