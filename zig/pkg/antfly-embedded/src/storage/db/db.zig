@@ -149707,3 +149707,55 @@ test "scalar text asset chunks asynchronous mixed parents settle publication" {
         try std.testing.expect(status.source_replay[0].producer_complete);
     }
 }
+
+test "source semantic media input PDF URI template registration survives reopen and admits repair" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-pdf-template");
+    defer directory.cleanup();
+    const options = OpenOptions{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } };
+    var db = try DB.open(a, directory.path(), options);
+    {
+        defer db.close();
+        const config = types.EnrichmentConfig{ .name = "pages", .kind = .embedding, .template = "{{{content.resource.uri}}}", .embedding_input = .pdf_page_images, .expected_dims = 3 };
+        try db.addEnrichment(config);
+        try std.testing.expectEqual(index_manager_mod.IndexManager.EnrichmentUpsertResult.unchanged, try db.upsertEnrichment(config));
+        var invalid = config;
+        invalid.name = "invalid_pages";
+        invalid.chunk_size = 128;
+        try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(invalid));
+        invalid.chunk_size = 0;
+        invalid.chunker_json = "{}";
+        try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(invalid));
+        invalid.chunker_json = "";
+        invalid.kind = .chunk;
+        try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(invalid));
+    }
+    db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    var config = (try db.getEnrichment(a, .embedding, "pages")).?;
+    defer config.deinit(a);
+    try std.testing.expectEqualStrings("{{{content.resource.uri}}}", config.template);
+    try std.testing.expectEqual(@TypeOf(config.embedding_input).pdf_page_images, config.embedding_input);
+    var repaired = try db.reprocessDocumentArtifactRange(a, "pages", .{ .limit = 1 });
+    defer repaired.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), repaired.scanned);
+}
+
+test "source semantic media input repair distinguishes supported producer kinds" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("source-repair-kinds");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "content", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "text", .source_artifact_name = "content", .chunk_size = 128 });
+    try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .field = "text" } });
+    try db.addEnrichment(.{ .name = "dense", .kind = .embedding, .field = "body", .expected_dims = 3 });
+    for ([_][]const u8{ "content", "dense" }) |name| {
+        var repaired = try db.reprocessDocumentArtifactRange(a, name, .{ .limit = 1 });
+        defer repaired.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), repaired.scanned);
+    }
+    for ([_][]const u8{ "chunks", "turns" }) |name|
+        try std.testing.expectError(error.NotFound, db.reprocessDocumentArtifactRange(a, name, .{ .limit = 1 }));
+}

@@ -2647,3 +2647,27 @@ test "PDF embedding input public contract round trips and validates modes" {
     try enrichment.object.put(arena.allocator(), "kind", .{ .string = "asset" });
     try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(a, value.object, "pdf_vectors", .{ .include_name = true, .default_type = true }));
 }
+
+test "PDF embedding input public contract rejects conflicting producer modes and text chunking" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources").api_local_indexes;
+    const types = @import("antfly_local_sources").storage_db_types;
+    const text = types.EnrichmentConfig{ .name = "pages", .kind = .embedding, .field = "pdf_uri", .expected_dims = 3 };
+    var pdf = text;
+    pdf.embedding_input = .pdf_page_images;
+    try std.testing.expect(!try local.artifactEnrichmentConfigsEqual(a, text, pdf));
+    try std.testing.expect(try local.artifactEnrichmentConfigsEqual(a, pdf, pdf));
+    try std.testing.expectError(error.ConflictingEnrichmentConfig, local.validateArtifactEnrichmentConfigDefinitions(a, &.{ text, pdf }));
+    try local.validateArtifactEnrichmentConfigDefinitions(a, &.{ pdf, pdf });
+    pdf.field = "";
+    pdf.template = "{{{content.resource.uri}}}";
+    try local.validateArtifactEnrichmentConfigDefinitions(a, &.{pdf});
+    pdf.chunk_size = 128;
+    try std.testing.expectError(error.InvalidEnrichmentConfig, local.validateArtifactEnrichmentConfigDefinitions(a, &.{pdf}));
+    pdf.chunk_size = 0;
+    pdf.chunker_json = "{}";
+    try std.testing.expectError(error.InvalidEnrichmentConfig, local.validateArtifactEnrichmentConfigDefinitions(a, &.{pdf}));
+    pdf.chunker_json = "";
+    pdf.kind = .asset;
+    try std.testing.expectError(error.InvalidEnrichmentConfig, local.validateArtifactEnrichmentConfigDefinitions(a, &.{pdf}));
+}
