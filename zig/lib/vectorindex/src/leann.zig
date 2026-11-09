@@ -219,7 +219,7 @@ pub const RecomputeGate = struct {
 
 pub const SearchOptions = struct {
     k: u32 = 10,
-    /// Only nodes this allows are returned (or recomputed in `bounds` mode).
+    /// Only nodes this allows are returned or recomputed during filtered search.
     filter: ?Filter = null,
     gate: ?RecomputeGate = null,
     /// Beam width, raised to `k` when smaller. Zero picks a default per
