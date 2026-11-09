@@ -16,12 +16,15 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/antflydb/antfly/go/pkg/sources/management"
 	"github.com/stretchr/testify/require"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"testing"
@@ -227,4 +230,55 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 	_, err = p.ProcessingJob(ctx, source, management.ProcessingJobRequest{Artifact: artifact.Artifact, Action: "cancel", JobId: id})
 	require.NoError(t, err)
 
+}
+
+// Invalid input shapes must fail before model resolution or catalog publication.
+func TestNativePDFInputAdmission(t *testing.T) {
+	endpoint := os.Getenv("ANTFLY_SOURCES_E2E_URL")
+	if endpoint == "" {
+		t.Skip("set ANTFLY_SOURCES_E2E_URL to an isolated native server")
+	}
+	u, err := url.Parse(endpoint)
+	require.NoError(t, err)
+	require.True(t, u.Scheme == "http" && net.ParseIP(u.Hostname()).IsLoopback())
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	p := &Publisher{Endpoint: endpoint}
+	table := fmt.Sprintf("pdf_input_admission_%d", time.Now().UnixNano())
+	require.NoError(t, p.EnsureTable(ctx, table))
+	require.NoError(t, p.Batch(ctx, table, map[string]any{"doc": map[string]any{"body": "https://example.invalid/source.pdf"}}, nil))
+	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for _, sparse := range []bool{false, true} {
+		name := "pdf_chunks"
+		enrichment := map[string]any{"name": "pages", "kind": "embedding", "field": "text", "embedding_input": "pdf_page_images", "source_artifact_name": "links", "expected_dims": 3}
+		config := map[string]any{"type": "embeddings", "dimension": 3, "embedder": map[string]any{"provider": "ollama", "model": "unavailable-fixture"}, "sources": []any{map[string]any{"artifact": "pages"}}, "enrichments": []any{map[string]any{"name": "links", "kind": "chunk", "field": "body", "chunk_size": 512}, enrichment}}
+		if sparse {
+			name = "pdf_sparse"
+			config["sparse"] = true
+			delete(config, "dimension")
+			delete(enrichment, "source_artifact_name")
+			delete(enrichment, "expected_dims")
+			enrichment["field"] = "body"
+		}
+		body, err := json.Marshal(config)
+		require.NoError(t, err)
+		target := endpoint + "/tables/" + table + "/indexes/" + name
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+		require.NoError(t, err)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := client.Do(request)
+		require.NoError(t, err)
+		raw, err := io.ReadAll(io.LimitReader(response.Body, 4096))
+		response.Body.Close()
+		require.NoError(t, err)
+		require.Equal(t, http.StatusBadRequest, response.StatusCode, "invalid %s: %s", name, raw)
+		request, err = http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		require.NoError(t, err)
+		response, err = client.Do(request)
+		require.NoError(t, err)
+		raw, err = io.ReadAll(io.LimitReader(response.Body, 4096))
+		response.Body.Close()
+		require.NoError(t, err)
+		require.Equal(t, http.StatusNotFound, response.StatusCode, "invalid index was published: %s", raw)
+	}
 }

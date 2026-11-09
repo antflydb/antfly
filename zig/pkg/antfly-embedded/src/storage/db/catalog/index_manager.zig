@@ -16434,6 +16434,7 @@ pub const IndexManager = struct {
                 }
                 try appendOwnedGeneratedRequest(alloc, &requests, .{
                     .kind = .sparse_embedding,
+                    .embedding_input = embedding_cfg.embedding_input,
                     .index_name = entry.config.name,
                     .artifact_name = chunk_cfg.artifact_name,
                     .embedding_name = embedding_name,
@@ -16466,6 +16467,7 @@ pub const IndexManager = struct {
                         if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try appendOwnedGeneratedRequest(alloc, &requests, .{
                                 .kind = .sparse_embedding,
+                                .embedding_input = embedding_cfg.embedding_input,
                                 .index_name = entry.config.name,
                                 .artifact_name = chunk_cfg.name,
                                 .embedding_name = embedding_name,
@@ -16484,6 +16486,7 @@ pub const IndexManager = struct {
                     } else if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
                         try appendOwnedGeneratedRequest(alloc, &requests, .{
                             .kind = .sparse_embedding,
+                            .embedding_input = embedding_cfg.embedding_input,
                             .index_name = entry.config.name,
                             .artifact_name = "",
                             .embedding_name = embedding_name,
@@ -17890,7 +17893,7 @@ pub const IndexManager = struct {
                 else
                     null;
                 if (referenced_embedding) |embedding_cfg| {
-                    if (embedding_cfg.expected_dims != 0) return error.InvalidIndexConfig;
+                    if (embedding_cfg.expected_dims != 0 or embedding_cfg.embedding_input != .text) return error.InvalidIndexConfig;
                 }
                 return .{
                     .chunk_name = if (sparse_generator) |generator| blk: {
@@ -24095,7 +24098,7 @@ pub const IndexManager = struct {
                     return error.InvalidIndexConfig;
                 }
                 if (referenced_embedding) |embedding_cfg| {
-                    if (embedding_cfg.expected_dims != 0) return error.InvalidIndexConfig;
+                    if (embedding_cfg.expected_dims != 0 or embedding_cfg.embedding_input != .text) return error.InvalidIndexConfig;
                 }
                 var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
                 var multi_source_supports_unit_grouping = sparse_cfg.embedding_names.len > 0;
@@ -24104,7 +24107,7 @@ pub const IndexManager = struct {
                 var multi_source_implicit_producer: ?[]const u8 = null;
                 for (sparse_cfg.embedding_names) |embedding_name| {
                     const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
-                    if (embedding_cfg.expected_dims != 0) return error.InvalidIndexConfig;
+                    if (embedding_cfg.expected_dims != 0 or embedding_cfg.embedding_input != .text) return error.InvalidIndexConfig;
                     if (sparse_cfg.embedding_names.len > 1) {
                         if (embedding_cfg.vector_space.len == 0) {
                             multi_source_has_implicit_vector_space = true;
@@ -25479,6 +25482,7 @@ pub const IndexManager = struct {
                 defer if (semantic_producer) |value| self.alloc.free(value);
                 if (try parseDenseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
                     defer generator.deinit(self.alloc);
+                    try enrichment_types.validateEmbeddingInputShape(generator.embedding_input, true, generatorHasChunking(generator));
                     const chunk_cfg = resolveChunkGenerator(self, generator);
                     if (generatorHasChunking(chunk_cfg)) {
                         changed = (try self.ensureChunkEnrichment(.{
@@ -25629,7 +25633,7 @@ pub const IndexManager = struct {
 
     fn validateEnrichmentConfig(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
         if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
-        try enrichment_config_validation.validateEmbeddingInput(internalEnrichmentKindToPublic(cfg.kind), cfg.embedding_input, cfg.chunk_size, cfg.chunker_json);
+        try enrichment_config_validation.validateEmbeddingInput(internalEnrichmentKindToPublic(cfg.kind), cfg.embedding_input, cfg.source_artifact_name, cfg.chunk_size, cfg.chunker_json);
         if (cfg.group_source_json.len > 0 or cfg.prior_context_json.len > 0) {
             var public = try enrichmentToPublic(self.alloc, cfg);
             defer public.deinit(self.alloc);
@@ -25769,11 +25773,14 @@ pub const IndexManager = struct {
                 if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
             }
             if (entry.embedding_name) |embedding_name| {
-                if (!entry.external and !entry.managed_direct_field and self.getEnrichment(.embedding, embedding_name) == null) return error.InvalidEnrichmentConfig;
+                if (!entry.external and !entry.managed_direct_field) {
+                    const enrichment = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidEnrichmentConfig;
+                    if (enrichment.expected_dims != 0 or enrichment.embedding_input != .text) return error.InvalidEnrichmentConfig;
+                }
             }
             for (entry.embedding_names) |embedding_name| {
                 const enrichment = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidEnrichmentConfig;
-                if (enrichment.expected_dims != 0) return error.InvalidEnrichmentConfig;
+                if (enrichment.expected_dims != 0 or enrichment.embedding_input != .text) return error.InvalidEnrichmentConfig;
             }
         }
         for (self.graph_indexes.items) |entry| {
@@ -36621,6 +36628,7 @@ fn hasGeneratedSparseEmbeddingRequest(
 }
 
 fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) GeneratorConfig {
+    if (generator.embedding_input == .pdf_page_images) return generator;
     if (self.getEnrichment(.chunk, generator.artifact_name)) |cfg| {
         return .{
             .source_field = @constCast(cfg.source_field),
@@ -36643,6 +36651,9 @@ fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) 
 /// Runtime and replay code must consume this explicit shape rather than infer
 /// it from the overloaded artifact name.
 fn embeddingInputKind(self: *const IndexManager, generator: GeneratorConfig) enrichment_types.EmbeddingInputKind {
+    // PDF artifact_name identifies the generated page output. An unrelated
+    // chunk with that name cannot turn the original document into chunk input.
+    if (generator.embedding_input == .pdf_page_images) return .document;
     if (generator.artifact_name.len > 0) {
         if (self.getEnrichment(.chunk, generator.artifact_name)) |cfg|
             return embeddingInputKindForChunkEnrichment(cfg);

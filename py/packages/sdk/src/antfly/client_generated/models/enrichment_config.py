@@ -39,9 +39,10 @@ class EnrichmentConfig:
                 consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other
                 asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must
                 be omitted and the producer must consume text: copy, generator, or extractor).
-            embedding_input (EnrichmentConfigEmbeddingInput | Unset): pdf_page_images requires kind=embedding, consumes a
-                PDF URI, and embeds its rendered pages. Native field selectors address literal root keys; use a raw template for
-                nested resource URIs. Default: EnrichmentConfigEmbeddingInput.TEXT.
+            embedding_input (EnrichmentConfigEmbeddingInput | Unset): pdf_page_images requires kind=embedding and a dense
+                index. It consumes an original PDF URI selected by field or template and embeds its rendered pages. Upstream
+                artifacts (source_artifact_name) and text chunking are not supported. Native field selectors address literal
+                root keys; use a raw template for nested resource URIs. Default: EnrichmentConfigEmbeddingInput.TEXT.
             expected_dims (int | Unset): Expected embedding dimension for embedding enrichments.
             vector_space (str | Unset): Optional stable model/token-space identifier for embedding artifacts. When omitted
                 on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally

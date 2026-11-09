@@ -41,10 +41,10 @@ pub fn producerJsonValuesEqual(alloc: Allocator, lhs: []const u8, rhs: []const u
 /// fields and rendered URI templates are supported; text chunking is not.
 /// Share this check with storage admission to avoid accepting definitions that
 /// cannot be installed after metadata publication.
-pub fn validateEmbeddingInput(kind: types.EnrichmentKind, input: @import("enrichment_types.zig").EmbeddingInput, chunk_size: u32, chunker_json: []const u8) !void {
+pub fn validateEmbeddingInput(kind: types.EnrichmentKind, input: @import("enrichment_types.zig").EmbeddingInput, source_artifact_name: []const u8, chunk_size: u32, chunker_json: []const u8) !void {
     if (input == .text) return;
-    if (kind != .embedding or chunk_size != 0 or chunker_json.len != 0)
-        return error.InvalidEnrichmentConfig;
+    if (kind != .embedding) return error.InvalidEnrichmentConfig;
+    try @import("enrichment_types.zig").validateEmbeddingInputShape(input, source_artifact_name.len == 0, chunk_size != 0 or chunker_json.len != 0);
 }
 
 /// Validates the context-free portion of a public enrichment definition.
@@ -52,7 +52,7 @@ pub fn validateEmbeddingInput(kind: types.EnrichmentKind, input: @import("enrich
 /// function is intentionally shared by API admission and local provisioning.
 pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void {
     if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
-    try validateEmbeddingInput(cfg.kind, cfg.embedding_input, cfg.chunk_size, cfg.chunker_json);
+    try validateEmbeddingInput(cfg.kind, cfg.embedding_input, cfg.source_artifact_name, cfg.chunk_size, cfg.chunker_json);
     if (cfg.kind == .group) {
         const source = cfg.source orelse return error.InvalidEnrichmentConfig;
         try source.validate();
