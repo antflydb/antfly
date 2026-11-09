@@ -1319,13 +1319,21 @@ pub const DocStore = struct {
             /// points below, which heap-allocate it, free it themselves
             /// after this returns.
             pub fn wait(self: StagedBatch) !void {
+                _ = try self.waitSequence();
+            }
+
+            /// Like `wait`, also returning the commit sequence this batch's
+            /// own native group committed at (0 on a backend with no such
+            /// concept -- see `backend_erased.Ticket.waitSequence`).
+            /// Regression-B test hook.
+            pub fn waitSequence(self: StagedBatch) !u64 {
                 // `self.batch` (not yet freed: the caller -- `StagedDocBatch.
                 // wait`/`commit` -- only destroys it after this function has
                 // returned) owns the one-shot guard, so a second `wait()`
                 // reached through another copy of this value-type wrapper
                 // cannot double-release `source_owner`'s certificate credit.
                 defer self.batch.releaseSourceCertificateOnce(self.source_owner);
-                self.ticket.wait() catch |err| {
+                const sequence = self.ticket.waitSequence() catch |err| {
                     self.batch.retained.poisoned = true;
                     if (self.source_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
                     // Deliberately not releasing `retained`/`artifact_inputs`/
@@ -1359,6 +1367,7 @@ pub const DocStore = struct {
                 self.batch.document_revisions.deinit(self.batch.alloc);
                 if (self.bump_columnar_revision) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
                 self.batch.* = undefined;
+                return sequence;
             }
         };
 
@@ -2700,6 +2709,13 @@ pub const DocStore = struct {
         replay_observation: ?StagedReplayObservation = null,
 
         pub fn wait(self: StagedDocBatch) !void {
+            _ = try self.waitSequence();
+        }
+
+        /// Like `wait`, also returning the commit sequence this batch's own
+        /// native group committed at (0 on a backend with no such concept).
+        /// Regression-B test hook; see `backend_erased.Ticket.waitSequence`.
+        pub fn waitSequence(self: StagedDocBatch) !u64 {
             // `inner.wait()` (`Batch.StagedBatch.wait`) deliberately does
             // *not* release `heap_batch`'s retained/artifact_inputs/
             // document_revisions captures on failure -- that contract
@@ -2719,7 +2735,7 @@ pub const DocStore = struct {
             // the one and only place responsible for finishing that abort
             // on this path, matching `backend_erased.zig`'s own `TicketBox`
             // wait_fn wrapper, which does the same for its layer.
-            self.inner.wait() catch |err| {
+            const sequence = self.inner.waitSequence() catch |err| {
                 self.heap_batch.abort();
                 self.heap_alloc.destroy(self.heap_batch);
                 return err;
@@ -2729,6 +2745,7 @@ pub const DocStore = struct {
                 observation.store.markReplayIndexAvailable();
                 observation.store.observeCommittedReplaySequence(observation.sequence);
             }
+            return sequence;
         }
     };
 

@@ -7567,6 +7567,27 @@ pub const DB = struct {
         }
     }
 
+    /// Regression-B test hook: like `batch`, but also reports the commit
+    /// sequence this write's own primary-store group committed at (Lite
+    /// backend only; 0 on a backend with no such concept -- see
+    /// `execution_resources.zig`'s `committed_sequence_out`). Exists so a
+    /// caller can assert `Store.durableSequence() >= committed_sequence_out`
+    /// instead of comparing against whatever `activeCheckpoint()` happens to
+    /// read afterward, which also chases any later, unrelated non-durable
+    /// ride-along commit -- see `lite/crash_consistency_test.zig`'s
+    /// `assertAcknowledgedWriteIsDurable`.
+    pub fn batchWithCommittedSequence(self: *DB, req: types.BatchRequest, committed_sequence_out: *u64) anyerror!void {
+        committed_sequence_out.* = 0;
+        const opts: BatchExecutionOptions = .{ .committed_sequence_out = committed_sequence_out };
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(req, &profile, opts);
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, opts);
+        }
+    }
+
     /// Like `batch`, also reporting whether the primary write became durable.
     /// Callers classify a failure from the flag: after the primary write it
     /// is committed (pending or needing repair); before it, the batch was not

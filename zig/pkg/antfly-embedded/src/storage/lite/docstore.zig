@@ -1465,6 +1465,14 @@ const MutationRequest = struct {
     /// group formation (`group_max_bytes`); never required to be exact.
     estimated_bytes: usize = 0,
     result: anyerror!void = {},
+    /// Regression-B test hook: stamped in `applyMutationGroup`, still under
+    /// `Store.mutex`, with the group's resulting `activeCheckpoint().
+    /// commit_sequence` right after `commitTransactionWithDurability`
+    /// returns -- i.e. exactly this member's own commit, never whatever a
+    /// later, unrelated commit (most notably a non-durable ride-along
+    /// bookkeeping write) advances `activeCheckpoint()` to afterward. See
+    /// `Ticket.waitSequence`.
+    committed_sequence: u64 = 0,
 };
 
 const ReadPin = struct {
@@ -3179,15 +3187,31 @@ pub const Store = struct {
 
         /// Block until this ticket's group is durable (or has failed). The
         /// request is heap-owned by the ticket and freed here; a ticket must
-        /// be waited on exactly once.
+        /// be waited on exactly once (via either `wait` or `waitSequence`,
+        /// never both).
         pub fn wait(self: Ticket) !void {
+            _ = try self.waitSequence();
+        }
+
+        /// Like `wait`, also returning the commit_sequence this ticket's own
+        /// group committed at (`MutationRequest.committed_sequence`,
+        /// stamped in `applyMutationGroup` while the group's commit still
+        /// held `Store.mutex`). Regression-B test hook: pairs with
+        /// `Store.durableSequence()` for the "the write's own commit must
+        /// already be durable" invariant -- comparing against this instead
+        /// of a since-read `activeCheckpoint()` avoids the false positive a
+        /// later, unrelated non-durable ride-along commit would otherwise
+        /// cause.
+        pub fn waitSequence(self: Ticket) !u64 {
             const io = self.store.file.runtime();
             self.store.commit_mutex.lockUncancelable(io);
             while (!self.request.done) self.store.commit_ready.waitUncancelable(io, &self.store.commit_mutex);
             const result = self.request.result;
+            const sequence = self.request.committed_sequence;
             self.store.commit_mutex.unlock(io);
             self.store.allocator.destroy(self.request);
-            return result;
+            try result;
+            return sequence;
         }
     };
 
@@ -3675,6 +3699,15 @@ pub const Store = struct {
         // confused with each other, since each owns its own stack frame.
         var sync_gate: SyncExclusiveGate = .{ .store = self };
         try self.file.commitTransactionWithDurability(durable, .{ .context = &sync_gate, .release = releaseStoreMutexForSync, .reacquire = reacquireStoreMutexAfterSync });
+        // Regression-B test hook: stamp every member with the sequence this
+        // group's commit just landed at, while `self.mutex` is still held
+        // (acquired at this function's top) so no other group can have
+        // committed in between -- this is unambiguously each member's own
+        // commit, not whatever is active by the time some later caller
+        // gets around to reading it. See `MutationRequest.committed_sequence`.
+        const committed_sequence = self.file.activeCheckpoint().commit_sequence;
+        var stamped: ?*MutationRequest = head;
+        while (stamped) |item| : (stamped = item.next) item.committed_sequence = committed_sequence;
     }
 
     /// Per-commit state threaded through one `commitTransactionWithDurability`
@@ -4356,6 +4389,14 @@ pub const Txn = struct {
         context: ?*PrimaryCommitContext = null,
 
         pub fn wait(self: StagedCommit) !void {
+            _ = try self.waitSequence();
+        }
+
+        /// Like `wait`, also returning the commit_sequence this commit's
+        /// own group landed at (0 for the no-op "nothing staged" case --
+        /// see `commitStaged`'s early return). Regression-B test hook; see
+        /// `Store.Ticket.waitSequence`.
+        pub fn waitSequence(self: StagedCommit) !u64 {
             // Unconditional: `mutations`/`context` are never touched again
             // after the ticket resolves, success or failure, since the
             // group's apply (the only reader) has already run either way.
@@ -4363,11 +4404,12 @@ pub const Txn = struct {
                 self.allocator.free(ctx.mutations);
                 self.allocator.destroy(ctx);
             };
+            var sequence: u64 = 0;
             if (self.staged) |staged| {
                 staged.drive();
-                try staged.ticket().wait();
+                sequence = try staged.ticket().waitSequence();
             } else if (self.ride_along_ticket) |ticket| {
-                try ticket.wait();
+                sequence = try ticket.waitSequence();
             }
             // Only on success: a failed ticket (OutcomeUnknown, a rejected
             // apply) leaves the transaction exactly as `commitStaged` left
@@ -4380,6 +4422,7 @@ pub const Txn = struct {
                 txn.freeOwnedReads();
                 txn.* = undefined;
             }
+            return sequence;
         }
     };
 
@@ -4477,6 +4520,15 @@ pub const Txn = struct {
     pub fn commit(self: *Txn) !void {
         var staged = try self.commitStaged();
         try staged.wait();
+    }
+
+    /// Regression-B test hook: like `commit`, but returns the commit_sequence
+    /// this transaction's own group committed at, for the "the write's own
+    /// commit must already be durable" invariant (`Store.durableSequence()
+    /// >= commitSequence()`'s result). See `StagedCommit.waitSequence`.
+    pub fn commitSequence(self: *Txn) !u64 {
+        var staged = try self.commitStaged();
+        return staged.waitSequence();
     }
 
     /// Caller owns the result. Unlike get(), this does not retain keys or

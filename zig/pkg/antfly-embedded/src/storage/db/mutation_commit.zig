@@ -3971,7 +3971,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // the first time (success or failure).
                 primary_ticket = null;
                 var owned_ticket = ticket;
-                owned_ticket.wait() catch |err| {
+                // Regression-B test hook: a caller that wants this write's
+                // own commit sequence (`opts.committed_sequence_out`) waits
+                // via `waitSequence` instead of `wait` -- same contract,
+                // same one-shot free of the ticket's owned heap state,
+                // just also reporting which commit this was. See
+                // `execution_resources.zig`'s `committed_sequence_out` doc
+                // comment.
+                if (opts.committed_sequence_out) |sequence_out| {
+                    sequence_out.* = owned_ticket.waitSequence() catch |err| {
+                        // See the plain `wait()` branch below for why
+                        // `primary_committed` is corrected here too.
+                        if (opts.primary_committed) |committed| committed.* = false;
+                        return err;
+                    };
+                } else owned_ticket.wait() catch |err| {
                     // `opts.primary_committed` was set true as soon as this
                     // write was staged into the group (above), before this
                     // wait -- the one place that actually confirms the

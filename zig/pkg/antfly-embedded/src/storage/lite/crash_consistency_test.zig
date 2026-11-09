@@ -2908,21 +2908,37 @@ const ride_along_steps: [ride_along_key_count * ride_along_round_count]RideAlong
 /// write (and, for `.full_text`/`.full_index`, the relevant index work) is
 /// durable -- never `.propose`/`.enrichments`, which don't promise that --
 /// the commit that produced the acknowledged state must already be durable:
-/// `Store.durableSequence()` must already cover `activeCheckpoint()`'s
-/// commit_sequence captured at the same instant. This is deterministic and
-/// unconditional, unlike the crash sweep's own barrier sampling, which only
-/// ever observes this gap indirectly (as a lost write after a crash that
-/// happens to land in exactly the right barrier window) and was missing it
-/// entirely in most runs. Call this immediately after every acknowledged
-/// write a via_db scenario makes at a durability-promising sync level.
-fn assertAcknowledgedWriteIsDurable(handle: *DbHandle) !void {
+/// `Store.durableSequence()` must already cover `write_commit_sequence`, the
+/// sequence *this write's own* group committed at
+/// (`DB.batchWithCommittedSequence`'s out-param -- ultimately
+/// `MutationRequest.committed_sequence`, stamped in `applyMutationGroup`
+/// while the group's commit still held `Store.mutex`). This is deterministic
+/// and unconditional, unlike the crash sweep's own barrier sampling, which
+/// only ever observes this gap indirectly (as a lost write after a crash
+/// that happens to land in exactly the right barrier window) and was
+/// missing it entirely in most runs.
+///
+/// Comparing against `write_commit_sequence` rather than a freshly-read
+/// `activeCheckpoint()` matters: a first version of this check read
+/// `activeCheckpoint()` here, immediately after `batch()` returned, and fired
+/// spuriously -- a background ride-along flush (`Store.
+/// rideAlongFlushLoop`/maintenance, both run via `io.concurrent`) can land a
+/// legitimate, unrelated, non-durable bookkeeping commit (e.g.
+/// `__metadata__:index_status:...`) in the gap between this write's own
+/// (already durable) commit and this check's read, advancing
+/// `activeCheckpoint()` past what `durableSequence()` -- correctly -- has not
+/// caught up to yet. `write_commit_sequence` is immune to that race: it is
+/// stamped once, under `Store.mutex`, for exactly the group this write's own
+/// ticket belongs to, and never changes afterward no matter what commits
+/// later. Call this immediately after every acknowledged write a via_db
+/// scenario makes at a durability-promising sync level.
+fn assertAcknowledgedWriteIsDurable(handle: *DbHandle, write_commit_sequence: u64) !void {
     const store = handle.backend.native_docstore orelse return;
-    const acked_sequence = store.file.activeCheckpoint().commit_sequence;
     const durable_sequence = store.durableSequence();
-    if (durable_sequence < acked_sequence) {
+    if (durable_sequence < write_commit_sequence) {
         std.debug.print(
             "crash-consistency: INVARIANT VIOLATED -- batch() returned success for commit_sequence={d} but Store.durableSequence()={d} (durable_header_set={})\n",
-            .{ acked_sequence, durable_sequence, store.file.durable_header != null },
+            .{ write_commit_sequence, durable_sequence, store.file.durable_header != null },
         );
         return error.AcknowledgedWriteNotYetDurable;
     }
@@ -2992,11 +3008,13 @@ fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const 
         try checkpoints.append(allocator, .{
             .expectations = &.{.{ .key = step.key, .before = step.before, .after = step.after, .searchable_after = step.after }},
         });
-        try handle.db.batch(.{ .writes = &.{.{ .key = step.key, .value = json }}, .sync_level = .full_index });
+        var write_commit_sequence: u64 = 0;
+        try handle.db.batchWithCommittedSequence(.{ .writes = &.{.{ .key = step.key, .value = json }}, .sync_level = .full_index }, &write_commit_sequence);
         if (native.recovery_debug_log) if (handle.backend.native_docstore) |store| {
-            std.debug.print("[native-recovery] acked key={s} value={s} commit_sequence={d} durable_header_set={}\n", .{
+            std.debug.print("[native-recovery] acked key={s} value={s} write_commit_sequence={d} active_commit_sequence={d} durable_header_set={}\n", .{
                 step.key,
                 step.after,
+                write_commit_sequence,
                 store.file.activeCheckpoint().commit_sequence,
                 store.file.durable_header != null,
             });
@@ -3004,17 +3022,11 @@ fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const 
         // Stale-base (hypothesis c) check: fresh on-disk read, bypassing
         // every live cache. Kept as the active, trusted assertion.
         try assertFreshOnDiskValueContains(allocator, &handle, step.key, step.after);
-        // `assertAcknowledgedWriteIsDurable` is NOT called here anymore:
-        // comparing durableSequence() against activeCheckpoint() at ack
-        // time is comparing against the *latest* commit of anyone, not
-        // this write's own -- a legitimate, unrelated non-durable
-        // ride-along bookkeeping commit (e.g. __metadata__:index_status)
-        // landing right after this write's own (already durable) commit
-        // produces exactly this false positive, confirmed by the fresh
-        // on-disk read above still finding the correct, acknowledged
-        // value every time this fired. Left defined, not wired in, until
-        // it captures the write's own ticket/group commit sequence
-        // instead of activeCheckpoint()'s.
+        // Durability invariant, now comparing against this write's own
+        // commit sequence (see `assertAcknowledgedWriteIsDurable`'s doc
+        // comment for why comparing against `activeCheckpoint()` instead
+        // used to fire spuriously).
+        try assertAcknowledgedWriteIsDurable(&handle, write_commit_sequence);
 
         // Mirrors production: a WS5 retirement turn driven explicitly here
         // (this harness bypasses the Owner/pool layer that normally drives

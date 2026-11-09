@@ -1055,6 +1055,13 @@ pub const BatchExecutionOptions = struct {
     /// Internal progress marker; set only after the primary store accepts the
     /// write. Visibility admission errors must not invite replay of transforms.
     primary_committed: ?*bool = null,
+    /// Regression-B test hook: when set, the primary write's own ticket
+    /// (`mutation_commit.zig`'s `primary_ticket`) is waited on via
+    /// `waitSequence` instead of `wait`, and the resulting commit sequence
+    /// (0 on a backend with no such concept) is written here. See
+    /// `db.zig`'s `DB.batchWithCommittedSequence` and `lite/docstore.zig`'s
+    /// `Store.Ticket.waitSequence`.
+    committed_sequence_out: ?*u64 = null,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
