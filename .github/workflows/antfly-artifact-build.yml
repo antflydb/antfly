@@ -376,6 +376,7 @@ jobs:
             --out-dir dist/embedded-zig-source
       - uses: ./.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           name: antfly-embedded-zig-source
           path: dist/embedded-zig-source/
 

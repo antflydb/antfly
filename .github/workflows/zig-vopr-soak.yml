@@ -81,6 +81,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/probe-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           namespace: vopr
 
   diagnose:
@@ -269,6 +270,7 @@ jobs:
           key: vopr-runner-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.head_sha || github.sha }}
       - uses: ./ci-storage-controller/.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           namespace: vopr
           name: vopr-runner
           path: ${{ runner.temp }}/vopr-cached-runner/vopr.tar.gz
@@ -380,6 +382,7 @@ jobs:
         timeout-minutes: 40
         uses: ./ci-storage-controller/.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           namespace: vopr
           name: vopr-run-${{ matrix.scenario }}--0
           path: |
@@ -409,6 +412,7 @@ jobs:
         timeout-minutes: 40
         uses: ./ci-storage-controller/.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           namespace: vopr
           name: vopr-run-${{ matrix.scenario }}--1
           path: |
@@ -789,6 +793,7 @@ jobs:
         timeout-minutes: 40
         uses: ./ci-storage-controller/.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           namespace: vopr
           name: vopr-corpus-standby
           path: ${{ runner.temp }}/vopr-corpus/standby
@@ -836,6 +841,7 @@ jobs:
         timeout-minutes: 40
         uses: ./ci-storage-controller/.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           namespace: vopr
           name: vopr-corpus-raft
           path: ${{ runner.temp }}/vopr-corpus/raft
@@ -883,6 +889,7 @@ jobs:
         timeout-minutes: 40
         uses: ./ci-storage-controller/.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           namespace: vopr
           name: vopr-corpus-distributed-data
           path: ${{ runner.temp }}/vopr-corpus/distributed-data
@@ -930,6 +937,7 @@ jobs:
         timeout-minutes: 40
         uses: ./ci-storage-controller/.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           namespace: vopr
           name: vopr-corpus-standby-scaling
           path: ${{ runner.temp }}/vopr-corpus/standby-scaling
@@ -977,6 +985,7 @@ jobs:
         timeout-minutes: 40
         uses: ./ci-storage-controller/.github/actions/upload-ci-artifact
         with:
+          gcs-enabled: ${{ vars.CI_ARTIFACT_GCS == 'true' }}
           namespace: vopr
           name: vopr-corpus-secrets
           path: ${{ runner.temp }}/vopr-corpus/secrets
