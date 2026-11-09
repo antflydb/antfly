@@ -1184,7 +1184,10 @@ pub const Reader = struct {
         const span = end - begin;
         // Never read beyond the authenticated object length. Every widened
         // GET still enforces the exact version/ETag from this plan.
-        if (span > read.range.len *| 16 or (begin == read.range.offset and span == read.range.len)) return null;
+        // For genuinely tiny files the entire authenticated object is one
+        // economical transfer, even when the first projected column is tiny.
+        const tiny_object = read.object.byte_len <= 64 * 1024;
+        if ((!tiny_object and span > read.range.len *| 16) or (begin == read.range.offset and span == read.range.len)) return null;
         const admission = self.scheduler.reserveIo(@intCast(2 * span + read.range.len)) orelse return null;
         defer admission.release();
         var held: [3]?ranges.RangeLease = @splat(null);
@@ -2541,4 +2544,31 @@ test "external lake source read ahead overlaps admitted windows and cancels befo
         try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
         try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
     }
+}
+
+test "external lake source read ahead tiny files share one verified transfer across narrow columns" {
+    const a = std.testing.allocator;
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var bytes: [16 * 1024]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i / 1024);
+    var put = try client.putObject("bucket", "small", &bytes, .{});
+    defer put.deinit(a);
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    var trace: @import("lake_read_context.zig").IoTrace = .{};
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(client), .scope = @splat(8), .context = .{ .trace = &trace } };
+    var read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "small", .byte_len = bytes.len, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 0, .len = 32 }, .purpose = .parquet_column_chunk };
+    for ([_]u64{ 0, 8192, 16300 }) |offset| {
+        read.range.offset = offset;
+        const lease = try reader.reader().readPlannedLease(a, read);
+        defer lease.release();
+        try std.testing.expectEqualSlices(u8, bytes[@intCast(offset)..][0..32], lease.bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 1), trace.snapshot().source_provider_reads);
+    try std.testing.expectEqual(@as(u64, bytes.len), trace.snapshot().source_provider_bytes);
+    try std.testing.expectEqual(@as(u64, bytes.len), trace.snapshot().read_ahead_bytes);
 }

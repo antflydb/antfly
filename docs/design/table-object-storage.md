@@ -238,7 +238,9 @@ Cold demand reads also use bounded byte read-ahead. A touched native text pack
 can be fetched and authenticated once (at most 1 MiB, at most 16 times its
 requested block). Parquet data reads can reuse aligned 1 MiB windows across
 headers and payloads, including stitching up to three windows for a bounded
-request. Independent misses overlap through admitted workers only when the
+request. Complete source objects of at most 64 KiB may use one transfer even
+when a first projected column is smaller than the usual amplification ratio;
+the same request and node budgets still apply. Independent misses overlap through admitted workers only when the
 provider advertises concurrency and its construction allocator is synchronized.
 Source clients own a stable locked, reclaiming allocator until teardown; workers
 use private state and independent result allocators. Cancellation drains every
