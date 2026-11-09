@@ -9103,6 +9103,38 @@ pub const MetadataHttpService = struct {
         return try self.raft.baseUri(alloc);
     }
 
+    /// Listeners and the restore supervisor are already live during bootstrap.
+    /// Publish the initial owner, routes and managed updates under the same
+    /// runtime authority as request and progress handlers.
+    pub fn bootstrapMetadataGroup(
+        self: *MetadataHttpService,
+        record: raft_catalog.ReplicaRecord,
+        updates: []const @import("../raft/metadata_view.zig").MetadataUpdate,
+    ) !void {
+        if (record.group_id != self.metadata_group_id) return error.InvalidMetadataGroupId;
+        for (updates) |update| switch (update) {
+            .replica_intent => |intent| switch (intent) {
+                .upsert => |value| if (value.record.group_id != self.metadata_group_id) return error.InvalidMetadataGroupId,
+                else => return error.UnsupportedOperation,
+            },
+            .peer_route => |route| switch (route) {
+                .upsert => |value| if (value.group_id != self.metadata_group_id) return error.InvalidMetadataGroupId,
+                else => return error.UnsupportedOperation,
+            },
+            else => return error.UnsupportedOperation,
+        };
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        if (self.raft.host.status(record.group_id) == .absent)
+            _ = try self.raft.host.http_host.ensureReplica(record);
+        for (updates) |update| if (update == .peer_route) {
+            const route = update.peer_route.upsert;
+            _ = try self.raft.host.http_host.upsertResolvedPeerEndpoints(route.group_id, route.node_id, route.endpoints);
+        };
+        try self.raft.submitBatch(updates);
+        _ = try self.raft.syncPendingRaftProgressOnly();
+    }
+
     pub fn ensureMetadataReplica(self: *MetadataHttpService, record: raft_catalog.ReplicaRecord) !raft_engine.runtime.EnsureReplicaResult {
         if (record.group_id != self.metadata_group_id) return error.InvalidMetadataGroupId;
         self.lockRuntime();
