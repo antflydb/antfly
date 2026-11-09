@@ -880,19 +880,22 @@ pub const HandleGuard = struct {
         // A lane-managed guard (see `lane_managed`) never holds `path_lease`
         // or `connection.gate.mutex` itself -- `WriterLane.checkout` already
         // released the gate right after establishing/refreshing the lease,
-        // keeping it parked on the lane instead. Mirror
-        // `releaseWriterLaneBeforeWait`'s own lane branch: hand the parked
-        // lease back to the lane via `checkin` instead of unconditionally
-        // unlocking a mutex this guard never locked (issue1015/issue1431 --
-        // a write whose value needs an inline inference call reaches this
-        // same suspend/resume path `resumeQuery`/`resumeAccess` already
-        // supports by re-entering fresh). Nothing to notify here either: a
-        // lane-managed suspend always happens before this call's own
-        // commit, so there is no newly-durable write to publish yet.
+        // keeping it parked on the lane instead, so unconditionally
+        // unlocking the gate mutex below would release a mutex this guard
+        // never locked. Give the lease up via `checkinForSuspend`, not
+        // plain `checkin`: this suspend's duration is unbounded (an inline
+        // provider call, issue1015/issue1431), unlike the bounded
+        // durability wait `checkin`'s own fairness-quantum grace period is
+        // sized for, so a foreign waiter must never be stuck behind a
+        // lease this process is not even using while suspended. Resuming
+        // (`resumeQuery`/`resumeAccess`) re-enters fresh, which correctly
+        // re-contends for the lease like a cold start. Nothing to notify
+        // here either: a lane-managed suspend always happens before this
+        // call's own commit, so there is no newly-durable write to
+        // publish yet.
         if (self.lane_managed) {
-            connection.detach();
             const store = root.owned_lite_backend.?.native_docstore.?;
-            connection.owner.writer_lane.checkin(connection, store);
+            connection.owner.writer_lane.checkinForSuspend(connection, store);
             self.connection_gate_held = false;
             connection.mutex.unlock(handleLockIo());
             return;
