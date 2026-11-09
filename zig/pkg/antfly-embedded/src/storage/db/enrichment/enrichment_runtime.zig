@@ -10624,6 +10624,7 @@ const SharedPdfWindowScheduler = struct {
     fn prepareConsumer(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !void {
         consumer.prepared = true;
         if (std.mem.indexOfScalar(u64, self.delayed_requests, logicalRequestFingerprint(request)) != null) return;
+        try enrichment_types.validateGeneratedEmbeddingInput(request);
         if (requestHasChunkSource(request)) return;
         if (request.kind == .asset) return self.prepareTextConsumer(consumer, request, raw);
         // Page-vector publication has a separate precommit sink. Never send
@@ -15398,6 +15399,12 @@ fn processPendingDocumentGroup(
                 try failed_artifacts.put(runtime.alloc, requestArtifactName(request), error.ArtifactDependencyFailed);
             continue;
         }
+        enrichment_types.validateGeneratedEmbeddingInput(request) catch |err| {
+            setActiveFailureFingerprint(runtime, requestFailureFingerprint(request));
+            try recordIsolatedRequestError(runtime, window, request, err);
+            try failed_artifacts.put(runtime.alloc, if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requestEmbeddingName(request) else requestArtifactName(request), err);
+            continue;
+        };
         if (shared_windows.completed(request_index)) continue;
         if (shared_windows.failure(request_index)) |failure| {
             const err = failure.cause;
@@ -30642,6 +30649,9 @@ fn processChunkedDenseWindow(
     scope: *FailureScope,
 ) !void {
     if (requests.len == 0) return;
+    // Defensive boundary for retained queues and direct dependency execution:
+    // this lane only embeds text chunks, never PDF pages.
+    for (requests) |request| if (request.embedding_input != .text) return error.InvalidEnrichmentConfig;
     const dense_embedder = runtime.config.dense_embedder orelse return;
 
     const processed = try runtime.alloc.alloc(bool, requests.len);
@@ -33341,6 +33351,7 @@ fn processDenseEmbedding(
     prepared_sources: *PreparedDocumentSourceCache,
     window: *GeneratedReplayWindow,
 ) !void {
+    try enrichment_types.validateGeneratedEmbeddingInput(request);
     const dense_embedder = runtime.config.dense_embedder orelse return;
     const embedding_artifact_name = requestEmbeddingName(request);
     const consumer_indexes = try runtime.index_manager.denseIndexesForEmbedding(runtime.alloc, embedding_artifact_name, request.expected_dims);
@@ -33456,6 +33467,7 @@ fn processSparseEmbedding(
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
     window: *GeneratedReplayWindow,
 ) !void {
+    try enrichment_types.validateGeneratedEmbeddingInput(request);
     const sparse_embedder = runtime.config.sparse_embedder orelse return;
     const embedding_artifact_name = requestEmbeddingName(request);
     const consumer_indexes = try runtime.index_manager.sparseIndexesForEmbedding(runtime.alloc, embedding_artifact_name);
@@ -47026,4 +47038,48 @@ test "OCR sampling byte fingerprint binds resolved render recipe" {
         defer a.free(exact);
         try std.testing.expect(!std.mem.eql(u8, automatic, exact));
     }
+}
+
+test "source semantic media input retained PDF chunk requests fail before replay work" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "pdf-input-guard" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(a, store);
+    defer erased.deinit();
+    var manager = try index_manager_mod.IndexManager.init(a, ".");
+    defer manager.deinit();
+    var runtime = EnrichmentRuntime{ .alloc = a, .io_impl = null, .store = erased, .owns_store = false, .change_journal = undefined, .replay_source = undefined, .index_manager = &manager, .write_ctx = undefined, .write_fn = undefined, .failure_ctx = undefined, .failure_fn = undefined, .notify_ctx = undefined, .notify_fn = undefined, .config = .{}, .ownership = undefined };
+    const source_key = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer a.free(source_key);
+    try storePutWithRetry(&runtime, source_key, "{\"content\":{\"resource\":{\"uri\":\"https://example.org/source.pdf\"}}}");
+    var request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "vectors", .embedding_name = "pages", .artifact_name = "links", .embedding_input = .pdf_page_images, .input_kind = .materialized_chunks, .doc_key = "doc", .source_field = "text", .chunk_size = 512, .expected_dims = 3 };
+    var cache: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty;
+    defer freeWorkerChunkCache(a, &cache);
+    var sources = PreparedDocumentSourceCache.initWithConfig(a, .{}, null);
+    defer sources.deinit();
+    var window = GeneratedReplayWindow{ .alloc = a };
+    defer window.deinit();
+    var scope = FailureScope{};
+    var invalid_document = request;
+    invalid_document.input_kind = .document;
+    var scheduler = SharedPdfWindowScheduler.init(&runtime, &.{invalid_document}, 0);
+    defer scheduler.deinit();
+    var consumer = SharedPdfWindowScheduler.Consumer{};
+    try std.testing.expectError(error.InvalidEnrichmentConfig, scheduler.prepareConsumer(&consumer, invalid_document, "{}"));
+    try std.testing.expectError(error.InvalidEnrichmentConfig, processDenseEmbedding(&runtime, request, &cache, &sources, &window));
+    try std.testing.expectError(error.InvalidEnrichmentConfig, processChunkedDenseWindow(&runtime, &.{request}, &cache, &window, &scope));
+    request.kind = .sparse_embedding;
+    try std.testing.expectError(error.InvalidEnrichmentConfig, processSparseEmbedding(&runtime, request, &cache, &window));
+    request.kind = .dense_embedding;
+    request.input_kind = .document;
+    request.chunk_size = 0;
+    request.artifact_name = "pages";
+    try enrichment_types.validateGeneratedEmbeddingInput(request);
+    request.upstream_artifact_name = "links";
+    try std.testing.expectError(error.InvalidEnrichmentConfig, enrichment_types.validateGeneratedEmbeddingInput(request));
+    request.embedding_input = .text;
+    try enrichment_types.validateGeneratedEmbeddingInput(request);
+    try std.testing.expect(!window.hasDerivedItems());
 }

@@ -43150,9 +43150,10 @@ components:
             - text
             - pdf_page_images
           default: text
-          description: pdf_page_images requires kind=embedding, consumes a PDF URI, and embeds its rendered
-            pages. Native field selectors address literal root keys; use a raw template for nested resource
-            URIs.
+          description: pdf_page_images requires kind=embedding and a dense index. It consumes an original
+            PDF URI selected by field or template and embeds its rendered pages. Upstream artifacts (source_artifact_name)
+            and text chunking are not supported. Native field selectors address literal root keys; use
+            a raw template for nested resource URIs.
         expected_dims:
           x-go-type-skip-optional-pointer: true
           type: integer
