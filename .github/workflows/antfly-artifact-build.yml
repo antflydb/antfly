@@ -247,7 +247,7 @@ jobs:
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          retention-days: 14
+          retention-days: ${{ needs.release-plan.outputs.channel == 'stable' && 90 || 14 }}
           name: ${{ matrix.artifact_name }}
           path: dist/release-archives/*.tar.gz
           if-no-files-found: error
@@ -441,7 +441,7 @@ jobs:
             > dist/release-request/release-request.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          retention-days: 14
+          retention-days: 90
           name: antfly-release-request
           path: dist/release-request/release-request.json
           if-no-files-found: error

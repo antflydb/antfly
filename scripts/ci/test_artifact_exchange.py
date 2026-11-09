@@ -141,11 +141,61 @@ class ArtifactExchangeTests(unittest.TestCase):
         first = self.upload(name="native-a")
         self.upload(name="native-b")
         with self.assertRaisesRegex(ValueError, "duplicate"):
-            self.restore(first, name="", pattern="native-*")
+            self.restore(first, name="", pattern="native-*", merge_multiple=True)
         next(p for p in first.iterdir() if "native-b" in p.name).unlink()
         (first / "unexpected.tar.gz").write_bytes(b"legacy")
         with self.assertRaisesRegex(ValueError, "mixed"):
-            self.restore(first, name="", pattern="native-*")
+            self.restore(first, name="", pattern="native-*", merge_multiple=True)
+
+    def test_pattern_download_preserves_shard_directories_and_same_named_files(self):
+        staging = self.root / "shards"
+        for name in ("shard-0", "shard-1"):
+            self.upload(name=name, destination=staging / name)
+        destination = self.restore(staging, name="", pattern="shard-*")
+        for name in ("shard-0", "shard-1"):
+            self.assertEqual(
+                (destination / name / "a.tar.gz").read_bytes(), b"canonical archive"
+            )
+
+    def test_cli_upload_and_download_use_the_same_producer_binding(self):
+        receipt = self.root / "cli-receipt"
+        output = self.root / "cli-restore"
+        producer = ["--repository", "antflydb/antfly", "--run-id", "42"]
+        with (
+            patch.dict("os.environ", {"CI_ARTIFACT_TOKEN": "test"}),
+            patch.object(exchange, "GCS", return_value=self.store),
+        ):
+            with patch(
+                "sys.argv",
+                [
+                    "artifact_exchange",
+                    "upload",
+                    "--paths",
+                    str(self.source),
+                    "--name",
+                    "native",
+                    "--destination",
+                    str(receipt),
+                    *producer,
+                ],
+            ):
+                exchange.main()
+            with patch(
+                "sys.argv",
+                [
+                    "artifact_exchange",
+                    "restore",
+                    "--staging",
+                    str(receipt),
+                    "--name",
+                    "native",
+                    "--destination",
+                    str(output),
+                    *producer,
+                ],
+            ):
+                exchange.main()
+        self.assertEqual((output / "a.tar.gz").read_bytes(), b"canonical archive")
 
     def test_legacy_artifacts_need_no_cloud_credentials_and_existing_files_are_preserved(
         self,

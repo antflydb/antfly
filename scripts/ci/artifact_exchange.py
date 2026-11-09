@@ -234,13 +234,16 @@ def restore(
     name="",
     pattern="",
     namespace="release",
+    merge_multiple=False,
 ):
     if namespace not in {"release", "vopr"} or bool(name) == bool(pattern):
         raise ValueError("select one artifact name or pattern and a valid namespace")
-    receipts = sorted(staging.glob(f"{RECEIPT_PREFIX}*.json"))
+    receipts = sorted(staging.rglob(f"{RECEIPT_PREFIX}*.json"))
     destination.mkdir(parents=True, exist_ok=True)
     if any(destination.iterdir()):
         raise ValueError("artifact destination must be empty")
+    if any(path.is_symlink() for path in staging.rglob("*")):
+        raise ValueError("artifact symlinks are forbidden")
     # Historical runs and explicitly disabled GCS uploads remain readable.
     if not receipts:
         if not any(path.is_file() for path in staging.rglob("*")):
@@ -254,12 +257,18 @@ def restore(
     for path in receipts:
         receipt = json.loads(path.read_text())
         artifact = safe_name(receipt.get("name", ""))
+        receipt_name = f"{RECEIPT_PREFIX}{artifact}.json"
+        expected_path = (
+            Path(artifact) / receipt_name
+            if pattern and not merge_multiple
+            else Path(receipt_name)
+        )
         if (
             receipt.get("schema_version") != 1
             or receipt.get("repository") != repository
             or receipt.get("namespace") != namespace
             or receipt.get("run_id") != str(run_id)
-            or path.name != f"{RECEIPT_PREFIX}{artifact}.json"
+            or path.relative_to(staging) != expected_path
             or (name and artifact != name)
             or (pattern and not fnmatch.fnmatchcase(artifact, pattern))
         ):
@@ -269,6 +278,8 @@ def restore(
             raise ValueError("CI receipt contains no files")
         for entry in files:
             member = safe_path(entry["path"])
+            if pattern and not merge_multiple:
+                member = artifact + "/" + member
             checksum = entry["sha256"]
             if (
                 not re.fullmatch(r"[0-9a-f]{64}", checksum)
@@ -311,6 +322,7 @@ def main():
     parser.add_argument("--paths", default="")
     parser.add_argument("--name", default="")
     parser.add_argument("--pattern", default="")
+    parser.add_argument("--merge-multiple", action="store_true")
     parser.add_argument("--namespace", choices=("release", "vopr"), default="release")
     parser.add_argument("--retention-days", type=int, choices=(14, 90), default=14)
     parser.add_argument(
@@ -348,6 +360,7 @@ def main():
             name=args.name,
             pattern=args.pattern,
             namespace=args.namespace,
+            merge_multiple=args.merge_multiple,
         )
 
 

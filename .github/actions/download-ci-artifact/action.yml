@@ -17,8 +17,8 @@ inputs:
     description: Token for cross-run downloads
     default: ''
   merge-multiple:
-    description: Retained for compatibility; files are always merged with collision rejection
-    default: 'true'
+    description: Merge pattern downloads, rejecting colliding member paths
+    default: 'false'
   namespace:
     description: release or vopr (separate bucket-scoped identities)
     default: release
@@ -32,7 +32,7 @@ runs:
       with:
         name: ${{ inputs.name }}
         pattern: ${{ inputs.pattern }}
-        merge-multiple: true
+        merge-multiple: ${{ inputs.merge-multiple }}
         path: ${{ steps.staging.outputs.path }}
         run-id: ${{ inputs.run-id }}
         github-token: ${{ inputs.github-token }}
@@ -41,9 +41,13 @@ runs:
       env:
         STAGING: ${{ steps.staging.outputs.path }}
       run: |
-        if compgen -G "$STAGING/_ci-artifact-*.json" > /dev/null; then
-          echo 'present=true' >> "$GITHUB_OUTPUT"
-        fi
+        python3 - <<'PY'
+        import os
+        from pathlib import Path
+        if any(Path(os.environ['STAGING']).rglob('_ci-artifact-*.json')):
+            with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                output.write('present=true\n')
+        PY
     - if: ${{ steps.receipt.outputs.present == 'true' }}
       uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
       id: auth
@@ -63,9 +67,12 @@ runs:
         ARTIFACT_NAME: ${{ inputs.name }}
         ARTIFACT_PATTERN: ${{ inputs.pattern }}
         PRODUCER_RUN_ID: ${{ inputs.run-id || github.run_id }}
+        MERGE_MULTIPLE: ${{ inputs.merge-multiple }}
         ACTION_ROOT: ${{ github.action_path }}
       run: |
+        args=()
+        if [ "$MERGE_MULTIPLE" = true ]; then args=(--merge-multiple); fi
         python3 "$ACTION_ROOT/../../../scripts/ci/artifact_exchange.py" restore \
           --name "$ARTIFACT_NAME" --pattern "$ARTIFACT_PATTERN" \
           --run-id "$PRODUCER_RUN_ID" --staging "$STAGING" --destination "$DESTINATION" \
-          --namespace "$ARTIFACT_NAMESPACE"
+          --namespace "$ARTIFACT_NAMESPACE" "${args[@]}"

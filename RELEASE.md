@@ -677,9 +677,10 @@ restricted by `cache-mode: read` in approved PR runs.
 Receipts and ordinary intermediate artifacts expire after fourteen days. Existing
 VOPR replay windows stay at ninety days. GCS short objects expire at thirty days,
 and replay objects at 120 days; both include headroom for reuse near the end of
-a fourteen-day namespace window. Native release archives remain fourteen-day
-Actions handoffs because embedded registry preflight deliberately has no OIDC
-permission. Embedded publishers verify and consume the original package snapshot
+a fourteen-day namespace window. Native release archives remain Actions handoffs because embedded registry
+preflight deliberately has no OIDC permission: fourteen days for RC/nightly,
+ninety for stable registry retries. Small release identity/ledger records also
+retain ninety days. Embedded publishers verify and consume the original package snapshot
 without uploading another verified copy. Stable embedded registry snapshots
 retain their ninety-day publication/retry window. RC/nightly packaging checks
 still run but do not upload an unused embedded registry snapshot. Historical
