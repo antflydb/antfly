@@ -277,7 +277,9 @@ pub fn imageGeometryForEncoded(bytes: []const u8, config: PreprocessorConfig) !I
     return imageGeometry(info.width, info.height, config);
 }
 
-/// Earlier normalized images remain live during the current decode/resize.
+/// Initial preparation forecast. Earlier normalized images remain live during
+/// the current decode/resize. Executors must use admitted allocation ownership:
+/// codec scratch and allocator bookkeeping may exceed this geometry forecast.
 pub fn imageWorkingBytes(images: []const []const u8, config: PreprocessorConfig) !usize {
     var retained: usize = 0;
     var peak: usize = 0;
@@ -353,7 +355,7 @@ pub fn prepareExpandedPromptEmbeddings(
     var prepared_images = try allocator.alloc(PreparedImage, images.len);
     defer allocator.free(prepared_images);
     var prepared_count: usize = 0;
-    errdefer {
+    defer {
         for (prepared_images[0..prepared_count]) |*prepared| prepared.deinit();
     }
     for (images, 0..) |image_bytes, idx| {
@@ -361,9 +363,6 @@ pub fn prepareExpandedPromptEmbeddings(
         prepared_images[idx] = try prepareImage(allocator, image_bytes, prep_cfg);
         debugQwenVlStage("prepared image {d} resized={}x{} tokens={d}", .{ idx, prepared_images[idx].resized_width, prepared_images[idx].resized_height, prepared_images[idx].image_token_count });
         prepared_count += 1;
-    }
-    defer {
-        for (prepared_images[0..prepared_count]) |*prepared| prepared.deinit();
     }
 
     debugQwenVlStage("expand prompt tokens", .{});
