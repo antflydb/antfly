@@ -9135,6 +9135,14 @@ pub const MetadataHttpService = struct {
         _ = try self.raft.syncPendingRaftProgressOnly();
     }
 
+    pub fn ensureInitialMetadataReplica(self: *MetadataHttpService, record: raft_catalog.ReplicaRecord) !void {
+        if (record.group_id != self.metadata_group_id) return error.InvalidMetadataGroupId;
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        if (self.raft.host.status(record.group_id) == .absent)
+            _ = try self.raft.host.http_host.ensureReplica(record);
+    }
+
     pub fn ensureMetadataReplica(self: *MetadataHttpService, record: raft_catalog.ReplicaRecord) !raft_engine.runtime.EnsureReplicaResult {
         if (record.group_id != self.metadata_group_id) return error.InvalidMetadataGroupId;
         self.lockRuntime();
@@ -11004,7 +11012,11 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn runRound(self: *MetadataHttpService) !void {
-        try self.runRoundInternal(true);
+        try self.runRoundInternal(true, false);
+    }
+
+    pub fn runBootstrapRound(self: *MetadataHttpService) !void {
+        try self.runRoundInternal(true, true);
     }
 
     /// Advances only the latency-sensitive Raft runtime. Production runtimes
@@ -11098,10 +11110,10 @@ pub const MetadataHttpService = struct {
     /// Callers must concurrently drive `runRaftRoundOnly` at the configured
     /// tick cadence.
     pub fn runControlRoundOnly(self: *MetadataHttpService) !void {
-        try self.runRoundInternal(false);
+        try self.runRoundInternal(false, false);
     }
 
-    fn runRoundInternal(self: *MetadataHttpService, advance_raft: bool) !void {
+    fn runRoundInternal(self: *MetadataHttpService, advance_raft: bool, skip_local_replica_root: bool) !void {
         var run_round_trace = MetadataRunRoundTrace.init();
         defer run_round_trace.logIfSlow();
         var phase_start_ns = platform_time.monotonicNs();
@@ -11140,7 +11152,7 @@ pub const MetadataHttpService = struct {
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
         try runRelationReconciliationRound(self);
         try runResolverNamespaceRound(self);
-        if (!self.observe_local_replica_root) return;
+        if (skip_local_replica_root or !self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
         var local_transition_inputs = try captureLocalTransitionInputs(self);

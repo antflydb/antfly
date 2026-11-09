@@ -803,19 +803,14 @@ pub const Server = struct {
     }
 
     pub fn bootstrapLocal(self: *Server, metadata_group_id: u64, local_node_id: u64) !void {
-        if (self.server.svc.raft.host.status(metadata_group_id) == .absent) {
-            _ = try self.server.svc.ensureMetadataReplica(.{
-                .group_id = metadata_group_id,
-                .replica_id = 1,
-                .local_node_id = local_node_id,
-                .bootstrap_mode = .empty,
-            });
-        }
+        try self.server.svc.ensureInitialMetadataReplica(.{
+            .group_id = metadata_group_id,
+            .replica_id = 1,
+            .local_node_id = local_node_id,
+            .bootstrap_mode = .empty,
+        });
         try self.server.campaignMetadataGroup();
-        const observe_local_replica_root = self.server.svc.observe_local_replica_root;
-        self.server.svc.observe_local_replica_root = false;
-        defer self.server.svc.observe_local_replica_root = observe_local_replica_root;
-        try self.server.runRound();
+        try self.server.svc.runBootstrapRound();
         self.refreshMetadataRaftStorageDiagnostics();
         _ = try self.server.svc.ensureMetadataReplica(.{
             .group_id = metadata_group_id,
@@ -2898,6 +2893,7 @@ test "metadata ownership cluster bootstrap stays coherent with concurrent progre
     // The listener's restore supervisor and this progress owner can drain the
     // queue throughout bootstrap. Every clone, route and initial owner must
     // remain protected by the same service authority.
+    try server.bootstrapCluster(cfg.metadata_group_id, cfg.local_node_id, &.{});
     for (0..32) |_| try server.bootstrapCluster(cfg.metadata_group_id, cfg.local_node_id, &peers);
     progress.stop();
     if (progress.failure) |err| return err;
