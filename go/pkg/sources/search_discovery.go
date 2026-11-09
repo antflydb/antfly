@@ -59,6 +59,9 @@ func (r *Runner) RefreshSearchDiscovery(ctx context.Context, sourceID string) er
 			if source.ID != sourceID {
 				continue
 			}
+			if err := ValidateKnowledgeProcessing(source.Knowledge, source.Processing, r.KnowledgeAudience); err != nil {
+				return err
+			}
 			if source.Permissions == nil {
 				return fmt.Errorf("source permissions are required")
 			}
@@ -95,6 +98,7 @@ func (r *Runner) RefreshSearchDiscovery(ctx context.Context, sourceID string) er
 				if binding.DocumentVersion != SourceRecordVersion {
 					return nil
 				}
+				binding.Knowledge = source.Knowledge
 				binding.SearchVersion, binding.Streams, binding.Artifacts = source.SearchVersion, source.Streams, source.Artifacts
 				if len(binding.Streams) == 0 && source.Publication != "media" {
 					binding.Streams = DefaultSearchStreams(source.SearchVersion)

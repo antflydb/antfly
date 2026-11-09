@@ -149840,3 +149840,50 @@ test "source semantic media input PDF page output cannot bind unrelated chunk de
     try std.testing.expectEqual(@as(u32, 0), request.chunk_size);
     try @import("enrichment/enrichment_types.zig").validateGeneratedEmbeddingInput(request);
 }
+
+test "source semantic media input graph resolution replays without mention edges" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("knowledge-resolution-relevance");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "knowledge", .kind = .graph, .config_json =
+        \\{"source":{"artifact":"facts","path":"$.relations[*]"},"artifact":{"name":"facts","kind":"asset","source":{"type":"field","value":"facts"},"content_type":"application/json"}}
+    });
+    try db.addResolver(.{ .name = "entities", .table = "entities", .source_artifact = "facts", .resolution_artifact = "resolved", .key_template = "entity/{{ slug _entity.text }}", .promote = false });
+    const resolution = try internal_keys.resolutionArtifactKeyAlloc(a, "parent", "resolved");
+    defer a.free(resolution);
+    const ref = index_manager_mod.ManagedIndexRef{ .name = "knowledge", .kind = .graph };
+    try std.testing.expectEqual(@as(usize, 0), db.core.index_manager.graphArtifactSources("knowledge")[0].mention_edge_type.len);
+    try std.testing.expectEqual(ManagedIndexBatchApplicability.relevant, managedIndexBatchApplicability(db.core.index_manager, .{ .changed_artifact_keys = &.{resolution} }, ref));
+    try std.testing.expectEqual(ManagedIndexBatchApplicability.relevant, managedIndexRecordApplicability(db.core.index_manager, .{ .sequence = 1, .changed_artifact_keys = &.{resolution} }, ref));
+}
+
+test "source semantic media input canonical relations publish without mention edges" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("knowledge-canonical-replay");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "knowledge", .kind = .graph, .config_json =
+        \\{"source":{"artifact":"facts","path":"$.relations[*]"},"artifact":{"name":"facts","kind":"asset","source":{"type":"field","value":"facts"},"content_type":"application/json"}}
+    });
+    try db.addResolver(.{ .name = "entities", .table = "default", .source_artifact = "facts", .resolution_artifact = "resolved", .key_template = "entity/{{ slug _entity.text }}", .promote = false });
+    try db.batch(.{ .writes = &.{.{ .key = "claim", .value =
+        \\{"facts":{"entities":[{"id":"e0","label":"person","text":"Alice"},{"id":"e1","label":"person","text":"Bob"}],"relations":[{"source":"e0","target":"e1","type":"KNOWS"}]}}
+    }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, "claim", "resolved");
+    defer a.free(resolution_key);
+    const resolution = try db.core.store.get(a, resolution_key);
+    defer a.free(resolution);
+    try std.testing.expect(std.mem.indexOf(u8, resolution, "entity/alice") != null);
+    const edges = try waitForGraphEdges(a, &db, "knowledge", "entity/alice", "KNOWS", .out, 1);
+    defer graph_mod.GraphIndex.freeEdges(a, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("entity/bob", edges[0].target);
+}

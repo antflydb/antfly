@@ -40,6 +40,10 @@ type Backend interface {
 }
 
 // ProcessingBackend is optional for older runtimes implementing acquisition only.
+type KnowledgeBackend interface {
+	QueryKnowledge(context.Context, string, KnowledgeRequest) (json.RawMessage, error)
+}
+
 type ProcessingBackend interface {
 	PreviewProcessing(context.Context, string, ProcessingPreset) (ProcessingPreview, error)
 	ProcessingJob(context.Context, string, ProcessingJobRequest) (map[string]any, error)
@@ -123,6 +127,16 @@ func Handler(b Backend) http.Handler {
 		case len(parts) >= 2 && parts[0] == "sources" && validID(parts[1]):
 			id := parts[1]
 			switch {
+			case len(parts) == 3 && parts[2] == "knowledge-query" && r.Method == http.MethodPost:
+				backend, ok := b.(KnowledgeBackend)
+				if !ok {
+					err = Failure(501, "knowledge_unsupported")
+					break
+				}
+				var input KnowledgeRequest
+				if err = Decode(w, r, &input); err == nil {
+					result, err = backend.QueryKnowledge(r.Context(), id, input)
+				}
 			case len(parts) == 2:
 				switch r.Method {
 				case http.MethodGet:

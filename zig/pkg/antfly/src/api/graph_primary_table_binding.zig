@@ -14,26 +14,94 @@
 // limitations under the License.
 
 //! Bind structural graph identities explicitly naming the already-resolved primary
-//! catalog target. Foreign names and existing physical qualifiers are preserved.
+//! catalog targets. Only explicitly resolved qualifiers are rewritten; predicates
+//! and existing physical qualifiers are preserved.
 const std = @import("std");
 
+pub const Binding = struct { names: []const []const u8, physical: []const u8 };
+
 pub fn bind(alloc: std.mem.Allocator, body: []const u8, primary_names: []const []const u8, physical: []const u8) !?[]u8 {
+    return bindMany(alloc, body, &.{.{ .names = primary_names, .physical = physical }});
+}
+
+pub fn bindMany(alloc: std.mem.Allocator, body: []const u8, bindings: []const Binding) !?[]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const queries = parsed.value.object.getPtr("graph_queries") orelse return null;
-    if (queries.* != .object) return null;
-    var changed = false;
+    var binder = Binder{ .bindings = bindings };
+    try visit(&parsed.value, &binder);
+    if (!binder.changed) return null;
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
+/// Structural table qualifiers only; never interpret user predicate values as
+/// catalog routes. Bound cardinality before metadata resolution or rewriting.
+pub fn qualifiersAlloc(alloc: std.mem.Allocator, body: []const u8) ![][]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    var collector = Collector{ .alloc = alloc };
+    defer collector.names.deinit(alloc);
+    errdefer {
+        var keys = collector.names.keyIterator();
+        while (keys.next()) |key| alloc.free(key.*);
+    }
+    try visit(&parsed.value, &collector);
+    const names = try alloc.alloc([]const u8, collector.names.count());
+    var keys = collector.names.keyIterator();
+    for (names) |*name| name.* = keys.next().?.*;
+    return names;
+}
+
+const Collector = struct {
+    alloc: std.mem.Allocator,
+    names: std.StringHashMapUnmanaged(void) = .empty,
+    fn identity(self: *Collector, value: *std.json.Value) !void {
+        if (value.* != .object) return;
+        const table = value.object.get("table") orelse return;
+        if (table != .string or self.names.contains(table.string)) return;
+        if (self.names.count() == 256) return error.InvalidQueryRequest;
+        const name = try self.alloc.dupe(u8, table.string);
+        errdefer self.alloc.free(name);
+        try self.names.put(self.alloc, name, {});
+    }
+};
+const Binder = struct {
+    bindings: []const Binding,
+    changed: bool = false,
+    fn identity(self: *Binder, value: *std.json.Value) !void {
+        if (value.* != .object) return;
+        const table = value.object.getPtr("table") orelse return;
+        if (table.* != .string) return;
+        for (self.bindings) |binding| {
+            for (binding.names) |name| {
+                if (!std.mem.eql(u8, table.string, name)) continue;
+                if (!std.mem.eql(u8, table.string, binding.physical)) {
+                    table.* = .{ .string = binding.physical };
+                    self.changed = true;
+                }
+                return;
+            }
+        }
+    }
+};
+fn visitNodes(nodes: *std.json.Value, context: anytype) !void {
+    if (nodes.* != .object) return;
+    var entries = nodes.object.iterator();
+    while (entries.next()) |entry| try context.identity(entry.value_ptr);
+}
+fn visit(root: *std.json.Value, context: anytype) !void {
+    if (root.* != .object) return;
+    const queries = root.object.getPtr("graph_queries") orelse return;
+    if (queries.* != .object) return;
     var operations = queries.object.iterator();
     while (operations.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
         if (entry.value_ptr.object.getPtr("match")) |match| {
             if (match.* == .object) {
-                if (match.object.getPtr("nodes")) |nodes| bindNodes(nodes, primary_names, physical, &changed);
+                if (match.object.getPtr("nodes")) |nodes| try visitNodes(nodes, context);
                 if (match.object.getPtr("optional")) |groups| {
                     if (groups.* == .array) for (groups.array.items) |*group| {
                         if (group.* != .object) continue;
-                        if (group.object.getPtr("nodes")) |nodes| bindNodes(nodes, primary_names, physical, &changed);
+                        if (group.object.getPtr("nodes")) |nodes| try visitNodes(nodes, context);
                     };
                 }
             }
@@ -42,7 +110,7 @@ pub fn bind(alloc: std.mem.Allocator, body: []const u8, primary_names: []const [
             if (traverse.* == .object) if (traverse.object.getPtr("start")) |start| {
                 if (start.* == .object) if (start.object.getPtr("identities")) |identities| {
                     if (identities.* == .array) for (identities.array.items) |*identity| {
-                        bindIdentity(identity, primary_names, physical, &changed);
+                        try context.identity(identity);
                     };
                 };
             };
@@ -50,32 +118,10 @@ pub fn bind(alloc: std.mem.Allocator, body: []const u8, primary_names: []const [
         inline for (.{ "shortest_path", "k_shortest_paths" }) |kind| {
             if (entry.value_ptr.object.getPtr(kind)) |path| {
                 if (path.* == .object) inline for (.{ "from", "to" }) |endpoint| {
-                    if (path.object.getPtr(endpoint)) |identity| bindIdentity(identity, primary_names, physical, &changed);
+                    if (path.object.getPtr(endpoint)) |identity| try context.identity(identity);
                 };
             }
         }
-    }
-    if (!changed) return null;
-    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
-}
-
-fn bindNodes(nodes: *std.json.Value, primary_names: []const []const u8, physical: []const u8, changed: *bool) void {
-    if (nodes.* != .object) return;
-    var entries = nodes.object.iterator();
-    while (entries.next()) |entry| {
-        bindIdentity(entry.value_ptr, primary_names, physical, changed);
-    }
-}
-
-fn bindIdentity(identity: *std.json.Value, primary_names: []const []const u8, physical: []const u8, changed: *bool) void {
-    if (identity.* != .object) return;
-    const table = identity.object.getPtr("table") orelse return;
-    if (table.* != .string or std.mem.eql(u8, table.string, physical)) return;
-    for (primary_names) |logical| {
-        if (!std.mem.eql(u8, table.string, logical)) continue;
-        table.* = .{ .string = physical };
-        changed.* = true;
-        break;
     }
 }
 
@@ -153,4 +199,22 @@ test "system catalog graph primary binding scopes only traversal and path select
     const alternatives = queries.get("alternatives").?.object.get("k_shortest_paths").?.object;
     try std.testing.expectEqualStrings("foreign", alternatives.get("from").?.object.get("table").?.string);
     try std.testing.expectEqualStrings("table:primary", alternatives.get("to").?.object.get("table").?.string);
+}
+
+test "system catalog graph bindings resolve entity qualifiers together without predicate rewriting" {
+    const a = std.testing.allocator;
+    const body =
+        \\{"graph_queries":{"walk":{"traverse":{"start":{"identities":[{"key":"alice","table":"entities"},{"key":"bob","table":"entities"},{"key":"doc","table":"docs"}]},"edge_filter":{"properties":[{"field":"table","value":"secret"}]}}}}}
+    ;
+    const names = try qualifiersAlloc(a, body);
+    defer {
+        for (names) |name| a.free(name);
+        a.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    const encoded = (try bindMany(a, body, &.{ .{ .names = &.{"docs"}, .physical = "table:docs" }, .{ .names = &.{"entities"}, .physical = "table:entities" } })).?;
+    defer a.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "table:entities") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "table:docs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"value\":\"secret\"") != null);
 }

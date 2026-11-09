@@ -984,3 +984,13 @@ for search_version=2, semantic-only media, complete query compatibility, externa
 vector admission, generic artifact discovery, standalone processing/search commands,
 Colony integration and the model-free local fixture. Legacy TextStream declarations
 remain supported; processing configuration does not change acquisition identity.
+
+## Source knowledge
+
+Optional `knowledge` version 1 discovers native extractor outputs, resolver-backed
+entities and source-owned graphs alongside SearchStreams. See
+[Source knowledge](../../../docs/design/source-knowledge.md) for native builders,
+stable namespaces, curation references, temporal/current-state semantics, bounded
+queries, the standalone fixture and Colony deployment controls. Knowledge is
+fail-closed by default and requires an operator-enforced one-instance/one-audience
+boundary; source JSON cannot enable that boundary.

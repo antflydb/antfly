@@ -1,0 +1,157 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package sources
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+// Runs native asset publication, resolution, graph projection, temporal filters
+// and owner retraction. Synthetic facts qualify integration, not extraction quality.
+func TestNativeSourceKnowledge(t *testing.T) {
+	endpoint := os.Getenv("ANTFLY_SOURCES_E2E_URL")
+	if endpoint == "" {
+		t.Skip("set ANTFLY_SOURCES_E2E_URL to a disposable native owner")
+	}
+	u, err := url.Parse(endpoint)
+	require.NoError(t, err)
+	require.True(t, u.Scheme == "http" && net.ParseIP(u.Hostname()).IsLoopback())
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	defer cancel()
+	p := &Publisher{Endpoint: endpoint}
+	table := fmt.Sprintf("source_knowledge_%d", time.Now().UnixNano())
+	require.NoError(t, p.EnsureTable(ctx, table))
+	plan, k := knowledgeFixture(t)
+	entityTable := table + "_entities"
+	require.NoError(t, p.EnsureTable(ctx, entityTable))
+	k.Entities[0].Table = entityTable
+	plan.Indexes[0].Config["resolvers"].([]any)[0].(map[string]any)["table"] = entityTable
+	// Both claims use logical entity endpoints independent of parent ownership.
+	// Native resolution also reads stable mentions from this same structured asset.
+	source := plan.Indexes[0].Config["sources"].([]any)[0].(map[string]any)
+	source["path"] = "$.relations[*]"
+	require.NoError(t, ReconcileProcessing(ctx, p, table, &plan))
+	resources, err := EntityResources(Binding{Table: table, Knowledge: &k}, "facts")
+	require.NoError(t, err)
+	for _, id := range []string{"local-a", "local-b"} {
+		rendered, err := p.call(ctx, "POST", resources["render"], map[string]any{"text": "Alice", "label": "person", "local_id": id})
+		require.NoError(t, err)
+		var r map[string]any
+		require.NoError(t, json.Unmarshal(rendered, &r))
+		require.Equal(t, k.Entities[0].Namespace+"person/alice", r["minted_key"])
+	}
+	until := time.Now().Add(5 * time.Minute).Unix()
+	b := Binding{ID: testSourceID, Table: table, Knowledge: &k, Status: "searchable", ValidUntil: &until}
+	fact := func(id, sourceID, revision string) map[string]any {
+		return map[string]any{"source_id": sourceID, "doc_type": "source_item", "source": map[string]any{"id": sourceID, "revision": revision, "uri": "local:///" + id}, "permissions": map[string]any{"public": true}, "facts": map[string]any{"entities": []any{map[string]any{"id": "a", "label": "person", "text": "Alice"}}, "relations": []any{map[string]any{"id": id, "source": "alice", "target": "acme", "valid_at": "2020-01-01T00:00:00Z", "invalid_at": "2030-01-01T00:00:00Z", "created_at": "2021-01-01T00:00:00Z", "expired_at": "2031-01-01T00:00:00Z"}}}}
+	}
+	otherID := "22222222-2222-4222-8222-222222222222"
+	_, err = p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": map[string]any{"claim-a": fact("a", testSourceID, "r1"), "claim-b": fact("b", testSourceID, "r1"), "other-source": fact("other", otherID, "r1")}, "sync_level": "write"})
+	require.NoError(t, err)
+	request := KnowledgeRequest{Graph: "facts", Start: []string{"alice"}, Depth: 1, Limit: 10, ValidAt: "2022-01-01T00:00:00Z", KnownAt: "2022-01-01T00:00:00Z"}
+	var raw []byte
+	defer func() {
+		if t.Failed() {
+			t.Logf("final status: %+v; response=%s", ObserveKnowledge(ctx, p, b, "research"), raw)
+		}
+	}()
+	require.Eventually(t, func() bool {
+		var err error
+		raw, err = p.QueryKnowledge(ctx, b, request, "research")
+		return err == nil && strings.Contains(string(raw), "claim-a") && strings.Contains(string(raw), "claim-b")
+	}, 60*time.Second, 100*time.Millisecond)
+	require.NotContains(t, string(raw), "other-source")
+	request.ValidAt = "2040-01-01T00:00:00Z"
+	raw, err = p.QueryKnowledge(ctx, b, request, "research")
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "claim-a")
+	request.ValidAt = "2022-01-01T00:00:00Z"
+	for _, known := range []string{"2020-01-01T00:00:00Z", "2031-01-01T00:00:00Z"} {
+		request.KnownAt = known
+		raw, err = p.QueryKnowledge(ctx, b, request, "research")
+		require.NoError(t, err)
+		require.NotContains(t, string(raw), "claim-a")
+	}
+	request.KnownAt = "2022-01-01T00:00:00Z"
+	_, err = p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"deletes": []string{"claim-a"}, "sync_level": "write"})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		var err error
+		raw, err = p.QueryKnowledge(ctx, b, request, "research")
+		return err == nil && !strings.Contains(string(raw), "claim-a") && strings.Contains(string(raw), "claim-b")
+	}, 30*time.Second, 100*time.Millisecond)
+	// Empty extraction retires the remaining owner's relationships without
+	// deleting the unrelated source's claim. Rebuilds remain native, source sync
+	// is never used as the processing executor.
+	empty := fact("b", testSourceID, "r2")
+	empty["facts"] = map[string]any{"entities": []any{}, "relations": []any{}}
+	_, err = p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": map[string]any{"claim-b": empty}, "sync_level": "write"})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		var err error
+		raw, err = p.QueryKnowledge(ctx, b, request, "research")
+		return err == nil && !strings.Contains(string(raw), "claim-b")
+	}, 30*time.Second, 100*time.Millisecond)
+	var wire map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &wire))
+	require.Contains(t, wire, "source_knowledge")
+	b.ID = otherID
+	raw, err = p.QueryKnowledge(ctx, b, request, "research")
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "other-source")
+	// Alias/merge/unmerge remain the existing revisioned native authority.
+	from := k.Entities[0].Namespace + "person/alice"
+	to := k.Entities[0].Namespace + "person/alicia"
+	_, err = p.call(ctx, "POST", resources["redirects"], map[string]any{"from": from, "to": to, "actor": "source-knowledge-fixture", "reason": "qualify explicit reversible composition"})
+	require.NoError(t, err)
+	rendered, err := p.call(ctx, "POST", resources["render"], map[string]any{"text": "Alice", "label": "person"})
+	require.NoError(t, err)
+	require.Contains(t, string(rendered), to)
+	_, err = p.call(ctx, "DELETE", resources["redirects"]+"/"+url.PathEscape(from), map[string]any{"actor": "source-knowledge-fixture", "reason": "restore independent key"})
+	require.NoError(t, err)
+	rendered, err = p.call(ctx, "POST", resources["render"], map[string]any{"text": "Alice", "label": "person"})
+	require.NoError(t, err)
+	var restored map[string]any
+	require.NoError(t, json.Unmarshal(rendered, &restored))
+	require.Equal(t, from, restored["key"])
+
+	// The ordinary resolver-backed shape has no mention-edge projection and no
+	// endpoint string templates. Its first full-index write must re-render the
+	// graph when resolution lands, without a second parent update or rebuild.
+	resolvedPlan, resolvedKnowledge, _, err := BuildKnowledgeProcessing(KnowledgePreset{Name: "resolved", SourceID: testSourceID, Audience: "research", Field: "resolved_facts", EntityTable: entityTable, Source: map[string]any{"path": "$.relations[*]", "edge": map[string]any{"edge_id": "{{ _item.id }}", "metadata": map[string]any{"created_at": "{{ _item.created_at }}", "valid_at": "{{ _item.valid_at }}"}}}})
+	require.NoError(t, err)
+	require.NoError(t, ReconcileProcessing(ctx, p, table, &resolvedPlan))
+	parent := map[string]any{"source_id": testSourceID, "doc_type": "source_item", "source": map[string]any{"id": testSourceID, "revision": "resolved-r1"}, "permissions": map[string]any{"public": true}, "resolved_facts": map[string]any{"entities": []any{map[string]any{"id": "e0", "text": "Alice", "label": "person"}, map[string]any{"id": "e1", "text": "Acme", "label": "organization"}}, "relations": []any{map[string]any{"id": "employment", "type": "WORKS_AT", "source": "e0", "target": "e1", "valid_at": "2020-01-01T00:00:00Z", "created_at": "2021-01-01T00:00:00Z"}}}}
+	_, err = p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": map[string]any{"resolved-claim": parent}, "sync_level": "full_index"})
+	require.NoError(t, err)
+	resolvedBinding := Binding{ID: testSourceID, Table: table, Knowledge: &resolvedKnowledge, Status: "searchable", ValidUntil: &until}
+	resolvedRequest := KnowledgeRequest{Graph: "resolved", Entity: "resolved", Start: []string{resolvedKnowledge.Entities[0].Namespace + "person/alice"}, ValidAt: "2022-01-01T00:00:00Z", KnownAt: "2022-01-01T00:00:00Z"}
+	require.Eventually(t, func() bool {
+		var err error
+		raw, err = p.QueryKnowledge(ctx, resolvedBinding, resolvedRequest, "research")
+		return err == nil && strings.Contains(string(raw), "employment") && strings.Contains(string(raw), "resolved-claim") && strings.Contains(string(raw), resolvedKnowledge.Entities[0].Namespace+"organization/acme")
+	}, 60*time.Second, 100*time.Millisecond)
+}

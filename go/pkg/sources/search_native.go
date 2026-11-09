@@ -442,8 +442,13 @@ func ValidateProcessing(plan *ProcessingDeclaration) error {
 func ObserveSearch(ctx context.Context, client SearchIndexClient, binding Binding) management.SearchStatus {
 	ctx, stop := context.WithTimeout(ctx, 5*time.Second)
 	defer stop()
-	out := management.SearchStatus{Version: SearchVersion, ObservedAt: int(time.Now().Unix()), Consistency: "unknown", Streams: []management.RepresentationStatus{}, Artifacts: []management.RepresentationStatus{}}
 	cache, failures := observeSearchIndexes(ctx, client, binding)
+	return searchStatusFromIndexes(binding, cache, failures)
+}
+
+func searchStatusFromIndexes(binding Binding, cache map[string]nativeSearchIndex, failures map[string]error) management.SearchStatus {
+	out := management.SearchStatus{Version: SearchVersion, ObservedAt: int(time.Now().Unix()), Consistency: "unknown", Streams: []management.RepresentationStatus{}, Artifacts: []management.RepresentationStatus{}}
+
 	inspect := func(name string) (nativeSearchIndex, error) {
 		if index, ok := cache[name]; ok {
 			return index, nil
@@ -547,7 +552,14 @@ var _ SearchIndexClient = (*Publisher)(nil)
 
 // Processing is driven independently of acquisition. Runtime adapters can call
 // this after desired state persistence, and retry it without provider downloads.
-func ReconcileSourceSearch(ctx context.Context, client SearchIndexClient, source Source) error {
+func ReconcileSourceSearch(ctx context.Context, client SearchIndexClient, source Source, audiences ...string) error {
+	audience := ""
+	if len(audiences) == 1 {
+		audience = audiences[0]
+	}
+	if err := ValidateKnowledgeProcessing(source.Knowledge, source.Processing, audience); err != nil {
+		return err
+	}
 	if err := ValidateSearchBindings(source.SearchVersion, source.Streams, source.Artifacts); err != nil {
 		return err
 	}
@@ -690,6 +702,14 @@ func observeSearchIndexes(ctx context.Context, client SearchIndexClient, binding
 			}
 		} else {
 			add(stream.Index)
+		}
+	}
+	if binding.Knowledge != nil {
+		for _, g := range binding.Knowledge.Graphs {
+			add(g.Index)
+		}
+		for _, e := range binding.Knowledge.Entities {
+			add(e.Index)
 		}
 	}
 	close(jobs)

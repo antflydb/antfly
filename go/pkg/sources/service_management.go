@@ -37,7 +37,7 @@ func (s *Service) serveManagement(w http.ResponseWriter, r *http.Request) {
 type localManagement struct{ s *Service }
 
 func (b localManagement) Capabilities(context.Context) (management.Capabilities, error) {
-	return management.Capabilities{ProcessingPresets: true, ProcessingJobs: true, SearchVersions: []int{1, 2}, ArtifactDiscovery: true, Version: 1, Runtime: "standalone", PerSourceRuns: true, CancelRuns: true, ConfigureSources: true, PurgeSources: true, MediaProxy: true, SerializedRuns: true, ConfigurationUrl: "/v1/connections"}, nil
+	return management.Capabilities{KnowledgeVersions: knowledgeVersions(b.s.knowledgeAudience), KnowledgeAudience: b.s.knowledgeAudience, ProcessingPresets: true, ProcessingJobs: true, SearchVersions: []int{1, 2}, ArtifactDiscovery: true, Version: 1, Runtime: "standalone", PerSourceRuns: true, CancelRuns: true, ConfigureSources: true, PurgeSources: true, MediaProxy: true, SerializedRuns: true, ConfigurationUrl: "/v1/connections"}, nil
 }
 func managementSource(source Source) management.Source {
 	var cfg map[string]any
@@ -50,7 +50,7 @@ func managementSource(source Source) management.Source {
 	if source.Permissions != nil {
 		perms = management.Permissions{Public: source.Permissions.Public, Readers: source.Permissions.Readers}
 	}
-	return management.Source{Processing: source.Processing, SearchVersion: source.SearchVersion, Artifacts: source.Artifacts, Identity: management.SourceIdentity{Namespace: source.Identity.Namespace}, Streams: source.Streams, Id: source.ID, Name: source.Alias, Connection: source.Connection, Table: source.Table, Config: cfg, Permissions: perms, PermissionTtlSeconds: source.PermissionTTLSeconds, Publication: management.SourcePublication(publication), State: "configured"}
+	return management.Source{Knowledge: source.Knowledge, Processing: source.Processing, SearchVersion: source.SearchVersion, Artifacts: source.Artifacts, Identity: management.SourceIdentity{Namespace: source.Identity.Namespace}, Streams: source.Streams, Id: source.ID, Name: source.Alias, Connection: source.Connection, Table: source.Table, Config: cfg, Permissions: perms, PermissionTtlSeconds: source.PermissionTTLSeconds, Publication: management.SourcePublication(publication), State: "configured"}
 }
 func (b localManagement) ListSources(ctx context.Context, limit int, cursor string) (management.SourcePage, error) {
 	b.s.mu.Lock()
@@ -82,29 +82,43 @@ func (b localManagement) ListSources(ctx context.Context, limit int, cursor stri
 }
 func (b localManagement) searchPublisher() *Publisher {
 	b.s.mu.Lock()
-	profile := cloneProfile(b.s.profile)
+	endpoint, tokenEnv := b.s.profile.Endpoint, b.s.profile.DataPlaneTokenEnv
 	b.s.mu.Unlock()
 	token := ""
-	if profile.DataPlaneTokenEnv != "" {
-		token = os.Getenv(profile.DataPlaneTokenEnv)
+	if tokenEnv != "" {
+		token = os.Getenv(tokenEnv)
 	}
-	return &Publisher{Endpoint: profile.Endpoint, Token: token}
+	return &Publisher{Endpoint: endpoint, Token: token}
 }
-func (b localManagement) GetSource(ctx context.Context, id string) (management.Source, error) {
+
+// Clone only the selected source. Knowledge queries do not fetch advisory
+// status for every representation before and after their own native checks.
+func (b localManagement) configuredSource(id string) (Source, error) {
 	b.s.mu.Lock()
-	profile := cloneProfile(b.s.profile)
-	b.s.mu.Unlock()
-	for _, source := range profile.Sources {
+	defer b.s.mu.Unlock()
+	for _, source := range b.s.profile.Sources {
 		if source.ID == id {
-			out := managementSource(source)
-			if source.SearchVersion == SearchVersion {
-				status := ObserveSearch(ctx, b.searchPublisher(), Binding{SearchVersion: source.SearchVersion, Table: source.Table, Streams: source.Streams, Artifacts: source.Artifacts})
-				out.SearchStatus = &status
-			}
-			return out, nil
+			return cloneProfile(Profile{Sources: []Source{source}}).Sources[0], nil
 		}
 	}
-	return management.Source{}, management.Failure(404, "source_not_found")
+	return Source{}, management.Failure(404, "source_not_found")
+}
+func (b localManagement) GetSource(ctx context.Context, id string) (management.Source, error) {
+	source, err := b.configuredSource(id)
+	if err != nil {
+		return management.Source{}, err
+	}
+	out := managementSource(source)
+	if source.Knowledge != nil || source.SearchVersion == SearchVersion {
+		search, knowledge := ObserveSource(ctx, b.searchPublisher(), Binding{Knowledge: source.Knowledge, SearchVersion: source.SearchVersion, Table: source.Table, Streams: source.Streams, Artifacts: source.Artifacts}, b.s.knowledgeAudience)
+		if source.Knowledge != nil {
+			out.KnowledgeStatus = &knowledge
+		}
+		if source.SearchVersion == SearchVersion {
+			out.SearchStatus = &search
+		}
+	}
+	return out, nil
 }
 
 func (b localManagement) legacy(ctx context.Context, method, path string, input any) ([]byte, error) {
@@ -127,14 +141,14 @@ func (b localManagement) legacy(ctx context.Context, method, path string, input 
 	return out.body.Bytes(), nil
 }
 func (b localManagement) PutSource(ctx context.Context, input management.Source) (management.Source, error) {
-	if input.SearchStatus != nil {
+	if input.SearchStatus != nil || input.KnowledgeStatus != nil {
 		return management.Source{}, management.Failure(400, "read_only_search_status")
 	}
 	cfg, err := json.Marshal(input.Config)
 	if err != nil {
 		return management.Source{}, err
 	}
-	source := Source{Processing: input.Processing, SearchVersion: input.SearchVersion, Artifacts: input.Artifacts, Identity: Identity{Namespace: input.Identity.Namespace}, Streams: input.Streams, ID: input.Id, Alias: input.Name, Connection: input.Connection, Table: input.Table, Config: cfg, Publication: string(input.Publication), Permissions: &Permissions{Public: input.Permissions.Public, Readers: input.Permissions.Readers}, PermissionTTLSeconds: input.PermissionTtlSeconds}
+	source := Source{Knowledge: input.Knowledge, Processing: input.Processing, SearchVersion: input.SearchVersion, Artifacts: input.Artifacts, Identity: Identity{Namespace: input.Identity.Namespace}, Streams: input.Streams, ID: input.Id, Alias: input.Name, Connection: input.Connection, Table: input.Table, Config: cfg, Publication: string(input.Publication), Permissions: &Permissions{Public: input.Permissions.Public, Readers: input.Permissions.Readers}, PermissionTTLSeconds: input.PermissionTtlSeconds}
 	raw, err := b.legacy(ctx, "PUT", "/v1/sources/"+input.Id, source)
 	if err != nil {
 		return management.Source{}, err
@@ -160,14 +174,14 @@ func (b localManagement) PutSource(ctx context.Context, input management.Source)
 		if err := publisher.EnsureTable(ctx, source.Table); err != nil {
 			return management.Source{}, err
 		}
-		if err := ReconcileSourceSearch(ctx, publisher, source); err != nil {
+		if err := ReconcileSourceSearch(ctx, publisher, source, b.s.knowledgeAudience); err != nil {
 			return management.Source{}, err
 		}
 	}
 	b.s.mu.Lock()
 	profile := cloneProfile(b.s.profile)
 	b.s.mu.Unlock()
-	runner := Runner{Profile: profile, StateDir: b.s.runnerPath(), Publisher: b.searchPublisher()}
+	runner := Runner{KnowledgeAudience: b.s.knowledgeAudience, Profile: profile, StateDir: b.s.runnerPath(), Publisher: b.searchPublisher()}
 	if !mutation.Rekeys {
 		if err := runner.RefreshSearchDiscovery(ctx, input.Id); err != nil {
 			return management.Source{}, err

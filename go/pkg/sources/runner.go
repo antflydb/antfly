@@ -55,6 +55,7 @@ type Identity struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 type Source struct {
+	Knowledge     *KnowledgeDeclaration  `json:"knowledge,omitempty"`
 	Processing    *ProcessingDeclaration `json:"processing,omitempty"`
 	SearchVersion int                    `json:"search_version,omitempty"`
 	Artifacts     []ArtifactBinding      `json:"artifacts,omitempty"`
@@ -72,6 +73,7 @@ type Source struct {
 	Identity             Identity        `json:"identity,omitzero"`
 }
 type Runner struct {
+	KnowledgeAudience string // Trusted deployment boundary, never source configuration.
 	// SourceID selects one source while retaining the complete profile/catalog.
 	// Filtering Profile.Sources would incorrectly retire unrelated bindings.
 	SourceID string
@@ -186,7 +188,7 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 		if alias == "" {
 			alias = source.ID
 		}
-		binding := Binding{SearchVersion: source.SearchVersion, Artifacts: source.Artifacts, ID: source.ID, Alias: alias, Table: source.Table, DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Streams: source.Streams, Filter: SourceFilter(source.ID), Status: "pending"}
+		binding := Binding{Knowledge: source.Knowledge, SearchVersion: source.SearchVersion, Artifacts: source.Artifacts, ID: source.ID, Alias: alias, Table: source.Table, DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Streams: source.Streams, Filter: SourceFilter(source.ID), Status: "pending"}
 		if len(binding.Streams) == 0 && source.Publication != "media" {
 			binding.Streams = DefaultSearchStreams(source.SearchVersion)
 		}
@@ -287,6 +289,9 @@ func (r *Runner) validate() error {
 		if !canonicalID(s.ID) || seen[s.ID] || s.Table == "" || strings.ContainsAny(s.Table, "\x00\r\n") || s.Table == "." || s.Table == ".." || s.Permissions == nil {
 			return fmt.Errorf("source needs a unique UUID, destination and explicit permissions")
 		}
+		if err := ValidateKnowledgeProcessing(s.Knowledge, s.Processing, r.KnowledgeAudience); err != nil {
+			return err
+		}
 		if err := ValidateProcessing(s.Processing); err != nil {
 			return err
 		}
@@ -337,6 +342,7 @@ func canonicalID(id string) bool {
 func sourceConfigurationHash(source Source, connection Connection) (string, error) {
 	source.Alias = ""
 	source.Streams = nil // Search/producer bindings do not change acquired bytes.
+	source.Knowledge = nil
 	source.Artifacts = nil
 	source.SearchVersion = 0
 	source.Processing = nil

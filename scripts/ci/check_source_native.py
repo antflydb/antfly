@@ -152,7 +152,7 @@ def main():
                         "-count=1",
                         "-v",
                         "-run",
-                        "^TestNative(SourceSearchStreams|TranscriptSearchEvidence|PDFInputAdmission)$",
+                        "^TestNative(SourceSearchStreams|TranscriptSearchEvidence|PDFInputAdmission|SourceKnowledge)$",
                         "-timeout",
                         "4m",
                     ],
@@ -160,6 +160,23 @@ def main():
                     env=env,
                     check=True,
                     timeout=270,
+                )
+                subprocess.run(
+                    [
+                        "go",
+                        "-C",
+                        "go/pkg/sources",
+                        "run",
+                        "./examples/source-knowledge",
+                        "--endpoint",
+                        env["ANTFLY_SOURCES_E2E_URL"],
+                        "--catalog",
+                        str(state / "knowledge-catalog.json"),
+                    ],
+                    cwd=root,
+                    env=env,
+                    check=True,
+                    timeout=150,
                 )
             except BaseException:
                 log.flush()
