@@ -24897,11 +24897,16 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (options.cancelled()) return error.Canceled;
         var effective_options = options;
-        if (req.target == .index and req.control == null) {
+        if (req.target == .index and req.control == null and self.local_index_repair_debt_hook != null) {
             // Persist the generation intent while the group lifecycle guard is
             // held, then let the DataServer's BackendRuntime maintenance owner
             // perform the admitted long-running work. This request remains a
             // bounded metadata operation and cannot stall foreground writes.
+            // Without a resident maintenance owner (embedded/standalone
+            // sources, and direct writers with no DataServer attached) there
+            // is nobody to drain that deferred debt, so retain the same
+            // synchronous fallback used by catchUpManagedIndexCreate instead
+            // of deferring forever.
             effective_options.defer_durable_index_repair_execution = true;
         }
         if (comptime !control_only_storage_sources) {
