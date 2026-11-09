@@ -946,12 +946,10 @@ test "public api smoke integration creates table inserts and queries documents" 
     // has published its durable generation. Wait on that owner's activity
     // contract instead of assuming a fixed number of metadata rounds is
     // enough on a loaded CI runner.
-    var structural_wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer structural_wait_io.deinit();
     var structural_wait_attempts: usize = 0;
     while (structural_wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (structural_wait_attempts += 1) {
         try svc.runRound();
-        structural_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
@@ -1022,12 +1020,10 @@ test "public api smoke integration creates table inserts and queries documents" 
     // data runtime's local-replica reconciliation hook does in production.
     // Without this step the lightweight fixture would retain the pre-cutover
     // cached writer even though metadata correctly moved reads to v1.
-    var owner_wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer owner_wait_io.deinit();
     var owner_wait_attempts: usize = 0;
     while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
         try svc.runRound();
-        owner_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
@@ -1115,11 +1111,9 @@ test "public api smoke integration creates table inserts and queries documents" 
     // Batch acknowledgement precedes asynchronous full-text generation
     // publication. Wait on the observable query contract instead of assuming
     // an unloaded scheduler makes the first query see the new generation.
-    var query_visibility_io = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer query_visibility_io.deinit();
     var query = try fetchQueryUntilTotal(
         &client,
-        query_visibility_io.io(),
+        std.testing.io,
         base_uri,
         "docs",
         query_body,
@@ -1529,7 +1523,7 @@ test "public api smoke integration creates table inserts and queries documents" 
     owner_wait_attempts = 0;
     while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
         try svc.runRound();
-        owner_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
